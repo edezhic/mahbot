@@ -35,7 +35,7 @@ use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{Clipboard, Shell};
 use iced::mouse;
-use iced::{Color, Element, Event, Length, Point, Rectangle, Size, Vector, alignment};
+use iced::{Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Vector, alignment};
 
 use super::theme;
 
@@ -317,6 +317,7 @@ where
 const MENU_ITEM_HEIGHT: f32 = 28.0;
 const MENU_PADDING: f32 = 8.0;
 const MENU_MIN_WIDTH: f32 = 140.0;
+const MENU_FONT_SIZE: f32 = 14.0;
 
 impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
     for ContextMenuOverlay<'_, '_, Message>
@@ -330,7 +331,7 @@ where
         let menu_height = item_count as f32 * MENU_ITEM_HEIGHT + MENU_PADDING * 2.0;
 
         // Compute the widest label using the renderer's text measurement.
-        let text_size = renderer.default_size();
+        let text_size = Pixels(MENU_FONT_SIZE);
         let max_label_width: f32 = self
             .menu_items
             .iter()
@@ -391,7 +392,7 @@ where
 
         // Draw each menu item.
         let font = renderer.default_font();
-        let text_size = renderer.default_size();
+        let text_size = Pixels(MENU_FONT_SIZE);
 
         for (i, (label, _action)) in self.menu_items.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
