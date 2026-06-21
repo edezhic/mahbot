@@ -355,25 +355,6 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
         .map(Box::as_ref)
 }
 
-/// Resolution mode for [`resolve_target`].
-///
-/// Controls whether the resolved path is being used for read or write operations,
-/// which affects canonicalization strategy, security checks, and error handling.
-#[derive(Copy, Clone)]
-enum ResolveMode {
-    /// Read mode: canonicalizes the full path (file must exist), uses
-    /// [`check_path_read_allowed`] which permits `EXTRA_READ_ALLOWED` paths,
-    /// and provides detailed error messages based on `io::ErrorKind`.
-    Read,
-    /// Write mode: canonicalizes only the parent directory (file may not exist),
-    /// uses [`is_path_allowed_with_base`] (stricter — no extra allowed paths),
-    /// and uses blanket error messages. Optionally creates parent directories.
-    Write {
-        /// If `true`, creates parent directories before canonicalizing.
-        ensure_parent: bool,
-    },
-}
-
 /// Fallback directory resolution when full-path [`canonicalize`] fails with
 /// `NotFound` but the lexical path still exists as a directory.
 ///
@@ -404,102 +385,6 @@ pub(crate) async fn resolve_directory_read_fallback(full_path: &Path) -> Option<
     Some(full_path.to_path_buf())
 }
 
-/// Unified path resolution for both read and write operations.
-///
-/// This is the internal implementation behind [`resolve_read_target`] and
-/// [`resolve_write_target`]. The `mode` parameter controls:
-/// - Pre-canonicalization security check (read permits `EXTRA_READ_ALLOWED`)
-/// - Canonicalization strategy (full path for read, parent-only for write)
-/// - Error message detail (io-error mapping for read, blanket context for write)
-/// - Symlink handling (resolved through for read, refused for write)
-/// - Parent directory creation (write-only via `ensure_parent`)
-async fn resolve_target(
-    workspace_root: &Path,
-    path: &str,
-    mode: ResolveMode,
-) -> anyhow::Result<PathBuf> {
-    let full_path = resolve_tool_path_with_base(path, workspace_root);
-
-    match mode {
-        ResolveMode::Read => {
-            // Pre-canonicalization check — allows EXTRA_READ_ALLOWED paths
-            // (temp files, dependency source directories) outside the workspace
-            check_path_read_allowed(path, workspace_root)?;
-            // Canonicalize full path (file must exist). Resolves symlinks,
-            // so the post-canonicalization check catches escapes.
-            let resolved_path = match tokio::fs::canonicalize(&full_path).await {
-                Ok(resolved) => resolved,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    resolve_directory_read_fallback(&full_path)
-                        .await
-                        .ok_or_else(|| anyhow::anyhow!("File not found: {}", full_path.display()))?
-                }
-                Err(e) => {
-                    return Err(match e.kind() {
-                        std::io::ErrorKind::PermissionDenied => {
-                            anyhow::anyhow!("Permission denied: {}", full_path.display())
-                        }
-                        _ => anyhow::anyhow!(
-                            "Failed to resolve file path: {}: {e}",
-                            full_path.display()
-                        ),
-                    });
-                }
-            };
-
-            check_path_read_allowed(&resolved_path.to_string_lossy(), workspace_root)?;
-
-            Ok(resolved_path)
-        }
-        ResolveMode::Write { ensure_parent } => {
-            // Pre-canonicalization check — strict, no extra allowed paths
-            if !is_path_allowed_with_base(path, workspace_root) {
-                anyhow::bail!("Path not allowed by security policy: {path}");
-            }
-
-            let Some(parent) = full_path.parent() else {
-                anyhow::bail!("Invalid path: missing parent directory");
-            };
-
-            if ensure_parent {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context("Failed to create parent directories")?;
-            }
-
-            // Canonicalize parent only — the file itself may not exist yet
-            let resolved_parent = tokio::fs::canonicalize(parent)
-                .await
-                .context("Failed to resolve file path")?;
-
-            if !is_path_allowed_with_base(&resolved_parent.to_string_lossy(), workspace_root) {
-                anyhow::bail!(
-                    "Path not allowed by security policy: {}",
-                    resolved_parent.display()
-                );
-            }
-
-            let Some(file_name) = full_path.file_name() else {
-                anyhow::bail!("Invalid path: missing file name");
-            };
-
-            let resolved_target = resolved_parent.join(file_name);
-
-            // Explicit symlink refusal (read resolves symlinks via canonicalize instead)
-            if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
-                && meta.file_type().is_symlink()
-            {
-                anyhow::bail!(
-                    "Refusing to write through symlink: {}",
-                    resolved_target.display()
-                );
-            }
-
-            Ok(resolved_target)
-        }
-    }
-}
-
 /// Resolve and validate a file target for write/edit operations.
 ///
 /// Path security is enforced via [`is_path_allowed_with_base`] (pre- and
@@ -520,7 +405,52 @@ pub async fn resolve_write_target(
     path: &str,
     ensure_parent: bool,
 ) -> anyhow::Result<PathBuf> {
-    resolve_target(workspace_root, path, ResolveMode::Write { ensure_parent }).await
+    let full_path = resolve_tool_path_with_base(path, workspace_root);
+
+    // Pre-canonicalization check — strict, no extra allowed paths
+    if !is_path_allowed_with_base(path, workspace_root) {
+        anyhow::bail!("Path not allowed by security policy: {path}");
+    }
+
+    let Some(parent) = full_path.parent() else {
+        anyhow::bail!("Invalid path: missing parent directory");
+    };
+
+    if ensure_parent {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("Failed to create parent directories")?;
+    }
+
+    // Canonicalize parent only — the file itself may not exist yet
+    let resolved_parent = tokio::fs::canonicalize(parent)
+        .await
+        .context("Failed to resolve file path")?;
+
+    if !is_path_allowed_with_base(&resolved_parent.to_string_lossy(), workspace_root) {
+        anyhow::bail!(
+            "Path not allowed by security policy: {}",
+            resolved_parent.display()
+        );
+    }
+
+    let Some(file_name) = full_path.file_name() else {
+        anyhow::bail!("Invalid path: missing file name");
+    };
+
+    let resolved_target = resolved_parent.join(file_name);
+
+    // Explicit symlink refusal (read resolves symlinks via canonicalize instead)
+    if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "Refusing to write through symlink: {}",
+            resolved_target.display()
+        );
+    }
+
+    Ok(resolved_target)
 }
 
 /// Resolve and validate a file path for read operations.
@@ -538,7 +468,34 @@ pub async fn resolve_write_target(
 ///
 /// Returns `Ok(path)` on success, or an error message to propagate to the agent.
 pub async fn resolve_read_target(workspace_root: &Path, path: &str) -> anyhow::Result<PathBuf> {
-    resolve_target(workspace_root, path, ResolveMode::Read).await
+    let full_path = resolve_tool_path_with_base(path, workspace_root);
+
+    // Pre-canonicalization check — allows EXTRA_READ_ALLOWED paths
+    // (temp files, dependency source directories) outside the workspace
+    check_path_read_allowed(path, workspace_root)?;
+
+    // Canonicalize full path (file must exist). Resolves symlinks,
+    // so the post-canonicalization check catches escapes.
+    let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            resolve_directory_read_fallback(&full_path)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("File not found: {}", full_path.display()))?
+        }
+        Err(e) => {
+            return Err(match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    anyhow::anyhow!("Permission denied: {}", full_path.display())
+                }
+                _ => anyhow::anyhow!("Failed to resolve file path: {}: {e}", full_path.display()),
+            });
+        }
+    };
+
+    check_path_read_allowed(&resolved_path.to_string_lossy(), workspace_root)?;
+
+    Ok(resolved_path)
 }
 
 /// If the path starts with `~`, expand it to the user's home directory.
@@ -1503,7 +1460,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(tmp.path()).await;
     }
 
-    // ── resolve_target tests ──────────────────────────────────────────
+    // ── Path resolution tests ──────────────────────────────────────────
 
     /// Create a temporary workspace and return `(TempDir, canonical_ws_path)`.
     /// The `TempDir` guard must be held alive for the test duration.
@@ -1516,12 +1473,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_read_file_exists() {
+    async fn resolve_read_target_file_exists() {
         let (_tmp, ws) = test_workspace().await;
         let file_path = ws.join("existing.txt");
         tokio::fs::write(&file_path, "hello").await.unwrap();
 
-        let result = resolve_target(&ws, "existing.txt", ResolveMode::Read).await;
+        let result = resolve_read_target(&ws, "existing.txt").await;
         assert!(
             result.is_ok(),
             "Should resolve existing file: {:?}",
@@ -1533,7 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_read_existing_subdirectory_without_trailing_slash() {
+    async fn resolve_read_target_existing_subdirectory_without_trailing_slash() {
         let (_tmp, ws) = test_workspace().await;
         let sub = ws.join("nested");
         tokio::fs::create_dir_all(&sub).await.unwrap();
@@ -1541,7 +1498,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = resolve_target(&ws, "nested", ResolveMode::Read).await;
+        let result = resolve_read_target(&ws, "nested").await;
         assert!(
             result.is_ok(),
             "Should resolve existing directory without trailing slash: {:?}",
@@ -1553,10 +1510,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_read_file_not_found() {
+    async fn resolve_read_target_file_not_found() {
         let (_tmp, ws) = test_workspace().await;
 
-        let result = resolve_target(&ws, "nonexistent.txt", ResolveMode::Read).await;
+        let result = resolve_read_target(&ws, "nonexistent.txt").await;
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("File not found"),
@@ -1566,7 +1523,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resolve_target_read_permission_denied() {
+    async fn resolve_read_target_permission_denied() {
         use std::os::unix::fs::PermissionsExt;
 
         let (_tmp, ws) = test_workspace().await;
@@ -1578,7 +1535,7 @@ mod tests {
         // Remove search permission from directory so canonicalize can't enter it
         std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let result = resolve_target(&ws, "secret/file.txt", ResolveMode::Read).await;
+        let result = resolve_read_target(&ws, "secret/file.txt").await;
 
         // Restore permissions so TempDir can clean up
         let _ = std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o755));
@@ -1593,14 +1550,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resolve_target_read_symlink_resolution() {
+    async fn resolve_read_target_symlink_resolution() {
         let (_tmp, ws) = test_workspace().await;
         let real_file = ws.join("real.txt");
         tokio::fs::write(&real_file, "content").await.unwrap();
         let link = ws.join("link.txt");
         std::os::unix::fs::symlink(&real_file, &link).unwrap();
 
-        let result = resolve_target(&ws, "link.txt", ResolveMode::Read).await;
+        let result = resolve_read_target(&ws, "link.txt").await;
         assert!(result.is_ok(), "Should resolve symlink: {:?}", result.err());
         let resolved = result.unwrap();
         let canonical_real = tokio::fs::canonicalize(&real_file).await.unwrap();
@@ -1611,7 +1568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_read_extra_allowed_path() {
+    async fn resolve_read_target_extra_allowed_path() {
         let (_tmp, ws) = test_workspace().await;
         let spill_file = std::env::temp_dir().join(format!(
             "mahbot_test_resolve_read_{}.txt",
@@ -1622,7 +1579,7 @@ mod tests {
             .unwrap();
         let spill_str = spill_file.to_string_lossy().to_string();
 
-        let result = resolve_target(&ws, &spill_str, ResolveMode::Read).await;
+        let result = resolve_read_target(&ws, &spill_str).await;
         let _ = tokio::fs::remove_file(&spill_file).await;
 
         assert!(
@@ -1633,7 +1590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_read_non_canonicalized_workspace_root() {
+    async fn resolve_read_target_non_canonicalized_workspace_root() {
         // When workspace_root is not canonicalized (e.g. /tmp vs /private/tmp on macOS),
         // reading via relative path should still succeed because resolve_tool_path_with_base
         // joins the (non-canonical) root with the relative path, and canonicalize resolves
@@ -1645,7 +1602,7 @@ mod tests {
         tokio::fs::write(&file_path, "world").await.unwrap();
 
         // Use the non-canonicalized ws_dir as workspace_root.
-        let result = resolve_target(&ws_dir, "hello.txt", ResolveMode::Read).await;
+        let result = resolve_read_target(&ws_dir, "hello.txt").await;
         assert!(
             result.is_ok(),
             "Read should succeed even with non-canonicalized root: {:?}",
@@ -1658,19 +1615,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_write_new_file_in_existing_dir() {
+    async fn resolve_write_target_new_file_in_existing_dir() {
         let (_tmp, ws) = test_workspace().await;
         let subdir = ws.join("subdir");
         tokio::fs::create_dir(&subdir).await.unwrap();
 
-        let result = resolve_target(
-            &ws,
-            "subdir/new_file.rs",
-            ResolveMode::Write {
-                ensure_parent: false,
-            },
-        )
-        .await;
+        let result = resolve_write_target(&ws, "subdir/new_file.rs", false).await;
         assert!(
             result.is_ok(),
             "Should resolve new file in existing dir: {:?}",
@@ -1684,17 +1634,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_write_new_file_new_dir_with_ensure_parent() {
+    async fn resolve_write_target_new_file_new_dir_with_ensure_parent() {
         let (_tmp, ws) = test_workspace().await;
 
-        let result = resolve_target(
-            &ws,
-            "a/b/c/new_file.rs",
-            ResolveMode::Write {
-                ensure_parent: true,
-            },
-        )
-        .await;
+        let result = resolve_write_target(&ws, "a/b/c/new_file.rs", true).await;
         assert!(
             result.is_ok(),
             "Should create parent directories: {:?}",
@@ -1713,17 +1656,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_write_new_file_new_dir_no_ensure_parent() {
+    async fn resolve_write_target_new_file_new_dir_no_ensure_parent() {
         let (_tmp, ws) = test_workspace().await;
 
-        let result = resolve_target(
-            &ws,
-            "nonexistent_dir/new_file.rs",
-            ResolveMode::Write {
-                ensure_parent: false,
-            },
-        )
-        .await;
+        let result = resolve_write_target(&ws, "nonexistent_dir/new_file.rs", false).await;
         assert!(result.is_err(), "Should fail when parent doesn't exist");
         let err = result.unwrap_err();
         assert!(
@@ -1735,20 +1671,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resolve_target_write_symlink_refusal() {
+    async fn resolve_write_target_symlink_refusal() {
         let (_tmp, ws) = test_workspace().await;
         // Create a symlink at the file target location
         let link = ws.join("malicious_link.txt");
         std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
 
-        let result = resolve_target(
-            &ws,
-            "malicious_link.txt",
-            ResolveMode::Write {
-                ensure_parent: false,
-            },
-        )
-        .await;
+        let result = resolve_write_target(&ws, "malicious_link.txt", false).await;
         assert!(result.is_err(), "Should refuse to write through symlink");
         if let Err(e) = result {
             assert!(
@@ -1759,21 +1688,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_write_outside_workspace_rejected() {
+    async fn resolve_write_target_outside_workspace_rejected() {
         let (_tmp, ws) = test_workspace().await;
         let outside = std::env::temp_dir().join(format!(
             "mahbot_test_write_outside_{}.txt",
             std::process::id()
         ));
 
-        let result = resolve_target(
-            &ws,
-            &outside.to_string_lossy(),
-            ResolveMode::Write {
-                ensure_parent: false,
-            },
-        )
-        .await;
+        let result = resolve_write_target(&ws, &outside.to_string_lossy(), false).await;
         assert!(result.is_err(), "Should reject write outside workspace");
     }
 }
