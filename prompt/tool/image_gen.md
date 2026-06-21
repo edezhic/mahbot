@@ -1,0 +1,1 @@
+Generate an image using an AI image generation model. Supports text-to-image and image-to-image (when reference images are provided). Returns the path to the generated image file — reference it as [IMAGE:path] in your reply.

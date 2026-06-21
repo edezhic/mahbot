@@ -1,0 +1,813 @@
+//! Workspace storage — persisted workspace metadata and contexts.
+//!
+//! Also handles workspace analysis: spawning a Discovery agent to explore a new
+//! workspace and produce role-specific context summaries.
+
+use crate::Role;
+use crate::Workspace;
+use crate::agent::run_agent;
+use crate::config::CONFIG;
+use crate::session::discovery_session_key;
+use crate::turso::{self, Connection};
+use anyhow::{Context, Result};
+use futures_util::future::join_all;
+use std::path::Path;
+use tokio::sync::OnceCell;
+use tracing::warn;
+
+/// Global workspace store.
+pub static WORKSPACES: OnceCell<WorkspaceStorage> = OnceCell::const_new();
+
+/// Initialize the global workspace store from CONFIG.
+pub async fn init_global() -> Result<()> {
+    let root = CONFIG.global_storage_root();
+    turso::register_global_store(&WORKSPACES, "WORKSPACES", || WorkspaceStorage::open(&root)).await
+}
+
+/// Get the global workspace store. Panics if not initialized — this must be
+/// initialized in `main.rs` during startup before any task runs.
+pub fn store() -> &'static WorkspaceStorage {
+    WORKSPACES
+        .get()
+        .expect("workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs")
+}
+
+/// Look up a workspace by its filesystem path.
+pub async fn get_by_path(path: &str) -> Result<Option<Workspace>> {
+    store().get_by_path(path).await
+}
+
+/// Look up a workspace by its name.
+pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
+    store().get_by_name(name).await
+}
+
+/// Turso-backed workspace storage.
+#[derive(Clone, Debug)]
+pub struct WorkspaceStorage {
+    pub(crate) conn: Connection,
+}
+
+const SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS workspaces (
+    name       TEXT PRIMARY KEY,
+    path       TEXT NOT NULL UNIQUE,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    maintenance INTEGER NOT NULL DEFAULT 0,
+    paused      INTEGER NOT NULL DEFAULT 0,
+    maintainer_debounce_mins INTEGER NOT NULL DEFAULT 5,
+    maintainer_last_run_at TEXT,
+    diagnostics TEXT,
+    diagnostics_updated_at TEXT,
+    discovery_generation INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS workspace_contexts (
+    workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
+    role           TEXT NOT NULL,
+    content        TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    UNIQUE(workspace_name, role)
+);
+CREATE TABLE IF NOT EXISTS editor_tabs (
+    workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
+    file_path      TEXT NOT NULL,
+    tab_order      INTEGER NOT NULL DEFAULT 0,
+    is_active      INTEGER NOT NULL DEFAULT 0,
+    is_dirty       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_name, file_path)
+);";
+
+/// Column list for workspace SELECT queries.
+///
+/// The column order here must match the positional indices defined in
+/// [`COL_WS_NAME`] through [`COL_WS_DIAGNOSTICS_UPDATED_AT`], which are used
+/// in [`workspace_from_row`].
+///
+/// `discovery_generation` is intentionally excluded from this column list: it
+/// is read only via its own single-column SELECT in
+/// [`WorkspaceStorage::get_discovery_generation`] and is never part of a workspace struct query.
+const WORKSPACE_COLUMNS: &str = "name, path, status, created_at, updated_at, \
+     maintenance, paused, maintainer_debounce_mins, maintainer_last_run_at, \
+     diagnostics, diagnostics_updated_at";
+
+/// Column-index constants for [`WORKSPACE_COLUMNS`].
+///
+/// These replace hardcoded positional indices in [`workspace_from_row`].
+/// With named constants, the compiler catches references to undefined column
+/// constants — for instance, removing a constant but forgetting to update a
+/// `row.get()` call produces a compile error rather than a silent field
+/// mapping bug.
+const COL_WS_NAME: usize = 0;
+const COL_WS_PATH: usize = 1;
+const COL_WS_STATUS: usize = 2;
+const COL_WS_CREATED_AT: usize = 3;
+const COL_WS_UPDATED_AT: usize = 4;
+const COL_WS_MAINTENANCE: usize = 5;
+const COL_WS_PAUSED: usize = 6;
+const COL_WS_MAINTAINER_DEBOUNCE_MINS: usize = 7;
+const COL_WS_MAINTAINER_LAST_RUN_AT: usize = 8;
+const COL_WS_DIAGNOSTICS: usize = 9;
+const COL_WS_DIAGNOSTICS_UPDATED_AT: usize = 10;
+
+/// Check the discovery generation counter: return `true` if the calling task
+/// is still the latest (OK to proceed), `false` if a newer [`WorkspaceStorage::rediscover`] has
+/// been triggered (stale — do not proceed).
+async fn check_discovery_generation(
+    storage: &WorkspaceStorage,
+    workspace_name: &str,
+    discovery_generation: i64,
+    label: &str,
+) -> bool {
+    let current_gen = storage
+        .get_discovery_generation(workspace_name)
+        .await
+        .unwrap_or(discovery_generation + 1);
+    if current_gen != discovery_generation {
+        tracing::warn!(
+            workspace_name,
+            captured_gen = discovery_generation,
+            current_gen,
+            label = %label,
+            "Discovery generation mismatch — skipping stale write"
+        );
+        return false;
+    }
+    true
+}
+
+/// Run workspace discovery for a single role, returning the result.
+///
+/// `discovery_generation` is the generation counter captured at spawn time.
+/// Before writing the context, we re-read the current generation from the DB;
+/// if it no longer matches, a newer [`WorkspaceStorage::rediscover`] call has been made and this
+/// task's result is stale — the write is skipped silently.
+///
+/// Returns `Ok(())` on success, or an error describing what went wrong.
+async fn run_workspace_discovery(
+    ws: &Workspace,
+    role: Role,
+    discovery_generation: i64,
+) -> Result<()> {
+    let storage = WORKSPACES
+        .get()
+        .context("WORKSPACES not initialized")?
+        .clone();
+
+    tracing::info!(workspace_name = ws.name, role = %role, "Starting workspace discovery");
+
+    // Create a Discovery agent pointed at the workspace
+    let agent_id = discovery_session_key(&ws.name, role.as_str());
+    let prompt = role.discovery_prompt();
+    let (_agent, response) = run_agent(agent_id, Role::Discovery, ws, None, &prompt).await;
+    let response =
+        response.context("Discovery agent returned no response (cancelled or failed)")?;
+
+    let content = response.trim().to_string();
+    if content.is_empty() {
+        anyhow::bail!("Empty response for role '{role}'");
+    }
+
+    // Guard against stale writes: if another rediscover has been triggered
+    // while this discovery ran, skip the context write.
+    if !check_discovery_generation(&storage, &ws.name, discovery_generation, "context").await {
+        return Ok(());
+    }
+
+    if let Err(e) = storage.set_context(&ws.name, role.as_str(), &content).await {
+        tracing::error!(workspace_name = ws.name, role = %role, error = %e, "Failed to store context");
+        return Err(e);
+    }
+
+    tracing::info!(workspace_name = ws.name, role = %role, "Workspace discovery for {role} completed");
+    Ok(())
+}
+
+/// Run diagnostics discovery — scan the workspace for dev tooling commands.
+///
+/// Runs a Discovery agent (using `Role::Discovery`'s tools: shell, read, search)
+/// to scan build files and identify commands for format, lint, type-check, build,
+/// and unit-test categories. Extracts structured output via [`crate::extraction::retry_extract_structured`].
+///
+/// `discovery_generation` guards against stale writes — if a newer [`WorkspaceStorage::rediscover`]
+/// was triggered while diagnostics were being computed, the write is skipped.
+///
+/// On failure, existing diagnostics data is left untouched.
+async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) -> Result<()> {
+    let storage = WORKSPACES
+        .get()
+        .context("WORKSPACES not initialized")?
+        .clone();
+
+    tracing::info!(workspace_name = ws.name, "Starting diagnostics discovery");
+
+    let agent_id = discovery_session_key(&ws.name, "diagnostics");
+
+    // Load the diagnostics discovery prompt directly (not a role-specific discovery prompt).
+    let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
+
+    let (agent, response) = run_agent(agent_id, Role::Discovery, ws, None, &prompt).await;
+    let _response = response
+        .context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
+
+    // Keep the Agent alive after run_agent() for retry_extract_structured —
+    // it needs agent.session.history() and agent.tool_specs.
+    let extraction_prompt = crate::prompt::load_prompt("extraction/diagnostics.md");
+    let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
+
+    // KV-cache preservation: `agent.extract_structured` uses the agent's own
+    // parameters (model, temperature, reasoning_effort, tools, provider routing)
+    // so the extraction call is byte-identical to the original Discovery agent
+    // call — the provider can reuse the cached prefix.
+    let cmds: crate::DiagnosticsCommands = agent
+        .extract_structured(&extraction_prompt, &retry_prompt, 3)
+        .await?;
+
+    // Guard against stale writes — see run_workspace_discovery.
+    if !check_discovery_generation(&storage, &ws.name, discovery_generation, "diagnostics").await {
+        return Ok(());
+    }
+
+    let now = turso::now();
+    storage.set_diagnostics(&ws.name, &cmds, &now).await?;
+
+    tracing::info!(
+        workspace_name = ws.name,
+        format = ?cmds.format,
+        lint = ?cmds.lint,
+        build = ?cmds.build,
+        unit_test = ?cmds.unit_test,
+        "Diagnostics discovery completed"
+    );
+    Ok(())
+}
+
+/// Spawn analysis for all analysis-eligible roles and set final status.
+/// Runs diagnostics discovery concurrently with role discovery via `tokio::join!`.
+/// Manager decision: diagnostics failure is FATAL — workspace status becomes "failed".
+///
+/// `discovery_generation` is the generation counter captured by the caller
+/// (either `add` or `rediscover`). Before writing final status, the task
+/// re-reads the generation from the DB; if it no longer matches, a newer
+/// rediscover call has been made and this task's results are stale — all
+/// writes are skipped.
+pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
+    let ws = ws.clone();
+    tokio::spawn(async move {
+        let ws_name = ws.name.clone();
+
+        // Run role discovery and diagnostics discovery concurrently.
+        let (role_results, diagnostics_result) = tokio::join!(
+            join_all(
+                <crate::Role as strum::IntoEnumIterator>::iter()
+                    .filter(|r| crate::role::role_info(r).has_discovery)
+                    .map(|role| {
+                        let ws = ws.clone();
+                        async move {
+                            run_workspace_discovery(&ws, role, discovery_generation).await
+                        }
+                    }),
+            ),
+            run_workspace_diagnostics(&ws, discovery_generation),
+        );
+
+        let mut all_ok = true;
+        let mut errors: Vec<String> = Vec::new();
+
+        for result in role_results {
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    all_ok = false;
+                    errors.push(e.to_string());
+                }
+            }
+        }
+
+        // Diagnostics failure is fatal.
+        if let Err(e) = diagnostics_result {
+            all_ok = false;
+            errors.push(format!("Diagnostics discovery failed: {e}"));
+        }
+
+        let Some(storage) = WORKSPACES.get() else {
+            tracing::error!("WORKSPACES not initialized during final status update");
+            return;
+        };
+
+        // Final guard: if a newer rediscover was triggered while this task ran,
+        // all three write sites (contexts, diagnostics, status) have already been
+        // individually guarded.  This check catches the status write.
+        if !check_discovery_generation(storage, &ws_name, discovery_generation, "final status")
+            .await
+        {
+            return;
+        }
+
+        if all_ok {
+            let _ = storage.set_status(&ws_name, "ready").await;
+            tracing::info!(
+                workspace_name = ws_name,
+                "Workspace analysis complete — all roles ready"
+            );
+        } else {
+            let msg = errors.join("; ");
+            let _ = storage.set_status(&ws_name, "failed").await;
+            tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
+        }
+    });
+}
+
+/// Validate a workspace name against the naming rules.
+///
+/// Rules:
+/// - ASCII letters (a-z, A-Z) and underscores only
+/// - Must start with a letter — no leading underscore
+/// - At least one letter — not underscores-only
+/// - Maximum 40 characters
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("Workspace name must not be empty");
+    }
+    if name.len() > 40 {
+        anyhow::bail!("Workspace name must not exceed 40 characters");
+    }
+    if !name.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
+        anyhow::bail!("Workspace name must contain only ASCII letters (a-z, A-Z) and underscores");
+    }
+    if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        anyhow::bail!("Workspace name must start with a letter");
+    }
+    if !name.chars().any(|c| c.is_ascii_alphabetic()) {
+        anyhow::bail!("Workspace name must contain at least one letter");
+    }
+    Ok(())
+}
+
+/// Normalize a workspace path: ensure it ends with a single `/`.
+fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    format!("{trimmed}/")
+}
+
+/// Canonicalize a user-provided path for workspace storage.
+///
+/// Expands `~` to the user's home directory, then uses
+/// [`std::fs::canonicalize`] to resolve relative segments and symlinks.
+/// Returns a clear error message on failure so callers can surface it
+/// to the user (e.g. "Path does not exist" or "Not a directory").
+fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
+    let expanded = crate::config::expand_tilde(raw);
+
+    let canonical = std::fs::canonicalize(&expanded).map_err(|e| {
+        if expanded.exists() {
+            format!("Cannot access path '{}': {e}", expanded.display())
+        } else {
+            format!("Path does not exist: {}", expanded.display())
+        }
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(format!("Path is not a directory: {}", canonical.display()));
+    }
+
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
+    Ok(Workspace {
+        name: row.get(COL_WS_NAME)?,
+        path: row.get(COL_WS_PATH)?,
+        status: row.get(COL_WS_STATUS)?,
+        created_at: row.get(COL_WS_CREATED_AT)?,
+        updated_at: row.get(COL_WS_UPDATED_AT)?,
+        maintenance: row.get::<bool>(COL_WS_MAINTENANCE)?,
+        paused: row.get::<bool>(COL_WS_PAUSED)?,
+        maintainer_debounce_mins: row.get::<i64>(COL_WS_MAINTAINER_DEBOUNCE_MINS)?,
+        maintainer_last_run_at: row.get::<Option<String>>(COL_WS_MAINTAINER_LAST_RUN_AT)?,
+        diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
+        diagnostics_updated_at: row.get::<Option<String>>(COL_WS_DIAGNOSTICS_UPDATED_AT)?,
+    })
+}
+
+impl WorkspaceStorage {
+    /// Open (or create) the workspaces database at `root/db/workspaces.db`.
+    pub async fn open(root: &Path) -> Result<Self> {
+        let db_path = root.join("db/workspaces.db");
+        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+        Ok(Self { conn })
+    }
+    /// Run a query that returns zero-or-one workspace row, mapping the result to
+    /// `Ok(Some(ws))` / `Ok(None)` / `Err`.
+    async fn query_one(
+        &self,
+        where_clause: &str,
+        params: impl turso::IntoParams + Send + 'static,
+    ) -> Result<Option<Workspace>> {
+        let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE {where_clause}");
+        match self.conn.query_row(&sql, params, workspace_from_row).await {
+            Ok(ws) => Ok(Some(ws)),
+            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Insert a new workspace and kick off analysis.
+    pub async fn add(&self, name: &str, path: &str) -> Result<Workspace> {
+        // Validate the workspace name.
+        validate_name(name)?;
+
+        // Canonicalize and validate the path so bad paths never enter the system.
+        let canonical = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = normalize_path(&canonical);
+        let now = turso::now();
+        self.conn
+            .execute(
+                "INSERT INTO workspaces (name, path, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                turso::params![name, path.clone(), now.clone(), now.clone()],
+            )
+            .await?;
+        let ws = Workspace {
+            name: name.to_string(),
+            path: path.clone(),
+            status: "pending".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            maintenance: false,
+            paused: false,
+            maintainer_debounce_mins: 5,
+            maintainer_last_run_at: None,
+            diagnostics: None,
+            diagnostics_updated_at: None,
+        };
+        let _ = self.set_status(name, "analyzing").await;
+        // New workspace: discovery_generation defaults to 0 in the schema.
+        // Generation 0 means "the first discovery" — if rediscover() bumps
+        // the generation before this task finishes, the task's context/
+        // diagnostics/status writes will be skipped by the generation guard.
+        spawn_workspace_discovery(&ws, 0);
+        // Eagerly initialize the shared search engine for this workspace.
+        if let Err(e) = crate::search_engine::get_or_init_engine(&ws) {
+            tracing::warn!(workspace_name = name, error = %e, "Failed to init search engine on workspace add");
+        }
+        Ok(ws)
+    }
+
+    /// List all workspaces ordered by name.
+    pub async fn list(&self) -> Result<Vec<Workspace>> {
+        let rows = self
+            .conn
+            .query_map(
+                &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY name"),
+                turso::params![],
+                workspace_from_row,
+            )
+            .await?;
+        let mut workspaces = Vec::new();
+        for row in rows {
+            workspaces.push(row?);
+        }
+        Ok(workspaces)
+    }
+
+    /// Look up a workspace by name.
+    pub async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
+        self.query_one("name = ?1", turso::params![name]).await
+    }
+
+    /// Look up a workspace by its filesystem path.
+    pub async fn get_by_path(&self, path: &str) -> Result<Option<Workspace>> {
+        self.query_one("path = ?1", turso::params![normalize_path(path)])
+            .await
+    }
+
+    /// Delete a workspace by name. Context rows are cascaded automatically.
+    /// The associated search engine is also removed from the in-memory registry.
+    pub async fn delete(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM workspaces WHERE name = ?1",
+                turso::params![name],
+            )
+            .await?;
+        crate::search_engine::remove_engine(name);
+        Ok(())
+    }
+
+    /// Update the status of a workspace.
+    pub async fn set_status(&self, name: &str, status: &str) -> Result<()> {
+        let now = turso::now();
+        self.conn
+            .execute(
+                "UPDATE workspaces SET status = ?1, updated_at = ?2 WHERE name = ?3",
+                turso::params![status, now.clone(), name],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Set or clear the maintenance toggle for a workspace.
+    pub async fn set_maintenance(&self, name: &str, enabled: bool) -> Result<()> {
+        let now = turso::now();
+        if enabled {
+            // Reset debounce state so the maintainer runs at the next 5-minute
+            // poll, regardless of how long the previous debounce interval was.
+            self.conn
+                .execute(
+                    "UPDATE workspaces SET maintenance = 1, maintainer_debounce_mins = 5, maintainer_last_run_at = NULL, updated_at = ?1 WHERE name = ?2",
+                    turso::params![now, name],
+                )
+                .await?;
+        } else {
+            self.conn
+                .execute(
+                    "UPDATE workspaces SET maintenance = 0, updated_at = ?1 WHERE name = ?2",
+                    turso::params![now, name],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Set or clear the pipeline pause toggle for a workspace.
+    pub async fn set_paused(&self, name: &str, paused: bool) -> Result<()> {
+        let now = turso::now();
+        let val: i64 = i64::from(paused);
+        self.conn
+            .execute(
+                "UPDATE workspaces SET paused = ?1, updated_at = ?2 WHERE name = ?3",
+                turso::params![val, now, name],
+            )
+            .await?;
+        if paused {
+            tracing::info!(workspace = name, "Workspace pipeline paused");
+        } else {
+            tracing::info!(workspace = name, "Workspace pipeline resumed");
+        }
+        Ok(())
+    }
+
+    /// Update the maintenance debounce state atomically.
+    ///
+    /// Sets both `maintainer_debounce_mins` and `maintainer_last_run_at` in one
+    /// UPDATE along with `updated_at`.
+    pub async fn set_maintenance_debounce(
+        &self,
+        name: &str,
+        debounce_mins: i64,
+        last_run_at: &str,
+    ) -> Result<()> {
+        let now = turso::now();
+        self.conn
+            .execute(
+                "UPDATE workspaces SET maintainer_debounce_mins = ?1, maintainer_last_run_at = ?2, updated_at = ?3 WHERE name = ?4",
+                turso::params![debounce_mins, last_run_at, now.clone(), name],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Store discovered diagnostics commands for a workspace.
+    pub async fn set_diagnostics(
+        &self,
+        name: &str,
+        commands: &crate::DiagnosticsCommands,
+        timestamp: &str,
+    ) -> Result<()> {
+        let json = serde_json::to_string(commands)?;
+        self.conn
+            .execute(
+                "UPDATE workspaces SET diagnostics = ?1, diagnostics_updated_at = ?2, updated_at = ?3 WHERE name = ?4",
+                turso::params![json, timestamp, turso::now(), name],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Retrieve discovered diagnostics commands for a workspace.
+    pub async fn get_diagnostics(&self, name: &str) -> Result<Option<crate::DiagnosticsCommands>> {
+        match self
+            .conn
+            .query_row(
+                "SELECT diagnostics FROM workspaces WHERE name = ?1",
+                turso::params![name],
+                |row| row.get::<Option<String>>(0),
+            )
+            .await
+        {
+            Ok(Some(json)) => {
+                let cmds: crate::DiagnosticsCommands = serde_json::from_str(&json)?;
+                Ok(Some(cmds))
+            }
+            Ok(None) | Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Clear all per-role workspace contexts for a workspace.
+    /// Called by [`Self::rediscover`] before spawning a new discovery task so that
+    /// stale context entries from a previous discovery don't persist.
+    async fn clear_contexts(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM workspace_contexts WHERE workspace_name = ?1",
+                turso::params![name],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read the current `discovery_generation` for a workspace.
+    ///
+    /// Used by discovery tasks to check whether a newer rediscover has been
+    /// triggered — if the generation no longer matches, the task's writes
+    /// are stale and must be skipped.
+    async fn get_discovery_generation(&self, name: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT discovery_generation FROM workspaces WHERE name = ?1",
+                turso::params![name],
+                |row| row.get(0),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Trigger re-analysis of an existing workspace.
+    /// Resets status to "analyzing", clears diagnostics columns, clears stale
+    /// per-role contexts, and spawns analysis with a fresh generation counter.
+    pub async fn rediscover(&self, name: &str) -> Result<()> {
+        let ws = self
+            .get_by_name(name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Workspace {name} not found"))?;
+
+        let now = turso::now();
+
+        // Atomically increment the discovery generation counter so any
+        // still-running discovery task from a previous rediscover will
+        // see a generation mismatch and skip its writes.
+        self.conn
+            .execute(
+                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = 'analyzing', diagnostics = NULL, diagnostics_updated_at = NULL, updated_at = ?1 WHERE name = ?2",
+                turso::params![now, name],
+            )
+            .await?;
+
+        // Clear stale per-role context entries so that old discovery tasks
+        // that beat the generation check cannot leave partial data behind.
+        self.clear_contexts(name).await?;
+
+        let generation = self.get_discovery_generation(name).await?;
+        spawn_workspace_discovery(&ws, generation);
+
+        Ok(())
+    }
+
+    /// Get a single context entry by workspace name and role.
+    pub async fn get_context(&self, workspace_name: &str, role: &str) -> Result<Option<String>> {
+        match self
+            .conn
+            .query_row(
+                "SELECT content FROM workspace_contexts WHERE workspace_name = ?1 AND role = ?2",
+                turso::params![workspace_name, role],
+                |row| row.get::<String>(0),
+            )
+            .await
+        {
+            Ok(content) => Ok(Some(content)),
+            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Upsert a single context entry for a workspace and role.
+    pub async fn set_context(&self, workspace_name: &str, role: &str, content: &str) -> Result<()> {
+        let now = turso::now();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(workspace_name, role) DO UPDATE SET content = excluded.content, created_at = excluded.created_at",
+                turso::params![workspace_name, role, content, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ── Editor tab persistence ─────────────────────────────────
+
+    /// Save the current set of open editor tabs for a workspace.
+    /// Replaces all existing records for this workspace.
+    pub async fn save_editor_tabs(
+        &self,
+        workspace_name: &str,
+        tabs: &[EditorTabRecord],
+    ) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        tx.execute(
+            "DELETE FROM editor_tabs WHERE workspace_name = ?1",
+            turso::params![workspace_name],
+        )
+        .await?;
+        for tab in tabs {
+            tx.execute(
+                "INSERT INTO editor_tabs (workspace_name, file_path, tab_order, is_active, is_dirty) VALUES (?1, ?2, ?3, ?4, ?5)",
+                turso::params![
+                    workspace_name,
+                    tab.file_path.clone(),
+                    i64::try_from(tab.tab_order).unwrap_or(i64::MAX),
+                    i64::from(tab.is_active),
+                    i64::from(tab.is_dirty),
+                ],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Load the saved open editor tabs for a workspace.
+    pub async fn load_editor_tabs(&self, workspace_name: &str) -> Result<Vec<EditorTabRecord>> {
+        let rows = self.conn
+            .query_map(
+                "SELECT file_path, tab_order, is_active, is_dirty FROM editor_tabs WHERE workspace_name = ?1 ORDER BY tab_order",
+                turso::params![workspace_name],
+                |row| -> std::result::Result<EditorTabRecord, String> {
+                    Ok(EditorTabRecord {
+                        file_path: row.get::<String>(0).unwrap_or_default(),
+                        tab_order: usize::try_from(row.get::<i64>(1).unwrap_or(0)).unwrap_or(0),
+                        is_active: row.get::<i64>(2).unwrap_or(0) != 0,
+                        is_dirty: row.get::<i64>(3).unwrap_or(0) != 0,
+                    })
+                },
+            )
+            .await?;
+        let mut tabs = Vec::new();
+        for row in rows {
+            let tab = row.map_err(|e| anyhow::anyhow!("Failed to parse editor tab row: {e}"))?;
+            if tab.file_path.is_empty() || tab.file_path.trim().is_empty() {
+                warn!(
+                    workspace = %workspace_name,
+                    tab_order = tab.tab_order,
+                    "Skipping editor tab with empty file_path — would resolve to workspace root"
+                );
+                continue;
+            }
+            tabs.push(tab);
+        }
+        Ok(tabs)
+    }
+
+    /// Clear dirty flags for all tabs on all workspaces (called on app startup).
+    pub async fn clear_all_editor_dirty_flags(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE editor_tabs SET is_dirty = 0 WHERE is_dirty != 0",
+                turso::params![],
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// A single editor tab record for persistence.
+#[derive(Debug, Clone)]
+pub struct EditorTabRecord {
+    pub file_path: String,
+    pub tab_order: usize,
+    pub is_active: bool,
+    pub is_dirty: bool,
+}
+
+/// List all workspaces (for display).
+pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
+    let store = WORKSPACES
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Workspace store not initialized"))?;
+    store.list().await
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+/// Create a minimal [`Workspace`] from a path for testing.
+/// The name is derived from the path's file name.
+#[cfg(test)]
+#[must_use]
+pub fn test_ws(path: impl AsRef<std::path::Path>) -> Workspace {
+    Workspace::from_path(path.as_ref())
+}
+
+/// Create a minimal [`Workspace`] with an explicit path and name.
+#[cfg(test)]
+#[must_use]
+pub fn test_ws_named(path: &str, name: &str) -> Workspace {
+    Workspace {
+        name: name.to_string(),
+        path: path.to_string(),
+        maintainer_debounce_mins: 5,
+        ..Default::default()
+    }
+}

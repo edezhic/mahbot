@@ -1,0 +1,1 @@
+Generate a video using an AI video generation model. Supports text-to-video and image-to-video (when reference images are provided). Returns the path to the generated video file — use [VIDEO:path] in your reply to send it to the user.

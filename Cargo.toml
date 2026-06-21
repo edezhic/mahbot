@@ -1,0 +1,133 @@
+[package]
+name = "mahbot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["ai", "agent"]
+rust-version = "1.96"
+resolver = "2"
+publish = false
+
+[[bin]]
+name = "mahbot"
+path = "src/main.rs"
+
+[lib]
+name = "mahbot"
+path = "src/lib.rs"
+
+[dependencies]
+# Async
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Async runtime
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "process", "signal", "sync", "fs"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+tokio-util = { version = "0.7", default-features = false }
+
+# Native GUI dashboard
+iced = { version = "0.14", default-features = false, features = ["tokio", "wgpu", "markdown", "advanced"] }
+iced_fonts = { version = "0.3", default-features = false, features = ["lucide"] }
+iced_anim = "0.3"
+iced_selection = { version = "0.5", features = ["markdown"] }
+iced_term = "0.8.0"
+
+# HTTP / WebSocket client
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "stream", "rustls-tls", "multipart"] }
+
+# Embed files into the binary
+rust-embed = "8"
+
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+# Config
+directories = "6.0"
+
+# Logging
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Self-replace for cross-platform binary swap during self-update
+self-replace = "1.5"
+
+# Utils
+base64 = "0.22"
+jsonrepair-rs = "0.2"
+rand = "0.10"
+
+# Memory / persistence
+turso = { version = "0.6", default-features = false, features = ["fts"] }
+turso_sdk_kit = { version = "0.6", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+# Regex
+regex = "1.10"
+
+# Fast file/content search for the tools
+fff-search = "0.9"
+
+# Embeddings
+ndarray = "0.17"
+tokenizers = "0.22"
+ort = { version = "=2.0.0-rc.12", features = ["ndarray", "download-binaries"] }
+
+# Enum derive helpers
+strum = { version = "0.27", features = ["derive"] }
+
+# Tree-sitter for code navigation
+tree-sitter = "0.26"
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-bash = "0.25"
+tree-sitter-css = "0.25"
+tree-sitter-html = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-ruby = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-sequel = "0.3"
+tree-sitter-md = { version = "0.5.3", features = ["parser"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+incremental = true
+opt-level = 0
+debug = 0
+codegen-units = 256
+
+[profile.dev.build-override]
+opt-level = 0
+debug = 0
+codegen-units = 256
+
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 32
+incremental = true
+strip = false
+panic = "unwind"
+
+[profile.test]
+inherits = "dev"
+debug = 0
+codegen-units = 256

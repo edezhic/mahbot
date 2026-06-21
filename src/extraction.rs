@@ -1,0 +1,195 @@
+//! Structured extraction from conversation history.
+//!
+//! Provides LLM-powered extraction of structured data (JSON) from agent
+//! conversation history, with retry logic and callback-button parsing.
+//! The provider dependency is natural here — extraction *is* an LLM call.
+
+use serde::de::DeserializeOwned;
+
+use crate::config::CONFIG;
+use crate::providers::chat;
+use crate::util::parse_fenced_json;
+use crate::{ChatMessage, ChatRequest, ToolSpec};
+
+// ── Retry extraction ──────────────────────────────────────────────────
+
+/// Retry a structured JSON extraction from conversation history.
+///
+/// Pushes `extraction_prompt` into the history, then loops up to `max_attempts`
+/// calling the LLM. On each iteration:
+/// - Tool calls → treat as failure, push `retry_prompt`, retry
+/// - Non-parseable text → push raw assistant text + `retry_prompt`, retry
+/// - Valid JSON matching `T` → return immediately
+///
+/// Pass `extraction_prompt = ""` if the prompt is already embedded in `history`.
+///
+/// KV-cache preservation: callers must pass the same `temperature`,
+/// `reasoning_effort`, `model`, and `tool_specs` that the agent's work loop
+/// uses so the provider can reuse the cached prefix.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
+    history: &[ChatMessage],
+    extraction_prompt: &str,
+    retry_prompt: &str,
+    tool_specs: Option<&[ToolSpec]>,
+    model: &str,
+    allow_image_parts: bool,
+    temperature: f32,
+    reasoning_effort: Option<String>,
+    max_attempts: usize,
+) -> anyhow::Result<T> {
+    let mut extraction_history = history.to_vec();
+
+    // Only push the extraction prompt if non-empty — caller may have embedded it
+    if !extraction_prompt.is_empty() {
+        extraction_history.push(ChatMessage::user(extraction_prompt));
+    }
+
+    let mut last_raw = String::new();
+
+    for _attempt in 1..=max_attempts {
+        let routing = CONFIG.model_routing(model);
+        let response = chat(ChatRequest {
+            messages: extraction_history.clone(),
+            tools: tool_specs.map(<[ToolSpec]>::to_vec),
+            model: model.to_string(),
+            allow_image_parts,
+            temperature,
+            reasoning_effort: reasoning_effort.clone(),
+            provider_order: routing.provider_order,
+            provider_allow_fallbacks: routing.allow_fallbacks,
+        })
+        .await?;
+
+        last_raw = response.text_or_empty().to_string();
+
+        // Try to parse as T (handles markdown fencing internally) — only if no tool calls
+        if response.tool_calls.is_empty()
+            && let Ok(result) = parse_fenced_json::<T>(&last_raw)
+        {
+            return Ok(result);
+        }
+
+        // Tool calls or parse failure — push raw assistant text + retry prompt, continue
+        extraction_history.push(ChatMessage::assistant(last_raw.clone()));
+        extraction_history.push(ChatMessage::user(retry_prompt));
+    }
+
+    let snippet: String = last_raw.chars().take(300).collect();
+    anyhow::bail!(
+        "Failed to extract structured response after {max_attempts} attempts. Last raw: {snippet}"
+    )
+}
+
+// ── Option extraction types ───────────────────────────────────────────
+
+/// Callback data prefix for dynamic option buttons.
+pub(crate) const CALLBACK_PREFIX: &str = "__opt__";
+
+/// Check whether `content` begins with [`CALLBACK_PREFIX`].
+///
+/// Fast prefix-only check — useful as an early filter before calling
+/// [`decode_callback`].
+#[must_use]
+pub fn is_callback(content: &str) -> bool {
+    content.starts_with(CALLBACK_PREFIX)
+}
+
+/// Decode callback data from inline keyboard interactions.
+///
+/// Returns `(ticket_id, label)` on success (`ticket_id` is `None` when the
+/// callback data was generated without one).  Returns `None` when `content`
+/// does not carry the [`CALLBACK_PREFIX`].
+///
+/// # Format contract
+///
+/// The callback data uses `|` as a delimiter between the optional ticket-id
+/// and the label.  Both join and split therefore assume that neither
+/// `ticket_id` nor `label` may contain a `|` character.
+///
+/// **Examples:**
+/// - `__opt__ticket-id|Label` → `(Some("ticket-id"), "Label")`
+/// - `__opt__|Label` → `(None, "Label")`
+/// - `__opt__BareLabel` → `(None, "BareLabel")`
+#[must_use]
+pub fn decode_callback(content: &str) -> Option<(Option<String>, String)> {
+    let rest = content.strip_prefix(CALLBACK_PREFIX)?;
+    Some(match rest.split_once('|') {
+        Some((tid, lbl)) if !tid.is_empty() => (Some(tid.to_string()), lbl.to_string()),
+        Some((_, lbl)) => (None, lbl.to_string()),
+        None => (None, rest.to_string()),
+    })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod callback_tests {
+    use super::{decode_callback, is_callback};
+
+    // ── is_callback ───────────────────────────────────────────────────────
+
+    #[test]
+    fn is_callback_matches_prefix() {
+        assert!(is_callback("__opt__ticket123|Label"));
+        assert!(is_callback("__opt__|Label"));
+        assert!(is_callback("__opt__bare"));
+    }
+
+    #[test]
+    fn is_callback_rejects_non_prefix() {
+        assert!(!is_callback("not_opt_something"));
+        assert!(!is_callback(""));
+        assert!(!is_callback("__op__ticket|Label"));
+    }
+
+    // ── decode_callback ───────────────────────────────────────────────────
+
+    #[test]
+    fn decode_callback_with_ticket_id() {
+        let (ticket_id, label) = decode_callback("__opt__mahbot-123|Option A").unwrap();
+        assert_eq!(ticket_id.as_deref(), Some("mahbot-123"));
+        assert_eq!(label, "Option A");
+    }
+
+    #[test]
+    fn decode_callback_empty_ticket_id() {
+        // "__opt__|Label" — empty ticket_id before the delimiter
+        let (ticket_id, label) = decode_callback("__opt__|Label").unwrap();
+        assert_eq!(ticket_id.as_deref(), None);
+        assert_eq!(label, "Label");
+    }
+
+    #[test]
+    fn decode_callback_no_delimiter() {
+        // No '|' at all — everything after prefix is the label
+        let (ticket_id, label) = decode_callback("__opt__BareLabel").unwrap();
+        assert_eq!(ticket_id.as_deref(), None);
+        assert_eq!(label, "BareLabel");
+    }
+
+    #[test]
+    fn decode_callback_rejects_non_prefix() {
+        assert!(decode_callback("random_text").is_none());
+        assert!(decode_callback("").is_none());
+    }
+
+    #[test]
+    fn decode_callback_label_with_extra_pipes() {
+        // Labels containing '|' are a known fragility — the format contract
+        // assumes neither ticket_id nor label may contain '|'.
+        // split_once('|') splits on the *first* pipe, so the label captures
+        // everything after it.
+        let (ticket_id, label) = decode_callback("__opt__ticket|A|B|C").unwrap();
+        assert_eq!(ticket_id.as_deref(), Some("ticket"));
+        assert_eq!(label, "A|B|C");
+    }
+
+    #[test]
+    fn decode_callback_only_prefix_and_pipe() {
+        // "__opt__|" — empty ticket_id, empty label
+        let (ticket_id, label) = decode_callback("__opt__|").unwrap();
+        assert_eq!(ticket_id.as_deref(), None);
+        assert_eq!(label, "");
+    }
+}

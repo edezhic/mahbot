@@ -1,0 +1,1 @@
+Search the web for information using the `query` parameter. Results come back as short highlights, each with an expand ID. To retrieve the full cached text of a result, call the tool again using the `expand` parameter with that ID.

@@ -1,0 +1,1121 @@
+//! Browser automation tool.
+
+use crate::util::UnwrapPoison;
+use crate::{Tool, ToolOutputPhase, Workspace};
+use anyhow::Context;
+use async_trait::async_trait;
+use futures_util::future::join_all;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::process::Command;
+use tracing::debug;
+
+/// Response from agent-browser `--json` commands.
+#[derive(Debug, Deserialize)]
+struct AgentBrowserResponse {
+    success: bool,
+    data: Option<Value>,
+    error: Option<String>,
+}
+
+/// Actions for navigating and extracting content from web pages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserAction {
+    /// Navigate to a URL (returns page content automatically).
+    Open { url: String },
+    /// Get accessibility snapshot with element refs (`@e1`, `@e2`, …).
+    /// Always take a fresh snapshot before using refs.
+    Snapshot {
+        /// Only show interactive elements (buttons, links, inputs).
+        #[serde(default)]
+        interactive_only: bool,
+        /// Remove empty structural elements (default: true).
+        #[serde(default = "true_val")]
+        compact: bool,
+        /// Limit tree depth.
+        depth: Option<u32>,
+    },
+    /// Click an element by ref (`@e1`) or CSS selector.
+    Click { selector: String },
+    /// Extract text content from an element by CSS selector.
+    GetText { selector: String },
+    /// Extract visible rendered text from an element by CSS selector
+    /// (uses `innerText()` — no `<script>` or `<style>` content).
+    #[serde(alias = "get_innertext")]
+    GetInnerText { selector: String },
+    /// Get current URL.
+    GetUrl {},
+    /// Press a keyboard key at the current focus (e.g. "Enter", "Tab", "Escape").
+    /// Useful for submitting forms after filling inputs.
+    Press { key: String },
+    /// Run JavaScript in the page context. Returns the result as a string.
+    /// Useful for inspecting element attributes, checking state, or debugging.
+    Eval { js: String },
+    /// Find an element by semantic locator and perform an action.
+    /// See `name()` doc block or the tool description for usage.
+    Find {
+        /// Locator type: text (case-sensitive substring, second most reliable),
+        /// role (accessibility tree role),
+        /// label (matches `<label for='...'>` only),
+        /// placeholder (exact HTML placeholder attribute, NOT aria-label),
+        /// alt, title (exact HTML title attribute), testid,
+        /// first (CSS selector — most reliable), last (CSS selector), nth (CSS selector + index).
+        by: String,
+        /// Locator value. For 'text': substring to search for; for 'role':
+        /// role name ('button', 'link', 'textbox', etc.); for 'first'/'last'/'nth': CSS selector.
+        value: String,
+        /// Action to perform: click, fill, type, hover, focus, check, uncheck, text.
+        /// "fill" clears the field then types; "type" appends without clearing.
+        action: String,
+        /// Text to fill/type into the element (only for action "fill" or "type").
+        text: Option<String>,
+        /// Accessible name filter for role-based finding, e.g. "Submit".
+        /// Note: this filter can fail even when the snapshot shows a matching element.
+        /// When it fails, retry with `by: "text"` or `by: "first"` with CSS.
+        name: Option<String>,
+        /// Require exact text match.
+        exact: Option<bool>,
+        /// Zero-based index for `by: "nth"`. Required when `by` is "nth".
+        index: Option<u32>,
+    },
+}
+
+/// Helper for `#[serde(default = "true_val")]` on boolean fields.
+const fn true_val() -> bool {
+    true
+}
+
+/// Browser tool for fetching content from web pages.
+///
+/// Each operation requires a `tab` name — separate browser sessions
+/// (isolated via `--session`). Use `"default"` for most browsing.
+/// Operations on the same tab are serialized via a per-tab lock.
+#[derive(Default)]
+pub struct BrowserTool {
+    /// Per-tab locks — only serializes operations on the same tab.
+    /// Different tabs can run concurrently without blocking each other.
+    tab_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl BrowserTool {
+    /// Acquire a per-tab lock for serializing operations on the same tab.
+    /// Different tabs run fully concurrently.
+    async fn acquire_tab_lock(&self, tab: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.tab_locks.lock().unwrap_poison();
+            locks
+                .entry(tab.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    /// Open a URL, wait for network idle, take a compact snapshot, and return
+    /// the page content as text. Handles all agent-browser response shapes:
+    /// string data, `content` field, `snapshot` field, or fallback JSON.
+    ///
+    /// The tab is left open — caller should close it with `close_session` when
+    /// done. Each call acquires a per-tab lock so concurrent calls to the same
+    /// tab are serialized.
+    pub async fn fetch_snapshot(&self, url: &str, tab: &str) -> anyhow::Result<String> {
+        Self::validate_url(url)?;
+
+        if !Self::is_available().await {
+            anyhow::bail!("agent-browser CLI is not available");
+        }
+
+        let _guard = self.acquire_tab_lock(tab).await;
+
+        // 1. Open the URL
+        self.run_command(&["open", url], Some(tab)).await?;
+
+        // 2. Wait for network idle (best-effort)
+        let _ = self
+            .run_command(&["wait", "--load", "networkidle"], Some(tab))
+            .await;
+
+        // 3. Take a compact snapshot and extract the text content
+        let snap_resp = self.run_command(&["snapshot", "-c"], Some(tab)).await?;
+        let text = snap_resp
+            .data
+            .as_ref()
+            .and_then(extract_snapshot_text)
+            .unwrap_or_default();
+
+        Ok(text)
+    }
+
+    /// Close a browser session tab by name (best-effort).
+    pub async fn close_session(&self, tab: &str) {
+        let _ = self.run_command(&["close"], Some(tab)).await;
+    }
+
+    /// Check whether `agent-browser` CLI is available on `$PATH`.
+    pub async fn is_available() -> bool {
+        let cmd = agent_browser_bin();
+        Command::new(cmd)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Validate a URL is structurally safe to navigate to.
+    fn validate_url(url: &str) -> anyhow::Result<()> {
+        let url = url.trim();
+
+        if url.is_empty() {
+            anyhow::bail!("URL cannot be empty");
+        }
+
+        // Block file:// — bypasses SSRF controls.
+        if url.starts_with("file://") {
+            anyhow::bail!("file:// URLs are not allowed in browser automation");
+        }
+
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            anyhow::bail!("Only http:// and https:// URLs are allowed");
+        }
+
+        Ok(())
+    }
+
+    /// Run an agent-browser command and parse the JSON response.
+    async fn run_command(
+        &self,
+        args: &[&str],
+        tab: Option<&str>,
+    ) -> anyhow::Result<AgentBrowserResponse> {
+        let mut cmd = Command::new(agent_browser_bin());
+        ensure_browser_env(&mut cmd);
+        cmd.args(args);
+        cmd.arg("--json");
+        if let Some(tab) = tab {
+            cmd.args(["--session", tab]);
+        }
+
+        debug!("agent-browser args: {:?}", cmd.as_std().get_args());
+
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("Failed to execute agent-browser CLI")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // agent-browser returns exit code 1 even when it outputs valid JSON
+        // with a structured error message. Try to parse the JSON first to
+        // get a meaningful error, fall back to stderr-only bail otherwise.
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let error_msg = match serde_json::from_str::<AgentBrowserResponse>(&stdout) {
+                Ok(resp) => resp.error.unwrap_or_default(),
+                Err(_) => stderr.trim().to_string(),
+            };
+            let error_msg = if error_msg.is_empty() {
+                format!("agent-browser exited with code {}", output.status)
+            } else {
+                enhance_browser_error(error_msg)
+            };
+            anyhow::bail!("agent-browser error: {error_msg}");
+        }
+
+        let response: AgentBrowserResponse =
+            serde_json::from_str(&stdout).context("Failed to parse agent-browser JSON response")?;
+
+        if !response.success {
+            let err = response.error.as_deref().unwrap_or("unknown error");
+            let enhanced = enhance_browser_error(err.to_string());
+            anyhow::bail!("agent-browser error: {enhanced}");
+        }
+
+        Ok(response)
+    }
+
+    /// Agent-browser supports multiple subcommand styles — this builds the correct
+    /// argument list for each action.
+    fn build_args(action: &BrowserAction) -> anyhow::Result<Vec<String>> {
+        match action {
+            BrowserAction::Open { url } => {
+                Self::validate_url(url)?;
+                Ok(vec!["open".into(), url.clone()])
+            }
+            BrowserAction::Snapshot {
+                interactive_only,
+                compact,
+                depth,
+            } => {
+                let mut args = vec!["snapshot".into()];
+                if *interactive_only {
+                    args.push("-i".into());
+                }
+                if *compact {
+                    args.push("-c".into());
+                }
+                if let Some(d) = depth {
+                    args.push("-d".into());
+                    args.push(d.to_string());
+                }
+                Ok(args)
+            }
+            BrowserAction::Click { selector } => Ok(vec!["click".into(), selector.clone()]),
+            BrowserAction::GetText { selector } => {
+                Ok(vec!["get".into(), "text".into(), selector.clone()])
+            }
+            BrowserAction::GetInnerText { selector } => {
+                Ok(vec!["get".into(), "innertext".into(), selector.clone()])
+            }
+            BrowserAction::GetUrl { .. } => Ok(vec!["get".into(), "url".into()]),
+            BrowserAction::Press { key } => Ok(vec!["press".into(), key.clone()]),
+            BrowserAction::Eval { js } => Ok(vec!["eval".into(), js.clone()]),
+            BrowserAction::Find {
+                by,
+                value,
+                action,
+                text,
+                name,
+                exact,
+                index,
+            } => {
+                let mut args = vec!["find".into(), by.clone()];
+                if by == "nth" {
+                    let idx = index.map_or_else(|| "0".into(), |i| i.to_string());
+                    args.push(idx);
+                    args.push(value.clone());
+                } else {
+                    args.push(value.clone());
+                }
+                args.push(action.clone());
+                if let Some(t) = text {
+                    args.push(t.clone());
+                }
+                if let Some(n) = name {
+                    args.push("--name".into());
+                    args.push(n.clone());
+                }
+                if *exact == Some(true) {
+                    args.push("--exact".into());
+                }
+                Ok(args)
+            }
+        }
+    }
+}
+
+/// Close all running agent-browser sessions at shutdown. The agent-browser
+/// child process (agent-browser.js via Node) does NOT get reaped on process
+/// exit — its sessions hold open ports and lingering Node instances that can
+/// interfere with the next daemon startup.
+pub async fn close_all_browser_sessions() {
+    let cmd = agent_browser_bin();
+
+    // List active sessions
+    let list_output = match Command::new(cmd)
+        .args(["session", "list", "--json"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!("agent-browser not available, skipping browser cleanup: {e}");
+            return;
+        }
+    };
+
+    let sessions: Vec<String> =
+        match serde_json::from_slice::<AgentBrowserResponse>(&list_output.stdout) {
+            Ok(resp) if resp.success => resp
+                .data
+                .and_then(|d| d.get("sessions")?.as_array().cloned())
+                .map(|arr| {
+                    arr.into_iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Ok(resp) => {
+                tracing::warn!(
+                    "agent-browser session list failed: {}",
+                    resp.error.as_deref().unwrap_or("unknown error")
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("failed to parse agent-browser session list output: {e}");
+                return;
+            }
+        };
+
+    if sessions.is_empty() {
+        tracing::debug!("No open agent-browser sessions to close");
+        return;
+    }
+
+    let close_futures: Vec<_> = sessions
+        .iter()
+        .map(|session_id| {
+            // session_id is &String, cmd is &'static str (Copy)
+            async move {
+                match Command::new(cmd)
+                    .args(["--session", session_id, "close"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                {
+                    Ok(status) if status.success() => {
+                        tracing::debug!("Closed agent-browser session: {session_id}");
+                    }
+                    Ok(status) => {
+                        tracing::warn!(
+                            "agent-browser close session '{session_id}' exited with status: {status}"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to close agent-browser session '{session_id}': {e}");
+                    }
+                }
+            }
+        })
+        .collect();
+
+    join_all(close_futures).await;
+}
+
+/// Build a single action schema entry for the oneOf array.
+///
+/// Constructs the wrapping JSON structure for a browser action entry.
+/// When `required` is non-empty, an inner `"required"` key is included;
+/// otherwise (as with `snapshot` and `get_url`) it is omitted.
+fn action_schema(name: &str, description: &str, required: &[&str], properties: Value) -> Value {
+    let mut inner = serde_json::Map::new();
+    inner.insert("type".into(), json!("object"));
+    inner.insert("properties".into(), properties);
+    if !required.is_empty() {
+        inner.insert("required".into(), json!(required));
+    }
+    inner.insert("additionalProperties".into(), json!(false));
+
+    json!({
+        "type": "object",
+        "properties": {
+            (name): json!(inner)
+        },
+        "required": [name],
+        "additionalProperties": false,
+        "description": description
+    })
+}
+
+#[async_trait]
+impl Tool for BrowserTool {
+    fn name(&self) -> &'static str {
+        "browser"
+    }
+
+    fn debug_output(
+        &self,
+        phase: ToolOutputPhase,
+        args: &serde_json::Value,
+        outcome: Option<&crate::tools::ToolExecutionOutcome>,
+    ) -> Option<String> {
+        let tab = args.get("tab").and_then(|v| v.as_str()).unwrap_or("?");
+        match phase {
+            ToolOutputPhase::Before => {
+                let action = args.get("action").and_then(|a| a.as_object());
+                let action_name = action
+                    .and_then(|m| m.keys().next())
+                    .map_or("?", String::as_str);
+                // Collect non-empty inner params for the action
+                let extra = action
+                    .and_then(|m| m.values().next())
+                    .and_then(|inner| inner.as_object())
+                    .map(|params| {
+                        let parts: Vec<String> = params
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                let s = match v {
+                                    Value::String(s) if !s.is_empty() => s.clone(),
+                                    Value::Bool(b) => b.to_string(),
+                                    Value::Number(n) => n.to_string(),
+                                    _ => return None,
+                                };
+                                Some(format!("{k}: {s}"))
+                            })
+                            .collect();
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", parts.join(" "))
+                        }
+                    })
+                    .unwrap_or_default();
+                Some(format!("🌐 ({tab}) {action_name}{extra}"))
+            }
+            ToolOutputPhase::After => {
+                let outcome = outcome?;
+                if outcome.success {
+                    None
+                } else {
+                    let output = outcome.output.trim();
+                    let err = if output.is_empty() {
+                        "unknown error"
+                    } else {
+                        output
+                    };
+                    Some(format!("❌ ({tab}) {err}"))
+                }
+            }
+        }
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "oneOf": [
+                        action_schema("open", "Navigate to a URL (returns page content automatically)", &["url"], json!({
+                            "url": {
+                                "type": "string",
+                                "description": "URL to navigate to"
+                            }
+                        })),
+                        action_schema("snapshot", "Get accessibility snapshot with element refs (@e1, @e2, ...)", &[], json!({
+                            "interactive_only": {
+                                "type": "boolean",
+                                "description": "Only show interactive elements (buttons, links, inputs)"
+                            },
+                            "compact": {
+                                "type": "boolean",
+                                "description": "Remove empty structural elements. Default: true"
+                            },
+                            "depth": {
+                                "type": "integer",
+                                "description": "Limit tree depth"
+                            }
+                        })),
+                        action_schema("click", "Click an element by ref or CSS selector", &["selector"], json!({
+                            "selector": {
+                                "type": "string",
+                                "description": "Element ref (@e1) or CSS selector to click. Refs come from the most recent snapshot on this tab — they become stale after any navigation or re-snapshot"
+                            }
+                        })),
+                        action_schema("get_text", "Get text content of an element (uses DOM textContent — includes script/style content)", &["selector"], json!({
+                            "selector": {
+                                "type": "string",
+                                "description": "Element ref (@e1) or CSS selector. Refs come from the most recent snapshot — always snapshot before calling get_text with a ref"
+                            }
+                        })),
+                        action_schema("get_innertext", "Get visible rendered text of an element (uses innerText — no script/style content)", &["selector"], json!({
+                            "selector": {
+                                "type": "string",
+                                "description": "Element ref (@e1) or CSS selector. Uses innerText() — returns only visible rendered text, no script/style content"
+                            }
+                        })),
+                        action_schema("get_url", "Get current URL", &[], json!({})),
+                        action_schema("press", "Press a keyboard key at the current focus (e.g. Enter to submit forms)", &["key"], json!({
+                            "key": {
+                                "type": "string",
+                                "description": "Key to press (e.g. Enter, Tab, Escape, Control+a, ArrowDown)"
+                            }
+                        })),
+                        action_schema("eval", "Run JavaScript in the page context. Use to inspect element attributes, check state, or debug.", &["js"], json!({
+                            "js": {
+                                "type": "string",
+                                "description": "JavaScript to run in the page context"
+                            }
+                        })),
+                        action_schema("find", "Find an element by semantic locator and perform an action", &["by", "value", "action"], json!({
+                            "by": {
+        "type": "string",
+                "description": "Locator type: text (case-sensitive visible text match, second most reliable for buttons/links/headings), role (accessibility tree role, use 'name' field to filter — but name filter can fail even when snapshot shows a match; fall back to 'text' or 'first' if it fails), label (matches <label for='...'> only), placeholder (EXACT match of HTML placeholder attribute — not accessible name shown in snapshot), alt, title (exact HTML title attribute), testid, first (CSS selector — MOST reliable for any element type), last (CSS selector), nth (CSS selector + index). For text inputs: prefer `by: \"first\"` with CSS selector (e.g. `\"input\"`, `\"textarea\"`) — role-based textbox locators are unreliable."
+                            },
+                            "value": {
+        "type": "string",
+                "description": "Locator match target. For 'text': substring to search for (case-sensitive); for 'placeholder': exact HTML placeholder attribute value (NOT what snapshot shows — check with eval); for 'role': role name ('button', 'link', 'textbox', 'heading'); for 'label': visible <label> text; for 'first'/'last'/'nth': CSS selector (e.g. 'input', 'button', 'form')"
+                            },
+                            "action": {
+        "type": "string",
+                "description": "Action to perform: click (click element), fill (clear field then type), type (append text without clearing), hover (hover over element), focus (focus element). For filling text into inputs, use 'fill' with the 'text' parameter. For typing without clearing first, use 'type'. Press Enter after filling to submit forms."
+                            },
+                            "text": {
+                                "type": "string",
+                                                                                                "description": "Text to fill/type into the element (for action 'fill' or 'type')"
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "Accessible name filter (for role-based finding, e.g. 'Submit'). Note: this filter can fail even when the snapshot shows a matching element. When it fails, retry with `by: \"text\"` or `by: \"first\"` with a CSS selector."
+                            },
+                            "exact": {
+                                "type": "boolean",
+                                "description": "Require exact text match"
+                            },
+                            "index": {
+                                "type": "integer",
+                                "description": "Zero-based index for `by: \"nth\"`. Required when by is 'nth'."
+                            }
+                        }))
+                    ]
+                },
+                "tab": {
+                    "type": "string",
+                    "description": "Logical name for this browser session. \
+                     Use \"default\" for most browsing. Only use a different \
+                     name (e.g. \"docs\", \"github\") if you need to keep \
+                     multiple pages open simultaneously. Same tab = serialized \
+                     operations on that page."
+                }
+            },
+            "required": ["action", "tab"]
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
+        let tab = super::get_opt_str(&args, "tab")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing or empty 'tab' field in browser arguments — specify which browser \
+                 session to use (e.g. \"main\", \"docs\"). Each tab is an isolated session."
+                )
+            })?;
+
+        let action_value = args
+            .get("action")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'action' field in browser arguments"))?;
+        let action: BrowserAction =
+            serde_json::from_value(action_value.clone()).map_err(|e| {
+                // Give a more helpful message when the LLM uses wrong field names.
+                let hint = match &action_value {
+                    Value::Object(map) if map.contains_key("find") => {
+                        " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus (use 'text' param for the text to type/fill)".to_string()
+                    }
+                    _ => String::new(),
+                };
+                anyhow::anyhow!("Invalid browser action arguments{hint}: {e}")
+            })?;
+
+        debug!(tab, action = ?action, "browser action");
+
+        if !Self::is_available().await {
+            anyhow::bail!(
+                "agent-browser CLI is not available. Install with: npm install -g agent-browser"
+            );
+        }
+
+        // Validate find locator type early for better diagnostics.
+        if let BrowserAction::Find {
+            by,
+            action: find_action,
+            index,
+            ..
+        } = &action
+        {
+            let valid = [
+                "role",
+                "text",
+                "label",
+                "placeholder",
+                "alt",
+                "title",
+                "testid",
+                "first",
+                "last",
+                "nth",
+            ];
+            if !valid.contains(&by.as_str()) {
+                anyhow::bail!(
+                    "Invalid 'find' locator type '{by}'. Must be one of: {}",
+                    valid.join(", ")
+                );
+            }
+            let valid_actions = [
+                "click", "hover", "focus", "fill", "type", "check", "uncheck", "text",
+            ];
+            if !valid_actions.contains(&find_action.as_str()) {
+                anyhow::bail!(
+                    "Invalid 'find' action '{find_action}'. Must be one of: {}",
+                    valid_actions.join(", ")
+                );
+            }
+            if by == "nth" && index.is_none() {
+                anyhow::bail!(
+                    "'index' is required when 'by' is \"nth\". \
+                     Provide the zero-based index of the element to select."
+                );
+            }
+        }
+
+        let cli_args = Self::build_args(&action)?;
+        let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
+
+        // Get or create a per-tab lock — only serializes operations on the
+        // same tab. Different tabs run fully concurrently.
+        let _guard = self.acquire_tab_lock(tab).await;
+        let response = self.run_command(&str_args, Some(tab)).await?;
+
+        // After open, wait for network idle, then auto-snapshot
+        // so the LLM sees page content immediately.
+        let snapshot_output = if matches!(action, BrowserAction::Open { .. }) {
+            let wait_args = ["wait", "--load", "networkidle"];
+            let _ = self.run_command(&wait_args, Some(tab)).await;
+
+            // Run a compact snapshot to return page content.
+            match self.run_command(&["snapshot", "-c"], Some(tab)).await {
+                Ok(snap_resp) => snap_resp
+                    .data
+                    .as_ref()
+                    .and_then(extract_snapshot_text)
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        let output = match response.data {
+            Some(data) => {
+                // Format the response nicely based on the action.
+                match &action {
+                    BrowserAction::Snapshot { .. }
+                    | BrowserAction::GetText { .. }
+                    | BrowserAction::GetInnerText { .. } => extract_snapshot_text(&data)
+                        .or_else(|| serde_json::to_string_pretty(&data).ok())
+                        .unwrap_or_default(),
+                    BrowserAction::Open { .. } => {
+                        let mut s = format!(
+                            "Opened {}",
+                            data.get("url").and_then(|v| v.as_str()).unwrap_or("?")
+                        );
+                        if !snapshot_output.is_empty() {
+                            use std::fmt::Write;
+                            let _ = write!(s, "\n\n--- Page content ---\n{snapshot_output}");
+                        }
+                        s
+                    }
+                    BrowserAction::GetUrl { .. } => data
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
+                }
+            }
+            None => String::new(),
+        };
+
+        let output = if output.is_empty() {
+            format!("[Tab: {tab}] (no output)")
+        } else {
+            format!("[Tab: {tab}] {output}")
+        };
+
+        Ok(output)
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+/// Get the platform-appropriate agent-browser binary name.
+fn agent_browser_bin() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "agent-browser.cmd"
+    } else {
+        "agent-browser"
+    }
+}
+
+/// Set HOME, `CHROMIUM_FLAGS`, and default timeout env vars on the command
+/// so that the Chromium spawned by agent-browser works in service/docker
+/// environments.
+fn ensure_browser_env(cmd: &mut Command) {
+    if std::env::var_os("HOME").is_none() {
+        cmd.env("HOME", "/tmp");
+    }
+    // Suppress Chromium's "--enable-crashes-dialog" and GPU-related flags
+    // that cause issues in headless/service environments.
+    if std::env::var_os("CHROMIUM_FLAGS").is_none() {
+        cmd.env(
+            "CHROMIUM_FLAGS",
+            "--no-first-run --no-default-browser-check --disable-gpu",
+        );
+    }
+    // Default 15-second timeout for all agent-browser actions (including
+    // `wait --text` which would otherwise block much longer).
+    cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", "15000");
+    // 5-minute idle timeout — the agent-browser daemon shuts down after
+    // 5 minutes of inactivity, cleaning up browser resources.
+    cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
+}
+
+/// Enhance agent-browser error messages with actionable hints for known
+/// failure patterns.
+fn enhance_browser_error(msg: String) -> String {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("unknown ref")
+        || lower.contains("node with given id does not belong to the document")
+    {
+        format!(
+            "{msg}. Hint: refs become stale after any navigation or DOM change. \
+             Take a fresh snapshot before using refs again."
+        )
+    } else {
+        msg
+    }
+}
+
+/// Extract textual content from an agent-browser snapshot response `data` field.
+///
+/// agent-browser can return the snapshot as:
+/// - A plain string (via `snapshot -c`)
+/// - An object with a `content` field (via `get_text`)
+/// - An object with `origin`, `refs`, and `snapshot` fields (via `open` auto-snapshot)
+///
+/// Returns `None` if none of these shapes match.
+fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> {
+    data.as_str()
+        .map(String::from)
+        .or_else(|| {
+            data.get("content")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .or_else(|| {
+            data.get("snapshot")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_validation_rejects_bad_urls() {
+        for url in &["", "file:///etc/passwd", "ftp://example.com"] {
+            assert!(
+                BrowserTool::validate_url(url).is_err(),
+                "expected reject for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_validation_accepts_all_domains() {
+        assert!(BrowserTool::validate_url("https://example.com").is_ok());
+        assert!(BrowserTool::validate_url("https://docs.example.com").is_ok());
+        assert!(BrowserTool::validate_url("https://other.com").is_ok());
+    }
+
+    #[test]
+    fn build_args_for_open_validates_url() {
+        let action = BrowserAction::Open {
+            url: "https://example.com".into(),
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["open", "https://example.com"]);
+    }
+
+    #[test]
+    fn build_args_for_snapshot() {
+        let action = BrowserAction::Snapshot {
+            interactive_only: true,
+            compact: true,
+            depth: Some(5),
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["snapshot", "-i", "-c", "-d", "5"]);
+    }
+
+    #[test]
+    fn build_args_for_click() {
+        let action = BrowserAction::Click {
+            selector: "@e1".into(),
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["click", "@e1"]);
+    }
+
+    #[test]
+    fn build_args_for_get_text() {
+        let action = BrowserAction::GetText {
+            selector: "@e3".into(),
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["get", "text", "@e3"]);
+    }
+
+    #[test]
+    fn build_args_for_get_innertext() {
+        let action = BrowserAction::GetInnerText {
+            selector: "body".into(),
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["get", "innertext", "body"]);
+    }
+
+    #[test]
+    fn build_args_for_get_url() {
+        let args = BrowserTool::build_args(&BrowserAction::GetUrl {}).unwrap();
+        assert_eq!(args, ["get", "url"]);
+    }
+
+    #[test]
+    fn build_args_for_find_by_text() {
+        let action = BrowserAction::Find {
+            by: "text".into(),
+            value: "Sign In".into(),
+            action: "click".into(),
+            text: None,
+            name: None,
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "text", "Sign In", "click"]);
+    }
+
+    #[test]
+    fn build_args_for_find_by_text_with_typing() {
+        let action = BrowserAction::Find {
+            by: "text".into(),
+            value: "Search".into(),
+            action: "fill".into(),
+            text: Some("tokio".into()),
+            name: None,
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "text", "Search", "fill", "tokio"]);
+    }
+
+    #[test]
+    fn build_args_for_find_by_first() {
+        let action = BrowserAction::Find {
+            by: "first".into(),
+            value: "a".into(),
+            action: "fill".into(),
+            text: None,
+            name: None,
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "first", "a", "fill"]);
+    }
+
+    #[test]
+    fn build_args_for_find_by_nth() {
+        let action = BrowserAction::Find {
+            by: "nth".into(),
+            value: ".card".into(),
+            action: "hover".into(),
+            text: None,
+            name: None,
+            exact: None,
+            index: Some(2),
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "nth", "2", ".card", "hover"]);
+    }
+
+    #[test]
+    fn build_args_for_find_by_nth_defaults_index_to_zero() {
+        let action = BrowserAction::Find {
+            by: "nth".into(),
+            value: "a".into(),
+            action: "click".into(),
+            text: None,
+            name: None,
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "nth", "0", "a", "click"]);
+    }
+
+    #[test]
+    fn build_args_for_find_with_name_and_exact() {
+        let action = BrowserAction::Find {
+            by: "role".into(),
+            value: "button".into(),
+            action: "click".into(),
+            text: None,
+            name: Some("Submit".into()),
+            exact: Some(true),
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(
+            args,
+            [
+                "find", "role", "button", "click", "--name", "Submit", "--exact"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_args_for_find_with_name_only() {
+        let action = BrowserAction::Find {
+            by: "role".into(),
+            value: "link".into(),
+            action: "click".into(),
+            text: None,
+            name: Some("Docs.rs".into()),
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "role", "link", "click", "--name", "Docs.rs"]);
+    }
+
+    #[test]
+    fn tool_name_and_description_are_set() {
+        let tool = BrowserTool::default();
+        assert_eq!(tool.name(), "browser");
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn parameters_schema_is_valid_json() {
+        let tool = BrowserTool::default();
+        let schema = tool.parameters_schema();
+        assert!(schema.is_object());
+        assert!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("action"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn parameters_schema_has_all_actions() {
+        let tool = BrowserTool::default();
+        let schema = tool.parameters_schema();
+        let action_schemas = schema["properties"]["action"]["oneOf"]
+            .as_array()
+            .expect("oneOf should be an array");
+
+        // There are exactly 9 browser actions.
+        assert_eq!(
+            action_schemas.len(),
+            9,
+            "expected 9 actions, got {}",
+            action_schemas.len()
+        );
+
+        let action_names: Vec<&str> = action_schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("properties")
+                    .and_then(|p| p.as_object())
+                    .and_then(|props| props.keys().next())
+                    .map(String::as_str)
+            })
+            .collect();
+
+        for expected in &[
+            "open",
+            "snapshot",
+            "click",
+            "get_text",
+            "get_innertext",
+            "get_url",
+            "press",
+            "eval",
+            "find",
+        ] {
+            assert!(
+                action_names.contains(expected),
+                "schema missing action: {expected}"
+            );
+        }
+
+        // Structural invariants: snapshot and get_url must lack inner "required";
+        // all other actions must have it.
+        for s in action_schemas {
+            let inner = s
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .and_then(|props| props.values().next())
+                .and_then(|v| v.as_object());
+            let name = s
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .and_then(|props| props.keys().next())
+                .map_or("?", String::as_str);
+
+            let has_inner_required = inner.is_some_and(|obj| obj.contains_key("required"));
+            if name == "snapshot" || name == "get_url" {
+                assert!(
+                    !has_inner_required,
+                    "{name} should NOT have inner 'required'"
+                );
+            } else {
+                assert!(has_inner_required, "{name} should have inner 'required'");
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_home_when_missing() {
+        let original_home = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+
+        let mut cmd = Command::new("true");
+        ensure_browser_env(&mut cmd);
+        // Function completes without panic.
+
+        if let Some(home) = original_home {
+            unsafe { std::env::set_var("HOME", home) };
+        }
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_chromium_flags() {
+        let original = std::env::var_os("CHROMIUM_FLAGS");
+        unsafe { std::env::remove_var("CHROMIUM_FLAGS") };
+
+        let mut cmd = Command::new("true");
+        ensure_browser_env(&mut cmd);
+
+        if let Some(val) = original {
+            unsafe { std::env::set_var("CHROMIUM_FLAGS", val) };
+        }
+    }
+
+    #[test]
+    fn ensure_browser_env_sets_idle_timeout() {
+        let mut cmd = Command::new("true");
+        ensure_browser_env(&mut cmd);
+        // Function completes without panic.
+    }
+
+    #[test]
+    fn agent_browser_bin_name_is_correct() {
+        let name = agent_browser_bin();
+        if cfg!(target_os = "windows") {
+            assert_eq!(name, "agent-browser.cmd");
+        } else {
+            assert_eq!(name, "agent-browser");
+        }
+    }
+}

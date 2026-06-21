@@ -1,0 +1,6722 @@
+//! Code editor dashboard page — tabbed code editor with file tree, syntax-aware
+//! editing, and workspace-backed tab persistence.
+//!
+//! Layout: split view of file tree (left, 25%) and tabbed editor (right, 75%).
+//! Workspace selection is handled by the Home page picker. Tabs persist
+//! to the workspace database and are restored on workspace selection.
+//! Key bindings: Ctrl+S/Cmd+S to save, Tab/Shift+Tab for indent/outdent,
+//! Ctrl+B for tree focus toggle.
+//!
+//! Tree keyboard navigation: when tree is focused, Arrow Up/Down navigate
+//! entries, Enter opens files or expands directories, Escape exits focus.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use std::time::SystemTime;
+
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::{
+    Alignment, Element, Length, Subscription, Task,
+    keyboard::{self},
+    widget::Id,
+};
+
+use iced_fonts::lucide;
+
+use fff_search::grep::{GrepMode, GrepSearchOptions};
+use fff_search::parse_grep_query;
+
+use super::context_menu::ContextMenu;
+
+use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unescape_c_style};
+use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
+
+use super::editor_widget::EditorBuffer;
+use super::highlight::HighlightLanguage;
+use super::theme;
+use super::widgets::{self, FileTree};
+
+// ── Constants ─────────────────────────────────────────────────────
+
+/// Estimated width per tab in the tab bar for programmatic scrolling.
+const ESTIMATED_TAB_WIDTH: f32 = 140.0;
+
+/// Tick interval (keeps consistency with other dashboard pages).
+const TICK_INTERVAL_SECS: u64 = 5;
+
+/// Interval for re-reading expanded directory entries from disk.
+const DIR_REFRESH_INTERVAL_SECS: u64 = 30;
+
+/// Base font size for the editor.
+const EDITOR_FONT_SIZE: f32 = 13.0;
+
+/// Widget IDs for find/replace text inputs (used for auto-focus).
+const FIND_SEARCH_ID: &str = "find_search_input";
+const FIND_REPLACE_ID: &str = "find_replace_input";
+
+/// Widget ID for the global search input.
+const GLOBAL_SEARCH_INPUT_ID: &str = "global_search_input";
+
+/// Maximum number of global search results to display.
+const MAX_GLOBAL_SEARCH_RESULTS: usize = 200;
+
+/// Maximum matches per file for global search — spread results across files.
+const GLOBAL_SEARCH_MATCHES_PER_FILE: usize = 20;
+
+/// Debounce delay for global search query input (milliseconds).
+const GLOBAL_SEARCH_DEBOUNCE_MS: u64 = 300;
+
+/// Check whether a file name is an OS-generated metadata file that should
+/// be hidden from the file tree.
+#[must_use]
+fn is_os_file(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower == ".ds_store" || lower == "thumbs.db" || lower == "desktop.ini"
+}
+
+// ── Types ─────────────────────────────────────────────────────────
+
+/// File-system entry for the directory tree.
+#[derive(Debug, Clone)]
+pub struct FsEntry {
+    pub name: String,
+    /// Path relative to the workspace root.
+    pub full_path: String,
+    pub is_dir: bool,
+    /// Error message if this entry couldn't be properly inspected
+    /// (broken symlink, permission denied, etc.).
+    pub error: Option<String>,
+}
+
+/// Git file status for coloring the file tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitFileStatus {
+    /// File has uncommitted modifications (M in porcelain output).
+    Modified,
+    /// File is untracked (?? in porcelain output) or newly added (A).
+    Added,
+}
+
+/// Line ending convention detected for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    #[must_use]
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+}
+
+/// A single editor tab (metadata, no content).
+#[derive(Debug, Clone)]
+struct Tab {
+    /// Full filesystem path to the file.
+    path: String,
+    /// Display name (file name component only).
+    file_name: String,
+    /// Whether the file has unsaved changes.
+    is_dirty: bool,
+    /// Whether the file ends with a newline.
+    has_trailing_newline: bool,
+    /// Detected line ending convention.
+    line_ending: LineEnding,
+}
+
+/// Content data for a tab, keyed by full path.
+struct TabData {
+    content: super::editor_widget::EditorBuffer,
+    /// Undo/redo stack for this tab.
+    undo_stack: RefCell<UndoStack>,
+    /// Find/replace state (None when bar is hidden).
+    find_replace_state: Option<FindReplaceState>,
+    /// Hash of the last saved (or loaded) text. Used by undo/redo to
+    /// detect when the editor returns to the saved state.
+    saved_text_hash: u64,
+}
+
+/// Fast non-crypto hash of a string for dirty-state comparison.
+fn hash_text(text: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(text.as_bytes());
+    h.finish()
+}
+
+// ── Undo/Redo ──────────────────────────────────────────────────────
+
+/// Snapshot-based undo/redo stack. Stores full-content snapshots
+/// with cursor positions. Bounded to [`MAX_UNDO_DEPTH`] entries.
+#[derive(Debug, Clone)]
+struct UndoStack {
+    /// Previous states, newest last.
+    undo: Vec<UndoSnapshot>,
+    /// Undone states, cleared on new edit.
+    redo: Vec<UndoSnapshot>,
+    /// Prevents snapping during composite operations (auto-close pairs).
+    batch_depth: usize,
+}
+
+/// A single undo snapshot.
+#[derive(Debug, Clone)]
+struct UndoSnapshot {
+    text: String,
+    cursor_line: usize,
+    cursor_col: usize,
+}
+
+/// Maximum undo/redo entries per tab. Reduced for large files.
+const MAX_UNDO_DEPTH: usize = 100;
+/// Threshold (bytes) above which max undo depth is halved.
+const LARGE_FILE_UNDO_THRESHOLD: usize = 100_000;
+
+impl UndoStack {
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            batch_depth: 0,
+        }
+    }
+
+    /// Take a snapshot before an edit is performed.
+    fn snap_before_edit(&mut self, content: &super::editor_widget::EditorBuffer) {
+        if self.batch_depth > 0 {
+            return;
+        }
+        let text = content.text();
+        let cursor = content.cursor();
+        let max_depth = if text.len() > LARGE_FILE_UNDO_THRESHOLD {
+            MAX_UNDO_DEPTH / 2
+        } else {
+            MAX_UNDO_DEPTH
+        };
+        self.redo.clear();
+        self.undo.push(UndoSnapshot {
+            text,
+            cursor_line: cursor.line,
+            cursor_col: cursor.column,
+        });
+        if self.undo.len() > max_depth {
+            self.undo.remove(0);
+        }
+    }
+
+    #[must_use]
+    fn undo(&mut self, content: &super::editor_widget::EditorBuffer) -> Option<UndoSnapshot> {
+        if self.batch_depth > 0 {
+            return None;
+        }
+        // Save current state to redo before undoing.
+        let cursor = content.cursor();
+        self.redo.push(UndoSnapshot {
+            text: content.text(),
+            cursor_line: cursor.line,
+            cursor_col: cursor.column,
+        });
+        self.undo.pop()
+    }
+
+    #[must_use]
+    fn redo(&mut self, content: &super::editor_widget::EditorBuffer) -> Option<UndoSnapshot> {
+        if self.batch_depth > 0 {
+            return None;
+        }
+        // Save current state to undo before redoing.
+        let cursor = content.cursor();
+        self.undo.push(UndoSnapshot {
+            text: content.text(),
+            cursor_line: cursor.line,
+            cursor_col: cursor.column,
+        });
+        self.redo.pop()
+    }
+}
+
+// ── Find/Replace ───────────────────────────────────────────────────
+
+/// State for the find/replace search bar.
+#[derive(Debug, Clone)]
+struct FindReplaceState {
+    /// Current search query string.
+    query: String,
+    /// Replace-with string.
+    replace: String,
+    /// Byte ranges of all matches in the file.
+    matches: Vec<std::ops::Range<usize>>,
+    /// Index of the currently focused match.
+    current_match_idx: usize,
+    /// Whether matching is case-sensitive (default: false).
+    case_sensitive: bool,
+}
+
+// ── Global Search ──────────────────────────────────────────────────
+
+/// Status of the global (find-in-files) search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlobalSearchStatus {
+    /// Search panel is open but no query entered yet.
+    Idle,
+    /// Search is in progress.
+    Searching,
+    /// Search completed with results.
+    Done,
+    /// Search completed with no results.
+    NoResults,
+    /// Search encountered an error.
+    Error(String),
+}
+
+/// Owned representation of a single grep match, extracted from
+/// `fff_search::GrepResult` so it can cross async boundaries.
+#[derive(Debug, Clone)]
+pub(super) struct OwnedGrepMatch {
+    /// Absolute filesystem path to the matched file.
+    abs_path: String,
+    /// Relative path (for display).
+    rel_path: String,
+    /// 1-based line number.
+    line_number: u64,
+    /// Content of the matching line.
+    line_content: String,
+    /// Byte offsets of the matched portion within `line_content`,
+    /// as `(start, end)` pairs (for highlighting).
+    match_byte_offsets: Vec<(u32, u32)>,
+}
+
+/// State for the global search (Cmd+Shift+F) panel.
+#[derive(Debug, Clone)]
+struct GlobalSearchState {
+    /// Current query text in the search input.
+    query: String,
+    /// Search results (empty when no search has been performed).
+    results: Vec<OwnedGrepMatch>,
+    /// Index of the currently selected result in the list.
+    selected_index: usize,
+    /// Current search status.
+    status: GlobalSearchStatus,
+    /// Generation counter for stale-result prevention.
+    search_gen: u64,
+}
+
+use std::ops::Range;
+
+/// Compute byte-range matches of `query` in `text`. Returns empty
+/// when query is shorter than 2 characters.
+///
+/// When `case_sensitive` is `false`, matching uses ASCII-only case
+/// folding via [`str::to_ascii_lowercase`] — this is length-preserving
+/// so returned byte ranges are valid for the original `text`.
+/// Non-ASCII queries are matched literally in case-insensitive mode
+/// (standard editor convention).
+#[must_use]
+fn compute_text_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Range<usize>> {
+    if query.len() < 2 {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+
+    if case_sensitive {
+        let mut offset = 0;
+        while let Some(pos) = text[offset..].find(query) {
+            let abs_start = offset + pos;
+            let abs_end = abs_start + query.len();
+            matches.push(abs_start..abs_end);
+            offset = abs_end;
+        }
+    } else {
+        // Case-insensitive: lowercase both strings (ASCII-only, length-preserving).
+        let text_lower = text.to_ascii_lowercase();
+        let query_lower = query.to_ascii_lowercase();
+        let mut offset = 0;
+        while let Some(pos) = text_lower[offset..].find(&query_lower) {
+            let abs_start = offset + pos;
+            let abs_end = abs_start + query.len();
+            matches.push(abs_start..abs_end);
+            offset = abs_end;
+        }
+    }
+
+    matches
+}
+
+/// Direction for navigating between find matches.
+enum FindDirection {
+    Next,
+    Prev,
+}
+
+/// Data returned from the async file load operation.
+#[derive(Debug, Clone)]
+pub struct FileLoadData {
+    path: String,
+    text: String,
+    has_trailing_newline: bool,
+    line_ending: LineEnding,
+}
+
+/// What to do with a dirty tab when closing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// Raw data loaded from a saved tab entry (string content, not Content).
+#[derive(Debug, Clone)]
+pub struct SavedTabData {
+    file_path: String,
+    text: String,
+    was_dirty: bool,
+    has_trailing_newline: bool,
+    line_ending: LineEnding,
+    /// Whether this tab was the active one when saved.
+    is_active: bool,
+}
+
+// ── Messages ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum EditorMessage {
+    /// Workspace selected via the Home page picker (name, filesystem path).
+    WorkspaceSelected(String, String),
+    /// A directory's listing was loaded from the filesystem.
+    DirExpanded {
+        dir_path: String,
+        r#gen: u64,
+        entries: Result<Vec<FsEntry>, String>,
+        /// When `true`, errors are silently logged instead of shown as a toast.
+        /// Used by background (periodic/manual) refresh to avoid noise.
+        quiet: bool,
+    },
+    /// User toggled a directory in the file tree.
+    ToggleDir(String),
+    /// User selected a file in the file tree.
+    SelectFile(String),
+    /// Ctrl+B toggled tree keyboard focus on/off.
+    TreeFocusToggled,
+    /// Arrow Up in tree keyboard navigation.
+    TreeNavUp,
+    /// Arrow Down in tree keyboard navigation.
+    TreeNavDown,
+    /// Enter key in tree navigation — open file or expand directory.
+    TreeNavEnter,
+    /// Arrow Left in tree navigation — collapse directory or go to parent.
+    TreeNavLeft,
+    /// Arrow Right in tree navigation — expand directory or go to first child.
+    TreeNavRight,
+    /// Escape key — dismiss find bar, go-to-line, quick open, tree focus, or close dialog.
+    Escape,
+    /// A file's contents were loaded from disk.
+    FileLoaded {
+        path: String,
+        r#gen: u64,
+        result: Result<FileLoadData, String>,
+    },
+    /// Saved tabs were loaded from the database with file contents.
+    SavedTabsLoaded {
+        tabs_data: Vec<SavedTabData>,
+        r#gen: u64,
+    },
+    /// User selected an existing tab.
+    TabSelected(usize),
+    /// User closed a tab.
+    TabClosed(usize),
+    /// User performed an editing action in the text editor.
+    EditorAction(super::editor_widget::EditorAction),
+    /// User requested to save the active tab.
+    SaveActiveTab,
+    /// Result of a save operation.
+    SaveResult {
+        path: String,
+        result: Result<(), String>,
+        /// Hash of the content that was written to disk, so we can
+        /// update `TabData::saved_text_hash` for undo/redo comparison.
+        saved_hash: u64,
+    },
+    /// User interacted with the close-dirty-tab dialog.
+    CloseDialog {
+        tab_index: usize,
+        action: CloseAction,
+    },
+    /// User interacted with the close-others dirty-tab dialog.
+    CloseOthersDialog {
+        keep_idx: usize,
+        action: CloseAction,
+    },
+    /// Periodic tick — refreshes git status and gitignore for file tree coloring.
+    Tick,
+    /// Fast tick (100 ms) — keeps the editor cursor blinking.
+    BlinkTick,
+    /// Git status has been loaded for the current workspace's file tree.
+    GitStatusLoaded(Result<HashMap<String, GitFileStatus>, String>),
+    /// Git ignore status has been loaded for the current workspace's file tree.
+    GitIgnoredLoaded(Result<HashSet<String>, String>),
+    /// Toast message to show.
+    Toast(super::ToastMessage),
+    /// Undo the last edit.
+    Undo,
+    /// Redo a previously undone edit.
+    Redo,
+    /// Open/toggle the find/replace bar.
+    FindToggle,
+    /// Search query text changed.
+    FindQueryInput(String),
+    /// Replace text changed.
+    FindReplaceInput(String),
+    /// Navigate to the next match.
+    FindNext,
+    /// Navigate to the previous match.
+    FindPrev,
+    /// Replace the current match with the replace text.
+    FindReplace,
+    /// Replace all matches.
+    FindReplaceAll,
+    /// Toggle case-sensitive matching.
+    FindToggleCaseSensitivity,
+    /// Manual or periodic refresh of all expanded directory listings from disk.
+    /// Also triggers a git status refresh so newly discovered files get colors.
+    RefreshFileTree,
+    /// Close all tabs except the given index.
+    CloseOtherTabs(usize),
+    /// Result of a tab-save-to-DB operation. The `u64` is a generation counter
+    /// for stale-result prevention — if it doesn't match the current generation,
+    /// the result is discarded.
+    TabsSaved(u64),
+    /// Periodic check (every 300 ms) for external file changes on the active tab.
+    /// Only fires when a workspace is selected.
+    CheckFileChanges,
+    /// A file was reloaded after being detected as changed on disk.
+    /// The cursor position was captured *before* the async read and should
+    /// be restored (clamped to new file bounds) on success.
+    FileReloaded {
+        /// Path of the reloaded file.
+        path: String,
+        /// Ok(text) on success, Err(msg) on failure.
+        result: Result<String, String>,
+        /// Cursor line before reload (preserved, clamped to new bounds).
+        cursor_line: usize,
+        /// Cursor column before reload (preserved, clamped to new bounds).
+        cursor_col: usize,
+    },
+    /// Toggle the go-to-line input bar.
+    GoToLineToggle,
+    /// Input text for the go-to-line bar.
+    GoToLineInput(String),
+    /// Jump to the entered line number.
+    GoToLineGo,
+    /// Toggle the quick-open file picker.
+    QuickOpenToggle,
+    /// Filter text for the quick-open file picker.
+    QuickOpenInput(String),
+    /// Select a file from the quick-open list by index.
+    QuickOpenSelect(usize),
+    /// Switch to the next tab (Ctrl+Tab).
+    TabSwitchNext,
+    /// Switch to the previous tab (Ctrl+Shift+Tab).
+    TabSwitchPrev,
+    /// Close the active tab (Ctrl+W).
+    CloseActiveTab,
+    /// Toggle the global search panel (Cmd+Shift+F / Ctrl+Shift+F).
+    GlobalSearchToggle,
+    /// Query text changed in the global search input.
+    GlobalSearchInput(String),
+    /// Results returned from the async global search.
+    #[allow(private_interfaces)]
+    GlobalSearchResults {
+        /// Generation counter for stale-result prevention.
+        r#gen: u64,
+        /// Owned grep match results.
+        results: Vec<OwnedGrepMatch>,
+        /// Error message if the search failed.
+        error: Option<String>,
+    },
+    /// A result was clicked or selected in the global search list.
+    GlobalSearchSelect(usize),
+    /// Close the global search panel.
+    GlobalSearchClose,
+    // ── Context menu actions ────────────────────────────────────────
+    /// Context menu: delete a file (shows confirmation dialog).
+    DeleteFileRequested(String),
+    /// Context menu: delete a directory (shows confirmation dialog).
+    DeleteDirectoryRequested(String),
+    /// Context menu: create a new file in the given parent directory.
+    NewFileRequested(String),
+    /// Context menu: create a new directory in the given parent directory.
+    NewDirectoryRequested(String),
+    /// Context menu: reveal the path in the system file manager.
+    RevealInFinder(String),
+    /// Context menu: copy a relative path to clipboard.
+    CopyRelativePath(String),
+    /// Context menu: copy an absolute path to clipboard.
+    CopyAbsolutePath(String),
+    /// User confirmed the delete operation.
+    ConfirmDelete,
+    /// User cancelled the delete dialog.
+    CancelDelete,
+    /// User submitted a name for a new file or directory.
+    NewItemSubmit(String),
+    /// User changed the new-item name input.
+    NewItemInput(String),
+    /// Internal: reveal-in-finder operation completed (no-op).
+    RevealDone,
+}
+
+// ── Context menu types ──────────────────────────────────────────
+
+/// Target for the delete confirmation dialog.
+#[derive(Debug, Clone)]
+struct DeleteConfirmTarget {
+    /// Full path (relative to workspace root).
+    path: String,
+    /// Whether this is a directory.
+    is_dir: bool,
+    /// Number of dirty tabs that would be affected (directory deletes only).
+    dirty_tab_count: usize,
+    /// Absolute path for filesystem operations.
+    abs_path: String,
+}
+
+/// Target for the new file/directory name input.
+#[derive(Debug, Clone)]
+struct NewItemTarget {
+    /// Parent directory path (relative to workspace root; empty = root).
+    parent_dir: String,
+    /// Whether to create a directory (vs a file).
+    is_dir: bool,
+    /// Absolute path of the parent directory.
+    abs_parent: String,
+    /// Absolute path of the workspace root.
+    ws_root: String,
+    /// Current input text.
+    input_text: String,
+}
+
+// ── Helpers — detection ──────────────────────────────────────────
+
+/// Check whether a byte slice has a trailing newline.
+#[must_use]
+fn has_trailing_newline(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.last() == Some(&b'\n')
+}
+
+/// Detect the line ending convention (LF vs CRLF) by scanning the first 64 KiB.
+#[must_use]
+fn detect_line_ending(bytes: &[u8]) -> LineEnding {
+    let limit = bytes.len().min(65536);
+    let has_crlf = bytes[..limit].windows(2).any(|w| w == b"\r\n");
+    if has_crlf {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    }
+}
+
+// ── Helpers — async I/O ──────────────────────────────────────────
+
+/// Read a flat list of directory entries for a given path relative to the
+/// workspace root. The `root` is the workspace's filesystem path; `rel_path`
+/// is the subdirectory relative to root (empty string for root).
+async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntry>, String> {
+    let dir_path = if rel_path.is_empty() {
+        root.to_string()
+    } else {
+        let p = Path::new(root).join(rel_path);
+        p.to_string_lossy().to_string()
+    };
+    let mut entries = match tokio::fs::read_dir(&dir_path).await {
+        Ok(rd) => rd,
+        Err(e) => return Err(format!("Failed to read directory '{rel_path}': {e}")),
+    };
+
+    let mut result: Vec<FsEntry> = Vec::new();
+    let mut dirs: Vec<FsEntry> = Vec::new();
+    let mut files: Vec<FsEntry> = Vec::new();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Filter out .git directory — it's not a user-editable file.
+        if name == ".git" {
+            continue;
+        }
+        // Filter out OS-generated metadata files.
+        if is_os_file(&name) {
+            continue;
+        }
+        let full_path = if rel_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_path}/{name}")
+        };
+        // Use tokio::fs::metadata() on the absolute path to follow symlinks.
+        // DirEntry::file_type() does NOT traverse symlinks (per Rust docs).
+        let abs_path = Path::new(&dir_path).join(&name);
+        let (is_dir, err) = match tokio::fs::metadata(&abs_path).await {
+            Ok(m) => (m.is_dir(), None),
+            Err(e) => (false, Some(format!("{e}"))),
+        };
+        let fs_entry = FsEntry {
+            name,
+            full_path,
+            is_dir: is_dir && err.is_none(),
+            error: err,
+        };
+        if fs_entry.is_dir {
+            dirs.push(fs_entry);
+        } else {
+            files.push(fs_entry);
+        }
+    }
+
+    // Sort: directories first, then files, alphabetical within each group.
+    dirs.sort_by_key(|e| e.name.to_lowercase());
+    files.sort_by_key(|e| e.name.to_lowercase());
+    result.extend(dirs);
+    result.extend(files);
+    Ok(result)
+}
+
+/// Load a file's contents from disk with detection of indent style, line
+/// ending, and trailing newline.
+async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
+    // Check file size first.
+    let metadata = match tokio::fs::metadata(&full_path).await {
+        Ok(m) => m,
+        Err(e) => {
+            return FileLoadMsg {
+                path: full_path,
+                r#gen,
+                result: Err(format!("Cannot read file metadata: {e}")),
+            };
+        }
+    };
+    if metadata.len() > MAX_FILE_SIZE {
+        return FileLoadMsg {
+            path: full_path,
+            r#gen,
+            result: Err(format!(
+                "File too large ({} bytes, max {MAX_FILE_SIZE})",
+                metadata.len()
+            )),
+        };
+    }
+
+    let bytes = match tokio::fs::read(&full_path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return FileLoadMsg {
+                path: full_path,
+                r#gen,
+                result: Err(format!("Cannot read file: {e}")),
+            };
+        }
+    };
+
+    // Null-byte pre-check and UTF-8 validation for binary detection.
+    if bytes.contains(&0) {
+        return FileLoadMsg {
+            path: full_path,
+            r#gen,
+            result: Err("Binary file detected (contains null bytes)".to_string()),
+        };
+    }
+    let text = match String::from_utf8(bytes.clone()) {
+        Ok(t) => t,
+        Err(_) => {
+            return FileLoadMsg {
+                path: full_path,
+                r#gen,
+                result: Err("Binary file detected (invalid UTF-8)".to_string()),
+            };
+        }
+    };
+
+    let data = FileLoadData {
+        path: full_path,
+        has_trailing_newline: has_trailing_newline(&bytes),
+        line_ending: detect_line_ending(&bytes),
+        text,
+    };
+    FileLoadMsg {
+        path: data.path.clone(),
+        r#gen,
+        result: Ok(data),
+    }
+}
+
+struct FileLoadMsg {
+    path: String,
+    r#gen: u64,
+    result: Result<FileLoadData, String>,
+}
+
+/// Build the `EditorTabRecord` list from the current tab state.
+#[must_use]
+fn build_tab_records(tabs: &[Tab], active_index: usize) -> Vec<crate::workspace::EditorTabRecord> {
+    tabs.iter()
+        .enumerate()
+        .map(|(i, t)| crate::workspace::EditorTabRecord {
+            file_path: t.path.clone(),
+            tab_order: i,
+            is_active: i == active_index,
+            is_dirty: t.is_dirty,
+        })
+        .collect()
+}
+
+/// Save current tabs to the database for a workspace.
+///
+/// Checks `gen_counter` for staleness before writing (pre-write guard): if a
+/// newer save has superseded this one, the DB write is skipped.  Also maps to
+/// [`EditorMessage::TabsSaved`] on completion for post-completion stale-result
+/// discarding in the handler (belt-and-suspenders).
+fn save_tabs_to_db(
+    workspace_name: String,
+    tabs: Vec<Tab>,
+    active_tab_index: usize,
+    save_gen: u64,
+    gen_counter: Arc<AtomicU64>,
+) -> Task<EditorMessage> {
+    Task::perform(
+        async move {
+            // Pre-write staleness guard: if a newer save has already been
+            // initiated, skip this write to avoid overwriting newer state.
+            if gen_counter.load(Ordering::Acquire) != save_gen {
+                return;
+            }
+            let records = build_tab_records(&tabs, active_tab_index);
+            let store = crate::workspace::store();
+            if let Err(e) = store.save_editor_tabs(&workspace_name, &records).await {
+                tracing::warn!("Failed to save editor tabs: {e}");
+            }
+        },
+        move |()| EditorMessage::TabsSaved(save_gen),
+    )
+}
+
+/// Save a single file to disk (async).
+async fn save_file_to_disk(
+    path: String,
+    content: String,
+    line_ending: LineEnding,
+    has_trailing_newline: bool,
+) -> Result<(), String> {
+    // Normalize to LF first to handle mixed line endings safely.
+    let lf = content.replace("\r\n", "\n");
+    let normalized = if line_ending == LineEnding::Crlf {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    };
+
+    // Ensure trailing newline if the original file had one.
+    let final_content = if has_trailing_newline && !normalized.ends_with('\n') {
+        format!("{normalized}{}", line_ending.as_str())
+    } else {
+        normalized
+    };
+
+    tokio::fs::write(&path, &final_content)
+        .await
+        .map_err(|e| format!("Failed to write file: {e}"))
+}
+
+/// Build a `Task` that saves the tab at `idx` to disk asynchronously.
+///
+/// # Panics
+///
+/// Panics in debug builds if `idx` is out of bounds (`idx >= tabs.len()`).
+/// All current callers validate the index before calling.
+fn build_save_task(
+    tabs: &[Tab],
+    tab_contents: &HashMap<String, TabData>,
+    idx: usize,
+) -> Task<EditorMessage> {
+    debug_assert!(
+        idx < tabs.len(),
+        "idx {idx} out of bounds (len {})",
+        tabs.len()
+    );
+    let path = tabs[idx].path.clone();
+    let line_ending = tabs[idx].line_ending;
+    let has_trailing = tabs[idx].has_trailing_newline;
+    let content = tab_contents
+        .get(&path)
+        .map(|d| d.content.text())
+        .unwrap_or_default();
+    let saved_hash = hash_text(&content);
+    Task::perform(
+        async move {
+            let result = save_file_to_disk(path.clone(), content, line_ending, has_trailing).await;
+            EditorMessage::SaveResult {
+                path,
+                result,
+                saved_hash,
+            }
+        },
+        |msg| msg,
+    )
+}
+
+// ── Helpers — tree building ──────────────────────────────────────
+
+/// Recursively build a hierarchical tree from flat directory entries.
+/// Only expanded directories have their children populated.
+fn build_hierarchical_tree(
+    dir_entries: &HashMap<String, Vec<FsEntry>>,
+    expanded_dirs: &HashSet<String>,
+    parent_path: &str,
+) -> Vec<widgets::TreeNode> {
+    let Some(entries) = dir_entries.get(parent_path) else {
+        return Vec::new();
+    };
+
+    let mut nodes: Vec<widgets::TreeNode> = entries
+        .iter()
+        .map(|entry| {
+            let mut node = widgets::TreeNode {
+                name: entry.name.clone(),
+                full_path: entry.full_path.clone(),
+                is_dir: entry.is_dir,
+                children: Vec::new(),
+                error: entry.error.clone(),
+            };
+            if node.is_dir && expanded_dirs.contains(&node.full_path) {
+                node.children =
+                    build_hierarchical_tree(dir_entries, expanded_dirs, &node.full_path);
+            }
+            node
+        })
+        .collect();
+
+    FileTree::sort_nodes(&mut nodes);
+    nodes
+}
+
+// ── Git status utilities ──────────────────────────────────────────
+
+/// Parse `git status --porcelain` output into a map of file path → `GitFileStatus`.
+///
+/// The porcelain format uses a two-column status (index + worktree).
+/// Precedence: modified > added > untracked. Rename entries (`R`) extract
+/// the new path after ` -> `. Deleted files (`D`) are ignored. Handles
+/// git's C-style quoting for paths with special characters.
+fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
+    /// Strip git porcelain quoting: remove surrounding double-quotes and
+    /// unescape C-style escapes via the shared `unescape_c_style` utility.
+    /// Returns `None` on malformed escape sequences (skipped by callers).
+    fn unquote_path(raw: &str) -> Option<String> {
+        if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            unescape_c_style(inner)
+        } else {
+            Some(raw.to_string())
+        }
+    }
+
+    let mut map: HashMap<String, GitFileStatus> = HashMap::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.len() < 2 {
+            continue;
+        }
+
+        let chars: Vec<char> = trimmed.chars().take(2).collect();
+        if chars.len() < 2 {
+            continue;
+        }
+
+        let ix = chars[0];
+        let wt = chars[1];
+
+        // Skip deleted files — they don't appear in the working tree.
+        if ix == 'D' || wt == 'D' {
+            continue;
+        }
+
+        // Rename entries: "R  old_path -> new_path"
+        // Both paths may be individually C-quoted by git. The separator
+        // ` -> ` appears at the boundary between the two paths.
+        if ix == 'R' {
+            let rest = &trimmed[2..];
+            let rest = rest.trim_start();
+            let new_path: String = if rest.starts_with('"') {
+                // Both paths are quoted. The boundary is `" -> "`.
+                // rsplit_once on `" -> "` strips the opening quote of the
+                // new path — add it back so unquote_path can strip both.
+                if let Some((_, tail)) = rest.rsplit_once("\" -> \"") {
+                    format!("\"{tail}")
+                } else {
+                    // Malformed — skip.
+                    continue;
+                }
+            } else {
+                // Unquoted paths: split on ` -> `.
+                if let Some((_, tail)) = rest.rsplit_once(" -> ") {
+                    tail.to_string()
+                } else {
+                    continue;
+                }
+            };
+            if let Some(unquoted) = unquote_path(&new_path) {
+                map.insert(unquoted, GitFileStatus::Modified);
+            }
+            continue;
+        }
+
+        // Extract path: strip first 2 chars (status columns) and leading space.
+        let path = trimmed[2..].trim_start();
+        if path.is_empty() {
+            continue;
+        }
+
+        let status = if ix == 'M' || wt == 'M' {
+            GitFileStatus::Modified
+        } else if ix == 'A' || wt == 'A' || (ix == '?' && wt == '?') {
+            GitFileStatus::Added
+        } else {
+            // Clean or ignored — don't store.
+            continue;
+        };
+
+        let Some(path) = unquote_path(path) else {
+            continue;
+        };
+        // Strip trailing slash — git appends '/' for untracked directories
+        // (e.g., `?? new_dir/`), but tree node full_path has no trailing slash.
+        let path = path.strip_suffix('/').unwrap_or(&path).to_string();
+
+        // For entries with multiple lines referencing the same file (e.g., staged +
+        // unstaged), keep the most "interesting" status: Modified > Added.
+        let entry = map.entry(path).or_insert(status);
+        if status == GitFileStatus::Modified && *entry == GitFileStatus::Added {
+            *entry = GitFileStatus::Modified;
+        }
+    }
+
+    map
+}
+
+/// Load git status for a workspace. Returns an empty map if the workspace
+/// is not a git repo or if git is not installed.
+async fn load_git_status(workspace_path: String) -> Result<HashMap<String, GitFileStatus>, String> {
+    let ws_path = Path::new(&workspace_path);
+    if !is_git_repo(ws_path).await {
+        tracing::debug!("Workspace '{workspace_path}' is not a git repo — skipping git status");
+        return Ok(HashMap::new());
+    }
+
+    let output = run_git_status(ws_path).await?;
+    Ok(parse_git_status_porcelain(&output))
+}
+
+/// Collect all file and directory paths from the tree recursively.
+fn collect_tree_paths(nodes: &[widgets::TreeNode]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for node in nodes {
+        paths.push(node.full_path.clone());
+        if node.is_dir {
+            paths.extend(collect_tree_paths(&node.children));
+        }
+    }
+    paths
+}
+
+/// Load git ignore status for the given tree paths.
+/// Handles workspaces that are subdirectories of a git repo by detecting
+/// the repo root and adjusting paths accordingly.
+/// Returns an empty set if the workspace is not in a git repo.
+async fn load_git_ignore(
+    workspace_path: String,
+    tree_paths: Vec<String>,
+) -> Result<HashSet<String>, String> {
+    if tree_paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let ws_path = Path::new(&workspace_path);
+
+    // Find the git repo root (handles subdirectory-of-repo workspaces).
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(ws_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git rev-parse: {e}"))?;
+
+    if !output.status.success() {
+        tracing::debug!(
+            "Workspace '{workspace_path}' is not in a git repo — skipping git ignore check"
+        );
+        return Ok(HashSet::new());
+    }
+
+    let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let repo_path = Path::new(&repo_root);
+
+    // Compute the relative prefix from repo root to workspace.
+    // When workspace is the repo root itself, prefix is empty.
+    let ws_canonical = ws_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize workspace path: {e}"))?;
+
+    let prefix = ws_canonical
+        .strip_prefix(repo_path)
+        .map_err(|e| format!("Workspace is not inside git repo: {e}"))?;
+
+    let prefix_empty = prefix.as_os_str().is_empty();
+
+    // Adjust tree paths to be repo-root-relative for git check-ignore.
+    let adjusted_paths: Vec<String> = if prefix_empty {
+        tree_paths
+    } else {
+        let prefix_str = prefix.to_string_lossy();
+        tree_paths
+            .iter()
+            .map(|p| format!("{prefix_str}/{p}"))
+            .collect()
+    };
+
+    let raw_ignored = run_git_check_ignore(repo_path, &adjusted_paths).await?;
+
+    // Strip the prefix back to get workspace-relative paths for the cache.
+    let ignored: HashSet<String> = if prefix_empty {
+        raw_ignored
+    } else {
+        let prefix_str = prefix.to_string_lossy();
+        let prefix_slash = format!("{prefix_str}/");
+        raw_ignored
+            .into_iter()
+            .filter_map(|p| {
+                p.strip_prefix(&prefix_slash)
+                    .or_else(|| (p == prefix_str).then_some(""))
+                    .map(ToString::to_string)
+            })
+            .collect()
+    };
+
+    Ok(ignored)
+}
+
+// ── Global search helpers ──────────────────────────────────────────
+
+/// Run a global (find-in-files) grep search with debounce.
+///
+/// 1. Debounce: waits 300ms (cancelled if a newer generation supersedes).
+/// 2. Initialises the search engine if needed.
+/// 3. Runs `picker.grep()` on the blocking thread pool.
+/// 4. Extracts owned data from `GrepResult` while holding the picker lock.
+async fn run_global_search(
+    ws_path: String,
+    ws_name: String,
+    query: String,
+    gs_gen: u64,
+) -> EditorMessage {
+    // Step 1: Debounce.
+    tokio::time::sleep(Duration::from_millis(GLOBAL_SEARCH_DEBOUNCE_MS)).await;
+
+    // Step 2: Get or init the search engine.
+    let ws = crate::Workspace {
+        name: ws_name,
+        path: ws_path.clone(),
+        ..Default::default()
+    };
+    let entry = match crate::search_engine::get_or_init_engine(&ws) {
+        Ok(e) => e,
+        Err(e) => {
+            return EditorMessage::GlobalSearchResults {
+                r#gen: gs_gen,
+                results: Vec::new(),
+                error: Some(e),
+            };
+        }
+    };
+    if let Err(e) = crate::search_engine::ensure_scanned(&entry).await {
+        return EditorMessage::GlobalSearchResults {
+            r#gen: gs_gen,
+            results: Vec::new(),
+            error: Some(format!("Search engine not ready: {e}")),
+        };
+    }
+
+    // Step 3: Run grep on the blocking thread pool.
+    let entry_for_blocking = Arc::clone(&entry);
+    let query_for_blocking = query.clone();
+    let base_path = ws_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let guard = entry_for_blocking.picker.read().unwrap();
+        let Some(picker) = guard.as_ref() else {
+            return (
+                Vec::new(),
+                Some("Search engine not initialized.".to_string()),
+            );
+        };
+
+        let fff_query = parse_grep_query(&query_for_blocking);
+        let grep_opts = GrepSearchOptions {
+            mode: GrepMode::PlainText,
+            smart_case: true,
+            max_file_size: MAX_FILE_SIZE,
+            max_matches_per_file: GLOBAL_SEARCH_MATCHES_PER_FILE,
+            file_offset: 0,
+            page_limit: MAX_GLOBAL_SEARCH_RESULTS,
+            time_budget_ms: 3_000,
+            before_context: 0,
+            after_context: 0,
+            classify_definitions: false,
+            trim_whitespace: true,
+            abort_signal: None,
+        };
+
+        let grep_result = picker.grep(&fff_query, &grep_opts);
+
+        if grep_result.matches.is_empty() {
+            return (Vec::new(), None);
+        }
+
+        // Step 4: Extract owned data while holding the picker lock.
+        let base = Path::new(&base_path);
+        let mut owned: Vec<OwnedGrepMatch> = Vec::with_capacity(grep_result.matches.len());
+
+        for m in &grep_result.matches {
+            let file = grep_result.files[m.file_index];
+            let rel_path = file.relative_path(picker);
+            let abs_path = base.join(&rel_path).to_string_lossy().to_string();
+            let offsets: Vec<(u32, u32)> =
+                m.match_byte_offsets.iter().map(|&(s, e)| (s, e)).collect();
+
+            owned.push(OwnedGrepMatch {
+                abs_path,
+                rel_path,
+                line_number: m.line_number,
+                line_content: m.line_content.clone(),
+                match_byte_offsets: offsets,
+            });
+        }
+
+        (owned, None)
+    })
+    .await
+    .unwrap_or((Vec::new(), Some("spawn_blocking join error".to_string())));
+
+    let (owned_matches, error) = result;
+
+    EditorMessage::GlobalSearchResults {
+        r#gen: gs_gen,
+        results: owned_matches,
+        error,
+    }
+}
+
+// ── Editor State ──────────────────────────────────────────────────
+
+pub struct EditorState {
+    /// Currently selected workspace name (set by the Home page picker via Dashboard).
+    selected_workspace_name: Option<String>,
+    /// Filesystem path for the currently selected workspace.
+    selected_workspace_path: Option<String>,
+    /// Monotonically increasing generation counter for stale-result prevention.
+    generation: u64,
+    /// Per-directory generation counters.
+    dir_generations: HashMap<String, u64>,
+    /// Per-file generation counters (prevents stale FileLoaded results).
+    file_generations: HashMap<String, u64>,
+    /// Directories currently being loaded.
+    loading_dirs: HashSet<String>,
+    /// Directory entries loaded from the filesystem (keyed by full path).
+    dir_entries: HashMap<String, Vec<FsEntry>>,
+    /// Shared file tree state (nodes, expanded dirs, focus, visible nodes, scroll ID).
+    file_tree: FileTree,
+    /// Currently selected file in the tree (full path).
+    selected_file: Option<String>,
+    /// Open tabs in order.
+    tabs: Vec<Tab>,
+    /// Index of the active tab.
+    active_tab_index: usize,
+    /// Content per tab (keyed by full filesystem path).
+    tab_contents: HashMap<String, TabData>,
+    /// Scrollable ID for the tab bar.
+    tab_scroll_id: Id,
+    /// Pending close dialog: (tab_index, action_sentinel).
+    close_dialog: Option<(usize, CloseAction)>,
+    /// When set, "close other tabs" dialog is shown (tab index to keep).
+    close_others_target: Option<usize>,
+    /// When set, after the next successful save, close this tab (used by Save-from-close-dialog).
+    pending_save_close: Option<usize>,
+    /// Save queue for close-others: (keep_idx, remaining dirty indices to save).
+    pending_close_others: Option<(usize, Vec<usize>)>,
+    /// Whether the workspace tabs have been loaded at least once this session.
+    session_initialized: bool,
+    /// When Enter expands a directory that needs async loading, this holds
+    /// the directory path so DirExpanded can advance focus to the first child.
+    pending_enter_dir: Option<String>,
+    /// Cached git status per file path (relative to workspace root).
+    git_status_cache: HashMap<String, GitFileStatus>,
+    /// Guard against concurrent git status refresh operations.
+    git_status_loading: bool,
+    /// Cached gitignored file/directory paths (relative to workspace root).
+    git_ignore_cache: HashSet<String>,
+    /// Guard against concurrent git ignore refresh operations.
+    git_ignore_loading: bool,
+    /// Monotonically incrementing blink generation counter.
+    /// Incremented on each `BlinkTick` to force Iced to redraw the editor
+    /// widget, keeping the cursor blink alive even if the `RedrawRequested`
+    /// chain breaks.
+    blink_gen: u64,
+    /// Generation counter for tab-save-to-DB stale-result prevention.
+    /// Incremented before every `save_current_tabs()` call.  The value is
+    /// both stored to `tab_save_counter` (for a pre-write staleness check
+    /// inside the async task) and captured for post-completion checking in
+    /// [`EditorMessage::TabsSaved`].
+    tab_save_generation: u64,
+    /// Shared atomic counter used by async save tasks for pre-write staleness
+    /// checking.  Written to on every save initiation; read by in-flight tasks
+    /// to determine if a newer save has superseded them.
+    tab_save_counter: Arc<AtomicU64>,
+    /// Last-known modification time per open file (keyed by full path).
+    /// Used by the auto-refresh poll to detect external file changes.
+    file_mtimes: HashMap<String, SystemTime>,
+    /// Paths for which a "file deleted" toast has already been shown.
+    /// Prevents spamming the toast every 300 ms.
+    deleted_file_toasted: HashSet<String>,
+    /// Go-to-line bar input text (None when bar is hidden).
+    goto_line_input: Option<String>,
+    /// Quick-open state (None when closed).
+    quick_open: Option<QuickOpenState>,
+    /// Cached list of all workspace files for quick-open filtering.
+    /// Populated on each quick-open toggle from currently expanded dirs.
+    all_workspace_files: Vec<String>,
+    /// Global search (find-in-files) state (None when closed).
+    global_search: Option<GlobalSearchState>,
+    /// Generation counter for global search stale-result prevention.
+    global_search_gen: u64,
+    /// When set, the next file load for this path+generation should jump to this line.
+    /// The tuple is (abs_path, 1-based line_number, expected_file_gen). Consumed by the
+    /// `FileLoaded` handler only when both path and generation match.
+    pending_goto: Option<(String, usize, u64)>,
+    /// Pending delete confirmation dialog.
+    delete_confirm: Option<DeleteConfirmTarget>,
+    /// Pending new file/directory name input.
+    new_item_input: Option<NewItemTarget>,
+}
+
+/// State for the quick-open file picker.
+#[derive(Debug, Clone)]
+struct QuickOpenState {
+    /// Current filter text.
+    filter: String,
+    /// Currently highlighted result index.
+    selected_index: usize,
+    /// Filtered file list (matching the filter text).
+    results: Vec<String>,
+}
+
+impl EditorState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            selected_workspace_name: None,
+            selected_workspace_path: None,
+            generation: 0,
+            dir_generations: HashMap::new(),
+            file_generations: HashMap::new(),
+            loading_dirs: HashSet::new(),
+            dir_entries: HashMap::new(),
+            file_tree: FileTree::new(Id::new("editor_tree_panel")),
+            selected_file: None,
+            tabs: Vec::new(),
+            active_tab_index: 0,
+            tab_contents: HashMap::new(),
+            tab_scroll_id: Id::new("editor_tabs_bar"),
+            close_dialog: None,
+            close_others_target: None,
+            pending_save_close: None,
+            pending_close_others: None,
+            session_initialized: false,
+            pending_enter_dir: None,
+            git_status_cache: HashMap::new(),
+            git_status_loading: false,
+            git_ignore_cache: HashSet::new(),
+            git_ignore_loading: false,
+            blink_gen: 0,
+            tab_save_generation: 0,
+            tab_save_counter: Arc::new(AtomicU64::new(0)),
+            file_mtimes: HashMap::new(),
+            deleted_file_toasted: HashSet::new(),
+            goto_line_input: None,
+            quick_open: None,
+            all_workspace_files: Vec::new(),
+            global_search: None,
+            global_search_gen: 0,
+            pending_goto: None,
+            delete_confirm: None,
+            new_item_input: None,
+        }
+    }
+
+    /// The filesystem root of the currently selected workspace, if any.
+    /// Always absolute — validated & canonicalized at creation time.
+    #[inline]
+    fn workspace_root(&self) -> Option<&str> {
+        self.selected_workspace_path.as_deref()
+    }
+
+    /// Resolve a relative tree path to an absolute filesystem path.
+    fn abs_path(&self, rel_path: &str) -> String {
+        self.selected_workspace_path
+            .as_ref()
+            .map(|ws| Path::new(ws).join(rel_path).to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Rebuild both the hierarchical tree and visible node list from `dir_entries`
+    /// and `expanded_dirs`.  Callers that also need `tree_focused = true` must set
+    /// it separately after this call.
+    fn rebuild_tree(&mut self) {
+        self.file_tree.nodes =
+            build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
+        self.file_tree.rebuild_visible();
+    }
+
+    pub fn subscription(&self) -> Subscription<EditorMessage> {
+        let mut subs: Vec<Subscription<EditorMessage>> = Vec::new();
+        if self.selected_workspace_name.is_some() {
+            subs.push(
+                iced::time::every(Duration::from_secs(TICK_INTERVAL_SECS))
+                    .map(|_| EditorMessage::Tick),
+            );
+            // Periodic directory refresh — re-reads all expanded directories
+            // to pick up external filesystem changes (git checkout, build
+            // scripts, other editors).
+            subs.push(
+                iced::time::every(Duration::from_secs(DIR_REFRESH_INTERVAL_SECS))
+                    .map(|_| EditorMessage::RefreshFileTree),
+            );
+            // Fast tick for cursor blinking — 100 ms ensures smooth blink.
+            subs.push(
+                iced::time::every(Duration::from_millis(100)).map(|_| EditorMessage::BlinkTick),
+            );
+            // Auto-refresh tick for detecting external file changes on the
+            // active tab.  Only the active (visible) tab is polled; dirty
+            // tabs (unsaved edits) are never auto-reloaded.
+            subs.push(
+                iced::time::every(Duration::from_millis(300))
+                    .map(|_| EditorMessage::CheckFileChanges),
+            );
+        }
+        // Always listen for keyboard events — tree navigation may be active.
+        subs.push(keyboard::listen().filter_map(|event| {
+            use keyboard::{Event, Key};
+            let Event::KeyPressed {
+                key,
+                modifiers,
+                physical_key,
+                ..
+            } = event
+            else {
+                return None;
+            };
+            let is_platform_mod = modifiers.command() || modifiers.control();
+            // On macOS, Ctrl alone (without Cmd) triggers emacs shortcuts
+            // (Ctrl+B → MoveLeft, Ctrl+F → MoveRight) — don't also fire
+            // TreeFocusToggled / FindToggle on the same keypress.
+            #[cfg(target_os = "macos")]
+            let is_emacs_ctrl = modifiers.control() && !modifiers.command();
+            #[cfg(not(target_os = "macos"))]
+            let is_emacs_ctrl = false;
+
+            // On non-macOS, AltGr (Ctrl+Alt) is character input — block
+            // shortcuts from firing.
+            #[cfg(not(target_os = "macos"))]
+            let altgr_active = modifiers.alt() && modifiers.control();
+            #[cfg(target_os = "macos")]
+            let altgr_active = false;
+
+            // Helper: match a Character key by its Latin equivalent.
+            let latin = |target: char| -> bool { key.to_latin(physical_key) == Some(target) };
+
+            // Ctrl+B / Cmd+B → toggle tree focus.
+            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('b') {
+                return Some(EditorMessage::TreeFocusToggled);
+            }
+            // Cmd+Shift+F / Ctrl+Shift+F → global search (find-in-files).
+            // Must appear BEFORE the Cmd+F / Ctrl+F check so Cmd+Shift+F
+            // doesn't also trigger FindToggle.
+            if is_platform_mod && !altgr_active && modifiers.shift() && latin('f') {
+                return Some(EditorMessage::GlobalSearchToggle);
+            }
+            // Cmd+F / Ctrl+F → toggle find/replace bar.
+            // Guard: Cmd+Shift+F handled above, so !modifiers.shift() prevents
+            // Cmd+Shift+F from also triggering FindToggle.
+            if is_platform_mod
+                && !is_emacs_ctrl
+                && !altgr_active
+                && !modifiers.shift()
+                && latin('f')
+            {
+                return Some(EditorMessage::FindToggle);
+            }
+            // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z / Ctrl+Shift+Z → redo.
+            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('z') {
+                if modifiers.shift() {
+                    return Some(EditorMessage::Redo);
+                }
+                return Some(EditorMessage::Undo);
+            }
+            // Cmd+S / Ctrl+S → save.
+            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('s') {
+                return Some(EditorMessage::SaveActiveTab);
+            }
+            // Ctrl+Tab / Ctrl+Shift+Tab → switch tabs.
+            // On macOS, modifiers.control() is used directly (not is_platform_mod)
+            // since Cmd+Tab is captured by the OS for app switching.
+            if modifiers.control() && matches!(key, Key::Named(keyboard::key::Named::Tab)) {
+                return if modifiers.shift() {
+                    Some(EditorMessage::TabSwitchPrev)
+                } else {
+                    Some(EditorMessage::TabSwitchNext)
+                };
+            }
+            // Ctrl+W → close tab (all platforms). Cmd+W on macOS is typically
+            // captured by the window manager to close the window, so we use
+            // Ctrl+W consistently.
+            if !altgr_active && modifiers.control() && latin('w') {
+                return Some(EditorMessage::CloseActiveTab);
+            }
+            // Go-to-line: Cmd+L on macOS, Ctrl+G on other platforms.
+            #[cfg(target_os = "macos")]
+            {
+                if modifiers.command() && !modifiers.control() && latin('l') {
+                    return Some(EditorMessage::GoToLineToggle);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if !altgr_active && modifiers.control() && latin('g') {
+                    return Some(EditorMessage::GoToLineToggle);
+                }
+            }
+            // Quick open: Cmd+P / Ctrl+P
+            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('p') {
+                return Some(EditorMessage::QuickOpenToggle);
+            }
+            // Refresh file tree: Cmd+R / Ctrl+R
+            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('r') {
+                return Some(EditorMessage::RefreshFileTree);
+            }
+            // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev
+            // macOS uses Cmd+G; non-macOS uses Ctrl+G for go-to-line (already mapped),
+            // so F3 and Shift+F3 serve as the cross-platform find shortcuts.
+            #[cfg(target_os = "macos")]
+            if modifiers.command() && !modifiers.control() && latin('g') {
+                return if modifiers.shift() {
+                    Some(EditorMessage::FindPrev)
+                } else {
+                    Some(EditorMessage::FindNext)
+                };
+            }
+            // F3 / Shift+F3 (all platforms)
+            if matches!(key, Key::Named(keyboard::key::Named::F3)) {
+                return if modifiers.shift() {
+                    Some(EditorMessage::FindPrev)
+                } else {
+                    Some(EditorMessage::FindNext)
+                };
+            }
+            // Shift+Enter → previous match (for use in the find/replace bar;
+            // no-op when find bar is closed — handler checks state).
+            if modifiers.shift() && matches!(key, Key::Named(keyboard::key::Named::Enter)) {
+                return Some(EditorMessage::FindPrev);
+            }
+            // Arrow key navigation: when quick-open is active, arrow keys
+            // navigate the results list (handled in the update method by
+            // checking quick_open state before tree focus).
+            match &key {
+                Key::Named(named) => match named {
+                    keyboard::key::Named::ArrowUp => Some(EditorMessage::TreeNavUp),
+                    keyboard::key::Named::ArrowDown => Some(EditorMessage::TreeNavDown),
+                    keyboard::key::Named::ArrowLeft => Some(EditorMessage::TreeNavLeft),
+                    keyboard::key::Named::ArrowRight => Some(EditorMessage::TreeNavRight),
+                    keyboard::key::Named::Enter => Some(EditorMessage::TreeNavEnter),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }));
+        Subscription::batch(subs)
+    }
+
+    /// Returns the active tab index, or `None` if there are no tabs open.
+    fn active_tab_idx(&self) -> Option<usize> {
+        let idx = self.active_tab_index;
+        if idx >= self.tabs.len() {
+            None
+        } else {
+            Some(idx)
+        }
+    }
+
+    /// Returns `true` when the find/replace bar is open on the active tab.
+    fn is_find_bar_open(&self) -> bool {
+        self.active_tab_idx()
+            .and_then(|idx| self.tabs.get(idx))
+            .and_then(|tab| self.tab_contents.get(&tab.path))
+            .and_then(|data| data.find_replace_state.as_ref())
+            .is_some()
+    }
+
+    /// Save editor tabs to the database for the currently selected workspace.
+    ///
+    /// Returns a task that performs the async DB write, or [`None`] if:
+    /// - Tabs haven't been initialized yet this session
+    /// - No workspace is selected
+    ///
+    /// Uses a generation counter for stale-result prevention: the captured
+    /// generation is mapped to [`EditorMessage::TabsSaved`], and the handler
+    /// discards the result if a newer save superseded it.
+    #[must_use]
+    pub(crate) fn save_current_tabs(&mut self) -> Option<Task<EditorMessage>> {
+        if !self.session_initialized {
+            return None;
+        }
+        let workspace_name = self.selected_workspace_name.as_ref()?;
+
+        // Increment generation to invalidate any in-flight stale saves.
+        self.tab_save_generation = self.tab_save_generation.wrapping_add(1);
+        let save_gen = self.tab_save_generation;
+        // Publish to shared counter so in-flight async tasks can detect staleness.
+        self.tab_save_counter.store(save_gen, Ordering::Release);
+
+        Some(save_tabs_to_db(
+            workspace_name.clone(),
+            self.tabs.clone(),
+            self.active_tab_index,
+            save_gen,
+            self.tab_save_counter.clone(),
+        ))
+    }
+
+    /// Scroll the tab bar to keep the active tab visible.
+    #[allow(clippy::cast_precision_loss)]
+    fn scroll_to_active_tab(&self) -> Task<EditorMessage> {
+        let index = self.active_tab_index;
+        let offset_x = index as f32 * ESTIMATED_TAB_WIDTH;
+        iced::widget::operation::scroll_to(
+            self.tab_scroll_id.clone(),
+            iced::widget::operation::AbsoluteOffset {
+                x: offset_x,
+                y: 0.0,
+            },
+        )
+    }
+
+    /// Switch to the tab at `new_idx`, updating active index and scrolling.
+    fn switch_to_tab(&mut self, new_idx: usize) -> Task<EditorMessage> {
+        if new_idx >= self.tabs.len() {
+            return Task::none();
+        }
+        self.active_tab_index = new_idx;
+        self.scroll_to_active_tab()
+    }
+
+    /// Collect all file paths from the workspace's directory entries for
+    /// quick-open filtering. Walks all expanded and known directories.
+    /// Called each time QuickOpen is opened to pick up newly expanded dirs.
+    fn scan_all_workspace_files(&mut self) {
+        self.all_workspace_files.clear();
+        let mut paths: Vec<String> = Vec::new();
+        for entries in self.dir_entries.values() {
+            for entry in entries {
+                if !entry.is_dir {
+                    paths.push(entry.full_path.clone());
+                }
+            }
+        }
+        paths.sort();
+        self.all_workspace_files = paths;
+    }
+
+    /// Filter workspace file paths by a fuzzy query string.
+    /// Returns paths that contain the filter text (case-insensitive).
+    fn filter_workspace_files(&self, filter: &str) -> Vec<String> {
+        if filter.is_empty() {
+            return self.all_workspace_files.iter().take(200).cloned().collect();
+        }
+        let lower_filter = filter.to_ascii_lowercase();
+        let mut scored: Vec<(usize, &String)> = self
+            .all_workspace_files
+            .iter()
+            .filter(|path| path.to_ascii_lowercase().contains(&lower_filter))
+            .map(|path| {
+                // Score: prefer matches on file name (after last /).
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let name_lower = name.to_ascii_lowercase();
+                let name_score = if name_lower.starts_with(&lower_filter) {
+                    0 // highest priority: file name starts with query
+                } else if name_lower.contains(&lower_filter) {
+                    1 // file name contains query
+                } else {
+                    2 // path segment match only
+                };
+                (name_score, path)
+            })
+            .collect();
+        scored.sort_by_key(|(score, _)| *score);
+        scored
+            .into_iter()
+            .take(200)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+
+    /// Open a file by its workspace-relative path.
+    /// If the file is already open in a tab, switches to that tab.
+    /// Otherwise loads the file and adds a new tab.
+    fn open_file_in_editor(&mut self, path: &str) -> Task<EditorMessage> {
+        let Some(ref ws) = self.selected_workspace_path.clone() else {
+            return Task::none();
+        };
+        let abs_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            std::path::Path::new(&ws)
+                .join(path)
+                .to_string_lossy()
+                .to_string()
+        };
+
+        // If already open, just switch to that tab.
+        if let Some(existing_idx) = self.tabs.iter().position(|t| t.path == abs_path) {
+            return self.switch_to_tab(existing_idx);
+        }
+
+        // Mark tree as not focused when a file is opened.
+        self.file_tree.tree_focused = false;
+        self.pending_enter_dir = None;
+
+        let file_path = abs_path.clone();
+        let file_gen = self.generation.wrapping_add(1);
+        self.generation = file_gen;
+        self.file_generations.insert(file_path.clone(), file_gen);
+        self.selected_file = Some(file_path.clone());
+
+        Task::perform(
+            async move {
+                let result = load_file_data(file_path, file_gen).await;
+                EditorMessage::FileLoaded {
+                    path: result.path,
+                    r#gen: result.r#gen,
+                    result: result.result,
+                }
+            },
+            |msg| msg,
+        )
+    }
+
+    /// Remove the tab at `idx`, cleaning up `tab_contents` and adjusting
+    /// `active_tab_index`.
+    fn remove_tab_at(&mut self, idx: usize) {
+        let closed_path = self.tabs[idx].path.clone();
+        self.tab_contents.remove(&closed_path);
+        self.tabs.remove(idx);
+        let len = self.tabs.len();
+        if len == 0 {
+            self.active_tab_index = 0;
+        } else if idx < self.active_tab_index {
+            self.active_tab_index = self.active_tab_index.saturating_sub(1);
+        } else {
+            self.active_tab_index = self.active_tab_index.min(len.saturating_sub(1));
+        }
+    }
+
+    /// Close all tabs except `keep_idx`, discarding changes.
+    ///
+    /// Does not update `active_tab_index` — callers that need scroll handling
+    /// should do so after the call.
+    fn remove_all_tabs_except(&mut self, keep_idx: usize) {
+        let mut to_remove: Vec<usize> = (0..self.tabs.len()).collect();
+        to_remove.retain(|&i| i != keep_idx);
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for i in to_remove {
+            self.remove_tab_at(i);
+        }
+    }
+
+    /// Close the tab at `idx`. If the tab is dirty, shows the close dialog.
+    /// If clean, immediately removes the tab and persists.
+    /// Returns the task for saving to DB.
+    fn close_tab_at(&mut self, idx: usize) -> Task<EditorMessage> {
+        if idx >= self.tabs.len() {
+            return Task::none();
+        }
+        if self.tabs[idx].is_dirty {
+            self.close_dialog = Some((idx, CloseAction::Cancel));
+            return Task::none();
+        }
+        self.close_dialog = None;
+        self.remove_tab_at(idx);
+        self.save_current_tabs().unwrap_or(Task::none())
+    }
+
+    /// Apply an undo or redo snapshot to the tab at `idx`.
+    ///
+    /// The snapshot is an owned value so there is no borrow entanglement
+    /// with the undo stack.  The helper does a fresh (O(1)) lookup of
+    /// `tab_contents` by path — the caller must have already resolved
+    /// the path from `self.tabs[idx]`.
+    ///
+    /// # Panics
+    /// Panics if `idx` is out of bounds for `self.tabs`.
+    fn apply_undo_snapshot(&mut self, idx: usize, snapshot: Option<UndoSnapshot>) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let path = self.tabs[idx].path.clone();
+        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+            // Clear find/replace state — match byte ranges are now stale.
+            tab_data.find_replace_state = None;
+            let language = HighlightLanguage::from_path(&path);
+            tab_data.content = EditorBuffer::with_text(&snapshot.text, language);
+            tab_data.content.set_file_extension(
+                std::path::Path::new(&path)
+                    .extension()
+                    .and_then(|e| e.to_str()),
+            );
+            tab_data
+                .content
+                .move_to(snapshot.cursor_line, snapshot.cursor_col);
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                let current_hash = hash_text(&tab_data.content.text());
+                tab.is_dirty = current_hash != tab_data.saved_text_hash;
+            }
+        }
+    }
+
+    /// Apply an undo or redo operation to the active tab.
+    ///
+    /// `is_redo` selects which operation: `false` for undo,
+    /// `true` for redo.
+    fn apply_undo_or_redo(&mut self, is_redo: bool) -> Task<EditorMessage> {
+        let Some(idx) = self.active_tab_idx() else {
+            return Task::none();
+        };
+        let path = self.tabs[idx].path.clone();
+        let snapshot = self.tab_contents.get_mut(&path).and_then(|tab_data| {
+            let mut stack = tab_data.undo_stack.borrow_mut();
+            if is_redo {
+                stack.redo(&tab_data.content)
+            } else {
+                stack.undo(&tab_data.content)
+            }
+        });
+        self.apply_undo_snapshot(idx, snapshot);
+        Task::none()
+    }
+
+    /// Clear all workspace-scoped editor state when switching workspaces.
+    /// Does not touch `selected_workspace_name`, `selected_workspace_path`, or `generation`
+    /// — those are managed at the call site.
+    fn clear_workspace_editor_state(&mut self) {
+        self.file_tree.nodes.clear();
+        self.file_tree.expanded_dirs.clear();
+        self.selected_file = None;
+        self.tabs.clear();
+        self.tab_contents.clear();
+        self.active_tab_index = 0;
+        self.dir_entries.clear();
+        self.loading_dirs.clear();
+        self.dir_generations.clear();
+        self.file_generations.clear();
+        self.git_status_cache.clear();
+        self.git_status_loading = false;
+        self.git_ignore_cache.clear();
+        self.git_ignore_loading = false;
+        self.session_initialized = false;
+        self.close_dialog = None;
+        self.close_others_target = None;
+        self.pending_save_close = None;
+        self.pending_close_others = None;
+        self.file_tree.visible_tree_nodes.clear();
+        self.file_tree.tree_focused = false;
+        self.file_tree.tree_focus_index = 0;
+        self.pending_enter_dir = None;
+        self.tab_save_generation = 0;
+        self.tab_save_counter.store(0, Ordering::Release);
+        self.file_mtimes.clear();
+        self.deleted_file_toasted.clear();
+        self.goto_line_input = None;
+        self.quick_open = None;
+        self.all_workspace_files.clear();
+        self.global_search = None;
+        self.global_search_gen = 0;
+        self.pending_goto = None;
+        self.delete_confirm = None;
+        self.new_item_input = None;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
+        match msg {
+            EditorMessage::WorkspaceSelected(name, path) => {
+                if name.is_empty() && path.is_empty() {
+                    self.selected_workspace_name = None;
+                    self.selected_workspace_path = None;
+                    self.clear_workspace_editor_state();
+                    return Task::none();
+                }
+
+                let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+
+                // Update selected workspace.
+                self.selected_workspace_name = Some(name.clone());
+                self.selected_workspace_path = Some(path.clone());
+
+                // Clear previous state.
+                let r#gen = self.generation.wrapping_add(1);
+                self.generation = r#gen;
+                self.clear_workspace_editor_state();
+
+                // ── Task 1: read root directory ───────────────────────
+                let root_path = path.clone();
+                let root_gen = r#gen;
+                let read_root_task = Task::perform(
+                    async move {
+                        let entries = read_directory_entries(&root_path, "").await;
+                        EditorMessage::DirExpanded {
+                            dir_path: String::new(),
+                            r#gen: root_gen,
+                            entries,
+                            quiet: false,
+                        }
+                    },
+                    |msg| msg,
+                );
+                tasks.push(read_root_task);
+
+                // ── Task 2: load tabs from DB + file contents ────────
+                let tab_ws = name.clone();
+                let tab_path = path.clone();
+                let tab_gen = r#gen;
+                let load_tabs_task = Task::perform(
+                    async move {
+                        let store = crate::workspace::store();
+                        let records = store.load_editor_tabs(&tab_ws).await.unwrap_or_default();
+                        let ws_path = tab_path;
+
+                        let mut loaded: Vec<SavedTabData> = Vec::new();
+                        for record in &records {
+                            // Belt-and-suspenders: skip tabs with empty file_path —
+                            // load_editor_tabs already filters these, but guard anyway.
+                            if record.file_path.is_empty() || record.file_path.trim().is_empty() {
+                                tracing::warn!(
+                                    workspace = %tab_ws,
+                                    tab_order = record.tab_order,
+                                    "Skipping editor tab with empty file_path in GUI loader"
+                                );
+                                continue;
+                            }
+                            let file_path = if ws_path.is_empty() {
+                                record.file_path.clone()
+                            } else {
+                                Path::new(&ws_path)
+                                    .join(&record.file_path)
+                                    .to_string_lossy()
+                                    .to_string()
+                            };
+                            if let Ok(bytes) = tokio::fs::read(&file_path).await {
+                                if (bytes.len() as u64) <= MAX_FILE_SIZE && !bytes.contains(&0) {
+                                    if let Ok(text) = String::from_utf8(bytes.clone()) {
+                                        let has_trailing = has_trailing_newline(&bytes);
+                                        let line_ending = detect_line_ending(&bytes);
+                                        loaded.push(SavedTabData {
+                                            file_path,
+                                            text,
+                                            was_dirty: record.is_dirty,
+                                            has_trailing_newline: has_trailing,
+                                            line_ending,
+                                            is_active: record.is_active,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        EditorMessage::SavedTabsLoaded {
+                            tabs_data: loaded,
+                            r#gen: tab_gen,
+                        }
+                    },
+                    |msg| msg,
+                );
+                tasks.push(load_tabs_task);
+
+                // ── Task 3: refresh git status for file tree coloring ──
+                let git_path = path.clone();
+                let git_task = Task::perform(
+                    async move { load_git_status(git_path).await },
+                    EditorMessage::GitStatusLoaded,
+                );
+                tasks.push(git_task);
+
+                Task::batch(tasks)
+            }
+
+            EditorMessage::SavedTabsLoaded { tabs_data, r#gen } => {
+                if r#gen != self.generation {
+                    return Task::none();
+                }
+
+                // Track which tab was active when persisted.
+                let mut active_idx = 0;
+
+                for (i, saved) in tabs_data.into_iter().enumerate() {
+                    let language = HighlightLanguage::from_path(&saved.file_path);
+                    let content = EditorBuffer::with_text(&saved.text, language);
+                    content.set_file_extension(
+                        std::path::Path::new(&saved.file_path)
+                            .extension()
+                            .and_then(|e| e.to_str()),
+                    );
+                    let file_name = Path::new(&saved.file_path).file_name().map_or_else(
+                        || saved.file_path.clone(),
+                        |n| n.to_string_lossy().to_string(),
+                    );
+
+                    let tab = Tab {
+                        path: saved.file_path.clone(),
+                        file_name,
+                        is_dirty: saved.was_dirty,
+                        has_trailing_newline: saved.has_trailing_newline,
+                        line_ending: saved.line_ending,
+                    };
+
+                    if saved.is_active {
+                        active_idx = i;
+                    }
+
+                    self.tabs.push(tab);
+                    let saved_hash = if saved.was_dirty {
+                        // Tab was dirty when persisted — the text in DB
+                        // differs from what's on disk.  Try to read the
+                        // on-disk version for an accurate saved hash;
+                        // fall back to the in-memory text if the file
+                        // is gone or unreadable.
+                        std::fs::read_to_string(&saved.file_path)
+                            .as_ref()
+                            .map_or_else(|_| hash_text(&saved.text), |disk| hash_text(disk))
+                    } else {
+                        hash_text(&saved.text)
+                    };
+                    let file_path = saved.file_path.clone();
+                    self.tab_contents.insert(
+                        saved.file_path,
+                        TabData {
+                            content,
+                            undo_stack: RefCell::new(UndoStack::new()),
+                            find_replace_state: None,
+                            saved_text_hash: saved_hash,
+                        },
+                    );
+                    // Record modification time for auto-refresh tracking.
+                    // Try the on-disk file first; if the file is missing
+                    // (e.g. it was saved dirty from a deleted file), no
+                    // mtime is recorded so the auto-refresh won't try to
+                    // reload a non-existent file.
+                    if let Ok(meta) = std::fs::metadata(&file_path) {
+                        if let Ok(mtime) = meta.modified() {
+                            self.file_mtimes.insert(file_path, mtime);
+                        }
+                    }
+                }
+
+                if !self.tabs.is_empty() {
+                    self.active_tab_index = active_idx.min(self.tabs.len().saturating_sub(1));
+                }
+                self.session_initialized = true;
+
+                if !self.tabs.is_empty() {
+                    self.scroll_to_active_tab()
+                } else {
+                    Task::none()
+                }
+            }
+
+            EditorMessage::DirExpanded {
+                dir_path,
+                r#gen,
+                entries,
+                quiet,
+            } => {
+                if !dir_path.is_empty() && self.dir_generations.get(&dir_path) != Some(&r#gen) {
+                    return Task::none();
+                }
+
+                self.loading_dirs.remove(&dir_path);
+
+                match entries {
+                    Ok(entries) => {
+                        self.dir_entries.insert(dir_path.clone(), entries);
+                        self.rebuild_tree();
+                        // If this was triggered by Enter-on-directory, advance
+                        // focus to the first child now that children are loaded.
+                        if self.pending_enter_dir.as_deref() == Some(&dir_path) {
+                            self.pending_enter_dir = None;
+                            // Find the directory's position in the new visible list
+                            // and advance to the first child.
+                            if let Some(pos) = self
+                                .file_tree
+                                .visible_tree_nodes
+                                .iter()
+                                .position(|(p, _)| p == &dir_path)
+                            {
+                                if pos + 1 < self.file_tree.visible_tree_nodes.len() {
+                                    self.file_tree.tree_focus_index = pos + 1;
+                                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if quiet {
+                            tracing::warn!("Failed to read directory (refresh): {e}");
+                            return Task::none();
+                        }
+                        return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
+                            format!("Failed to read directory: {e}"),
+                        )));
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::ToggleDir(dir_path) => {
+                if self.file_tree.expanded_dirs.contains(&dir_path) {
+                    self.file_tree.expanded_dirs.remove(&dir_path);
+                    self.rebuild_tree();
+                    self.file_tree.tree_focused = true;
+                    // Place focus on the collapsed directory.
+                    if let Some(pos) = self
+                        .file_tree
+                        .visible_tree_nodes
+                        .iter()
+                        .position(|(p, _)| p == &dir_path)
+                    {
+                        self.file_tree.tree_focus_index = pos;
+                    }
+                    Task::none()
+                } else {
+                    self.file_tree.expanded_dirs.insert(dir_path.clone());
+
+                    if !self.dir_entries.contains_key(&dir_path) {
+                        let Some(ref ws_path) = self.selected_workspace_path else {
+                            tracing::error!("ToggleDir without workspace selected");
+                            return Task::none();
+                        };
+                        let dir_gen = self.generation.wrapping_add(1);
+                        self.generation = dir_gen;
+                        self.dir_generations.insert(dir_path.clone(), dir_gen);
+                        self.loading_dirs.insert(dir_path.clone());
+
+                        let d_path = dir_path.clone();
+                        let r_path = ws_path.clone();
+                        let read_task = Task::perform(
+                            async move {
+                                let entries = read_directory_entries(&r_path, &d_path).await;
+                                EditorMessage::DirExpanded {
+                                    dir_path: d_path,
+                                    r#gen: dir_gen,
+                                    entries,
+                                    quiet: false,
+                                }
+                            },
+                            |msg| msg,
+                        );
+
+                        self.rebuild_tree();
+                        self.file_tree.tree_focused = true;
+                        // Place focus on the expanding directory.
+                        if let Some(pos) = self
+                            .file_tree
+                            .visible_tree_nodes
+                            .iter()
+                            .position(|(p, _)| p == &dir_path)
+                        {
+                            self.file_tree.tree_focus_index = pos;
+                        }
+                        read_task
+                    } else {
+                        self.rebuild_tree();
+                        self.file_tree.tree_focused = true;
+                        // Place focus on the expanding directory.
+                        if let Some(pos) = self
+                            .file_tree
+                            .visible_tree_nodes
+                            .iter()
+                            .position(|(p, _)| p == &dir_path)
+                        {
+                            self.file_tree.tree_focus_index = pos;
+                        }
+                        Task::none()
+                    }
+                }
+            }
+
+            EditorMessage::SelectFile(path) => {
+                self.file_tree.tree_focused = false;
+                self.pending_enter_dir = None;
+                // Remember the clicked file's position for Ctrl+B re-focus.
+                if let Some(pos) = self
+                    .file_tree
+                    .visible_tree_nodes
+                    .iter()
+                    .position(|(p, _)| p == &path)
+                {
+                    self.file_tree.tree_focus_index = pos;
+                }
+                self.selected_file = Some(path.clone());
+
+                // Resolve tree-relative path against workspace root so that
+                // file operations and tab paths are absolute (matching restored
+                // tabs) and work regardless of MahBot's CWD.
+                let Some(ws) = self.workspace_root() else {
+                    tracing::error!("SelectFile without workspace selected");
+                    return Task::none();
+                };
+                let abs_path = Path::new(ws).join(&path).to_string_lossy().to_string();
+
+                if let Some(pos) = self.tabs.iter().position(|t| t.path == abs_path) {
+                    self.active_tab_index = pos;
+                    let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                    tasks.push(self.scroll_to_active_tab());
+                    if let Some(save_task) = self.save_current_tabs() {
+                        tasks.push(save_task);
+                    }
+                    return Task::batch(tasks);
+                }
+
+                // Per-file generation: keyed by absolute path.
+                let file_gen = self
+                    .file_generations
+                    .get(&abs_path)
+                    .copied()
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                self.file_generations.insert(abs_path.clone(), file_gen);
+                Task::perform(
+                    async move {
+                        let msg = load_file_data(abs_path, file_gen).await;
+                        EditorMessage::FileLoaded {
+                            path: msg.path,
+                            r#gen: msg.r#gen,
+                            result: msg.result,
+                        }
+                    },
+                    |msg| msg,
+                )
+            }
+
+            EditorMessage::FileLoaded {
+                path,
+                r#gen,
+                result,
+            } => {
+                // Check per-file generation to prevent stale loads.
+                if self.file_generations.get(&path).copied() != Some(r#gen) {
+                    return Task::none();
+                }
+
+                match result {
+                    Ok(data) => {
+                        let language = HighlightLanguage::from_path(&data.path);
+                        let content = EditorBuffer::with_text(&data.text, language);
+                        content.set_file_extension(
+                            std::path::Path::new(&data.path)
+                                .extension()
+                                .and_then(|e| e.to_str()),
+                        );
+                        let file_name = Path::new(&data.path)
+                            .file_name()
+                            .map_or_else(|| data.path.clone(), |n| n.to_string_lossy().to_string());
+
+                        let tab = Tab {
+                            path: data.path.clone(),
+                            file_name,
+                            is_dirty: false,
+                            has_trailing_newline: data.has_trailing_newline,
+                            line_ending: data.line_ending,
+                        };
+
+                        let saved_hash = hash_text(&data.text);
+                        self.tabs.push(tab);
+                        let file_path = data.path.clone();
+                        self.tab_contents.insert(
+                            data.path,
+                            TabData {
+                                content,
+                                undo_stack: RefCell::new(UndoStack::new()),
+                                find_replace_state: None,
+                                saved_text_hash: saved_hash,
+                            },
+                        );
+                        // Record modification time for auto-refresh tracking.
+                        if let Ok(meta) = std::fs::metadata(&file_path) {
+                            if let Ok(mtime) = meta.modified() {
+                                self.file_mtimes.insert(file_path, mtime);
+                            }
+                        }
+                        self.active_tab_index = self.tabs.len().saturating_sub(1);
+                        self.session_initialized = true;
+
+                        // ── Pending goto from global search ────────────
+                        // If this file was loaded for a global-search result click,
+                        // jump to the matching line. Only consume when both path and
+                        // generation match to avoid stealing from a different file load.
+                        if self
+                            .pending_goto
+                            .as_ref()
+                            .is_some_and(|(gp, _, gg)| *gp == path && *gg == r#gen)
+                        {
+                            if let Some((_, goto_line_1based, _)) = self.pending_goto.take() {
+                                let cursor_line = goto_line_1based.saturating_sub(1);
+                                let tab_path = self.tabs[self.active_tab_index].path.clone();
+                                if let Some(tab_data) = self.tab_contents.get_mut(&tab_path) {
+                                    let max_line = tab_data.content.line_count();
+                                    let line = cursor_line.min(max_line.saturating_sub(1));
+                                    tab_data.content.move_to(line, 0);
+                                }
+                            }
+                        }
+
+                        let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                        tasks.push(self.scroll_to_active_tab());
+                        if let Some(save_task) = self.save_current_tabs() {
+                            tasks.push(save_task);
+                        }
+                        Task::batch(tasks)
+                    }
+                    Err(e) => {
+                        let toast = if e.starts_with("File too large")
+                            || e.starts_with("Binary file detected")
+                        {
+                            super::ToastMessage::Warning(e)
+                        } else {
+                            super::ToastMessage::Error(e)
+                        };
+                        Task::done(EditorMessage::Toast(toast))
+                    }
+                }
+            }
+
+            EditorMessage::TabSelected(idx) => {
+                if idx < self.tabs.len() {
+                    self.active_tab_index = idx;
+                    let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                    tasks.push(self.scroll_to_active_tab());
+                    if let Some(save_task) = self.save_current_tabs() {
+                        tasks.push(save_task);
+                    }
+                    Task::batch(tasks)
+                } else {
+                    Task::none()
+                }
+            }
+
+            EditorMessage::TabClosed(idx) => self.close_tab_at(idx),
+
+            EditorMessage::EditorAction(action) => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                let is_edit = matches!(
+                    action,
+                    super::editor_widget::EditorAction::Insert(_)
+                        | super::editor_widget::EditorAction::Enter
+                        | super::editor_widget::EditorAction::Backspace
+                        | super::editor_widget::EditorAction::Delete
+                        | super::editor_widget::EditorAction::Paste(_)
+                        | super::editor_widget::EditorAction::Indent
+                        | super::editor_widget::EditorAction::Unindent
+                        | super::editor_widget::EditorAction::DeleteWordBack
+                        | super::editor_widget::EditorAction::DeleteWordForward
+                        | super::editor_widget::EditorAction::ToggleLineComment
+                        | super::editor_widget::EditorAction::DeleteLine
+                        | super::editor_widget::EditorAction::DuplicateLine
+                        | super::editor_widget::EditorAction::MoveLineUp
+                        | super::editor_widget::EditorAction::MoveLineDown
+                );
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    if is_edit {
+                        tab_data
+                            .undo_stack
+                            .borrow_mut()
+                            .snap_before_edit(&tab_data.content);
+                    }
+                    tab_data.content.perform_action(action);
+                    if is_edit {
+                        if let Some(tab) = self.tabs.get_mut(idx) {
+                            let current_hash = hash_text(&tab_data.content.text());
+                            tab.is_dirty = current_hash != tab_data.saved_text_hash;
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::SaveActiveTab => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                build_save_task(&self.tabs, &self.tab_contents, idx)
+            }
+
+            EditorMessage::SaveResult {
+                path,
+                result,
+                saved_hash,
+            } => match result {
+                Ok(()) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
+                        tab.is_dirty = false;
+                    }
+                    if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                        tab_data.saved_text_hash = saved_hash;
+                    }
+                    // Update stored mtime so the next auto-refresh tick won't
+                    // detect the save-time mtime change as an external edit
+                    // and re-read the file, destroying the undo stack.
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if let Ok(mtime) = meta.modified() {
+                            self.file_mtimes.insert(path.clone(), mtime);
+                        }
+                    }
+
+                    // If this save was triggered by CloseDialog::Save, close the tab now.
+                    if let Some(close_idx) = self.pending_save_close.take() {
+                        if close_idx < self.tabs.len() {
+                            self.remove_tab_at(close_idx);
+                            // Save after removal + scroll.
+                            let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                            if !self.tabs.is_empty() {
+                                tasks.push(self.scroll_to_active_tab());
+                            }
+                            if let Some(save_task) = self.save_current_tabs() {
+                                tasks.push(save_task);
+                            }
+                            return Task::batch(tasks);
+                        }
+                    }
+                    // If this save is part of a close-others save queue, continue.
+                    if let Some((keep_idx, mut remaining)) = self.pending_close_others.take() {
+                        return if remaining.is_empty() {
+                            // All dirty tabs saved — close everything except keep_idx.
+                            self.remove_all_tabs_except(keep_idx);
+                            // Save after removal.
+                            self.save_current_tabs().map_or_else(Task::none, |t| {
+                                Task::batch([
+                                    t,
+                                    Task::done(EditorMessage::Toast(super::ToastMessage::Saved)),
+                                ])
+                            })
+                        } else {
+                            // Save the next dirty tab.
+                            let next = remaining.remove(0);
+                            self.pending_close_others = Some((keep_idx, remaining));
+                            build_save_task(&self.tabs, &self.tab_contents, next)
+                        };
+                    }
+
+                    // Regular save (not from close dialog) — persist clean state.
+                    if let Some(save_task) = self.save_current_tabs() {
+                        save_task
+                    } else {
+                        Task::done(EditorMessage::Toast(super::ToastMessage::Saved))
+                    }
+                }
+                Err(e) => {
+                    self.pending_save_close = None;
+                    self.pending_close_others = None;
+                    let toast = super::ToastMessage::Error(e);
+                    Task::done(EditorMessage::Toast(toast))
+                }
+            },
+
+            EditorMessage::CloseDialog { tab_index, action } => match action {
+                CloseAction::Save => {
+                    if tab_index < self.tabs.len() {
+                        // Clear dialog immediately; close tab after save completes.
+                        self.close_dialog = None;
+                        self.pending_save_close = Some(tab_index);
+
+                        build_save_task(&self.tabs, &self.tab_contents, tab_index)
+                    } else {
+                        self.close_dialog = None;
+                        Task::none()
+                    }
+                }
+                CloseAction::Discard => {
+                    self.close_dialog = None;
+                    self.pending_save_close = None;
+                    if tab_index < self.tabs.len() {
+                        self.remove_tab_at(tab_index);
+                    }
+                    self.save_current_tabs().unwrap_or(Task::none())
+                }
+                CloseAction::Cancel => {
+                    self.close_dialog = None;
+                    self.pending_save_close = None;
+                    Task::none()
+                }
+            },
+
+            EditorMessage::CloseOthersDialog { keep_idx, action } => match action {
+                CloseAction::Save => {
+                    self.close_others_target = None;
+                    // Collect all dirty tabs (excluding keep_idx) to save sequentially.
+                    let mut dirty: Vec<usize> = (0..self.tabs.len())
+                        .filter(|&i| i != keep_idx && self.tabs[i].is_dirty)
+                        .collect();
+                    if dirty.is_empty() {
+                        // Nothing to save — just close the rest and persist.
+                        self.close_others_target = None;
+                        self.remove_all_tabs_except(keep_idx);
+                        return self.save_current_tabs().unwrap_or(Task::none());
+                    }
+                    // Start saving the first dirty tab in the queue.
+                    let first = dirty.remove(0);
+                    self.pending_close_others = Some((keep_idx, dirty));
+                    build_save_task(&self.tabs, &self.tab_contents, first)
+                }
+                CloseAction::Discard => {
+                    self.close_others_target = None;
+                    self.pending_close_others = None;
+                    // Close all tabs except keep_idx, discarding unsaved changes.
+                    self.remove_all_tabs_except(keep_idx);
+                    self.save_current_tabs().unwrap_or(Task::none())
+                }
+                CloseAction::Cancel => {
+                    self.close_others_target = None;
+                    self.pending_close_others = None;
+                    Task::none()
+                }
+            },
+
+            EditorMessage::CloseOtherTabs(idx) => {
+                if idx >= self.tabs.len() {
+                    return Task::none();
+                }
+                // Collect indices of dirty tabs (excluding the kept tab).
+                let dirty: Vec<usize> = (0..self.tabs.len())
+                    .filter(|&i| i != idx && self.tabs[i].is_dirty)
+                    .collect();
+                if dirty.is_empty() {
+                    // No unsaved changes — close immediately and persist.
+                    self.remove_all_tabs_except(idx);
+                    return self.save_current_tabs().unwrap_or(Task::none());
+                }
+                self.close_others_target = Some(idx);
+                Task::none()
+            }
+
+            EditorMessage::Escape => {
+                // Close global search first (before find bar).
+                if self.global_search.is_some() {
+                    self.global_search = None;
+                    return Task::none();
+                }
+                // Close find bar on active tab next, if open.
+                if let Some(idx) = self.active_tab_idx() {
+                    let path = self.tabs[idx].path.clone();
+                    if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                        if tab_data.find_replace_state.is_some() {
+                            tab_data.find_replace_state = None;
+                            return Task::none();
+                        }
+                    }
+                }
+                // Close go-to-line bar.
+                if self.goto_line_input.is_some() {
+                    self.goto_line_input = None;
+                    return Task::none();
+                }
+                // Close quick-open.
+                if self.quick_open.is_some() {
+                    self.quick_open = None;
+                    return Task::none();
+                }
+                // Close new-item input (before tree focus, after quick-open).
+                if self.new_item_input.is_some() {
+                    self.new_item_input = None;
+                    return Task::none();
+                }
+                // Close delete confirmation.
+                if self.delete_confirm.is_some() {
+                    self.delete_confirm = None;
+                    return Task::none();
+                }
+                if self.file_tree.tree_focused {
+                    self.file_tree.tree_focused = false;
+                    self.pending_enter_dir = None;
+                    return Task::none();
+                }
+                self.close_dialog = None;
+                self.close_others_target = None;
+                self.pending_save_close = None;
+                self.pending_close_others = None;
+                Task::none()
+            }
+
+            // ── Go-to-line ────────────────────────────────────────────
+            EditorMessage::GoToLineToggle => {
+                if self.active_tab_idx().is_some() {
+                    if self.goto_line_input.is_some() {
+                        self.goto_line_input = None;
+                    } else {
+                        // Close find bar when opening go-to-line.
+                        if let Some(idx) = self.active_tab_idx() {
+                            let path = self.tabs[idx].path.clone();
+                            if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                                tab_data.find_replace_state = None;
+                            }
+                        }
+                        self.goto_line_input = Some(String::new());
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::GoToLineInput(input) => {
+                // Only keep digits in the input.
+                let digits: String = input.chars().filter(char::is_ascii_digit).collect();
+                self.goto_line_input = Some(digits);
+                Task::none()
+            }
+
+            EditorMessage::GoToLineGo => {
+                let input = match self.goto_line_input.as_ref() {
+                    Some(v) => v.clone(),
+                    None => return Task::none(),
+                };
+                let line_num: usize = match input.parse::<usize>() {
+                    Ok(n) if n > 0 => n.saturating_sub(1), // convert 1-based to 0-based
+                    _ => return Task::none(),
+                };
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    let max_line = tab_data.content.line_count();
+                    let line = line_num.min(max_line.saturating_sub(1));
+                    tab_data.content.move_to(line, 0);
+                }
+                self.goto_line_input = None;
+                Task::none()
+            }
+
+            // ── Global search (find-in-files) ──────────────────────────
+            EditorMessage::GlobalSearchToggle => {
+                if self.global_search.is_some() {
+                    // Close if already open.
+                    self.global_search = None;
+                    return Task::none();
+                }
+                // Close find bar and go-to-line when opening global search.
+                if let Some(idx) = self.active_tab_idx() {
+                    let path = self.tabs[idx].path.clone();
+                    if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                        tab_data.find_replace_state = None;
+                    }
+                }
+                self.goto_line_input = None;
+
+                let ws_path = match self.selected_workspace_path.as_ref() {
+                    Some(p) => p.clone(),
+                    None => return Task::none(),
+                };
+                let ws_name = match self.selected_workspace_name.as_ref() {
+                    Some(n) => n.clone(),
+                    None => return Task::none(),
+                };
+
+                self.global_search_gen = self.global_search_gen.wrapping_add(1);
+                let gs_gen = self.global_search_gen;
+
+                self.global_search = Some(GlobalSearchState {
+                    query: String::new(),
+                    results: Vec::new(),
+                    selected_index: 0,
+                    status: GlobalSearchStatus::Idle,
+                    search_gen: gs_gen,
+                });
+
+                // Start scanning the search engine and show readiness status.
+                let engine_task = Task::perform(
+                    async move {
+                        let ws = crate::Workspace {
+                            name: ws_name,
+                            path: ws_path,
+                            ..Default::default()
+                        };
+                        match crate::search_engine::get_or_init_engine(&ws) {
+                            Ok(entry) => match crate::search_engine::ensure_scanned(&entry).await {
+                                Ok(()) => EditorMessage::GlobalSearchResults {
+                                    r#gen: gs_gen,
+                                    results: Vec::new(),
+                                    error: None,
+                                },
+                                Err(e) => EditorMessage::GlobalSearchResults {
+                                    r#gen: gs_gen,
+                                    results: Vec::new(),
+                                    error: Some(e),
+                                },
+                            },
+                            Err(e) => EditorMessage::GlobalSearchResults {
+                                r#gen: gs_gen,
+                                results: Vec::new(),
+                                error: Some(e),
+                            },
+                        }
+                    },
+                    |msg| msg,
+                );
+
+                // Auto-focus the search input when the panel opens.
+                let focus_task = iced::widget::operation::focus::<EditorMessage>(Id::new(
+                    GLOBAL_SEARCH_INPUT_ID,
+                ));
+
+                Task::batch([engine_task, focus_task])
+            }
+
+            EditorMessage::GlobalSearchInput(query) => {
+                let state = match self.global_search.as_mut() {
+                    Some(s) => s,
+                    None => return Task::none(),
+                };
+                state.query.clone_from(&query);
+
+                if query.is_empty() {
+                    state.status = GlobalSearchStatus::Idle;
+                    state.results.clear();
+                    state.selected_index = 0;
+                    // Increment generation to cancel any in-flight searches.
+                    self.global_search_gen = self.global_search_gen.wrapping_add(1);
+                    state.search_gen = self.global_search_gen;
+                    return Task::none();
+                }
+
+                state.status = GlobalSearchStatus::Searching;
+
+                let ws_path = match self.selected_workspace_path.as_ref() {
+                    Some(p) => p.clone(),
+                    None => return Task::none(),
+                };
+                let ws_name = match self.selected_workspace_name.as_ref() {
+                    Some(n) => n.clone(),
+                    None => return Task::none(),
+                };
+
+                self.global_search_gen = self.global_search_gen.wrapping_add(1);
+                let gs_gen = self.global_search_gen;
+                state.search_gen = gs_gen;
+
+                Task::perform(run_global_search(ws_path, ws_name, query, gs_gen), |msg| {
+                    msg
+                })
+            }
+
+            EditorMessage::GlobalSearchResults {
+                r#gen,
+                results,
+                error,
+            } => {
+                // Stale result? Discard (r#gen is never 0 from the async helper).
+                if r#gen != self.global_search_gen {
+                    return Task::none();
+                }
+
+                let state = match self.global_search.as_mut() {
+                    Some(s) => s,
+                    None => return Task::none(),
+                };
+
+                // Double-check: also discard if state has a newer generation.
+                if state.search_gen != r#gen {
+                    return Task::none();
+                }
+
+                if let Some(err) = error {
+                    state.status = GlobalSearchStatus::Error(err);
+                    state.results.clear();
+                    return Task::none();
+                }
+
+                if results.is_empty() && state.query.is_empty() {
+                    state.status = GlobalSearchStatus::Idle;
+                    return Task::none();
+                }
+
+                if results.is_empty() {
+                    state.status = GlobalSearchStatus::NoResults;
+                    state.results.clear();
+                    state.selected_index = 0;
+                    return Task::none();
+                }
+
+                state.results = results;
+                state.selected_index = 0;
+                state.status = GlobalSearchStatus::Done;
+                Task::none()
+            }
+
+            EditorMessage::GlobalSearchSelect(idx) => {
+                let state = match self.global_search.as_ref() {
+                    Some(s) => s,
+                    None => return Task::none(),
+                };
+                let Some(match_result) = state.results.get(idx) else {
+                    return Task::none();
+                };
+                let abs_path = match_result.abs_path.clone();
+                #[allow(clippy::cast_possible_truncation)]
+                let line_number = match_result.line_number as usize;
+
+                // Close the search panel.
+                self.global_search = None;
+
+                // Open the file and move to the matching line.
+                // Convert from 1-based (grep) to 0-based (editor).
+                let cursor_line = line_number.saturating_sub(1);
+
+                // Check if already open in a tab.
+                if let Some(existing_idx) = self.tabs.iter().position(|t| t.path == abs_path) {
+                    self.active_tab_index = existing_idx;
+                    if let Some(tab_data) = self.tab_contents.get_mut(&abs_path) {
+                        let max_line = tab_data.content.line_count();
+                        let line = cursor_line.min(max_line.saturating_sub(1));
+                        tab_data.content.move_to(line, 0);
+                    }
+                    return self.scroll_to_active_tab();
+                }
+
+                // File not open — load it, then jump after loading.
+                // Set pending_goto so FileLoaded handler moves the cursor.
+                // Use self.generation.wrapping_add(1) to match the generation
+                // that open_file_in_editor will assign (line 1612).
+                let file_gen = self.generation.wrapping_add(1);
+                self.pending_goto = Some((abs_path.clone(), line_number, file_gen));
+                self.open_file_in_editor(&abs_path)
+            }
+
+            EditorMessage::GlobalSearchClose => {
+                self.global_search = None;
+                Task::none()
+            }
+
+            // ── Context menu actions ─────────────────────────────────
+            EditorMessage::DeleteFileRequested(path) => {
+                let Some(ref ws) = self.selected_workspace_path else {
+                    return Task::none();
+                };
+                let abs_path = Path::new(ws).join(&path).to_string_lossy().to_string();
+                self.delete_confirm = Some(DeleteConfirmTarget {
+                    path,
+                    is_dir: false,
+                    dirty_tab_count: 0,
+                    abs_path,
+                });
+                Task::none()
+            }
+
+            EditorMessage::DeleteDirectoryRequested(path) => {
+                // Guard: don't allow deleting the root directory.
+                if path.is_empty() {
+                    return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
+                        "Cannot delete root directory".into(),
+                    )));
+                }
+                let Some(ref ws) = self.selected_workspace_path else {
+                    return Task::none();
+                };
+                let abs_path = Path::new(ws).join(&path).to_string_lossy().to_string();
+                let abs_prefix = format!("{abs_path}/");
+
+                // Count open tabs that are inside this directory.
+                let mut dirty_count = 0;
+                for tab in &self.tabs {
+                    if tab.path.starts_with(&abs_prefix) {
+                        if tab.is_dirty {
+                            dirty_count += 1;
+                        }
+                    }
+                }
+
+                self.delete_confirm = Some(DeleteConfirmTarget {
+                    path,
+                    is_dir: true,
+                    dirty_tab_count: dirty_count,
+                    abs_path,
+                });
+                Task::none()
+            }
+
+            EditorMessage::NewFileRequested(parent_dir) => {
+                let Some(ref ws) = self.selected_workspace_path else {
+                    return Task::none();
+                };
+                let abs_parent = if parent_dir.is_empty() {
+                    ws.clone()
+                } else {
+                    Path::new(ws)
+                        .join(&parent_dir)
+                        .to_string_lossy()
+                        .to_string()
+                };
+                self.new_item_input = Some(NewItemTarget {
+                    parent_dir,
+                    is_dir: false,
+                    abs_parent,
+                    ws_root: ws.clone(),
+                    input_text: String::new(),
+                });
+                Task::none()
+            }
+
+            EditorMessage::NewDirectoryRequested(parent_dir) => {
+                let Some(ref ws) = self.selected_workspace_path else {
+                    return Task::none();
+                };
+                let abs_parent = if parent_dir.is_empty() {
+                    ws.clone()
+                } else {
+                    Path::new(ws)
+                        .join(&parent_dir)
+                        .to_string_lossy()
+                        .to_string()
+                };
+                self.new_item_input = Some(NewItemTarget {
+                    parent_dir,
+                    is_dir: true,
+                    abs_parent,
+                    ws_root: ws.clone(),
+                    input_text: String::new(),
+                });
+                Task::none()
+            }
+
+            EditorMessage::RevealInFinder(path) => Self::perform_reveal_in_finder(path),
+
+            EditorMessage::CopyRelativePath(path) => iced::clipboard::write(path),
+
+            EditorMessage::CopyAbsolutePath(path) => iced::clipboard::write(path),
+
+            EditorMessage::ConfirmDelete => {
+                let Some(target) = self.delete_confirm.clone() else {
+                    return Task::none();
+                };
+                self.delete_confirm = None;
+                if target.is_dir {
+                    self.perform_dir_delete(&target)
+                } else {
+                    self.perform_file_delete(&target)
+                }
+            }
+
+            EditorMessage::CancelDelete => {
+                self.delete_confirm = None;
+                Task::none()
+            }
+
+            EditorMessage::NewItemSubmit(name) => {
+                let Some(target) = self.new_item_input.clone() else {
+                    return Task::none();
+                };
+                let trimmed = name.trim();
+                if trimmed.is_empty()
+                    || trimmed.contains('/')
+                    || trimmed.contains('\0')
+                    || trimmed == "."
+                    || trimmed == ".."
+                {
+                    return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
+                        "Invalid name".into(),
+                    )));
+                }
+                self.new_item_input = None;
+                self.perform_create_item(&target, trimmed)
+            }
+
+            EditorMessage::NewItemInput(new_text) => {
+                if let Some(ref mut target) = self.new_item_input {
+                    target.input_text = new_text;
+                }
+                Task::none()
+            }
+
+            EditorMessage::RevealDone => Task::none(),
+
+            // ── Quick-open file picker ────────────────────────────────
+            EditorMessage::QuickOpenToggle => {
+                if self.quick_open.is_some() {
+                    self.quick_open = None;
+                    return Task::none();
+                }
+
+                // Refresh file list from all currently expanded directories.
+                self.scan_all_workspace_files();
+
+                self.quick_open = Some(QuickOpenState {
+                    filter: String::new(),
+                    selected_index: 0,
+                    results: Vec::new(),
+                });
+                Task::none()
+            }
+
+            EditorMessage::QuickOpenInput(filter) => {
+                let results = self.filter_workspace_files(&filter);
+                if let Some(ref mut qo) = self.quick_open {
+                    qo.filter = filter;
+                    qo.results = results;
+                    qo.selected_index = 0;
+                }
+                Task::none()
+            }
+
+            EditorMessage::QuickOpenSelect(idx) => {
+                let result_path = self
+                    .quick_open
+                    .as_ref()
+                    .and_then(|qo| qo.results.get(idx).cloned());
+                self.quick_open = None;
+                if let Some(path) = result_path {
+                    return self.open_file_in_editor(&path);
+                }
+                Task::none()
+            }
+
+            // ── Tab switching ─────────────────────────────────────────
+            EditorMessage::TabSwitchNext => {
+                if self.tabs.len() > 1 {
+                    let new_idx = (self.active_tab_index + 1) % self.tabs.len();
+                    return self.switch_to_tab(new_idx);
+                }
+                Task::none()
+            }
+
+            EditorMessage::TabSwitchPrev => {
+                if self.tabs.len() > 1 {
+                    let new_idx = if self.active_tab_index == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        self.active_tab_index - 1
+                    };
+                    return self.switch_to_tab(new_idx);
+                }
+                Task::none()
+            }
+
+            EditorMessage::CloseActiveTab => {
+                let idx = self.active_tab_index;
+                if idx < self.tabs.len() {
+                    return self.close_tab_at(idx);
+                }
+                Task::none()
+            }
+
+            // ── Tree keyboard navigation ─────────────────────────────
+            EditorMessage::TreeFocusToggled => {
+                self.file_tree.tree_focused = !self.file_tree.tree_focused;
+                if self.file_tree.tree_focused && self.file_tree.visible_tree_nodes.is_empty() {
+                    self.file_tree.rebuild_visible();
+                }
+                if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
+                    self.file_tree.tree_focused = false;
+                    self.pending_enter_dir = None;
+                }
+                Task::none()
+            }
+
+            EditorMessage::TreeNavUp => {
+                // When global search is active, navigate the results list.
+                if let Some(ref mut gs) = self.global_search {
+                    if gs.selected_index > 0 {
+                        gs.selected_index -= 1;
+                    }
+                    return Task::none();
+                }
+                // When quick-open is active, navigate the results list.
+                if let Some(ref mut qo) = self.quick_open {
+                    if qo.selected_index > 0 {
+                        qo.selected_index -= 1;
+                    }
+                    return Task::none();
+                }
+                if self.file_tree.tree_focused && self.file_tree.tree_focus_index > 0 {
+                    self.file_tree.tree_focus_index -= 1;
+                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                }
+                Task::none()
+            }
+
+            EditorMessage::TreeNavDown => {
+                // When global search is active, navigate the results list.
+                if let Some(ref mut gs) = self.global_search {
+                    if gs.selected_index + 1 < gs.results.len() {
+                        gs.selected_index += 1;
+                    }
+                    return Task::none();
+                }
+                // When quick-open is active, navigate the results list.
+                if let Some(ref mut qo) = self.quick_open {
+                    if qo.selected_index + 1 < qo.results.len() {
+                        qo.selected_index += 1;
+                    }
+                    return Task::none();
+                }
+                if self.file_tree.tree_focused
+                    && self.file_tree.tree_focus_index + 1 < self.file_tree.visible_tree_nodes.len()
+                {
+                    self.file_tree.tree_focus_index += 1;
+                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                }
+                Task::none()
+            }
+
+            EditorMessage::TreeNavEnter => {
+                // When global search is active, Enter selects the highlighted result.
+                // Borrow to extract the index without cloning the entire state.
+                if let Some(gs) = self.global_search.as_ref() {
+                    let idx = gs.selected_index.min(gs.results.len().saturating_sub(1));
+                    return Task::done(EditorMessage::GlobalSearchSelect(idx));
+                }
+                // When quick-open is active, Enter selects the highlighted file.
+                if let Some(ref qo) = self.quick_open.clone() {
+                    let idx = qo.selected_index.min(qo.results.len().saturating_sub(1));
+                    return Task::done(EditorMessage::QuickOpenSelect(idx));
+                }
+                if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
+                    return Task::none();
+                }
+                let idx = self
+                    .file_tree
+                    .tree_focus_index
+                    .min(self.file_tree.visible_tree_nodes.len() - 1);
+                let (ref path, is_dir) = self.file_tree.visible_tree_nodes[idx];
+                if is_dir {
+                    // Expand directory and move focus to the first child.
+                    if self.file_tree.expanded_dirs.contains(path) {
+                        // Collapse: remove from expanded, rebuild, keep focus.
+                        self.file_tree.expanded_dirs.remove(path);
+                        self.rebuild_tree();
+                        return Task::none();
+                    }
+                    // Expand: insert, rebuild, jump to first child.
+                    self.file_tree.expanded_dirs.insert(path.clone());
+                    let mut task = Task::none();
+                    let needs_async_load = !self.dir_entries.contains_key(path);
+                    if needs_async_load {
+                        let Some(ref ws_path) = self.selected_workspace_path else {
+                            tracing::error!("TreeNavEnter without workspace selected");
+                            return Task::none();
+                        };
+                        let dir_gen = self.generation.wrapping_add(1);
+                        self.generation = dir_gen;
+                        self.dir_generations.insert(path.clone(), dir_gen);
+                        self.loading_dirs.insert(path.clone());
+                        let d_path = path.clone();
+                        let r_path = ws_path.clone();
+                        task = Task::perform(
+                            async move {
+                                let entries = read_directory_entries(&r_path, &d_path).await;
+                                EditorMessage::DirExpanded {
+                                    dir_path: d_path,
+                                    r#gen: dir_gen,
+                                    entries,
+                                    quiet: false,
+                                }
+                            },
+                            |msg| msg,
+                        );
+                        // Remember to advance focus to first child after async load.
+                        self.pending_enter_dir = Some(path.clone());
+                    }
+                    self.rebuild_tree();
+                    if needs_async_load {
+                        // Children not loaded yet — keep focus on directory,
+                        // DirExpanded will advance focus when data arrives.
+                        return task;
+                    }
+                    // Synchronous expansion — children available immediately.
+                    // Move focus to the first child (right after the directory).
+                    if idx + 1 < self.file_tree.visible_tree_nodes.len() {
+                        self.file_tree.tree_focus_index = idx + 1;
+                        return Task::batch([widgets::scroll_to_tree_focus(&self.file_tree), task]);
+                    }
+                    // No children — keep focus on directory.
+                    return task;
+                }
+                // Open file.
+                Task::done(EditorMessage::SelectFile(path.clone()))
+            }
+
+            EditorMessage::TreeNavLeft => {
+                if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
+                    return Task::none();
+                }
+                let idx = self
+                    .file_tree
+                    .tree_focus_index
+                    .min(self.file_tree.visible_tree_nodes.len() - 1);
+                let path = self.file_tree.visible_tree_nodes[idx].0.clone();
+                let is_dir = self.file_tree.visible_tree_nodes[idx].1;
+
+                if is_dir && self.file_tree.expanded_dirs.contains(&path) {
+                    // Collapse expanded directory and keep focus on it.
+                    self.file_tree.expanded_dirs.remove(&path);
+                    self.rebuild_tree();
+                    if let Some(pos) = self
+                        .file_tree
+                        .visible_tree_nodes
+                        .iter()
+                        .position(|(p, _)| p == &path)
+                    {
+                        self.file_tree.tree_focus_index = pos;
+                        return widgets::scroll_to_tree_focus(&self.file_tree);
+                    }
+                    return Task::none();
+                }
+
+                // ArrowLeft on collapsed directory or file — navigate to parent.
+                let parent = Path::new(&path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string());
+                match parent {
+                    Some(ref p) if !p.is_empty() => {
+                        if let Some(parent_idx) = self
+                            .file_tree
+                            .visible_tree_nodes
+                            .iter()
+                            .position(|(vp, _)| vp == p)
+                        {
+                            self.file_tree.tree_focus_index = parent_idx;
+                            return widgets::scroll_to_tree_focus(&self.file_tree);
+                        }
+                    }
+                    _ => {} // Root-level item has no parent — no-op.
+                }
+                Task::none()
+            }
+
+            EditorMessage::TreeNavRight => {
+                if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
+                    return Task::none();
+                }
+                let idx = self
+                    .file_tree
+                    .tree_focus_index
+                    .min(self.file_tree.visible_tree_nodes.len() - 1);
+                let path = self.file_tree.visible_tree_nodes[idx].0.clone();
+                let is_dir = self.file_tree.visible_tree_nodes[idx].1;
+
+                if !is_dir {
+                    // ArrowRight on a file does nothing.
+                    return Task::none();
+                }
+
+                if !self.file_tree.expanded_dirs.contains(&path) {
+                    // Expand directory and move focus to first child.
+                    self.file_tree.expanded_dirs.insert(path.clone());
+                    let mut task = Task::none();
+                    let needs_async_load = !self.dir_entries.contains_key(&path);
+                    if needs_async_load {
+                        let Some(ref ws_path) = self.selected_workspace_path else {
+                            tracing::error!("TreeNavRight without workspace selected");
+                            return Task::none();
+                        };
+                        let dir_gen = self.generation.wrapping_add(1);
+                        self.generation = dir_gen;
+                        self.dir_generations.insert(path.clone(), dir_gen);
+                        self.loading_dirs.insert(path.clone());
+                        let d_path = path.clone();
+                        let r_path = ws_path.clone();
+                        task = Task::perform(
+                            async move {
+                                let entries = read_directory_entries(&r_path, &d_path).await;
+                                EditorMessage::DirExpanded {
+                                    dir_path: d_path,
+                                    r#gen: dir_gen,
+                                    entries,
+                                    quiet: false,
+                                }
+                            },
+                            |msg| msg,
+                        );
+                        // DirExpanded will advance focus to first child.
+                        self.pending_enter_dir = Some(path.clone());
+                    }
+                    self.rebuild_tree();
+                    if needs_async_load {
+                        // Keep focus on directory until async load completes.
+                        return task;
+                    }
+                    // Synchronous expansion — children available now.
+                    if let Some(dir_idx) = self
+                        .file_tree
+                        .visible_tree_nodes
+                        .iter()
+                        .position(|(p, _)| p == &path)
+                    {
+                        if dir_idx + 1 < self.file_tree.visible_tree_nodes.len() {
+                            self.file_tree.tree_focus_index = dir_idx + 1;
+                            return Task::batch([
+                                widgets::scroll_to_tree_focus(&self.file_tree),
+                                task,
+                            ]);
+                        }
+                    }
+                    // No children — keep focus on directory.
+                    return task;
+                }
+
+                // Already expanded directory — move focus to first child (if any).
+                if idx + 1 < self.file_tree.visible_tree_nodes.len() {
+                    self.file_tree.tree_focus_index = idx + 1;
+                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                }
+                Task::none()
+            }
+
+            EditorMessage::Undo => {
+                if self.is_find_bar_open() {
+                    // Cmd+Z in the find bar's text input should undo within
+                    // the text field, not undo the editor. Bail when find bar
+                    // is open so the text_input handles Cmd+Z internally.
+                    Task::none()
+                } else {
+                    self.apply_undo_or_redo(false)
+                }
+            }
+            EditorMessage::Redo => {
+                if self.is_find_bar_open() {
+                    Task::none()
+                } else {
+                    self.apply_undo_or_redo(true)
+                }
+            }
+
+            EditorMessage::FindToggle => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    if tab_data.find_replace_state.is_none() {
+                        // Open find bar with current selection as default query.
+                        let default_query = tab_data.content.selection().unwrap_or_default();
+                        let mut state = FindReplaceState {
+                            query: default_query,
+                            replace: String::new(),
+                            matches: Vec::new(),
+                            current_match_idx: 0,
+                            case_sensitive: false,
+                        };
+                        // Compute matches if query is non-empty.
+                        if !state.query.is_empty() {
+                            let text = tab_data.content.text();
+                            state.matches =
+                                compute_text_matches(&text, &state.query, state.case_sensitive);
+                            // Auto-jump to first match.
+                            auto_jump_to_first_match(&mut tab_data.content, &mut state);
+                        }
+                        // Close go-to-line when opening find bar (mutually exclusive).
+                        self.goto_line_input = None;
+                        tab_data.find_replace_state = Some(state);
+                    }
+                    // Already open — re-focus the search input (no state change needed).
+                }
+                // Always focus the search input when FindToggle is pressed.
+                iced::widget::operation::focus::<EditorMessage>(Id::new(FIND_SEARCH_ID))
+            }
+
+            EditorMessage::FindQueryInput(query) => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    if let Some(ref mut state) = tab_data.find_replace_state {
+                        state.query = query;
+                        let text = tab_data.content.text();
+                        state.matches =
+                            compute_text_matches(&text, &state.query, state.case_sensitive);
+                        auto_jump_to_first_match(&mut tab_data.content, state);
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::FindReplaceInput(replace) => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    if let Some(ref mut state) = tab_data.find_replace_state {
+                        state.replace = replace;
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::FindNext => {
+                self.navigate_find_match(&FindDirection::Next);
+                Task::none()
+            }
+
+            EditorMessage::FindPrev => {
+                self.navigate_find_match(&FindDirection::Prev);
+                Task::none()
+            }
+
+            EditorMessage::FindReplace => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    if let Some(ref state) = tab_data.find_replace_state {
+                        if let Some(range) = state.matches.get(state.current_match_idx) {
+                            let replace_text = state.replace.clone();
+                            let replace_end = range.start + replace_text.len();
+                            if !replace_text.is_empty() || range.start < range.end {
+                                // Take undo snapshot.
+                                tab_data
+                                    .undo_stack
+                                    .borrow_mut()
+                                    .snap_before_edit(&tab_data.content);
+                                let text = tab_data.content.text();
+                                let new_text = format!(
+                                    "{}{}{}",
+                                    &text[..range.start],
+                                    replace_text,
+                                    &text[range.end..]
+                                );
+                                tab_data.content = EditorBuffer::with_text(
+                                    &new_text,
+                                    HighlightLanguage::from_path(&path),
+                                );
+                                tab_data.content.set_file_extension(
+                                    std::path::Path::new(&path)
+                                        .extension()
+                                        .and_then(|e| e.to_str()),
+                                );
+                                if let Some(tab) = self.tabs.get_mut(idx) {
+                                    let current_hash = hash_text(&new_text);
+                                    tab.is_dirty = current_hash != tab_data.saved_text_hash;
+                                }
+                                // Recompute matches and auto-advance to next match.
+                                if let Some(ref mut state) = tab_data.find_replace_state {
+                                    state.matches = compute_text_matches(
+                                        &new_text,
+                                        &state.query,
+                                        state.case_sensitive,
+                                    );
+                                    if !state.matches.is_empty() {
+                                        // Advance to the next match starting at or
+                                        // after the end of the replacement in the
+                                        // new text (position = range.start + len(replace_text)).
+                                        // Using a position in the old text (range.end)
+                                        // would be wrong when replacement length differs
+                                        // from the original match length.
+                                        let next_idx = state
+                                            .matches
+                                            .iter()
+                                            .position(|m| m.start >= replace_end)
+                                            .unwrap_or(0)
+                                            .min(state.matches.len() - 1);
+                                        state.current_match_idx = next_idx;
+                                        // Position cursor at the new match.
+                                        if let Some(r) = state.matches.get(next_idx) {
+                                            if let Some((line, col)) = byte_offset_to_cursor_pos(
+                                                &tab_data.content,
+                                                r.start,
+                                            ) {
+                                                tab_data.content.move_to(line, col);
+                                            }
+                                        }
+                                    } else {
+                                        state.current_match_idx = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::FindReplaceAll => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                let mut toast = None;
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    if let Some(ref state) = tab_data.find_replace_state {
+                        if !state.matches.is_empty() {
+                            // Take undo snapshot.
+                            tab_data
+                                .undo_stack
+                                .borrow_mut()
+                                .snap_before_edit(&tab_data.content);
+                            let text = tab_data.content.text();
+                            let replace = &state.replace;
+                            // Replace all in reverse order to preserve positions.
+                            let mut new_text = text.clone();
+                            for range in state.matches.iter().rev() {
+                                new_text.replace_range(range.start..range.end, replace);
+                            }
+                            tab_data.content = EditorBuffer::with_text(
+                                &new_text,
+                                HighlightLanguage::from_path(&path),
+                            );
+                            tab_data.content.set_file_extension(
+                                std::path::Path::new(&path)
+                                    .extension()
+                                    .and_then(|e| e.to_str()),
+                            );
+                            if let Some(tab) = self.tabs.get_mut(idx) {
+                                let current_hash = hash_text(&new_text);
+                                tab.is_dirty = current_hash != tab_data.saved_text_hash;
+                            }
+                            // Clear matches since they're all replaced.
+                            if let Some(ref mut state) = tab_data.find_replace_state {
+                                state.matches.clear();
+                                state.current_match_idx = 0;
+                            }
+                            toast = Some(EditorMessage::Toast(super::ToastMessage::SuccessMsg(
+                                "All matches replaced".to_string(),
+                            )));
+                        }
+                    }
+                }
+                if let Some(t) = toast {
+                    Task::done(t)
+                } else {
+                    Task::none()
+                }
+            }
+
+            EditorMessage::FindToggleCaseSensitivity => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                let path = self.tabs[idx].path.clone();
+                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                    if let Some(ref mut state) = tab_data.find_replace_state {
+                        state.case_sensitive = !state.case_sensitive;
+                        // Recompute matches with new case sensitivity.
+                        let text = tab_data.content.text();
+                        state.matches =
+                            compute_text_matches(&text, &state.query, state.case_sensitive);
+                        auto_jump_to_first_match(&mut tab_data.content, state);
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::RefreshFileTree => {
+                let Some(ref ws_path) = self.selected_workspace_path.clone() else {
+                    return Task::none();
+                };
+
+                // Collect directories to refresh: root + all expanded dirs.
+                let mut dirs_to_refresh: Vec<String> = Vec::new();
+
+                // Root directory (empty string) is always included — it's
+                // implicitly expanded and not tracked in expanded_dirs.
+                dirs_to_refresh.push(String::new());
+
+                // All manually expanded directories.
+                dirs_to_refresh.extend(self.file_tree.expanded_dirs.iter().cloned());
+
+                // Filter out directories currently being loaded by the user
+                // (e.g., from a ToggleDir or TreeNavEnter action). This avoids
+                // racing user-initiated async loads. Generation counters also
+                // protect against races, but skipping in-flight dirs avoids
+                // wasted I/O.
+                dirs_to_refresh.retain(|d| !self.loading_dirs.contains(d));
+
+                if dirs_to_refresh.is_empty() {
+                    return Task::none();
+                }
+
+                let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                let root_path = ws_path.clone();
+
+                for dir_path in dirs_to_refresh {
+                    let dir_gen = self.generation.wrapping_add(1);
+                    self.generation = dir_gen;
+                    self.dir_generations.insert(dir_path.clone(), dir_gen);
+                    // NOTE: deliberately NOT adding to `loading_dirs` — this
+                    // avoids a "Loading…" flicker for every expanded directory
+                    // on every background refresh. The tree silently updates
+                    // when results arrive via DirExpanded.
+
+                    let d_path = dir_path.clone();
+                    let r_path = root_path.clone();
+                    tasks.push(Task::perform(
+                        async move {
+                            let entries = read_directory_entries(&r_path, &d_path).await;
+                            EditorMessage::DirExpanded {
+                                dir_path: d_path,
+                                r#gen: dir_gen,
+                                entries,
+                                quiet: true,
+                            }
+                        },
+                        |msg| msg,
+                    ));
+                }
+
+                // Kick off a git status refresh so newly discovered files
+                // get their git status colors without waiting for the next Tick.
+                if !self.git_status_loading {
+                    self.git_status_loading = true;
+                    let path = root_path.clone();
+                    tasks.push(Task::perform(
+                        async move { load_git_status(path).await },
+                        EditorMessage::GitStatusLoaded,
+                    ));
+                }
+
+                Task::batch(tasks)
+            }
+
+            EditorMessage::Tick => {
+                // Refresh git status and gitignore for file tree coloring.
+                if let Some(ref ws_path) = self.selected_workspace_path {
+                    let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+
+                    if !self.git_status_loading {
+                        self.git_status_loading = true;
+                        let path = ws_path.clone();
+                        tasks.push(Task::perform(
+                            async move { load_git_status(path).await },
+                            EditorMessage::GitStatusLoaded,
+                        ));
+                    }
+
+                    if !self.git_ignore_loading {
+                        self.git_ignore_loading = true;
+                        let path = ws_path.clone();
+                        let tree_paths = collect_tree_paths(&self.file_tree.nodes);
+                        tasks.push(Task::perform(
+                            async move { load_git_ignore(path, tree_paths).await },
+                            EditorMessage::GitIgnoredLoaded,
+                        ));
+                    }
+
+                    Task::batch(tasks)
+                } else {
+                    Task::none()
+                }
+            }
+
+            EditorMessage::BlinkTick => {
+                // Increment the blink generation counter to force Iced
+                // to redraw the editor widget. Iced 0.14 may skip redrawing
+                // unchanged widgets when only request_redraw_at is used;
+                // this counter ensures the widget is re-evaluated on each
+                // BlinkTick (every 100 ms), keeping the cursor blink alive
+                // even if the RedrawRequested chain breaks.
+                self.blink_gen = self.blink_gen.wrapping_add(1);
+                Task::none()
+            }
+
+            EditorMessage::GitStatusLoaded(result) => {
+                self.git_status_loading = false;
+                match result {
+                    Ok(cache) => {
+                        self.git_status_cache = cache;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load git status: {e}");
+                        self.git_status_cache.clear();
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::GitIgnoredLoaded(result) => {
+                self.git_ignore_loading = false;
+                match result {
+                    Ok(cache) => {
+                        self.git_ignore_cache = cache;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load git ignore status: {e}");
+                        self.git_ignore_cache.clear();
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::TabsSaved(saved_gen) => {
+                if saved_gen != self.tab_save_generation {
+                    return Task::none();
+                }
+                Task::none()
+            }
+
+            EditorMessage::CheckFileChanges => {
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                // Only auto-refresh tabs that are not dirty.
+                if self.tabs[idx].is_dirty {
+                    return Task::none();
+                }
+                let path = self.tabs[idx].path.clone();
+
+                let current_mtime = if let Ok(meta) = std::fs::metadata(&path) {
+                    meta.modified().ok()
+                } else {
+                    // File doesn't exist (deleted or moved).
+                    if !self.deleted_file_toasted.contains(&path) {
+                        self.deleted_file_toasted.insert(path);
+                        return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
+                            format!("File was deleted: {}", self.tabs[idx].file_name),
+                        )));
+                    }
+                    return Task::none();
+                };
+
+                // File exists — if it was previously reported as deleted,
+                // clear that flag (file has been recreated).
+                self.deleted_file_toasted.remove(&path);
+
+                let Some(current_mtime) = current_mtime else {
+                    // Cannot determine mtime on this platform — skip.
+                    return Task::none();
+                };
+
+                let stored_mtime = if let Some(m) = self.file_mtimes.get(&path) {
+                    *m
+                } else {
+                    // No stored mtime yet — record it now and skip.
+                    self.file_mtimes.insert(path, current_mtime);
+                    return Task::none();
+                };
+
+                // Only re-read if mtime actually changed.
+                if current_mtime == stored_mtime {
+                    return Task::none();
+                }
+
+                // Mtime changed — capture cursor position and reload async.
+                let cursor = if let Some(tab_data) = self.tab_contents.get(&path) {
+                    tab_data.content.cursor()
+                } else {
+                    return Task::none();
+                };
+
+                // Start the async read.
+                Task::perform(
+                    async move {
+                        match tokio::fs::read_to_string(&path).await {
+                            Ok(text) => {
+                                // Apply size/binary checks matching load_file_data.
+                                let bytes = text.as_bytes();
+                                if (bytes.len() as u64) > MAX_FILE_SIZE {
+                                    EditorMessage::FileReloaded {
+                                        path,
+                                        result: Err(format!(
+                                            "File too large ({} bytes, max {MAX_FILE_SIZE})",
+                                            bytes.len()
+                                        )),
+                                        cursor_line: cursor.line,
+                                        cursor_col: cursor.column,
+                                    }
+                                } else if bytes.contains(&0) {
+                                    EditorMessage::FileReloaded {
+                                        path,
+                                        result: Err("Binary file detected (contains null bytes)"
+                                            .to_string()),
+                                        cursor_line: cursor.line,
+                                        cursor_col: cursor.column,
+                                    }
+                                } else {
+                                    EditorMessage::FileReloaded {
+                                        path,
+                                        result: Ok(text),
+                                        cursor_line: cursor.line,
+                                        cursor_col: cursor.column,
+                                    }
+                                }
+                            }
+                            Err(e) => EditorMessage::FileReloaded {
+                                path,
+                                result: Err(format!("Cannot read file: {e}")),
+                                cursor_line: cursor.line,
+                                cursor_col: cursor.column,
+                            },
+                        }
+                    },
+                    |msg| msg,
+                )
+            }
+
+            EditorMessage::FileReloaded {
+                path,
+                result,
+                cursor_line,
+                cursor_col,
+            } => {
+                // Guard: the tab must still be the active one and not dirty.
+                let Some(idx) = self.active_tab_idx() else {
+                    return Task::none();
+                };
+                if self.tabs[idx].path != path || self.tabs[idx].is_dirty {
+                    return Task::none();
+                }
+
+                match result {
+                    Ok(text) => {
+                        let language = HighlightLanguage::from_path(&path);
+                        let has_trailing = text.ends_with('\n');
+                        let line_ending = detect_line_ending(text.as_bytes());
+
+                        // Update tab metadata.
+                        if let Some(tab) = self.tabs.get_mut(idx) {
+                            tab.is_dirty = false;
+                            tab.has_trailing_newline = has_trailing;
+                            tab.line_ending = line_ending;
+                        }
+
+                        // Replace content, preserving cursor position (clamped).
+                        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                            // Clear find/replace state — match byte ranges are now stale.
+                            tab_data.find_replace_state = None;
+                            tab_data.content = EditorBuffer::with_text(&text, language);
+                            tab_data.content.set_file_extension(
+                                std::path::Path::new(&path)
+                                    .extension()
+                                    .and_then(|e| e.to_str()),
+                            );
+                            // Restore cursor, clamped to new file bounds.
+                            tab_data.content.move_to(cursor_line, cursor_col);
+                            // Clear undo stack — new content didn't come from user edits.
+                            *tab_data.undo_stack.borrow_mut() = UndoStack::new();
+                            tab_data.saved_text_hash = hash_text(&text);
+                        }
+
+                        // Update stored mtime.
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if let Ok(mtime) = meta.modified() {
+                                self.file_mtimes.insert(path, mtime);
+                            }
+                        }
+                        Task::none()
+                    }
+                    Err(e) => {
+                        // If the file can no longer be read, don't spam.
+                        // Update the stored mtime so the next tick matches
+                        // and won't retry every 300 ms.
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if let Ok(mtime) = meta.modified() {
+                                self.file_mtimes.insert(path.clone(), mtime);
+                            }
+                        }
+                        Task::done(EditorMessage::Toast(super::ToastMessage::Warning(e)))
+                    }
+                }
+            }
+
+            EditorMessage::Toast(_) => Task::none(),
+        }
+    }
+
+    /// Navigate to the next or previous find match in the active tab.
+    /// Returns silently if there is no active tab, no find state, or no matches.
+    fn navigate_find_match(&mut self, direction: &FindDirection) {
+        let Some(idx) = self.active_tab_idx() else {
+            return;
+        };
+        let path = self.tabs[idx].path.clone();
+        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+            if let Some(ref mut state) = tab_data.find_replace_state {
+                if !state.matches.is_empty() {
+                    let new_idx = match direction {
+                        FindDirection::Next => (state.current_match_idx + 1) % state.matches.len(),
+                        FindDirection::Prev => {
+                            if state.current_match_idx == 0 {
+                                state.matches.len().saturating_sub(1)
+                            } else {
+                                state.current_match_idx - 1
+                            }
+                        }
+                    };
+                    state.current_match_idx = new_idx;
+                    if let Some(range) = state.matches.get(new_idx) {
+                        if let Some((line, col)) =
+                            byte_offset_to_cursor_pos(&tab_data.content, range.start)
+                        {
+                            tab_data.content.move_to(line, col);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, EditorMessage> {
+        // ── No workspace selected — placeholder ──────────────────────
+        if self.selected_workspace_name.is_none() {
+            let placeholder = container(
+                text("No workspace selected")
+                    .size(24)
+                    .color(theme::TEXT_MUTED)
+                    .font(theme::FONT_BOLD),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+
+            return placeholder.into();
+        }
+
+        // ── Split layout ─────────────────────────────────────────────
+        let tree_panel = self.build_tree_panel();
+        let editor_panel = self.build_editor_panel();
+
+        let split = row![tree_panel, editor_panel]
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        // ── Close dialog overlay ─────────────────────────────────────
+        let dialog = self.close_dialog.map(|(tab_idx, _)| {
+            let on_save = EditorMessage::CloseDialog {
+                tab_index: tab_idx,
+                action: CloseAction::Save,
+            };
+            let on_discard = EditorMessage::CloseDialog {
+                tab_index: tab_idx,
+                action: CloseAction::Discard,
+            };
+            let on_cancel = EditorMessage::CloseDialog {
+                tab_index: tab_idx,
+                action: CloseAction::Cancel,
+            };
+            Self::build_close_dialog(
+                on_save,
+                on_discard,
+                on_cancel,
+                "This file has unsaved changes. What would you like to do?".to_string(),
+            )
+        });
+
+        let close_others_overlay = self.close_others_target.map(|keep_idx| {
+            let dirty_count = self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(i, t)| *i != keep_idx && t.is_dirty)
+                .count();
+            let desc = if dirty_count == 1 {
+                "1 file has unsaved changes. What would you like to do?".to_string()
+            } else {
+                format!("{dirty_count} files have unsaved changes. What would you like to do?")
+            };
+            let on_save = EditorMessage::CloseOthersDialog {
+                keep_idx,
+                action: CloseAction::Save,
+            };
+            let on_discard = EditorMessage::CloseOthersDialog {
+                keep_idx,
+                action: CloseAction::Discard,
+            };
+            let on_cancel = EditorMessage::CloseOthersDialog {
+                keep_idx,
+                action: CloseAction::Cancel,
+            };
+            Self::build_close_dialog(on_save, on_discard, on_cancel, desc)
+        });
+
+        // ── Quick-open overlay ────────────────────────────────────────
+        let quick_open_overlay = self
+            .quick_open
+            .as_ref()
+            .map(|qo| Self::build_quick_open_overlay(qo));
+
+        // ── Global search overlay ─────────────────────────────────────
+        let global_search_overlay = self
+            .global_search
+            .as_ref()
+            .map(|gs| Self::build_global_search_overlay(gs));
+
+        // ── Delete confirmation overlay ──────────────────────────────
+        let delete_overlay = self
+            .delete_confirm
+            .as_ref()
+            .map(|target| Self::build_delete_confirm_dialog(target));
+
+        // ── New item name input overlay ──────────────────────────────
+        let new_item_overlay = self
+            .new_item_input
+            .as_ref()
+            .map(|target| Self::build_new_item_input(target));
+
+        // ── Assemble ─────────────────────────────────────────────────
+        let col_children: Vec<Element<'_, EditorMessage>> = vec![split.into()];
+
+        let body = column(col_children)
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        // Keep Stack widget type stable — a Column→Stack type change between frames
+        // destroys widget state (scroll positions, ContextMenu overlay states),
+        // causing stale overlay-to-tab associations. Always return a Stack
+        // with a zero-size placeholder when no overlay is present.
+        let placeholder: Element<'_, EditorMessage> = container(text(""))
+            .width(Length::Shrink)
+            .height(Length::Shrink)
+            .into();
+        let overlay = dialog
+            .or(close_others_overlay)
+            .or(global_search_overlay)
+            .or(quick_open_overlay)
+            .or(new_item_overlay)
+            .or(delete_overlay)
+            .unwrap_or(placeholder);
+
+        iced::widget::stack([body.into(), overlay]).into()
+    }
+
+    // ── Tree panel ────────────────────────────────────────────────
+
+    fn build_tree_panel(&self) -> Element<'_, EditorMessage> {
+        let elements: Vec<Element<'_, EditorMessage>> = self
+            .file_tree
+            .nodes
+            .iter()
+            .map(|n| self.render_tree_node(n, 0))
+            .collect();
+        let panel = widgets::build_tree_panel(&self.file_tree, elements);
+
+        // Wrap the tree panel with a context menu that fires on empty-space
+        // right-clicks. When the user right-clicks on a tree node, the inner
+        // node-level ContextMenu captures the event, so this outer fallback
+        // does not fire. When right-clicking on empty space below the nodes,
+        // no inner ContextMenu captures it, so this one shows the menu.
+        ContextMenu::new(
+            panel,
+            vec![
+                (
+                    "New File".into(),
+                    EditorMessage::NewFileRequested(String::new()),
+                ),
+                (
+                    "New Directory".into(),
+                    EditorMessage::NewDirectoryRequested(String::new()),
+                ),
+            ],
+        )
+        .into()
+    }
+
+    /// Check if any child (file or expanded dir) in the node has a git status.
+    /// Returns the most "interesting" status: Modified > Added. Only meaningful
+    /// for expanded directories (which have children populated).
+    fn dir_git_status(&self, node: &widgets::TreeNode) -> Option<GitFileStatus> {
+        let mut best: Option<GitFileStatus> = None;
+        for child in &node.children {
+            if child.is_dir {
+                // For expanded subdirectories, recurse into their children.
+                if let Some(status) = self.dir_git_status(child) {
+                    if best != Some(GitFileStatus::Modified) {
+                        best = Some(status);
+                    }
+                }
+            } else {
+                match self.git_status_cache.get(&child.full_path) {
+                    Some(&GitFileStatus::Modified) => return Some(GitFileStatus::Modified),
+                    Some(&GitFileStatus::Added) => {
+                        best = Some(GitFileStatus::Added);
+                    }
+                    None => {}
+                }
+            }
+        }
+        best
+    }
+
+    /// Check whether a path is gitignored, either directly or because an
+    /// ancestor directory is in the gitignore cache (directory inheritance).
+    #[must_use]
+    fn is_path_ignored(&self, full_path: &str) -> bool {
+        if self.git_ignore_cache.is_empty() {
+            return false;
+        }
+        if self.git_ignore_cache.contains(full_path) {
+            return true;
+        }
+        // Walk up the path tree: if any parent directory is ignored,
+        // the child inherits that status.
+        let mut path = full_path;
+        while let Some(pos) = path.rfind('/') {
+            path = &path[..pos];
+            if self.git_ignore_cache.contains(path) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn render_tree_node<'a>(
+        &'a self,
+        node: &'a widgets::TreeNode,
+        depth: usize,
+    ) -> Element<'a, EditorMessage> {
+        if node.is_dir {
+            self.render_dir_node(node, depth)
+        } else {
+            self.render_file_node(node, depth)
+        }
+    }
+
+    fn render_dir_node<'a>(
+        &'a self,
+        node: &'a widgets::TreeNode,
+        depth: usize,
+    ) -> Element<'a, EditorMessage> {
+        let indent = widgets::tree_indent(depth);
+        let is_expanded = self.file_tree.expanded_dirs.contains(&node.full_path);
+        let is_loading = self.loading_dirs.contains(&node.full_path);
+        let is_ignored = self.is_path_ignored(&node.full_path);
+        let icon: iced::widget::Text<'static, iced::Theme, iced::Renderer> = if is_expanded {
+            lucide::folder_open()
+        } else {
+            lucide::folder()
+        };
+        let dir_status = if is_expanded && !is_loading {
+            self.dir_git_status(node)
+        } else {
+            None
+        };
+        let icon_color = if is_ignored {
+            theme::TEXT_MUTED
+        } else if is_expanded && dir_status.is_some() {
+            match dir_status {
+                Some(GitFileStatus::Modified) => theme::STATUS_WARNING,
+                Some(GitFileStatus::Added) => theme::STATUS_SUCCESS,
+                _ => theme::ACCENT_LIGHT,
+            }
+        } else if is_expanded {
+            theme::ACCENT_LIGHT
+        } else {
+            theme::TEXT_MUTED
+        };
+
+        let (label_text, label_color) = if is_loading {
+            (format!("{}  Loading…", node.name), theme::TEXT_MUTED)
+        } else if let Some(ref err) = node.error {
+            (format!("{} [⚠ {err}]", node.name), theme::STATUS_ERROR)
+        } else if is_ignored {
+            (node.name.clone(), theme::TEXT_MUTED)
+        } else if dir_status.is_some() {
+            let color = match dir_status {
+                Some(GitFileStatus::Modified) => theme::STATUS_WARNING,
+                Some(GitFileStatus::Added) => theme::STATUS_SUCCESS,
+                _ => theme::TEXT_SECONDARY,
+            };
+            (node.name.clone(), color)
+        } else {
+            (node.name.clone(), theme::TEXT_SECONDARY)
+        };
+
+        let header_row = row![
+            Space::new().width(indent),
+            icon.size(13).color(icon_color),
+            Space::new().width(4),
+            text(label_text).size(12).color(label_color),
+            Space::new().width(Length::Fill),
+        ]
+        .align_y(Alignment::Center)
+        .padding([1, 8]);
+
+        let full_path = node.full_path.clone();
+        let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
+
+        let header_btn = widgets::tree_node_button(
+            header_row,
+            is_focused,
+            Some(EditorMessage::ToggleDir(full_path.clone())),
+        );
+
+        // Wrap directory header in context menu (children remain outside).
+        let abs_path = self.abs_path(&node.full_path);
+        let rel_path = node.full_path.clone();
+        let ctx_menu = ContextMenu::new(
+            header_btn,
+            vec![
+                (
+                    "New File".into(),
+                    EditorMessage::NewFileRequested(node.full_path.clone()),
+                ),
+                (
+                    "New Directory".into(),
+                    EditorMessage::NewDirectoryRequested(node.full_path.clone()),
+                ),
+                (
+                    "Delete".into(),
+                    EditorMessage::DeleteDirectoryRequested(node.full_path.clone()),
+                ),
+                (
+                    "Copy Relative Path".into(),
+                    EditorMessage::CopyRelativePath(rel_path),
+                ),
+                (
+                    "Copy Absolute Path".into(),
+                    EditorMessage::CopyAbsolutePath(abs_path.clone()),
+                ),
+                (
+                    "Reveal in Finder".into(),
+                    EditorMessage::RevealInFinder(abs_path),
+                ),
+            ],
+        );
+
+        let mut col = column![Element::from(ctx_menu)].spacing(0);
+        if is_expanded {
+            for child in &node.children {
+                col = col.push(self.render_tree_node(child, depth + 1));
+            }
+        }
+        col.into()
+    }
+
+    fn render_file_node<'a>(
+        &'a self,
+        node: &'a widgets::TreeNode,
+        depth: usize,
+    ) -> Element<'a, EditorMessage> {
+        let indent = widgets::tree_indent(depth);
+        let is_selected = self.selected_file.as_deref() == Some(&node.full_path);
+
+        let icon = lucide::file::<iced::Theme, iced::Renderer>();
+        let is_ignored = self.is_path_ignored(&node.full_path);
+        let icon_color = if is_selected {
+            theme::ACCENT
+        } else if is_ignored {
+            theme::TEXT_FAINT
+        } else {
+            theme::TEXT_MUTED
+        };
+
+        let git_status = self.git_status_cache.get(&node.full_path);
+        let name_color = if is_selected {
+            theme::TEXT_PRIMARY
+        } else if node.error.is_some() {
+            theme::STATUS_ERROR
+        } else if is_ignored {
+            theme::TEXT_MUTED
+        } else if git_status == Some(&GitFileStatus::Modified) {
+            theme::STATUS_WARNING
+        } else if git_status == Some(&GitFileStatus::Added) {
+            theme::STATUS_SUCCESS
+        } else {
+            theme::TEXT_SECONDARY
+        };
+        let name_weight = if is_selected {
+            iced::font::Weight::Bold
+        } else {
+            iced::font::Weight::Normal
+        };
+
+        let name_text: Element<'a, EditorMessage> = if node.error.is_some() {
+            row![
+                text(&node.name)
+                    .size(12)
+                    .color(name_color)
+                    .font(iced::Font {
+                        weight: name_weight,
+                        ..theme::FONT_REGULAR
+                    }),
+                Space::new().width(4),
+                text("[⚠]").size(11).color(theme::STATUS_ERROR),
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            text(&node.name)
+                .size(12)
+                .color(name_color)
+                .font(iced::Font {
+                    weight: name_weight,
+                    ..theme::FONT_REGULAR
+                })
+                .into()
+        };
+
+        let btn_row = row![
+            Space::new().width(indent),
+            icon.size(12).color(icon_color),
+            Space::new().width(4),
+            name_text,
+            Space::new().width(Length::Fill),
+        ]
+        .align_y(Alignment::Center)
+        .padding([1, 8]);
+
+        let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
+
+        let full_path = node.full_path.clone();
+        let file_btn = widgets::tree_node_button(
+            btn_row,
+            is_selected || is_focused,
+            Some(EditorMessage::SelectFile(full_path.clone())),
+        );
+
+        let abs_path = self.abs_path(&node.full_path);
+        let rel_path = node.full_path.clone();
+        ContextMenu::new(
+            file_btn,
+            vec![
+                (
+                    "Delete".into(),
+                    EditorMessage::DeleteFileRequested(node.full_path.clone()),
+                ),
+                (
+                    "Copy Relative Path".into(),
+                    EditorMessage::CopyRelativePath(rel_path),
+                ),
+                (
+                    "Copy Absolute Path".into(),
+                    EditorMessage::CopyAbsolutePath(abs_path.clone()),
+                ),
+                (
+                    "Reveal in Finder".into(),
+                    EditorMessage::RevealInFinder(abs_path),
+                ),
+            ],
+        )
+        .into()
+    }
+
+    // ── Editor panel ──────────────────────────────────────────────
+
+    fn build_editor_panel(&self) -> Element<'_, EditorMessage> {
+        if self.tabs.is_empty() {
+            return container(
+                text("Select a file to edit")
+                    .size(18)
+                    .color(theme::TEXT_MUTED),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+        }
+
+        let tab_bar = self.build_tab_bar();
+        let find_bar = self.build_find_replace_bar();
+        let go_to_line = self.build_go_to_line_bar();
+        let editor_widget = self.build_editor_widget();
+
+        let mut col = column![tab_bar].spacing(0).width(Length::Fill);
+        if let Some(bar) = find_bar {
+            col = col.push(bar);
+        } else if let Some(bar) = go_to_line {
+            // Go-to-line uses the same UI slot; only one bar visible at a time.
+            col = col.push(bar);
+        }
+        col = col.push(editor_widget);
+
+        col.height(Length::Fill).into()
+    }
+
+    fn build_tab_bar(&self) -> Element<'_, EditorMessage> {
+        let mut tab_buttons: Vec<Element<'_, EditorMessage>> = Vec::new();
+
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let is_active = i == self.active_tab_index;
+
+            // Dirty indicator dot.
+            let dirty_dot: Option<Element<'_, EditorMessage>> = if tab.is_dirty {
+                Some(
+                    lucide::circle::<iced::Theme, iced::Renderer>()
+                        .size(8)
+                        .color(theme::STATUS_WARNING)
+                        .into(),
+                )
+            } else {
+                None
+            };
+
+            let name_color = if is_active {
+                theme::ACCENT
+            } else {
+                theme::TEXT_MUTED
+            };
+            let name_text = text(&tab.file_name).size(12).color(name_color);
+
+            let close_btn = button(lucide::x::<iced::Theme, iced::Renderer>().size(12).color(
+                if is_active {
+                    theme::TEXT_SECONDARY
+                } else {
+                    theme::TEXT_FAINT
+                },
+            ))
+            .on_press(EditorMessage::TabClosed(i))
+            .style(|_t: &iced::Theme, _s: button::Status| button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding(0);
+
+            let mut tab_row = row![].spacing(2).align_y(Alignment::Center);
+            if let Some(dot) = dirty_dot {
+                tab_row = tab_row.push(dot);
+            }
+            tab_row = tab_row.push(name_text).push(close_btn);
+
+            let tab_btn = button(tab_row.padding([8, 8]))
+                .on_press(EditorMessage::TabSelected(i))
+                .style(move |_t: &iced::Theme, status| {
+                    let bg = if is_active {
+                        theme::BG_ELEVATED
+                    } else if status == button::Status::Hovered {
+                        theme::HOVER
+                    } else {
+                        theme::BG_SURFACE
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        border: iced::Border {
+                            radius: 0.0.into(),
+                            width: 0.0,
+                            color: iced::Color::TRANSPARENT,
+                        },
+                        ..Default::default()
+                    }
+                })
+                .padding(0);
+
+            let tab_abs_path = tab.path.clone();
+            let tab_rel_path = self
+                .selected_workspace_path
+                .as_ref()
+                .and_then(|ws| {
+                    Path::new(&tab_abs_path)
+                        .strip_prefix(ws)
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string())
+                })
+                .unwrap_or_else(|| tab_abs_path.clone());
+
+            let ctx_menu = ContextMenu::new(
+                tab_btn,
+                vec![
+                    ("Close".into(), EditorMessage::TabClosed(i)),
+                    ("Close Others".into(), EditorMessage::CloseOtherTabs(i)),
+                    (
+                        "Copy Relative Path".into(),
+                        EditorMessage::CopyRelativePath(tab_rel_path),
+                    ),
+                    (
+                        "Copy Absolute Path".into(),
+                        EditorMessage::CopyAbsolutePath(tab_abs_path),
+                    ),
+                ],
+            );
+
+            tab_buttons.push(ctx_menu.into());
+        }
+
+        let scrollable_content = row(tab_buttons).spacing(0).width(Length::Fill);
+
+        container(
+            scrollable(scrollable_content)
+                .id(self.tab_scroll_id.clone())
+                .direction(scrollable::Direction::Horizontal(theme::thin_scrollbar()))
+                .style(theme::scrollbar_style)
+                .width(Length::Fill)
+                .height(Length::Shrink),
+        )
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_SURFACE)),
+            border: iced::Border {
+                radius: 0.0.into(),
+                width: 0.0,
+                color: iced::Color::TRANSPARENT,
+            },
+            ..Default::default()
+        })
+        .width(Length::Fill)
+        .into()
+    }
+
+    fn build_find_replace_bar(&self) -> Option<Element<'_, EditorMessage>> {
+        let idx = self.active_tab_idx()?;
+        let path = &self.tabs[idx].path;
+        let state = self.tab_contents.get(path)?.find_replace_state.as_ref()?;
+
+        let search_input = text_input("Find…", &state.query)
+            .on_input(EditorMessage::FindQueryInput)
+            .on_submit(EditorMessage::FindNext)
+            .id(Id::new(FIND_SEARCH_ID))
+            .style(widgets::text_input_style)
+            .width(Length::Fixed(200.0))
+            .size(13);
+
+        let replace_input = text_input("Replace…", &state.replace)
+            .on_input(EditorMessage::FindReplaceInput)
+            .on_submit(EditorMessage::FindNext)
+            .id(Id::new(FIND_REPLACE_ID))
+            .style(widgets::text_input_style)
+            .width(Length::Fixed(160.0))
+            .size(13);
+
+        let total = state.matches.len();
+        let match_label = if !state.query.is_empty() && total > 0 {
+            format!("{}/{}", state.current_match_idx.saturating_add(1), total)
+        } else if !state.query.is_empty() {
+            "0/0".to_string()
+        } else {
+            String::new()
+        };
+
+        let prev_btn = button(text("‹").size(14).color(theme::TEXT_SECONDARY))
+            .on_press(EditorMessage::FindPrev)
+            .style(|_t: &iced::Theme, _s| button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding([2, 8]);
+
+        let next_btn = button(text("›").size(14).color(theme::TEXT_SECONDARY))
+            .on_press(EditorMessage::FindNext)
+            .style(|_t: &iced::Theme, _s| button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding([2, 8]);
+
+        let replace_btn = button(text("Replace").size(11).color(theme::TEXT_SECONDARY))
+            .on_press(EditorMessage::FindReplace)
+            .style(|_t: &iced::Theme, _s| button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding([2, 6]);
+
+        let replace_all_btn = button(text("All").size(11).color(theme::TEXT_SECONDARY))
+            .on_press(EditorMessage::FindReplaceAll)
+            .style(|_t: &iced::Theme, _s| button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding([2, 6]);
+
+        // Case sensitivity toggle: "Aa" label, highlighted when active.
+        let case_label_color = if state.case_sensitive {
+            theme::ACCENT_LIGHT
+        } else {
+            theme::TEXT_SECONDARY
+        };
+        let case_btn = button(text("Aa").size(11).color(case_label_color))
+            .on_press(EditorMessage::FindToggleCaseSensitivity)
+            .style(|_t: &iced::Theme, _s| button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding([2, 6]);
+
+        let bar = row![
+            search_input,
+            replace_input,
+            prev_btn,
+            text(match_label).size(12).color(theme::TEXT_MUTED),
+            next_btn,
+            Space::new().width(Length::Fixed(4.0)),
+            case_btn,
+            replace_btn,
+            replace_all_btn,
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .padding([4, 8]);
+
+        Some(
+            container(bar)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+                    border: iced::Border {
+                        radius: 0.0.into(),
+                        width: 0.0,
+                        color: iced::Color::TRANSPARENT,
+                    },
+                    ..Default::default()
+                })
+                .width(Length::Fill)
+                .into(),
+        )
+    }
+
+    /// Build the go-to-line input bar. Appears in the same slot as the find
+    /// bar (below the tab bar) and is mutually exclusive with it.
+    fn build_go_to_line_bar(&self) -> Option<Element<'_, EditorMessage>> {
+        let input_text = self.goto_line_input.as_ref()?;
+
+        let line_input = text_input("Line #", input_text)
+            .on_input(EditorMessage::GoToLineInput)
+            .on_submit(EditorMessage::GoToLineGo)
+            .style(widgets::text_input_style)
+            .width(Length::Fixed(120.0))
+            .size(13);
+
+        let go_btn = button(text("Go").size(12).color(theme::TEXT_SECONDARY))
+            .on_press(EditorMessage::GoToLineGo)
+            .style(|_t: &iced::Theme, _s: button::Status| button::Style {
+                background: None,
+                ..Default::default()
+            })
+            .padding([2, 8]);
+
+        let bar = row![
+            text("Go to line:").size(12).color(theme::TEXT_MUTED),
+            Space::new().width(4),
+            line_input,
+            go_btn,
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .padding([4, 8]);
+
+        Some(
+            container(bar)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+                    border: iced::Border {
+                        radius: 0.0.into(),
+                        width: 0.0,
+                        color: iced::Color::TRANSPARENT,
+                    },
+                    ..Default::default()
+                })
+                .width(Length::Fill)
+                .into(),
+        )
+    }
+
+    /// Build the quick-open overlay: a centered dialog with search input
+    /// and filtered results list.
+    fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, EditorMessage> {
+        let search_input: iced::widget::TextInput<'_, EditorMessage> =
+            text_input("Search files…", &qo.filter)
+                .on_input(EditorMessage::QuickOpenInput)
+                .on_submit(qo.results.first().map_or(EditorMessage::Escape, |_| {
+                    EditorMessage::QuickOpenSelect(qo.selected_index)
+                }))
+                .style(widgets::text_input_style)
+                .size(14)
+                .width(Length::Fill)
+                .padding([8, 12]);
+
+        // Convert to Element for use in column.
+        let search_elem: Element<'static, EditorMessage> = search_input.into();
+
+        // Build results list with owned data to satisfy 'static lifetime.
+        let results_owned: Vec<String> = qo.results.clone();
+        let selected_index = qo.selected_index;
+
+        let results: Vec<Element<'static, EditorMessage>> = results_owned
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let is_selected = i == selected_index;
+                let path_owned = path.clone();
+                let bg = if is_selected {
+                    theme::HOVER_STRONG
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                let label = text(path_owned.clone()).size(12).color(if is_selected {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_SECONDARY
+                });
+                let entry = container(label).padding([4, 12]).width(Length::Fill).style(
+                    move |_t: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        ..Default::default()
+                    },
+                );
+                button(entry)
+                    .on_press(EditorMessage::QuickOpenSelect(i))
+                    .style(|_t: &iced::Theme, _s: button::Status| button::Style {
+                        background: None,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    })
+                    .width(Length::Fill)
+                    .padding(0)
+                    .into()
+            })
+            .collect();
+
+        let results_column = column(results).spacing(0).width(Length::Fill);
+
+        let empty_hint: Option<Element<'static, EditorMessage>> =
+            if qo.filter.is_empty() && qo.results.is_empty() {
+                Some(
+                    text("Type to filter files…")
+                        .size(12)
+                        .color(theme::TEXT_FAINT)
+                        .into(),
+                )
+            } else if qo.results.is_empty() {
+                Some(
+                    text("No matches found")
+                        .size(12)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                )
+            } else {
+                None
+            };
+
+        let content: Element<'static, EditorMessage> = if let Some(hint) = empty_hint {
+            column![search_elem, hint].spacing(4).into()
+        } else {
+            column![
+                search_elem,
+                scrollable(results_column)
+                    .height(Length::Fixed(300.0))
+                    .style(theme::scrollbar_style),
+            ]
+            .spacing(4)
+            .into()
+        };
+
+        let dialog = container(content)
+            .width(Length::Fixed(400.0))
+            .padding(12)
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: theme::BORDER_STRONG,
+                },
+                ..Default::default()
+            });
+
+        let centered = container(dialog)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+
+        // Backdrop.
+        let backdrop = iced::widget::mouse_area(
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.0, 0.0, 0.0, 0.4,
+                    ))),
+                    ..Default::default()
+                }),
+        )
+        .on_press(EditorMessage::Escape);
+
+        iced::widget::stack([backdrop.into(), centered.into()]).into()
+    }
+
+    fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'static, EditorMessage> {
+        let search_input: iced::widget::TextInput<'_, EditorMessage> =
+            text_input("Search across workspace…", &gs.query)
+                .on_input(EditorMessage::GlobalSearchInput)
+                .on_submit(if gs.results.is_empty() {
+                    EditorMessage::GlobalSearchClose
+                } else {
+                    EditorMessage::GlobalSearchSelect(gs.selected_index)
+                })
+                .id(Id::new(GLOBAL_SEARCH_INPUT_ID))
+                .style(widgets::text_input_style)
+                .size(14)
+                .width(Length::Fill)
+                .padding([8, 12]);
+
+        let search_elem: Element<'static, EditorMessage> = search_input.into();
+
+        // Status/hint line below the input.
+        let status_elem: Element<'static, EditorMessage> = match &gs.status {
+            GlobalSearchStatus::Idle => text("Type to search across workspace files")
+                .size(12)
+                .color(theme::TEXT_FAINT)
+                .into(),
+            GlobalSearchStatus::Searching => row![
+                text("Searching…").size(12).color(theme::TEXT_MUTED),
+                Space::new().width(Length::Fill),
+            ]
+            .into(),
+            GlobalSearchStatus::NoResults => text("No matches found")
+                .size(12)
+                .color(theme::TEXT_MUTED)
+                .into(),
+            GlobalSearchStatus::Error(e) => text(format!("Search error: {e}"))
+                .size(12)
+                .color(theme::STATUS_ERROR)
+                .into(),
+            GlobalSearchStatus::Done => {
+                let count = gs.results.len();
+                text(format!(
+                    "{count} result{}",
+                    if count == 1 { "" } else { "s" }
+                ))
+                .size(12)
+                .color(theme::TEXT_FAINT)
+                .into()
+            }
+        };
+
+        // Build results list with owned data to satisfy 'static lifetime.
+        let results_owned: Vec<OwnedGrepMatch> = gs.results.clone();
+        let selected_index = gs.selected_index;
+
+        let results: Vec<Element<'static, EditorMessage>> = results_owned
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let is_selected = i == selected_index;
+                let bg = if is_selected {
+                    theme::HOVER_STRONG
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+
+                // Clone owned data into the closure to satisfy 'static.
+                let path_text = format!("{}:{}", m.rel_path, m.line_number);
+                let line_content = m.line_content.clone();
+                let offsets = m.match_byte_offsets.clone();
+                let accent = if is_selected {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_SECONDARY
+                };
+
+                let path_label = text(path_text.clone())
+                    .size(12)
+                    .color(accent)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..theme::FONT_REGULAR
+                    });
+
+                // Build the snippet with match portion highlighted in bold.
+                let trimmed = line_content.trim().to_string();
+                let snippet_label: Element<'static, EditorMessage> =
+                    if let Some(&(start, end)) = offsets.first() {
+                        let start_us = start as usize;
+                        let end_us = end as usize;
+                        let content = &line_content;
+                        let pre = if start_us <= content.len() {
+                            content[..start_us.min(content.len())]
+                                .trim_start()
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+                        let matched = if start_us < content.len() && end_us <= content.len() {
+                            content[start_us..end_us].to_string()
+                        } else {
+                            String::new()
+                        };
+                        let post = if end_us < content.len() {
+                            content[end_us..].trim_end().to_string()
+                        } else {
+                            String::new()
+                        };
+
+                        let text_color = if is_selected {
+                            theme::TEXT_PRIMARY
+                        } else {
+                            theme::TEXT_MUTED
+                        };
+
+                        row![
+                            text(pre).size(12).color(text_color),
+                            text(matched)
+                                .size(12)
+                                .color(theme::ACCENT_LIGHT)
+                                .font(iced::Font {
+                                    weight: iced::font::Weight::Bold,
+                                    ..theme::FONT_REGULAR
+                                }),
+                            text(post).size(12).color(text_color),
+                        ]
+                        .spacing(0)
+                        .into()
+                    } else {
+                        text(trimmed)
+                            .size(12)
+                            .color(if is_selected {
+                                theme::TEXT_PRIMARY
+                            } else {
+                                theme::TEXT_MUTED
+                            })
+                            .into()
+                    };
+
+                let entry_content = column![path_label, snippet_label].spacing(1);
+
+                let entry = container(entry_content)
+                    .padding([4, 12])
+                    .width(Length::Fill)
+                    .style(move |_t: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        ..Default::default()
+                    });
+
+                button(entry)
+                    .on_press(EditorMessage::GlobalSearchSelect(i))
+                    .style(|_t: &iced::Theme, _s: button::Status| button::Style {
+                        background: None,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    })
+                    .width(Length::Fill)
+                    .padding(0)
+                    .into()
+            })
+            .collect();
+
+        let results_column = column(results).spacing(0).width(Length::Fill);
+
+        let has_results = !gs.results.is_empty();
+
+        let content: Element<'static, EditorMessage> = if !has_results {
+            column![search_elem, status_elem].spacing(4).into()
+        } else {
+            column![
+                search_elem,
+                status_elem,
+                scrollable(results_column)
+                    .height(Length::Fixed(400.0))
+                    .style(theme::scrollbar_style),
+            ]
+            .spacing(4)
+            .into()
+        };
+
+        let dialog = container(content)
+            .width(Length::Fixed(600.0))
+            .padding(12)
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: theme::BORDER_STRONG,
+                },
+                ..Default::default()
+            });
+
+        let centered = container(dialog)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+
+        // Backdrop.
+        let backdrop = iced::widget::mouse_area(
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.0, 0.0, 0.0, 0.4,
+                    ))),
+                    ..Default::default()
+                }),
+        )
+        .on_press(EditorMessage::GlobalSearchClose);
+
+        iced::widget::stack([backdrop.into(), centered.into()]).into()
+    }
+
+    fn build_editor_widget(&self) -> Element<'_, EditorMessage> {
+        let Some(idx) = self.active_tab_idx() else {
+            return container(
+                text("No file selected")
+                    .size(EDITOR_FONT_SIZE)
+                    .color(theme::TEXT_MUTED),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+        };
+
+        let path = self.tabs[idx].path.clone();
+        let Some(tab_data) = self.tab_contents.get(&path) else {
+            return container(
+                text("Error: tab content missing")
+                    .size(EDITOR_FONT_SIZE)
+                    .color(theme::STATUS_ERROR),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+        };
+
+        // ── Build editor widget ────────────────────────────────────────
+        let content = &tab_data.content;
+        let tree_focused = self.file_tree.tree_focused;
+        let find_bar_open = tab_data.find_replace_state.is_some();
+        let block_editing =
+            find_bar_open || self.quick_open.is_some() || self.global_search.is_some();
+        let ignore_keyboard = tree_focused || block_editing;
+
+        // Compute match highlight tuples from find/replace state.
+        // Each tuple is (line, byte_col_start, byte_col_end) for
+        // cosmic_text::Cursor-based highlight rendering.
+        let (match_tuples, match_current_idx) = tab_data
+            .find_replace_state
+            .as_ref()
+            .map(|state| {
+                let tuples: Vec<(usize, usize, usize)> = state
+                    .matches
+                    .iter()
+                    .filter_map(|range| {
+                        let (line, col) =
+                            byte_offset_to_cursor_pos(&tab_data.content, range.start)?;
+                        // Query has no embedded newlines, so the match
+                        // ends on the same line at col + query.len().
+                        Some((line, col, col + (range.end - range.start)))
+                    })
+                    .collect();
+                (tuples, state.current_match_idx)
+            })
+            .unwrap_or_default();
+
+        // ── Bracket matching ───────────────────────────────────────────
+        // Compute matching bracket pair from cursor position (if any).
+        let cursor = content.cursor();
+        let bracket_pair = if !ignore_keyboard && cursor.selection.is_none() {
+            let text = content.text();
+            super::editor_widget::find_matching_bracket(&text, cursor.line, cursor.column)
+        } else {
+            None
+        };
+
+        Self::build_highlighted_editor(
+            content,
+            ignore_keyboard,
+            block_editing,
+            match_tuples,
+            match_current_idx,
+            self.blink_gen,
+            bracket_pair,
+        )
+    }
+
+    /// Build an [`Element`] from an editor content reference.
+    fn build_highlighted_editor(
+        content: &super::editor_widget::EditorBuffer,
+        ignore_keyboard: bool,
+        block_editing: bool,
+        matches: Vec<(usize, usize, usize)>,
+        match_current_idx: usize,
+        blink_gen: u64,
+        bracket_pair: Option<super::editor_widget::BracketPair>,
+    ) -> Element<'_, EditorMessage> {
+        let editor = super::editor_widget::EditorWidget::new(content)
+            .font_size(EDITOR_FONT_SIZE)
+            .padding(8.0)
+            .ignore_keyboard(ignore_keyboard)
+            .block_editing(block_editing)
+            .matches(matches, match_current_idx)
+            .blink_gen(blink_gen)
+            .bracket_pair(bracket_pair);
+        let element = iced::Element::new(editor);
+        let mapped = element.map(EditorMessage::EditorAction);
+
+        container(mapped)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_BASE)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    // ── Close dialog ──────────────────────────────────────────────
+
+    fn build_close_dialog(
+        on_save: EditorMessage,
+        on_discard: EditorMessage,
+        on_cancel: EditorMessage,
+        description: String,
+    ) -> Element<'static, EditorMessage> {
+        // Backdrop.
+        let backdrop = iced::widget::mouse_area(
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.0, 0.0, 0.0, 0.5,
+                    ))),
+                    ..container::Style::default()
+                }),
+        )
+        .on_press(on_cancel.clone());
+
+        // Dialog content.
+        let dialog = container(
+            column![
+                row![
+                    lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                        .size(16)
+                        .color(theme::STATUS_WARNING),
+                    Space::new().width(8),
+                    text("Unsaved changes").size(16).color(theme::TEXT_PRIMARY),
+                ]
+                .align_y(Alignment::Center),
+                text(description)
+                    .size(14)
+                    .color(theme::TEXT_SECONDARY)
+                    .width(Length::Fill),
+                row![
+                    button(
+                        text("Cancel")
+                            .size(13)
+                            .color(theme::TEXT_SECONDARY)
+                            .align_x(Alignment::Center)
+                    )
+                    .style(theme::button_secondary)
+                    .on_press(on_cancel),
+                    Space::new().width(8),
+                    button(
+                        text("Discard")
+                            .size(13)
+                            .color(theme::STATUS_ERROR)
+                            .align_x(Alignment::Center)
+                    )
+                    .style(theme::button_danger)
+                    .on_press(on_discard),
+                    Space::new().width(8),
+                    button(
+                        text("Save")
+                            .size(13)
+                            .color(theme::ACCENT_LIGHT)
+                            .align_x(Alignment::Center)
+                    )
+                    .style(theme::button_primary)
+                    .on_press(on_save),
+                ]
+                .align_y(Alignment::End)
+                .width(Length::Fill),
+            ]
+            .spacing(16)
+            .width(Length::Fill),
+        )
+        .width(380)
+        .padding(24)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: theme::BORDER_STRONG,
+            },
+            ..container::Style::default()
+        });
+
+        let centered = container(dialog)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+
+        iced::widget::stack([backdrop.into(), centered.into()]).into()
+    }
+
+    // ── Context menu dialog helpers ─────────────────────────────────
+
+    /// Build the delete confirmation dialog overlay.
+    fn build_delete_confirm_dialog(target: &DeleteConfirmTarget) -> Element<'_, EditorMessage> {
+        let description = if target.is_dir {
+            let dirty_msg = if target.dirty_tab_count > 0 {
+                format!(
+                    " ({} tab{} with unsaved changes will be closed)",
+                    target.dirty_tab_count,
+                    if target.dirty_tab_count == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "Delete directory \"{}\" and all its contents?{}",
+                target.path, dirty_msg
+            )
+        } else {
+            format!("Delete file \"{}\"?", target.path)
+        };
+
+        // Backdrop.
+        let backdrop = iced::widget::mouse_area(
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.0, 0.0, 0.0, 0.5,
+                    ))),
+                    ..container::Style::default()
+                }),
+        )
+        .on_press(EditorMessage::CancelDelete);
+
+        // Dialog content.
+        let dialog = container(
+            column![
+                row![
+                    lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                        .size(16)
+                        .color(theme::STATUS_WARNING),
+                    Space::new().width(8),
+                    text(if target.is_dir {
+                        "Delete directory"
+                    } else {
+                        "Delete file"
+                    })
+                    .size(16)
+                    .color(theme::TEXT_PRIMARY),
+                ]
+                .align_y(Alignment::Center),
+                text(description)
+                    .size(14)
+                    .color(theme::TEXT_SECONDARY)
+                    .width(Length::Fill),
+                row![
+                    button(
+                        text("Cancel")
+                            .size(13)
+                            .color(theme::TEXT_SECONDARY)
+                            .align_x(Alignment::Center)
+                    )
+                    .style(theme::button_secondary)
+                    .on_press(EditorMessage::CancelDelete),
+                    Space::new().width(8),
+                    button(
+                        text("Delete")
+                            .size(13)
+                            .color(theme::STATUS_ERROR)
+                            .align_x(Alignment::Center)
+                    )
+                    .style(theme::button_danger)
+                    .on_press(EditorMessage::ConfirmDelete),
+                ]
+                .align_y(Alignment::End)
+                .width(Length::Fill),
+            ]
+            .spacing(16)
+            .width(Length::Fill),
+        )
+        .width(400)
+        .padding(24)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: theme::BORDER_STRONG,
+            },
+            ..container::Style::default()
+        });
+
+        let centered = container(dialog)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+
+        iced::widget::stack([backdrop.into(), centered.into()]).into()
+    }
+
+    /// Build the new file/directory name input overlay.
+    fn build_new_item_input(target: &NewItemTarget) -> Element<'_, EditorMessage> {
+        let label = if target.is_dir {
+            format!("New directory in \"{}\"", target.parent_dir)
+        } else {
+            format!("New file in \"{}\"", target.parent_dir)
+        };
+
+        // Backdrop — clicking outside dismisses.
+        let backdrop = iced::widget::mouse_area(
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.0, 0.0, 0.0, 0.4,
+                    ))),
+                    ..container::Style::default()
+                }),
+        )
+        .on_press(EditorMessage::Escape);
+
+        let input = text_input("Name…", &target.input_text)
+            .id(Id::new("new-item-input"))
+            .on_input(EditorMessage::NewItemInput)
+            .on_submit(EditorMessage::NewItemSubmit(target.input_text.clone()))
+            .style(widgets::text_input_style)
+            .padding(8);
+
+        // Dialog content.
+        let dialog = container(
+            column![
+                text(label).size(14).color(theme::TEXT_PRIMARY),
+                input,
+                row![
+                    button(
+                        text("Cancel")
+                            .size(13)
+                            .color(theme::TEXT_SECONDARY)
+                            .align_x(Alignment::Center)
+                    )
+                    .style(theme::button_secondary)
+                    .on_press(EditorMessage::Escape),
+                    Space::new().width(8),
+                    button(
+                        text("Create")
+                            .size(13)
+                            .color(theme::ACCENT_LIGHT)
+                            .align_x(Alignment::Center)
+                    )
+                    .style(theme::button_primary)
+                    .on_press(EditorMessage::NewItemSubmit(target.input_text.clone())),
+                ]
+                .align_y(Alignment::End)
+                .width(Length::Fill),
+            ]
+            .spacing(12)
+            .width(Length::Fill),
+        )
+        .width(380)
+        .padding(24)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: theme::BORDER_STRONG,
+            },
+            ..container::Style::default()
+        });
+
+        let centered = container(dialog)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+
+        iced::widget::stack([backdrop.into(), centered.into()]).into()
+    }
+
+    // ── Context menu action handlers ───────────────────────────────
+
+    /// Perform file deletion: close tab, delete file, re-read parent directory.
+    fn perform_file_delete(&mut self, target: &DeleteConfirmTarget) -> Task<EditorMessage> {
+        // Close tab if open.
+        if let Some(tab_idx) = self.tabs.iter().position(|t| t.path == target.abs_path) {
+            self.remove_tab_at(tab_idx);
+        }
+        // Clear selection if it matches the deleted file.
+        // selected_file stores relative paths (set by SelectFile handler).
+        if self.selected_file.as_deref() == Some(&target.path) {
+            self.selected_file = None;
+        }
+        // Clean up mtime and toast guard.
+        self.file_mtimes.remove(&target.abs_path);
+        self.deleted_file_toasted.remove(&target.abs_path);
+
+        let abs_path = target.abs_path.clone();
+        let parent_dir = {
+            let path = Path::new(&target.path);
+            path.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        let ws_path = self
+            .selected_workspace_path
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        let r#gen = self.generation.wrapping_add(1);
+        self.generation = r#gen;
+        // Register the generation so DirExpanded handler accepts the result.
+        self.dir_generations.insert(parent_dir.clone(), r#gen);
+
+        Task::perform(
+            async move {
+                // Delete the file.
+                if let Err(e) = tokio::fs::remove_file(&abs_path).await {
+                    return EditorMessage::Toast(super::ToastMessage::Error(format!(
+                        "Failed to delete file: {e}"
+                    )));
+                }
+                // Re-read parent directory.
+                let entries = read_directory_entries(&ws_path, &parent_dir).await;
+                EditorMessage::DirExpanded {
+                    dir_path: parent_dir,
+                    r#gen,
+                    entries,
+                    quiet: false,
+                }
+            },
+            |msg| msg,
+        )
+    }
+
+    /// Perform directory deletion: remove dir, close affected tabs, re-read parent.
+    fn perform_dir_delete(&mut self, target: &DeleteConfirmTarget) -> Task<EditorMessage> {
+        let abs_prefix = format!("{}/", target.abs_path);
+        let rel_prefix = format!("{}/", target.path);
+
+        // Collect open tabs inside this directory (close in reverse order).
+        let mut affected_indices: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.path.starts_with(&abs_prefix))
+            .map(|(i, _)| i)
+            .collect();
+        affected_indices.sort_unstable_by(|a, b| b.cmp(a));
+
+        for &idx in &affected_indices {
+            self.remove_tab_at(idx);
+        }
+
+        // Clear selection if it was inside the deleted directory.
+        // selected_file stores relative paths.
+        if let Some(ref sel) = self.selected_file {
+            if sel == &target.path || sel.starts_with(&rel_prefix) {
+                self.selected_file = None;
+            }
+        }
+
+        // Clean up mtimes and toast guards for affected paths (absolute).
+        self.file_mtimes
+            .retain(|path, _| path != &target.abs_path && !path.starts_with(&abs_prefix));
+        self.deleted_file_toasted
+            .retain(|path| path != &target.abs_path && !path.starts_with(&abs_prefix));
+
+        let abs_path = target.abs_path.clone();
+        let parent_dir = {
+            let path = Path::new(&target.path);
+            path.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        let ws_path = self
+            .selected_workspace_path
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        let r#gen = self.generation.wrapping_add(1);
+        self.generation = r#gen;
+        // Register the generation so DirExpanded handler accepts the result.
+        self.dir_generations.insert(parent_dir.clone(), r#gen);
+
+        Task::perform(
+            async move {
+                // Remove the directory and all contents.
+                if let Err(e) = tokio::fs::remove_dir_all(&abs_path).await {
+                    return EditorMessage::Toast(super::ToastMessage::Error(format!(
+                        "Failed to delete directory: {e}"
+                    )));
+                }
+                // Re-read parent directory.
+                let entries = read_directory_entries(&ws_path, &parent_dir).await;
+                EditorMessage::DirExpanded {
+                    dir_path: parent_dir,
+                    r#gen,
+                    entries,
+                    quiet: false,
+                }
+            },
+            |msg| msg,
+        )
+    }
+
+    /// Perform new file/directory creation, then re-read parent directory.
+    fn perform_create_item(&mut self, target: &NewItemTarget, name: &str) -> Task<EditorMessage> {
+        let abs_parent = target.abs_parent.clone();
+        let parent_dir = target.parent_dir.clone();
+        let is_dir = target.is_dir;
+        let ws_root = target.ws_root.clone();
+
+        let abs_new_path_str = Path::new(&abs_parent)
+            .join(name)
+            .to_string_lossy()
+            .to_string();
+        let r#gen = self.generation.wrapping_add(1);
+        self.generation = r#gen;
+        // Register the generation so DirExpanded handler accepts the result.
+        self.dir_generations.insert(parent_dir.clone(), r#gen);
+
+        Task::perform(
+            async move {
+                if is_dir {
+                    if let Err(e) = tokio::fs::create_dir(&abs_new_path_str).await {
+                        return EditorMessage::Toast(super::ToastMessage::Error(format!(
+                            "Failed to create directory: {e}"
+                        )));
+                    }
+                } else if let Err(e) = tokio::fs::write(&abs_new_path_str, "").await {
+                    return EditorMessage::Toast(super::ToastMessage::Error(format!(
+                        "Failed to create file: {e}"
+                    )));
+                }
+                let entries = read_directory_entries(&ws_root, &parent_dir).await;
+                EditorMessage::DirExpanded {
+                    dir_path: parent_dir,
+                    r#gen,
+                    entries,
+                    quiet: false,
+                }
+            },
+            |msg| msg,
+        )
+    }
+
+    /// Fire-and-forget reveal in system file manager.
+    fn perform_reveal_in_finder(path: String) -> Task<EditorMessage> {
+        Task::perform(
+            async move {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(e) = std::process::Command::new("open")
+                        .arg("-R")
+                        .arg(&path)
+                        .spawn()
+                    {
+                        tracing::warn!("Failed to open Finder for {path}: {e}");
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    if let Err(e) = std::process::Command::new("explorer")
+                        .arg("/select,")
+                        .arg(&path)
+                        .spawn()
+                    {
+                        tracing::warn!("Failed to open Explorer for {path}: {e}");
+                    }
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    if let Some(parent) = std::path::Path::new(&path).parent() {
+                        if let Err(e) = std::process::Command::new("xdg-open").arg(parent).spawn() {
+                            tracing::warn!("Failed to open file manager for {path}: {e}");
+                        }
+                    }
+                }
+            },
+            |()| EditorMessage::RevealDone,
+        )
+    }
+}
+
+// ── Find/Replace helpers ───────────────────────────────────────────
+
+/// Convert a byte offset in the editor content to a cursor position.
+/// Returns `None` if the offset is out of range.
+#[must_use]
+fn byte_offset_to_cursor_pos(
+    content: &super::editor_widget::EditorBuffer,
+    offset: usize,
+) -> Option<(usize, usize)> {
+    let text = content.text();
+    if offset > text.len() {
+        return None;
+    }
+    let prefix = &text[..offset];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count();
+    let col = offset - prefix.rfind('\n').map_or(0, |p| p + 1);
+    Some((line, col))
+}
+
+/// Auto-jump the cursor to the first find match and reset the match index to 0.
+fn auto_jump_to_first_match(
+    content: &mut super::editor_widget::EditorBuffer,
+    state: &mut FindReplaceState,
+) {
+    state.current_match_idx = 0;
+    if let Some(range) = state.matches.first() {
+        if let Some((line, col)) = byte_offset_to_cursor_pos(content, range.start) {
+            content.move_to(line, col);
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gui::editor_widget::EditorBuffer;
+
+    #[test]
+    fn test_has_trailing_newline() {
+        assert!(has_trailing_newline(b"hello\n"));
+        assert!(!has_trailing_newline(b"hello"));
+        assert!(!has_trailing_newline(b""));
+    }
+
+    #[test]
+    fn test_detect_line_ending_lf() {
+        assert_eq!(detect_line_ending(b"hello\nworld\n"), LineEnding::Lf);
+    }
+
+    #[test]
+    fn test_detect_line_ending_crlf() {
+        assert_eq!(detect_line_ending(b"hello\r\nworld\r\n"), LineEnding::Crlf);
+    }
+
+    // ── compute_text_matches ────────────────────────────────────
+
+    #[test]
+    fn test_compute_text_matches_empty_query() {
+        let result = compute_text_matches("hello", "", true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_text_matches_short_query() {
+        let result = compute_text_matches("hello", "h", true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_text_matches_basic() {
+        let result = compute_text_matches("hello world hello", "hello", true);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], 0..5);
+        assert_eq!(result[1], 12..17);
+    }
+
+    #[test]
+    fn test_compute_text_matches_no_match() {
+        let result = compute_text_matches("hello world", "xyz", true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_text_matches_overlapping_prevented() {
+        // "aa" in "aaaaa" should find two matches (0..2 and 2..4)
+        let result = compute_text_matches("aaaaa", "aa", true);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], 0..2);
+        assert_eq!(result[1], 2..4);
+    }
+
+    #[test]
+    fn test_compute_text_matches_case_insensitive() {
+        let result = compute_text_matches("Hello World hello", "hello", false);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], 0..5);
+        assert_eq!(result[1], 12..17);
+    }
+
+    #[test]
+    fn test_compute_text_matches_case_insensitive_no_match() {
+        let result = compute_text_matches("Hello World", "xyz", false);
+        assert!(result.is_empty());
+    }
+
+    // ── byte_offset_to_cursor_pos ───────────────────────────────
+
+    #[test]
+    fn test_byte_offset_to_cursor_pos_start() {
+        let content = EditorBuffer::with_text("hello\nworld", None);
+        let pos = byte_offset_to_cursor_pos(&content, 0).unwrap();
+        assert_eq!(pos.0, 0);
+        assert_eq!(pos.1, 0);
+    }
+
+    #[test]
+    fn test_byte_offset_to_cursor_pos_second_line() {
+        let content = EditorBuffer::with_text("hello\nworld", None);
+        let pos = byte_offset_to_cursor_pos(&content, 6).unwrap(); // after "hello\n"
+        assert_eq!(pos.0, 1);
+        assert_eq!(pos.1, 0);
+    }
+
+    #[test]
+    fn test_byte_offset_to_cursor_pos_mid_line() {
+        let content = EditorBuffer::with_text("hello\nworld", None);
+        let pos = byte_offset_to_cursor_pos(&content, 8).unwrap(); // "wo"
+        assert_eq!(pos.0, 1);
+        assert_eq!(pos.1, 2);
+    }
+
+    #[test]
+    fn test_byte_offset_to_cursor_pos_out_of_range() {
+        let content = EditorBuffer::with_text("hello", None);
+        assert!(byte_offset_to_cursor_pos(&content, 100).is_none());
+    }
+
+    #[test]
+    fn test_byte_offset_to_cursor_pos_empty_content() {
+        let content = EditorBuffer::with_text("", None);
+        let pos = byte_offset_to_cursor_pos(&content, 0).unwrap();
+        assert_eq!(pos.0, 0);
+        assert_eq!(pos.1, 0);
+    }
+
+    // ── UndoStack ───────────────────────────────────────────────
+
+    #[test]
+    fn test_undo_stack_snap_and_undo() {
+        let content = EditorBuffer::with_text("original", None);
+        let mut stack = UndoStack::new();
+        stack.snap_before_edit(&content);
+
+        // Simulate edit
+        let modified = EditorBuffer::with_text("modified", None);
+        let snapshot = stack.undo(&modified).unwrap();
+        assert_eq!(snapshot.text, "original");
+    }
+
+    #[test]
+    fn test_undo_stack_redo() {
+        let content = EditorBuffer::with_text("original", None);
+        let mut stack = UndoStack::new();
+        stack.snap_before_edit(&content);
+
+        let modified = EditorBuffer::with_text("modified", None);
+        let _ = stack.undo(&modified);
+
+        let snapshot = stack.redo(&modified).unwrap();
+        assert_eq!(snapshot.text, "modified");
+    }
+
+    #[test]
+    fn test_undo_stack_new_edit_clears_redo() {
+        let content = EditorBuffer::with_text("v1", None);
+        let mut stack = UndoStack::new();
+        stack.snap_before_edit(&content);
+
+        let v2 = EditorBuffer::with_text("v2", None);
+        let _ = stack.undo(&v2);
+
+        // New edit after undo should clear redo.
+        let v3 = EditorBuffer::with_text("v3", None);
+        stack.snap_before_edit(&v3);
+
+        assert!(stack.redo(&v3).is_none());
+    }
+
+    #[test]
+    fn test_undo_stack_cursor_restoration() {
+        let content = EditorBuffer::with_text("line1\nline2\nline3", None);
+        let mut stack = UndoStack::new();
+        // Move cursor to (1, 2) — line 1, column 2 ("ne2")
+        content.move_to(1, 2);
+        stack.snap_before_edit(&content);
+
+        let modified = EditorBuffer::with_text("changed", None);
+        let snapshot = stack.undo(&modified).unwrap();
+        assert_eq!(snapshot.cursor_line, 1);
+        assert_eq!(snapshot.cursor_col, 2);
+    }
+
+    // ── Tree keyboard navigation focus state tests ──────────────────
+
+    /// Helper to create a minimal EditorState with a simple tree.
+    fn make_editor_with_tree() -> EditorState {
+        let mut state = EditorState::new();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        // Populate root dir_entries so build_hierarchical_tree works.
+        state.dir_entries.insert(
+            String::new(),
+            vec![
+                FsEntry {
+                    name: "src".to_string(),
+                    full_path: "src".to_string(),
+                    is_dir: true,
+                    error: None,
+                },
+                FsEntry {
+                    name: "Cargo.toml".to_string(),
+                    full_path: "Cargo.toml".to_string(),
+                    is_dir: false,
+                    error: None,
+                },
+            ],
+        );
+        // Populate "src" dir_entries so children show when expanded.
+        state.dir_entries.insert(
+            "src".to_string(),
+            vec![FsEntry {
+                name: "main.rs".to_string(),
+                full_path: "src/main.rs".to_string(),
+                is_dir: false,
+                error: None,
+            }],
+        );
+        // Build the tree from dir_entries (consistent with real behavior).
+        state.rebuild_tree();
+        state
+    }
+
+    #[test]
+    fn test_rebuild_visible_tree_flattens_nodes() {
+        let state = make_editor_with_tree();
+        assert_eq!(state.file_tree.visible_tree_nodes.len(), 2);
+        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
+        assert!(state.file_tree.visible_tree_nodes[0].1); // is_dir
+        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "Cargo.toml");
+        assert!(!state.file_tree.visible_tree_nodes[1].1); // not is_dir
+    }
+
+    #[test]
+    fn test_rebuild_visible_tree_with_expanded_dir() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        // Rebuild tree from dir_entries with expanded state, then flatten.
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        assert_eq!(state.file_tree.visible_tree_nodes.len(), 3);
+        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
+        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
+        assert_eq!(state.file_tree.visible_tree_nodes[2].0, "Cargo.toml");
+    }
+
+    #[test]
+    fn test_tree_focus_toggled_sets_focus() {
+        let mut state = make_editor_with_tree();
+        assert!(!state.file_tree.tree_focused);
+
+        // Toggle on
+        let _ = state.update(EditorMessage::TreeFocusToggled);
+        assert!(state.file_tree.tree_focused);
+
+        // Toggle off
+        let _ = state.update(EditorMessage::TreeFocusToggled);
+        assert!(!state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_tree_focus_toggled_empty_tree_stays_off() {
+        let mut state = EditorState::new();
+        assert!(!state.file_tree.tree_focused);
+
+        let _ = state.update(EditorMessage::TreeFocusToggled);
+        assert!(!state.file_tree.tree_focused); // No visible nodes, focus rejected
+    }
+
+    #[test]
+    fn test_tree_nav_up_at_top_clamped() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0;
+        let _ = state.update(EditorMessage::TreeNavUp);
+        assert_eq!(state.file_tree.tree_focus_index, 0); // Clamped at top
+    }
+
+    #[test]
+    fn test_tree_nav_down_at_bottom_clamped() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        let last = state.file_tree.visible_tree_nodes.len() - 1;
+        state.file_tree.tree_focus_index = last;
+        let _ = state.update(EditorMessage::TreeNavDown);
+        assert_eq!(state.file_tree.tree_focus_index, last); // Clamped at bottom
+    }
+
+    #[test]
+    fn test_tree_nav_up_down_moves_focus() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 1;
+        let _ = state.update(EditorMessage::TreeNavUp);
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+        let _ = state.update(EditorMessage::TreeNavDown);
+        assert_eq!(state.file_tree.tree_focus_index, 1);
+    }
+
+    #[test]
+    fn test_tree_nav_ignored_when_not_focused() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focus_index = 0;
+        let _ = state.update(EditorMessage::TreeNavDown);
+        assert_eq!(state.file_tree.tree_focus_index, 0); // No movement
+    }
+
+    #[test]
+    fn test_escape_clears_tree_focus() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        let _ = state.update(EditorMessage::Escape);
+        assert!(!state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_toggle_dir_sets_tree_focus() {
+        let mut state = make_editor_with_tree();
+        // ToggleDir on collapsed directory → should set tree_focused
+        let _ = state.update(EditorMessage::ToggleDir("src".to_string()));
+        assert!(state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_select_file_clears_tree_focus() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
+        assert!(!state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_tree_nav_enter_on_file_dispatches_task() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 1; // Cargo.toml (not a directory)
+        let _task = state.update(EditorMessage::TreeNavEnter);
+        // TreeNavEnter dispatches SelectFile which clears tree_focused.
+        // The task is async, so tree_focused is still true here.
+        // We verify the state hasn't changed prematurely.
+        assert!(state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_tree_nav_enter_not_focused_ignored() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focus_index = 1; // Cargo.toml
+        let _task = state.update(EditorMessage::TreeNavEnter);
+        // Tree not focused — Enter is a no-op. State unchanged.
+        assert_eq!(state.file_tree.tree_focus_index, 1);
+        assert!(!state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_tree_nav_enter_on_dir_expands_and_advances() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src" directory
+        let _task = state.update(EditorMessage::TreeNavEnter);
+        // After expanding "src", focus should move to first child
+        assert!(state.file_tree.expanded_dirs.contains("src"));
+        assert_eq!(state.file_tree.tree_focus_index, 1); // "src/main.rs"
+    }
+
+    #[test]
+    fn test_visible_tree_clamps_focus_on_rebuild() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focus_index = 999; // Way out of range
+        state.file_tree.rebuild_visible();
+        assert_eq!(
+            state.file_tree.tree_focus_index,
+            state.file_tree.visible_tree_nodes.len() - 1
+        );
+    }
+
+    #[test]
+    fn test_async_enter_dir_sets_pending_then_advances() {
+        let mut state = EditorState::new();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        // Set up a tree where "src" dir_entries are empty (needs async load).
+        state.dir_entries.insert(
+            String::new(),
+            vec![FsEntry {
+                name: "src".to_string(),
+                full_path: "src".to_string(),
+                is_dir: true,
+                error: None,
+            }],
+        );
+        state.rebuild_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src"
+
+        let _task = state.update(EditorMessage::TreeNavEnter);
+        // "src" needs async loading — pending_enter_dir is set.
+        assert_eq!(state.pending_enter_dir.as_deref(), Some("src"));
+        assert!(state.file_tree.expanded_dirs.contains("src"));
+        // Focus stays on "src" until children load.
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+
+        // Simulate DirExpanded completing with children.
+        let entries = vec![FsEntry {
+            name: "main.rs".to_string(),
+            full_path: "src/main.rs".to_string(),
+            is_dir: false,
+            error: None,
+        }];
+        let dir_gen = state.generation;
+        let _task = state.update(EditorMessage::DirExpanded {
+            dir_path: "src".to_string(),
+            r#gen: dir_gen,
+            entries: Ok(entries),
+            quiet: false,
+        });
+        // Focus should have advanced to the first child.
+        assert_eq!(state.pending_enter_dir, None);
+        assert_eq!(state.file_tree.tree_focus_index, 1); // "src/main.rs"
+    }
+
+    // ── Git status porcelain parsing tests ─────────────────────────
+
+    #[test]
+    fn test_porcelain_modified_file() {
+        let map = parse_git_status_porcelain(" M src/main.rs\n");
+        assert_eq!(map.get("src/main.rs"), Some(&GitFileStatus::Modified));
+    }
+
+    #[test]
+    fn test_porcelain_staged_added() {
+        let map = parse_git_status_porcelain("A  new_file.rs\n");
+        assert_eq!(map.get("new_file.rs"), Some(&GitFileStatus::Added));
+    }
+
+    #[test]
+    fn test_porcelain_untracked() {
+        let map = parse_git_status_porcelain("?? new_file.rs\n");
+        assert_eq!(map.get("new_file.rs"), Some(&GitFileStatus::Added));
+    }
+
+    #[test]
+    fn test_porcelain_staged_and_unstaged_modified() {
+        // MM = staged modified + additional unstaged changes → Modified
+        let map = parse_git_status_porcelain("MM both.rs\n");
+        assert_eq!(map.get("both.rs"), Some(&GitFileStatus::Modified));
+    }
+
+    #[test]
+    fn test_porcelain_staged_added_unstaged_modified() {
+        // AM = staged added, but additionally modified in worktree → Modified
+        let map = parse_git_status_porcelain("AM partial.rs\n");
+        assert_eq!(map.get("partial.rs"), Some(&GitFileStatus::Modified));
+    }
+
+    #[test]
+    fn test_porcelain_rename() {
+        let map = parse_git_status_porcelain("R  old.rs -> new.rs\n");
+        assert_eq!(map.get("new.rs"), Some(&GitFileStatus::Modified));
+    }
+
+    #[test]
+    fn test_porcelain_rename_with_arrow_in_old_path() {
+        // Old path contains " -> " — rsplit_once extracts only the new path.
+        let map = parse_git_status_porcelain("R  \"old -> name.rs\" -> \"new -> name.rs\"\n");
+        assert_eq!(map.get("new -> name.rs"), Some(&GitFileStatus::Modified));
+    }
+
+    #[test]
+    fn test_porcelain_untracked_directory() {
+        // Git reports untracked directories with trailing slash.
+        let map = parse_git_status_porcelain("?? new_dir/\n");
+        assert_eq!(map.get("new_dir"), Some(&GitFileStatus::Added));
+    }
+
+    #[test]
+    fn test_porcelain_quoted_path_with_spaces() {
+        let map = parse_git_status_porcelain(" M \"path with spaces.rs\"\n");
+        assert_eq!(
+            map.get("path with spaces.rs"),
+            Some(&GitFileStatus::Modified)
+        );
+    }
+
+    #[test]
+    fn test_porcelain_deleted_file_skipped() {
+        let map = parse_git_status_porcelain(" D gone.rs\n");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_porcelain_staged_deleted_skipped() {
+        let map = parse_git_status_porcelain("D  gone.rs\n");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_porcelain_clean_file_not_present() {
+        // A clean (unmodified) tracked file won't appear in porcelain output,
+        // but if a line with no recognized status comes through, it's skipped.
+        let map = parse_git_status_porcelain("   clean.rs\n");
+        assert!(!map.contains_key("clean.rs"));
+    }
+
+    #[test]
+    fn test_porcelain_multiple_entries_same_file_modified_wins() {
+        // Staged added + unstaged modified (two lines for same file).
+        // The parser should keep Modified over Added.
+        let map = parse_git_status_porcelain("A  dup.rs\n M dup.rs\n");
+        assert_eq!(map.get("dup.rs"), Some(&GitFileStatus::Modified));
+    }
+
+    #[test]
+    fn test_porcelain_multiple_entries_same_file_untracked_wins() {
+        // Two untracked entries for same file? Real porcelain doesn't produce
+        // this, but we verify Added sticks when both are Added-level.
+        let map = parse_git_status_porcelain("?? dup.rs\nA  dup.rs\n");
+        assert_eq!(map.get("dup.rs"), Some(&GitFileStatus::Added));
+    }
+
+    #[test]
+    fn test_porcelain_empty_output() {
+        let map = parse_git_status_porcelain("");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_porcelain_mixed_statuses() {
+        let output = concat!(
+            " M src/main.rs\n",
+            "?? new_file.rs\n",
+            "A  staged.rs\n",
+            " D deleted.rs\n",
+        );
+        let map = parse_git_status_porcelain(output);
+        assert_eq!(map.get("src/main.rs"), Some(&GitFileStatus::Modified));
+        assert_eq!(map.get("new_file.rs"), Some(&GitFileStatus::Added));
+        assert_eq!(map.get("staged.rs"), Some(&GitFileStatus::Added));
+        assert!(!map.contains_key("deleted.rs"));
+    }
+
+    // ── Find/Replace tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_is_find_bar_open_true_when_active() {
+        let mut state = EditorState::new();
+        // Must have an active tab with find_replace_state.
+        state.tabs.push(Tab {
+            path: "/test.rs".to_string(),
+            file_name: "test.rs".to_string(),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.active_tab_index = 0;
+        state.tab_contents.insert(
+            "/test.rs".to_string(),
+            TabData {
+                content: EditorBuffer::with_text("fn hello() {}", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: Some(FindReplaceState {
+                    query: "hello".to_string(),
+                    replace: String::new(),
+                    matches: std::iter::once(4..9).collect(),
+                    current_match_idx: 0,
+                    case_sensitive: false,
+                }),
+                saved_text_hash: 0,
+            },
+        );
+        assert!(state.is_find_bar_open());
+    }
+
+    #[test]
+    fn test_is_find_bar_open_false_when_closed() {
+        let mut state = EditorState::new();
+        state.tabs.push(Tab {
+            path: "/test.rs".to_string(),
+            file_name: "test.rs".to_string(),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.active_tab_index = 0;
+        state.tab_contents.insert(
+            "/test.rs".to_string(),
+            TabData {
+                content: EditorBuffer::with_text("fn hello() {}", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: None,
+                saved_text_hash: 0,
+            },
+        );
+        assert!(!state.is_find_bar_open());
+    }
+
+    #[test]
+    fn test_is_find_bar_open_no_tabs() {
+        let state = EditorState::new();
+        assert!(!state.is_find_bar_open());
+    }
+
+    #[test]
+    fn test_find_replace_auto_advance_same_length() {
+        // Replace "ab" with "xy" in "ab cd ab" → "xy cd ab".
+        // After replacement, one "ab" remains at byte 7.
+        // Auto-advance should skip past the replacement (replace_end = 0 + 2 = 2)
+        // and find the remaining match at position 7.
+        let mut tab_data = TabData {
+            content: EditorBuffer::with_text("ab cd ab", None),
+            undo_stack: RefCell::new(UndoStack::new()),
+            find_replace_state: Some(FindReplaceState {
+                query: "ab".to_string(),
+                replace: "xy".to_string(),
+                matches: vec![0..2, 6..8],
+                current_match_idx: 0,
+                case_sensitive: true,
+            }),
+            saved_text_hash: 0,
+        };
+
+        // Simulate FindReplace on match 0.
+        let range = 0..2;
+        let replace_text = "xy".to_string();
+        let replace_end = range.start + replace_text.len(); // = 2
+        let text = tab_data.content.text();
+        let new_text = format!(
+            "{}{}{}",
+            &text[..range.start],
+            replace_text,
+            &text[range.end..]
+        );
+        assert_eq!(new_text, "xy cd ab");
+        tab_data.content = EditorBuffer::with_text(&new_text, None);
+        if let Some(ref mut state) = tab_data.find_replace_state {
+            state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
+            assert_eq!(state.matches.len(), 1, "one remaining match");
+            let next_idx = state
+                .matches
+                .iter()
+                .position(|m| m.start >= replace_end)
+                .unwrap_or(0)
+                .min(state.matches.len() - 1);
+            assert_eq!(next_idx, 0, "should advance to the remaining match");
+            if let Some(r) = state.matches.get(next_idx) {
+                assert_eq!(r.start, 6, "remaining match should start at byte 6");
+                assert_eq!(r.end, 8, "remaining match should end at byte 8");
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_replace_auto_advance_shorter_replacement() {
+        // Replace "aaa" with "a" in "aaa bbb aaa" → "a bbb aaa".
+        // After replacing first match (0..3) → "a" (at pos 0), the new text
+        // is "a bbb aaa". Position after replacement = 0 + 1 = 1.
+        // The remaining "aaa" starts at byte 6 in the new text.
+        // replace_end = 1 correctly finds it; old_end = 3 would also work here
+        // because 6 >= 3, but the real bug manifests with adjacent matches.
+        let mut tab_data = TabData {
+            content: EditorBuffer::with_text("aaa bbb aaa", None),
+            undo_stack: RefCell::new(UndoStack::new()),
+            find_replace_state: Some(FindReplaceState {
+                query: "aaa".to_string(),
+                replace: "a".to_string(),
+                matches: vec![0..3, 8..11],
+                current_match_idx: 0,
+                case_sensitive: true,
+            }),
+            saved_text_hash: 0,
+        };
+
+        let range = 0..3;
+        let replace_text = "a".to_string();
+        // CORRECT: position after replacement in NEW text
+        let replace_end = range.start + replace_text.len(); // = 1
+        let text = tab_data.content.text();
+        let new_text = format!(
+            "{}{}{}",
+            &text[..range.start],
+            replace_text,
+            &text[range.end..]
+        );
+        assert_eq!(new_text, "a bbb aaa");
+        tab_data.content = EditorBuffer::with_text(&new_text, None);
+        if let Some(ref mut state) = tab_data.find_replace_state {
+            state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
+            // Only the second "aaa" (now at 6..9) remains
+            assert_eq!(state.matches.len(), 1, "one remaining match");
+            assert_eq!(state.matches[0].start, 6);
+            assert_eq!(state.matches[0].end, 9);
+
+            // Using replace_end (= 1): finds next match at position 6
+            let correct_idx = state
+                .matches
+                .iter()
+                .position(|m| m.start >= replace_end)
+                .unwrap_or(0);
+            assert_eq!(
+                correct_idx, 0,
+                "replace_end should find the remaining match"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_replace_auto_advance_adjacent_matches() {
+        // Replace "aa" with "x" in "aaaa" → "xx".
+        // Original matches: 0..2, 2..4 (adjacent overlapping prohibited).
+        // After replacing match 0 (0..2) with "x": new text = "xaa".
+        // Position after replacement = 0 + 1 = 1.
+        // The old_end bug: old_end = 2. In new text, the remaining "aa" is at
+        // byte 1..3. Using old_end (= 2) would skip it because 2 >= 2 is true!
+        // But replace_end (= 1) correctly finds it because 1 >= 1.
+        let mut tab_data = TabData {
+            content: EditorBuffer::with_text("aaaa", None),
+            undo_stack: RefCell::new(UndoStack::new()),
+            find_replace_state: Some(FindReplaceState {
+                query: "aa".to_string(),
+                replace: "x".to_string(),
+                matches: vec![0..2, 2..4],
+                current_match_idx: 0,
+                case_sensitive: true,
+            }),
+            saved_text_hash: 0,
+        };
+
+        let range = 0..2;
+        let replace_text = "x".to_string();
+        let replace_end = range.start + replace_text.len(); // = 1
+        let old_end = range.end; // = 2 (the bug value)
+        let text = tab_data.content.text();
+        let new_text = format!(
+            "{}{}{}",
+            &text[..range.start],
+            replace_text,
+            &text[range.end..]
+        );
+        assert_eq!(new_text, "xaa", "after replacing first aa with x");
+        tab_data.content = EditorBuffer::with_text(&new_text, None);
+        if let Some(ref mut state) = tab_data.find_replace_state {
+            state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
+            assert_eq!(state.matches.len(), 1, "one remaining match in xaa");
+
+            // replace_end (= 1): m.start >= 1 → finds match at 1..3
+            let correct_idx = state
+                .matches
+                .iter()
+                .position(|m| m.start >= replace_end)
+                .unwrap_or(0);
+            assert_eq!(
+                correct_idx, 0,
+                "replace_end should find the remaining match"
+            );
+
+            // old_end (= 2): m.start >= 2 → finds match at... 1..3 has start=1,
+            // so 1 >= 2 is false, and 0 is returned (no match found).
+            // This means the match would be SKIPPED!
+            let bug_idx = state.matches.iter().position(|m| m.start >= old_end);
+            assert_eq!(bug_idx, None, "old_end skips the remaining match!");
+        }
+    }
+
+    #[test]
+    fn test_find_replace_auto_advance_longer_replacement() {
+        // Replace "ab" with "abc" in "ab" → "abc".
+        // After replacement, the new match for "ab" is at 0..2.
+        // replace_end = 0 + 3 = 3. The match at 0..2 has start=0 < 3,
+        // so position() returns None → unwrap_or(0) wraps to index 0.
+        let mut tab_data = TabData {
+            content: EditorBuffer::with_text("ab", None),
+            undo_stack: RefCell::new(UndoStack::new()),
+            find_replace_state: Some(FindReplaceState {
+                query: "ab".to_string(),
+                replace: "abc".to_string(),
+                matches: std::iter::once(0..2).collect(),
+                current_match_idx: 0,
+                case_sensitive: true,
+            }),
+            saved_text_hash: 0,
+        };
+
+        let range = 0..2;
+        let replace_text = "abc".to_string();
+        let replace_end = range.start + replace_text.len(); // = 3
+        let text = tab_data.content.text();
+        let new_text = format!(
+            "{}{}{}",
+            &text[..range.start],
+            replace_text,
+            &text[range.end..]
+        );
+        assert_eq!(new_text, "abc");
+        tab_data.content = EditorBuffer::with_text(&new_text, None);
+        if let Some(ref mut state) = tab_data.find_replace_state {
+            state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
+            // "abc" still contains "ab" at 0..2
+            assert_eq!(state.matches.len(), 1, "one match in abc");
+
+            // replace_end = 3: m.start >= 3 → match 0..2 has start=0, 0 >= 3 is false,
+            // so position() returns None, unwrap_or(0) gives 0.
+            let next_idx = state
+                .matches
+                .iter()
+                .position(|m| m.start >= replace_end)
+                .unwrap_or(0)
+                .min(state.matches.len() - 1);
+            assert_eq!(next_idx, 0, "wraps back to the same match");
+        }
+    }
+
+    #[test]
+    fn test_find_replace_auto_advance_no_more_matches() {
+        // Replace "ab" with "xy" in "ab" → "xy". No more matches.
+        let mut tab_data = TabData {
+            content: EditorBuffer::with_text("ab", None),
+            undo_stack: RefCell::new(UndoStack::new()),
+            find_replace_state: Some(FindReplaceState {
+                query: "ab".to_string(),
+                replace: "xy".to_string(),
+                matches: std::iter::once(0..2).collect(),
+                current_match_idx: 0,
+                case_sensitive: true,
+            }),
+            saved_text_hash: 0,
+        };
+
+        let range = 0..2;
+        let replace_text = "xy".to_string();
+        let text = tab_data.content.text();
+        let new_text = format!(
+            "{}{}{}",
+            &text[..range.start],
+            replace_text,
+            &text[range.end..]
+        );
+        tab_data.content = EditorBuffer::with_text(&new_text, None);
+        if let Some(ref mut state) = tab_data.find_replace_state {
+            state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
+            assert!(state.matches.is_empty(), "no matches in xy");
+            if state.matches.is_empty() {
+                state.current_match_idx = 0;
+            }
+            assert_eq!(state.current_match_idx, 0, "reset to 0");
+        }
+    }
+
+    #[test]
+    fn test_navigate_find_match_wraps_next() {
+        let mut state = EditorState::new();
+        state.tabs.push(Tab {
+            path: "/test.rs".to_string(),
+            file_name: "test.rs".to_string(),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.active_tab_index = 0;
+        state.tab_contents.insert(
+            "/test.rs".to_string(),
+            TabData {
+                content: EditorBuffer::with_text("a b c", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: Some(FindReplaceState {
+                    query: " ".to_string(),
+                    replace: String::new(),
+                    matches: vec![1..2, 3..4],
+                    current_match_idx: 0,
+                    case_sensitive: true,
+                }),
+                saved_text_hash: 0,
+            },
+        );
+
+        // Navigate next from index 0 → 1.
+        state.navigate_find_match(&FindDirection::Next);
+        let frs = state.tab_contents.get("/test.rs").unwrap();
+        let s = frs.find_replace_state.as_ref().unwrap();
+        assert_eq!(s.current_match_idx, 1);
+
+        // Navigate next from index 1 → wraps to 0.
+        state.navigate_find_match(&FindDirection::Next);
+        let s = state.tab_contents.get("/test.rs").unwrap();
+        let s = s.find_replace_state.as_ref().unwrap();
+        assert_eq!(s.current_match_idx, 0);
+    }
+
+    #[test]
+    fn test_navigate_find_match_wraps_prev() {
+        let mut state = EditorState::new();
+        state.tabs.push(Tab {
+            path: "/test.rs".to_string(),
+            file_name: "test.rs".to_string(),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.active_tab_index = 0;
+        state.tab_contents.insert(
+            "/test.rs".to_string(),
+            TabData {
+                content: EditorBuffer::with_text("a b c", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: Some(FindReplaceState {
+                    query: " ".to_string(),
+                    replace: String::new(),
+                    matches: vec![1..2, 3..4],
+                    current_match_idx: 0,
+                    case_sensitive: true,
+                }),
+                saved_text_hash: 0,
+            },
+        );
+
+        // Navigate prev from index 0 → wraps to 1 (last).
+        state.navigate_find_match(&FindDirection::Prev);
+        let s = state.tab_contents.get("/test.rs").unwrap();
+        let s = s.find_replace_state.as_ref().unwrap();
+        assert_eq!(s.current_match_idx, 1);
+
+        // Navigate prev from index 1 → 0.
+        state.navigate_find_match(&FindDirection::Prev);
+        let s = state.tab_contents.get("/test.rs").unwrap();
+        let s = s.find_replace_state.as_ref().unwrap();
+        assert_eq!(s.current_match_idx, 0);
+    }
+
+    #[test]
+    fn test_navigate_find_match_no_matches() {
+        let mut state = EditorState::new();
+        state.tabs.push(Tab {
+            path: "/test.rs".to_string(),
+            file_name: "test.rs".to_string(),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.active_tab_index = 0;
+        state.tab_contents.insert(
+            "/test.rs".to_string(),
+            TabData {
+                content: EditorBuffer::with_text("no matches", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: Some(FindReplaceState {
+                    query: "zzz".to_string(),
+                    replace: String::new(),
+                    matches: vec![],
+                    current_match_idx: 0,
+                    case_sensitive: true,
+                }),
+                saved_text_hash: 0,
+            },
+        );
+
+        // Navigating with no matches should not crash.
+        state.navigate_find_match(&FindDirection::Next);
+        state.navigate_find_match(&FindDirection::Prev);
+        let s = state.tab_contents.get("/test.rs").unwrap();
+        let s = s.find_replace_state.as_ref().unwrap();
+        assert_eq!(s.current_match_idx, 0);
+    }
+
+    #[test]
+    fn test_navigate_find_match_only_affects_find_tab() {
+        // Tab without find state should not be affected.
+        let mut state = EditorState::new();
+        state.tabs.push(Tab {
+            path: "/a.rs".to_string(),
+            file_name: "a.rs".to_string(),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.active_tab_index = 0;
+        state.tab_contents.insert(
+            "/a.rs".to_string(),
+            TabData {
+                content: EditorBuffer::with_text("hello", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: None,
+                saved_text_hash: 0,
+            },
+        );
+
+        // Should not panic.
+        state.navigate_find_match(&FindDirection::Next);
+        state.navigate_find_match(&FindDirection::Prev);
+    }
+
+    #[test]
+    fn test_compute_text_matches_no_minimum_length() {
+        // Current implementation requires 2-char minimum. Document this
+        // behavior — single-char queries return empty.
+        let result = compute_text_matches("hello", "h", true);
+        assert!(
+            result.is_empty(),
+            "single-char query returns empty (2-char min)"
+        );
+
+        let result = compute_text_matches("hello", "he", true);
+        assert_eq!(result.len(), 1, "2-char query works");
+    }
+
+    #[test]
+    fn test_compute_text_matches_at_boundaries() {
+        let result = compute_text_matches("ab", "ab", true);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], 0..2);
+
+        let result = compute_text_matches("abab", "ab", true);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], 0..2);
+        assert_eq!(result[1], 2..4);
+    }
+
+    // ── Tree arrow-key navigation tests ─────────────────────────────
+
+    #[test]
+    fn test_tree_nav_left_on_expanded_dir_collapses() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focus_index = 0; // "src"
+        assert!(state.file_tree.expanded_dirs.contains("src"));
+
+        let _ = state.update(EditorMessage::TreeNavLeft);
+        assert!(!state.file_tree.expanded_dirs.contains("src"));
+        // Focus stays on "src" after collapse
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn test_tree_nav_left_on_file_navigates_to_parent() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 1; // "src/main.rs"
+
+        let _ = state.update(EditorMessage::TreeNavLeft);
+        // Should navigate to parent "src"
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
+    }
+
+    #[test]
+    fn test_tree_nav_left_on_root_collapsed_dir_noop() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src" (collapsed, root-level)
+        assert!(!state.file_tree.expanded_dirs.contains("src"));
+
+        let _ = state.update(EditorMessage::TreeNavLeft);
+        // Root-level collapsed dir has no parent — no-op.
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn test_tree_nav_left_on_root_file_noop() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 1; // "Cargo.toml" (root-level file)
+
+        let _ = state.update(EditorMessage::TreeNavLeft);
+        // Root-level file has no parent — no-op.
+        assert_eq!(state.file_tree.tree_focus_index, 1);
+    }
+
+    #[test]
+    fn test_tree_nav_right_on_collapsed_dir_expands_and_advances() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src" (collapsed, has children in dir_entries)
+
+        let _ = state.update(EditorMessage::TreeNavRight);
+        // Should expand "src" and advance to first child "src/main.rs"
+        assert!(state.file_tree.expanded_dirs.contains("src"));
+        assert_eq!(state.file_tree.tree_focus_index, 1);
+        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
+    }
+
+    #[test]
+    fn test_tree_nav_right_on_expanded_dir_moves_to_first_child() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src" (already expanded)
+
+        let _ = state.update(EditorMessage::TreeNavRight);
+        // Should move focus to first child "src/main.rs"
+        assert_eq!(state.file_tree.tree_focus_index, 1);
+        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
+    }
+
+    #[test]
+    fn test_tree_nav_right_on_file_noop() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 1; // "Cargo.toml" (file)
+
+        let _ = state.update(EditorMessage::TreeNavRight);
+        // ArrowRight on file does nothing
+        assert_eq!(state.file_tree.tree_focus_index, 1);
+    }
+
+    // ── Click-to-select focus index tests ────────────────────────────
+
+    #[test]
+    fn test_toggle_dir_sets_tree_focus_index() {
+        let mut state = make_editor_with_tree();
+        let _ = state.update(EditorMessage::ToggleDir("src".to_string()));
+        // ToggleDir should set tree_focus_index to "src"'s position
+        assert!(state.file_tree.tree_focused);
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
+    }
+
+    #[test]
+    fn test_select_file_sets_tree_focus_index() {
+        let mut state = make_editor_with_tree();
+        // Expand "src" so "src/main.rs" is visible in the flat list.
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = false;
+        let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
+        // SelectFile clears tree_focused but remembers focus index.
+        assert!(!state.file_tree.tree_focused);
+        // tree_focus_index should point to "src/main.rs" for Ctrl+B re-focus.
+        assert_eq!(
+            state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
+            "src/main.rs"
+        );
+    }
+}

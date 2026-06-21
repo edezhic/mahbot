@@ -1,0 +1,1 @@
+Edit or create a file. Without `old_string` (or when `old_string` is empty): creates a new file (refuses to overwrite). With `old_string`: replaces that text in the existing file (semi-insensitive to whitespace in code files). `old_string` and `new_string` must differ — identical strings are rejected as a no-op.
