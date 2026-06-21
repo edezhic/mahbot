@@ -596,9 +596,9 @@ mod tests {
         // experimental_*() equivalent — they cannot be mapped here.
         // ─────────────────────────────────────────────────────────────────
 
-        mapped.sort();
+        mapped.sort_unstable();
         let mut expected: Vec<&str> = EXPERIMENTAL_FEATURES.to_vec();
-        expected.sort();
+        expected.sort_unstable();
 
         assert_eq!(
             mapped, expected,

@@ -187,9 +187,9 @@ impl ConfigStore {
                 "SELECT model, reasoning_effort FROM config_role WHERE role = ?1",
                 turso::params![role],
                 |row| {
-                    let model = turso::row_text_opt(&row, 0)
+                    let model = turso::row_text_opt(row, 0)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
-                    let reasoning_effort = turso::row_text_opt(&row, 1)
+                    let reasoning_effort = turso::row_text_opt(row, 1)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
                     Ok::<RoleConfig, ::turso::Error>(RoleConfig {
                         role: role_owned,
@@ -247,9 +247,9 @@ impl ConfigStore {
                 "SELECT provider_order, allow_fallbacks FROM config_model_routing WHERE model = ?1",
                 turso::params![model],
                 |row| {
-                    let provider_order = turso::row_text_opt(&row, 0)
+                    let provider_order = turso::row_text_opt(row, 0)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
-                    let allow_fallbacks = turso::row_bool_opt(&row, 1)
+                    let allow_fallbacks = turso::row_bool_opt(row, 1)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
                     Ok::<ModelRouting, ::turso::Error>(ModelRouting {
                         model: model_owned,

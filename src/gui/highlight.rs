@@ -1157,7 +1157,7 @@ mod tests {
     fn test_markdown_heading_with_emphasis() {
         let code = "# *hello*\n";
         let fh = parse_markdown_highlights(code);
-        assert!(fh.spans.len() >= 1, "at least heading line");
+        assert!(!fh.spans.is_empty(), "at least heading line");
         // Block-level text.title (Type) subsumes emphasis due to stable sort
         // order (block captures come before inline in the flat span list).
         let has_title = fh.spans[0]
@@ -1173,7 +1173,7 @@ mod tests {
     fn test_markdown_combined_heading_bold() {
         let code = "## **important**\n";
         let fh = parse_markdown_highlights(code);
-        assert!(fh.spans.len() >= 1);
+        assert!(!fh.spans.is_empty());
         // Block heading has Type.
         let has_type = fh.spans[0]
             .iter()

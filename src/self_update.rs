@@ -1344,7 +1344,7 @@ mod tests {
         let source = Path::new("/tmp/nonexistent_binary");
         let current_exe = std::env::current_exe().unwrap();
 
-        let result = resolve_spawn_path(&source, None, None).await;
+        let result = resolve_spawn_path(source, None, None).await;
 
         assert!(
             result.is_ok(),
