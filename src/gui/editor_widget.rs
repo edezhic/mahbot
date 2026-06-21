@@ -1630,6 +1630,66 @@ pub fn line_comment_prefix(
 
 // ── Helper functions ────────────────────────────────────────────────
 
+/// Compute the total height of a cosmic_text buffer, accounting for wrapped
+/// lines. Each source line is capped at [`MAX_VISUAL_LINES_PER_SOURCE`]
+/// visual lines as a safety limit against pathological single lines
+/// (e.g. no-whitespace megabyte lines).
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn compute_total_height(
+    buffer: &mut cosmic_text::Buffer,
+    font_sys: &mut cosmic_text::FontSystem,
+    metrics: cosmic_text::Metrics,
+) -> f32 {
+    let mut total_visual_lines: f32 = 0.0;
+    for i in 0..buffer.lines.len() {
+        let visual_count = buffer
+            .line_layout(font_sys, i)
+            .map_or(1, |ll| ll.len().min(MAX_VISUAL_LINES_PER_SOURCE));
+        total_visual_lines += visual_count as f32;
+    }
+    total_visual_lines * metrics.line_height
+}
+
+/// Compute the text area rectangle (position and size) inside the given
+/// `bounds`, accounting for `padding` and `gutter_width`.
+///
+/// The returned rectangle has:
+/// - `x`: `bounds.x + padding + gutter_width + 4px` gap
+/// - `y`: `bounds.y + padding`
+/// - `width`: remainder of `bounds.width` after gutter, gap, and padding
+/// - `height`: `bounds.height` minus `padding` on both sides
+pub(crate) fn text_area_rect(
+    bounds: iced::Rectangle,
+    padding: f32,
+    gutter_width: f32,
+) -> iced::Rectangle {
+    let x = bounds.x + padding + gutter_width + 4.0; // 4px gap
+    let y = bounds.y + padding;
+    let width = (bounds.width - (x - bounds.x) - padding).max(0.0);
+    let height = (bounds.height - padding * 2.0).max(0.0);
+    iced::Rectangle {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// Compute the gutter clip rectangle for line numbers.
+pub(crate) fn gutter_clip_rect(
+    bounds: iced::Rectangle,
+    padding: f32,
+    gutter_width: f32,
+    text_area_height: f32,
+) -> iced::Rectangle {
+    iced::Rectangle {
+        x: bounds.x + padding,
+        y: bounds.y + padding,
+        width: gutter_width,
+        height: text_area_height,
+    }
+}
+
 /// Convert an [`iced::Color`] (f32 RGBA components, 0.0–1.0) to
 /// [`cosmic_text::Color`] (u8 RGB).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2258,16 +2318,7 @@ where
         // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines
         // as a safety limit against pathological single lines (e.g.
         // no-whitespace megabyte).
-        let total_height = {
-            let mut total_visual_lines: f32 = 0.0;
-            for i in 0..buffer.lines.len() {
-                let visual_count = buffer
-                    .line_layout(font_sys, i)
-                    .map_or(1, |ll| ll.len().min(MAX_VISUAL_LINES_PER_SOURCE));
-                total_visual_lines += visual_count as f32;
-            }
-            total_visual_lines * metrics.line_height
-        };
+        let total_height = compute_total_height(&mut buffer, font_sys, metrics);
         state.max_scroll_y = (total_height - text_area_height).max(0.0);
         state.scroll_y = state.scroll_y.clamp(0.0, state.max_scroll_y);
 
@@ -2306,10 +2357,11 @@ where
         let bounds = layout.bounds();
         let gutter_width = state.gutter_width;
 
-        let text_x = bounds.x + self.padding + gutter_width + 4.0; // 4px gap
-        let text_y = bounds.y + self.padding;
-        let text_area_width = (bounds.width - (text_x - bounds.x) - self.padding).max(0.0);
-        let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
+        let text_rect = text_area_rect(bounds, self.padding, gutter_width);
+        let text_x = text_rect.x;
+        let text_y = text_rect.y;
+        let text_area_width = text_rect.width;
+        let text_area_height = text_rect.height;
 
         // ── 1. Fill background ──
         renderer.fill_quad(
@@ -2335,21 +2387,11 @@ where
             cloned
         });
 
-        let text_clip = Rectangle {
-            x: text_x,
-            y: text_y,
-            width: text_area_width,
-            height: text_area_height,
-        };
+        let text_clip = text_rect;
 
         // ── Draw line numbers ──
         let number_color = theme::TEXT_MUTED;
-        let number_clip = Rectangle {
-            x: bounds.x + self.padding,
-            y: bounds.y + self.padding,
-            width: gutter_width,
-            height: text_area_height,
-        };
+        let number_clip = gutter_clip_rect(bounds, self.padding, gutter_width, text_area_height);
 
         let mut last_line_i = usize::MAX;
         for run in buffer_for_draw.layout_runs() {

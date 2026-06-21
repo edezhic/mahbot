@@ -33,8 +33,8 @@ use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 use crate::util::UnwrapPoison;
 
 use super::editor_widget::{
-    GUTTER_FONT_SIZE, MAX_VISUAL_LINES_PER_SOURCE, font_metrics, iced_color_to_cosmic,
-    push_or_merge,
+    GUTTER_FONT_SIZE, compute_total_height, font_metrics, gutter_clip_rect, iced_color_to_cosmic,
+    push_or_merge, text_area_rect,
 };
 use super::theme;
 
@@ -199,16 +199,7 @@ where
 
         // ── Compute total height ────────────────────────────────────
         // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines
-        let total_height: f32 = {
-            let mut total: f32 = 0.0;
-            for i in 0..buffer.lines.len() {
-                let visual_count = buffer
-                    .line_layout(font_sys, i)
-                    .map_or(1, |ll| ll.len().min(MAX_VISUAL_LINES_PER_SOURCE));
-                total += visual_count as f32;
-            }
-            total * metrics.line_height
-        };
+        let total_height: f32 = compute_total_height(&mut buffer, font_sys, metrics);
 
         // Move the shaped buffer into an Arc and store for fill_raw
         let arc = Arc::new(buffer);
@@ -233,17 +224,13 @@ where
         let bounds = layout.bounds();
         let gutter_width = state.gutter_width;
 
-        let text_x = bounds.x + self.padding + gutter_width + 4.0;
-        let text_y = bounds.y + self.padding;
-        let text_area_width = (bounds.width - (text_x - bounds.x) - self.padding).max(0.0);
-        let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
+        let text_rect = text_area_rect(bounds, self.padding, gutter_width);
+        let text_x = text_rect.x;
+        let text_y = text_rect.y;
+        let text_area_width = text_rect.width;
+        let text_area_height = text_rect.height;
 
-        let text_clip = Rectangle {
-            x: text_x,
-            y: text_y,
-            width: text_area_width,
-            height: text_area_height,
-        };
+        let text_clip = text_rect;
 
         let buffer_for_draw = match &state.buffer_for_render {
             Some(arc) => arc.clone(),
@@ -292,12 +279,7 @@ where
 
         // ── 2. Draw line numbers (gutter) ───────────────────────────
         let number_color = theme::TEXT_MUTED;
-        let gutter_clip = Rectangle {
-            x: bounds.x + self.padding,
-            y: bounds.y + self.padding,
-            width: gutter_width,
-            height: text_area_height,
-        };
+        let gutter_clip = gutter_clip_rect(bounds, self.padding, gutter_width, text_area_height);
 
         let mut last_drawn_line = usize::MAX;
         for run in buffer_for_draw.layout_runs() {
