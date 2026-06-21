@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     maintenance INTEGER NOT NULL DEFAULT 0,
-    paused      INTEGER NOT NULL DEFAULT 0,
+    paused      INTEGER NOT NULL DEFAULT 1,
     maintainer_debounce_mins INTEGER NOT NULL DEFAULT 5,
     maintainer_last_run_at TEXT,
     diagnostics TEXT,
@@ -243,15 +243,65 @@ async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) ->
     Ok(())
 }
 
-/// Spawn analysis for all analysis-eligible roles and set final status.
-/// Runs diagnostics discovery concurrently with role discovery via `tokio::join!`.
-/// Manager decision: diagnostics failure is FATAL — workspace status becomes "failed".
+// Spawn analysis for all analysis-eligible roles and set final status.
+// Runs diagnostics discovery concurrently with role discovery via `tokio::join!`.
+// Manager decision: diagnostics failure is FATAL — workspace status becomes "failed".
+//
+// `discovery_generation` is the generation counter captured by the caller
+// (either `add` or `rediscover`). Before writing final status, the task
+// re-reads the generation from the DB; if it no longer matches, a newer
+// rediscover call has been made and this task's results are stale — all
+// writes are skipped.
+// ── Discovery completion finalizer ────────────────────────────────
+
+/// Apply the final status and pause state after a discovery run completes.
 ///
-/// `discovery_generation` is the generation counter captured by the caller
-/// (either `add` or `rediscover`). Before writing final status, the task
-/// re-reads the generation from the DB; if it no longer matches, a newer
-/// rediscover call has been made and this task's results are stale — all
-/// writes are skipped.
+/// This is called from [`spawn_workspace_discovery`] after all role discoveries
+/// and diagnostics have finished.  Extracted as a separate function so unit tests
+/// can verify the paused-behavior invariants without running real agents.
+///
+/// ## Invariants
+///
+/// - If `all_ok`: sets status to `ready`. When `discovery_generation == 0` (the
+///   initial discovery), also unpauses the workspace.  Rediscovery (generation > 0)
+///   does **not** auto-unpause — if a user explicitly paused the workspace and
+///   triggered rediscovery, their choice is preserved.
+/// - If **not** `all_ok`: sets status to `failed` and leaves `paused` untouched.
+/// - Before any write, checks the generation guard: if a newer [`WorkspaceStorage::rediscover`]
+///   bumped the generation while discovery was in flight, the writes are skipped.
+async fn finalize_discovery(
+    storage: &WorkspaceStorage,
+    ws_name: &str,
+    discovery_generation: i64,
+    all_ok: bool,
+    errors: &[String],
+) {
+    // Final guard: if a newer rediscover was triggered while this task ran,
+    // all three write sites (contexts, diagnostics, status) have already been
+    // individually guarded.  This check catches the status write.
+    if !check_discovery_generation(storage, ws_name, discovery_generation, "final status").await {
+        return;
+    }
+
+    if all_ok {
+        let _ = storage.set_status(ws_name, "ready").await;
+        // Auto-unpause only on the initial discovery (generation 0).
+        // Rediscovery should NOT auto-unpause — if a user explicitly paused the
+        // workspace and then triggered rediscovery, the workspace stays paused.
+        if discovery_generation == 0 {
+            let _ = storage.set_paused(ws_name, false).await;
+        }
+        tracing::info!(
+            workspace_name = ws_name,
+            "Workspace analysis complete — all roles ready"
+        );
+    } else {
+        let msg = errors.join("; ");
+        let _ = storage.set_status(ws_name, "failed").await;
+        tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
+    }
+}
+
 pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
     let ws = ws.clone();
     tokio::spawn(async move {
@@ -296,26 +346,7 @@ pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
             return;
         };
 
-        // Final guard: if a newer rediscover was triggered while this task ran,
-        // all three write sites (contexts, diagnostics, status) have already been
-        // individually guarded.  This check catches the status write.
-        if !check_discovery_generation(storage, &ws_name, discovery_generation, "final status")
-            .await
-        {
-            return;
-        }
-
-        if all_ok {
-            let _ = storage.set_status(&ws_name, "ready").await;
-            tracing::info!(
-                workspace_name = ws_name,
-                "Workspace analysis complete — all roles ready"
-            );
-        } else {
-            let msg = errors.join("; ");
-            let _ = storage.set_status(&ws_name, "failed").await;
-            tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
-        }
+        finalize_discovery(storage, &ws_name, discovery_generation, all_ok, &errors).await;
     });
 }
 
@@ -424,8 +455,8 @@ impl WorkspaceStorage {
         let now = turso::now();
         self.conn
             .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
-                turso::params![name, path.clone(), now.clone(), now.clone()],
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) VALUES (?1, ?2, ?3, ?4, ?5)",
+                turso::params![name, path.clone(), now.clone(), now.clone(), 1],
             )
             .await?;
         let ws = Workspace {
@@ -435,7 +466,7 @@ impl WorkspaceStorage {
             created_at: now.clone(),
             updated_at: now.clone(),
             maintenance: false,
-            paused: false,
+            paused: true,
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: None,
             diagnostics: None,
@@ -809,5 +840,273 @@ pub fn test_ws_named(path: &str, name: &str) -> Workspace {
         path: path.to_string(),
         maintainer_debounce_mins: 5,
         ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Open a temporary workspace store for testing.
+    /// Returns (store, temp_dir). The temp_dir is kept alive for the lifetime
+    /// of the store (~ the test function).
+    async fn test_store() -> (WorkspaceStorage, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let store = WorkspaceStorage::open(tmp.path())
+            .await
+            .expect("open workspace store");
+        (store, tmp)
+    }
+
+    /// Helper: insert a workspace row directly with full control over fields,
+    /// bypassing `add()` (which has side-effects like initializing search
+    /// engine globals).
+    #[expect(clippy::too_many_arguments)]
+    async fn insert_direct(
+        store: &WorkspaceStorage,
+        name: &str,
+        path: &str,
+        paused: bool,
+        discovery_generation: i64,
+    ) -> Workspace {
+        let now = crate::turso::now();
+        let paused_int: i64 = i64::from(paused);
+        store
+            .conn
+            .execute(
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused, discovery_generation) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                crate::turso::params![name, path, now.clone(), now.clone(), paused_int, discovery_generation],
+            )
+            .await
+            .expect("insert workspace");
+        Workspace {
+            name: name.to_string(),
+            path: path.to_string(),
+            status: "pending".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            maintenance: false,
+            paused,
+            maintainer_debounce_mins: 5,
+            maintainer_last_run_at: None,
+            diagnostics: None,
+            diagnostics_updated_at: None,
+        }
+    }
+
+    // ── Schema / struct consistency ─────────────────────────────
+
+    #[tokio::test]
+    async fn new_workspace_starts_paused() {
+        let (store, _tmp) = test_store().await;
+        let ws = insert_direct(&store, "test_ws", "/tmp/test_ws", true, 0).await;
+        assert!(ws.paused, "In-memory workspace should have paused = true");
+
+        // Round-trip through the DB.
+        let fetched = store
+            .get_by_name("test_ws")
+            .await
+            .expect("fetch workspace")
+            .expect("workspace exists");
+        assert!(
+            fetched.paused,
+            "Persisted workspace should have paused = true"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_default_is_paused() {
+        // Insert WITHOUT specifying paused, relying on the schema DEFAULT.
+        let (store, _tmp) = test_store().await;
+        let now = crate::turso::now();
+        store
+            .conn
+            .execute(
+                "INSERT INTO workspaces (name, path, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                crate::turso::params!["schema_test", "/tmp/schema_test", now.clone(), now.clone()],
+            )
+            .await
+            .expect("insert workspace");
+
+        let ws = store
+            .get_by_name("schema_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(
+            ws.paused,
+            "Schema DEFAULT should produce paused = true for new rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_paused_toggles_pause_state() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "toggle_test", "/tmp/toggle_test", true, 0).await;
+
+        // Unpause
+        store.set_paused("toggle_test", false).await.unwrap();
+        let fetched = store
+            .get_by_name("toggle_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(
+            !fetched.paused,
+            "Should be unpaused after set_paused(false)"
+        );
+
+        // Re-pause
+        store.set_paused("toggle_test", true).await.unwrap();
+        let fetched = store
+            .get_by_name("toggle_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(fetched.paused, "Should be paused after set_paused(true)");
+    }
+
+    // ── finalize_discovery — auto-unpause invariants ─────────────
+
+    #[tokio::test]
+    async fn finalize_discovery_success_gen0_auto_unpauses() {
+        let (store, _tmp) = test_store().await;
+        // Start paused with discovery_generation = 0.
+        insert_direct(&store, "gen0", "/tmp/gen0", true, 0).await;
+
+        // Act: simulate initial discovery completion (all_ok = true, gen 0).
+        finalize_discovery(&store, "gen0", 0, true, &[]).await;
+
+        let ws = store
+            .get_by_name("gen0")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(!ws.paused, "Should auto-unpause after initial discovery OK");
+        assert_eq!(ws.status, "ready", "Status should be 'ready'");
+    }
+
+    #[tokio::test]
+    async fn finalize_discovery_success_gen1_no_auto_unpause() {
+        let (store, _tmp) = test_store().await;
+        // Start paused with discovery_generation = 1 (rediscovery case).
+        insert_direct(&store, "gen1", "/tmp/gen1", true, 1).await;
+
+        // Act: simulate rediscovery completing successfully (generation 1).
+        finalize_discovery(&store, "gen1", 1, true, &[]).await;
+
+        let ws = store
+            .get_by_name("gen1")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(
+            ws.paused,
+            "Should NOT auto-unpause on rediscovery (gen > 0)"
+        );
+        assert_eq!(ws.status, "ready", "Status should be 'ready'");
+    }
+
+    #[tokio::test]
+    async fn finalize_discovery_failure_keeps_paused() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "fail_gen0", "/tmp/fail_gen0", true, 0).await;
+
+        // Act: discovery failed (all_ok = false).
+        let errors = vec!["Diagnostics discovery failed: timeout".to_string()];
+        finalize_discovery(&store, "fail_gen0", 0, false, &errors).await;
+
+        let ws = store
+            .get_by_name("fail_gen0")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(ws.paused, "Should remain paused after discovery failure");
+        assert_eq!(ws.status, "failed", "Status should be 'failed'");
+    }
+
+    #[tokio::test]
+    async fn finalize_discovery_stale_generation_skips_writes() {
+        let (store, _tmp) = test_store().await;
+        // Start paused with generation 0.
+        insert_direct(&store, "stale", "/tmp/stale", true, 0).await;
+
+        // Bump the generation behind the scenes (simulates a concurrent
+        // rediscover() call).
+        let now = crate::turso::now();
+        store
+            .conn
+            .execute(
+                "UPDATE workspaces SET discovery_generation = 1, updated_at = ?1 WHERE name = ?2",
+                crate::turso::params![now, "stale"],
+            )
+            .await
+            .expect("bump generation");
+
+        // Act: try to finalize with the stale generation 0.
+        finalize_discovery(&store, "stale", 0, true, &[]).await;
+
+        let ws = store
+            .get_by_name("stale")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        // The writes should have been skipped because the generation
+        // no longer matches.
+        assert!(
+            ws.paused,
+            "Should stay paused — writes skipped by generation guard"
+        );
+        assert_eq!(
+            ws.status, "pending",
+            "Status should remain unchanged — writes skipped"
+        );
+    }
+
+    // ── Integration: add() returns paused: true ──────────────────
+
+    #[tokio::test]
+    async fn add_returns_paused_true() {
+        let (store, _tmp) = test_store().await;
+        let dir = TempDir::new().expect("temp dir for workspace path");
+
+        // add() requires: search engine globals initialized + CONFIG storage
+        // root set.  Initialize the minimum globals.
+        if !crate::search_engine::registry_initialized() {
+            crate::search_engine::init_global();
+        }
+        // Set a throwaway storage root if not already set (the OnceLock
+        // panics on double-set, so we only set if not already set).
+        let tmp_root = TempDir::new().expect("storage root temp dir");
+        let _ = crate::config::CONFIG.set_storage_root(tmp_root.path().to_path_buf());
+        crate::config::CONFIG.swap(crate::config::ConfigData::default());
+
+        let ws = store
+            .add("add_test", dir.path().to_str().unwrap())
+            .await
+            .expect("add workspace");
+
+        assert!(
+            ws.paused,
+            "add() must return a Workspace with paused = true"
+        );
+
+        // Also verify via get_by_name.
+        let fetched = store
+            .get_by_name("add_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(
+            fetched.paused,
+            "Persisted workspace must have paused = true"
+        );
     }
 }
