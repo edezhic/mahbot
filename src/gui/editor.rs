@@ -36,7 +36,6 @@ use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unesc
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
 use super::editor_widget::EditorBuffer;
-use super::highlight::HighlightLanguage;
 use super::theme;
 use super::widgets::{self, FileTree};
 
@@ -1788,13 +1787,7 @@ impl EditorState {
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             // Clear find/replace state — match byte ranges are now stale.
             tab_data.find_replace_state = None;
-            let language = HighlightLanguage::from_path(&path);
-            tab_data.content = EditorBuffer::with_text(&snapshot.text, language);
-            tab_data.content.set_file_extension(
-                std::path::Path::new(&path)
-                    .extension()
-                    .and_then(|e| e.to_str()),
-            );
+            tab_data.content = EditorBuffer::from_file(&snapshot.text, &path);
             tab_data
                 .content
                 .move_to(snapshot.cursor_line, snapshot.cursor_col);
@@ -1982,13 +1975,7 @@ impl EditorState {
                 let mut active_idx = 0;
 
                 for (i, saved) in tabs_data.into_iter().enumerate() {
-                    let language = HighlightLanguage::from_path(&saved.file_path);
-                    let content = EditorBuffer::with_text(&saved.text, language);
-                    content.set_file_extension(
-                        std::path::Path::new(&saved.file_path)
-                            .extension()
-                            .and_then(|e| e.to_str()),
-                    );
+                    let content = EditorBuffer::from_file(&saved.text, &saved.file_path);
                     let file_name = Path::new(&saved.file_path).file_name().map_or_else(
                         || saved.file_path.clone(),
                         |n| n.to_string_lossy().to_string(),
@@ -2239,13 +2226,7 @@ impl EditorState {
 
                 match result {
                     Ok(data) => {
-                        let language = HighlightLanguage::from_path(&data.path);
-                        let content = EditorBuffer::with_text(&data.text, language);
-                        content.set_file_extension(
-                            std::path::Path::new(&data.path)
-                                .extension()
-                                .and_then(|e| e.to_str()),
-                        );
+                        let content = EditorBuffer::from_file(&data.text, &data.path);
                         let file_name = Path::new(&data.path)
                             .file_name()
                             .map_or_else(|| data.path.clone(), |n| n.to_string_lossy().to_string());
@@ -3415,15 +3396,7 @@ impl EditorState {
                                     replace_text,
                                     &text[range.end..]
                                 );
-                                tab_data.content = EditorBuffer::with_text(
-                                    &new_text,
-                                    HighlightLanguage::from_path(&path),
-                                );
-                                tab_data.content.set_file_extension(
-                                    std::path::Path::new(&path)
-                                        .extension()
-                                        .and_then(|e| e.to_str()),
-                                );
+                                tab_data.content = EditorBuffer::from_file(&new_text, &path);
                                 if let Some(tab) = self.tabs.get_mut(idx) {
                                     let current_hash = hash_text(&new_text);
                                     tab.is_dirty = current_hash != tab_data.saved_text_hash;
@@ -3490,15 +3463,7 @@ impl EditorState {
                             for range in state.matches.iter().rev() {
                                 new_text.replace_range(range.start..range.end, replace);
                             }
-                            tab_data.content = EditorBuffer::with_text(
-                                &new_text,
-                                HighlightLanguage::from_path(&path),
-                            );
-                            tab_data.content.set_file_extension(
-                                std::path::Path::new(&path)
-                                    .extension()
-                                    .and_then(|e| e.to_str()),
-                            );
+                            tab_data.content = EditorBuffer::from_file(&new_text, &path);
                             if let Some(tab) = self.tabs.get_mut(idx) {
                                 let current_hash = hash_text(&new_text);
                                 tab.is_dirty = current_hash != tab_data.saved_text_hash;
@@ -3797,7 +3762,6 @@ impl EditorState {
 
                 match result {
                     Ok(text) => {
-                        let language = HighlightLanguage::from_path(&path);
                         let has_trailing = text.ends_with('\n');
                         let line_ending = detect_line_ending(text.as_bytes());
 
@@ -3812,12 +3776,7 @@ impl EditorState {
                         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                             // Clear find/replace state — match byte ranges are now stale.
                             tab_data.find_replace_state = None;
-                            tab_data.content = EditorBuffer::with_text(&text, language);
-                            tab_data.content.set_file_extension(
-                                std::path::Path::new(&path)
-                                    .extension()
-                                    .and_then(|e| e.to_str()),
-                            );
+                            tab_data.content = EditorBuffer::from_file(&text, &path);
                             // Restore cursor, clamped to new file bounds.
                             tab_data.content.move_to(cursor_line, cursor_col);
                             // Clear undo stack — new content didn't come from user edits.

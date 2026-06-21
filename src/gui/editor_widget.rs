@@ -250,6 +250,16 @@ impl EditorBuffer {
         }
     }
 
+    /// Create a buffer pre-populated with the given text and infer the
+    /// language and file extension from the given file path.
+    pub fn from_file(text: &str, path: impl AsRef<std::path::Path>) -> Self {
+        let path_ref = path.as_ref();
+        let language = path_ref.to_str().and_then(HighlightLanguage::from_path);
+        let content = Self::with_text(text, language);
+        content.set_file_extension(path_ref.extension().and_then(|e| e.to_str()));
+        content
+    }
+
     /// Set the file extension for fallback comment prefix lookup.
     /// The extension should be the file extension without the dot
     /// (e.g., `"yaml"`, `"py"`, `"rs"`).
@@ -2483,7 +2493,6 @@ where
                 (end, start)
             };
 
-            let text_buf = self.buffer.text();
             for run in buffer_for_draw.layout_runs() {
                 if let Some(highlight) = run.highlight(
                     cosmic_text::Cursor {
@@ -2515,7 +2524,6 @@ where
                     }
                 }
             }
-            let _ = text_buf.is_empty();
         }
 
         // ── 5. Draw text via fill_raw ──
