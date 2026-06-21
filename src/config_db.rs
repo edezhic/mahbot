@@ -120,14 +120,8 @@ impl ConfigStore {
         rows.into_iter()
             .map(|row| {
                 let role = turso::row_text(&row, 0)?;
-                let model = match row.get_value(1)? {
-                    turso::Value::Text(s) => Some(s),
-                    _ => None,
-                };
-                let reasoning_effort = match row.get_value(2)? {
-                    turso::Value::Text(s) => Some(s),
-                    _ => None,
-                };
+                let model = turso::row_text_opt(&row, 1)?;
+                let reasoning_effort = turso::row_text_opt(&row, 2)?;
                 Ok(RoleConfig {
                     role,
                     model,
@@ -151,14 +145,8 @@ impl ConfigStore {
         rows.into_iter()
             .map(|row| {
                 let model = turso::row_text(&row, 0)?;
-                let provider_order = match row.get_value(1)? {
-                    turso::Value::Text(s) => Some(s),
-                    _ => None,
-                };
-                let allow_fallbacks = match row.get_value(2)? {
-                    turso::Value::Integer(i) => Some(i != 0),
-                    _ => None,
-                };
+                let provider_order = turso::row_text_opt(&row, 1)?;
+                let allow_fallbacks = turso::row_bool_opt(&row, 2)?;
                 Ok(ModelRouting {
                     model,
                     provider_order,
@@ -199,25 +187,11 @@ impl ConfigStore {
                 "SELECT model, reasoning_effort FROM config_role WHERE role = ?1",
                 turso::params![role],
                 |row| {
-                    let model = match row.get_value(0)? {
-                        turso::Value::Text(s) => Some(s),
-                        turso::Value::Null => None,
-                        other => {
-                            return Err(::turso::Error::Error(format!(
-                                "expected text or null for model, got {other:?}"
-                            )));
-                        }
-                    };
-                    let reasoning_effort = match row.get_value(1)? {
-                        turso::Value::Text(s) => Some(s),
-                        turso::Value::Null => None,
-                        other => {
-                            return Err(::turso::Error::Error(format!(
-                                "expected text or null for reasoning_effort, got {other:?}"
-                            )));
-                        }
-                    };
-                    Ok(RoleConfig {
+                    let model = turso::row_text_opt(&row, 0)
+                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
+                    let reasoning_effort = turso::row_text_opt(&row, 1)
+                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
+                    Ok::<RoleConfig, ::turso::Error>(RoleConfig {
                         role: role_owned,
                         model,
                         reasoning_effort,
@@ -273,25 +247,11 @@ impl ConfigStore {
                 "SELECT provider_order, allow_fallbacks FROM config_model_routing WHERE model = ?1",
                 turso::params![model],
                 |row| {
-                    let provider_order = match row.get_value(0)? {
-                        turso::Value::Text(s) => Some(s),
-                        turso::Value::Null => None,
-                        other => {
-                            return Err(::turso::Error::Error(format!(
-                                "expected text or null for provider_order, got {other:?}"
-                            )));
-                        }
-                    };
-                    let allow_fallbacks = match row.get_value(1)? {
-                        turso::Value::Integer(i) => Some(i != 0),
-                        turso::Value::Null => None,
-                        other => {
-                            return Err(::turso::Error::Error(format!(
-                                "expected integer or null for allow_fallbacks, got {other:?}"
-                            )));
-                        }
-                    };
-                    Ok(ModelRouting {
+                    let provider_order = turso::row_text_opt(&row, 0)
+                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
+                    let allow_fallbacks = turso::row_bool_opt(&row, 1)
+                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
+                    Ok::<ModelRouting, ::turso::Error>(ModelRouting {
                         model: model_owned,
                         provider_order,
                         allow_fallbacks,
