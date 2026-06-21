@@ -60,13 +60,6 @@ impl Tool for ReadTool {
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("File not found") {
-                    let full_path = super::resolve_tool_path_with_base(&path, ws.as_path());
-                    if let Some(dir_path) = super::resolve_directory_read_fallback(&full_path).await
-                        && super::check_path_read_allowed(&dir_path.to_string_lossy(), ws.as_path())
-                            .is_ok()
-                    {
-                        return self.read_resolved(ws, &dir_path, &path, None, &args).await;
-                    }
                     return self.recover_missing_path(ws, &path, &args, &msg).await;
                 }
                 return Err(e);
