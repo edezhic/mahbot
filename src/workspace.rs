@@ -866,7 +866,6 @@ mod tests {
     /// Helper: insert a workspace row directly with full control over fields,
     /// bypassing `add()` (which has side-effects like initializing search
     /// engine globals).
-    #[expect(clippy::too_many_arguments)]
     async fn insert_direct(
         store: &WorkspaceStorage,
         name: &str,
@@ -1119,7 +1118,7 @@ mod tests {
         // Set a throwaway storage root if not already set (the OnceLock
         // panics on double-set, so we only set if not already set).
         let tmp_root = TempDir::new().expect("storage root temp dir");
-        let _ = crate::config::CONFIG.set_storage_root(tmp_root.path().to_path_buf());
+        crate::config::CONFIG.set_storage_root(tmp_root.path().to_path_buf());
         crate::config::CONFIG.swap(crate::config::ConfigData::default());
 
         let ws = store
