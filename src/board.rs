@@ -1259,8 +1259,9 @@ impl BoardStore {
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
              (status IN ({blocker_sql}) OR \
-              (status = 'ready_for_development' AND pipeline_reservation = 1)) \
-             AND workspace_name = ?1 AND is_archived = 0 LIMIT 1"
+              (status = '{}' AND pipeline_reservation = 1)) \
+             AND workspace_name = ?1 AND is_archived = 0 LIMIT 1",
+            TicketPhase::ReadyForDevelopment.as_ref()
         );
         let rows = self
             .conn
