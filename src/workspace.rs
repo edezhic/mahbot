@@ -681,7 +681,7 @@ impl WorkspaceStorage {
         // see a generation mismatch and skip its writes.
         self.conn
             .execute(
-                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = 'analyzing', diagnostics = NULL, diagnostics_updated_at = NULL, updated_at = ?1 WHERE name = ?2",
+                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = 'analyzing', paused = 1, diagnostics = NULL, diagnostics_updated_at = NULL, updated_at = ?1 WHERE name = ?2",
                 turso::params![now, name],
             )
             .await?;
@@ -1067,6 +1067,40 @@ mod tests {
         assert_eq!(
             ws.status, "pending",
             "Status should remain unchanged — writes skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn rediscover_sets_paused() {
+        let (store, _tmp) = test_store().await;
+        // Start with paused = false and status = ready (simulating a fully
+        // discovered workspace).
+        insert_direct(&store, "rediscover_test", "/tmp/rediscover_test", false, 0).await;
+        store.set_status("rediscover_test", "ready").await.unwrap();
+
+        let ws = store
+            .get_by_name("rediscover_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(!ws.paused, "Precondition: workspace should start unpaused");
+        assert_eq!(ws.status, "ready", "Precondition: status should be 'ready'");
+
+        // Act: rediscover.
+        store
+            .rediscover("rediscover_test")
+            .await
+            .expect("rediscover");
+
+        // Assert: paused is set immediately by the UPDATE.
+        let ws = store
+            .get_by_name("rediscover_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(
+            ws.paused,
+            "rediscover() must set paused = true when transitioning to 'analyzing'"
         );
     }
 
