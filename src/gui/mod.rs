@@ -74,8 +74,6 @@ pub static LOG_BROADCAST: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 pub enum Page {
     Home,
     Board,
-    Workspaces,
-    Users,
     Sessions,
     Logs,
     ToolFailures,
@@ -90,8 +88,6 @@ impl Page {
         &[
             Page::Home,
             Page::Board,
-            Page::Workspaces,
-            Page::Users,
             Page::Sessions,
             Page::Logs,
             Page::ToolFailures,
@@ -107,12 +103,10 @@ impl Page {
         &[Page::Home, Page::Editor, Page::Diff, Page::Shell]
     }
 
-    /// Pages shown in the footer nav (Board, Workspaces, Users, Sessions, Logs, Tool Failures).
+    /// Pages shown in the footer nav (Board, Sessions, Logs, Tool Failures).
     fn footer_pages() -> &'static [Page] {
         &[
             Page::Board,
-            Page::Workspaces,
-            Page::Users,
             Page::Sessions,
             Page::Logs,
             Page::ToolFailures,
@@ -124,8 +118,6 @@ impl Page {
         match self {
             Page::Home => "Home",
             Page::Board => "Board",
-            Page::Workspaces => "Workspaces",
-            Page::Users => "Users",
             Page::Sessions => "Sessions",
             Page::Logs => "Logs",
             Page::ToolFailures => "Tool Failures",
@@ -239,8 +231,6 @@ pub enum Message {
     Home(home::HomeMessage),
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
-    Workspaces(workspaces::WorkspacesMessage),
-    Users(users::UsersMessage),
     Sessions(sessions::SessionsMessage),
     ToolFailures(tool_failures::ToolFailuresMessage),
     Diff(diff::DiffMessage),
@@ -285,8 +275,6 @@ pub struct Dashboard {
 
     logs_state: logs::LogsState,
     board_state: board::BoardState,
-    workspaces_state: workspaces::WorkspacesState,
-    users_state: users::UsersState,
     sessions_state: sessions::SessionsState,
     tool_failures_state: tool_failures::ToolFailuresState,
     diff_state: diff::DiffState,
@@ -316,8 +304,6 @@ impl Dashboard {
             paused: false,
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
-            workspaces_state: workspaces::WorkspacesState::new(),
-            users_state: users::UsersState::new(),
             sessions_state: sessions::SessionsState::new(),
             tool_failures_state: tool_failures::ToolFailuresState::new(),
             diff_state: diff::DiffState::new(),
@@ -481,8 +467,6 @@ impl Dashboard {
                     }
                     Page::Shell => Task::none(),
                     Page::Board => self.board_state.refresh().map(Message::Board),
-                    Page::Workspaces => self.workspaces_state.refresh().map(Message::Workspaces),
-                    Page::Users => self.users_state.refresh().map(Message::Users),
                     Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
                     // Editor and Diff receive workspace state via WorkspaceSelected
                     // from the Home page picker, not via refresh().
@@ -490,7 +474,15 @@ impl Dashboard {
                     Page::Editor => Task::none(),
                     Page::Settings => {
                         self.settings_state.refresh();
-                        Task::none()
+                        let refresh_workspaces =
+                            self.settings_state.workspaces_state.refresh().map(|msg| {
+                                Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg))
+                            });
+                        let refresh_users =
+                            self.settings_state.users_state.refresh().map(|msg| {
+                                Message::Settings(settings::SettingsMessage::UserMsg(msg))
+                            });
+                        Task::batch([refresh_workspaces, refresh_users])
                     }
                 }
             }
@@ -513,19 +505,33 @@ impl Dashboard {
                         self.board_state.loading = true;
                         self.board_state.refresh().map(Message::Board)
                     }
-                    Page::Workspaces if !self.workspaces_state.loading => {
-                        self.workspaces_state.loading = true;
-                        self.workspaces_state.refresh().map(Message::Workspaces)
-                    }
-                    Page::Users if !self.users_state.loading => {
-                        self.users_state.loading = true;
-                        self.users_state.refresh().map(Message::Users)
-                    }
                     Page::Sessions if !self.sessions_state.loading => {
                         self.sessions_state.loading = true;
                         self.sessions_state.refresh().map(Message::Sessions)
                     }
-                    Page::Diff => Task::none(), // Diff page uses its own 5s subscription
+                    Page::Settings => {
+                        // Refresh workspace and user lists when on Settings page
+                        let ws_loading = self.settings_state.workspaces_state.loading;
+                        let us_loading = self.settings_state.users_state.loading;
+                        let ws = if !ws_loading {
+                            self.settings_state.workspaces_state.loading = true;
+                            self.settings_state.workspaces_state.refresh().map(|msg| {
+                                Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg))
+                            })
+                        } else {
+                            Task::none()
+                        };
+                        let us = if !us_loading {
+                            self.settings_state.users_state.loading = true;
+                            self.settings_state.users_state.refresh().map(|msg| {
+                                Message::Settings(settings::SettingsMessage::UserMsg(msg))
+                            })
+                        } else {
+                            Task::none()
+                        };
+                        Task::batch([ws, us])
+                    }
+                    Page::Diff => Task::none(),
                     _ => Task::none(),
                 }
             }
@@ -593,74 +599,6 @@ impl Dashboard {
                 }
                 self.board_state.update(msg).map(Message::Board)
             }
-            Message::Workspaces(msg) if self.ready => {
-                // Intercept markdown link clicks — open in system browser.
-                if let workspaces::WorkspacesMessage::LinkClicked(ref url) = msg {
-                    open_url(url);
-                }
-                // Detect workspace add/delete success to refresh global picker.
-                let needs_global_reload = matches!(
-                    &msg,
-                    workspaces::WorkspacesMessage::AddResult(Ok(_))
-                        | workspaces::WorkspacesMessage::DeleteResult(Ok(()))
-                );
-                if let workspaces::WorkspacesMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
-                let page_task = self.workspaces_state.update(msg).map(Message::Workspaces);
-                if needs_global_reload {
-                    let reload_task = self.reload_workspace_options();
-                    Task::batch([page_task, reload_task])
-                } else {
-                    page_task
-                }
-            }
-            Message::Users(msg) if self.ready => {
-                // Intercept SwitchUser: user clicked the switch icon on the
-                // Users page — fire UserSelected on Home so the full
-                // reverse-sync chain (role load, workspace check, history
-                // refresh) runs.
-                if let users::UsersMessage::SwitchUser(ref user) = msg {
-                    let switch = Task::done(home::HomeMessage::UserSelected(user.clone()))
-                        .map(Message::Home);
-                    return switch;
-                }
-                // Intercept DeleteResult: if the deleted user was the active
-                // user, fall back to admin.
-                if let users::UsersMessage::DeleteResult(Ok(()), ref deleted_user) = msg {
-                    if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
-                        self.selected_user_name = Some("admin".to_string());
-                        save_window_state(
-                            self.last_position,
-                            self.last_size,
-                            self.selected_workspace_name.as_deref(),
-                            self.selected_user_name.as_deref(),
-                        );
-                        let switch =
-                            Task::done(home::HomeMessage::UserSelected("admin".to_string()))
-                                .map(Message::Home);
-                        let page_task = self.users_state.update(msg).map(Message::Users);
-                        return Task::batch([switch, page_task]);
-                    }
-                }
-                // Intercept UpdateWorkspace: when the active user's workspace
-                // is changed on the Users page, propagate to the Dashboard
-                // sidebar and all affected pages (Board, Memory, Editor, etc.)
-                // via select_workspace.  We must NOT use UserSelected here
-                // because UserSelected for the SAME user is a no-op
-                // (home.rs:566-568 returns early when selected_user == user).
-                if let users::UsersMessage::UpdateWorkspace(ref sender, ref ws) = msg {
-                    if self.selected_user_name.as_deref() == Some(sender.as_str()) {
-                        let select_task = self.select_workspace(ws);
-                        let page_task = self.users_state.update(msg).map(Message::Users);
-                        return Task::batch([select_task, page_task]);
-                    }
-                }
-                if let users::UsersMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
-                self.users_state.update(msg).map(Message::Users)
-            }
             Message::Sessions(msg) if self.ready => {
                 if let sessions::SessionsMessage::LinkClicked(ref url) = msg {
                     open_url(url);
@@ -691,7 +629,98 @@ impl Dashboard {
                 self.editor_state.update(msg).map(Message::Editor)
             }
             Message::Settings(msg) if self.ready => {
-                self.settings_state.update(msg).map(Message::Settings)
+                // Intercept workspace link clicks from the context-view modal
+                if let settings::SettingsMessage::WorkspaceMsg(
+                    ref wm @ workspaces::WorkspacesMessage::LinkClicked(ref url),
+                ) = msg
+                {
+                    open_url(url);
+                    return self
+                        .settings_state
+                        .update(settings::SettingsMessage::WorkspaceMsg(wm.clone()))
+                        .map(Message::Settings);
+                }
+                // Intercept toast messages from workspace and user state.
+                let toast = if let settings::SettingsMessage::WorkspaceMsg(
+                    workspaces::WorkspacesMessage::Toast(ref tm),
+                ) = msg
+                {
+                    Some(tm.clone())
+                } else if let settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(
+                    ref tm,
+                )) = msg
+                {
+                    Some(tm.clone())
+                } else {
+                    None
+                };
+                if let Some(tm) = toast {
+                    self.toasts.push(Toast::from_toast_msg(&tm));
+                }
+                // Intercept SwitchUser from user messages.
+                if let settings::SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
+                    ref user,
+                )) = msg
+                {
+                    let switch = Task::done(home::HomeMessage::UserSelected(user.clone()))
+                        .map(Message::Home);
+                    return switch;
+                }
+                // Intercept DeleteResult: if the deleted user was the active
+                // user, fall back to admin.
+                if let settings::SettingsMessage::UserMsg(
+                    ref msg_inner @ users::UsersMessage::DeleteResult(Ok(()), ref deleted_user),
+                ) = msg
+                {
+                    if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
+                        self.selected_user_name = Some("admin".to_string());
+                        save_window_state(
+                            self.last_position,
+                            self.last_size,
+                            self.selected_workspace_name.as_deref(),
+                            self.selected_user_name.as_deref(),
+                        );
+                        let switch =
+                            Task::done(home::HomeMessage::UserSelected("admin".to_string()))
+                                .map(Message::Home);
+                        let settings_task = self
+                            .settings_state
+                            .update(settings::SettingsMessage::UserMsg(msg_inner.clone()))
+                            .map(Message::Settings);
+                        return Task::batch([switch, settings_task]);
+                    }
+                }
+                // Intercept UpdateWorkspace: propagate to Dashboard if it's
+                // the active user.
+                if let settings::SettingsMessage::UserMsg(
+                    ref msg_inner @ users::UsersMessage::UpdateWorkspace(ref sender, ref ws),
+                ) = msg
+                {
+                    if self.selected_user_name.as_deref() == Some(sender.as_str()) {
+                        let select_task = self.select_workspace(ws);
+                        let settings_task = self
+                            .settings_state
+                            .update(settings::SettingsMessage::UserMsg(msg_inner.clone()))
+                            .map(Message::Settings);
+                        return Task::batch([select_task, settings_task]);
+                    }
+                }
+                // Check whether workspace list changed (add/delete) and
+                // needs_global_reload is computed right before consumption,
+                // after all early-return intercepts above.
+                let needs_global_reload = matches!(
+                    msg,
+                    settings::SettingsMessage::WorkspaceMsg(
+                        workspaces::WorkspacesMessage::DeleteResult(Ok(()))
+                    ) | settings::SettingsMessage::AddWorkspaceResult(Ok(_))
+                );
+                let task = self.settings_state.update(msg).map(Message::Settings);
+                if needs_global_reload {
+                    let reload_task = self.reload_workspace_options();
+                    Task::batch([task, reload_task])
+                } else {
+                    task
+                }
             }
             Message::Shutdown => self.save_and_exit(),
             Message::CloseRequested(_id) => self.save_and_exit(),
@@ -743,14 +772,6 @@ impl Dashboard {
                     .board_state
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
-                Page::Workspaces => self
-                    .workspaces_state
-                    .update(workspaces::WorkspacesMessage::Escape)
-                    .map(Message::Workspaces),
-                Page::Users => self
-                    .users_state
-                    .update(users::UsersMessage::Escape)
-                    .map(Message::Users),
                 Page::Sessions => self
                     .sessions_state
                     .update(sessions::SessionsMessage::Escape)
@@ -767,7 +788,15 @@ impl Dashboard {
                     .editor_state
                     .update(editor::EditorMessage::Escape)
                     .map(Message::Editor),
-                Page::Settings => Task::none(),
+                Page::Settings => {
+                    if self.settings_state.is_modal_open() {
+                        self.settings_state
+                            .update(settings::SettingsMessage::Escape)
+                            .map(Message::Settings)
+                    } else {
+                        Task::none()
+                    }
+                }
             },
             Message::UpdateBot if self.ready => {
                 self.updating = true;
@@ -854,8 +883,6 @@ impl Dashboard {
             | Message::Shell(_)
             | Message::Logs(_)
             | Message::Board(_)
-            | Message::Workspaces(_)
-            | Message::Users(_)
             | Message::Sessions(_)
             | Message::ToolFailures(_)
             | Message::Diff(_)
@@ -1020,16 +1047,14 @@ impl Dashboard {
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::ToolFailures => self.tool_failures_state.view().map(Message::ToolFailures),
             Page::Board => self.board_state.view().map(Message::Board),
-            Page::Workspaces => self.workspaces_state.view().map(Message::Workspaces),
-            Page::Users => self
-                .users_state
-                .view(self.selected_user_name.as_deref())
-                .map(Message::Users),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
             Page::Diff => self.diff_state.view().map(Message::Diff),
             Page::Shell => self.shell_state.view().map(Message::Shell),
             Page::Editor => self.editor_state.view().map(Message::Editor),
-            Page::Settings => self.settings_state.view().map(Message::Settings),
+            Page::Settings => self
+                .settings_state
+                .view(self.selected_user_name.as_deref())
+                .map(Message::Settings),
         };
 
         let body = column![
@@ -1412,10 +1437,10 @@ impl Dashboard {
 
     /// 24px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
-        // Left: footer navigation (Board, Workspaces, Users, Sessions, Logs, Update)
+        // Left: footer navigation (Board, Sessions, Logs, Tool Failures, Settings)
         // Icon-only, 16px. Active page in ACCENT, inactive in TEXT_MUTED.
         // Board is hidden when no shared workspace is selected.
-        let mut left_icons = Vec::with_capacity(7);
+        let mut left_icons = Vec::with_capacity(6);
         for page in Page::footer_pages() {
             // Hide Board icon when no shared workspace is selected.
             if *page == Page::Board && self.selected_workspace_name.is_none() {
@@ -1429,14 +1454,6 @@ impl Dashboard {
             };
             let icon: iced::Element<'_, Message> = match page {
                 Page::Board => lucide::kanban::<iced::Theme, iced::Renderer>()
-                    .size(16)
-                    .color(color)
-                    .into(),
-                Page::Workspaces => lucide::folder_open::<iced::Theme, iced::Renderer>()
-                    .size(16)
-                    .color(color)
-                    .into(),
-                Page::Users => lucide::user::<iced::Theme, iced::Renderer>()
                     .size(16)
                     .color(color)
                     .into(),
