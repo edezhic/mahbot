@@ -634,9 +634,7 @@ impl Agent {
     /// dropping tools, forces full recomputation.
     pub(crate) async fn summarize(&self) -> anyhow::Result<String> {
         let mut history = self.session.history().to_vec();
-        history.push(crate::ChatMessage::user(crate::prompt::load_prompt(
-            "summarize.md",
-        )));
+        history.push(crate::ChatMessage::user(self.role.summary_prompt()));
 
         let chat_resp = crate::providers::chat(self.build_chat_request(history, false)).await?;
 

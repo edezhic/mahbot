@@ -236,6 +236,15 @@ impl Role {
             panic!("Discovery prompt for role '{self}' does not exist")
         }
     }
+
+    /// Conversation compaction prompt for this role, loaded from embedded prompt files.
+    ///
+    /// # Panics
+    /// Panics if the summarization prompt asset is missing.
+    #[must_use]
+    pub fn summary_prompt(&self) -> String {
+        crate::prompt::load_prompt(&format!("summarize/{}.md", self.as_str()))
+    }
 }
 
 // ── Tool set factory ──────────────────────────────────────────────────────
@@ -429,5 +438,22 @@ mod tests {
         // QA has a special display label (not "Qa").
         let info = super::role_info(&crate::Role::Qa);
         assert_eq!(info.display_label, "QA");
+    }
+
+    #[test]
+    fn all_roles_have_summary_prompt() {
+        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+            let prompt = role.summary_prompt();
+            assert!(
+                !prompt.trim().is_empty(),
+                "{}: summary_prompt() must not be empty",
+                role.as_str()
+            );
+            assert!(
+                prompt.contains("DO NOT USE ANY TOOLS"),
+                "{}: summary prompt must instruct no tool use",
+                role.as_str()
+            );
+        }
     }
 }
