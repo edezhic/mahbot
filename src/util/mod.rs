@@ -304,16 +304,17 @@ mod tests {
     use super::parse_fenced_json;
     use crate::Verdict;
 
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct TestVerdict {
+        score: u8,
+        #[serde(default)]
+        critique: String,
+    }
+
     // ── parse_fenced_json tests ──────────────────────────────────────────
 
     #[test]
     fn parse_fenced_json_with_json_tag() {
-        #[derive(serde::Deserialize, Debug, PartialEq)]
-        struct TestVerdict {
-            score: u8,
-            critique: String,
-        }
-
         let text = "Based on the analysis, here's my verdict:\n\n```json\n{\"score\": 8, \"critique\": \"Looks good\"}\n```";
         let result: TestVerdict = parse_fenced_json(text).unwrap();
         assert_eq!(result.score, 8);
@@ -322,12 +323,6 @@ mod tests {
 
     #[test]
     fn parse_fenced_json_bare_fence() {
-        #[derive(serde::Deserialize, Debug, PartialEq)]
-        struct TestVerdict {
-            score: u8,
-            critique: String,
-        }
-
         let text = "```\n{\"score\": 7, \"critique\": \"Some issues\"}\n```";
         let result: TestVerdict = parse_fenced_json(text).unwrap();
         assert_eq!(result.score, 7);
@@ -351,12 +346,6 @@ mod tests {
 
     #[test]
     fn parse_fenced_json_commentary_before_fence() {
-        #[derive(serde::Deserialize, Debug, PartialEq)]
-        struct TestVerdict {
-            score: u8,
-            critique: String,
-        }
-
         // LLM prefaces with commentary, then outputs fenced JSON
         let text = "I have reviewed the code.\n\n```json\n{\"score\": 6, \"critique\": \"Needs improvement\"}\n```\n\nOverall, acceptable.";
         let result: TestVerdict = parse_fenced_json(text).unwrap();
@@ -366,11 +355,6 @@ mod tests {
 
     #[test]
     fn parse_fenced_json_multiple_fences_uses_first_json() {
-        #[derive(serde::Deserialize, Debug, PartialEq)]
-        struct TestVerdict {
-            score: u8,
-        }
-
         let text = "```json\n{\"score\": 9}\n```\n\nSome text\n\n```\n{\"score\": 5}\n```";
         let result: TestVerdict = parse_fenced_json(text).unwrap();
         // Should parse the first ```json block
