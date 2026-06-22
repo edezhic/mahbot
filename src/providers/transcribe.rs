@@ -67,34 +67,17 @@ impl ImageTranscriber {
             });
         }
 
-        let response = self
-            .inner
-            .client
-            .post(self.inner.chat_url())
-            .header("Authorization", crate::util::http::bearer_auth_header())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("transcription request failed: {e}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let provider_err = ProviderError::new(status.as_u16(), "transcription", text, None);
-            return Err(anyhow::Error::from(provider_err));
-        }
-
-        let body_text = response
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("transcription failed to read response body: {e}"))?;
-
-        let result: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
-            anyhow::anyhow!(
-                "transcription response parse error: {e}\nraw response body ({}): {body_text:.500}",
-                body_text.len(),
-            )
-        })?;
+        // NOTE: This helper switches from `ProviderError` to `anyhow::bail` for
+        // non-2xx responses.  This is safe because the error is caught by
+        // `handle_non_multimodal_image` (in channels/mod.rs) which logs a
+        // warning and falls back to a generic annotation — it never reaches
+        // the retry logic in the provider layer.
+        let result = crate::util::http::post_json_to_provider(
+            &self.inner.chat_url(),
+            &body,
+            "transcription",
+        )
+        .await?;
 
         let text = result["choices"][0]["message"]["content"]
             .as_str()

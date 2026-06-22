@@ -41,6 +41,56 @@ pub fn bearer_auth_header() -> String {
     )
 }
 
+/// POST JSON to a provider endpoint, check the status, and parse the response
+/// as JSON.
+///
+/// Uses [`bearer_auth_header()`] for the Authorization header and
+/// [`media_http_client()`] for the HTTP client.  Future media tools that need
+/// the same POST → status-check → parse pattern should reuse this helper
+/// instead of duplicating the boilerplate.
+///
+/// # Errors
+///
+/// - Transport errors: `"{error_context} request failed: {err}"`
+/// - Non-2xx status: `"{error_context} API error ({status}): {preview}"` (first 500 chars)
+/// - JSON parse failure: includes the raw response body length and a preview in
+///   the error message for easier debugging.
+pub async fn post_json_to_provider(
+    url: &str,
+    body: &serde_json::Value,
+    error_context: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let auth = bearer_auth_header();
+    let client = media_http_client();
+
+    let response = client
+        .post(url)
+        .header("Authorization", &auth)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        let preview = crate::util::truncate(&error_text, 500);
+        anyhow::bail!("{error_context} API error ({status}): {preview}");
+    }
+
+    let body_text = response
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("{error_context} failed to read response body: {e}"))?;
+
+    serde_json::from_str(&body_text).map_err(|e| {
+        anyhow::anyhow!(
+            "{error_context} response parse error: {e}\nraw response body ({}): {body_text:.500}",
+            body_text.len(),
+        )
+    })
+}
+
 /// Return the shared media-generation HTTP client, initialising it on first
 /// call with a 2-minute request timeout and a 10-second connection timeout.
 ///

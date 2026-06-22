@@ -99,32 +99,11 @@ impl Tool for ImageGenTool {
             "image_size": size.unwrap_or("2k"),
         });
 
-        let auth = crate::util::http::bearer_auth_header();
         let endpoint = crate::config::CONFIG.provider_endpoint();
         let chat_url = crate::providers::ensure_chat_completions_url(&endpoint);
 
-        let client = crate::util::http::media_http_client();
-        let response = match client
-            .post(&chat_url)
-            .header("Authorization", &auth)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => anyhow::bail!("API request failed: {e}"),
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Image generation API error ({status}): {error_text}");
-        }
-
-        let response_body: serde_json::Value = match response.json().await {
-            Ok(v) => v,
-            Err(e) => anyhow::bail!("Failed to parse response: {e}"),
-        };
+        let response_body =
+            crate::util::http::post_json_to_provider(&chat_url, &body, "Image generation").await?;
 
         // Extract from choices[0].message.images[].image_url.url (OpenRouter format)
         let parts = extract_response_parts(&response_body);
