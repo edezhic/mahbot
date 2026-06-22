@@ -610,13 +610,14 @@ Use this tool only for inspection: reading files, listing directories, running c
 
 // ── Shell output processing pipeline ──────────────────────────────────
 //
-// Two-phase pipeline:
+// Single dispatch path through the profile system:
 //
-// Phase 1 — process_shell_output (pre-processing + special short-circuits):
+// Phase 1 — process_shell_output (select profile + dispatch):
 //   NOTE: ANSI stripping and 1MB truncation now happen in execute(),
 //   before process_shell_output is called.
-//   1. cargo test short-circuit — state-machine parser for test output
-//   2. ls short-circuit       — compact line parser for `ls -l` output
+//   1. Extract command segments
+//   2. Select matching profile (or GEN_FALLBACK)
+//   3. Dispatch to apply_profile_pipeline
 //
 // Phase 2 — apply_profile_pipeline (profile-driven stages):
 //   Stage numbers below match inline comments in apply_profile_pipeline.
@@ -628,8 +629,13 @@ Use this tool only for inspection: reading files, listing directories, running c
 //   5.  max_line_len           — cap individual line length
 //   6.  line_truncation        — head/tail sandwich + max_lines cap
 //   7.  on_empty               — fallback message when all output stripped
+//   8.  output_transform       — custom transform (cargo test state machine,
+//                                ls compact parser, etc.). `standalone_only`
+//                                profiles are excluded by `select_profile` for
+//                                chained commands, falling through to
+//                                GEN_FALLBACK with its truncation defaults.
 //
-// The main pipeline path (stage 8) ends with combine_output + finish_shell_output.
+// The main pipeline path ends with combine_output + finish_shell_output.
 // Early-return paths (json_preview, short_circuit, on_empty) call combine_output
 // only, since their output is already short or includes its own timing:
 //   combine_output         — merge stderr for non-zero exit; filter stderr
@@ -862,13 +868,21 @@ pub(super) fn is_env_assignment(word: &str) -> bool {
 /// Returns on the first match in the first matching command segment
 /// (short-circuits on both segment and profile iteration); chained
 /// commands are handled by iterating over pre-parsed segments.
-fn select_profile(segments: &[String]) -> &'static Profile {
+///
+/// Profiles with `standalone_only` are skipped when `is_chained` is true,
+/// so transforms that assume homogeneous output (e.g., `compact_ls`) are
+/// not applied to chained commands. The command falls through to
+/// `GEN_FALLBACK` with its sensible truncation defaults instead.
+fn select_profile(segments: &[String], is_chained: bool) -> &'static Profile {
     for segment in segments {
         let canonical = canonical_command(segment);
         if canonical.is_empty() {
             continue;
         }
         for p in PROFILES.iter() {
+            if is_chained && p.standalone_only {
+                continue;
+            }
             if p.match_command.is_match(&canonical) {
                 return p;
             }
@@ -978,7 +992,7 @@ fn collapse_blank_lines(input: &str) -> String {
 
 /// State machine for processing cargo test output.
 /// Drops passing test lines, captures only failure blocks + summary.
-fn filter_cargo_test_output(output: &str, exit_ok: bool) -> String {
+pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Section {
         Normal,
@@ -992,6 +1006,8 @@ fn filter_cargo_test_output(output: &str, exit_ok: bool) -> String {
         summary_lines: Vec<String>,
         output_lines: Vec<String>,
     }
+
+    let exit_ok = exit_code == 0;
 
     let mut f = CargoTestFilter {
         section: Section::Normal,
@@ -1091,7 +1107,20 @@ fn filter_cargo_test_output(output: &str, exit_ok: bool) -> String {
     }
 
     // Fallback: return raw output (shouldn't normally reach here)
-    output.to_string()
+    let result = output.to_string();
+    if exit_ok && result.trim().is_empty() {
+        // NOTE: This emptiness check runs before combine_output, so it only
+        // considers stdout. The cargo test profile has keep_stderr: None, so
+        // combine_output never appends stderr on success — the result is empty
+        // too. If keep_stderr were ever added to the cargo test profile, this
+        // check would produce [cargo test: ok] even when stderr contains
+        // warnings, while combine_output would then append them after it.
+        // That's arguably better behavior (tests passed, warnings are
+        // secondary), but the coupling should be intentional.
+        "[cargo test: ok]".to_string()
+    } else {
+        result
+    }
 }
 
 /// Parse a single `ls -l` line. Returns `(file_type, size, name)` on success.
@@ -1154,7 +1183,7 @@ fn human_readable_size(size: &str) -> String {
 /// Groups directories and files, shows sizes, and includes an extension summary.
 ///
 /// Non-`-l` output (without a `total N` header) passes through unchanged.
-fn compact_ls(output: &str) -> String {
+pub(super) fn compact_ls(output: &str, _exit_code: i32) -> String {
     // If the output lacks a "total N" header, it's not in `-l` format.
     // `parse_ls_line` can only parse `-l` lines — passing non-`-l` output
     // through would trigger the "(empty)" false positive.
@@ -1234,10 +1263,11 @@ fn compact_ls(output: &str) -> String {
 
 /// Main entry point for shell output processing.
 ///
-/// Routes command output through the appropriate processing path: special-case
-/// handling for `cargo test` (state machine) and `ls` (compact parser), then
-/// delegates to `apply_profile_pipeline` for all other commands. Each path
-/// terminates with `finish_shell_output` for timing + spill-to-file.
+/// Routes command output through the profile system: select profile → apply
+/// profile pipeline → combine → finish. Custom output transforms for commands
+/// like `cargo test` (state machine) and `ls` (compact parser) are handled
+/// through the profile's `output_transform` field rather than as hardcoded
+/// special cases.
 fn process_shell_output(
     command: &str,
     stdout: &str,
@@ -1245,41 +1275,9 @@ fn process_shell_output(
     exit_code: i32,
     elapsed: Duration,
 ) -> String {
-    let exit_ok = exit_code == 0;
     let segments = extract_command_segments(command);
-
-    // ── Special cases ───────────────────────────────────────────────
-
-    // Cargo test uses a state machine (bypasses profile pipeline)
-    if segments.iter().any(|s| {
-        let c = canonical_command(s);
-        c == "cargo test" || c == "cargo nextest"
-    }) {
-        let filtered = filter_cargo_test_output(stdout, exit_ok);
-        let combined = combine_output(&filtered, stderr, exit_code, None);
-        let combined = if exit_ok && combined.trim().is_empty() {
-            "[cargo test: ok]".to_string()
-        } else {
-            combined
-        };
-        return finish_shell_output(combined, elapsed, None);
-    }
-
-    // ls uses a line parser
-    if segments.len() == 1
-        && segments.iter().any(|s| {
-            let canon = canonical_command(s);
-            canon == "ls" || canon.starts_with("ls ")
-        })
-    {
-        let filtered = compact_ls(stdout);
-        let combined = combine_output(&filtered, stderr, exit_code, None);
-        return finish_shell_output(combined, elapsed, None);
-    }
-
-    // Profile-based pipeline for all other commands
-    let profile = select_profile(&segments);
     let is_chained = segments.len() > 1;
+    let profile = select_profile(&segments, is_chained);
     apply_profile_pipeline(profile, stdout, stderr, exit_code, elapsed, is_chained)
 }
 
@@ -1468,6 +1466,16 @@ fn apply_profile_pipeline(
             exit_code,
             profile.keep_stderr.as_ref(),
         );
+    }
+
+    // Stage 8: output transform — replaces processed output before combine/finish.
+    // This allows profiles to apply custom transformations (e.g., cargo test state
+    // machine, ls compaction) that operate on the full output after standard
+    // line-level processing has been applied.
+    // `standalone_only` profiles are already skipped at profile-selection time
+    // for chained commands, so the transform here is always applicable.
+    if let Some(transform) = profile.output_transform {
+        processed = transform(&processed, exit_code);
     }
 
     let combined = combine_output(&processed, stderr, exit_code, profile.keep_stderr.as_ref());
@@ -2264,7 +2272,7 @@ mod tests {
             \n\
             test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
         ";
-        let result = filter_cargo_test_output(output, false);
+        let result = filter_cargo_test_output(output, 1);
         assert!(!result.contains("Compiling"), "compiling stripped");
         assert!(!result.contains("test1 ... ok"), "passing tests stripped");
         assert!(result.contains("test2 ... FAILED"), "failure preserved");
@@ -2285,7 +2293,7 @@ mod tests {
             \n\
             test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
         ";
-        let result = filter_cargo_test_output(output, true);
+        let result = filter_cargo_test_output(output, 0);
         assert!(!result.contains("Compiling"), "compiling stripped");
         assert!(!result.contains("Checking"), "checking stripped");
         assert!(!result.contains("test1 ... ok"), "passing stripped");
@@ -2302,7 +2310,7 @@ mod tests {
             \n\
             error: could not compile `foo` due to 1 previous error\n\
         ";
-        let result = filter_cargo_test_output(output, false);
+        let result = filter_cargo_test_output(output, 1);
         assert!(!result.contains("Compiling"), "compiling stripped");
         assert!(result.contains("error[E0425]"), "error preserved");
         assert!(
@@ -2331,7 +2339,7 @@ mod tests {
             \n\
             test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
         ";
-        let result = filter_cargo_test_output(output, false);
+        let result = filter_cargo_test_output(output, 1);
         assert!(!result.contains("Compiling"), "compiling stripped");
         assert!(
             result.contains("Running unittests"),
@@ -2839,9 +2847,43 @@ mod tests {
     }
 
     #[test]
+    fn chained_ls_skips_compact_ls() {
+        // Chained `ls -l && echo done` should NOT go through compact_ls —
+        // the standalone_only flag ensures the transform is skipped for
+        // chained commands, preserving output from later segments.
+        let input = "total 8\n-rw-r--r--  1 user  group  1024 May 21 10:00 foo\n-rw-r--r--  1 user  group  2048 May 21 10:00 bar\ndone\n";
+        let result = process_shell_output("ls -l && echo done", input, "", 0, Duration::ZERO);
+        assert!(
+            result.contains("done"),
+            "chained ls: later segments' output preserved"
+        );
+        assert!(
+            !result.contains("Summary:"),
+            "chained ls: compact_ls should not be applied"
+        );
+    }
+
+    #[test]
     fn save_raw_output_if_large_skips_small_output() {
         let result = save_raw_output_if_large(b"hello", b"", "echo hello");
         assert!(result.is_none(), "should skip saving for small output");
+    }
+
+    #[test]
+    fn chained_ls_with_pipe_skips_compact_ls() {
+        // Piped `ls -l | head -5` should NOT go through compact_ls —
+        // the standalone_only flag causes select_profile to skip the ls
+        // profile for chained commands, falling through to GEN_FALLBACK.
+        let input = "total 8\n-rw-r--r--  1 user  group  1024 May 21 10:00 foo\n-rw-r--r--  1 user  group  2048 May 21 10:00 bar\n";
+        let result = process_shell_output("ls -l | head -5", input, "", 0, Duration::ZERO);
+        assert!(
+            !result.contains("Summary:"),
+            "piped ls: compact_ls should not be applied"
+        );
+        assert!(
+            result.contains("total 8"),
+            "piped ls: raw -l format should be preserved"
+        );
     }
 
     #[test]

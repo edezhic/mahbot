@@ -28,6 +28,16 @@ pub(super) struct Profile {
     pub(super) tail_lines: Option<usize>,
     pub(super) max_lines: Option<usize>,
     pub(super) on_empty: Option<&'static str>,
+    /// Optional transform that replaces the pipeline output after line-level
+    /// processing but before `combine_output` and `finish_shell_output`.
+    /// Receives the processed output and exit code, returns the transformed output.
+    pub(super) output_transform: Option<fn(&str, exit_code: i32) -> String>,
+    /// When true, the output_transform is only applied to standalone commands
+    /// (single segment). For chained commands (`&&`, `||`, `;`, `|`), the
+    /// transform is skipped and the output passes through as-is. This prevents
+    /// transforms that assume homogeneous output (e.g., compact_ls) from
+    /// silently dropping output produced by later command segments.
+    pub(super) standalone_only: bool,
 }
 
 impl Profile {
@@ -43,6 +53,8 @@ impl Profile {
             tail_lines: None,
             max_lines: None,
             on_empty: None,
+            output_transform: None,
+            standalone_only: false,
         }
     }
 
@@ -103,6 +115,24 @@ impl Profile {
 
     fn on_empty(mut self, msg: &'static str) -> Self {
         self.on_empty = Some(msg);
+        self
+    }
+
+    /// Set an output transform that replaces the pipeline output after line-level
+    /// processing but before `combine_output` and `finish_shell_output`.
+    fn output_transform(mut self, transform: fn(&str, exit_code: i32) -> String) -> Self {
+        self.output_transform = Some(transform);
+        self
+    }
+
+    /// Restrict the `output_transform` to standalone commands only (no chaining).
+    /// When set, `select_profile` skips this profile entirely for chained commands
+    /// (`&&`, `||`, `;`, `|`), causing them to fall through to `GEN_FALLBACK`
+    /// with its sensible truncation defaults. This is useful for transforms like
+    /// `compact_ls` that assume homogeneous output and would silently drop
+    /// output from later command segments.
+    fn standalone_only(mut self) -> Self {
+        self.standalone_only = true;
         self
     }
 }
@@ -383,5 +413,12 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .tail(15)
             .max(40)
             .on_empty("[terraform: ok]"),
+        // ── Cargo test / nextest ──────────────────────────────────────────
+        Profile::new(r"^cargo\s+(test|nextest)\b")
+            .output_transform(super::filter_cargo_test_output),
+        // ── ls ─────────────────────────────────────────────────────────────
+        Profile::new(r"^ls\b")
+            .output_transform(super::compact_ls)
+            .standalone_only(),
     ]
 });
