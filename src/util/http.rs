@@ -41,6 +41,55 @@ pub fn bearer_auth_header() -> String {
     )
 }
 
+/// Check that an HTTP response has a successful status code.
+///
+/// If the status is 2xx the response is returned unmodified for further
+/// processing (body reading, parsing, etc.).  On non-2xx the response body is
+/// consumed, truncated to 500 characters, and included in the error message.
+///
+/// # Error format
+///
+/// `"{error_context} API error ({status}): {preview}"`
+///
+/// **Important:** [`crate::tools::video_gen`] string-matches `"(402)"` in this
+/// exact format to detect insufficient credits.  Any format change will silently
+/// break that logic.
+///
+/// # Errors
+///
+/// - Non-2xx status: the formatted error described above.
+async fn check_response(
+    response: reqwest::Response,
+    error_context: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        let preview = crate::util::truncate(&error_text, 500);
+        anyhow::bail!("{error_context} API error ({status}): {preview}");
+    }
+    Ok(response)
+}
+
+/// Parse a JSON response body string, producing a detailed error message on
+/// failure that includes the body length and a preview.
+///
+/// # Error format
+///
+/// `"{error_context} response parse error: {e}\nraw response body (N): {body:.500}"`
+///
+/// # Errors
+///
+/// - Invalid JSON: the formatted error described above.
+fn parse_json_response(body_text: &str, error_context: &str) -> anyhow::Result<serde_json::Value> {
+    serde_json::from_str(body_text).map_err(|e| {
+        anyhow::anyhow!(
+            "{error_context} response parse error: {e}\nraw response body ({}): {body_text:.500}",
+            body_text.len(),
+        )
+    })
+}
+
 /// POST JSON to a provider endpoint, check the status, and parse the response
 /// as JSON.
 ///
@@ -71,24 +120,14 @@ pub async fn post_json_to_provider(
         .await
         .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        let preview = crate::util::truncate(&error_text, 500);
-        anyhow::bail!("{error_context} API error ({status}): {preview}");
-    }
+    let response = check_response(response, error_context).await?;
 
     let body_text = response
         .text()
         .await
         .map_err(|e| anyhow::anyhow!("{error_context} failed to read response body: {e}"))?;
 
-    serde_json::from_str(&body_text).map_err(|e| {
-        anyhow::anyhow!(
-            "{error_context} response parse error: {e}\nraw response body ({}): {body_text:.500}",
-            body_text.len(),
-        )
-    })
+    parse_json_response(&body_text, error_context)
 }
 
 /// GET JSON from a provider endpoint, check the status, and parse the response
@@ -119,24 +158,14 @@ pub async fn get_json_from_provider(
         .await
         .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        let preview = crate::util::truncate(&error_text, 500);
-        anyhow::bail!("{error_context} API error ({status}): {preview}");
-    }
+    let response = check_response(response, error_context).await?;
 
     let body_text = response
         .text()
         .await
         .map_err(|e| anyhow::anyhow!("{error_context} failed to read response body: {e}"))?;
 
-    serde_json::from_str(&body_text).map_err(|e| {
-        anyhow::anyhow!(
-            "{error_context} response parse error: {e}\nraw response body ({}): {body_text:.500}",
-            body_text.len(),
-        )
-    })
+    parse_json_response(&body_text, error_context)
 }
 
 /// GET bytes from a provider endpoint, check the status, and return the raw
@@ -162,12 +191,7 @@ pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::
         .await
         .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        let preview = crate::util::truncate(&error_text, 500);
-        anyhow::bail!("{error_context} API error ({status}): {preview}");
-    }
+    let response = check_response(response, error_context).await?;
 
     response
         .bytes()
