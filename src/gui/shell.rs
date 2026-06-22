@@ -19,7 +19,7 @@ use super::theme;
 fn zed_one_dark_palette() -> iced_term::ColorPalette {
     iced_term::ColorPalette {
         foreground: "#abb2bf".into(),
-        background: "#282c34".into(),
+        background: "#100f0f".into(),
         black: "#282c34".into(),
         red: "#e06c75".into(),
         green: "#98c379".into(),
