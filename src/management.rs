@@ -203,6 +203,54 @@ async fn resolve_ticket_workspace(
     }
 }
 
+/// Bounce a failed ticket back to [`TicketPhase::ReadyForDevelopment`] with a
+/// pipeline reservation, ensuring it gets priority re-dispatch over fresh
+/// tickets.
+///
+/// Used by both the diagnostics runner and the verifier (reviewer/QA)
+/// processing — both paths had nearly identical duplicated bounce-back logic
+/// that differed only in the source phase and log label, and the verifier
+/// path was missing the defensive `assigned_to` cleanup on transition failure.
+async fn bounce_back_to_development(
+    board: &BoardStore,
+    ticket: &Ticket,
+    source_phase: TicketPhase,
+    log_label: &str,
+) {
+    match board
+        .transition_to_with_reservation(
+            &ticket.id,
+            Some(source_phase),
+            TicketPhase::ReadyForDevelopment,
+            true,
+        )
+        .await
+    {
+        Ok(()) => {
+            ticket_buffer::push(
+                &ticket.workspace_name,
+                &ticket.id,
+                source_phase.as_ref(),
+                "ready_for_development",
+            );
+            info!(
+                ticket = %ticket.id,
+                "{log_label} failed — pipeline reservation set for rework priority",
+            );
+        }
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "{log_label} failed but transition to ReadyForDevelopment \
+                 failed — ticket stuck in {phase}, clearing assigned_to for retry",
+                phase = source_phase.as_ref(),
+            );
+            let _ = board.set_assigned_to(&ticket.id, None).await;
+        }
+    }
+}
+
 /// Prepare and dispatch a notification for a ticket transition.
 ///
 /// Renders the notification message and enqueues a Manager job via the
@@ -964,37 +1012,7 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
     let _ = board.add_comment(&ticket.id, "diagnostics", &comment).await;
 
     if target == TicketPhase::ReadyForDevelopment {
-        // Bounce-back: atomic transition + pipeline reservation while the
-        // ticket is still in InDiagnostics (pipeline-blocking), preventing
-        // any other ReadyForDevelopment ticket from being claimed first.
-        if let Err(e) = board
-            .transition_to_with_reservation(
-                &ticket.id,
-                Some(TicketPhase::InDiagnostics),
-                TicketPhase::ReadyForDevelopment,
-                true,
-            )
-            .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Diagnostics failed but transition to ReadyForDevelopment \
-                 failed — clearing assigned_to for retry",
-            );
-            let _ = board.set_assigned_to(&ticket.id, None).await;
-        } else {
-            ticket_buffer::push(
-                &ticket.workspace_name,
-                &ticket.id,
-                "in_diagnostics",
-                "ready_for_development",
-            );
-            info!(
-                ticket = %ticket.id,
-                "Diagnostics failed — pipeline reservation set for rework priority",
-            );
-        }
+        bounce_back_to_development(board, &ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
     } else if let Err(e) =
         transition_ticket(board, &ticket, TicketPhase::InDiagnostics, target, false).await
     {
@@ -1548,43 +1566,7 @@ async fn process_verdict_results(
     }
 
     if any_failed {
-        // Bounce-back: atomic transition + pipeline reservation while the
-        // ticket is still in the active_phase (InReview/InQa, pipeline-
-        // blocking), preventing any other ReadyForDevelopment ticket from
-        // being claimed before this bounced-back ticket.
-        match board
-            .transition_to_with_reservation(
-                &ticket.id,
-                Some(verifier.active_phase),
-                TicketPhase::ReadyForDevelopment,
-                true,
-            )
-            .await
-        {
-            Ok(()) => {
-                ticket_buffer::push(
-                    &ticket.workspace_name,
-                    &ticket.id,
-                    verifier.active_phase.as_ref(),
-                    "ready_for_development",
-                );
-                info!(
-                    ticket = %ticket.id,
-                    "{} failed — pipeline reservation set for rework priority",
-                    verifier.log_label,
-                );
-            }
-            Err(e) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "{role} verdicts completed but transition to \
-                     ReadyForDevelopment failed — ticket stuck in {stuck}",
-                    role = verifier.log_label,
-                    stuck = verifier.active_phase.as_ref(),
-                );
-            }
-        }
+        bounce_back_to_development(board, ticket, verifier.active_phase, verifier.log_label).await;
     } else if let Err(e) = transition_ticket(
         board,
         ticket,
