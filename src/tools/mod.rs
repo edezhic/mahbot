@@ -869,13 +869,10 @@ pub fn unknown_tool_message(call_name: &str) -> String {
 
 /// Check whether `path` is safe to access within the given `workspace_root`.
 ///
-/// This is the central security gate for all file-path operations: it prevents
-/// directory-traversal attacks, null-byte injection, tilde-based escapes, and
-/// other common path-escape vectors before they reach any tool that reads or
-/// writes files. The check is purely lexical — no filesystem I/O is performed —
-/// so it cannot detect symlink-based escapes. The caller is responsible for
-/// that post-canonicalization validation (see [`resolve_read_target`] and
-/// [`resolve_write_target`]).
+/// This is the central security gate for all file-path operations: it performs
+/// a purely lexical check — no filesystem I/O — so it cannot detect symlink-based
+/// escapes. The caller is responsible for that post-canonicalization validation
+/// (see [`resolve_read_target`] and [`resolve_write_target`]).
 #[must_use]
 pub fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
