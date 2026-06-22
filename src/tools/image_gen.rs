@@ -259,90 +259,75 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_response_parts_empty_image_url() {
-        // An empty image_url.url should be skipped; falls to None if only empty URLs
-        let body = json!({
-            "choices": [{
-                "message": {
-                    "images": [{"image_url": {"url": ""}}]
-                }
-            }]
-        });
-        let result = extract_response_parts(&body);
-        assert_eq!(result.image_data, None);
-        assert_eq!(result.text_content, None);
+    fn test_extract_response_parts_graceful_empty() {
+        // All these empty/missing response structures should yield (None, None)
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("empty image URL", make_response(Some(""), None)),
+            (
+                "null fields",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "images": null,
+                            "content": null,
+                        }
+                    }]
+                }),
+            ),
+            ("empty choices array", json!({"choices": []})),
+            ("missing choices key", json!({})),
+        ];
+        for (label, body) in &cases {
+            let result = extract_response_parts(body);
+            assert_eq!(
+                result.image_data, None,
+                "{label}: expected image_data to be None",
+            );
+            assert_eq!(
+                result.text_content, None,
+                "{label}: expected text_content to be None",
+            );
+        }
     }
 
     #[test]
-    fn test_extract_response_parts_null_fields() {
-        // Null/missing fields should be handled gracefully
-        let body = json!({
-            "choices": [{
-                "message": {
-                    "images": null,
-                    "content": null
-                }
-            }]
-        });
-        let result = extract_response_parts(&body);
-        assert_eq!(result.image_data, None);
-        assert_eq!(result.text_content, None);
-    }
-
-    #[test]
-    fn test_extract_response_parts_empty_choices() {
-        let body = json!({"choices": []});
-        let result = extract_response_parts(&body);
-        assert_eq!(result.image_data, None);
-        assert_eq!(result.text_content, None);
-    }
-
-    #[test]
-    fn test_extract_response_parts_missing_choices() {
-        let body = json!({});
-        let result = extract_response_parts(&body);
-        assert_eq!(result.image_data, None);
-        assert_eq!(result.text_content, None);
-    }
-
-    #[test]
-    fn test_extract_response_parts_multiple_images_picks_first() {
-        // When multiple images are present, the first non-empty URL is returned
-        let body = json!({
-            "choices": [{
-                "message": {
-                    "images": [
-                        {"image_url": {"url": "data:image/png;base64,first"}},
-                        {"image_url": {"url": "data:image/png;base64,second"}}
-                    ]
-                }
-            }]
-        });
-        let result = extract_response_parts(&body);
-        assert_eq!(
-            result.image_data,
-            Some("data:image/png;base64,first".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_response_parts_first_empty_second_valid() {
-        // Skip empty URLs, pick the first non-empty one
-        let body = json!({
-            "choices": [{
-                "message": {
-                    "images": [
-                        {"image_url": {"url": ""}},
-                        {"image_url": {"url": "data:image/png;base64,valid"}}
-                    ]
-                }
-            }]
-        });
-        let result = extract_response_parts(&body);
-        assert_eq!(
-            result.image_data,
-            Some("data:image/png;base64,valid".to_string())
-        );
+    fn test_extract_response_parts_first_valid_image() {
+        // Both cases should return the first non-empty image_url.url
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "first of two valid URLs",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "images": [
+                                {"image_url": {"url": "data:image/png;base64,first"}},
+                                {"image_url": {"url": "data:image/png;base64,second"}}
+                            ]
+                        }
+                    }]
+                }),
+                "data:image/png;base64,first",
+            ),
+            (
+                "skip empty, pick next valid",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "images": [
+                                {"image_url": {"url": ""}},
+                                {"image_url": {"url": "data:image/png;base64,valid"}}
+                            ]
+                        }
+                    }]
+                }),
+                "data:image/png;base64,valid",
+            ),
+        ];
+        for (label, body, expected_url) in &cases {
+            let result = extract_response_parts(body);
+            assert_eq!(result.image_data, Some(expected_url.to_string()), "{label}",);
+            assert_eq!(result.text_content, None, "{label}");
+        }
     }
 
     #[test]
