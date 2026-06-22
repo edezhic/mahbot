@@ -8,7 +8,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
+use std::time::Duration as StdDuration;
 use tokio::sync::OnceCell;
+use tracing::{debug, info, warn};
 
 /// Global board store.
 pub static BOARD: OnceCell<BoardStore> = OnceCell::const_new();
@@ -17,6 +19,34 @@ pub static BOARD: OnceCell<BoardStore> = OnceCell::const_new();
 pub async fn init_global() -> Result<()> {
     let root = CONFIG.global_storage_root();
     turso::register_global_store(&BOARD, "BOARD", || BoardStore::open(&root)).await
+}
+
+/// Background task: auto-archive cancelled tickets older than 1 hour.
+///
+/// Runs every 5 minutes, respects the global shutdown token via
+/// [`crate::shutdown::sleep_or_shutdown`] (same pattern as
+/// [`crate::maintainer::run_maintainer_loop`]).
+/// Logs per-ticket failures and continues — a ticket that was un-cancelled
+/// between the SELECT and UPDATE is harmlessly skipped.
+pub async fn run_archive_cancelled_loop() {
+    let interval = StdDuration::from_mins(5);
+
+    loop {
+        if !crate::shutdown::sleep_or_shutdown(interval).await {
+            break;
+        }
+
+        let Some(board) = BOARD.get() else {
+            warn!("Archive cancelled loop: board not initialized");
+            continue;
+        };
+
+        match board.archive_stale_cancelled(1).await {
+            Ok(n) if n > 0 => info!(count = n, "Archived stale cancelled tickets"),
+            Ok(_) => debug!("Archive cancelled loop: no stale tickets"),
+            Err(e) => warn!(error = %e, "Archive cancelled loop failed"),
+        }
+    }
 }
 
 const SCHEMA: &str = "\

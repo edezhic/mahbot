@@ -272,7 +272,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "archive-cancelled",
-        run_archive_cancelled_loop(),
+        mahbot::board::run_archive_cancelled_loop(),
     );
 
     // Eagerly initialize search engines for all existing workspaces.
@@ -496,33 +496,6 @@ where
             Ok(n) if n > 0 => info!(deleted = n, "{label}: deleted old entries"),
             Ok(_) => tracing::debug!("{label}: nothing to delete"),
             Err(e) => warn!(error = %e, "{label} failed"),
-        }
-    }
-}
-
-/// Background task: auto-archive cancelled tickets older than 1 hour.
-///
-/// Runs every 5 minutes, respects the global shutdown token via
-/// [`sleep_or_shutdown`] (same pattern as [`run_maintainer_loop`]).
-/// Logs per-ticket failures and continues — a ticket that was un-cancelled
-/// between the SELECT and UPDATE is harmlessly skipped.
-async fn run_archive_cancelled_loop() {
-    let interval = Duration::from_mins(5);
-
-    loop {
-        if !mahbot::shutdown::sleep_or_shutdown(interval).await {
-            break;
-        }
-
-        let Some(board) = mahbot::board::BOARD.get() else {
-            warn!("Archive cancelled loop: board not initialized");
-            continue;
-        };
-
-        match board.archive_stale_cancelled(1).await {
-            Ok(n) if n > 0 => info!(count = n, "Archived stale cancelled tickets"),
-            Ok(_) => debug!("Archive cancelled loop: no stale tickets"),
-            Err(e) => warn!(error = %e, "Archive cancelled loop failed"),
         }
     }
 }
