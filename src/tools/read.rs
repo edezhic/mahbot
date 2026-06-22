@@ -754,6 +754,23 @@ async fn list_directory(resolved_path: &std::path::Path, ws: &Workspace) -> anyh
 mod tests {
     use super::*;
     use crate::workspace::test_ws;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Create a temporary workspace directory for read tests.
+    /// Writes initial `files` (relative_path, content) if any.
+    /// Returns `(TempDir, PathBuf)` — hold the `TempDir` to keep the dir alive.
+    /// The directory is auto-cleaned on drop (panic-safe).
+    fn temp_workspace(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        for (rel_path, content) in files {
+            let full_path = dir.path().join(rel_path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, content).unwrap();
+        }
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
 
     /// Every extension listed in the error message must have tree-sitter language support.
     /// Catches drift when an extension is removed from `language_support` match arms
@@ -792,16 +809,11 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_basic_scenarios() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_read");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello world")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("test.txt", "hello world")]);
 
         // existing file
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "test.txt"}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "test.txt"}))
             .await;
         assert!(result.is_ok(), "read should succeed: {result:?}");
         let result = result.unwrap();
@@ -809,7 +821,7 @@ mod tests {
         assert!(result.contains("[1 lines total]"));
         // nonexistent file
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "nope.txt"}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "nope.txt"}))
             .await;
         assert!(
             result.is_err(),
@@ -818,27 +830,26 @@ mod tests {
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("File not found"));
         // empty file
-        tokio::fs::write(dir.join("empty.txt"), "").await.unwrap();
+        tokio::fs::write(ws_path.join("empty.txt"), "")
+            .await
+            .unwrap();
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "empty.txt"}))
+            .execute(
+                &Workspace::from_path(&ws_path),
+                json!({"path": "empty.txt"}),
+            )
             .await;
         assert!(result.is_ok(), "empty file read should succeed: {result:?}");
         let result = result.unwrap();
         assert_eq!(result, "");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn read_wildcard_without_search_index_returns_helpful_error() {
-        let dir = std::env::temp_dir().join("mahbot_test_read_wildcard_err");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("alpha.rs"), "fn alpha() {}")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("alpha.rs", "fn alpha() {}")]);
 
         let result = ReadTool
-            .execute(&test_ws(&dir), json!({"path": "*.rs"}))
+            .execute(&test_ws(&ws_path), json!({"path": "*.rs"}))
             .await;
         assert!(
             result.is_err(),
@@ -849,31 +860,28 @@ mod tests {
             err.contains("search index") || err.contains("Wildcard"),
             "unexpected error: {err}"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_blocks_unsafe_paths() {
         // path traversal
-        let dir = std::env::temp_dir().join("mahbot_test_file_read_traversal");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let (dir1, ws_path1) = temp_workspace(&[]);
 
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path1),
                 json!({"path": "../../../etc/passwd"}),
             )
             .await;
         assert!(result.is_err(), "traversal should be blocked: {result:?}");
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("not allowed"));
-        let _ = tokio::fs::remove_dir_all(&dir).await;
         // absolute path
-
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "/etc/passwd"}))
+            .execute(
+                &Workspace::from_path(&ws_path1),
+                json!({"path": "/etc/passwd"}),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -881,14 +889,13 @@ mod tests {
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("not allowed"));
-        // null byte in path
-        let dir = std::env::temp_dir().join("mahbot_test_file_read_null_byte");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // null byte in path — separate workspace
+        drop(dir1);
+        let (_dir2, ws_path2) = temp_workspace(&[]);
 
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path2),
                 json!({"path": "test\0evil.txt"}),
             )
             .await;
@@ -898,23 +905,15 @@ mod tests {
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("not allowed"));
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_nested_path() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_read_nested");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("sub/dir"))
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join("sub/dir/deep.txt"), "deep content")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("sub/dir/deep.txt", "deep content")]);
 
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "sub/dir/deep.txt"}),
             )
             .await;
@@ -924,8 +923,6 @@ mod tests {
         );
         let result = result.unwrap();
         assert!(result.contains("1: deep content"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[cfg(unix)]
@@ -933,10 +930,8 @@ mod tests {
     async fn file_read_blocks_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("mahbot_test_file_read_symlink_escape");
-        let workspace = root.join("workspace");
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
         // Symlink to /etc/passwd — a real file outside workspace and temp_dir
@@ -955,23 +950,16 @@ mod tests {
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("security policy"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
     async fn file_read_offset_handling() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_read_offset");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("lines.txt"), "aaa\nbbb\nccc\nddd\neee")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("lines.txt", "aaa\nbbb\nccc\nddd\neee")]);
 
         // Read lines 2-3
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "lines.txt", "offset": 2, "limit": 2}),
             )
             .await;
@@ -982,7 +970,7 @@ mod tests {
         // Offset to end
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "lines.txt", "offset": 4}),
             )
             .await;
@@ -992,7 +980,7 @@ mod tests {
         // Limit only (first 2 lines)
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "lines.txt", "limit": 2}),
             )
             .await;
@@ -1000,12 +988,12 @@ mod tests {
         let result = result.unwrap();
         assert!(!result.contains("3: ccc"));
         // Offset beyond end
-        tokio::fs::write(dir.join("short.txt"), "one\ntwo")
+        tokio::fs::write(ws_path.join("short.txt"), "one\ntwo")
             .await
             .unwrap();
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "short.txt", "offset": 100}),
             )
             .await;
@@ -1015,21 +1003,21 @@ mod tests {
         );
         let result = result.unwrap();
         assert!(result.contains("[No lines in range, file has 2 lines]"));
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_rejects_oversized_file() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_read_large");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
 
         // Create a file just over 10 MB
         let big = vec![b'x'; 10 * 1024 * 1024 + 1];
-        tokio::fs::write(dir.join("huge.bin"), &big).await.unwrap();
+        tokio::fs::write(ws_path.join("huge.bin"), &big)
+            .await
+            .unwrap();
 
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "huge.bin"}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "huge.bin"}))
             .await;
         assert!(
             result.is_err(),
@@ -1037,25 +1025,22 @@ mod tests {
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("File too large"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Non-UTF-8 binary files should be read with lossy conversion.
     #[tokio::test]
     async fn file_read_lossy_reads_binary_file() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_read_lossy");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
 
         // Write bytes that are not valid UTF-8 and not a PDF
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
-        tokio::fs::write(dir.join("data.bin"), &binary_data)
+        tokio::fs::write(ws_path.join("data.bin"), &binary_data)
             .await
             .unwrap();
 
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "data.bin"}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "data.bin"}))
             .await;
 
         assert!(
@@ -1072,8 +1057,6 @@ mod tests {
             result.contains("hi"),
             "lossy output must preserve valid ASCII, got: {result:?}",
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Short output should pass through unchanged.
@@ -1132,9 +1115,6 @@ mod tests {
     /// Symbols mode lists top-level declarations for Rust files.
     #[tokio::test]
     async fn symbols_mode_lists_rust_symbols() {
-        let dir = std::env::temp_dir().join("mahbot_test_symbols_rust");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
         let code = r"
 fn hello() {}
 struct Point { x: i32, y: i32 }
@@ -1146,11 +1126,11 @@ type MyInt = i32;
 macro_rules! my_macro { () => {} }
 mod utils;
 ";
-        tokio::fs::write(dir.join("lib.rs"), code).await.unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("lib.rs", code)]);
 
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "lib.rs", "mode": "symbols"}),
             )
             .await;
@@ -1169,23 +1149,16 @@ mod utils;
         assert!(result.contains("const `MAX`"), "missing const MAX");
         assert!(result.contains("type `MyInt`"), "missing type MyInt");
         assert!(result.contains("mod `utils`"), "missing mod utils");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Symbols mode returns clear error for unsupported extensions.
     #[tokio::test]
     async fn symbols_mode_unsupported_extension() {
-        let dir = std::env::temp_dir().join("mahbot_test_symbols_unsupported");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("data.yaml"), r"{}")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("data.yaml", "{}")]);
 
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "data.yaml", "mode": "symbols"}),
             )
             .await;
@@ -1195,8 +1168,6 @@ mod utils;
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("Unsupported"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Zoom mode extracts a specific symbol's source.
@@ -1204,18 +1175,13 @@ mod utils;
     /// with the same name as another function should not match.
     #[tokio::test]
     async fn zoom_mode_extracts_rust_function() {
-        let dir = std::env::temp_dir().join("mahbot_test_zoom_rust");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        // `name` appears as a parameter in `greet` — zoom for `name` should NOT
-        // return the parameter, and zoom for `greet` should return the full function body.
         let code =
             "fn greet(name: &str) -> String {\n    format!(\"Hi, {name}!\")\n}\n\nfn main() {}";
-        tokio::fs::write(dir.join("main.rs"), code).await.unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("main.rs", code)]);
 
         let result = ReadTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(&ws_path),
                 json!({"path": "main.rs", "mode": "zoom", "symbol": "greet"}),
             )
             .await;
@@ -1230,23 +1196,16 @@ mod utils;
             result.contains("format!(\"Hi, {name}!\")"),
             "missing function body"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Zoom mode returns helpful error for nonexistent symbol.
     #[tokio::test]
     async fn zoom_mode_symbol_not_found() {
-        let dir = std::env::temp_dir().join("mahbot_test_zoom_notfound");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("lib.rs"), "fn existing() {}")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn existing() {}")]);
 
         let result = ReadTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(&ws_path),
                 json!({"path": "lib.rs", "mode": "zoom", "symbol": "nope"}),
             )
             .await;
@@ -1261,23 +1220,16 @@ mod utils;
             err.contains("existing"),
             "should list existing symbol: {err}"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Zoom mode requires symbol parameter.
     #[tokio::test]
     async fn zoom_mode_missing_symbol_param() {
-        let dir = std::env::temp_dir().join("mahbot_test_zoom_missing_param");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("lib.rs"), "fn f() {}")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn f() {}")]);
 
         let result = ReadTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(&ws_path),
                 json!({"path": "lib.rs", "mode": "zoom"}),
             )
             .await;
@@ -1287,22 +1239,16 @@ mod utils;
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("Missing 'symbol' parameter"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Directory listing returns file names instead of erroring.
     #[tokio::test]
     async fn directory_listing_returns_contents() {
-        let dir = std::env::temp_dir().join("mahbot_test_dir_list");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("a.txt"), "alpha").await.unwrap();
-        tokio::fs::write(dir.join("b.rs"), "beta").await.unwrap();
-        tokio::fs::create_dir(dir.join("sub")).await.unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("a.txt", "alpha"), ("b.rs", "beta")]);
+        tokio::fs::create_dir(ws_path.join("sub")).await.unwrap();
 
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "."}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(result.is_ok(), "dir listing should succeed: {result:?}");
         let output = result.unwrap();
@@ -1313,24 +1259,15 @@ mod utils;
         assert!(output.contains("sub/"), "should list sub/: {output}");
         // Should NOT be the old error message
         assert!(!output.contains("Path is a directory"), "should not error");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Subdirectories without a trailing slash should list contents, not error.
     #[tokio::test]
     async fn directory_listing_subdir_without_trailing_slash() {
-        let dir = std::env::temp_dir().join("mahbot_test_dir_sub_no_slash");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let sub = dir.join("sub");
-        tokio::fs::create_dir_all(&sub).await.unwrap();
-        tokio::fs::write(sub.join("inside.txt"), "nested")
-            .await
-            .unwrap();
+        let (_dir, ws_path) = temp_workspace(&[("sub/inside.txt", "nested")]);
 
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "sub"}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "sub"}))
             .await;
         assert!(
             result.is_ok(),
@@ -1345,19 +1282,15 @@ mod utils;
             !output.contains("File not found"),
             "should not report missing file: {output}"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Directory listing shows "(empty)" for empty directories.
     #[tokio::test]
     async fn directory_listing_empty() {
-        let dir = std::env::temp_dir().join("mahbot_test_dir_empty");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let (_dir, ws_path) = temp_workspace(&[]);
 
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "."}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(
             result.is_ok(),
@@ -1369,28 +1302,24 @@ mod utils;
             output.contains("total 0") || output.contains("(empty)"),
             "empty dir should indicate emptiness: {output}"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Directory listing handles paths with spaces and special characters.
     #[tokio::test]
     async fn directory_listing_spaces_in_path() {
-        let dir = std::env::temp_dir().join("mahbot_test spaces dir");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("my file.txt"), "content")
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().join("my workspace");
+        tokio::fs::create_dir_all(&ws_path).await.unwrap();
+        tokio::fs::write(ws_path.join("my file.txt"), "content")
             .await
             .unwrap();
 
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "."}))
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(result.is_ok(), "dir with spaces should succeed: {result:?}");
         let output = result.unwrap();
         assert!(output.contains("my file.txt"), "should list file: {output}");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Directory listing resolves symlinks to directories.
@@ -1398,20 +1327,22 @@ mod utils;
     async fn directory_listing_symlink() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join("mahbot_test_dir_symlink");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let real_dir = dir.join("real");
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let real_dir = ws_path.join("real");
         tokio::fs::create_dir_all(&real_dir).await.unwrap();
         tokio::fs::write(real_dir.join("nested.txt"), "data")
             .await
             .unwrap();
-        let link = dir.join("link_to_real");
+        let link = ws_path.join("link_to_real");
         symlink(&real_dir, &link).unwrap();
 
         // Reading the symlink directly (it resolves to the directory)
         let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "link_to_real"}))
+            .execute(
+                &Workspace::from_path(&ws_path),
+                json!({"path": "link_to_real"}),
+            )
             .await;
         assert!(
             result.is_ok(),
@@ -1422,8 +1353,6 @@ mod utils;
             output.contains("nested.txt"),
             "should list nested file: {output}"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// The shell_quote function handles various edge cases.
