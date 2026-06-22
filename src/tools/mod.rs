@@ -512,18 +512,19 @@ fn expand_tilde_for_path_check(path: &Path) -> std::borrow::Cow<'_, Path> {
     }
 }
 
-/// Check whether `path` is under an [`EXTRA_READ_ALLOWED`] directory.
+/// Check whether a path is under any of the given roots, after tilde expansion.
 ///
 /// The path may contain a leading `~` (user-provided input before
 /// canonicalization). In that case the `~` is expanded to the user's
-/// home directory before comparing against the (already-expanded)
-/// allowlist entries.
-fn is_path_in_extra_allowed(path: &Path) -> bool {
+/// home directory before comparing against the (already-expanded) roots.
+fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     let check_path = expand_tilde_for_path_check(path);
+    roots.iter().any(|root| check_path.starts_with(root))
+}
 
-    EXTRA_READ_ALLOWED
-        .iter()
-        .any(|allowed| check_path.starts_with(allowed))
+/// Check whether `path` is under an [`EXTRA_READ_ALLOWED`] directory.
+fn is_path_in_extra_allowed(path: &Path) -> bool {
+    is_path_under_roots(path, &EXTRA_READ_ALLOWED)
 }
 
 /// Whether `path` looks like an OS temp/scratch directory (checked at read time).
@@ -809,11 +810,7 @@ static APPROVED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// Check whether `path` is under an approved temp/scratch root.
 #[must_use]
 pub fn is_path_under_allowed_temp(path: &Path) -> bool {
-    let check_path = expand_tilde_for_path_check(path);
-
-    APPROVED_TEMP_ROOTS
-        .iter()
-        .any(|root| check_path.starts_with(root))
+    is_path_under_roots(path, &APPROVED_TEMP_ROOTS)
 }
 
 /// Returns true when the path looks like a glob rather than a literal file path.
