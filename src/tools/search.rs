@@ -18,8 +18,41 @@ use std::fmt::Write;
 const DEFAULT_MAX_RESULTS: usize = 50;
 const MAX_RESULTS_LIMIT: usize = 500;
 
+/// Canonical list of argument aliases for the `"query"` key.
+///
+/// Tools accept `"pattern"`, `"search"`, `"search_term"`, and `"grep_search"`
+/// as aliases for the primary `"query"` argument. This constant is the single
+/// source of truth for those aliases, used by [`normalize_search_args`] and
+/// [`resolve_query`].
+///
+/// # Priority ordering
+///
+/// The iteration order defines alias priority in [`normalize_search_args`]:
+/// the first alias present in the argument map wins. Currently:
+/// 1. `"pattern"`
+/// 2. `"search"`
+/// 3. `"search_term"`
+/// 4. `"grep_search"`
+///
+/// [`resolve_query`] intentionally excludes `"grep_search"` — see its
+/// documentation for rationale. Do not change this ordering without
+/// updating both callers' priority semantics.
+pub(crate) const QUERY_ALIAS_KEYS: &[&str] = &["pattern", "search", "search_term", "grep_search"];
+
 /// Valid parameter keys (schema + normalization aliases).
+///
 /// Used for unknown-parameter detection in the execute path.
+///
+/// This is the union of:
+/// - Schema keys: `mode`, `query`, `grep_mode`, `case_sensitive`,
+///   `max_results`, `offset`, `context_lines`
+/// - Query aliases: see [`QUERY_ALIAS_KEYS`]
+/// - Constraint params: `path`, `ext`
+/// - Mode switch: `file_pattern`
+///
+/// ⚠ Rust const slices cannot be concatenated at compile time, so the
+/// values are duplicated here. The regression test
+/// `known_keys_includes_query_alias_keys` enforces consistency.
 const KNOWN_KEYS: &[&str] = &[
     // schema keys
     "mode",
@@ -29,12 +62,14 @@ const KNOWN_KEYS: &[&str] = &[
     "max_results",
     "offset",
     "context_lines",
-    // normalization aliases (consumed but still may appear in args)
+    // query aliases (see QUERY_ALIAS_KEYS)
     "pattern",
     "search",
     "search_term",
-    "file_pattern",
     "grep_search",
+    // mode-switching alias (not a query alias — converts to files-mode)
+    "file_pattern",
+    // constraint params
     "path",
     "ext",
 ];
@@ -47,8 +82,8 @@ fn normalize_search_args(args: &mut serde_json::Value) {
 
     // Query aliases — only when canonical key is absent.
     if !obj.contains_key("query") {
-        for alias in ["pattern", "search", "search_term", "grep_search"] {
-            if let Some(v) = obj.remove(alias) {
+        for alias in QUERY_ALIAS_KEYS {
+            if let Some(v) = obj.remove(*alias) {
                 obj.insert("query".to_string(), v);
                 break;
             }
@@ -121,10 +156,16 @@ fn normalize_search_args(args: &mut serde_json::Value) {
 ///
 /// Returns `None` when no query components are present.
 fn resolve_query(args: &serde_json::Value) -> Option<String> {
-    let raw_query = super::get_opt_str(args, "query")
-        .or_else(|| super::get_opt_str(args, "pattern"))
-        .or_else(|| super::get_opt_str(args, "search"))
-        .or_else(|| super::get_opt_str(args, "search_term"));
+    let raw_query = super::get_opt_str(args, "query").or_else(|| {
+        // grep_search is intentionally excluded — it is only a
+        // normalization alias (consumed by normalize_search_args),
+        // not a query alias that resolve_query should recognize.
+        // See QUERY_ALIAS_KEYS doc comment for the full list.
+        QUERY_ALIAS_KEYS
+            .iter()
+            .filter(|k| **k != "grep_search")
+            .find_map(|alias| super::get_opt_str(args, alias))
+    });
 
     let path_constraint = super::get_opt_str(args, "path")
         .filter(|p| !p.is_empty() && *p != "/")
@@ -1033,6 +1074,67 @@ mod tests {
         normalize_search_args(&mut args);
         assert_eq!(args["mode"], "grep");
         assert_eq!(args["grep_mode"], "plain_text");
+    }
+
+    // ── QUERY_ALIAS_KEYS / KNOWN_KEYS consistency ──────────────────────
+
+    #[test]
+    fn known_keys_includes_query_alias_keys() {
+        // Every query alias must appear in KNOWN_KEYS to prevent
+        // unknown-parameter false-positives. Since Rust const slices
+        // cannot be concatenated at compile time, this test enforces
+        // the invariant documented on KNOWN_KEYS.
+        for alias in QUERY_ALIAS_KEYS {
+            assert!(
+                KNOWN_KEYS.contains(alias),
+                "QUERY_ALIAS_KEYS entry \"{alias}\" is missing from KNOWN_KEYS; \
+                 update the duplicate list in KNOWN_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn known_keys_contains_all_expected_keys() {
+        // Sanity check: KNOWN_KEYS should contain everything we expect.
+        // If this test fails after adding new schema keys, update KNOWN_KEYS.
+        let expected: std::collections::HashSet<&str> = std::collections::HashSet::from([
+            // schema keys
+            "mode",
+            "query",
+            "grep_mode",
+            "case_sensitive",
+            "max_results",
+            "offset",
+            "context_lines",
+            // query aliases (must match QUERY_ALIAS_KEYS)
+            "pattern",
+            "search",
+            "search_term",
+            "grep_search",
+            // mode-switching alias
+            "file_pattern",
+            // constraint params
+            "path",
+            "ext",
+        ]);
+
+        let actual: std::collections::HashSet<&str> = KNOWN_KEYS.iter().copied().collect();
+
+        // Every expected key is present
+        for key in &expected {
+            assert!(
+                actual.contains(key),
+                "Expected KNOWN_KEYS to contain \"{key}\" but it is missing"
+            );
+        }
+
+        // Every actual key is expected (catches stale entries after refactoring)
+        for key in &actual {
+            assert!(
+                expected.contains(key),
+                "KNOWN_KEYS contains unexpected key \"{key}\"; remove it or update the expected set"
+            );
+        }
     }
 
     // ── resolve_query ──────────────────────────────────────────────────
