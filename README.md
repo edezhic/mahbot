@@ -1,6 +1,6 @@
 # MahBot
 
-Experimental harness aiming at reliable autonomous development with minimal supervision while heavily using cheap models. 
+Agentic development environment aiming at reliable autonomous development with minimal supervision while heavily using cheap models.
 
 ## Features
 
@@ -9,7 +9,7 @@ Experimental harness aiming at reliable autonomous development with minimal supe
 
 ## Goals
 
-* Reach the point where I don't need to open IDE while working on the MahBot itself, BUT without any special setup in the mahbot repo like tuned agents.md, specific skills etc. And code quality should be kept at least ~fine.
+* Reach the point where I don't want to open other IDEs while working on the MahBot itself, BUT without any special setup in the mahbot repo like tuned agents.md, specific skills etc. And code quality should be kept at least fine.
 * Generalize the rest of the rust-specific treatment and make it work with any project.
 * More tools, more agents, more edge cases covered. As self-contained as possible, require only LLM and web search providers.
 
