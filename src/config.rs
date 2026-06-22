@@ -99,11 +99,12 @@ pub struct ConfigData {
 
 // ── String config field mapping ──────────────────────────────────
 //
-// The four sync items below (`STRING_CONFIG_KEYS`, `STRUCT_FIELDS_DEFAULT`,
-// `string_fields()`, `set_string_field()`) are generated from a single
-// field-name declaration by the `string_config_fields!` macro — adding
-// or removing a field in the macro invocation updates all four
-// automatically, eliminating the entire class of sync bugs.
+// The three runtime sync items (`STRUCT_FIELDS_DEFAULT`, `string_fields()`,
+// `set_string_field()`) plus the test-only `STRING_CONFIG_KEYS` constant
+// are generated from a single field-name declaration by the
+// `string_config_fields!` macro — adding or removing a field in the
+// macro invocation updates all four automatically, eliminating the
+// entire class of sync bugs.
 //
 // ══ Structural protection ═════════════════════════════════════════
 //
@@ -124,8 +125,9 @@ pub struct ConfigData {
 // Per-field accessors on [`ConfigReload`] are written explicitly
 // below (see "String config accessors") so IDE navigation works.
 
-/// Generate `STRING_CONFIG_KEYS`, `string_fields()`, `set_string_field()`,
-/// and `STRUCT_FIELDS_DEFAULT` from a single list of `Option<String>` field names.
+/// Generate the runtime sync methods `string_fields()` and `set_string_field()`,
+/// the const `STRUCT_FIELDS_DEFAULT`, and the test-only `STRING_CONFIG_KEYS`
+/// constant from a single list of `Option<String>` field names.
 ///
 /// Each field name corresponds to a field on [`ConfigData`] and becomes the
 /// database key (via `stringify!`).  All generated items are guaranteed to stay
