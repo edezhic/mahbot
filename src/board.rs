@@ -3536,91 +3536,70 @@ with a comment explaining why no agent is mid-execution in that state.\
     // ── parse_prereqs unit tests ──
 
     #[test]
-    fn parse_prereqs_valid_empty_array() {
-        let result = parse_prereqs("[]").expect("should parse empty array");
-        assert!(result.is_empty(), "empty array → empty vec");
+    fn parse_prereqs_valid() {
+        let cases: &[(&str, &[&str])] = &[
+            ("[]", &[] as &[&str]),
+            (r#"["a","b","c"]"#, &["a", "b", "c"]),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_prereqs(input).expect("should parse valid JSON"),
+                *expected,
+                "input: {input:?}"
+            );
+        }
     }
 
     #[test]
-    fn parse_prereqs_valid_nonempty_array() {
-        let result = parse_prereqs(r#"["a","b","c"]"#).expect("should parse");
-        assert_eq!(result, vec!["a", "b", "c"]);
+    fn parse_prereqs_invalid() {
+        let cases: &[(&str, &str)] = &[
+            ("", "empty string"),
+            ("not valid json {{{", "non-JSON garbage"),
+            (r#"{"key":"value"}"#, "valid JSON but not an array"),
+            ("[1, 2, 3]", "array of non-strings"),
+        ];
+        for (input, desc) in cases {
+            let err = parse_prereqs(input).unwrap_err();
+            assert!(
+                err.to_string().contains("Corrupt prerequisites JSON"),
+                "{desc}: expected 'Corrupt prerequisites JSON' error, got: {}",
+                err
+            );
+        }
     }
 
     #[test]
-    fn parse_prereqs_empty_string_is_error() {
-        let err = parse_prereqs("").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Corrupt prerequisites JSON"),
-            "should mention corrupt JSON: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_prereqs_non_json_garbage_is_error() {
-        let err = parse_prereqs("not valid json {{{").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Corrupt prerequisites JSON"),
-            "should mention corrupt JSON: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_prereqs_non_array_valid_json_is_error() {
-        // Valid JSON but not an array — serde_json will fail to deserialize Vec<String>
-        let err = parse_prereqs(r#"{"key":"value"}"#).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Corrupt prerequisites JSON"),
-            "should mention corrupt JSON: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_prereqs_array_of_non_strings_is_error() {
-        // Array of integers — deserialization to Vec<String> fails
-        let err = parse_prereqs("[1, 2, 3]").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Corrupt prerequisites JSON"),
-            "should mention corrupt JSON: {msg}"
-        );
-    }
-
-    #[test]
-    fn parse_prereqs_long_corrupt_json_truncates_preview() {
+    fn parse_prereqs_long_input_truncation() {
+        // Long input (>200 chars) — preview should be truncated with ellipsis
         let long = format!(r#""{}...""#, "x".repeat(500));
-        let err = parse_prereqs(&long).unwrap_err();
-        let msg = err.to_string();
-        // Should contain the first 200 chars + "…"
-        assert!(msg.contains('…'), "long preview should be truncated: {msg}");
+        let msg = parse_prereqs(&long).unwrap_err().to_string();
+        assert!(
+            msg.contains('…'),
+            "long input should produce truncated preview: {msg}"
+        );
         assert!(
             msg.len() < 500,
-            "error message should not include full 500-char raw: len={}",
+            "truncated message should be <500 chars, got len={}",
             msg.len()
         );
-    }
 
-    #[test]
-    fn parse_prereqs_multi_byte_char_straddling_byte_200_no_panic() {
-        // 199 ASCII bytes + multi-byte chars: byte 200 is a continuation byte.
+        // Multi-byte characters straddling byte 200 — no panic on truncation.
         // Without floor_char_boundary, `&raw[..200]` would panic on the mid-char slice.
         let raw = format!("{}éééééééééémore", "x".repeat(199));
-        assert!(raw.len() > 200);
+        assert!(raw.len() > 200, "need raw longer than 200 chars");
         // Verify byte 200 is indeed within a multi-byte character (not a boundary).
         assert!(
             !raw.is_char_boundary(200),
             "byte 200 must be mid-character for this test to be meaningful"
         );
-        let err = parse_prereqs(&raw).unwrap_err();
-        let msg = err.to_string();
-        // Should not panic, and should produce a truncated preview with ellipsis.
-        assert!(msg.contains('…'), "long preview should be truncated: {msg}");
+        let msg = parse_prereqs(&raw).unwrap_err().to_string();
+        assert!(
+            msg.contains('…'),
+            "multi-byte input should produce truncated preview: {msg}"
+        );
         assert!(
             msg.len() < raw.len() + 50,
-            "error message near raw length indicates truncation may not have worked: len={}, raw.len()={}",
+            "message too long after truncation: len={}, raw.len()={}",
             msg.len(),
             raw.len()
         );
