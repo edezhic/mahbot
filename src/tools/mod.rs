@@ -1011,69 +1011,33 @@ mod tests {
             Box::new(EditTool),
         ];
 
-        // Canonical names
-        assert!(
-            find_tool(&tools, "search").is_some(),
-            "search tool should be found by name"
-        );
-        assert!(
-            find_tool(&tools, "shell").is_some(),
-            "shell tool should be found by name"
-        );
-        assert!(
-            find_tool(&tools, "read").is_some(),
-            "read tool should be found by name"
-        );
-        assert!(
-            find_tool(&tools, "edit").is_some(),
-            "edit tool should be found by name"
-        );
+        // Each case: (alias, expected_tool_name or None).
+        let cases: &[(&str, Option<&str>)] = &[
+            // Canonical names
+            ("search", Some("search")),
+            ("shell", Some("shell")),
+            ("read", Some("read")),
+            ("edit", Some("edit")),
+            // Shell aliases
+            ("bash", Some("shell")),
+            ("run_terminal_cmd", Some("shell")),
+            // Search aliases
+            ("grep", Some("search")),
+            ("rg", Some("search")),
+            ("grep_search", Some("search")),
+            ("glob", Some("search")),
+            // Read aliases
+            ("read_file", Some("read")),
+            // Edit aliases
+            ("str_replace", Some("edit")),
+            // Unknown tool
+            ("unknown", None),
+        ];
 
-        // Shell aliases
-        assert!(
-            find_tool(&tools, "bash").is_some(),
-            "bash alias should resolve to shell tool"
-        );
-        assert!(
-            find_tool(&tools, "run_terminal_cmd").is_some(),
-            "run_terminal_cmd alias should resolve to shell tool"
-        );
-
-        // Search aliases
-        assert!(
-            find_tool(&tools, "grep").is_some(),
-            "grep alias should resolve to search tool"
-        );
-        assert!(
-            find_tool(&tools, "rg").is_some(),
-            "rg alias should resolve to search tool"
-        );
-        assert!(
-            find_tool(&tools, "grep_search").is_some(),
-            "grep_search alias should resolve to search tool"
-        );
-        assert!(
-            find_tool(&tools, "glob").is_some(),
-            "glob alias should resolve to search tool"
-        );
-
-        // Read aliases
-        assert!(
-            find_tool(&tools, "read_file").is_some(),
-            "read_file alias should resolve to read tool"
-        );
-
-        // Edit aliases
-        assert!(
-            find_tool(&tools, "str_replace").is_some(),
-            "str_replace alias should resolve to edit tool"
-        );
-
-        // Unknown tool
-        assert!(
-            find_tool(&tools, "unknown").is_none(),
-            "unknown tool should return None"
-        );
+        for &(input, expected) in cases {
+            let found = find_tool(&tools, input);
+            assert_eq!(found.map(|t| t.name()), expected, "find_tool({input:?})",);
+        }
     }
 
     #[test]
