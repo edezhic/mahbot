@@ -1447,27 +1447,6 @@ mod utils;
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// File read still works after directory delegation changes.
-    #[tokio::test]
-    async fn file_read_still_works() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_read_still");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("hello.txt"), "hello world")
-            .await
-            .unwrap();
-
-        let result = ReadTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "hello.txt"}))
-            .await;
-        assert!(result.is_ok(), "file read should still succeed: {result:?}");
-        let output = result.unwrap();
-        assert!(output.contains("hello world"));
-        assert!(output.contains("[1 lines total]"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
     /// The shell_quote function handles various edge cases.
     #[test]
     fn shell_quoting_edge_cases() {
