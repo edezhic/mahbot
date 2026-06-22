@@ -154,9 +154,10 @@ const COL_COMMENT_CREATED_AT: usize = 2;
 ///
 /// Note: [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
 /// of these (InDevelopment, InDiagnostics, InReview, InQa) plus Analysis — see its docs for
-/// rationale. `DiagnosticsDone`, `Reviewed`, and `QaPassed` are transitory handoff phases
-/// intentionally excluded from reset. The `tests::test_pipeline_blockers_coverage` test
-/// enforces that every non-transitory pipeline blocker has a corresponding reset transition.
+/// rationale. [`TicketPhase::is_transitory_handoff`] identifies the phases
+/// (`DiagnosticsDone`, `Reviewed`, `QaPassed`) intentionally excluded from reset. The
+/// `tests::test_pipeline_blockers_coverage` test enforces that every non-transitory pipeline
+/// blocker has a corresponding reset transition.
 const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
@@ -422,6 +423,21 @@ pub enum TicketPhase {
 }
 
 impl TicketPhase {
+    /// Returns `true` for transitory handoff phases — pipeline-blocking
+    /// statuses where no agent is mid-execution.
+    ///
+    /// These phases ([`TicketPhase::DiagnosticsDone`], [`TicketPhase::Reviewed`],
+    /// [`TicketPhase::QaPassed`]) are automatically picked up by the poller within
+    /// seconds, so they don't need a reset transition in
+    /// [`BoardStore::RESET_TRANSITIONS`].
+    #[must_use]
+    pub fn is_transitory_handoff(&self) -> bool {
+        matches!(
+            self,
+            TicketPhase::DiagnosticsDone | TicketPhase::Reviewed | TicketPhase::QaPassed
+        )
+    }
+
     /// Returns `true` for phases that unblock dependent tickets.
     ///
     /// Delegates to [`UNBLOCKING_STATUSES`] so the unblocking set can never
@@ -1203,7 +1219,7 @@ impl BoardStore {
     /// but `Analysis` is intentionally NOT in [`PIPELINE_BLOCKING_STATUSES`] (it's a pre-flight
     /// phase, not a pipeline blocker).
     ///
-    /// Transitory handoff phases (`DiagnosticsDone`, `Reviewed`, `QaPassed`) are pipeline
+    /// Transitory handoff phases (see [`TicketPhase::is_transitory_handoff`]) are pipeline
     /// blocking but don't need a reset entry — the poller picks them up within seconds
     /// of restart, so no agent session is mid-execution in those states.
     const RESET_TRANSITIONS: &[(TicketPhase, TicketPhase, bool)] = &[
@@ -2315,13 +2331,6 @@ mod tests {
     /// is intentionally not a pipeline blocker (it's a pre-flight phase).
     #[test]
     fn test_pipeline_blockers_coverage() {
-        // Transitory handoff phases that are pipeline-blocking but don't need reset.
-        const TRANSIENT_HANDOFF: &[TicketPhase] = &[
-            TicketPhase::DiagnosticsDone,
-            TicketPhase::Reviewed,
-            TicketPhase::QaPassed,
-        ];
-
         // Collect all `from` phases from BoardStore::RESET_TRANSITIONS for easy lookup.
         let reset_from: Vec<TicketPhase> = BoardStore::RESET_TRANSITIONS
             .iter()
@@ -2330,15 +2339,14 @@ mod tests {
 
         for phase in PIPELINE_BLOCKING_STATUSES {
             let has_reset = reset_from.contains(phase);
-            let is_transient = TRANSIENT_HANDOFF.contains(phase);
             assert!(
-                has_reset || is_transient,
+                has_reset || phase.is_transitory_handoff(),
                 "\
 PIPELINE_BLOCKING_STATUSES contains `{phase}` which has no corresponding \
-entry in RESET_TRANSITIONS and is not listed as a transitory handoff phase \
-({TRANSIENT_HANDOFF:?}). Either add a reset transition to RESET_TRANSITIONS, \
-or add the phase to the transitory handoff list above with a comment explaining \
-why no agent is mid-execution in that state.\
+entry in RESET_TRANSITIONS and is not a transitory handoff phase \
+(see `TicketPhase::is_transitory_handoff`). Either add a reset transition to \
+RESET_TRANSITIONS, or mark the phase as transitory handoff in that method \
+with a comment explaining why no agent is mid-execution in that state.\
                 ",
             );
         }
