@@ -1253,9 +1253,8 @@ impl BoardStore {
 
     /// Returns true if the given workspace has any ticket with a pipeline-blocking
     /// status (dev/review/QA), OR any reserved ReadyForDevelopment ticket that
-    /// was bounced back and is awaiting rework. Used by the maintainer and
-    /// management poll loop to avoid scanning codebases that are actively being
-    /// changed or about to be changed by rework.
+    /// was bounced back and is awaiting rework. Used by the maintainer to avoid
+    /// scanning codebases that are actively being changed or about to be changed by rework.
     ///
     /// Excludes archived tickets — the only statuses that ever get archived are
     /// `Done` and `Cancelled`, neither of which appears in
