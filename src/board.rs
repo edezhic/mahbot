@@ -491,17 +491,12 @@ impl BoardStore {
         )
         .await?;
 
-        // Migration: add pipeline_reservation column (v1 → v2).
+        // Migration: add pipeline_reservation column.
         // Check current version first to avoid re-running migrations.
         let version: i64 = conn
             .query_row("PRAGMA user_version", turso::params![], |row| row.get(0))
             .await
             .unwrap_or(0);
-        if version < 1 {
-            conn.execute("PRAGMA user_version = 1", turso::params![])
-                .await
-                .context("Failed to set PRAGMA user_version = 1")?;
-        }
         if version < 2 {
             // Use a silent ALTER TABLE ADD COLUMN since `IF NOT EXISTS` requires
             // SQLite 3.35+. If the ALTER fails (column already exists from a
