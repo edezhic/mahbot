@@ -353,9 +353,7 @@ impl ReadTool {
         symbols.sort();
         symbols.dedup();
 
-        let filename = resolved_path
-            .file_name()
-            .map_or("?", |n| n.to_str().unwrap_or("?"));
+        let filename = display_filename(resolved_path);
         let output = if symbols.is_empty() {
             format!("[No symbols found in {filename}]")
         } else {
@@ -409,16 +407,12 @@ impl ReadTool {
             if suggestions.is_empty() {
                 anyhow::bail!(
                     "Symbol '{symbol_name}' not found in {}",
-                    resolved_path
-                        .file_name()
-                        .map_or("?", |n| n.to_str().unwrap_or("?")),
+                    display_filename(resolved_path),
                 );
             }
             anyhow::bail!(
                 "Symbol '{symbol_name}' not found in {}. Did you mean: {}",
-                resolved_path
-                    .file_name()
-                    .map_or("?", |n| n.to_str().unwrap_or("?")),
+                display_filename(resolved_path),
                 suggestions.join(", ")
             );
         };
@@ -481,6 +475,14 @@ impl ReadTool {
 }
 
 // ── Tree-sitter infrastructure ────────────────────────────────────────
+
+/// Extract a human-readable filename from a path for use in display messages.
+///
+/// Returns `"?"` if the path has no filename component or if the filename
+/// is not valid UTF-8.
+fn display_filename(path: &Path) -> &str {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+}
 
 struct ParsedSource {
     source: String,
