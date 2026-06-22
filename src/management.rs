@@ -1203,6 +1203,26 @@ fn format_verdict_comment(
     }
 }
 
+/// Record per-agent verdict comments on a ticket.
+///
+/// Analysts record ALL verdicts (passing + failing) so that every
+/// verdict is visible in the ticket discussion — this differs from
+/// verifiers (reviewers / QA), which only record failing comments.
+async fn record_verdict_comments(
+    board: &BoardStore,
+    ticket_id: &str,
+    results: &[ParallelVerdict],
+    role_str: &str,
+    filter: VerdictFilter,
+) {
+    for (i, r) in results.iter().enumerate() {
+        let role_label = format!("{role_str}_{}", i + 1);
+        if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
+            let _ = board.add_comment(ticket_id, &role_label, &comment).await;
+        }
+    }
+}
+
 // ── Backlog Analysis ──────────────────────────────────────────────────
 
 /// Spawn 3 parallel analyst agents to research a backlog ticket.
@@ -1235,16 +1255,16 @@ async fn dispatch_backlog_analysts(board: &BoardStore, ticket: Arc<Ticket>, ws: 
 /// - to Planning (notify) if ALL analysts passed (≥ `ANALYSIS_THRESHOLD`/10)
 /// - to Paused (notify) if any analyst failed, with a comment listing the counts
 async fn handle_analyst_verdicts(board: &BoardStore, ticket: &Ticket, results: &[ParallelVerdict]) {
-    // Side-effect loop: record per-analyst comments.
-    // Analysts record ALL verdicts (passing + failing) so that every
-    // verdict is visible in the ticket discussion — this differs from
-    // verifiers, which only record failing verdicts.
-    for (i, r) in results.iter().enumerate() {
-        let role_label = format!("{}_{}", Role::Analyst.as_str(), i + 1);
-        if let Some(comment) = format_verdict_comment(r, &role_label, VerdictFilter::All) {
-            let _ = board.add_comment(&ticket.id, &role_label, &comment).await;
-        }
-    }
+    // Record per-analyst comments.
+    // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
+    record_verdict_comments(
+        board,
+        &ticket.id,
+        results,
+        Role::Analyst.as_str(),
+        VerdictFilter::All,
+    )
+    .await;
 
     // Post-loop computation: categorize each analyst verdict
     let nonempty_count = results.iter().filter(|r| !r.response.is_empty()).count();
@@ -1503,12 +1523,14 @@ async fn process_verdict_results(
     verifier: VerifierInfo,
 ) {
     // Record failing comments
-    for (i, r) in results.iter().enumerate() {
-        let role_label = format!("{}_{}", verifier.role.as_str(), i + 1);
-        if let Some(comment) = format_verdict_comment(r, &role_label, VerdictFilter::FailingOnly) {
-            let _ = board.add_comment(&ticket.id, &role_label, &comment).await;
-        }
-    }
+    record_verdict_comments(
+        board,
+        &ticket.id,
+        results,
+        verifier.role.as_str(),
+        VerdictFilter::FailingOnly,
+    )
+    .await;
 
     // Determine outcome
     let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
