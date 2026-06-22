@@ -130,7 +130,11 @@ impl ShellState {
                     container(term_view)
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .padding(4)
+                        .padding(8)
+                        .style(|_t: &iced::Theme| container::Style {
+                            background: Some(iced::Background::Color(theme::BG_BASE)),
+                            ..Default::default()
+                        })
                         .into()
                 } else {
                     // Terminal failed to spawn for this workspace.
@@ -152,8 +156,13 @@ impl ShellState {
                     )
                     .width(Length::Fill)
                     .height(Length::Fill)
+                    .padding(8)
                     .center_x(Length::Fill)
                     .center_y(Length::Fill)
+                    .style(|_t: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(theme::BG_BASE)),
+                        ..Default::default()
+                    })
                     .into()
                 }
             } else {
@@ -174,8 +183,13 @@ impl ShellState {
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .padding(8)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::BG_BASE)),
+                    ..Default::default()
+                })
                 .into()
             };
 

@@ -803,10 +803,22 @@ impl DiffState {
         } else if let Some(ref s) = self.status_message {
             container(text(s).size(13).color(theme::TEXT_SECONDARY))
                 .padding([8, 12])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::BG_BASE)),
+                    ..Default::default()
+                })
                 .into()
         } else if self.diff_loading && !self.diff_has_loaded {
             container(text("Loading diff…").size(12).color(theme::TEXT_MUTED))
                 .padding([8, 12])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::BG_BASE)),
+                    ..Default::default()
+                })
                 .into()
         } else if self.selected_workspace_name.is_none() {
             container(
@@ -815,6 +827,12 @@ impl DiffState {
                     .color(theme::TEXT_MUTED),
             )
             .padding([8, 12])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_BASE)),
+                ..Default::default()
+            })
             .into()
         } else if self.diff_empty {
             container(
@@ -834,6 +852,10 @@ impl DiffState {
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_BASE)),
+                ..Default::default()
+            })
             .into()
         } else {
             self.build_split_view()
@@ -1063,12 +1085,20 @@ impl DiffState {
     /// truncation warnings, and per-file [`DiffBufferWidget`]s interleaved.
     fn build_diff_content(&self) -> Element<'_, DiffMessage> {
         if self.diff_files.is_empty() {
-            return scrollable(column![])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
-                .style(theme::scrollbar_style)
-                .into();
+            return container(
+                scrollable(column![])
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                    .style(theme::scrollbar_style),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_BASE)),
+                ..Default::default()
+            })
+            .into();
         }
 
         let mut rows: Vec<Element<'_, DiffMessage>> = Vec::new();
@@ -1194,12 +1224,20 @@ impl DiffState {
             );
         }
 
-        scrollable(column(rows).spacing(0).width(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
-            .style(theme::scrollbar_style)
-            .into()
+        container(
+            scrollable(column(rows).spacing(0).width(Length::Fill))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                .style(theme::scrollbar_style),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_BASE)),
+            ..Default::default()
+        })
+        .into()
     }
 
     /// Rebuild per-file cosmic_text buffer data. Called from `update()` when

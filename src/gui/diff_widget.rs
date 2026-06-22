@@ -224,6 +224,16 @@ where
         let bounds = layout.bounds();
         let gutter_width = state.gutter_width;
 
+        // ── 0. Fill background ──
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: iced::Border::default(),
+                ..renderer::Quad::default()
+            },
+            theme::BG_BASE,
+        );
+
         let text_rect = text_area_rect(bounds, self.padding, gutter_width);
         let text_x = text_rect.x;
         let text_y = text_rect.y;
