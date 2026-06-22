@@ -384,7 +384,7 @@ impl ConfigReload {
     // to the actual accessor, not macro-expanded code.
     //
     // The compiler catches an accessor referencing a non-existent `ConfigData`
-    // field, and `accessor_count_matches_field_count` (line ~815) covers the
+    // field, and `accessor_count_matches_field_count` covers the
     // forward direction: every field listed in `string_config_fields!` has a
     // corresponding accessor match arm.  The reverse direction — a field added
     // to `ConfigData` but omitted from `string_config_fields!` — is caught by
@@ -699,6 +699,21 @@ fn validate_config(config: &ConfigData) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Shared test values for every string config field, used by multiple roundtrip tests.
+    /// Each entry is a (db_key, test_value) pair.
+    const STRING_FIELD_TEST_VALUES: &[(&str, &str)] = &[
+        ("provider_key", "sk-test-key"),
+        ("provider_endpoint", "https://example.com/api"),
+        ("image_transcription_model", "gpt-4-vision"),
+        ("audio_transcription_model", "whisper-1"),
+        ("transcription_provider", "OpenAI"),
+        ("audio_transcription_provider", "Deepgram"),
+        ("image_gen_model", "dall-e-3"),
+        ("video_gen_model", "sora"),
+        ("exa_key", "exa-test-key"),
+        ("telegram_bot_token", "123:abc"),
+    ];
+
     /// All string keys that [`ConfigData::string_fields`] returns must be
     /// round-trippable through [`ConfigData::set_string_field`]: setting each
     /// individually and reading back via [`ConfigData::string_fields`] must
@@ -715,27 +730,14 @@ mod tests {
 
         // Set each field to a known value via set_string_field and verify
         // it round-trips back through string_fields.
-        let test_cases: &[(&str, &str)] = &[
-            ("provider_key", "sk-test-key"),
-            ("provider_endpoint", "https://example.com/api"),
-            ("image_transcription_model", "gpt-4-vision"),
-            ("audio_transcription_model", "whisper-1"),
-            ("transcription_provider", "OpenAI"),
-            ("audio_transcription_provider", "Deepgram"),
-            ("image_gen_model", "dall-e-3"),
-            ("video_gen_model", "sora"),
-            ("exa_key", "exa-test-key"),
-            ("telegram_bot_token", "123:abc"),
-        ];
-
         // Defensive completeness check — every known key must be exercised.
         assert_eq!(
-            test_cases.len(),
+            STRING_FIELD_TEST_VALUES.len(),
             STRING_CONFIG_KEYS.len(),
-            "roundtrip test_cases must cover every entry in STRING_CONFIG_KEYS",
+            "STRING_FIELD_TEST_VALUES must cover every entry in STRING_CONFIG_KEYS",
         );
 
-        for &(key, value) in test_cases {
+        for &(key, value) in STRING_FIELD_TEST_VALUES {
             let recognized = config.set_string_field(key, value);
             assert!(recognized, "key '{key}' should be recognized");
 
@@ -775,35 +777,6 @@ mod tests {
 
         // Unknown key returns false.
         assert!(!config.set_string_field("nonexistent_key", "value"));
-    }
-
-    /// Every key in [`STRING_CONFIG_KEYS`] must be recognised by
-    /// [`ConfigData::set_string_field`] and appear in [`ConfigData::string_fields`].
-    /// Conversely, `set_string_field` must reject keys NOT in `STRING_CONFIG_KEYS`.
-    #[test]
-    fn all_string_fields_are_settable() {
-        let mut config = ConfigData::default();
-
-        // Every STRING_CONFIG_KEYS entry must be recognised by set_string_field
-        // and also appear in string_fields().
-        for &key in STRING_CONFIG_KEYS {
-            assert!(
-                config.set_string_field(key, "test"),
-                "STRING_CONFIG_KEYS key '{key}' must be recognised by set_string_field"
-            );
-            let found_in_fields = config.string_fields().iter().any(|(k, _)| *k == key);
-            assert!(
-                found_in_fields,
-                "STRING_CONFIG_KEYS key '{key}' must appear in string_fields()"
-            );
-        }
-
-        // set_string_field must reject keys not in STRING_CONFIG_KEYS
-        // (catches accidental extra arms that drift from the constant).
-        assert!(
-            !config.set_string_field("nonexistent_key", "value"),
-            "unknown key must be rejected by set_string_field"
-        );
     }
 
     /// All [`ConfigReload`] accessors exist and return the expected types.
@@ -868,26 +841,13 @@ mod tests {
         let mut config = ConfigData::default();
 
         // Set every string field via the DB interface (set_string_field)
-        let test_cases: &[(&str, &str)] = &[
-            ("provider_key", "sk-test-key"),
-            ("provider_endpoint", "https://example.com/api"),
-            ("image_transcription_model", "gpt-4-vision"),
-            ("audio_transcription_model", "whisper-1"),
-            ("transcription_provider", "OpenAI"),
-            ("audio_transcription_provider", "Deepgram"),
-            ("image_gen_model", "dall-e-3"),
-            ("video_gen_model", "sora"),
-            ("exa_key", "exa-test-key"),
-            ("telegram_bot_token", "123:abc"),
-        ];
         // Defensive completeness check — every known key must be exercised.
         assert_eq!(
-            test_cases.len(),
+            STRING_FIELD_TEST_VALUES.len(),
             STRING_CONFIG_KEYS.len(),
-            "config_reload_accessors_roundtrip test_cases must cover every entry \
-             in STRING_CONFIG_KEYS",
+            "STRING_FIELD_TEST_VALUES must cover every entry in STRING_CONFIG_KEYS",
         );
-        for &(key, value) in test_cases {
+        for &(key, value) in STRING_FIELD_TEST_VALUES {
             assert!(
                 config.set_string_field(key, value),
                 "set_string_field failed for '{key}'"
