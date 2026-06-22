@@ -251,25 +251,6 @@ pub fn format_tool_failure_feedback(
     )
 }
 
-/// Shared result formatting for file-based tools (write, edit).
-/// Handles the "After" phase with truncation and either a code fence or
-/// expandable blockquote depending on content size.
-#[must_use]
-pub fn format_file_tool_result(
-    action: &str,
-    content: &str,
-    args: &serde_json::Value,
-    outcome: &ToolExecutionOutcome,
-) -> String {
-    let path = crate::tools::find_path_arg(args).unwrap_or("?");
-    if !outcome.success {
-        return format!("❌ {action} attempted on {path}");
-    }
-
-    let block = crate::util::truncate_sandwich(content, 2000, "debug");
-    format!("✏️ {path}\n{block}")
-}
-
 /// Outcome for a tool execution.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionOutcome {

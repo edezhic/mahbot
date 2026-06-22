@@ -210,17 +210,32 @@ impl Tool for EditTool {
                 let new_string = super::get_opt_str(args, "new_string").unwrap_or("?");
                 if let Some(old) = old_string {
                     let combined = format!("{old}\n-----------\n{new_string}");
-                    Some(super::format_file_tool_result(
-                        "Edit", &combined, args, outcome,
-                    ))
+                    Some(format_file_tool_result("Edit", &combined, args, outcome))
                 } else {
-                    Some(super::format_file_tool_result(
-                        "Write", new_string, args, outcome,
-                    ))
+                    Some(format_file_tool_result("Write", new_string, args, outcome))
                 }
             }
         }
     }
+}
+
+/// Result formatting for the edit tool's "After" phase.
+/// Handles truncation and either a code fence or expandable blockquote
+/// depending on content size.
+#[must_use]
+fn format_file_tool_result(
+    action: &str,
+    content: &str,
+    args: &serde_json::Value,
+    outcome: &super::ToolExecutionOutcome,
+) -> String {
+    let path = super::find_path_arg(args).unwrap_or("?");
+    if !outcome.success {
+        return format!("❌ {action} attempted on {path}");
+    }
+
+    let block = crate::util::truncate_sandwich(content, 2000, "debug");
+    format!("✏️ {path}\n{block}")
 }
 
 // ── Whitespace-insensitive matching ───────────────────────────────
