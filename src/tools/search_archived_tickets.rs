@@ -17,7 +17,6 @@ use tracing::debug;
 ///
 /// Uses the board's FTS index (`BoardStore::search_archived_by_fts`) and ONNX
 /// embeddings (`embedder::embed()`) with RRF merge (`vector::hybrid_merge`).
-/// Does not share infrastructure with the file-search engine (`search_engine.rs`).
 pub struct SearchArchivedTicketsTool;
 
 #[async_trait]
