@@ -459,7 +459,7 @@ mod tests {
 
         for &(input, expected) in cases {
             let found = find_tool(&tools, input);
-            assert_eq!(found.map(|t| t.name()), expected, "find_tool({input:?})",);
+            assert_eq!(found.map(Tool::name), expected, "find_tool({input:?})");
         }
     }
 
@@ -487,7 +487,6 @@ mod tests {
 
     #[test]
     // ── media_marker coverage ────────────────────────────────────────
-    #[test]
     fn all_media_tools_implement_media_marker() {
         /// Assert that a tool returns Some from media_marker().
         macro_rules! assert_media_marker {

@@ -325,7 +325,7 @@ mod tests {
         ];
         for (label, body, expected_url) in &cases {
             let result = extract_response_parts(body);
-            assert_eq!(result.image_data, Some(expected_url.to_string()), "{label}",);
+            assert_eq!(result.image_data, Some(expected_url.to_string()), "{label}");
             assert_eq!(result.text_content, None, "{label}");
         }
     }

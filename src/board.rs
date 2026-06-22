@@ -3565,8 +3565,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             let err = parse_prereqs(input).unwrap_err();
             assert!(
                 err.to_string().contains("Corrupt prerequisites JSON"),
-                "{desc}: expected 'Corrupt prerequisites JSON' error, got: {}",
-                err
+                "{desc}: expected 'Corrupt prerequisites JSON' error, got: {err}",
             );
         }
     }
