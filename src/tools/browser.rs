@@ -687,33 +687,30 @@ impl Tool for BrowserTool {
         };
 
         let output = match response.data {
-            Some(data) => {
-                // Format the response nicely based on the action.
-                match &action {
-                    BrowserAction::Snapshot { .. }
-                    | BrowserAction::GetText { .. }
-                    | BrowserAction::GetInnerText { .. } => extract_snapshot_text(&data)
-                        .or_else(|| serde_json::to_string_pretty(&data).ok())
-                        .unwrap_or_default(),
-                    BrowserAction::Open { .. } => {
-                        let mut s = format!(
-                            "Opened {}",
-                            data.get("url").and_then(|v| v.as_str()).unwrap_or("?")
-                        );
-                        if !snapshot_output.is_empty() {
-                            use std::fmt::Write;
-                            let _ = write!(s, "\n\n--- Page content ---\n{snapshot_output}");
-                        }
-                        s
+            Some(data) => match &action {
+                BrowserAction::Snapshot { .. }
+                | BrowserAction::GetText { .. }
+                | BrowserAction::GetInnerText { .. } => extract_snapshot_text(&data)
+                    .or_else(|| serde_json::to_string_pretty(&data).ok())
+                    .unwrap_or_default(),
+                BrowserAction::Open { .. } => {
+                    let mut s = format!(
+                        "Opened {}",
+                        data.get("url").and_then(|v| v.as_str()).unwrap_or("?")
+                    );
+                    if !snapshot_output.is_empty() {
+                        use std::fmt::Write;
+                        let _ = write!(s, "\n\n--- Page content ---\n{snapshot_output}");
                     }
-                    BrowserAction::GetUrl { .. } => data
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    _ => serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
+                    s
                 }
-            }
+                BrowserAction::GetUrl { .. } => data
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                _ => serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()),
+            },
             None => String::new(),
         };
 

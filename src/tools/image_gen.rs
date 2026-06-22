@@ -55,7 +55,6 @@ impl Tool for ImageGenTool {
         let aspect_ratio = super::get_opt_str(&args, "aspect_ratio");
         let size = super::get_opt_str(&args, "size");
 
-        // Build user message content
         let images: Vec<String> = super::get_str_array(&args, "images");
 
         let messages = if images.is_empty() {
@@ -88,7 +87,6 @@ impl Tool for ImageGenTool {
             }])
         };
 
-        // Build request body
         let mut body = json!({
             "model": model,
             "messages": messages,
@@ -101,7 +99,6 @@ impl Tool for ImageGenTool {
             "image_size": size.unwrap_or("2k"),
         });
 
-        // Make the API call
         let auth = crate::util::http::bearer_auth_header();
         let endpoint = crate::config::CONFIG.provider_endpoint();
         let chat_url = crate::providers::ensure_chat_completions_url(&endpoint);
@@ -144,7 +141,6 @@ impl Tool for ImageGenTool {
 
         let output_path = super::save_generated_file(ws, &bytes, "image", "png").await?;
 
-        // Build output: include model's text (if any) alongside the image marker
         let path_str = output_path.to_string_lossy();
         let marker_prefix = self
             .media_marker()

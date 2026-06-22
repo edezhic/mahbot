@@ -188,7 +188,6 @@ impl Tool for VideoGenTool {
             }
         };
 
-        // Extract job ID and polling URL from response.
         // OpenRouter returns: { id, polling_url, status, ... }
         let job_id = match submit_body.get("id").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
