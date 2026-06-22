@@ -344,6 +344,27 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
         .map(Box::as_ref)
 }
 
+/// Canonicalize the parent directory of `path` and join the original file name.
+///
+/// This is the common canonicalization strategy used by both
+/// [`resolve_directory_read_fallback`] and [`resolve_write_target`]: the parent
+/// directory is canonicalized (to resolve symlinks in the directory chain) while
+/// the final file component is preserved as-is (the file itself may not exist
+/// yet for write operations).
+///
+/// Returns an error if `path` has no parent or file_name component, or if
+/// [`tokio::fs::canonicalize`] fails on the parent directory.
+async fn canonicalize_parent_and_join(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent directory")
+    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let canon_parent = tokio::fs::canonicalize(parent).await?;
+    Ok(canon_parent.join(name))
+}
+
 /// Fallback directory resolution when full-path [`canonicalize`] fails with
 /// `NotFound` but the lexical path still exists as a directory.
 ///
@@ -356,10 +377,7 @@ pub(crate) async fn resolve_directory_read_fallback(full_path: &Path) -> Option<
         return None;
     }
 
-    let parent = full_path.parent()?;
-    let name = full_path.file_name()?;
-    let canon_parent = tokio::fs::canonicalize(parent).await.ok()?;
-    let resolved = canon_parent.join(name);
+    let resolved = canonicalize_parent_and_join(full_path).await.ok()?;
     if tokio::fs::symlink_metadata(&resolved)
         .await
         .is_ok_and(|m| m.is_dir())
@@ -408,9 +426,13 @@ pub async fn resolve_write_target(
     }
 
     // Canonicalize parent only — the file itself may not exist yet
-    let resolved_parent = tokio::fs::canonicalize(parent)
+    let resolved_target = canonicalize_parent_and_join(&full_path)
         .await
         .context("Failed to resolve file path")?;
+
+    // Re-extract canonicalized parent for the post-canonicalization security check.
+    // The helper guarantees the result has a parent component.
+    let resolved_parent = resolved_target.parent().unwrap();
 
     if !is_path_safe_for_workspace(&resolved_parent.to_string_lossy(), workspace_root) {
         anyhow::bail!(
@@ -418,12 +440,6 @@ pub async fn resolve_write_target(
             resolved_parent.display()
         );
     }
-
-    let Some(file_name) = full_path.file_name() else {
-        anyhow::bail!("Invalid path: missing file name");
-    };
-
-    let resolved_target = resolved_parent.join(file_name);
 
     // Explicit symlink refusal (read resolves symlinks via canonicalize instead)
     if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
