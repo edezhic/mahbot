@@ -170,13 +170,8 @@ fn extract_response_parts(body: &serde_json::Value) -> ImageGenResponse {
     let text_content = message
         .and_then(|msg| msg.get("content"))
         .and_then(|v| v.as_str())
-        .and_then(|text| {
-            if text.is_empty() {
-                None
-            } else {
-                Some(text.to_string())
-            }
-        });
+        .filter(|t| !t.is_empty())
+        .map(ToString::to_string);
 
     ImageGenResponse {
         image_data,
