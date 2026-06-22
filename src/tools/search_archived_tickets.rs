@@ -121,8 +121,7 @@ impl SearchArchivedTicketsTool {
         board: &crate::board::BoardStore,
         top_ids: &[String],
     ) -> Result<String> {
-        let id_refs: Vec<&str> = top_ids.iter().map(std::string::String::as_str).collect();
-        let rows = board.list_tickets_minimal(&id_refs).await?;
+        let rows = board.list_tickets_minimal(top_ids).await?;
 
         let mut output = String::from("Search results (top 10, highest score first):\n");
         for id in top_ids {

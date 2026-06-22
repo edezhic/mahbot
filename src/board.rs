@@ -1637,7 +1637,7 @@ impl BoardStore {
     /// display purposes after hybrid ranking.
     pub async fn list_tickets_minimal(
         &self,
-        ids: &[&str],
+        ids: &[String],
     ) -> Result<Vec<(String, String, String)>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -1646,10 +1646,7 @@ impl BoardStore {
             "SELECT id, title, status FROM tickets WHERE id IN ({})",
             turso::sql_in_placeholders(ids.len()),
         );
-        let params: Vec<Value> = ids
-            .iter()
-            .map(|id| Value::Text((*id).to_string()))
-            .collect();
+        let params: Vec<Value> = ids.iter().map(|id| Value::Text(id.clone())).collect();
 
         let rows = self.conn.query(&sql, params_from_iter(params)).await?;
 
@@ -1663,8 +1660,8 @@ impl BoardStore {
 
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some((title, status)) = map.get(*id) {
-                results.push((id.to_string(), title.clone(), status.clone()));
+            if let Some((title, status)) = map.get(id) {
+                results.push((id.clone(), title.clone(), status.clone()));
             }
         }
         Ok(results)
@@ -4046,7 +4043,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let id = create_archived_ticket(&store, "Test title", "ws").await;
 
         let rows = store
-            .list_tickets_minimal(&[&id])
+            .list_tickets_minimal(&[id.clone()])
             .await
             .expect("list minimal");
         assert_eq!(rows.len(), 1);
@@ -4058,8 +4055,10 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_list_tickets_minimal_empty_ids_yields_empty() {
         let (store, _tmp) = open_test_store().await;
-        let rows: Vec<(String, String, String)> =
-            store.list_tickets_minimal(&[]).await.expect("list minimal");
+        let rows: Vec<(String, String, String)> = store
+            .list_tickets_minimal(&[] as &[String])
+            .await
+            .expect("list minimal");
         assert!(rows.is_empty());
     }
 
@@ -4069,7 +4068,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let id = create_archived_ticket(&store, "Exists", "ws").await;
 
         let rows = store
-            .list_tickets_minimal(&[&id, "nonexistent"])
+            .list_tickets_minimal(&[id.clone(), "nonexistent".to_string()])
             .await
             .expect("list minimal");
         assert_eq!(rows.len(), 1, "only the existing ticket should be returned");
@@ -4085,7 +4084,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Request in non-insertion order
         let rows = store
-            .list_tickets_minimal(&[&id_c, &id_a, &id_b])
+            .list_tickets_minimal(&[id_c.clone(), id_a.clone(), id_b.clone()])
             .await
             .expect("list minimal");
         assert_eq!(rows.len(), 3);
