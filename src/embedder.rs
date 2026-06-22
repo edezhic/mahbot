@@ -8,10 +8,12 @@
 //! bug"` matching `"login issue"`) — which pure FTS keyword search alone cannot
 //! do.
 //!
-//! The embedding model is loaded **once at startup** and cached in a global
-//! [`OnceLock`]; embedding generation does not add latency to every ticket
-//! creation.  Only the `SearchArchivedTicketsTool` triggers embedding, and only
-//! when the user (or an agent) explicitly queries history.
+//! The embedding model is loaded **lazily on first `embed()` call** and cached in a
+//! global [`OnceLock`]; embedding is computed at **ticket creation time** (to
+//! pre-compute a vector for future archived search) and at **search-query time**
+//! (to vectorize the query for `SearchArchivedTicketsTool`).  Both paths gracefully
+//! degrade: if the model fails to load or inference fails, `embed()` returns `None`
+//! and the caller falls back to FTS-only search.
 //!
 //! While the ONNX runtime and tokenizer dependencies add compilation time, the
 //! feature provides real value for the Manager agent when searching historical
