@@ -157,8 +157,6 @@ pub fn scrub_credentials(input: &str) -> String {
                 .map_or("", |m| m.as_str());
 
             // Preserve first 4 chars for context, then redact.
-            // The regex requires values to be at least 8 chars, so the guard below
-            // (val.len() > 4) would always be true — it was removed as dead code.
             debug_assert!(val.len() > 4, "regex guarantees values >= 8 chars");
             let prefix = val
                 .char_indices()
