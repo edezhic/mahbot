@@ -3941,7 +3941,7 @@ impl EditorState {
             Self::build_close_dialog(
                 on_save,
                 on_discard,
-                on_cancel,
+                &on_cancel,
                 "This file has unsaved changes. What would you like to do?".to_string(),
             )
         });
@@ -3970,7 +3970,7 @@ impl EditorState {
                 keep_idx,
                 action: CloseAction::Cancel,
             };
-            Self::build_close_dialog(on_save, on_discard, on_cancel, desc)
+            Self::build_close_dialog(on_save, on_discard, &on_cancel, desc)
         });
 
         // ── Quick-open overlay ────────────────────────────────────────
@@ -4642,6 +4642,51 @@ impl EditorState {
         )
     }
 
+    // ── Overlay helpers ────────────────────────────────────────────
+
+    /// Wrap any dialog element in a centered overlay with a semi-transparent
+    /// backdrop that closes the dialog on click.
+    fn overlay_dialog<'a>(
+        dialog: impl Into<Element<'a, EditorMessage>>,
+        on_backdrop: EditorMessage,
+        opacity: f32,
+    ) -> Element<'a, EditorMessage> {
+        let backdrop = iced::widget::mouse_area(
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.0, 0.0, 0.0, opacity,
+                    ))),
+                    ..Default::default()
+                }),
+        )
+        .on_press(on_backdrop);
+
+        let centered = container(dialog.into())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+
+        iced::widget::stack([backdrop.into(), centered.into()]).into()
+    }
+
+    /// Shared dialog container style used by all overlay dialogs:
+    /// elevated background, strong border, 8px radius.
+    fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
+        container::Style {
+            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: theme::BORDER_STRONG,
+            },
+            ..Default::default()
+        }
+    }
+
     /// Build the quick-open overlay: a centered dialog with search input
     /// and filtered results list.
     fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, EditorMessage> {
@@ -4735,37 +4780,9 @@ impl EditorState {
         let dialog = container(content)
             .width(Length::Fixed(400.0))
             .padding(12)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: theme::BORDER_STRONG,
-                },
-                ..Default::default()
-            });
+            .style(Self::dialog_container_style);
 
-        let centered = container(dialog)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-
-        // Backdrop.
-        let backdrop = iced::widget::mouse_area(
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.0, 0.0, 0.0, 0.4,
-                    ))),
-                    ..Default::default()
-                }),
-        )
-        .on_press(EditorMessage::Escape);
-
-        iced::widget::stack([backdrop.into(), centered.into()]).into()
+        Self::overlay_dialog(dialog, EditorMessage::Escape, 0.4)
     }
 
     fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'static, EditorMessage> {
@@ -4948,37 +4965,9 @@ impl EditorState {
         let dialog = container(content)
             .width(Length::Fixed(600.0))
             .padding(12)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: theme::BORDER_STRONG,
-                },
-                ..Default::default()
-            });
+            .style(Self::dialog_container_style);
 
-        let centered = container(dialog)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-
-        // Backdrop.
-        let backdrop = iced::widget::mouse_area(
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.0, 0.0, 0.0, 0.4,
-                    ))),
-                    ..Default::default()
-                }),
-        )
-        .on_press(EditorMessage::GlobalSearchClose);
-
-        iced::widget::stack([backdrop.into(), centered.into()]).into()
+        Self::overlay_dialog(dialog, EditorMessage::GlobalSearchClose, 0.4)
     }
 
     fn build_editor_widget(&self) -> Element<'_, EditorMessage> {
@@ -5096,23 +5085,9 @@ impl EditorState {
     fn build_close_dialog(
         on_save: EditorMessage,
         on_discard: EditorMessage,
-        on_cancel: EditorMessage,
+        on_cancel: &EditorMessage,
         description: String,
     ) -> Element<'static, EditorMessage> {
-        // Backdrop.
-        let backdrop = iced::widget::mouse_area(
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.0, 0.0, 0.0, 0.5,
-                    ))),
-                    ..container::Style::default()
-                }),
-        )
-        .on_press(on_cancel.clone());
-
         // Dialog content.
         let dialog = container(
             column![
@@ -5136,7 +5111,7 @@ impl EditorState {
                             .align_x(Alignment::Center)
                     )
                     .style(theme::button_secondary)
-                    .on_press(on_cancel),
+                    .on_press(on_cancel.clone()),
                     Space::new().width(8),
                     button(
                         text("Discard")
@@ -5164,26 +5139,10 @@ impl EditorState {
         )
         .width(380)
         .padding(24)
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-            border: iced::Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: theme::BORDER_STRONG,
-            },
-            ..container::Style::default()
-        });
+        .style(Self::dialog_container_style);
 
-        let centered = container(dialog)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-
-        iced::widget::stack([backdrop.into(), centered.into()]).into()
+        Self::overlay_dialog(dialog, on_cancel.clone(), 0.5)
     }
-
-    // ── Context menu dialog helpers ─────────────────────────────────
 
     /// Build the delete confirmation dialog overlay.
     fn build_delete_confirm_dialog(target: &DeleteConfirmTarget) -> Element<'_, EditorMessage> {
@@ -5204,20 +5163,6 @@ impl EditorState {
         } else {
             format!("Delete file \"{}\"?", target.path)
         };
-
-        // Backdrop.
-        let backdrop = iced::widget::mouse_area(
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.0, 0.0, 0.0, 0.5,
-                    ))),
-                    ..container::Style::default()
-                }),
-        )
-        .on_press(EditorMessage::CancelDelete);
 
         // Dialog content.
         let dialog = container(
@@ -5267,23 +5212,9 @@ impl EditorState {
         )
         .width(400)
         .padding(24)
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-            border: iced::Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: theme::BORDER_STRONG,
-            },
-            ..container::Style::default()
-        });
+        .style(Self::dialog_container_style);
 
-        let centered = container(dialog)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-
-        iced::widget::stack([backdrop.into(), centered.into()]).into()
+        Self::overlay_dialog(dialog, EditorMessage::CancelDelete, 0.5)
     }
 
     /// Build the new file/directory name input overlay.
@@ -5293,20 +5224,6 @@ impl EditorState {
         } else {
             format!("New file in \"{}\"", target.parent_dir)
         };
-
-        // Backdrop — clicking outside dismisses.
-        let backdrop = iced::widget::mouse_area(
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.0, 0.0, 0.0, 0.4,
-                    ))),
-                    ..container::Style::default()
-                }),
-        )
-        .on_press(EditorMessage::Escape);
 
         let input = text_input("Name…", &target.input_text)
             .id(Id::new("new-item-input"))
@@ -5347,23 +5264,9 @@ impl EditorState {
         )
         .width(380)
         .padding(24)
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-            border: iced::Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: theme::BORDER_STRONG,
-            },
-            ..container::Style::default()
-        });
+        .style(Self::dialog_container_style);
 
-        let centered = container(dialog)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-
-        iced::widget::stack([backdrop.into(), centered.into()]).into()
+        Self::overlay_dialog(dialog, EditorMessage::Escape, 0.4)
     }
 
     // ── Context menu action handlers ───────────────────────────────
