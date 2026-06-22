@@ -55,7 +55,7 @@ impl Tool for ReadTool {
             return self.recover_wildcard_path(ws, &path).await;
         }
 
-        let resolved_path = match super::resolve_read_target(ws.as_path(), &path).await {
+        let resolved_path = match super::path::resolve_read_target(ws.as_path(), &path).await {
             Ok(p) => p,
             Err(e) => {
                 let msg = e.to_string();
@@ -238,7 +238,7 @@ impl ReadTool {
 
         if matches.len() == 1 {
             let recovered = &matches[0];
-            let resolved = super::resolve_read_target(ws.as_path(), recovered).await?;
+            let resolved = super::path::resolve_read_target(ws.as_path(), recovered).await?;
             let note = format!("[Recovered path: requested '{path}', using '{recovered}']");
             return self.read_resolved(ws, &resolved, Some(&note), args).await;
         }

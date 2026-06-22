@@ -367,7 +367,7 @@ fn has_disallowed_redirect(command_str: &str) -> bool {
 
         let target_path = Path::new(target);
         if target_path.is_absolute() {
-            if crate::tools::is_path_under_allowed_temp(target_path) {
+            if crate::tools::path::is_path_under_allowed_temp(target_path) {
                 continue;
             }
             // Absolute non-temp non-devnull = disallowed
@@ -456,7 +456,7 @@ fn scratch_paths_under_temp(segment: &str) -> bool {
     !paths.is_empty()
         && paths.iter().all(|p| {
             let path = Path::new(p);
-            path.is_absolute() && crate::tools::is_path_under_allowed_temp(path)
+            path.is_absolute() && crate::tools::path::is_path_under_allowed_temp(path)
         })
 }
 

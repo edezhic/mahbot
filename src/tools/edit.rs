@@ -65,7 +65,7 @@ impl Tool for EditTool {
         match old_string {
             None | Some("") => {
                 let resolved_target =
-                    super::resolve_write_target(ws.as_path(), &path, true).await?;
+                    super::path::resolve_write_target(ws.as_path(), &path, true).await?;
 
                 // Refuse to overwrite an existing file in write mode
                 if tokio::fs::try_exists(&resolved_target)
@@ -100,7 +100,7 @@ impl Tool for EditTool {
 
                 // ── 2. Path pre-validation ───────────────────────────────
                 let resolved_target =
-                    super::resolve_write_target(ws.as_path(), &path, false).await?;
+                    super::path::resolve_write_target(ws.as_path(), &path, false).await?;
 
                 let use_ws_matching = is_ws_insensitive_extension(&path);
 
