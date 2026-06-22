@@ -15,7 +15,7 @@
 //!
 //! ## Gutter rendering
 //!
-//! Gutter (5-char old/new line numbers) is rendered entirely in `draw()` via
+//! Gutter (old/new line numbers) is rendered entirely in `draw()` via
 //! `fill_text` — it is NOT part of the buffer text at all. This avoids the
 //! problem of gutter text being repeated on wrapped continuation lines.
 
@@ -135,7 +135,7 @@ where
         let line_count = self.data.line_kinds.len();
         let gutter_width = {
             let digits = (line_count.max(1).ilog10() + 1).min(6) as f32;
-            // Two 5-char columns side by side + gap + padding
+            // Two columns side by side + gap + padding
             digits * 5.0 * 2.0 + 14.0
         };
         state.gutter_width = gutter_width;
@@ -298,7 +298,7 @@ where
             let half_gutter = gutter_width / 2.0;
 
             // Draw old line number (right-aligned in left half)
-            let old_str = old_num.map_or_else(String::new, |n| format!("{n:>5}"));
+            let old_str = old_num.map_or_else(String::new, |n| n.to_string());
             if !old_str.is_empty() {
                 let num_text = text::Text {
                     content: old_str,
@@ -323,7 +323,7 @@ where
             }
 
             // Draw new line number (right-aligned in right half)
-            let new_str = new_num.map_or_else(String::new, |n| format!("{n:>5}"));
+            let new_str = new_num.map_or_else(String::new, |n| n.to_string());
             if !new_str.is_empty() {
                 let num_text = text::Text {
                     content: new_str,
