@@ -312,13 +312,10 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
                 broadcast_and_persist_agent_response(
                     &user.name,
                     channel,
-                    &SendMessage {
-                        content: content.clone(),
-                        recipient: user.name.clone(),
-                        reply_markup: reply_markup.clone(),
-                        agent_role: agent_role.clone(),
-                        workspace: workspace.clone(),
-                    },
+                    content,
+                    agent_role.clone(),
+                    workspace,
+                    reply_markup.clone(),
                 )
                 .await;
             }

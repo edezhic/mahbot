@@ -84,23 +84,26 @@ impl BroadcastPersistEntry {
 /// ([`send_channel_reply_with_buttons`]) and the Manager queue consumer
 /// in [`crate::manager_queue`].
 ///
-/// Takes explicit `user_name` (canonical user name) and `channel` (e.g. "telegram", "gui")
-/// parameters — does **not** depend on [`ChannelMessage`], so it can be used
+/// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
+/// and primitive fields — does **not** depend on [`SendMessage`], so it can be used
 /// from the Manager queue which works from [`crate::users::UserRecord`].
 pub async fn broadcast_and_persist_agent_response(
     user_name: &str,
     channel: &str,
-    reply: &SendMessage,
+    content: &str,
+    agent_role: Option<String>,
+    workspace: &str,
+    reply_markup: Option<serde_json::Value>,
 ) {
     BroadcastPersistEntry {
         user_name: user_name.to_string(),
         channel_name: channel.to_string(),
-        content: reply.content.clone(),
+        content: content.to_string(),
         direction: ChatDirection::Agent,
-        agent_role: reply.agent_role.clone(),
-        workspace: reply.workspace.clone(),
+        agent_role,
+        workspace: workspace.to_string(),
         optimistic_id: None, // agent messages must not carry one
-        reply_markup: reply.reply_markup.clone(),
+        reply_markup,
     }
     .broadcast_and_persist()
     .await;
@@ -154,7 +157,15 @@ pub async fn send_channel_reply_with_buttons(
     };
 
     // ── Broadcast agent response for live GUI display and chat_history ──
-    broadcast_and_persist_agent_response(&msg.user_name, &msg.source_channel, &reply).await;
+    broadcast_and_persist_agent_response(
+        &msg.user_name,
+        &msg.source_channel,
+        &reply.content,
+        reply.agent_role.clone(),
+        &reply.workspace,
+        reply.reply_markup.clone(),
+    )
+    .await;
 
     if let Err(e) = channel.send(&reply).await {
         tracing::error!("Failed to reply on {}: {e}", channel.name());
