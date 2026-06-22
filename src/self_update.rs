@@ -19,12 +19,9 @@
 //!
 //! ## macOS Gatekeeper safety
 //!
-//! On macOS, `posix_spawn` triggers asynchronous Gatekeeper code signature
-//! validation. If the spawn target is deleted while Gatekeeper is still validating,
-//! `syspolicyd` finds the file gone (ENOENT) and SIGKILLs the child before `dyld`
-//! starts — producing empty stderr. The cleanup guard below guarantees the spawn
-//! target is never deleted during or before the child's startup window. All path
-//! comparisons use `canonicalize_safe()` to handle symlinks correctly.
+//! `posix_spawn` triggers async Gatekeeper code-signing validation; deleting the
+//! spawn target during validation produces empty stderr (SIGKILL by `syspolicyd`).
+//! See `should_delete_build_artifact()` and `execute_update()` steps 12–13.
 //!
 //! Self-update is only available when running from the original build checkout
 //! directory — `CARGO_MANIFEST_DIR` is a compile-time constant embedded via
