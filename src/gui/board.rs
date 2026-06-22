@@ -12,7 +12,6 @@ use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
 use super::theme;
-use super::widgets;
 use super::widgets::selectable_text;
 
 /// Per-file stat from `git show --numstat`.
@@ -609,49 +608,6 @@ impl BoardState {
         })
     }
 
-    pub fn view(&self) -> Element<'_, BoardMessage> {
-        let mut content = column![];
-
-        if let Some(ref err) = self.error {
-            content = content.push(widgets::error_banner(err));
-            content = content.push(Space::new().height(12));
-        }
-
-        if self.loading && !self.has_loaded {
-            content = content.push(text("Loading...").size(14).color(theme::TEXT_MUTED));
-        } else if self.tickets.is_empty() {
-            content = content.push(widgets::empty_state_placeholder(
-                lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
-                "No tickets",
-            ));
-        } else {
-            // Partition tickets into 3 columns
-            let (pending, pipeline, completed) = Self::partition_tickets(&self.tickets);
-
-            let kanban = row![
-                self.render_kanban_column("Pending", &pending, false),
-                Space::new().width(8),
-                self.render_kanban_column("In Pipeline", &pipeline, false),
-                Space::new().width(8),
-                self.render_kanban_column("Completed", &completed, true),
-            ]
-            .height(Length::Fill);
-
-            content = content.push(kanban);
-        }
-
-        let base = container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(24)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..container::Style::default()
-            });
-
-        iced::widget::stack([base.into(), self.render_modal_overlay()]).into()
-    }
-
     /// Partition tickets into the three kanban columns.
     pub(crate) fn partition_tickets(
         tickets: &[Ticket],
@@ -689,91 +645,6 @@ impl BoardState {
         completed.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         (pending, pipeline, completed)
-    }
-
-    /// Render a single kanban column: header with count + scrollable ticket cards.
-    /// When `is_completed` is true, a batch-archive button is shown in the header.
-    fn render_kanban_column<'a>(
-        &'a self,
-        title: &'static str,
-        tickets: &[&'a Ticket],
-        is_completed: bool,
-    ) -> Element<'a, BoardMessage> {
-        let count = tickets.len();
-
-        let mut header_row = row![
-            text(title)
-                .size(14)
-                .color(theme::TEXT_SECONDARY)
-                .font(theme::FONT_BOLD),
-            Space::new().width(6),
-            container(text(format!("{count}")).size(12).color(theme::TEXT_MUTED))
-                .padding([1, 6])
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        ..iced::Border::default()
-                    },
-                    ..container::Style::default()
-                }),
-        ]
-        .align_y(Alignment::Center);
-
-        if is_completed && !tickets.is_empty() {
-            let archive_icon = lucide::archive::<iced::Theme, iced::Renderer>()
-                .size(14)
-                .color(theme::TEXT_SECONDARY);
-            let archive_btn = tooltip(
-                button(archive_icon)
-                    .on_press(BoardMessage::ArchiveAllCompleted)
-                    .padding(4)
-                    .style(theme::button_text),
-                text("Archive all done & cancelled").size(11),
-                tooltip::Position::Top,
-            );
-            header_row = header_row.push(Space::new().width(6)).push(archive_btn);
-        }
-
-        let header = header_row;
-
-        let column_content = if tickets.is_empty() {
-            column![
-                header,
-                Space::new().height(16),
-                container(text("No tickets").size(13).color(theme::TEXT_MUTED))
-                    .width(Length::Fill)
-                    .center_x(Length::Fill),
-            ]
-        } else {
-            let mut cards = Column::new().spacing(4);
-            for ticket in tickets {
-                cards = cards.push(self.render_ticket_card(ticket));
-            }
-            column![
-                header,
-                Space::new().height(8),
-                scrollable(cards)
-                    .height(Length::Fill)
-                    .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
-                    .style(theme::scrollbar_style)
-            ]
-        };
-
-        container(column_content)
-            .padding(12)
-            .width(Length::FillPortion(1))
-            .height(Length::Fill)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    width: 1.0,
-                    color: theme::BORDER,
-                },
-                ..container::Style::default()
-            })
-            .into()
     }
 
     /// Render a single ticket card: clickable title, ID, status badge, and action icons.

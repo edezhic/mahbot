@@ -73,7 +73,6 @@ pub static LOG_BROADCAST: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Home,
-    Board,
     Sessions,
     Logs,
     ToolFailures,
@@ -87,7 +86,6 @@ impl Page {
     fn all() -> &'static [Page] {
         &[
             Page::Home,
-            Page::Board,
             Page::Sessions,
             Page::Logs,
             Page::ToolFailures,
@@ -103,10 +101,9 @@ impl Page {
         &[Page::Home, Page::Editor, Page::Diff, Page::Shell]
     }
 
-    /// Pages shown in the footer nav (Board, Sessions, Logs, Tool Failures).
+    /// Pages shown in the footer nav (Sessions, Logs, Tool Failures).
     fn footer_pages() -> &'static [Page] {
         &[
-            Page::Board,
             Page::Sessions,
             Page::Logs,
             Page::ToolFailures,
@@ -117,7 +114,6 @@ impl Page {
     fn label(self) -> &'static str {
         match self {
             Page::Home => "Home",
-            Page::Board => "Board",
             Page::Sessions => "Sessions",
             Page::Logs => "Logs",
             Page::ToolFailures => "Tool Failures",
@@ -439,14 +435,6 @@ impl Dashboard {
             }
             Message::Navigation(_) if !self.ready => Task::none(),
             Message::Navigation(page) => {
-                // Guard: Board requires a shared workspace.
-                if page == Page::Board && self.selected_workspace_name.is_none() {
-                    self.toasts
-                        .push(Toast::from_toast_msg(&ToastMessage::Warning(
-                            "Select a workspace first".to_string(),
-                        )));
-                    return Task::none();
-                }
                 self.page = page;
                 match page {
                     Page::Logs => Task::none(),
@@ -466,7 +454,6 @@ impl Dashboard {
                         Task::batch([load_users, ws_opts, snap, board_refresh])
                     }
                     Page::Shell => Task::none(),
-                    Page::Board => self.board_state.refresh().map(Message::Board),
                     Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
                     // Editor and Diff receive workspace state via WorkspaceSelected
                     // from the Home page picker, not via refresh().
@@ -501,10 +488,6 @@ impl Dashboard {
                         self.board_state.refresh().map(Message::Board)
                     }
                     Page::Shell => Task::none(),
-                    Page::Board if !self.board_state.loading => {
-                        self.board_state.loading = true;
-                        self.board_state.refresh().map(Message::Board)
-                    }
                     Page::Sessions if !self.sessions_state.loading => {
                         self.sessions_state.loading = true;
                         self.sessions_state.refresh().map(Message::Sessions)
@@ -768,10 +751,6 @@ impl Dashboard {
                         self.log_store.as_ref().expect("ready"),
                     )
                     .map(Message::Logs),
-                Page::Board => self
-                    .board_state
-                    .update(board::BoardMessage::Escape)
-                    .map(Message::Board),
                 Page::Sessions => self
                     .sessions_state
                     .update(sessions::SessionsMessage::Escape)
@@ -910,11 +889,6 @@ impl Dashboard {
                 None,
                 self.selected_user_name.as_deref(),
             );
-            // If the user is currently on the Board page, redirect to Home
-            // since Board requires a shared workspace and its icon is now hidden.
-            if self.page == Page::Board {
-                self.page = Page::Home;
-            }
             self.propagate_workspace_selection("")
         } else {
             self.selected_workspace_name = Some(name.to_string());
@@ -1046,7 +1020,6 @@ impl Dashboard {
             }
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::ToolFailures => self.tool_failures_state.view().map(Message::ToolFailures),
-            Page::Board => self.board_state.view().map(Message::Board),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
             Page::Diff => self.diff_state.view().map(Message::Diff),
             Page::Shell => self.shell_state.view().map(Message::Shell),
@@ -1437,15 +1410,10 @@ impl Dashboard {
 
     /// 24px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
-        // Left: footer navigation (Board, Sessions, Logs, Tool Failures, Settings)
+        // Left: footer navigation (Sessions, Logs, Tool Failures, Settings)
         // Icon-only, 16px. Active page in ACCENT, inactive in TEXT_MUTED.
-        // Board is hidden when no shared workspace is selected.
         let mut left_icons = Vec::with_capacity(6);
         for page in Page::footer_pages() {
-            // Hide Board icon when no shared workspace is selected.
-            if *page == Page::Board && self.selected_workspace_name.is_none() {
-                continue;
-            }
             let is_active = self.page == *page;
             let color = if is_active {
                 theme::ACCENT
@@ -1453,10 +1421,6 @@ impl Dashboard {
                 theme::TEXT_MUTED
             };
             let icon: iced::Element<'_, Message> = match page {
-                Page::Board => lucide::kanban::<iced::Theme, iced::Renderer>()
-                    .size(16)
-                    .color(color)
-                    .into(),
                 Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>()
                     .size(16)
                     .color(color)
