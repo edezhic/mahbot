@@ -371,6 +371,12 @@ pub(crate) fn to_message_content(
         return MessageContent::Text(content.to_string());
     }
 
+    // Fast path: avoid regex work when there are no IMAGE markers at all.
+    // All valid markers begin with "[IMAGE:" so a simple substring check is safe.
+    if !content.contains("[IMAGE:") {
+        return MessageContent::Text(content.to_string());
+    }
+
     let (cleaned_text, image_refs) = parse_image_markers(content);
     if image_refs.is_empty() {
         return MessageContent::Text(content.to_string());
