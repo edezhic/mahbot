@@ -83,6 +83,12 @@ fn normalize_search_args(args: &mut serde_json::Value) {
             "content" => {
                 obj.insert("mode".to_string(), json!("grep"));
             }
+            "code" => {
+                obj.insert("mode".to_string(), json!("grep"));
+                if !obj.contains_key("grep_mode") {
+                    obj.insert("grep_mode".to_string(), json!("fuzzy"));
+                }
+            }
             _ => {}
         }
     }
