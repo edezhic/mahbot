@@ -7,14 +7,6 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-/// Runtime slash commands surfaced in the Telegram `/` menu.
-const RUNTIME_COMMANDS: &[(&str, &str)] = &[
-    ("new", "Start a fresh conversation"),
-    ("update", "Trigger a self-update"),
-    ("workspaces", "List available workspaces"),
-    ("agents", "List available agents"),
-];
-
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// Reserve space for continuation markers added by `send_text_chunks`:
@@ -174,6 +166,7 @@ impl MessageContext {
             source_channel: "telegram".to_string(),
             workspace: String::new(),
             message_id: None,
+            callback_query_id: None,
         }
     }
 }
@@ -527,11 +520,15 @@ impl TelegramChannel {
     }
 
     /// Answer a callback query to dismiss the loading spinner.
+    /// When `text` is provided, shows a toast notification to the user.
     /// Errors are logged so users don't get stuck on an infinite spinner.
-    async fn answer_callback_query(&self, callback_query_id: &str) {
-        let body = serde_json::json!({
+    pub async fn answer_callback_query(&self, callback_query_id: &str, text: Option<&str>) {
+        let mut body = serde_json::json!({
             "callback_query_id": callback_query_id,
         });
+        if let Some(txt) = text {
+            body["text"] = serde_json::Value::String(txt.to_string());
+        }
         match self
             .http_client()
             .post(self.api_url("answerCallbackQuery"))
@@ -563,6 +560,10 @@ impl TelegramChannel {
         let cq = update.get("callback_query")?;
         let data = cq.get("data").and_then(serde_json::Value::as_str)?;
         let msg = cq.get("message")?;
+        let callback_query_id = cq
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
 
         // chat_id is intentionally unused here: callback queries don't need
         // to route replies by chat context, only the reply_target is used.
@@ -575,6 +576,7 @@ impl TelegramChannel {
             source_channel: "telegram".to_string(),
             workspace: String::new(),
             message_id: None,
+            callback_query_id,
         })
     }
 
@@ -695,38 +697,6 @@ impl TelegramChannel {
             anyhow::bail!("Invalid Telegram bot token: {desc}");
         }
         Ok(())
-    }
-
-    /// Registers runtime commands (from [`RUNTIME_COMMANDS`]) with Telegram.
-    async fn push_bot_commands_menu(&self) {
-        let body = serde_json::json!({
-            "commands": RUNTIME_COMMANDS.iter().map(|(cmd, desc)| {
-                serde_json::json!({ "command": cmd, "description": desc })
-            }).collect::<Vec<_>>()
-        });
-        let url = self.api_url("setMyCommands");
-        let resp = match self.http_client().post(&url).json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Telegram setMyCommands request failed: {e}");
-                return;
-            }
-        };
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            tracing::warn!("Telegram setMyCommands failed: status={status}, body={text}");
-            return;
-        }
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {}
-            Ok(v) => {
-                tracing::warn!("Telegram setMyCommands returned unexpected JSON: {v}");
-            }
-            Err(e) => {
-                tracing::warn!("Telegram setMyCommands parse error: {e}; body={text}");
-            }
-        }
     }
 
     fn handle_non_parseable_message(update: &serde_json::Value) {
@@ -1548,10 +1518,17 @@ impl TelegramChannel {
                 let cq_id = update["callback_query"]["id"]
                     .as_str()
                     .map(ToString::to_string);
-                // Answer immediately to dismiss the loading spinner
-                if let Some(ref id) = cq_id {
-                    self.answer_callback_query(id).await;
+                let cq_data = update["callback_query"]["data"].as_str().unwrap_or("");
+
+                // For __act__ callbacks, do NOT answer early — the action handler
+                // (handle_action_callback in main.rs) will answer with the appropriate
+                // toast text. For __opt__ and other callbacks, dismiss the spinner now.
+                if !cq_data.starts_with("__act__")
+                    && let Some(ref id) = cq_id
+                {
+                    self.answer_callback_query(id, None).await;
                 }
+
                 let Some(msg) = self.parse_callback_query(&update).await else {
                     continue;
                 };
@@ -1679,8 +1656,6 @@ impl Channel for TelegramChannel {
         if !self.probe_startup_slot(&mut offset).await {
             return Ok(());
         }
-
-        self.push_bot_commands_menu().await;
 
         tracing::debug!("Startup probe succeeded; entering main long-poll loop.");
         let shutdown_token = crate::shutdown::shutdown_token();

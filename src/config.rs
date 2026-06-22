@@ -84,8 +84,12 @@ pub struct ConfigData {
     pub audio_transcription_provider: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
+    /// Newline-separated list of available image generation models (for selection UI).
+    pub image_gen_models: Option<String>,
     /// Video generation model.
     pub video_gen_model: Option<String>,
+    /// Newline-separated list of available video generation models (for selection UI).
+    pub video_gen_models: Option<String>,
     /// Exa API key for web search.
     pub exa_key: Option<String>,
     /// Telegram Bot API token (hot-reloaded on save).
@@ -217,7 +221,9 @@ string_config_fields! {
     transcription_provider,
     audio_transcription_provider,
     image_gen_model,
+    image_gen_models,
     video_gen_model,
+    video_gen_models,
     exa_key,
     telegram_bot_token,
 }
@@ -328,6 +334,25 @@ impl ConfigReload {
     #[must_use]
     pub fn snapshot(&self) -> ConfigData {
         self.read().clone()
+    }
+
+    /// Update a single string config field in-memory and atomically apply it.
+    ///
+    /// This is intentionally lightweight — it only mutates the in-memory
+    /// [`ConfigData`] without touching the database or triggering provider
+    /// warmup. Callers are responsible for persisting the change to the
+    /// config DB separately (e.g. via [`crate::config_db::store().set_kv()`]).
+    ///
+    /// Returns `true` if the key was recognised, `false` otherwise (unknown
+    /// keys are silently ignored for forward compatibility).
+    #[must_use]
+    pub fn set_string_field_and_apply(&self, key: &str, value: &str) -> bool {
+        let mut config = self.snapshot();
+        let recognized = config.set_string_field(key, value);
+        if recognized {
+            *self.inner.write().expect("CONFIG inner poisoned") = config;
+        }
+        recognized
     }
 
     // ── Provider routing (per-model) ──────────────────────────
@@ -459,6 +484,54 @@ impl ConfigReload {
     #[must_use]
     pub fn video_gen_model(&self) -> String {
         resolve_or(self.read().video_gen_model.clone(), DEFAULT_VIDEO_GEN_MODEL)
+    }
+
+    /// Get the list of available image generation models for selection UI.
+    ///
+    /// Returns the parsed newline-separated list from `image_gen_models` if set and
+    /// non-empty, otherwise falls back to a vec containing the currently active model
+    /// (or the hardcoded default).
+    #[must_use]
+    pub fn image_gen_models(&self) -> Vec<String> {
+        let data = self.read();
+        if let Some(ref raw) = data.image_gen_models {
+            let parsed: Vec<String> = raw
+                .split('\n')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        vec![resolve_or(
+            data.image_gen_model.clone(),
+            DEFAULT_IMAGE_GEN_MODEL,
+        )]
+    }
+
+    /// Get the list of available video generation models for selection UI.
+    ///
+    /// Returns the parsed newline-separated list from `video_gen_models` if set and
+    /// non-empty, otherwise falls back to a vec containing the currently active model
+    /// (or the hardcoded default).
+    #[must_use]
+    pub fn video_gen_models(&self) -> Vec<String> {
+        let data = self.read();
+        if let Some(ref raw) = data.video_gen_models {
+            let parsed: Vec<String> = raw
+                .split('\n')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        vec![resolve_or(
+            data.video_gen_model.clone(),
+            DEFAULT_VIDEO_GEN_MODEL,
+        )]
     }
 
     /// Get the configured Exa API key, with empty/whitespace values collapsed to `None`.
@@ -710,7 +783,9 @@ mod tests {
         ("transcription_provider", "OpenAI"),
         ("audio_transcription_provider", "Deepgram"),
         ("image_gen_model", "dall-e-3"),
+        ("image_gen_models", "dall-e-3\nstable-diffusion\nmidjourney"),
         ("video_gen_model", "sora"),
+        ("video_gen_models", "sora\npika\nrunway"),
         ("exa_key", "exa-test-key"),
         ("telegram_bot_token", "123:abc"),
     ];
@@ -810,8 +885,14 @@ mod tests {
                 "image_gen_model" => {
                     let _: String = reload.image_gen_model();
                 }
+                "image_gen_models" => {
+                    let _: Vec<String> = reload.image_gen_models();
+                }
                 "video_gen_model" => {
                     let _: String = reload.video_gen_model();
+                }
+                "video_gen_models" => {
+                    let _: Vec<String> = reload.video_gen_models();
                 }
                 // ── non_empty accessors (Option<String>) ──
                 "transcription_provider" => {
@@ -894,6 +975,29 @@ mod tests {
             "unset video_gen_model should fall back to default"
         );
 
+        // ── Vec accessors: when list field is unset, falls back to active model ──
+        assert_eq!(
+            reload.image_gen_models(),
+            vec![DEFAULT_IMAGE_GEN_MODEL.to_string()],
+            "unset image_gen_models should fall back to active model"
+        );
+        assert_eq!(
+            reload.video_gen_models(),
+            vec![DEFAULT_VIDEO_GEN_MODEL.to_string()],
+            "unset video_gen_models should fall back to active model"
+        );
+
+        // When list field is set, returns parsed entries
+        let mut list_config = ConfigData::default();
+        assert!(list_config.set_string_field("image_gen_models", "model-a\nmodel-b\nmodel-c"));
+        assert!(list_config.set_string_field("video_gen_models", "vid-x\nvid-y"));
+        reload.swap(list_config);
+        assert_eq!(
+            reload.image_gen_models(),
+            vec!["model-a", "model-b", "model-c"]
+        );
+        assert_eq!(reload.video_gen_models(), vec!["vid-x", "vid-y"]);
+
         // ── non_empty: empty/whitespace → None ──
         let mut empty_config = ConfigData::default();
         let _ = empty_config.set_string_field("provider_key", "");
@@ -937,5 +1041,24 @@ mod tests {
         // resolve_or delegates through non_empty — the only unique behaviour is
         // the fallback on None via unwrap_or_else.
         assert_eq!(resolve_or(None, "fallback"), "fallback");
+    }
+
+    #[test]
+    fn set_string_field_and_apply_updates_in_memory() {
+        let reload = ConfigReload::const_new();
+
+        // Unknown key returns false and does nothing
+        assert!(!reload.set_string_field_and_apply("nonexistent", "value"));
+
+        // Known key returns true and updates the in-memory value
+        assert!(reload.set_string_field_and_apply("image_gen_model", "test-model"));
+        assert_eq!(reload.image_gen_model(), "test-model");
+
+        // Empty string stores as None (via non_empty)
+        assert!(reload.set_string_field_and_apply("image_gen_model", ""));
+        assert_eq!(
+            reload.image_gen_model(),
+            "google/gemini-3.1-flash-image-preview"
+        );
     }
 }

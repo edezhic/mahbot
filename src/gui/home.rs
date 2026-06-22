@@ -930,6 +930,7 @@ impl HomeState {
                         .unwrap_or_default()
                         .to_string(),
                     message_id: Some(crate::generate_id()),
+                    callback_query_id: None,
                 };
                 if let Some(tx) = crate::GUI_MESSAGE_TX.get() {
                     if let Err(e) = tx.send(msg) {
@@ -1409,6 +1410,7 @@ impl HomeState {
                 .unwrap_or_default()
                 .to_string(),
             message_id: optimistic_id,
+            callback_query_id: None,
         };
 
         // Push to GUI_MESSAGE_TX.

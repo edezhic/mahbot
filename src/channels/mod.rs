@@ -647,6 +647,7 @@ mod tests {
             source_channel: "test".into(),
             workspace: "test".into(),
             message_id: None,
+            callback_query_id: None,
         }
     }
 

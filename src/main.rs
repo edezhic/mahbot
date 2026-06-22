@@ -18,34 +18,17 @@ use mahbot::channels::{
     write_incoming_to_broadcast,
 };
 use mahbot::config::CONFIG;
-use mahbot::extraction::{decode_callback, is_callback};
+use mahbot::extraction::{decode_action, decode_callback, is_action, is_callback};
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::manager_queue;
 use mahbot::session::{Session, direct_session_key, manager_session_key};
 use mahbot::util::UnwrapPoison;
 use mahbot::{Agent, Channel, ChannelMessage, Command, Role, Workspace};
-
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
 const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regular.ttf");
 
 /// JetBrainsMono-Bold.ttf embedded for header text in the Iced dashboard.
 const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Bold.ttf");
-
-/// Build a list of inline keyboard buttons for Telegram. Each entry is a
-/// `(label, callback_data)` tuple.
-fn build_inline_buttons(
-    items: impl IntoIterator<Item = (String, String)>,
-) -> Vec<serde_json::Value> {
-    items
-        .into_iter()
-        .map(|(label, callback_data)| {
-            serde_json::json!({
-                "text": label,
-                "callback_data": callback_data,
-            })
-        })
-        .collect()
-}
 
 /// Resolve the workspace for a user, falling back to a personal workspace
 /// if `get_workspace` fails or returns `None`.
@@ -519,17 +502,19 @@ async fn handle_messages(mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>) {
             continue;
         }
 
+        // Handle action callbacks (__act__ prefix) — route to inline handler
+        // that updates config / clears session without involving the Manager agent.
+        if is_action(&msg.content) {
+            handle_action_callback(msg).await;
+            continue;
+        }
+
         if handle_dispatch_command(&mut msg).await {
             continue;
         }
 
         spawn(process_channel_message(msg));
     }
-}
-
-/// Error reply helper — formats `Error: {e}` and sends it.
-async fn reply_error(msg: &ChannelMessage, e: impl std::fmt::Display) {
-    send_channel_reply(format!("Error: {e}"), msg).await;
 }
 
 /// Handle a dispatch-level command. Returns `true` if the message was handled
@@ -540,197 +525,201 @@ async fn handle_dispatch_command(msg: &mut ChannelMessage) -> bool {
         return false;
     };
 
-    let is_full = mahbot::users::is_full_user(&msg.user_name).await;
-
-    // Permission gate: certain admin commands require full-permission users.
-    if !is_full && cmd.needs_full_user() {
-        send_channel_reply(
-            "This command is only available to full-permission users.".to_owned(),
-            msg,
-        )
-        .await;
-        return true;
+    // Only Telegram gets the /start inline keyboard; GUI and other channels
+    // route /start as a normal message (returns false to fall through to
+    // process_channel_message).
+    if msg.source_channel != "telegram" {
+        return false;
     }
 
-    // Resolve workspace for downstream broadcasts (non-dispatch messages
-    // use the same helper via process_channel_message).
-    let ws = resolve_workspace_for_user(msg).await;
-    msg.workspace = ws.name;
-
     match cmd {
-        Command::NewSession => handle_new_session(msg).await,
-        Command::Update => handle_update(msg).await,
-        Command::Workspaces => handle_workspaces(msg).await,
-        Command::Workspace(arg) => handle_workspace(msg, arg).await,
-        Command::Agent(arg) => handle_agent(msg, arg).await,
-        Command::Agents => handle_agents(msg).await,
+        Command::Start => handle_start_command(msg).await,
     }
     true
 }
 
-async fn handle_new_session(msg: &ChannelMessage) {
-    let role = mahbot::users::resolve_active_role(&msg.user_name).await;
-    let session_key = build_session_key(&msg.user_name, &role, &msg.source_channel).await;
-    let reply = Session::reset(&session_key).await;
-    send_channel_reply(reply, msg).await;
-}
-
-async fn handle_update(msg: &ChannelMessage) {
-    if !mahbot::self_update::is_update_available() {
-        send_channel_reply(
-            "Self-update is not available on this installation.".to_owned(),
-            msg,
-        )
-        .await;
+/// Handle `/start` command for Telegram — sends an inline keyboard with
+/// context-appropriate action buttons.
+async fn handle_start_command(msg: &ChannelMessage) {
+    let Some(reply_markup) = build_start_keyboard(msg).await else {
         return;
-    }
-
-    // Ack to requester before update starts — exit(0) prevents any later reply.
-    send_channel_reply("Update started, I'll be back shortly…".to_owned(), msg).await;
-
-    // Fire and forget — the update process handles its own lifecycle.
-    // Clone what we need from msg before the reference goes out of scope.
-    let source_channel = msg.source_channel.clone();
-    let reply_target = msg.reply_target.clone();
-    let workspace = msg.workspace.clone();
-    tokio::spawn(async move {
-        if let Err(e) = mahbot::self_update::execute_update().await {
-            let err_msg = format!("Self-update failed: {e}");
-
-            // Try to notify the original requester.
-            if let Some(channel) = mahbot::channel_registry().get(&source_channel) {
-                let reply = mahbot::SendMessage {
-                    content: err_msg,
-                    recipient: reply_target,
-                    reply_markup: None,
-                    agent_role: None,
-                    workspace,
-                };
-                let _ = channel.send(&reply).await;
-            }
-        }
-    });
-}
-
-async fn handle_workspaces(msg: &ChannelMessage) {
-    match mahbot::workspace::get_workspaces().await {
-        Ok(workspaces) if workspaces.is_empty() => {
-            send_channel_reply(
-                "No workspaces configured. Add one via the dashboard.".to_owned(),
-                msg,
-            )
-            .await;
-        }
-        Ok(workspaces) => {
-            let buttons = build_inline_buttons(workspaces.iter().map(|ws| {
-                let label = match ws.status.as_str() {
-                    "ready" => format!("{} ✅", ws.name),
-                    "analyzing" => format!("{} 🔄", ws.name),
-                    "failed" => format!("{} ❌", ws.name),
-                    "pending" => format!("{} ⏳", ws.name),
-                    _ => ws.name.clone(),
-                };
-                (label, format!("/workspace {}", ws.name))
-            }));
-            send_channel_reply_with_buttons(
-                "📂 **Workspaces:**".to_owned(),
-                msg,
-                Some(buttons),
-                None,
-            )
-            .await;
-        }
-        Err(e) => {
-            send_channel_reply(format!("Failed to list workspaces: {e}"), msg).await;
-        }
+    };
+    let reply = mahbot::SendMessage {
+        content: "Choose an action:".to_string(),
+        recipient: msg.reply_target.clone(),
+        reply_markup: Some(reply_markup),
+        agent_role: None,
+        workspace: msg.workspace.clone(),
+    };
+    // Send directly through the channel so the inline_keyboard structure
+    // (rows of buttons) is preserved exactly — send_channel_reply_with_buttons
+    // wraps everything in a single row.
+    if let Some(channel) = mahbot::channel_registry().get(&msg.source_channel) {
+        let _ = channel.send(&reply).await;
     }
 }
 
-async fn handle_workspace(msg: &ChannelMessage, arg: Option<String>) {
-    match arg {
-        Some(name) => match mahbot::users::set_workspace(&msg.user_name, &name).await {
-            Ok(ref ws) => {
-                send_channel_reply(
-                    format!("✅ Active workspace: **{}** (`{}`)", ws.name, ws.path),
-                    msg,
-                )
-                .await;
-            }
-            Err(e) => reply_error(msg, e).await,
-        },
-        None => match mahbot::users::get_workspace(&msg.user_name).await {
-            Ok(Some(ref ws)) => {
-                send_channel_reply(
-                    format!(
-                        "Current workspace: **{}** (`{}`) — status: {}",
-                        ws.name, ws.path, ws.status
-                    ),
-                    msg,
-                )
-                .await;
-            }
-            Ok(None) => {
-                send_channel_reply(
-                    "No workspace selected. Use /workspaces to pick one.".to_owned(),
-                    msg,
-                )
-                .await;
-            }
-            Err(e) => reply_error(msg, e).await,
-        },
+/// Build inline keyboard for `/start` based on the user's current role.
+///
+/// Returns the full Telegram `inline_keyboard` JSON array, where each element
+/// is a row (list of buttons in that row). Currently each button gets its own
+/// row. Returns `None` if the caller is not on a Telegram channel.
+///
+/// For Artist: shows image model selection, video model selection, and clear session.
+/// For other roles: shows only clear session.
+async fn build_start_keyboard(msg: &ChannelMessage) -> Option<serde_json::Value> {
+    // Only Telegram gets inline keyboards — other channels get None
+    if msg.source_channel != "telegram" {
+        return None;
+    }
+
+    let role = mahbot::users::resolve_active_role(&msg.user_name).await;
+
+    let rows = if role == Role::Artist {
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+
+        // Image model buttons — each on its own row
+        build_model_button_rows(
+            &mut rows,
+            &CONFIG.image_gen_models(),
+            &CONFIG.image_gen_model(),
+            "__act__set_image_model",
+        );
+
+        // Video model buttons — each on its own row
+        build_model_button_rows(
+            &mut rows,
+            &CONFIG.video_gen_models(),
+            &CONFIG.video_gen_model(),
+            "__act__set_video_model",
+        );
+
+        // Clear session button
+        rows.push(serde_json::json!([{
+            "text": "Clear session",
+            "callback_data": "__act__clear_session|",
+        }]));
+
+        rows
+    } else {
+        // Non-Artist: just a clear session button
+        vec![serde_json::json!([{
+            "text": "Clear session",
+            "callback_data": "__act__clear_session|",
+        }])]
+    };
+
+    Some(serde_json::json!({ "inline_keyboard": rows }))
+}
+
+/// Push one row per model to `rows`, marking the active model with ✓.
+fn build_model_button_rows(
+    rows: &mut Vec<serde_json::Value>,
+    models: &[String],
+    active_model: &str,
+    action_prefix: &str,
+) {
+    for model in models {
+        let label = if model == active_model {
+            format!("\u{2713} {model}")
+        } else {
+            model.clone()
+        };
+        rows.push(serde_json::json!([{
+            "text": label,
+            "callback_data": format!("{action_prefix}|{model}"),
+        }]));
     }
 }
 
-async fn handle_agent(msg: &ChannelMessage, arg: Option<String>) {
-    match arg {
-        Some(role_name) => {
-            if !Role::selectable_roles().contains(&role_name.as_str()) {
-                send_channel_reply(
-                    format!(
-                        "❌ Invalid role `{role_name}`. Must be one of: {}",
-                        Role::selectable_roles().join(", ")
-                    ),
-                    msg,
-                )
-                .await;
+/// Handle an action callback (`__act__` prefix).
+///
+/// Actions are processed inline without involving the Manager agent queue.
+async fn handle_action_callback(msg: ChannelMessage) {
+    let Some((action, payload)) = decode_action(&msg.content) else {
+        tracing::warn!("Malformed __act__ callback data: {}", &msg.content);
+        return;
+    };
+
+    match action.as_str() {
+        "set_image_model" => {
+            if payload.is_empty() {
+                tracing::warn!("set_image_model action with empty payload");
+                answer_telegram_callback(&msg, Some("No model specified.".to_string())).await;
                 return;
             }
-            match mahbot::users::set_active_role(&msg.user_name, &role_name).await {
-                Ok(()) => {
-                    send_channel_reply(format!("✅ Role changed to: **{role_name}**"), msg).await;
-                }
-                Err(e) => reply_error(msg, e).await,
+            // Direct-write to config_kv table (bypasses save_and_reload which
+            // triggers provider warmup — unnecessary for a model name change).
+            let store = mahbot::config_db::store();
+            if let Err(e) = store.set_kv("image_gen_model", &payload).await {
+                tracing::error!("Failed to save image_gen_model: {e}");
+                answer_telegram_callback(&msg, Some(format!("Failed to save model: {e}"))).await;
+                return;
             }
+            // Lightweight in-memory update — no DB read, no provider warmup
+            let _ = CONFIG.set_string_field_and_apply("image_gen_model", &payload);
+
+            // Acknowledge callback with toast
+            answer_telegram_callback(
+                &msg,
+                Some(format!("Image generation model set to: {payload}")),
+            )
+            .await;
         }
-        None => match mahbot::users::get_active_role(&msg.user_name).await {
-            Ok(Some(ref name)) => {
-                send_channel_reply(format!("Current role: **{name}**"), msg).await;
+        "set_video_model" => {
+            if payload.is_empty() {
+                tracing::warn!("set_video_model action with empty payload");
+                answer_telegram_callback(&msg, Some("No model specified.".to_string())).await;
+                return;
             }
-            Ok(None) => {
-                send_channel_reply(
-                    "No role selected. Defaulting to **analyst**.".to_owned(),
-                    msg,
-                )
-                .await;
+            let store = mahbot::config_db::store();
+            if let Err(e) = store.set_kv("video_gen_model", &payload).await {
+                tracing::error!("Failed to save video_gen_model: {e}");
+                answer_telegram_callback(&msg, Some(format!("Failed to save model: {e}"))).await;
+                return;
             }
-            Err(e) => reply_error(msg, e).await,
-        },
+            // Lightweight in-memory update — no DB read, no provider warmup
+            let _ = CONFIG.set_string_field_and_apply("video_gen_model", &payload);
+
+            answer_telegram_callback(
+                &msg,
+                Some(format!("Video generation model set to: {payload}")),
+            )
+            .await;
+        }
+        "clear_session" => {
+            // Acknowledge callback silently first (dismiss spinner)
+            answer_telegram_callback(&msg, None).await;
+
+            // Resolve role and reset session
+            let role = mahbot::users::resolve_active_role(&msg.user_name).await;
+            let session_key = build_session_key(&msg.user_name, &role, &msg.source_channel).await;
+            let reply = Session::reset(&session_key).await;
+            send_channel_reply(reply, &msg).await;
+        }
+        _ => {
+            // Always acknowledge callback queries to dismiss the Telegram
+            // loading spinner, even for unknown actions.
+            answer_telegram_callback(&msg, None).await;
+            tracing::warn!(action = %action, "Unknown __act__ action — ignoring");
+        }
     }
 }
 
-async fn handle_agents(msg: &ChannelMessage) {
-    let buttons = build_inline_buttons(
-        Role::selectable_roles()
-            .iter()
-            .map(|name| (name.to_string(), format!("/agent {name}"))),
-    );
-    send_channel_reply_with_buttons(
-        "🤖 **Available roles:**".to_owned(),
-        msg,
-        Some(buttons),
-        None,
-    )
-    .await;
+/// Acknowledge a Telegram callback query with an optional toast message.
+/// If the message doesn't have a `callback_query_id` (non-Telegram channel),
+/// this is a no-op.
+async fn answer_telegram_callback(msg: &ChannelMessage, toast: Option<String>) {
+    let Some(cq_id) = &msg.callback_query_id else {
+        return;
+    };
+    if let Some(channel) = mahbot::channel_registry().get("telegram")
+        && let Some(tc) = channel
+            .as_any()
+            .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
+    {
+        tc.answer_callback_query(cq_id, toast.as_deref()).await;
+    }
 }
 
 async fn process_channel_message(mut msg: ChannelMessage) {
@@ -825,24 +814,17 @@ async fn process_channel_message(mut msg: ChannelMessage) {
 
 /// Parse a channel message's content and classify it.
 ///
-/// Command names are case-insensitive. Arguments preserve their original case
-/// (e.g. workspace names) except for `/agent`, where the argument is lowercased
-/// because role names are lowercase.
+/// Command names are case-insensitive. `/start` is the only recognized command.
+/// All other `/`-prefixed text is treated as a normal message (routed to agent).
 #[must_use]
 pub fn parse(content: &str) -> Option<Command> {
     let cmd_line = content.trim().strip_prefix('/')?;
-    let (cmd, arg) = cmd_line
+    let (cmd, _arg) = cmd_line
         .split_once(' ')
         .map_or((cmd_line, ""), |(c, a)| (c, a.trim()));
-    let arg = (!arg.is_empty()).then(|| arg.to_string());
 
     match cmd.to_ascii_lowercase().as_str() {
-        "new" | "start" => Some(Command::NewSession),
-        "update" => Some(Command::Update),
-        "workspaces" => Some(Command::Workspaces),
-        "workspace" => Some(Command::Workspace(arg)),
-        "agents" => Some(Command::Agents),
-        "agent" => Some(Command::Agent(arg.map(|a| a.to_ascii_lowercase()))),
+        "start" => Some(Command::Start),
         _ => None,
     }
 }

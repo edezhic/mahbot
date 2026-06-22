@@ -40,7 +40,11 @@ pub enum SettingsMessage {
     TranscriptionProvider(String),
     AudioTranscriptionProvider(String),
     ImageGenModel(String),
+    /// Newline-separated list of available image generation models.
+    ImageGenModels(String),
     VideoGenModel(String),
+    /// Newline-separated list of available video generation models.
+    VideoGenModels(String),
     ExaKey(String),
     TelegramToken(String),
     /// Per-role model edits
@@ -204,8 +208,16 @@ impl SettingsState {
                 self.config.image_gen_model = Some(v).filter(|s| !s.is_empty());
                 Task::none()
             }
+            SettingsMessage::ImageGenModels(v) => {
+                self.config.image_gen_models = Some(v).filter(|s| !s.is_empty());
+                Task::none()
+            }
             SettingsMessage::VideoGenModel(v) => {
                 self.config.video_gen_model = Some(v).filter(|s| !s.is_empty());
+                Task::none()
+            }
+            SettingsMessage::VideoGenModels(v) => {
+                self.config.video_gen_models = Some(v).filter(|s| !s.is_empty());
                 Task::none()
             }
             SettingsMessage::ExaKey(v) => {
@@ -1586,7 +1598,7 @@ impl SettingsState {
             "Generation",
             column![
                 field_row(
-                    "Image Gen Model",
+                    "Image Gen Model (active)",
                     text_input(
                         "google/gemini-3.1-flash-image-preview",
                         self.config.image_gen_model.as_deref().unwrap_or_default(),
@@ -1598,7 +1610,19 @@ impl SettingsState {
                     None,
                 ),
                 field_row(
-                    "Video Gen Model",
+                    "Image Gen Models (one per line)",
+                    text_input(
+                        "one model per line",
+                        self.config.image_gen_models.as_deref().unwrap_or_default(),
+                    )
+                    .on_input(SettingsMessage::ImageGenModels)
+                    .style(super::widgets::text_input_style)
+                    .width(Length::Fixed(350.0))
+                    .into(),
+                    None,
+                ),
+                field_row(
+                    "Video Gen Model (active)",
                     text_input(
                         "google/veo-3.1-lite",
                         self.config.video_gen_model.as_deref().unwrap_or_default(),
@@ -1606,6 +1630,18 @@ impl SettingsState {
                     .on_input(SettingsMessage::VideoGenModel)
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
+                    .into(),
+                    None,
+                ),
+                field_row(
+                    "Video Gen Models (one per line)",
+                    text_input(
+                        "one model per line",
+                        self.config.video_gen_models.as_deref().unwrap_or_default(),
+                    )
+                    .on_input(SettingsMessage::VideoGenModels)
+                    .style(super::widgets::text_input_style)
+                    .width(Length::Fixed(350.0))
                     .into(),
                     None,
                 ),
@@ -1886,7 +1922,9 @@ mod tests {
             ("transcription_provider", "TranscriptionProvider"),
             ("audio_transcription_provider", "AudioTranscriptionProvider"),
             ("image_gen_model", "ImageGenModel"),
+            ("image_gen_models", "ImageGenModels"),
             ("video_gen_model", "VideoGenModel"),
+            ("video_gen_models", "VideoGenModels"),
             ("exa_key", "ExaKey"),
             ("telegram_bot_token", "TelegramToken"),
         ];

@@ -121,11 +121,49 @@ pub fn decode_callback(content: &str) -> Option<(Option<String>, String)> {
     })
 }
 
+// ── Action prefixes (__act__) ───────────────────────────────────────
+
+/// Callback data prefix for action callbacks (e.g., model selection, clear session).
+pub(crate) const ACTION_PREFIX: &str = "__act__";
+
+/// Check whether `content` begins with [`ACTION_PREFIX`].
+///
+/// Fast prefix-only check — useful as an early filter before calling
+/// [`decode_action`].
+#[must_use]
+pub fn is_action(content: &str) -> bool {
+    content.starts_with(ACTION_PREFIX)
+}
+
+/// Decode action callback data.
+///
+/// Returns `(action, payload)` on success, `None` when `content` does not
+/// carry the [`ACTION_PREFIX`].
+///
+/// # Format
+///
+/// `__act__<action>|<payload>` where `<action>` is the action name and
+/// `<payload>` is the action-specific data (may be empty).
+///
+/// **Examples:**
+/// - `__act__set_image_model|google/gemini-3.1-flash-image-preview`
+///   → `("set_image_model", "google/gemini-3.1-flash-image-preview")`
+/// - `__act__clear_session|` → `("clear_session", "")`
+/// - `__act__clear_session` → `("clear_session", "")`
+#[must_use]
+pub fn decode_action(content: &str) -> Option<(String, String)> {
+    let rest = content.strip_prefix(ACTION_PREFIX)?;
+    match rest.split_once('|') {
+        Some((action, payload)) => Some((action.to_string(), payload.to_string())),
+        None => Some((rest.to_string(), String::new())),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod callback_tests {
-    use super::{decode_callback, is_callback};
+    use super::{decode_action, decode_callback, is_action, is_callback};
 
     // ── is_callback ───────────────────────────────────────────────────────
 
@@ -191,5 +229,51 @@ mod callback_tests {
         let (ticket_id, label) = decode_callback("__opt__|").unwrap();
         assert_eq!(ticket_id.as_deref(), None);
         assert_eq!(label, "");
+    }
+
+    // ── is_action ───────────────────────────────────────────────────────
+
+    #[test]
+    fn is_action_matches_prefix() {
+        assert!(is_action("__act__set_image_model|model-name"));
+        assert!(is_action("__act__clear_session|"));
+        assert!(is_action("__act__clear_session"));
+    }
+
+    #[test]
+    fn is_action_rejects_non_prefix() {
+        assert!(!is_action("not_act_something"));
+        assert!(!is_action(""));
+        assert!(!is_action("__ac__something"));
+    }
+
+    // ── decode_action ───────────────────────────────────────────────────
+
+    #[test]
+    fn decode_action_with_payload() {
+        let (action, payload) =
+            decode_action("__act__set_image_model|google/gemini-3.1-flash-image-preview").unwrap();
+        assert_eq!(action, "set_image_model");
+        assert_eq!(payload, "google/gemini-3.1-flash-image-preview");
+    }
+
+    #[test]
+    fn decode_action_empty_payload_with_pipe() {
+        let (action, payload) = decode_action("__act__clear_session|").unwrap();
+        assert_eq!(action, "clear_session");
+        assert_eq!(payload, "");
+    }
+
+    #[test]
+    fn decode_action_no_pipe() {
+        let (action, payload) = decode_action("__act__clear_session").unwrap();
+        assert_eq!(action, "clear_session");
+        assert_eq!(payload, "");
+    }
+
+    #[test]
+    fn decode_action_rejects_non_prefix() {
+        assert!(decode_action("random_text").is_none());
+        assert!(decode_action("").is_none());
     }
 }

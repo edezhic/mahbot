@@ -211,32 +211,16 @@ pub fn generate_suffix() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// `/new` — clear session history, start fresh.
-    NewSession,
-    /// `/update` — trigger self-update directly.
-    Update,
-    /// `/workspaces` — list all workspaces with inline keyboard.
-    Workspaces,
-    /// `/workspace` — show current workspace, or `/workspace <name>` to switch.
-    Workspace(Option<String>),
-    /// `/agent` — show current agent, or `/agent <name>` to switch.
-    Agent(Option<String>),
-    /// `/agents` — list available agents.
-    Agents,
+    /// `/start` — display inline keyboard with actions for Telegram,
+    /// or route as normal message for other channels.
+    Start,
 }
 
 impl Command {
     /// Whether this command requires a full-permission user.
-    ///
-    /// New variants default to `false` (unrestricted) — only commands that
-    /// expose admin-level operations (workspace management, self-update)
-    /// should return `true`.
     #[must_use]
     pub fn needs_full_user(&self) -> bool {
-        matches!(
-            self,
-            Command::Workspaces | Command::Workspace(..) | Command::Update
-        )
+        false
     }
 }
 
@@ -257,6 +241,10 @@ pub struct ChannelMessage {
     /// Optimistic message ID set by the GUI sender for deduplication in the
     /// ChatEvent handler — `None` for non-GUI channels (Telegram, callbacks).
     pub message_id: Option<String>,
+    /// Callback query ID from Telegram inline keyboard interactions.
+    /// Only set for callback queries (`__opt__` or `__act__` prefixes),
+    /// used to acknowledge and dismiss the Telegram loading spinner.
+    pub callback_query_id: Option<String>,
 }
 
 /// An outbound message to deliver on a channel.
@@ -264,10 +252,10 @@ pub struct ChannelMessage {
 /// ## Telegram-specific legacy
 ///
 /// The `reply_markup` field carries Telegram inline_keyboard JSON. Non-Telegram
-/// channels ignore it. Functions like `build_inline_buttons` in main.rs
-/// construct Telegram button payloads — other channels receive empty or
-/// harmless payloads. The self-update path stores `reply_target` for
-/// admin Telegram notifications during the update process.
+/// channels ignore it. Inline keyboard construction happens in `main.rs`
+/// (e.g. `build_start_keyboard`) — other channels receive empty or harmless
+/// payloads. The self-update path stores `reply_target` for admin Telegram
+/// notifications during the update process.
 #[derive(Debug, Clone)]
 pub struct SendMessage {
     pub content: String,
@@ -892,16 +880,7 @@ mod tests {
 
     #[test]
     fn command_needs_full_user() {
-        // Restricted commands
-        assert!(Command::Workspaces.needs_full_user());
-        assert!(Command::Workspace(None).needs_full_user());
-        assert!(Command::Workspace(Some("test".into())).needs_full_user());
-        assert!(Command::Update.needs_full_user());
-
-        // Unrestricted commands (default for new variants)
-        assert!(!Command::NewSession.needs_full_user());
-        assert!(!Command::Agent(None).needs_full_user());
-        assert!(!Command::Agent(Some("analyst".into())).needs_full_user());
-        assert!(!Command::Agents.needs_full_user());
+        // The only command is Start, which does not require full user
+        assert!(!Command::Start.needs_full_user());
     }
 }
