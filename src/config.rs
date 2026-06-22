@@ -195,6 +195,16 @@ macro_rules! string_config_fields {
                 }
                 true
             }
+
+            /// Normalise all string fields in place: trim whitespace and collapse
+            /// empty or whitespace-only values to `None`.
+            ///
+            /// This is equivalent to passing every field through [`set_string_field`]
+            /// but avoids the intermediate enumeration, allocation, and key dispatch.
+            /// The behaviour is identical — each field is run through [`non_empty`].
+            pub(crate) fn normalize_string_fields(&mut self) {
+                $(self.$field = non_empty(self.$field.take());)*
+            }
         }
     };
 }
@@ -638,16 +648,7 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
 
     // Normalise string fields: trim whitespace, collapse empty → None.
     // This matches reload_from_db's set_string_field → non_empty pipeline.
-    let fields: Vec<(&'static str, Option<String>)> = config
-        .string_fields()
-        .into_iter()
-        .map(|(k, v)| (k, v.map(String::from)))
-        .collect();
-    for (key, value) in fields {
-        if let Some(ref v) = value {
-            let _ = config.set_string_field(key, v);
-        }
-    }
+    config.normalize_string_fields();
     // Sort to match DB ORDER BY clauses (get_all_role_configs / get_all_model_routings).
     config.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
     config.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
