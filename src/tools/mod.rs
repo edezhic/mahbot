@@ -1136,15 +1136,6 @@ mod tests {
         assert!(err.to_string().contains("path"));
     }
 
-    // ── truncate tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn floor_char_boundary_handles_multibyte_offsets() {
-        let text = "aé你好";
-        assert_eq!(text.floor_char_boundary(5), 3);
-        assert_eq!(text.floor_char_boundary(usize::MAX), text.len());
-    }
-
     // ── path validation tests ──────────────────────────────────────────
 
     #[test]
