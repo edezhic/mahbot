@@ -585,6 +585,37 @@ pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<
     None
 }
 
+/// Find the index of the first word that is a command (not a shell prefix,
+/// flag, or environment variable assignment).
+///
+/// Shared helper used by [`first_command_word`] and [`canonical_command`]
+/// to avoid duplicating the scanning logic.
+fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
+    words
+        .iter()
+        .position(|w| !SHELL_PREFIXES.contains(w) && !w.starts_with('-') && !is_env_assignment(w))
+}
+
+/// Extract just the first command word (basename) from a shell segment.
+///
+/// Strips shell prefixes, environment variable assignments (`KEY=value`),
+/// and absolute paths, but stops before any subcommand detection.
+/// This is the lightweight alternative to [`canonical_command`] for callers
+/// that only need the command name (e.g., `check_segment`).
+pub(super) fn first_command_word(segment: &str) -> &str {
+    let trimmed = segment.trim();
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+
+    let Some(cmd_idx) = find_first_command_word_index(&words) else {
+        return "";
+    };
+    let cmd_word = words[cmd_idx];
+    cmd_word
+        .rsplit('/')
+        .next()
+        .expect("rsplit always yields at least one element")
+}
+
 /// Extract a canonical command key from a shell segment for profile matching.
 ///
 /// Strips shell prefixes, environment variable assignments (`KEY=value`),
@@ -598,12 +629,7 @@ pub(super) fn canonical_command(segment: &str) -> String {
     let trimmed = segment.trim();
     let words: Vec<&str> = trimmed.split_whitespace().collect();
 
-    // Find position of the first command word (skip shell prefixes, env, flags)
-    let cmd_idx = words
-        .iter()
-        .position(|w| !SHELL_PREFIXES.contains(w) && !w.starts_with('-') && !is_env_assignment(w));
-
-    let Some(cmd_idx) = cmd_idx else {
+    let Some(cmd_idx) = find_first_command_word_index(&words) else {
         return String::new();
     };
 
@@ -611,13 +637,12 @@ pub(super) fn canonical_command(segment: &str) -> String {
     let cmd = cmd_word
         .rsplit('/')
         .next()
-        .expect("rsplit always yields at least one element")
-        .to_string();
+        .expect("rsplit always yields at least one element");
 
     // If no more words after the command, return just the command
     let remaining = &words[cmd_idx + 1..];
     if remaining.is_empty() {
-        return cmd;
+        return cmd.to_string();
     }
 
     // Skip flags between command and subcommand using shared helper
@@ -626,7 +651,7 @@ pub(super) fn canonical_command(segment: &str) -> String {
     if let Some(sub_idx) = find_first_non_flag_index(remaining, is_git) {
         format!("{} {}", cmd, remaining[sub_idx])
     } else {
-        cmd
+        cmd.to_string()
     }
 }
 
@@ -2199,6 +2224,65 @@ mod tests {
                 expected,
                 "canonical_command({input:?})",
             );
+        }
+    }
+
+    #[test]
+    fn first_command_word_consistent_with_canonical() {
+        // Property: first_command_word returns the first word of canonical_command's
+        // result, or empty when canonical_command is empty.
+        let inputs: &[&str] = &[
+            // Path stripping
+            "/usr/local/bin/cargo build",
+            // Git global flags
+            "git -C /repo diff",
+            "git -c user.name=me log",
+            "git -- diff",
+            // Shell prefix: sudo
+            "sudo cargo build",
+            "sudo -E cargo build",
+            "sudo --preserve-env cargo build",
+            "sudo -E git -C /repo diff",
+            // Shell prefix: time
+            "time -v cargo test",
+            // cd (shell builtin)
+            "cd",
+            "cd ..",
+            // Package managers
+            "pnpm install",
+            "yarn add foo",
+            // Cargo flags
+            "cargo test --lib",
+            "cargo --release build",
+            "cargo --release --verbose build",
+            // Environment variable assignments
+            "CC=gcc make",
+            "VAR=val cargo check",
+            "CC=gcc CXX=g++ make -j4",
+            "CC=gcc",
+            "sudo CC=gcc make",
+            // Edge cases
+            "",
+            "   ",
+            "ls",
+            "cat file.txt",
+            "/bin/echo hello",
+        ];
+        for &input in inputs {
+            let canonical = canonical_command(input);
+            let first = first_command_word(input);
+            if canonical.is_empty() {
+                assert!(
+                    first.is_empty(),
+                    "first_command_word({input:?}) should be empty when canonical_command is empty",
+                );
+            } else {
+                let expected_first = canonical.split_whitespace().next().unwrap_or("");
+                assert_eq!(
+                    first, expected_first,
+                    "first_command_word({input:?}) should match first word of canonical_command({input:?}) = {canonical:?}",
+                );
+            }
         }
     }
 

@@ -472,8 +472,7 @@ fn check_segment(segment: &str) -> Result<(), String> {
 
     // Extract the effective command by stripping shell prefixes and
     // environment variable assignments.
-    let canonical = super::canonical_command(trimmed);
-    let first_word = canonical.split_whitespace().next().unwrap_or("");
+    let first_word = super::first_command_word(trimmed);
 
     if first_word.is_empty() {
         return Ok(());
