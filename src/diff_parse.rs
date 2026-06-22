@@ -157,21 +157,14 @@ pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
                 let raw = line.strip_prefix("rename from ").unwrap_or("");
                 // Git C-quotes rename-from paths: outer double-quotes plus
                 // C-style escapes inside when the path has trigger chars.
-                let old_path =
-                    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                        if let Some(p) = unescape_c_style(inner) {
-                            p
-                        } else {
-                            warn!(
-                                line = %line,
-                                "rename from: malformed C-style escape, dropping rename info"
-                            );
-                            f.status = DiffFileStatus::Modified;
-                            continue;
-                        }
-                    } else {
-                        raw.to_string()
-                    };
+                let Some(old_path) = unquote_c_style(raw) else {
+                    warn!(
+                        line = %line,
+                        "rename from: malformed C-style escape, dropping rename info"
+                    );
+                    f.status = DiffFileStatus::Modified;
+                    continue;
+                };
                 f.old_path = Some(old_path);
             }
         } else if line.starts_with("rename to ") {
@@ -277,11 +270,29 @@ pub fn make_untracked_diff_file(path: &str, content: &str) -> DiffFile {
     }
 }
 
-/// Unescape a git C-style quoted string.
+/// Strip surrounding double-quotes and unescape C-style escapes.
 ///
-/// Git's `quote_c_style()` produces the following escape sequences:
-/// - `\"` → literal `"`
-/// - `\\` → literal `\`
+/// If the input starts with `"` and ends with `"`, strips the quotes and
+/// calls [`unescape_c_style`] on the inner content. Otherwise returns the
+/// input as-is (no unescaping needed — git only C-quotes paths that contain
+/// trigger characters).
+///
+/// This is the standard pattern for handling git's quoted path output.
+/// Compare with git's own `unquote_c_style` which performs the same
+/// quote-strip-then-unescape logic.
+#[must_use]
+pub fn unquote_c_style(raw: &str) -> Option<String> {
+    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        unescape_c_style(inner)
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// Unescape C-style escape sequences from a git path name.
+///
+/// Supports the same escapes as git's `unquote_c_style`:
+/// - `\"` → literal `"`, `\\` → literal `\`
 /// - `\t` → tab, `\n` → newline, `\a` → bell, `\b` → backspace
 /// - `\f` → form feed, `\r` → carriage return, `\v` → vertical tab
 /// - `\0`–`\3` followed by 1–3 octal digits → byte value
@@ -462,15 +473,8 @@ fn find_b_part(rest: &str) -> Option<&str> {
 /// The b-part is either `b/path` (unquoted, no trigger chars) or
 /// `"b/path\"with\"escapes"` (quoted, the `b/` prefix is inside the quotes).
 fn extract_b_path(b_part: &str) -> Option<String> {
-    if let Some(inner) = b_part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        // Quoted: the `b/` prefix and path are both inside the quotes.
-        let path_raw = inner.strip_prefix("b/")?;
-        unescape_c_style(path_raw)
-    } else {
-        // Unquoted: just strip the `b/` prefix — no escapes present.
-        let path = b_part.strip_prefix("b/")?;
-        Some(path.to_string())
-    }
+    let path = unquote_c_style(b_part)?;
+    Some(path.strip_prefix("b/")?.to_string())
 }
 
 /// Parse hunk header: @@ -old_start,old_count +new_start,new_count @@ \[context]

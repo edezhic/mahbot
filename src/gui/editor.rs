@@ -32,7 +32,7 @@ use fff_search::parse_grep_query;
 
 use super::context_menu::ContextMenu;
 
-use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unescape_c_style};
+use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unquote_c_style};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
 use super::editor_widget::EditorBuffer;
@@ -913,17 +913,6 @@ fn build_hierarchical_tree(
 /// the new path after ` -> `. Deleted files (`D`) are ignored. Handles
 /// git's C-style quoting for paths with special characters.
 fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
-    /// Strip git porcelain quoting: remove surrounding double-quotes and
-    /// unescape C-style escapes via the shared `unescape_c_style` utility.
-    /// Returns `None` on malformed escape sequences (skipped by callers).
-    fn unquote_path(raw: &str) -> Option<String> {
-        if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-            unescape_c_style(inner)
-        } else {
-            Some(raw.to_string())
-        }
-    }
-
     let mut map: HashMap<String, GitFileStatus> = HashMap::new();
 
     for line in output.lines() {
@@ -954,7 +943,7 @@ fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
             let new_path: String = if rest.starts_with('"') {
                 // Both paths are quoted. The boundary is `" -> "`.
                 // rsplit_once on `" -> "` strips the opening quote of the
-                // new path — add it back so unquote_path can strip both.
+                // new path — add it back so `unquote_c_style` can strip both.
                 if let Some((_, tail)) = rest.rsplit_once("\" -> \"") {
                     format!("\"{tail}")
                 } else {
@@ -969,7 +958,7 @@ fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
                     continue;
                 }
             };
-            if let Some(unquoted) = unquote_path(&new_path) {
+            if let Some(unquoted) = unquote_c_style(&new_path) {
                 map.insert(unquoted, GitFileStatus::Modified);
             }
             continue;
@@ -990,7 +979,7 @@ fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
             continue;
         };
 
-        let Some(path) = unquote_path(path) else {
+        let Some(path) = unquote_c_style(path) else {
             continue;
         };
         // Strip trailing slash — git appends '/' for untracked directories
