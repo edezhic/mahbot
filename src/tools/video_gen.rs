@@ -95,10 +95,6 @@ impl Tool for VideoGenTool {
         let endpoint = crate::config::CONFIG.provider_endpoint();
         let api_base = crate::providers::ensure_base_url(&endpoint);
 
-        let auth = crate::util::http::bearer_auth_header();
-
-        let client = crate::util::http::media_http_client();
-
         // ── Step 1: Submit video generation job ─────────────────────────
         let mut body = json!({
             "model": model,
@@ -152,39 +148,25 @@ impl Tool for VideoGenTool {
         }
 
         let videos_url = format!("{api_base}/videos");
-        let submit_resp = match client
-            .post(&videos_url)
-            .header("Authorization", &auth)
-            .json(&body)
-            .send()
-            .await
+        // NOTE: 402 detection relies on string-matching "(402)" in the error
+        // message from post_json_to_provider. If that helper's error format
+        // changes, this check must be updated accordingly.
+        let submit_body: serde_json::Value = match crate::util::http::post_json_to_provider(
+            &videos_url,
+            &body,
+            "Video generation submission",
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                anyhow::bail!("Video generation submission failed: {e}");
-            }
-        };
-
-        let submit_status = submit_resp.status();
-
-        // Handle insufficient credits specifically
-        if submit_status.as_u16() == 402 {
-            let error_text = submit_resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Insufficient OpenRouter credits for video generation (HTTP 402). \
-                 Please add credits to your OpenRouter account and try again.\nAPI response: {error_text}"
-            );
-        }
-
-        if !submit_status.is_success() {
-            let error_text = submit_resp.text().await.unwrap_or_default();
-            anyhow::bail!("Video generation submission error ({submit_status}): {error_text}");
-        }
-
-        let submit_body: serde_json::Value = match submit_resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                anyhow::bail!("Failed to parse submission response: {e}");
+                if e.to_string().contains("(402)") {
+                    anyhow::bail!(
+                        "Insufficient OpenRouter credits for video generation (HTTP 402). \
+                             Please add credits to your OpenRouter account and try again."
+                    );
+                }
+                return Err(e);
             }
         };
 
@@ -209,23 +191,15 @@ impl Tool for VideoGenTool {
         for attempt in 1..=MAX_POLL_ATTEMPTS {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-            let poll_resp = match client
-                .get(&polling_url)
-                .header("Authorization", &auth)
-                .send()
-                .await
+            let poll_body = match crate::util::http::get_json_from_provider(
+                &polling_url,
+                "Video generation poll",
+            )
+            .await
             {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(%job_id, attempt, error = %e, "Poll failed");
-                    continue;
-                }
-            };
-
-            let poll_body: serde_json::Value = match poll_resp.json().await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!(%job_id, attempt, error = %e, "Poll parse failed");
+                    tracing::debug!(%job_id, attempt, error = %e, "Poll failed");
                     continue;
                 }
             };
@@ -268,30 +242,8 @@ impl Tool for VideoGenTool {
         };
 
         // ── Step 3: Download the video ──────────────────────────────────
-        let response = match client
-            .get(&download_url)
-            .header("Authorization", &auth)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                anyhow::bail!("Failed to download generated video: {e}");
-            }
-        };
-
-        let download_status = response.status();
-        if !download_status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to download video (HTTP {download_status}): {error_text}");
-        }
-
-        let video_bytes = match response.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                anyhow::bail!("Failed to read downloaded video: {e}");
-            }
-        };
+        let video_bytes =
+            crate::util::http::get_bytes_from_provider(&download_url, "Video download").await?;
 
         // ── Step 4: Save to workspace/generated/ ────────────────────────
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;

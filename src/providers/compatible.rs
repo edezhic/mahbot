@@ -582,9 +582,9 @@ impl OpenAiCompatibleProvider {
         if let Some(order) = provider_order
             && let Some(routing) =
                 provider_routing_json(order, provider_allow_fallbacks.unwrap_or(false))
-            {
-                extra.insert("provider".to_string(), routing);
-            }
+        {
+            extra.insert("provider".to_string(), routing);
+        }
 
         // Reasoning effort
         if let Some(effort) = reasoning_effort.filter(|e| !e.is_empty()) {
