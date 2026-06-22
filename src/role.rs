@@ -327,13 +327,6 @@ mod tests {
     fn role_roundtrip() {
         // FromStr for every variant by lowercase name
         for role in <crate::Role as strum::IntoEnumIterator>::iter() {
-            let name = role.as_str();
-            let parsed: crate::Role = name.parse().unwrap();
-            assert_eq!(parsed, role, "parse failed for '{name}'");
-        }
-
-        // Roundtrip: as_str() -> parse() for every variant
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
             let parsed: crate::Role = role.as_str().parse().unwrap();
             assert_eq!(parsed, role, "roundtrip failed for '{}'", role.as_str());
             // Display (strum-generated) must match the canonical as_str()
