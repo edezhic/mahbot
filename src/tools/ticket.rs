@@ -154,7 +154,7 @@ impl Tool for UpdateTicketTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let id = super::get_str(&args, "ticket_id")?;
+        let ticket_id = super::get_str(&args, "ticket_id")?;
         let new_status = super::get_str(&args, "status")?;
 
         let parsed_status = parse_ticket_phase(new_status)?;
@@ -162,11 +162,13 @@ impl Tool for UpdateTicketTool {
         let store = crate::board::store();
 
         // Guard: refuse to update a ticket that is in a pipeline-blocking phase.
-        guard_not_pipeline_blocking(store, id).await?;
+        guard_not_pipeline_blocking(store, ticket_id).await?;
 
-        store.transition_to(id, None, parsed_status).await?;
+        store.transition_to(ticket_id, None, parsed_status).await?;
 
-        Ok(format!("Ticket {id} status updated to '{new_status}'"))
+        Ok(format!(
+            "Ticket {ticket_id} status updated to '{new_status}'"
+        ))
     }
 }
 
@@ -276,13 +278,13 @@ impl Tool for GetTicketTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let id = super::get_str(&args, "ticket_id")?;
+        let ticket_id = super::get_str(&args, "ticket_id")?;
 
         let store = crate::board::store();
 
-        match store.get_ticket(id).await? {
+        match store.get_ticket(ticket_id).await? {
             Some(ticket) => Ok(ticket.detailed_display()),
-            None => anyhow::bail!("Ticket {id} not found"),
+            None => anyhow::bail!("Ticket {ticket_id} not found"),
         }
     }
 }
@@ -377,6 +379,31 @@ mod tests {
     use super::*;
     use crate::workspace::test_ws;
     use serde_json::json;
+
+    // ── Unit test for parse_ticket_phase error formatting ──────────
+
+    #[test]
+    fn test_parse_ticket_phase_error_message() {
+        let err = parse_ticket_phase("bogus_status").unwrap_err();
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("Invalid status"),
+            "error should mention 'Invalid status'"
+        );
+        assert!(
+            msg.contains("bogus_status"),
+            "error should contain the invalid input value"
+        );
+        assert!(
+            msg.contains("backlog"),
+            "error should list valid phases (e.g. backlog)"
+        );
+        assert!(
+            msg.contains("done"),
+            "error should list valid phases (e.g. done)"
+        );
+    }
 
     #[tokio::test]
     async fn test_create_ticket_tool() {
@@ -537,19 +564,6 @@ mod tests {
         let args = json!({"status": "bogus_status"});
         let result = tool.execute(&ws, args).await;
         assert!(result.is_err(), "Invalid status should fail");
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("Invalid status"),
-            "Should mention invalid status"
-        );
-        assert!(
-            err.contains("backlog"),
-            "Error should list phase names (e.g. backlog)"
-        );
-        assert!(
-            err.contains("done"),
-            "Error should list phase names (e.g. done)"
-        );
     }
 
     #[tokio::test]
@@ -644,19 +658,6 @@ mod tests {
         });
         let result = tool.execute(&ws, args).await;
         assert!(result.is_err(), "Invalid status should fail");
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("Invalid status"),
-            "Should mention invalid status"
-        );
-        assert!(
-            err.contains("backlog"),
-            "Error should list phase names (e.g. backlog)"
-        );
-        assert!(
-            err.contains("done"),
-            "Error should list phase names (e.g. done)"
-        );
     }
 
     // ── Pipeline-blocking guard tests ────────────────────────────

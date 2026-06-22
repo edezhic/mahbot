@@ -1145,9 +1145,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let mac_spill = PathBuf::from(
-                "/var/folders/xx/yy/T/.agent/spill_cd34.txt",
-            );
+            let mac_spill = PathBuf::from("/var/folders/xx/yy/T/.agent/spill_cd34.txt");
             assert!(
                 check_path_read_allowed(&mac_spill.to_string_lossy(), &workspace).is_ok(),
                 "macOS-shaped spill path should be allowed"

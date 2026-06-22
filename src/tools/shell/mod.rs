@@ -6,9 +6,9 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -163,7 +163,7 @@ async fn read_stream_limited(
             }
         };
         match reader.read(&mut chunk[..to_read]).await {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => {
                 let mut guard = shared.lock().unwrap_poison();
                 if guard.len() < cap {
@@ -171,7 +171,6 @@ async fn read_stream_limited(
                     guard.extend_from_slice(&chunk[..take]);
                 }
             }
-            Err(_) => break,
         }
     }
     shared.lock().unwrap_poison().clone()
@@ -275,12 +274,20 @@ fn format_timeout_error(
     if !stdout.is_empty() {
         let scrubbed = scrub_credentials(&String::from_utf8_lossy(stdout));
         let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
-        let _ = write!(msg, "\nstdout (last {} chars): {tail}", tail.chars().count());
+        let _ = write!(
+            msg,
+            "\nstdout (last {} chars): {tail}",
+            tail.chars().count()
+        );
     }
     if !stderr.is_empty() {
         let scrubbed = scrub_credentials(&String::from_utf8_lossy(stderr));
         let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
-        let _ = write!(msg, "\nstderr (last {} chars): {tail}", tail.chars().count());
+        let _ = write!(
+            msg,
+            "\nstderr (last {} chars): {tail}",
+            tail.chars().count()
+        );
     }
     msg
 }
@@ -505,11 +512,9 @@ Use this tool only for inspection: reading files, listing directories, running c
         // `cd workspace/subdir && cargo build` actually navigates the shell.
         let mut cmd = build_shell_command(command_str, ws.as_path());
 
-        let result = run_command_with_timeout(
-            &mut cmd,
-            Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
-        )
-        .await;
+        let result =
+            run_command_with_timeout(&mut cmd, Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS))
+                .await;
 
         match result {
             ShellRunResult::Completed {
@@ -1901,7 +1906,10 @@ mod tests {
         match result {
             ShellRunResult::TimedOut { stdout, .. } => {
                 let s = String::from_utf8_lossy(&stdout);
-                assert!(s.contains("started"), "stdout should contain partial output: {s}");
+                assert!(
+                    s.contains("started"),
+                    "stdout should contain partial output: {s}"
+                );
             }
             other => panic!("expected TimedOut, got {other:?}"),
         }
