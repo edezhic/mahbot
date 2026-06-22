@@ -1,4 +1,4 @@
-use crate::{Tool, ToolOutputPhase, Workspace};
+use crate::{Tool, ToolOutputPhase, Workspace, util::UnwrapPoison};
 use async_trait::async_trait;
 use directories::UserDirs;
 use regex::{Regex, RegexSet};
@@ -8,6 +8,8 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::scrub_credentials;
@@ -52,6 +54,10 @@ pub(super) const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree",
 
 /// Default maximum shell command execution time before kill.
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
+/// Cap bytes collected from each pipe during command execution (including timeouts).
+const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
+/// Max chars of partial output included in timeout error messages.
+const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
@@ -118,6 +124,165 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
         apply_safe_env(&mut process);
         process
     }
+}
+
+/// Outcome of a timed shell subprocess run.
+#[derive(Debug)]
+enum ShellRunResult {
+    Completed {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        status: std::process::ExitStatus,
+        elapsed: Duration,
+    },
+    TimedOut {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        pid: Option<u32>,
+        elapsed: Duration,
+    },
+    SpawnFailed(std::io::Error),
+}
+
+/// Read from an async stream up to `cap` bytes, mirroring progress into `shared`.
+async fn read_stream_limited(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    cap: usize,
+    shared: &Arc<Mutex<Vec<u8>>>,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    let mut chunk = [0u8; 8192];
+    loop {
+        let to_read = {
+            let guard = shared.lock().unwrap_poison();
+            if guard.len() >= cap {
+                chunk.len()
+            } else {
+                (cap - guard.len()).min(chunk.len())
+            }
+        };
+        match reader.read(&mut chunk[..to_read]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut guard = shared.lock().unwrap_poison();
+                if guard.len() < cap {
+                    let take = n.min(cap - guard.len());
+                    guard.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    shared.lock().unwrap_poison().clone()
+}
+
+/// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout`.
+async fn run_command_with_timeout(
+    cmd: &mut tokio::process::Command,
+    timeout: Duration,
+) -> ShellRunResult {
+    let start = std::time::Instant::now();
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return ShellRunResult::SpawnFailed(e),
+    };
+
+    let pid = child.id();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_shared = Arc::new(Mutex::new(Vec::new()));
+    let stderr_shared = Arc::new(Mutex::new(Vec::new()));
+
+    let stdout_buf = Arc::clone(&stdout_shared);
+    let stdout_handle = tokio::spawn(async move {
+        if let Some(mut out) = stdout_pipe {
+            read_stream_limited(&mut out, SHELL_PIPE_READ_CAP, &stdout_buf).await
+        } else {
+            Vec::new()
+        }
+    });
+    let stderr_buf = Arc::clone(&stderr_shared);
+    let stderr_handle = tokio::spawn(async move {
+        if let Some(mut err) = stderr_pipe {
+            read_stream_limited(&mut err, SHELL_PIPE_READ_CAP, &stderr_buf).await
+        } else {
+            Vec::new()
+        }
+    });
+
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let stdout = stdout_handle.await.unwrap_or_default();
+            let stderr = stderr_handle.await.unwrap_or_default();
+            ShellRunResult::Completed {
+                stdout,
+                stderr,
+                status,
+                elapsed: start.elapsed(),
+            }
+        }
+        Ok(Err(e)) => ShellRunResult::SpawnFailed(e),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), stdout_handle).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), stderr_handle).await;
+            let stdout = stdout_shared.lock().unwrap_poison().clone();
+            let stderr = stderr_shared.lock().unwrap_poison().clone();
+            ShellRunResult::TimedOut {
+                stdout,
+                stderr,
+                pid,
+                elapsed: start.elapsed(),
+            }
+        }
+    }
+}
+
+fn tail_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let skip = s.chars().count().saturating_sub(max_chars);
+    s.chars().skip(skip).collect()
+}
+
+fn format_timeout_error(
+    command: &str,
+    elapsed: Duration,
+    pid: Option<u32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
+    let mut msg = format!(
+        "Shell command timed out.\n\
+         command: {command}\n\
+         elapsed: {:.1}s\n\
+         timeout_limit: {DEFAULT_SHELL_TIMEOUT_SECS}s",
+        elapsed.as_secs_f64()
+    );
+    if let Some(p) = pid {
+        let _ = write!(msg, "\npid: {p}");
+    }
+    msg.push_str("\nreason: command was killed after exceeding the timeout");
+
+    if !stdout.is_empty() {
+        let scrubbed = scrub_credentials(&String::from_utf8_lossy(stdout));
+        let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
+        let _ = write!(msg, "\nstdout (last {} chars): {tail}", tail.chars().count());
+    }
+    if !stderr.is_empty() {
+        let scrubbed = scrub_credentials(&String::from_utf8_lossy(stderr));
+        let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
+        let _ = write!(msg, "\nstderr (last {} chars): {tail}", tail.chars().count());
+    }
+    msg
 }
 
 /// Shell command execution tool
@@ -335,38 +500,40 @@ Use this tool only for inspection: reading files, listing directories, running c
             anyhow::bail!("{rejection}");
         }
 
-        let start = std::time::Instant::now();
-
         // Execute with timeout to prevent hanging commands.
         // Use the ORIGINAL command string (not the stripped version) so that
         // `cd workspace/subdir && cargo build` actually navigates the shell.
         let mut cmd = build_shell_command(command_str, ws.as_path());
 
-        let result = tokio::time::timeout(
+        let result = run_command_with_timeout(
+            &mut cmd,
             Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
-            cmd.output(),
         )
         .await;
 
         match result {
-            Ok(Ok(output)) => {
+            ShellRunResult::Completed {
+                stdout,
+                stderr,
+                status,
+                elapsed,
+            } => {
                 // Save raw output BEFORE any truncation so agents can access
                 // the full output even when filtered/truncated to fit the context.
-                let raw_hint =
-                    save_raw_output_if_large(&output.stdout, &output.stderr, command_str);
+                let raw_hint = save_raw_output_if_large(&stdout, &stderr, command_str);
 
                 // Strip ANSI escape codes before truncation so that
                 // truncation boundaries cannot split multi-character
                 // escape sequences into garbled fragments.
-                let stdout_str = String::from_utf8_lossy(&output.stdout);
+                let stdout_str = String::from_utf8_lossy(&stdout);
                 let cleaned_stdout = strip_ansi_escapes(&stdout_str);
                 let stdout =
                     crate::util::truncate_sandwich(&cleaned_stdout, MAX_OUTPUT_BYTES, "output");
-                let stderr_str = String::from_utf8_lossy(&output.stderr);
+                let stderr_str = String::from_utf8_lossy(&stderr);
                 let stderr =
                     crate::util::truncate_sandwich(&stderr_str, MAX_OUTPUT_BYTES, "stderr");
 
-                let (exit_code, exit_note) = match output.status.code() {
+                let (exit_code, exit_note) = match status.code() {
                     Some(c) => (c, format!("[exit status: {c}]")),
                     None => (-1, "[exit status: terminated by signal]".to_string()),
                 };
@@ -374,7 +541,6 @@ Use this tool only for inspection: reading files, listing directories, running c
                 // All completed commands return output with exit info,
                 // regardless of exit code. Only actual execution failures
                 // (timeout, process launch failure) are tool errors.
-                let elapsed = start.elapsed();
                 let processed =
                     process_shell_output(command_str, &stdout, &stderr, exit_code, elapsed);
                 let mut combined = processed;
@@ -389,15 +555,27 @@ Use this tool only for inspection: reading files, listing directories, running c
                 }
                 Ok(combined)
             }
-            Ok(Err(e)) => anyhow::bail!(
+            ShellRunResult::TimedOut {
+                stdout,
+                stderr,
+                pid,
+                elapsed,
+            } => {
+                tracing::warn!(
+                    command = command_str,
+                    elapsed_secs = elapsed.as_secs_f64(),
+                    ?pid,
+                    stdout_bytes = stdout.len(),
+                    stderr_bytes = stderr.len(),
+                    "Shell command timed out"
+                );
+                let msg = format_timeout_error(command_str, elapsed, pid, &stdout, &stderr);
+                anyhow::bail!("{msg}");
+            }
+            ShellRunResult::SpawnFailed(e) => anyhow::bail!(
                 "Failed to start shell command.\n\
                  command: {command_str}\n\
                  reason: {e}"
-            ),
-            Err(_) => anyhow::bail!(
-                "Shell command timed out.\n\
-                 command: {command_str}\n\
-                 reason: command was killed after exceeding the timeout (5 min)"
             ),
         }
     }
@@ -1697,6 +1875,56 @@ mod tests {
             output.contains("nonexistent_dir_xyz"),
             "output should contain the error: {output:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_kills_long_sleep() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 10");
+        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(1)).await;
+        match result {
+            ShellRunResult::TimedOut { elapsed, .. } => {
+                assert!(
+                    elapsed < Duration::from_secs(3),
+                    "expected ~1s timeout, got {elapsed:?}"
+                );
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_captures_partial_stdout() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("echo started; sleep 60");
+        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(2)).await;
+        match result {
+            ShellRunResult::TimedOut { stdout, .. } => {
+                let s = String::from_utf8_lossy(&stdout);
+                assert!(s.contains("started"), "stdout should contain partial output: {s}");
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_error_includes_diagnostics() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut cmd = build_shell_command("echo before-timeout; sleep 30", tmp.path());
+        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(1)).await;
+        let ShellRunResult::TimedOut {
+            stdout,
+            stderr,
+            pid,
+            elapsed,
+        } = result
+        else {
+            panic!("expected timeout");
+        };
+        let msg = format_timeout_error("echo test", elapsed, pid, &stdout, &stderr);
+        assert!(msg.contains("elapsed:"), "msg: {msg}");
+        assert!(msg.contains("timeout_limit:"), "msg: {msg}");
+        assert!(msg.contains("before-timeout"), "msg: {msg}");
     }
 
     // ── Shell compression pipeline tests ────────────────────────────

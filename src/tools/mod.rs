@@ -510,14 +510,106 @@ fn is_path_in_extra_allowed(path: &Path) -> bool {
         .any(|allowed| check_path.starts_with(allowed))
 }
 
+/// Whether `path` looks like an OS temp/scratch directory (checked at read time).
+fn paths_same_or_canonical(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Whether `path` is an OS temp directory root (not merely nested under temp).
+fn is_os_temp_root(path: &Path) -> bool {
+    let check_path = expand_tilde_for_path_check(path);
+
+    if paths_same_or_canonical(&check_path, &std::env::temp_dir()) {
+        return true;
+    }
+
+    for var in ["TMPDIR", "TEMP", "TMP"] {
+        if let Ok(val) = std::env::var(var) {
+            let env_path = PathBuf::from(val);
+            if paths_same_or_canonical(&check_path, &env_path) {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        for prefix in ["/tmp", "/private/tmp", "/var/tmp"] {
+            if paths_same_or_canonical(&check_path, Path::new(prefix)) {
+                return true;
+            }
+        }
+        // macOS per-user temp root: /var/folders/XX/YY/T
+        let lossy = check_path.to_string_lossy();
+        let parts: Vec<&str> = lossy.trim_start_matches('/').split('/').collect();
+        if parts.len() == 5 && parts[0] == "var" && parts[1] == "folders" && parts[4] == "T" {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Whether `path` is a mahbot shell spill/raw log under an OS temp directory.
+fn is_mahbot_spill_filename(name: &str) -> bool {
+    if name.ends_with(".raw.log") {
+        return true;
+    }
+    let Some(hex) = name
+        .strip_prefix("spill_")
+        .and_then(|s| s.strip_suffix(".txt"))
+    else {
+        return false;
+    };
+    hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Whether `path` has the spill filename and `.agent` parent layout (ignoring temp root).
+fn is_mahbot_spill_shaped(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !is_mahbot_spill_filename(file_name) {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some(".agent")
+}
+
+/// Whether `path` is a mahbot spill file written under `$TEMP/.agent/`.
+fn is_mahbot_spill_file(path: &Path) -> bool {
+    if !is_mahbot_spill_shaped(path) {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.parent())
+        .is_some_and(is_os_temp_root)
+}
+
 /// Check that a path is allowed by the read-path security policy.
 ///
 /// The path must be either within the workspace (via [`is_path_safe_for_workspace`])
 /// or under one of the [`EXTRA_READ_ALLOWED`] directories (temp files,
 /// dependency caches, SDK headers, etc.).
 fn check_path_read_allowed(path: &str, workspace_root: &Path) -> anyhow::Result<()> {
+    let path_buf = Path::new(path);
+    if is_mahbot_spill_shaped(path_buf) && !is_mahbot_spill_file(path_buf) {
+        anyhow::bail!("Path not allowed by security policy: {path}");
+    }
     if !is_path_safe_for_workspace(path, workspace_root)
-        && !is_path_in_extra_allowed(Path::new(path))
+        && !is_path_in_extra_allowed(path_buf)
+        && !is_mahbot_spill_file(path_buf)
     {
         anyhow::bail!("Path not allowed by security policy: {path}");
     }
@@ -1036,6 +1128,63 @@ mod tests {
         assert!(
             check_path_read_allowed("/var/tmp/mahbot-test.txt", &workspace).is_ok(),
             "/var/tmp should be readable via EXTRA_READ_ALLOWED"
+        );
+    }
+
+    #[test]
+    fn is_mahbot_spill_file_allows_temp_agent_spills() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().to_path_buf();
+
+        let spill = std::env::temp_dir().join(".agent/spill_ab12.txt");
+        assert!(
+            check_path_read_allowed(&spill.to_string_lossy(), &workspace).is_ok(),
+            "spill under current temp_dir should be allowed: {}",
+            spill.display()
+        );
+
+        #[cfg(unix)]
+        {
+            let mac_spill = PathBuf::from(
+                "/var/folders/xx/yy/T/.agent/spill_cd34.txt",
+            );
+            assert!(
+                check_path_read_allowed(&mac_spill.to_string_lossy(), &workspace).is_ok(),
+                "macOS-shaped spill path should be allowed"
+            );
+        }
+
+        let raw_log = std::env::temp_dir().join(".agent/12345_cargo_check.raw.log");
+        assert!(
+            check_path_read_allowed(&raw_log.to_string_lossy(), &workspace).is_ok(),
+            "raw.log spill should be allowed"
+        );
+    }
+
+    #[test]
+    fn is_mahbot_spill_file_rejects_workspace_and_system_paths() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().to_path_buf();
+
+        let in_workspace = workspace.join(".agent/spill_ab12.txt");
+        assert!(
+            check_path_read_allowed(&in_workspace.to_string_lossy(), &workspace).is_err(),
+            "workspace .agent spill should be rejected: {}",
+            in_workspace.display()
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = PathBuf::from("/usr/local/.agent/spill_ab12.txt");
+            assert!(
+                check_path_read_allowed(&outside.to_string_lossy(), &workspace).is_err(),
+                "non-temp spill-shaped path should be rejected"
+            );
+        }
+
+        assert!(
+            check_path_read_allowed("/etc/passwd", &workspace).is_err(),
+            "/etc/passwd should be rejected"
         );
     }
 

@@ -242,6 +242,36 @@ impl BrowserTool {
         Ok(response)
     }
 
+    /// Extract visible rendered text via `innerText`, falling back to `get text`
+    /// (`textContent`) when eval fails or returns empty.
+    async fn get_inner_text(&self, selector: &str, tab: &str) -> anyhow::Result<String> {
+        const FALLBACK_NOTE: &str =
+            "(used get text fallback — textContent, may include script/style text)";
+
+        let js = inner_text_eval_js(selector);
+        if let Ok(resp) = self.run_command(&["eval", &js], Some(tab)).await
+            && let Some(data) = resp.data.as_ref()
+            && let Some(text) = extract_snapshot_text(data)
+            && !text.trim().is_empty()
+        {
+            return Ok(text);
+        }
+
+        let resp = self
+            .run_command(&["get", "text", selector], Some(tab))
+            .await?;
+        let mut text = resp
+            .data
+            .as_ref()
+            .and_then(extract_snapshot_text)
+            .unwrap_or_default();
+        if !text.is_empty() {
+            text.push('\n');
+            text.push_str(FALLBACK_NOTE);
+        }
+        Ok(text)
+    }
+
     /// Agent-browser supports multiple subcommand styles — this builds the correct
     /// argument list for each action.
     fn build_args(action: &BrowserAction) -> anyhow::Result<Vec<String>> {
@@ -272,8 +302,8 @@ impl BrowserTool {
             BrowserAction::GetText { selector } => {
                 Ok(vec!["get".into(), "text".into(), selector.clone()])
             }
-            BrowserAction::GetInnerText { selector } => {
-                Ok(vec!["get".into(), "innertext".into(), selector.clone()])
+            BrowserAction::GetInnerText { .. } => {
+                anyhow::bail!("GetInnerText is handled in execute(), not build_args")
             }
             BrowserAction::GetUrl { .. } => Ok(vec!["get".into(), "url".into()]),
             BrowserAction::Press { key } => Ok(vec!["press".into(), key.clone()]),
@@ -659,12 +689,21 @@ impl Tool for BrowserTool {
             }
         }
 
-        let cli_args = Self::build_args(&action)?;
-        let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
-
         // Get or create a per-tab lock — only serializes operations on the
         // same tab. Different tabs run fully concurrently.
         let _guard = self.acquire_tab_lock(tab).await;
+
+        if let BrowserAction::GetInnerText { selector } = &action {
+            let output = self.get_inner_text(selector, tab).await?;
+            return Ok(if output.is_empty() {
+                format!("[Tab: {tab}] (no output)")
+            } else {
+                format!("[Tab: {tab}] {output}")
+            });
+        }
+
+        let cli_args = Self::build_args(&action)?;
+        let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
         let response = self.run_command(&str_args, Some(tab)).await?;
 
         // After open, wait for network idle, then auto-snapshot
@@ -774,6 +813,19 @@ fn enhance_browser_error(msg: String) -> String {
     }
 }
 
+/// Escape a string for embedding in a single-quoted JavaScript literal.
+fn escape_js_single_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Build eval JS that returns `innerText` for the given CSS selector or ref.
+fn inner_text_eval_js(selector: &str) -> String {
+    let escaped = escape_js_single_quoted(selector);
+    format!(
+        "(() => {{ const el = document.querySelector('{escaped}'); return el ? el.innerText : ''; }})()"
+    )
+}
+
 /// Extract textual content from an agent-browser snapshot response `data` field.
 ///
 /// agent-browser can return the snapshot as:
@@ -859,12 +911,31 @@ mod tests {
     }
 
     #[test]
-    fn build_args_for_get_innertext() {
+    fn build_args_rejects_get_innertext() {
         let action = BrowserAction::GetInnerText {
             selector: "body".into(),
         };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["get", "innertext", "body"]);
+        assert!(
+            BrowserTool::build_args(&action).is_err(),
+            "GetInnerText must be handled in execute(), not build_args"
+        );
+    }
+
+    #[test]
+    fn inner_text_eval_js_escapes_quotes() {
+        let js = inner_text_eval_js("it's");
+        assert!(js.contains("it\\'s"));
+        assert!(!js.contains("innertext"));
+    }
+
+    #[test]
+    fn inner_text_eval_js_body_and_ref() {
+        let body = inner_text_eval_js("body");
+        assert!(body.contains("document.querySelector('body')"));
+        assert!(body.contains("innerText"));
+
+        let refr = inner_text_eval_js("@e1");
+        assert!(refr.contains("document.querySelector('@e1')"));
     }
 
     #[test]
