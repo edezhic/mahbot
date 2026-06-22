@@ -500,10 +500,11 @@ async fn read_and_parse(resolved_path: &Path, mode_label: &str) -> anyhow::Resul
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_owned();
-    let Some(language) = language_for_extension(&ext) else {
+    let Some(language) = language_support(&ext).map(|ls| ls.language) else {
         anyhow::bail!(
             "Unsupported file extension '.{ext}' for {mode_label}. \
-             Supported: .rs, .js, .jsx, .mjs, .cjs, .ts, .tsx, .py, .pyi, .pyx, .json, .toml, .sh, .bash, .zsh, .css, .html, .htm, .go, .rb, .c, .h, .sql"
+             Supported: .rs, .js, .jsx, .mjs, .cjs, .ts, .tsx, .py, .pyi, .pyx, .json, .toml, \
+             .sh, .bash, .zsh, .css, .html, .htm, .go, .rb, .c, .h, .sql"
         );
     };
 
@@ -524,62 +525,15 @@ async fn read_and_parse(resolved_path: &Path, mode_label: &str) -> anyhow::Resul
     })
 }
 
-/// Map file extension to tree-sitter Language.
-fn language_for_extension(ext: &str) -> Option<Language> {
-    match ext {
-        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
-        "js" | "jsx" | "mjs" | "cjs" => Some(tree_sitter_javascript::LANGUAGE.into()),
-        "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
-        "py" | "pyi" | "pyx" => Some(tree_sitter_python::LANGUAGE.into()),
-        "json" => Some(tree_sitter_json::LANGUAGE.into()),
-        "toml" => Some(tree_sitter_toml_ng::LANGUAGE.into()),
-        "sh" | "bash" | "zsh" => Some(tree_sitter_bash::LANGUAGE.into()),
-        "css" => Some(tree_sitter_css::LANGUAGE.into()),
-        "html" | "htm" => Some(tree_sitter_html::LANGUAGE.into()),
-        "go" => Some(tree_sitter_go::LANGUAGE.into()),
-        "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
-        "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
-        "sql" => Some(tree_sitter_sequel::LANGUAGE.into()),
-        _ => None,
-    }
+struct LanguageSupport {
+    language: Language,
+    symbol_query: &'static str,
 }
 
-/// Return a tree-sitter query string listing top-level declarations for the language.
+/// Single source of truth mapping extensions to tree-sitter language and symbol query.
 #[allow(clippy::too_many_lines)]
-fn symbol_query_for_extension(ext: &str) -> &'static str {
-    match ext {
-        "rs" => {
-            r"(
-            [
-                (function_item name: (identifier) @name)
-                (struct_item name: (type_identifier) @name)
-                (enum_item name: (type_identifier) @name)
-                (trait_item name: (type_identifier) @name)
-                (impl_item type: (_) @name)
-                (const_item name: (identifier) @name)
-                (static_item name: (identifier) @name)
-                (type_item name: (type_identifier) @name)
-                (macro_definition name: (identifier) @name)
-                (mod_item name: (identifier) @name)
-            ]
-        )"
-        }
-        "js" | "jsx" | "mjs" | "cjs" => {
-            r"(
-            [
-                (function_declaration name: (identifier) @name)
-                (class_declaration name: (type_identifier) @name)
-                (method_definition name: (property_identifier) @name)
-                (arrow_function name: (identifier) @name)
-                (variable_declarator name: (identifier) @name)
-                (export_statement (function_declaration name: (identifier) @name))
-                (export_statement (class_declaration name: (type_identifier) @name))
-            ]
-        )"
-        }
-        "ts" | "tsx" => {
-            r"(
+fn language_support(ext: &str) -> Option<LanguageSupport> {
+    const TS_SYMBOL_QUERY: &str = r"(
             [
                 (function_declaration name: (identifier) @name)
                 (class_declaration name: (type_identifier) @name)
@@ -595,25 +549,83 @@ fn symbol_query_for_extension(ext: &str) -> &'static str {
                 (export_statement (enum_declaration name: (identifier) @name))
                 (export_statement (type_alias_declaration name: (type_identifier) @name))
             ]
-        )"
-        }
-        "py" | "pyi" | "pyx" => {
-            r"(
+        )";
+    match ext {
+        "rs" => Some(LanguageSupport {
+            language: tree_sitter_rust::LANGUAGE.into(),
+            symbol_query: r"(
+            [
+                (function_item name: (identifier) @name)
+                (struct_item name: (type_identifier) @name)
+                (enum_item name: (type_identifier) @name)
+                (trait_item name: (type_identifier) @name)
+                (impl_item type: (_) @name)
+                (const_item name: (identifier) @name)
+                (static_item name: (identifier) @name)
+                (type_item name: (type_identifier) @name)
+                (macro_definition name: (identifier) @name)
+                (mod_item name: (identifier) @name)
+            ]
+        )",
+        }),
+        "js" | "jsx" | "mjs" | "cjs" => Some(LanguageSupport {
+            language: tree_sitter_javascript::LANGUAGE.into(),
+            symbol_query: r"(
+            [
+                (function_declaration name: (identifier) @name)
+                (class_declaration name: (type_identifier) @name)
+                (method_definition name: (property_identifier) @name)
+                (arrow_function name: (identifier) @name)
+                (variable_declarator name: (identifier) @name)
+                (export_statement (function_declaration name: (identifier) @name))
+                (export_statement (class_declaration name: (type_identifier) @name))
+            ]
+        )",
+        }),
+        "ts" => Some(LanguageSupport {
+            language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            symbol_query: TS_SYMBOL_QUERY,
+        }),
+        "tsx" => Some(LanguageSupport {
+            language: tree_sitter_typescript::LANGUAGE_TSX.into(),
+            symbol_query: TS_SYMBOL_QUERY,
+        }),
+        "py" | "pyi" | "pyx" => Some(LanguageSupport {
+            language: tree_sitter_python::LANGUAGE.into(),
+            symbol_query: r"(
             [
                 (function_definition name: (identifier) @name)
                 (class_definition name: (identifier) @name)
             ]
-        )"
-        }
-        "sh" | "bash" | "zsh" => {
-            r"(
+        )",
+        }),
+        "json" => Some(LanguageSupport {
+            language: tree_sitter_json::LANGUAGE.into(),
+            symbol_query: "",
+        }),
+        "toml" => Some(LanguageSupport {
+            language: tree_sitter_toml_ng::LANGUAGE.into(),
+            symbol_query: "",
+        }),
+        "sh" | "bash" | "zsh" => Some(LanguageSupport {
+            language: tree_sitter_bash::LANGUAGE.into(),
+            symbol_query: r"(
             [
                 (function_definition name: (word) @name)
             ]
-        )"
-        }
-        "go" => {
-            r"(
+        )",
+        }),
+        "css" => Some(LanguageSupport {
+            language: tree_sitter_css::LANGUAGE.into(),
+            symbol_query: "",
+        }),
+        "html" | "htm" => Some(LanguageSupport {
+            language: tree_sitter_html::LANGUAGE.into(),
+            symbol_query: "",
+        }),
+        "go" => Some(LanguageSupport {
+            language: tree_sitter_go::LANGUAGE.into(),
+            symbol_query: r"(
             [
                 (function_declaration name: (identifier) @name)
                 (method_declaration name: (field_identifier) @name)
@@ -621,20 +633,22 @@ fn symbol_query_for_extension(ext: &str) -> &'static str {
                 (const_declaration (const_spec name: (identifier) @name))
                 (var_declaration (var_spec name: (identifier) @name))
             ]
-        )"
-        }
-        "rb" => {
-            r"(
+        )",
+        }),
+        "rb" => Some(LanguageSupport {
+            language: tree_sitter_ruby::LANGUAGE.into(),
+            symbol_query: r"(
             [
                 (method name: (identifier) @name)
                 (singleton_method name: (identifier) @name)
                 (class name: (constant) @name)
                 (module name: (constant) @name)
             ]
-        )"
-        }
-        "c" | "h" => {
-            r"(
+        )",
+        }),
+        "c" | "h" => Some(LanguageSupport {
+            language: tree_sitter_c::LANGUAGE.into(),
+            symbol_query: r"(
             [
                 (function_definition declarator: (function_declarator declarator: (identifier) @name))
                 (struct_specifier name: (type_identifier) @name)
@@ -642,25 +656,26 @@ fn symbol_query_for_extension(ext: &str) -> &'static str {
                 (union_specifier name: (type_identifier) @name)
                 (type_definition declarator: (type_identifier) @name)
             ]
-        )"
-        }
-        "sql" => {
-            r"(
+        )",
+        }),
+        "sql" => Some(LanguageSupport {
+            language: tree_sitter_sequel::LANGUAGE.into(),
+            symbol_query: r"(
             [
                 (create_table (object_reference name: (identifier) @name))
                 (create_view (object_reference name: (identifier) @name))
                 (create_index (object_reference name: (identifier) @name))
                 (create_trigger (object_reference name: (identifier) @name))
             ]
-        )"
-        }
-        _ => "",
+        )",
+        }),
+        _ => None,
     }
 }
 
 /// Compile the tree-sitter symbol query for the source file's language.
 fn build_symbol_query(ps: &ParsedSource) -> anyhow::Result<Query> {
-    let query_str = symbol_query_for_extension(&ps.ext);
+    let query_str = language_support(&ps.ext).map_or("", |ls| ls.symbol_query);
     Query::new(&ps.language, query_str)
         .map_err(|e| anyhow::anyhow!("Failed to build symbol query: {e}"))
 }
@@ -760,6 +775,41 @@ async fn list_directory(resolved_path: &std::path::Path, ws: &Workspace) -> anyh
 mod tests {
     use super::*;
     use crate::workspace::test_ws;
+
+    /// Every extension listed in the error message must have tree-sitter language support.
+    /// Catches drift when an extension is removed from `language_support` match arms
+    /// without updating the error string.
+    #[test]
+    fn all_supported_extensions_have_language() {
+        let expected: &[&str] = &[
+            "rs", "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "pyi", "pyx", "json", "toml", "sh",
+            "bash", "zsh", "css", "html", "htm", "go", "rb", "c", "h", "sql",
+        ];
+        for ext in expected {
+            assert!(
+                language_support(ext).is_some(),
+                "expected language support for .{ext}"
+            );
+        }
+    }
+
+    /// Spot-check that common non-code extensions return no language support.
+    /// Helps catch accidental regressions in `language_support` match arms.
+    /// Not exhaustive — adding a new supported extension without updating the
+    /// error message still passes silently.
+    #[test]
+    fn unsupported_extensions_return_none() {
+        let unsupported: &[&str] = &[
+            "txt", "md", "yml", "yaml", "xml", "svg", "config", "ini", "cfg", "log", "csv", "tsv",
+            "pdf", "png", "jpg", "gif", "woff", "ttf",
+        ];
+        for ext in unsupported {
+            assert!(
+                language_support(ext).is_none(),
+                "expected no language support for .{ext}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn file_read_basic_scenarios() {
