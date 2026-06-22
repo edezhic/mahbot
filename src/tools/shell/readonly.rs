@@ -1190,7 +1190,7 @@ mod tests {
     fn shell_prefix_mutating_rejected() {
         for prefix in SHELL_PREFIXES {
             match *prefix {
-                "cd" | "pushd" | "popd" | "export" | "source" | "." => continue,
+                "cd" | "pushd" | "popd" | "export" | "source" | "." => {}
                 _ => assert_rejected(&format!("{prefix} rm file")),
             }
         }

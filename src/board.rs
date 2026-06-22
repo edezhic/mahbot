@@ -4038,7 +4038,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let id = create_archived_ticket(&store, "Test title", "ws").await;
 
         let rows = store
-            .list_tickets_minimal(&[id.clone()])
+            .list_tickets_minimal(std::slice::from_ref(&id))
             .await
             .expect("list minimal");
         assert_eq!(rows.len(), 1);
