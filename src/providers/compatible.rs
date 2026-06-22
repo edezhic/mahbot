@@ -3,9 +3,9 @@
 //! This module provides a single implementation that works for all of them.
 
 use crate::providers::compatible_streaming::drain_sse_into_channel;
-use crate::providers::ensure_chat_completions_url;
 use crate::providers::error::ProviderError;
 use crate::providers::reasoning_roundtrip;
+use crate::providers::{ensure_chat_completions_url, provider_routing_json};
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, ProviderUsage, Reasoning, StreamError, StreamEvent, StreamResult,
@@ -579,23 +579,12 @@ impl OpenAiCompatibleProvider {
 
         // Provider routing — per-request values only; no global fallback.
         // If provider_order is present and non-empty, build the routing block.
-        if let Some(order) = provider_order {
-            let providers: Vec<&str> = order
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !providers.is_empty() {
-                let allow = provider_allow_fallbacks.unwrap_or(false);
-                extra.insert(
-                    "provider".to_string(),
-                    serde_json::json!({
-                        "order": providers,
-                        "allow_fallbacks": allow,
-                    }),
-                );
+        if let Some(order) = provider_order
+            && let Some(routing) =
+                provider_routing_json(order, provider_allow_fallbacks.unwrap_or(false))
+            {
+                extra.insert("provider".to_string(), routing);
             }
-        }
 
         // Reasoning effort
         if let Some(effort) = reasoning_effort.filter(|e| !e.is_empty()) {

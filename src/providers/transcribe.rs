@@ -60,12 +60,10 @@ impl ImageTranscriber {
             "max_tokens": 512,
         });
 
-        if let Some(route) = &self.inner.provider_route {
-            body["provider"] = serde_json::json!({
-                "order": [route],
-                "allow_fallbacks": false,
-            });
-        }
+        if let Some(route) = &self.inner.provider_route
+            && let Some(routing) = crate::providers::provider_routing_json(route, false) {
+                body["provider"] = routing;
+            }
 
         // NOTE: This helper switches from `ProviderError` to `anyhow::bail` for
         // non-2xx responses.  This is safe because the error is caught by
@@ -122,16 +120,10 @@ impl AudioTranscriber {
             .part("file", file_part)
             .text("model", self.inner.model.clone());
 
-        if let Some(route) = &self.inner.provider_route {
-            form = form.text(
-                "provider",
-                serde_json::json!({
-                    "order": [route],
-                    "allow_fallbacks": false,
-                })
-                .to_string(),
-            );
-        }
+        if let Some(route) = &self.inner.provider_route
+            && let Some(routing) = crate::providers::provider_routing_json(route, false) {
+                form = form.text("provider", routing.to_string());
+            }
 
         let base = crate::providers::ensure_base_url(&self.inner.api_url);
         let url = format!("{base}/audio/transcriptions");

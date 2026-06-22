@@ -48,6 +48,47 @@ pub(crate) fn ensure_base_url(endpoint: &str) -> String {
         .to_string()
 }
 
+/// Build a `provider` routing JSON value for OpenAI-compatible chat requests.
+///
+/// Splits `order` on commas, trims whitespace, and filters empty strings.
+/// Returns `None` when the resulting provider list is empty, so callers can
+/// skip inserting the routing block entirely (matching the pre-existing
+/// behaviour in [`compatible::build_chat_request`]).
+///
+/// This works for both comma-separated provider lists (chat completions) and
+/// single-provider strings (transcription) — a single slug survives the
+/// split/trim/filter cycle unchanged.
+///
+/// # Example
+///
+/// ```ignore
+/// let routing = provider_routing_json("openai,   anthropic  ", true);
+/// assert_eq!(
+///     routing,
+///     Some(serde_json::json!({
+///         "order": ["openai", "anthropic"],
+///         "allow_fallbacks": true,
+///     })),
+/// );
+/// ```
+pub(crate) fn provider_routing_json(
+    order: &str,
+    allow_fallbacks: bool,
+) -> Option<serde_json::Value> {
+    let providers: Vec<&str> = order
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if providers.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "order": providers,
+        "allow_fallbacks": allow_fallbacks,
+    }))
+}
+
 // ── Global singletons (recreatable via RwLock) ─────────────────
 
 /// Global provider instance. Recreatable when config changes at runtime.
@@ -401,5 +442,63 @@ mod tests {
         let base = ensure_base_url(url);
         // Same reasoning — '/chat/completions' is not a suffix.
         assert_eq!(base, "https://chat.completions.com/api");
+    }
+
+    // ── provider_routing_json tests ─────────────────────────────
+
+    #[test]
+    fn routing_single_provider() {
+        assert_eq!(
+            provider_routing_json("openai", false),
+            Some(serde_json::json!({
+                "order": ["openai"],
+                "allow_fallbacks": false,
+            })),
+        );
+    }
+
+    #[test]
+    fn routing_multiple_providers() {
+        assert_eq!(
+            provider_routing_json("openai, anthropic, google", true),
+            Some(serde_json::json!({
+                "order": ["openai", "anthropic", "google"],
+                "allow_fallbacks": true,
+            })),
+        );
+    }
+
+    #[test]
+    fn routing_whitespace_only_yields_none() {
+        assert_eq!(provider_routing_json("  , ,  ", false), None);
+    }
+
+    #[test]
+    fn routing_empty_string_yields_none() {
+        assert_eq!(provider_routing_json("", true), None);
+    }
+
+    #[test]
+    fn routing_leading_trailing_whitespace() {
+        assert_eq!(
+            provider_routing_json("  openai  ", false),
+            Some(serde_json::json!({
+                "order": ["openai"],
+                "allow_fallbacks": false,
+            })),
+        );
+    }
+
+    #[test]
+    fn routing_single_slug_survives_split() {
+        // Transcription call sites pass a single provider slug; the
+        // split/trim/filter cycle must leave it unchanged.
+        assert_eq!(
+            provider_routing_json("google-gemini", false),
+            Some(serde_json::json!({
+                "order": ["google-gemini"],
+                "allow_fallbacks": false,
+            })),
+        );
     }
 }
