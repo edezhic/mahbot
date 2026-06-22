@@ -1267,53 +1267,56 @@ mod tests {
     }
 
     #[test]
-    fn test_should_delete_build_artifact_all_same() {
-        // All three paths match → should not delete.
-        let binary = Path::new("/usr/local/bin/mahbot");
-        let current = Path::new("/usr/local/bin/mahbot");
-        assert!(!should_delete_build_artifact(binary, current, Some(binary)));
-    }
-
-    #[test]
-    fn test_should_delete_build_artifact_all_different() {
-        // All three paths differ → should delete.
-        let binary = Path::new("/build/target/release/mahbot");
-        let current = Path::new("/usr/local/bin/mahbot");
-        let cargo = Path::new("/home/user/.cargo/bin/mahbot");
-        assert!(should_delete_build_artifact(binary, current, Some(cargo)));
-    }
-
-    #[test]
-    fn test_should_delete_build_artifact_binary_matches_cargo() {
-        // Binary matches cargo bin but differs from current_exe → should not delete.
-        let binary = Path::new("/home/user/.cargo/bin/mahbot");
-        let current = Path::new("/home/user/dev/mahbot/target/release/mahbot");
-        let cargo = Path::new("/home/user/.cargo/bin/mahbot");
-        assert!(!should_delete_build_artifact(binary, current, Some(cargo)));
-    }
-
-    #[test]
-    fn test_should_delete_build_artifact_binary_matches_current_exe() {
-        // Binary matches current_exe but differs from cargo bin → should not delete.
-        let binary = Path::new("/usr/local/bin/mahbot");
-        let current = Path::new("/usr/local/bin/mahbot");
-        let cargo = Path::new("/home/user/.cargo/bin/mahbot");
-        assert!(!should_delete_build_artifact(binary, current, Some(cargo)));
-    }
-
-    #[test]
-    fn test_should_delete_build_artifact_no_cargo_bin() {
-        // No cargo bin path → only compare binary vs current_exe.
-        let binary = Path::new("/build/target/release/mahbot");
-        let current = Path::new("/usr/local/bin/mahbot");
-        assert!(should_delete_build_artifact(binary, current, None));
-    }
-
-    #[test]
-    fn test_should_delete_build_artifact_no_cargo_bin_same() {
-        // No cargo bin path, binary == current_exe → should not delete.
-        let binary = Path::new("/usr/local/bin/mahbot");
-        assert!(!should_delete_build_artifact(binary, binary, None));
+    fn test_should_delete_build_artifact() {
+        let cases: &[(&str, &str, Option<&str>, bool)] = &[
+            (
+                "/usr/local/bin/mahbot",
+                "/usr/local/bin/mahbot",
+                Some("/usr/local/bin/mahbot"),
+                false,
+            ), // all same
+            (
+                "/build/target/release/mahbot",
+                "/usr/local/bin/mahbot",
+                Some("/home/user/.cargo/bin/mahbot"),
+                true,
+            ), // all different
+            (
+                "/home/user/.cargo/bin/mahbot",
+                "/home/user/dev/mahbot/target/release/mahbot",
+                Some("/home/user/.cargo/bin/mahbot"),
+                false,
+            ), // binary matches cargo
+            (
+                "/usr/local/bin/mahbot",
+                "/usr/local/bin/mahbot",
+                Some("/home/user/.cargo/bin/mahbot"),
+                false,
+            ), // binary matches current, differs from cargo
+            (
+                "/build/target/release/mahbot",
+                "/usr/local/bin/mahbot",
+                None,
+                true,
+            ), // no cargo bin, differs
+            (
+                "/usr/local/bin/mahbot",
+                "/usr/local/bin/mahbot",
+                None,
+                false,
+            ), // no cargo bin, same
+        ];
+        for &(binary, current, cargo_bin, expected) in cases {
+            assert_eq!(
+                should_delete_build_artifact(
+                    Path::new(binary),
+                    Path::new(current),
+                    cargo_bin.map(Path::new)
+                ),
+                expected,
+                "binary={binary}, current={current}, cargo_bin={cargo_bin:?}"
+            );
+        }
     }
 
     #[tokio::test]
