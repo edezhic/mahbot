@@ -127,13 +127,12 @@ impl Tool for ImageGenTool {
         };
 
         // Extract from choices[0].message.images[].image_url.url (OpenRouter format)
-        let image_data = extract_image_data(&response_body);
-        let Some(image_data) = image_data else {
+        let parts = extract_response_parts(&response_body);
+        let Some(image_data) = parts.image_data else {
             anyhow::bail!("Image generation response did not contain image data in message.images");
         };
 
-        // Extract text content from the model response (Gemini-class models return both)
-        let model_text = extract_text_content(&response_body);
+        let model_text = parts.text_content;
 
         let Some(bytes) = decode_data_uri(&image_data) else {
             anyhow::bail!("Failed to decode image data from response (expected base64 data URI)");
@@ -154,38 +153,55 @@ impl Tool for ImageGenTool {
     }
 }
 
-/// Extract image data from an OpenRouter image generation response.
-/// Images are in `choices[0].message.images[].image_url.url` (OpenRouter format).
-fn extract_image_data(body: &serde_json::Value) -> Option<String> {
-    let images = body["choices"]
-        .as_array()?
-        .first()?
-        .get("message")?
-        .get("images")?
-        .as_array()?;
-    for img in images {
-        if let Some(url) = img["image_url"]["url"].as_str()
-            && !url.is_empty()
-        {
-            return Some(url.to_string());
-        }
-    }
-    None
+/// The parts extracted from an image generation response.
+///
+/// - `image_data`: the first non-empty `choices[0].message.images[].image_url.url`
+/// - `text_content`: the optional text from `choices[0].message.content`
+#[derive(Debug, PartialEq)]
+pub(crate) struct ImageGenResponse {
+    pub(crate) image_data: Option<String>,
+    pub(crate) text_content: Option<String>,
 }
 
-/// Extract text content from the model response (Gemini-class models return both
-/// text and images). Returns `None` if no text content is present.
-fn extract_text_content(body: &serde_json::Value) -> Option<String> {
-    let content = body["choices"]
-        .as_array()?
-        .first()?
-        .get("message")?
-        .get("content")?;
-    let text = content.as_str()?;
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
+/// Extract both image data and text content from an OpenRouter image generation
+/// response via a single traversal of `body["choices"][0]["message"]`.
+///
+/// Images are in `choices[0].message.images[].image_url.url` (OpenRouter format).
+/// Text content is in `choices[0].message.content` (Gemini-class models return both).
+fn extract_response_parts(body: &serde_json::Value) -> ImageGenResponse {
+    let message = body["choices"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("message"));
+
+    let image_data = message
+        .and_then(|msg| msg.get("images"))
+        .and_then(|imgs| imgs.as_array())
+        .and_then(|arr| {
+            for img in arr {
+                if let Some(url) = img["image_url"]["url"].as_str()
+                    && !url.is_empty()
+                {
+                    return Some(url.to_string());
+                }
+            }
+            None
+        });
+
+    let text_content = message
+        .and_then(|msg| msg.get("content"))
+        .and_then(|v| v.as_str())
+        .and_then(|text| {
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        });
+
+    ImageGenResponse {
+        image_data,
+        text_content,
     }
 }
 
@@ -193,4 +209,177 @@ fn extract_text_content(body: &serde_json::Value) -> Option<String> {
 fn decode_data_uri(data_uri: &str) -> Option<Vec<u8>> {
     let base64_part = data_uri.split(";base64,").nth(1)?;
     STANDARD.decode(base64_part).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Helper to build a minimal response body matching the OpenRouter image gen format.
+    fn make_response(image_url: Option<&str>, text_content: Option<&str>) -> serde_json::Value {
+        let msg = match image_url {
+            Some(url) => {
+                let images = json!([{"image_url": {"url": url}}]);
+                match text_content {
+                    Some(t) => json!({"images": images, "content": t}),
+                    None => json!({"images": images}),
+                }
+            }
+            None => match text_content {
+                Some(t) => json!({"content": t}),
+                None => json!({}),
+            },
+        };
+        json!({
+            "choices": [{"message": msg}]
+        })
+    }
+
+    #[test]
+    fn test_extract_response_parts_image_and_text() {
+        let body = make_response(
+            Some("data:image/png;base64,abc123"),
+            Some("Here is your generated image"),
+        );
+        let result = extract_response_parts(&body);
+        assert_eq!(
+            result.image_data,
+            Some("data:image/png;base64,abc123".to_string())
+        );
+        assert_eq!(
+            result.text_content,
+            Some("Here is your generated image".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_response_parts_image_only() {
+        let body = make_response(Some("data:image/png;base64,def456"), None);
+        let result = extract_response_parts(&body);
+        assert_eq!(
+            result.image_data,
+            Some("data:image/png;base64,def456".to_string())
+        );
+        assert_eq!(result.text_content, None);
+    }
+
+    #[test]
+    fn test_extract_response_parts_text_only() {
+        let body = make_response(None, Some("Just text, no image"));
+        let result = extract_response_parts(&body);
+        assert_eq!(result.image_data, None);
+        assert_eq!(result.text_content, Some("Just text, no image".to_string()));
+    }
+
+    #[test]
+    fn test_extract_response_parts_empty_content() {
+        // Empty text content should yield None (preserving the empty-string guard)
+        let body = make_response(Some("data:image/png;base64,ghi789"), Some(""));
+        let result = extract_response_parts(&body);
+        assert_eq!(
+            result.image_data,
+            Some("data:image/png;base64,ghi789".to_string())
+        );
+        assert_eq!(result.text_content, None);
+    }
+
+    #[test]
+    fn test_extract_response_parts_empty_image_url() {
+        // An empty image_url.url should be skipped; falls to None if only empty URLs
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "images": [{"image_url": {"url": ""}}]
+                }
+            }]
+        });
+        let result = extract_response_parts(&body);
+        assert_eq!(result.image_data, None);
+        assert_eq!(result.text_content, None);
+    }
+
+    #[test]
+    fn test_extract_response_parts_null_fields() {
+        // Null/missing fields should be handled gracefully
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "images": null,
+                    "content": null
+                }
+            }]
+        });
+        let result = extract_response_parts(&body);
+        assert_eq!(result.image_data, None);
+        assert_eq!(result.text_content, None);
+    }
+
+    #[test]
+    fn test_extract_response_parts_empty_choices() {
+        let body = json!({"choices": []});
+        let result = extract_response_parts(&body);
+        assert_eq!(result.image_data, None);
+        assert_eq!(result.text_content, None);
+    }
+
+    #[test]
+    fn test_extract_response_parts_missing_choices() {
+        let body = json!({});
+        let result = extract_response_parts(&body);
+        assert_eq!(result.image_data, None);
+        assert_eq!(result.text_content, None);
+    }
+
+    #[test]
+    fn test_extract_response_parts_multiple_images_picks_first() {
+        // When multiple images are present, the first non-empty URL is returned
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "images": [
+                        {"image_url": {"url": "data:image/png;base64,first"}},
+                        {"image_url": {"url": "data:image/png;base64,second"}}
+                    ]
+                }
+            }]
+        });
+        let result = extract_response_parts(&body);
+        assert_eq!(
+            result.image_data,
+            Some("data:image/png;base64,first".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_response_parts_first_empty_second_valid() {
+        // Skip empty URLs, pick the first non-empty one
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "images": [
+                        {"image_url": {"url": ""}},
+                        {"image_url": {"url": "data:image/png;base64,valid"}}
+                    ]
+                }
+            }]
+        });
+        let result = extract_response_parts(&body);
+        assert_eq!(
+            result.image_data,
+            Some("data:image/png;base64,valid".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decode_data_uri_valid() {
+        let result = decode_data_uri("data:image/png;base64,aGVsbG8=");
+        assert_eq!(result, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_decode_data_uri_invalid() {
+        let result = decode_data_uri("not-a-data-uri");
+        assert_eq!(result, None);
+    }
 }
