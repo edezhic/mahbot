@@ -288,22 +288,33 @@ pub fn normalize_tool_call(name: &str, args: serde_json::Value) -> (String, serd
     (normalized_name, args)
 }
 
-fn normalize_tool_name(name: &str, mut args: serde_json::Value) -> (String, serde_json::Value) {
-    let normalized = match name {
+/// Map known tool-name aliases to their canonical names.
+///
+/// This is the single source of truth for tool-name normalization, shared by
+/// [`normalize_tool_name`] (full call normalization) and [`find_tool`] (direct
+/// lookup).  Adding a new alias here immediately affects both paths.
+///
+/// The `"glob"` alias is included because it resolves to `"search"` regardless
+/// of arguments; the parallel `mode:"files"` injection is handled separately
+/// in [`normalize_tool_name`] when args are available.
+fn normalize_tool_name_str(name: &str) -> &str {
+    match name {
         "bash" | "run_terminal_cmd" => "shell",
-        "grep" | "rg" | "grep_search" => "search",
-        "glob" => {
-            if let Some(obj) = args.as_object_mut()
-                && !obj.contains_key("mode")
-            {
-                obj.insert("mode".to_string(), serde_json::json!("files"));
-            }
-            "search"
-        }
+        "grep" | "rg" | "grep_search" | "glob" => "search",
         "read_file" => "read",
         "str_replace" => "edit",
         _ => name,
-    };
+    }
+}
+
+fn normalize_tool_name(name: &str, mut args: serde_json::Value) -> (String, serde_json::Value) {
+    if name == "glob"
+        && let Some(obj) = args.as_object_mut()
+            && !obj.contains_key("mode")
+        {
+            obj.insert("mode".to_string(), serde_json::json!("files"));
+        }
+    let normalized = normalize_tool_name_str(name);
     (normalized.to_string(), args)
 }
 
@@ -340,11 +351,12 @@ fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &st
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 ///
-/// Prefer [`normalize_tool_call`] before dispatch; this helper still maps
-/// `"grep"` → `"search"` for direct callers.
+/// Tool-name aliases are resolved via [`normalize_tool_name_str`] so that all
+/// callers benefit from the same alias mapping.  Prefer [`normalize_tool_call`]
+/// before dispatch when full argument normalization is also desired.
 #[must_use]
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    let normalized = if name == "grep" { "search" } else { name };
+    let normalized = normalize_tool_name_str(name);
     tools
         .iter()
         .find(|t| t.name() == normalized)
@@ -929,16 +941,73 @@ mod tests {
     // ── find_tool aliases ──────────────────────────────────────────
 
     #[test]
-    fn find_tool_grep_alias() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SearchTool)];
+    fn find_tool_aliases() {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(SearchTool),
+            Box::new(ShellTool::new(ShellMode::Full)),
+            Box::new(ReadTool),
+            Box::new(EditTool),
+        ];
+
+        // Canonical names
         assert!(
             find_tool(&tools, "search").is_some(),
             "search tool should be found by name"
         );
         assert!(
+            find_tool(&tools, "shell").is_some(),
+            "shell tool should be found by name"
+        );
+        assert!(
+            find_tool(&tools, "read").is_some(),
+            "read tool should be found by name"
+        );
+        assert!(
+            find_tool(&tools, "edit").is_some(),
+            "edit tool should be found by name"
+        );
+
+        // Shell aliases
+        assert!(
+            find_tool(&tools, "bash").is_some(),
+            "bash alias should resolve to shell tool"
+        );
+        assert!(
+            find_tool(&tools, "run_terminal_cmd").is_some(),
+            "run_terminal_cmd alias should resolve to shell tool"
+        );
+
+        // Search aliases
+        assert!(
             find_tool(&tools, "grep").is_some(),
             "grep alias should resolve to search tool"
         );
+        assert!(
+            find_tool(&tools, "rg").is_some(),
+            "rg alias should resolve to search tool"
+        );
+        assert!(
+            find_tool(&tools, "grep_search").is_some(),
+            "grep_search alias should resolve to search tool"
+        );
+        assert!(
+            find_tool(&tools, "glob").is_some(),
+            "glob alias should resolve to search tool"
+        );
+
+        // Read aliases
+        assert!(
+            find_tool(&tools, "read_file").is_some(),
+            "read_file alias should resolve to read tool"
+        );
+
+        // Edit aliases
+        assert!(
+            find_tool(&tools, "str_replace").is_some(),
+            "str_replace alias should resolve to edit tool"
+        );
+
+        // Unknown tool
         assert!(
             find_tool(&tools, "unknown").is_none(),
             "unknown tool should return None"
