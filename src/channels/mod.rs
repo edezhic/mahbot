@@ -355,33 +355,16 @@ async fn remove_temp_file(path: &std::path::Path) {
     let _ = tokio::fs::remove_file(path).await;
 }
 
-/// Apply enrichment post-processing: append upload annotations (multimodal
-/// only), strip markers according to strategy, and prepend text annotations.
+/// Apply enrichment post-processing: strip markers according to strategy
+/// and prepend text annotations. This is a pure function that takes the
+/// content (with any replacements already applied) and returns the final
+/// content string.
 fn finish_enrichment(
-    msg: &mut ChannelMessage,
     annotations: &[String],
     strategy: &EnrichmentStrategy,
-    result: &mut String,
-    modified: &mut bool,
-    upload_annotations: &[String],
-) {
-    // ── Multimodal-specific post-processing ──
-    // Append upload path annotations so the model can reference saved files.
-    // Invariant: upload_annotations is only populated when `modified` is already
-    // true (both are set together in the Multimodal IMAGE handler), so the
-    // annotation block is always appended (never prepended).
-    if !upload_annotations.is_empty() {
-        let annotation_block = upload_annotations.join("\n");
-        let _ = write!(result, "\n\n{annotation_block}");
-    }
-
-    if *modified {
-        msg.content.clone_from(result);
-    }
-
-    // ── Strip markers — must run AFTER applying `result` to `msg.content`    ──
-    // because `result` contains the multimodal IMAGE replacements (data URIs)
-    // and the markers to strip (AUDIO/VIDEO) are still in `msg.content`.
+    content: &str,
+) -> String {
+    // ── Strip markers ──
     let cleaned = match strategy {
         EnrichmentStrategy::Multimodal { .. } => {
             // Strip AUDIO and VIDEO markers; preserve IMAGE markers for vision API
@@ -389,7 +372,7 @@ fn finish_enrichment(
             // pattern used by parse_image_markers() in compatible.rs — MEDIA_MARKER_RE
             // is the single canonical source of truth for all media marker patterns.
             MEDIA_MARKER_RE
-                .replace_all(&msg.content, |caps: &regex::Captures| {
+                .replace_all(content, |caps: &regex::Captures| {
                     match caps.get(1).unwrap().as_str() {
                         "IMAGE" => caps.get(0).unwrap().as_str().to_string(),
                         _ => String::new(),
@@ -399,21 +382,21 @@ fn finish_enrichment(
         }
         EnrichmentStrategy::NonMultimodal => {
             // Strip all markers; annotations are prepended by the caller above.
-            MEDIA_MARKER_RE.replace_all(&msg.content, "").to_string()
+            MEDIA_MARKER_RE.replace_all(content, "").to_string()
         }
     };
     let cleaned = cleaned.trim().to_string();
 
     // ── Prepend annotations (if any) ──
-    if !annotations.is_empty() {
+    if annotations.is_empty() {
+        cleaned
+    } else {
         let prefix = annotations.join("\n");
-        msg.content = if cleaned.is_empty() {
+        if cleaned.is_empty() {
             prefix
         } else {
             format!("{prefix}\n\n{cleaned}")
-        };
-    } else if cleaned != msg.content {
-        msg.content = cleaned;
+        }
     }
 }
 
@@ -433,7 +416,6 @@ fn finish_enrichment(
 /// after processing.
 pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrategy) {
     let mut annotations: Vec<String> = Vec::new();
-    let mut modified = false;
     let mut result = msg.content.clone();
     // Only populated/used in Multimodal mode — always empty in NonMultimodal.
     let mut upload_annotations: Vec<String> = Vec::new();
@@ -461,7 +443,6 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                             upload_annotation,
                         } => {
                             result = result.replacen(whole.as_str(), &replacement, 1);
-                            modified = true;
                             if let Some(ann) = upload_annotation {
                                 upload_annotations.push(ann);
                             }
@@ -482,9 +463,8 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
             "VIDEO" => match strategy {
                 EnrichmentStrategy::Multimodal { .. } => {
                     // No native video support in chat completions — strip silently.
-                    // The marker will be stripped by the conditional closure in
-                    // finish_enrichment below (all non-IMAGE markers are removed
-                    // in multimodal mode).
+                    // The marker will be stripped by finish_enrichment below
+                    // (all non-IMAGE markers are removed in multimodal mode).
                     remove_temp_file(path_obj).await;
                 }
                 EnrichmentStrategy::NonMultimodal => {
@@ -507,14 +487,17 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
         }
     }
 
-    finish_enrichment(
-        msg,
-        &annotations,
-        strategy,
-        &mut result,
-        &mut modified,
-        &upload_annotations,
-    );
+    // ── Multimodal-specific post-processing ──
+    // Append upload path annotations so the model can reference saved files.
+    // Invariant: upload_annotations is only populated in Multimodal mode,
+    // when a local IMAGE file was successfully copied to the workspace uploads
+    // directory.
+    if !upload_annotations.is_empty() {
+        let annotation_block = upload_annotations.join("\n");
+        let _ = write!(result, "\n\n{annotation_block}");
+    }
+
+    msg.content = finish_enrichment(&annotations, strategy, &result);
 }
 
 /// Transcribe a local image file into a text description.
