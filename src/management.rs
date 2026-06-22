@@ -1380,8 +1380,8 @@ fn build_analyst_summary(
 /// duplication while preserving exact behavioral semantics.
 ///
 /// When the target is [`TicketPhase::Failed`], the workspace is also paused
-/// automatically via `notify_ticket` → [`notify_ticket`] (called from
-/// [`transition_ticket`] with `notify=true`).
+/// automatically via [`notify_ticket`], called from
+/// [`transition_ticket`] with `notify=true`.
 ///
 /// # Self-counting prevention
 ///
