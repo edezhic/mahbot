@@ -81,7 +81,10 @@ async fn check_response(
 /// # Errors
 ///
 /// - Invalid JSON: the formatted error described above.
-fn parse_json_response(body_text: &str, error_context: &str) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn parse_json_response(
+    body_text: &str,
+    error_context: &str,
+) -> anyhow::Result<serde_json::Value> {
     serde_json::from_str(body_text).map_err(|e| {
         anyhow::anyhow!(
             "{error_context} response parse error: {e}\nraw response body ({}): {body_text:.500}",

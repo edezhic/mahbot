@@ -150,12 +150,7 @@ impl AudioTranscriber {
             return Err(anyhow::Error::from(provider_err));
         }
 
-        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to parse transcription response: {e}\nraw response body ({}): {body:.500}",
-                body.len(),
-            )
-        })?;
+        let json = crate::util::http::parse_json_response(&body, "audio transcription")?;
 
         json.get("text")
             .and_then(|v| v.as_str())
