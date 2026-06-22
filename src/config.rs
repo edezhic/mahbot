@@ -256,6 +256,31 @@ fn resolve_or(val: Option<String>, fallback: &str) -> String {
     non_empty(val).unwrap_or_else(|| fallback.to_string())
 }
 
+/// Parse a newline-separated list field, falling back to a singular field, then to a hardcoded
+/// default.
+///
+/// If `list_field` is `Some` and contains at least one non-empty line (after trimming), the parsed
+/// lines are returned as a `Vec<String>`. Otherwise a single-element vec containing the resolved
+/// value of `fallback_field` (or `default_value`) is returned.
+#[must_use]
+fn resolve_list_or(
+    list_field: Option<&String>,
+    fallback_field: Option<String>,
+    default_value: &str,
+) -> Vec<String> {
+    if let Some(raw) = list_field {
+        let parsed: Vec<String> = raw
+            .split('\n')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    vec![resolve_or(fallback_field, default_value)]
+}
+
 /// Expand a leading tilde (`~`) to the user's home directory.
 ///
 /// Checks `$HOME` first (Unix, Git Bash on Windows), then `$USERPROFILE`
@@ -493,21 +518,12 @@ impl ConfigReload {
     /// (or the hardcoded default).
     #[must_use]
     pub fn image_gen_models(&self) -> Vec<String> {
-        let data = self.read();
-        if let Some(ref raw) = data.image_gen_models {
-            let parsed: Vec<String> = raw
-                .split('\n')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !parsed.is_empty() {
-                return parsed;
-            }
-        }
-        vec![resolve_or(
-            data.image_gen_model.clone(),
+        let guard = self.read();
+        resolve_list_or(
+            guard.image_gen_models.as_ref(),
+            guard.image_gen_model.clone(),
             DEFAULT_IMAGE_GEN_MODEL,
-        )]
+        )
     }
 
     /// Get the list of available video generation models for selection UI.
@@ -517,21 +533,12 @@ impl ConfigReload {
     /// (or the hardcoded default).
     #[must_use]
     pub fn video_gen_models(&self) -> Vec<String> {
-        let data = self.read();
-        if let Some(ref raw) = data.video_gen_models {
-            let parsed: Vec<String> = raw
-                .split('\n')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !parsed.is_empty() {
-                return parsed;
-            }
-        }
-        vec![resolve_or(
-            data.video_gen_model.clone(),
+        let guard = self.read();
+        resolve_list_or(
+            guard.video_gen_models.as_ref(),
+            guard.video_gen_model.clone(),
             DEFAULT_VIDEO_GEN_MODEL,
-        )]
+        )
     }
 
     /// Get the configured Exa API key, with empty/whitespace values collapsed to `None`.
