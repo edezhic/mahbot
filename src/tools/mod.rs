@@ -787,9 +787,11 @@ pub fn unknown_tool_message(call_name: &str) -> String {
 ///    `"../etc/passwd"`, `"foo/../../bar"`) are denied.
 /// 5. **URL-encoded traversal** — Patterns `..%2f` and `%2f..` (case-insensitive)
 ///    are denied, covering percent-encoded bypass attempts.
-/// 6. **Tilde validation** — Bare `~` and `~/…` are accepted; everything else
-///    starting with `~` (e.g. `~root`, `~nobody`) is denied to prevent access
-///    to other users' home directories.
+/// 6. **Tilde validation** — Bare `~` is shorthand for the workspace root
+///    (see [`resolve_tool_path_with_base`]), `~/…` expands to the user's home
+///    directory and must be inside the workspace; everything else starting with
+///    `~` (e.g. `~root`, `~nobody`) is denied to prevent access to other users'
+///    home directories.
 /// 7. **Tilde expansion** — The leading `~` (if present) is expanded to the
 ///    current user's home directory.
 /// 8. **Absolute path prefix check** — Absolute paths (including those produced
@@ -809,6 +811,10 @@ pub fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
     if path.is_empty() {
         return true; // empty after trim → relative, safe
+    }
+    // Bare tilde is shorthand for workspace root (see resolve_tool_path_with_base)
+    if path == "~" {
+        return true;
     }
     if path.contains('\0') {
         return false;
@@ -1125,6 +1131,34 @@ mod tests {
             &workspace
         ));
         assert!(is_path_safe_for_workspace("relative.txt", &workspace));
+    }
+
+    #[test]
+    fn bare_tilde_is_allowed_as_workspace_root_shorthand() {
+        // Bare ~ is shorthand for the workspace root — is_path_safe_for_workspace
+        // must accept it, matching resolve_tool_path_with_base's behaviour.
+        // Write operations are still protected by the post-canonicalization
+        // parent check in resolve_write_target (the parent of workspace root
+        // is outside the workspace).
+        let base = Path::new(".");
+        // Pathological: bare tilde with no workspace context
+        assert!(is_path_safe_for_workspace("~", base));
+        // Bare tilde with leading/trailing whitespace (trimmed before check)
+        assert!(is_path_safe_for_workspace("  ~", base));
+        assert!(is_path_safe_for_workspace("~  ", base));
+        assert!(is_path_safe_for_workspace("  ~  ", base));
+
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().to_path_buf();
+        assert!(is_path_safe_for_workspace("~", &workspace));
+
+        // ~/… still correctly resolved relative to home and blocked if outside
+        // workspace (sensitive files like .ssh should never pass)
+        assert!(!is_path_safe_for_workspace("~/.ssh/id_rsa", &workspace));
+        assert!(!is_path_safe_for_workspace(
+            "~/.gnupg/secring.gpg",
+            &workspace
+        ));
     }
 
     #[test]
