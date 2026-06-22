@@ -41,7 +41,8 @@ impl Tool for VideoGenTool {
                 "images": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Paths to reference/start images for image-to-video generation"
+                    "description": "Path to a reference/start image for image-to-video generation (single image only)",
+                    "maxItems": 1
                 },
                 "duration": {
                     "type": "integer",
@@ -127,6 +128,14 @@ impl Tool for VideoGenTool {
 
         // Optional: add reference image via input_references
         let images: Vec<String> = super::get_str_array(&args, "images");
+
+        if images.len() > 1 {
+            anyhow::bail!(
+                "Video generation supports only a single reference image (received {}). \
+                 Retry with exactly one image.",
+                images.len(),
+            );
+        }
 
         if let Some(img_path) = images.first() {
             match crate::util::load_reference_image(
