@@ -402,15 +402,26 @@ impl ConfigReload {
 
     // ── Per-role model resolution ───────────────────────────────
 
+    /// Find the per-role override config for a given role, if one exists.
+    ///
+    /// Returns `None` when no matching override is configured in
+    /// `per_role_configs`.
+    fn find_role_config(&self, role: Role) -> Option<RoleConfig> {
+        let role_key: &str = role.into();
+        let guard = self.read();
+        guard
+            .per_role_configs
+            .iter()
+            .find(|rc| rc.role == role_key)
+            .cloned()
+    }
+
     /// Resolve the configured model for a role.
     ///
     /// Priority: per-role override → role info default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
-        let role_key: &str = role.into();
-        let guard = self.read();
-        // Check per-role override
-        if let Some(rc) = guard.per_role_configs.iter().find(|rc| rc.role == role_key)
+        if let Some(rc) = self.find_role_config(role)
             && let Some(ref m) = rc.model
             && !m.is_empty()
         {
@@ -425,10 +436,7 @@ impl ConfigReload {
     /// Priority: per-role override → role info default.
     #[must_use]
     pub fn role_reasoning_effort(&self, role: Role) -> Option<String> {
-        let role_key: &str = role.into();
-        let guard = self.read();
-        // Check per-role override
-        if let Some(rc) = guard.per_role_configs.iter().find(|rc| rc.role == role_key)
+        if let Some(rc) = self.find_role_config(role)
             && let Some(ref r) = rc.reasoning_effort
             && !r.is_empty()
         {
