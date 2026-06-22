@@ -775,7 +775,7 @@ pub fn unknown_tool_message(call_name: &str) -> String {
 
 // ── Path validation ──────────────────────────
 
-/// Check whether `path` is safe to access within the given `workspace_base`.
+/// Check whether `path` is safe to access within the given `workspace_root`.
 ///
 /// This is the central security gate for all file-path operations. It performs
 /// the following checks in order:
@@ -795,7 +795,7 @@ pub fn unknown_tool_message(call_name: &str) -> String {
 /// 7. **Tilde expansion** — The leading `~` (if present) is expanded to the
 ///    current user's home directory.
 /// 8. **Absolute path prefix check** — Absolute paths (including those produced
-///    by tilde expansion) must start with `workspace_base`. This is a lexical
+///    by tilde expansion) must start with `workspace_root`. This is a lexical
 ///    check only — no I/O is performed.
 /// 9. **Relative path allowance** — Relative paths that pass all previous checks
 ///    (no traversal, no null bytes, valid tilde) are unconditionally allowed.
@@ -807,7 +807,7 @@ pub fn unknown_tool_message(call_name: &str) -> String {
 /// checks (see `resolve_write_target` / `resolve_read_target`), which catch
 /// symlink-based escapes that could bypass this pre-check.
 #[must_use]
-pub fn is_path_safe_for_workspace(path: &str, workspace_base: &Path) -> bool {
+pub fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
     if path.is_empty() {
         return true; // empty after trim → relative, safe
@@ -832,32 +832,32 @@ pub fn is_path_safe_for_workspace(path: &str, workspace_base: &Path) -> bool {
     if expanded_path.is_absolute() {
         // Lexical prefix check — no sync I/O.
         //
-        // Safety: workspace_base is pre-canonicalized at workspace registration
+        // Safety: workspace_root is pre-canonicalized at workspace registration
         // (see canonicalize_workspace_path in workspace.rs). The lexical check
         // may reject absolute paths whose prefix is a symlink into the workspace
         // (e.g. /tmp/… when the real workspace is /private/tmp/… on macOS), but
         // this is harmless: agents use relative paths, and the post-canonicalization
         // checks in resolve_read_target / resolve_write_target catch any symlink
         // escapes that would bypass this pre-check.
-        expanded_path.starts_with(workspace_base)
+        expanded_path.starts_with(workspace_root)
     } else {
         // Relative path without parent-dir components — always safe
         true
     }
 }
 
-/// Resolve a user path segment against `workspace_base`.
+/// Resolve a user path segment against `workspace_root`.
 #[must_use]
-pub fn resolve_tool_path_with_base(path: &str, workspace_base: &Path) -> PathBuf {
+pub fn resolve_tool_path_with_base(path: &str, workspace_root: &Path) -> PathBuf {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "~" {
-        return workspace_base.to_path_buf();
+        return workspace_root.to_path_buf();
     }
     let expanded = crate::config::expand_tilde(trimmed);
     if expanded.is_absolute() {
         return expanded;
     }
-    workspace_base.join(expanded)
+    workspace_root.join(expanded)
 }
 
 /// Save generated media bytes to `workspace/generated/{prefix}_{timestamp}.{ext}`.
