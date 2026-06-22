@@ -840,9 +840,9 @@ impl BoardStore {
     /// separate SELECT + UPDATE window). Pipeline-blocking statuses are defined
     /// in [`PIPELINE_BLOCKING_STATUSES`].
     ///
-    /// Note that a reserved ReadyForDevelopment ticket (see
-    /// [`set_pipeline_reservation`](Self::set_pipeline_reservation)) is **not**
-    /// treated as a pipeline blocker for the purpose of this claim. This
+    /// Note that a reserved ReadyForDevelopment ticket (one with
+    /// `pipeline_reservation = 1`) is **not** treated as a pipeline blocker for
+    /// the purpose of this claim. This
     /// asymmetry with [`has_pipeline_blocker_for_workspace`](Self::has_pipeline_blocker_for_workspace)
     /// (which does treat reserved ReadyForDevelopment as a blocker for the
     /// maintainer) is intentional: the claim subquery orders by
@@ -1152,30 +1152,6 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Set or clear the pipeline reservation on a ticket.
-    ///
-    /// Pipeline reservations are set on tickets that are bounced back from
-    /// diagnostics/review/QA to `ReadyForDevelopment`, ensuring they are
-    /// claimed by the engineer before any other `ReadyForDevelopment` ticket.
-    ///
-    /// The reservation is cleared when the ticket is claimed by the engineer
-    /// (via [`claim_ticket_in_workspace`](Self::claim_ticket_in_workspace)),
-    /// transitions to a terminal phase, or is explicitly cleared here.
-    ///
-    /// Does NOT cancel running agents — callers should cancel agents separately
-    /// if needed (reservation is metadata, not a runtime intervention).
-    pub async fn set_pipeline_reservation(&self, id: &str, reserved: bool) -> Result<()> {
-        let rows = self
-            .conn
-            .execute(
-                "UPDATE tickets SET pipeline_reservation = ?1, updated_at = ?2 WHERE id = ?3",
-                turso::params![i64::from(reserved), turso::now(), id],
-            )
-            .await?;
-        Self::ensure_ticket_found(rows, id, "set pipeline reservation")?;
-        Ok(())
-    }
-
     /// Transition a ticket to `target_phase` while atomically setting the
     /// pipeline reservation to `reservation`.
     ///
@@ -1184,7 +1160,7 @@ impl BoardStore {
     /// for bounce-back transitions (diagnostics/review/QA failure →
     /// ReadyForDevelopment) to avoid a race where a non-reserved ticket is
     /// claimed between the transition and the subsequent
-    /// [`set_pipeline_reservation`](Self::set_pipeline_reservation) call.
+    /// separate call to set the reservation.
     pub async fn transition_to_with_reservation(
         &self,
         id: &str,
@@ -2211,7 +2187,12 @@ mod tests {
 
         // Set reservation on the second ticket
         store
-            .set_pipeline_reservation(&reserved_id, true)
+            .transition_to_with_reservation(
+                &reserved_id,
+                Some(TicketPhase::ReadyForDevelopment),
+                TicketPhase::ReadyForDevelopment,
+                true,
+            )
             .await
             .expect("set reservation");
 
@@ -2287,7 +2268,12 @@ mod tests {
 
         // After setting reservation, it should be a blocker
         store
-            .set_pipeline_reservation(&id, true)
+            .transition_to_with_reservation(
+                &id,
+                Some(TicketPhase::ReadyForDevelopment),
+                TicketPhase::ReadyForDevelopment,
+                true,
+            )
             .await
             .expect("set reservation");
         assert!(
@@ -2300,7 +2286,12 @@ mod tests {
 
         // After removing reservation, it should not be a blocker
         store
-            .set_pipeline_reservation(&id, false)
+            .transition_to_with_reservation(
+                &id,
+                Some(TicketPhase::ReadyForDevelopment),
+                TicketPhase::ReadyForDevelopment,
+                false,
+            )
             .await
             .expect("clear reservation");
         assert!(
