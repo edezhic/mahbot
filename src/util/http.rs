@@ -41,6 +41,38 @@ pub fn bearer_auth_header() -> String {
     )
 }
 
+/// Extract the first 4xx HTTP status code from a formatted error message.
+///
+/// Status codes appear in messages like
+/// "OpenAI API error (400): ..." or "429 Too Many Requests".
+/// This scans for any 4xx number; it is the only viable approach since
+/// the typed `reqwest::Error` chain is not always preserved by the caller.
+///
+/// Used by:
+/// - [`classify_err`](crate::providers::reliable) (string-fallback error path)
+/// - [`VideoGenTool`](crate::tools::video_gen::VideoGenTool) (402 credit detection)
+///
+/// Both consumers depend on the error format produced by [`check_response`]:
+/// `"{error_context} API error ({status}): {preview}"`.
+/// This shared extractor centralises the string-based status parsing so
+/// that format changes only need updating in one place.
+///
+/// # Limitations
+///
+/// - May produce false positives if error messages contain other 400-500
+///   range numbers (e.g. a field value of 400).  This is an accepted risk
+///   shared by all string-parsing approaches.
+/// - A more robust solution would refactor `check_response` to return a
+///   typed `ProviderError` with a structured status code — this is a
+///   future improvement left for when the error handling infrastructure
+///   is revisited more broadly.
+#[must_use]
+pub(crate) fn extract_http_status(msg: &str) -> Option<u16> {
+    msg.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|w| w.parse::<u16>().ok())
+        .find(|&code| (400..500).contains(&code))
+}
+
 /// Check that an HTTP response has a successful status code.
 ///
 /// If the status is 2xx the response is returned unmodified for further
@@ -51,9 +83,10 @@ pub fn bearer_auth_header() -> String {
 ///
 /// `"{error_context} API error ({status}): {preview}"`
 ///
-/// **Important:** [`crate::tools::video_gen`] string-matches `"(402)"` in this
-/// exact format to detect insufficient credits.  Any format change will silently
-/// break that logic.
+/// **Important:** Both [`extract_http_status`] and callers that parse status
+/// codes from this error format (e.g. [`VideoGenTool`](crate::tools::video_gen::VideoGenTool))
+/// depend on exactly this format.  Any format change will silently break
+/// those consumers.
 ///
 /// # Errors
 ///
@@ -236,4 +269,117 @@ pub fn build_http_client(timeout: Duration) -> reqwest::Client {
             );
             reqwest::Client::new()
         })
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_http_status_detects_4xx() {
+        // ── Table-driven tests for extract_http_status ──
+        // Format: (message_snippet, expected_status_code, description)
+        //
+        // The test covers:
+        // - Standard 4xx codes from check_response format
+        // - Two-digit and three-digit 4xx codes
+        // - Non-4xx numbers (2xx, 5xx) that should be ignored
+        // - No status code at all
+        // - Numbers embedded in other contexts (field values, etc.)
+        let cases: Vec<(&str, Option<u16>, &str)> = vec![
+            (
+                "API error (402): Insufficient credits",
+                Some(402),
+                "402 payment required — primary use case",
+            ),
+            (
+                "Video generation submission API error (402):",
+                Some(402),
+                "402 in video_gen format",
+            ),
+            (
+                "OpenAI API error (400): Bad Request",
+                Some(400),
+                "400 bad request",
+            ),
+            (
+                "API error (401): Unauthorized",
+                Some(401),
+                "401 unauthorized",
+            ),
+            ("API error (403): Forbidden", Some(403), "403 forbidden"),
+            ("API error (404): Not Found", Some(404), "404 not found"),
+            (
+                "API error (408): Request Timeout",
+                Some(408),
+                "408 request timeout",
+            ),
+            (
+                "API error (429): Too Many Requests",
+                Some(429),
+                "429 too many requests",
+            ),
+            (
+                "500 Server Error",
+                None,
+                "5xx ignored — not in 400-500 range",
+            ),
+            ("502 Bad Gateway", None, "5xx ignored"),
+            ("200 OK", None, "2xx ignored"),
+            ("connection reset", None, "no status code at all"),
+            ("", None, "empty string"),
+            (
+                "field value is 400 but should be rejected",
+                Some(400),
+                "number in body text within range — accepted false positive",
+            ),
+            ("error code 1113", None, "four-digit number outside range"),
+            (
+                "HTTP 402 Payment Required",
+                Some(402),
+                "bare status in message without parens",
+            ),
+            ("Status 429", Some(429), "bare two-digit-then-three-digit"),
+        ];
+
+        for (msg, expected, description) in cases {
+            let result = extract_http_status(msg);
+            assert_eq!(
+                result, expected,
+                "extract_http_status({msg:?}): expected {expected:?}, got {result:?} — {description}",
+            );
+        }
+    }
+
+    #[test]
+    fn extract_http_status_handles_adjacent_text() {
+        // Numbers adjacent to other text without delimiters
+        assert_eq!(
+            extract_http_status("API error (402)"),
+            Some(402),
+            "parenthesised status"
+        );
+        assert_eq!(
+            extract_http_status("code402"),
+            Some(402),
+            "digits adjacent to text without delimiter"
+        );
+        assert_eq!(
+            extract_http_status("402error"),
+            Some(402),
+            "digits followed by text"
+        );
+        assert_eq!(
+            extract_http_status("error402error"),
+            Some(402),
+            "digits surrounded by text"
+        );
+        assert_eq!(
+            extract_http_status("value_is_400"),
+            Some(400),
+            "400 as part of identifier — accepted false positive"
+        );
+    }
 }

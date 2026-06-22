@@ -1,5 +1,6 @@
 use super::Provider;
 use crate::providers::error::ProviderError;
+use crate::util::http::extract_http_status;
 use crate::{ChatRequest, ChatResponse, StreamEvent, StreamResult};
 use async_trait::async_trait;
 use futures_util::stream;
@@ -83,18 +84,6 @@ const BILLING_HINTS: &[&str] = &[
     "error code 1113",
 ];
 
-/// Extract the first 4xx HTTP status code from a formatted error message.
-///
-/// Status codes appear in messages like
-/// "OpenAI API error (400): ..." or "429 Too Many Requests".
-/// This scans for any 4xx number; it is the only viable approach since
-/// the typed reqwest::Error chain is not preserved by the caller.
-fn extract_http_status(msg: &str) -> Option<u16> {
-    msg.split(|c: char| !c.is_ascii_digit())
-        .filter_map(|w| w.parse::<u16>().ok())
-        .find(|&code| (400..500).contains(&code))
-}
-
 /// Fallback classification for errors without a recognized 4xx status code.
 /// Checks auth keywords, model-not-found patterns, then defaults to retryable.
 fn classify_fallback(lower: &str) -> ErrorClass {
@@ -163,7 +152,7 @@ fn is_non_retryable_4xx(code: u16) -> bool {
 ///    `is_status()` via [`classify_transport_err`] — avoids string-matching transport
 ///    error messages
 /// 4. **String-fallback path** (no structured wrapper): extract HTTP status from
-///    string via `extract_http_status`, then dispatch via
+///    string via [`crate::util::http::extract_http_status`], then dispatch via
 ///    [`classify_by_status_code`]
 fn classify_err(err: &anyhow::Error) -> ErrorClass {
     let msg = err.to_string();
