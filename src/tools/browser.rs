@@ -46,7 +46,7 @@ pub enum BrowserAction {
     GetText { selector: String },
     /// Extract visible rendered text from an element by CSS selector
     /// (uses `innerText()` — no `<script>` or `<style>` content).
-    #[serde(alias = "get_innertext")]
+    #[serde(alias = "get_innertext", alias = "innertext")]
     GetInnerText { selector: String },
     /// Get current URL.
     GetUrl {},
