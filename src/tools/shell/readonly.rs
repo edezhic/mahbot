@@ -1612,4 +1612,14 @@ mod tests {
     fn rm_under_tmp_still_rejected() {
         assert_rejected("rm /tmp/scratch.txt");
     }
+
+    #[test]
+    fn scratch_mutators_are_subset_of_mutating_commands() {
+        for cmd in SCRATCH_MUTATORS {
+            assert!(
+                MUTATING_COMMANDS.contains(cmd),
+                "SCRATCH_MUTATORS entry '{cmd}' must also be in MUTATING_COMMANDS"
+            );
+        }
+    }
 }
