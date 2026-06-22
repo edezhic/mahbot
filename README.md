@@ -1,10 +1,10 @@
 # MahBot
 
-Experimental harness aiming at reliable autonomous development with minimal supervision while heavily using cheap models. As of now integrated with telegram as primary user interface, and includes a native GUI dashboard if you want to see the details.
+Experimental harness aiming at reliable autonomous development with minimal supervision while heavily using cheap models. 
 
 ## Features
 
-- You are talking to the manager; he orchestrates ticket-based pipeline with pre- and post-dev verification stages
+- You are talking to the manager agent, he orchestrates the rest
 - Background maintainer always looking for refactoring opportunities
 
 ## Goals
