@@ -144,7 +144,7 @@ impl Workspace {
     /// workspace is not found in the database.
     ///
     /// The name is derived from the last path component (directory name).
-    /// The stored path is canonicalized so that `is_path_allowed_with_base`
+    /// The stored path is canonicalized so that `is_path_safe_for_workspace`
     /// (which uses lexical `starts_with`) produces correct results even
     /// when the workspace base is behind a symlink (e.g. `/tmp` → `/private/tmp`
     /// on macOS).

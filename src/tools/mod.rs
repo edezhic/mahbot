@@ -385,7 +385,7 @@ pub(crate) async fn resolve_directory_read_fallback(full_path: &Path) -> Option<
 
 /// Resolve and validate a file target for write/edit operations.
 ///
-/// Path security is enforced via [`is_path_allowed_with_base`] (pre- and
+/// Path security is enforced via [`is_path_safe_for_workspace`] (pre- and
 /// post-canonicalization). Extra read paths (spill files, dependency caches)
 /// are **not** allowed for writes.
 ///
@@ -406,7 +406,7 @@ pub async fn resolve_write_target(
     let full_path = resolve_tool_path_with_base(path, workspace_root);
 
     // Pre-canonicalization check — strict, no extra allowed paths
-    if !is_path_allowed_with_base(path, workspace_root) {
+    if !is_path_safe_for_workspace(path, workspace_root) {
         anyhow::bail!("Path not allowed by security policy: {path}");
     }
 
@@ -425,7 +425,7 @@ pub async fn resolve_write_target(
         .await
         .context("Failed to resolve file path")?;
 
-    if !is_path_allowed_with_base(&resolved_parent.to_string_lossy(), workspace_root) {
+    if !is_path_safe_for_workspace(&resolved_parent.to_string_lossy(), workspace_root) {
         anyhow::bail!(
             "Path not allowed by security policy: {}",
             resolved_parent.display()
@@ -525,11 +525,11 @@ fn is_path_in_extra_allowed(path: &Path) -> bool {
 
 /// Check that a path is allowed by the read-path security policy.
 ///
-/// The path must be either within the workspace (via [`is_path_allowed_with_base`])
+/// The path must be either within the workspace (via [`is_path_safe_for_workspace`])
 /// or under one of the [`EXTRA_READ_ALLOWED`] directories (temp files,
 /// dependency caches, SDK headers, etc.).
 fn check_path_read_allowed(path: &str, workspace_root: &Path) -> anyhow::Result<()> {
-    if !is_path_allowed_with_base(path, workspace_root)
+    if !is_path_safe_for_workspace(path, workspace_root)
         && !is_path_in_extra_allowed(Path::new(path))
     {
         anyhow::bail!("Path not allowed by security policy: {path}");
@@ -775,9 +775,39 @@ pub fn unknown_tool_message(call_name: &str) -> String {
 
 // ── Path validation ──────────────────────────
 
-/// Check if a file path is allowed within the given workspace base.
+/// Check whether `path` is safe to access within the given `workspace_base`.
+///
+/// This is the central security gate for all file-path operations. It performs
+/// the following checks in order:
+///
+/// 1. **Whitespace trimming** — Leading/trailing whitespace is stripped before
+///    any other check, preventing trivial bypass attempts (e.g. `"  ../etc"`).
+/// 2. **Empty / whitespace-only paths** — After trimming, an empty path is
+///    treated as relative and allowed (safe).
+/// 3. **Null byte rejection** — Paths containing `\0` are immediately denied.
+/// 4. **Parent directory traversal** — Paths with `..` components (e.g.
+///    `"../etc/passwd"`, `"foo/../../bar"`) are denied.
+/// 5. **URL-encoded traversal** — Patterns `..%2f` and `%2f..` (case-insensitive)
+///    are denied, covering percent-encoded bypass attempts.
+/// 6. **Tilde validation** — Bare `~` and `~/…` are accepted; everything else
+///    starting with `~` (e.g. `~root`, `~nobody`) is denied to prevent access
+///    to other users' home directories.
+/// 7. **Tilde expansion** — The leading `~` (if present) is expanded to the
+///    current user's home directory.
+/// 8. **Absolute path prefix check** — Absolute paths (including those produced
+///    by tilde expansion) must start with `workspace_base`. This is a lexical
+///    check only — no I/O is performed.
+/// 9. **Relative path allowance** — Relative paths that pass all previous checks
+///    (no traversal, no null bytes, valid tilde) are unconditionally allowed.
+///
+/// # Note
+///
+/// The prefix check for absolute paths is purely lexical and does not
+/// canonicalize the input. The caller is responsible for any post-canonicalization
+/// checks (see `resolve_write_target` / `resolve_read_target`), which catch
+/// symlink-based escapes that could bypass this pre-check.
 #[must_use]
-pub fn is_path_allowed_with_base(path: &str, workspace_base: &Path) -> bool {
+pub fn is_path_safe_for_workspace(path: &str, workspace_base: &Path) -> bool {
     let path = path.trim();
     if path.is_empty() {
         return true; // empty after trim → relative, safe
@@ -1051,73 +1081,76 @@ mod tests {
     #[test]
     fn path_traversal_edge_cases() {
         let base = Path::new(".");
-        assert!(!is_path_allowed_with_base("../etc/passwd", base));
-        assert!(!is_path_allowed_with_base("foo/../etc/passwd", base));
-        assert!(is_path_allowed_with_base("my..file.txt", base));
-        assert!(!is_path_allowed_with_base("foo/..%2f..%2fetc/passwd", base));
+        assert!(!is_path_safe_for_workspace("../etc/passwd", base));
+        assert!(!is_path_safe_for_workspace("foo/../etc/passwd", base));
+        assert!(is_path_safe_for_workspace("my..file.txt", base));
+        assert!(!is_path_safe_for_workspace(
+            "foo/..%2f..%2fetc/passwd",
+            base
+        ));
     }
 
     #[test]
     fn path_blocked_system_and_sensitive() {
         let base = Path::new(".");
-        assert!(!is_path_allowed_with_base("file\0.txt", base));
-        assert!(!is_path_allowed_with_base(
+        assert!(!is_path_safe_for_workspace("file\0.txt", base));
+        assert!(!is_path_safe_for_workspace(
             "/proc/self/root/etc/passwd",
             base
         ));
-        assert!(!is_path_allowed_with_base("/var/run/docker.sock", base));
-        assert!(!is_path_allowed_with_base("~/.ssh/id_rsa", base));
-        assert!(!is_path_allowed_with_base("~/.gnupg/secring.gpg", base));
-        assert!(!is_path_allowed_with_base("~root/.ssh/id_rsa", base));
-        assert!(!is_path_allowed_with_base("~nobody", base));
+        assert!(!is_path_safe_for_workspace("/var/run/docker.sock", base));
+        assert!(!is_path_safe_for_workspace("~/.ssh/id_rsa", base));
+        assert!(!is_path_safe_for_workspace("~/.gnupg/secring.gpg", base));
+        assert!(!is_path_safe_for_workspace("~root/.ssh/id_rsa", base));
+        assert!(!is_path_safe_for_workspace("~nobody", base));
     }
 
     #[test]
     fn checklist_path_blocking() {
         let base = Path::new(".");
-        assert!(!is_path_allowed_with_base("/", base));
-        assert!(!is_path_allowed_with_base("/anything", base));
-        assert!(!is_path_allowed_with_base("/tmp", base));
-        assert!(!is_path_allowed_with_base("/var/log", base));
+        assert!(!is_path_safe_for_workspace("/", base));
+        assert!(!is_path_safe_for_workspace("/anything", base));
+        assert!(!is_path_safe_for_workspace("/tmp", base));
+        assert!(!is_path_safe_for_workspace("/var/log", base));
         // Leading whitespace bypasses (all three variants)
-        assert!(!is_path_allowed_with_base("  /etc/passwd", base));
-        assert!(!is_path_allowed_with_base("\t/etc/passwd", base));
-        assert!(!is_path_allowed_with_base("  ~root/.ssh/id_rsa", base));
-        assert!(!is_path_allowed_with_base("  ../foo", base));
+        assert!(!is_path_safe_for_workspace("  /etc/passwd", base));
+        assert!(!is_path_safe_for_workspace("\t/etc/passwd", base));
+        assert!(!is_path_safe_for_workspace("  ~root/.ssh/id_rsa", base));
+        assert!(!is_path_safe_for_workspace("  ../foo", base));
         // Whitespace-only paths are treated as empty (relative, safe)
-        assert!(is_path_allowed_with_base("  ", base));
+        assert!(is_path_safe_for_workspace("  ", base));
 
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
-        assert!(is_path_allowed_with_base(
+        assert!(is_path_safe_for_workspace(
             workspace.join("test.txt").to_str().unwrap(),
             &workspace
         ));
-        assert!(is_path_allowed_with_base("relative.txt", &workspace));
+        assert!(is_path_safe_for_workspace("relative.txt", &workspace));
     }
 
     #[test]
     fn path_allows_relative_and_blocks_absolute() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
-        assert!(is_path_allowed_with_base("src/main.rs", &workspace));
-        assert!(is_path_allowed_with_base(
+        assert!(is_path_safe_for_workspace("src/main.rs", &workspace));
+        assert!(is_path_safe_for_workspace(
             "deep/nested/dir/file.txt",
             &workspace
         ));
-        assert!(is_path_allowed_with_base(".gitignore", &workspace));
-        assert!(is_path_allowed_with_base(".env", &workspace));
-        assert!(is_path_allowed_with_base("", &workspace));
-        assert!(!is_path_allowed_with_base("../etc/passwd", &workspace));
-        assert!(!is_path_allowed_with_base(
+        assert!(is_path_safe_for_workspace(".gitignore", &workspace));
+        assert!(is_path_safe_for_workspace(".env", &workspace));
+        assert!(is_path_safe_for_workspace("", &workspace));
+        assert!(!is_path_safe_for_workspace("../etc/passwd", &workspace));
+        assert!(!is_path_safe_for_workspace(
             "../../root/.ssh/id_rsa",
             &workspace
         ));
-        assert!(!is_path_allowed_with_base(
+        assert!(!is_path_safe_for_workspace(
             "foo/../../../etc/shadow",
             &workspace
         ));
-        assert!(!is_path_allowed_with_base("..", &workspace));
+        assert!(!is_path_safe_for_workspace("..", &workspace));
     }
 
     // ── EXTRA_READ_ALLOWED tests ──────────────────────────────────────
@@ -1240,19 +1273,19 @@ mod tests {
         }
     }
 
-    /// `is_path_allowed_with_base` blocks paths outside the workspace even
+    /// `is_path_safe_for_workspace` blocks paths outside the workspace even
     /// when they're in [`EXTRA_READ_ALLOWED`] — the extra-read bypass is
     /// read-only and must not affect write-path checks.
     #[test]
-    fn is_path_allowed_with_base_blocks_extra_dependency_paths() {
+    fn is_path_safe_for_workspace_blocks_extra_dependency_paths() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
 
-        // Temp dir spill files — should be blocked by is_path_allowed_with_base
+        // Temp dir spill files — should be blocked by is_path_safe_for_workspace
         let temp_file = std::env::temp_dir().join("test-spill.txt");
         let temp_str = temp_file.to_string_lossy().to_string();
         assert!(
-            !is_path_allowed_with_base(&temp_str, &workspace),
+            !is_path_safe_for_workspace(&temp_str, &workspace),
             "Temp file should be blocked by base check"
         );
 
@@ -1260,7 +1293,7 @@ mod tests {
         if let Ok(home) = std::env::var("HOME") {
             let dep_path = format!("{home}/.cargo/registry/src/crate-0.1.0/src/lib.rs");
             assert!(
-                !is_path_allowed_with_base(&dep_path, &workspace),
+                !is_path_safe_for_workspace(&dep_path, &workspace),
                 "Dependency path should be blocked by base check"
             );
         }
