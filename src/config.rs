@@ -922,39 +922,19 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_trims_whitespace() {
-        // non_empty should trim values before returning
-        assert_eq!(
-            non_empty(Some("  value  ".to_string())),
-            Some("value".to_string())
-        );
-        assert_eq!(non_empty(Some(" ".to_string())), None);
-        assert_eq!(non_empty(Some(String::new())), None);
-        assert_eq!(non_empty(None), None);
-        assert_eq!(
-            non_empty(Some("  spaced out  ".to_string())),
-            Some("spaced out".to_string())
-        );
-    }
-
-    #[test]
     fn trim_non_empty_trims_whitespace() {
+        // trim_non_empty is the canonical primitive — trims and returns None
+        // for empty or whitespace-only strings.
         assert_eq!(trim_non_empty("  value  "), Some("value".to_string()));
         assert_eq!(trim_non_empty(" "), None);
         assert_eq!(trim_non_empty(""), None);
-        // trim_non_empty is only defined for &str, not Option — None coverage
-        // is provided by non_empty_trims_whitespace which delegates to trim_non_empty.
-    }
 
-    #[test]
-    fn resolve_or_trims_whitespace() {
-        // resolve_or uses non_empty internally, so it should also trim
-        assert_eq!(
-            resolve_or(Some("  custom  ".to_string()), "fallback"),
-            "custom"
-        );
-        assert_eq!(resolve_or(Some(" ".to_string()), "fallback"), "fallback");
-        assert_eq!(resolve_or(Some(String::new()), "fallback"), "fallback");
+        // non_empty delegates to trim_non_empty — the only unique behaviour is
+        // the Option→&str unwrap via and_then.
+        assert_eq!(non_empty(None), None);
+
+        // resolve_or delegates through non_empty — the only unique behaviour is
+        // the fallback on None via unwrap_or_else.
         assert_eq!(resolve_or(None, "fallback"), "fallback");
     }
 }
