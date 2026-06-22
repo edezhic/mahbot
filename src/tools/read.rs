@@ -506,7 +506,7 @@ async fn read_and_parse(resolved_path: &Path, mode_label: &str) -> anyhow::Resul
         anyhow::bail!(
             "Unsupported file extension '.{ext}' for {mode_label}. \
              Supported: .rs, .js, .jsx, .mjs, .cjs, .ts, .tsx, .py, .pyi, .pyx, .json, .toml, \
-             .sh, .bash, .zsh, .css, .html, .htm, .go, .rb, .c, .h, .sql"
+             .sh, .bash, .zsh, .css, .html, .htm, .go, .rb, .c, .h, .sql, .md, .markdown"
         );
     };
 
@@ -552,10 +552,12 @@ fn language_support(ext: &str) -> Option<LanguageSupport> {
                 (export_statement (type_alias_declaration name: (type_identifier) @name))
             ]
         )";
-    match ext {
-        "rs" => Some(LanguageSupport {
-            language: tree_sitter_rust::LANGUAGE.into(),
-            symbol_query: r"(
+
+    let language = crate::util::tree_sitter::tree_sitter_language_for_extension(ext)?;
+
+    let symbol_query = match ext {
+        "rs" => {
+            r"(
             [
                 (function_item name: (identifier) @name)
                 (struct_item name: (type_identifier) @name)
@@ -568,11 +570,10 @@ fn language_support(ext: &str) -> Option<LanguageSupport> {
                 (macro_definition name: (identifier) @name)
                 (mod_item name: (identifier) @name)
             ]
-        )",
-        }),
-        "js" | "jsx" | "mjs" | "cjs" => Some(LanguageSupport {
-            language: tree_sitter_javascript::LANGUAGE.into(),
-            symbol_query: r"(
+        )"
+        }
+        "js" | "jsx" | "mjs" | "cjs" => {
+            r"(
             [
                 (function_declaration name: (identifier) @name)
                 (class_declaration name: (type_identifier) @name)
@@ -582,52 +583,26 @@ fn language_support(ext: &str) -> Option<LanguageSupport> {
                 (export_statement (function_declaration name: (identifier) @name))
                 (export_statement (class_declaration name: (type_identifier) @name))
             ]
-        )",
-        }),
-        "ts" => Some(LanguageSupport {
-            language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            symbol_query: TS_SYMBOL_QUERY,
-        }),
-        "tsx" => Some(LanguageSupport {
-            language: tree_sitter_typescript::LANGUAGE_TSX.into(),
-            symbol_query: TS_SYMBOL_QUERY,
-        }),
-        "py" | "pyi" | "pyx" => Some(LanguageSupport {
-            language: tree_sitter_python::LANGUAGE.into(),
-            symbol_query: r"(
+        )"
+        }
+        "ts" | "tsx" => TS_SYMBOL_QUERY,
+        "py" | "pyi" | "pyx" => {
+            r"(
             [
                 (function_definition name: (identifier) @name)
                 (class_definition name: (identifier) @name)
             ]
-        )",
-        }),
-        "json" => Some(LanguageSupport {
-            language: tree_sitter_json::LANGUAGE.into(),
-            symbol_query: "",
-        }),
-        "toml" => Some(LanguageSupport {
-            language: tree_sitter_toml_ng::LANGUAGE.into(),
-            symbol_query: "",
-        }),
-        "sh" | "bash" | "zsh" => Some(LanguageSupport {
-            language: tree_sitter_bash::LANGUAGE.into(),
-            symbol_query: r"(
+        )"
+        }
+        "sh" | "bash" | "zsh" => {
+            r"(
             [
                 (function_definition name: (word) @name)
             ]
-        )",
-        }),
-        "css" => Some(LanguageSupport {
-            language: tree_sitter_css::LANGUAGE.into(),
-            symbol_query: "",
-        }),
-        "html" | "htm" => Some(LanguageSupport {
-            language: tree_sitter_html::LANGUAGE.into(),
-            symbol_query: "",
-        }),
-        "go" => Some(LanguageSupport {
-            language: tree_sitter_go::LANGUAGE.into(),
-            symbol_query: r"(
+        )"
+        }
+        "go" => {
+            r"(
             [
                 (function_declaration name: (identifier) @name)
                 (method_declaration name: (field_identifier) @name)
@@ -635,22 +610,20 @@ fn language_support(ext: &str) -> Option<LanguageSupport> {
                 (const_declaration (const_spec name: (identifier) @name))
                 (var_declaration (var_spec name: (identifier) @name))
             ]
-        )",
-        }),
-        "rb" => Some(LanguageSupport {
-            language: tree_sitter_ruby::LANGUAGE.into(),
-            symbol_query: r"(
+        )"
+        }
+        "rb" => {
+            r"(
             [
                 (method name: (identifier) @name)
                 (singleton_method name: (identifier) @name)
                 (class name: (constant) @name)
                 (module name: (constant) @name)
             ]
-        )",
-        }),
-        "c" | "h" => Some(LanguageSupport {
-            language: tree_sitter_c::LANGUAGE.into(),
-            symbol_query: r"(
+        )"
+        }
+        "c" | "h" => {
+            r"(
             [
                 (function_definition declarator: (function_declarator declarator: (identifier) @name))
                 (struct_specifier name: (type_identifier) @name)
@@ -658,21 +631,25 @@ fn language_support(ext: &str) -> Option<LanguageSupport> {
                 (union_specifier name: (type_identifier) @name)
                 (type_definition declarator: (type_identifier) @name)
             ]
-        )",
-        }),
-        "sql" => Some(LanguageSupport {
-            language: tree_sitter_sequel::LANGUAGE.into(),
-            symbol_query: r"(
+        )"
+        }
+        "sql" => {
+            r"(
             [
                 (create_table (object_reference name: (identifier) @name))
                 (create_view (object_reference name: (identifier) @name))
                 (create_index (object_reference name: (identifier) @name))
                 (create_trigger (object_reference name: (identifier) @name))
             ]
-        )",
-        }),
-        _ => None,
-    }
+        )"
+        }
+        _ => "",
+    };
+
+    Some(LanguageSupport {
+        language,
+        symbol_query,
+    })
 }
 
 /// Compile the tree-sitter symbol query for the source file's language.
@@ -802,8 +779,8 @@ mod tests {
     #[test]
     fn unsupported_extensions_return_none() {
         let unsupported: &[&str] = &[
-            "txt", "md", "yml", "yaml", "xml", "svg", "config", "ini", "cfg", "log", "csv", "tsv",
-            "pdf", "png", "jpg", "gif", "woff", "ttf",
+            "txt", "yml", "yaml", "xml", "svg", "config", "ini", "cfg", "log", "csv", "tsv", "pdf",
+            "png", "jpg", "gif", "woff", "ttf",
         ];
         for ext in unsupported {
             assert!(

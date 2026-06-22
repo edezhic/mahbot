@@ -12,9 +12,7 @@
 use iced::Color;
 use std::sync::OnceLock;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
-use tree_sitter_md::{
-    INLINE_LANGUAGE as MD_INLINE_LANG, LANGUAGE as MD_BLOCK_LANG, MarkdownParser, MarkdownTree,
-};
+use tree_sitter_md::{INLINE_LANGUAGE as MD_INLINE_LANG, MarkdownParser, MarkdownTree};
 // Built-in highlight queries for new languages (ticket mahbot-1244).
 use tree_sitter_bash::HIGHLIGHT_QUERY as BASH_HIGHLIGHT_QUERY;
 use tree_sitter_c::HIGHLIGHT_QUERY as C_HIGHLIGHT_QUERY;
@@ -572,40 +570,33 @@ impl HighlightLanguage {
 
     /// Return the tree-sitter Language and highlight query string for this language.
     ///
+    /// The Language is obtained from the shared extension-to-language mapping
+    /// ([`crate::util::tree_sitter::tree_sitter_language_for_extension`]).
+    ///
     /// For Markdown, returns the **block** grammar — inline Markdown uses
     /// a separate grammar (see [`MD_INLINE_LANG`] and
     /// [`MD_HIGHLIGHT_QUERY_INLINE`]).
     pub(crate) fn language_and_query(self) -> (Language, &'static str) {
-        match self {
-            HighlightLanguage::Rust => (tree_sitter_rust::LANGUAGE.into(), RUST_HIGHLIGHT_QUERY),
-            HighlightLanguage::JavaScript => (
-                tree_sitter_javascript::LANGUAGE.into(),
-                JAVASCRIPT_HIGHLIGHT_QUERY,
-            ),
-            HighlightLanguage::TypeScript => (
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                TYPESCRIPT_HIGHLIGHT_QUERY,
-            ),
-            HighlightLanguage::TSX => (
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
-                TSX_HIGHLIGHT_QUERY,
-            ),
-            HighlightLanguage::Python => {
-                (tree_sitter_python::LANGUAGE.into(), PYTHON_HIGHLIGHT_QUERY)
-            }
-            HighlightLanguage::Json => (tree_sitter_json::LANGUAGE.into(), JSON_HIGHLIGHTS_QUERY),
-            HighlightLanguage::Toml => {
-                (tree_sitter_toml_ng::LANGUAGE.into(), TOML_HIGHLIGHTS_QUERY)
-            }
-            HighlightLanguage::Bash => (tree_sitter_bash::LANGUAGE.into(), BASH_HIGHLIGHT_QUERY),
-            HighlightLanguage::Css => (tree_sitter_css::LANGUAGE.into(), CSS_HIGHLIGHTS_QUERY),
-            HighlightLanguage::Html => (tree_sitter_html::LANGUAGE.into(), HTML_HIGHLIGHTS_QUERY),
-            HighlightLanguage::Go => (tree_sitter_go::LANGUAGE.into(), GO_HIGHLIGHTS_QUERY),
-            HighlightLanguage::Ruby => (tree_sitter_ruby::LANGUAGE.into(), RUBY_HIGHLIGHTS_QUERY),
-            HighlightLanguage::C => (tree_sitter_c::LANGUAGE.into(), C_HIGHLIGHT_QUERY),
-            HighlightLanguage::Sql => (tree_sitter_sequel::LANGUAGE.into(), SQL_HIGHLIGHTS_QUERY),
-            HighlightLanguage::Markdown => (MD_BLOCK_LANG.into(), MD_HIGHLIGHT_QUERY_BLOCK),
-        }
+        let lang = crate::util::tree_sitter::tree_sitter_language_for_extension(self.extension())
+            .expect("HighlightLanguage variant should have a valid extension mapping");
+        let query = match self {
+            HighlightLanguage::Rust => RUST_HIGHLIGHT_QUERY,
+            HighlightLanguage::JavaScript => JAVASCRIPT_HIGHLIGHT_QUERY,
+            HighlightLanguage::TypeScript => TYPESCRIPT_HIGHLIGHT_QUERY,
+            HighlightLanguage::TSX => TSX_HIGHLIGHT_QUERY,
+            HighlightLanguage::Python => PYTHON_HIGHLIGHT_QUERY,
+            HighlightLanguage::Json => JSON_HIGHLIGHTS_QUERY,
+            HighlightLanguage::Toml => TOML_HIGHLIGHTS_QUERY,
+            HighlightLanguage::Bash => BASH_HIGHLIGHT_QUERY,
+            HighlightLanguage::Css => CSS_HIGHLIGHTS_QUERY,
+            HighlightLanguage::Html => HTML_HIGHLIGHTS_QUERY,
+            HighlightLanguage::Go => GO_HIGHLIGHTS_QUERY,
+            HighlightLanguage::Ruby => RUBY_HIGHLIGHTS_QUERY,
+            HighlightLanguage::C => C_HIGHLIGHT_QUERY,
+            HighlightLanguage::Sql => SQL_HIGHLIGHTS_QUERY,
+            HighlightLanguage::Markdown => MD_HIGHLIGHT_QUERY_BLOCK,
+        };
+        (lang, query)
     }
 
     /// Return the tree-sitter Language for this language.
@@ -614,6 +605,31 @@ impl HighlightLanguage {
     /// the language (e.g., creating a parser).
     pub(crate) fn tree_sitter_language(self) -> Language {
         self.language_and_query().0
+    }
+
+    /// Return the canonical file extension for this language variant.
+    ///
+    /// Used to look up the shared tree-sitter [`Language`] via
+    /// [`crate::util::tree_sitter::tree_sitter_language_for_extension`].
+    #[must_use]
+    pub fn extension(self) -> &'static str {
+        match self {
+            HighlightLanguage::Rust => "rs",
+            HighlightLanguage::JavaScript => "js",
+            HighlightLanguage::TypeScript => "ts",
+            HighlightLanguage::TSX => "tsx",
+            HighlightLanguage::Python => "py",
+            HighlightLanguage::Json => "json",
+            HighlightLanguage::Toml => "toml",
+            HighlightLanguage::Bash => "sh",
+            HighlightLanguage::Css => "css",
+            HighlightLanguage::Html => "html",
+            HighlightLanguage::Go => "go",
+            HighlightLanguage::Ruby => "rb",
+            HighlightLanguage::C => "c",
+            HighlightLanguage::Sql => "sql",
+            HighlightLanguage::Markdown => "md",
+        }
     }
 }
 
@@ -758,79 +774,34 @@ mod tests {
 
     #[test]
     fn test_all_queries_compile() {
-        for (name, lang, query) in [
-            (
-                "Rust",
-                tree_sitter_rust::LANGUAGE.into(),
-                RUST_HIGHLIGHT_QUERY,
-            ),
-            (
-                "JS",
-                tree_sitter_javascript::LANGUAGE.into(),
-                JAVASCRIPT_HIGHLIGHT_QUERY,
-            ),
-            (
-                "TS",
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                TYPESCRIPT_HIGHLIGHT_QUERY,
-            ),
-            (
-                "TSX",
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
-                TSX_HIGHLIGHT_QUERY,
-            ),
-            (
-                "Python",
-                tree_sitter_python::LANGUAGE.into(),
-                PYTHON_HIGHLIGHT_QUERY,
-            ),
-            (
-                "JSON",
-                tree_sitter_json::LANGUAGE.into(),
-                JSON_HIGHLIGHTS_QUERY,
-            ),
-            (
-                "TOML",
-                tree_sitter_toml_ng::LANGUAGE.into(),
-                TOML_HIGHLIGHTS_QUERY,
-            ),
-            (
-                "Bash",
-                tree_sitter_bash::LANGUAGE.into(),
-                BASH_HIGHLIGHT_QUERY,
-            ),
-            (
-                "CSS",
-                tree_sitter_css::LANGUAGE.into(),
-                CSS_HIGHLIGHTS_QUERY,
-            ),
-            (
-                "HTML",
-                tree_sitter_html::LANGUAGE.into(),
-                HTML_HIGHLIGHTS_QUERY,
-            ),
-            ("Go", tree_sitter_go::LANGUAGE.into(), GO_HIGHLIGHTS_QUERY),
-            (
-                "Ruby",
-                tree_sitter_ruby::LANGUAGE.into(),
-                RUBY_HIGHLIGHTS_QUERY,
-            ),
-            ("C", tree_sitter_c::LANGUAGE.into(), C_HIGHLIGHT_QUERY),
-            (
-                "SQL",
-                tree_sitter_sequel::LANGUAGE.into(),
-                SQL_HIGHLIGHTS_QUERY,
-            ),
-            ("MD block", MD_BLOCK_LANG.into(), MD_HIGHLIGHT_QUERY_BLOCK),
-            (
-                "MD inline",
-                MD_INLINE_LANG.into(),
-                MD_HIGHLIGHT_QUERY_INLINE,
-            ),
+        // Test all standard HighlightLanguage variants via the shared extension mapping.
+        for (name, variant) in [
+            ("Rust", HighlightLanguage::Rust),
+            ("JS", HighlightLanguage::JavaScript),
+            ("TS", HighlightLanguage::TypeScript),
+            ("TSX", HighlightLanguage::TSX),
+            ("Python", HighlightLanguage::Python),
+            ("JSON", HighlightLanguage::Json),
+            ("TOML", HighlightLanguage::Toml),
+            ("Bash", HighlightLanguage::Bash),
+            ("CSS", HighlightLanguage::Css),
+            ("HTML", HighlightLanguage::Html),
+            ("Go", HighlightLanguage::Go),
+            ("Ruby", HighlightLanguage::Ruby),
+            ("C", HighlightLanguage::C),
+            ("SQL", HighlightLanguage::Sql),
+            ("MD block", HighlightLanguage::Markdown),
         ] {
+            let (lang, query) = variant.language_and_query();
             let q = tree_sitter::Query::new(&lang, query);
             assert!(q.is_ok(), "{name} query failed: {:?}", q.err());
         }
+
+        // Inline Markdown uses a separate grammar that has no extension mapping,
+        // so construct its Language directly.
+        let md_inline = MD_INLINE_LANG.into();
+        let q = tree_sitter::Query::new(&md_inline, MD_HIGHLIGHT_QUERY_INLINE);
+        assert!(q.is_ok(), "MD inline query failed: {:?}", q.err());
     }
 
     #[test]

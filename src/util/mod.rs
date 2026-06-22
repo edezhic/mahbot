@@ -4,6 +4,7 @@ pub mod http;
 pub mod json;
 #[cfg(test)]
 pub mod test;
+pub mod tree_sitter;
 
 use regex::Regex;
 use serde::de::DeserializeOwned;
