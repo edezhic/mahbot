@@ -98,6 +98,88 @@ where
     Ok(())
 }
 
+/// Declare a global `OnceCell`-backed store with `init_global()` and `store()`.
+///
+/// Generates three items:
+/// - `pub static $NAME: OnceCell<$Type>` — the underlying cell.
+/// - `pub async fn init_global()` — calls `register_global_store` with the
+///   constructor function invoked on `CONFIG.global_storage_root()`.
+/// - `#[must_use] pub fn store()` — returns `&'static $Type`, panicking if
+///   not yet initialized.
+///
+/// # Two-arm syntax
+///
+/// Standard form — auto-generates expect message:
+/// ```ignore
+/// global_store! {
+///     /// Doc comment for the static.
+///     pub static $NAME: $Type,
+///     constructor = $constructor_expr,
+/// }
+/// ```
+///
+/// Custom expect form — for non-standard panic messages:
+/// ```ignore
+/// global_store! {
+///     /// Doc comment for the static.
+///     pub static $NAME: $Type,
+///     constructor = $constructor_expr,
+///     expect = $custom_message,
+/// }
+/// ```
+#[macro_export]
+macro_rules! global_store {
+    // Standard form — auto-generates expect message.
+    (
+        $(#[$attr:meta])*
+        pub static $name:ident: $ty:ty,
+        constructor = $constructor:expr,
+    ) => {
+        $crate::global_store! {
+            $(#[$attr])*
+            pub static $name: $ty,
+            constructor = $constructor,
+            expect = concat!(
+                stringify!($name),
+                " not initialized — call init_global() first"
+            ),
+        }
+    };
+
+    // Custom expect form.
+    (
+        $(#[$attr:meta])*
+        pub static $name:ident: $ty:ty,
+        constructor = $constructor:expr,
+        expect = $expect:expr,
+    ) => {
+        $(#[$attr])*
+        pub static $name: ::tokio::sync::OnceCell<$ty> =
+            ::tokio::sync::OnceCell::const_new();
+
+        #[doc = concat!("Initialize the global ", stringify!($name), " store.")]
+        pub async fn init_global() -> ::anyhow::Result<()> {
+            let root = $crate::config::CONFIG.global_storage_root();
+            $crate::turso::register_global_store(
+                &$name,
+                stringify!($name),
+                || $constructor(&root),
+            )
+            .await
+        }
+
+        #[must_use]
+        #[doc = concat!(
+            "Get a reference to the global ",
+            stringify!($name),
+            " store.\n\n# Panics\n\nPanics if the store has not been initialized.",
+        )]
+        pub fn store() -> &'static $ty {
+            $name.get().expect($expect)
+        }
+    };
+}
+
 /// Remove characters that cause FTS query parser errors.
 ///
 /// Replaces offending characters with spaces (rather than removing them) to

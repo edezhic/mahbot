@@ -4,38 +4,22 @@
 //! - `config_kv` — generic key-value string pairs for runtime configuration.
 //! - `config_role` — per-role model and reasoning_effort overrides.
 
-use crate::config::{CONFIG, ModelRouting, RoleConfig};
+use crate::config::{ModelRouting, RoleConfig};
+use crate::global_store;
 use crate::turso::{self, Connection};
 use anyhow::Result;
 use std::path::Path;
-use tokio::sync::OnceCell;
 
-/// Global config store.
-pub static CONFIG_STORE: OnceCell<ConfigStore> = OnceCell::const_new();
-
-/// Initialize the global config store.
-pub async fn init_global() -> Result<()> {
-    let root = CONFIG.global_storage_root();
-    turso::register_global_store(&CONFIG_STORE, "CONFIG_STORE", || ConfigStore::open(&root)).await
+global_store! {
+    /// Global config store.
+    pub static CONFIG_STORE: ConfigStore,
+    constructor = ConfigStore::open,
 }
 
 /// Turso-backed config storage.
 #[derive(Clone, Debug)]
 pub struct ConfigStore {
     pub(crate) conn: Connection,
-}
-
-/// Returns a reference to the global config store.
-///
-/// # Panics
-///
-/// Panics if the config store has not been initialized. All production code
-/// initializes the store before any access, so this is a programming error.
-#[must_use]
-pub fn store() -> &'static ConfigStore {
-    CONFIG_STORE
-        .get()
-        .expect("CONFIG_STORE not initialized — call init_global() first")
 }
 
 const SCHEMA: &str = "\

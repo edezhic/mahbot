@@ -18,21 +18,17 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::config::CONFIG;
+use crate::global_store;
 use crate::turso::{self, Connection, TxGuard};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use tokio::sync::OnceCell;
 use tracing::warn;
 
-/// Global user store.
-pub static USER_STORE: OnceCell<UserStorage> = OnceCell::const_new();
-
-/// Initialize the global user store.
-pub async fn init_global() -> Result<()> {
-    let root = CONFIG.global_storage_root();
-    turso::register_global_store(&USER_STORE, "USER_STORE", || UserStorage::open(&root)).await
+global_store! {
+    /// Global user store.
+    pub static USER_STORE: UserStorage,
+    constructor = UserStorage::open,
 }
 
 /// Turso-backed user preferences storage.
@@ -474,19 +470,6 @@ async fn init_personal_workspace_dir(name: &str) {
 }
 
 // ── Free functions ──────────────────────────────────────────────
-
-/// Returns a reference to the global user store, panicking if not initialized.
-///
-/// # Panics
-///
-/// Panics if the user store has not been initialized. All production code
-/// initializes the store before any access, so this is a programming error.
-#[must_use]
-pub fn store() -> &'static UserStorage {
-    USER_STORE
-        .get()
-        .expect("USER_STORE not initialized — call init_global() first")
-}
 
 /// Switch a user's active workspace to a shared workspace (from workspaces.db).
 /// Returns the `Workspace` on success.

@@ -6,30 +6,19 @@
 use crate::Role;
 use crate::Workspace;
 use crate::agent::run_agent;
-use crate::config::CONFIG;
+use crate::global_store;
 use crate::session::discovery_session_key;
 use crate::turso::{self, Connection};
 use anyhow::{Context, Result};
 use futures_util::future::join_all;
 use std::path::Path;
-use tokio::sync::OnceCell;
 use tracing::warn;
 
-/// Global workspace store.
-pub static WORKSPACES: OnceCell<WorkspaceStorage> = OnceCell::const_new();
-
-/// Initialize the global workspace store from CONFIG.
-pub async fn init_global() -> Result<()> {
-    let root = CONFIG.global_storage_root();
-    turso::register_global_store(&WORKSPACES, "WORKSPACES", || WorkspaceStorage::open(&root)).await
-}
-
-/// Get the global workspace store. Panics if not initialized — this must be
-/// initialized in `main.rs` during startup before any task runs.
-pub fn store() -> &'static WorkspaceStorage {
-    WORKSPACES
-        .get()
-        .expect("workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs")
+global_store! {
+    /// Global workspace store.
+    pub static WORKSPACES: WorkspaceStorage,
+    constructor = WorkspaceStorage::open,
+    expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",
 }
 
 /// Look up a workspace by its filesystem path.

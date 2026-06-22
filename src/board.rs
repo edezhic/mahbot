@@ -1,6 +1,6 @@
 //! Ticket/board system — Turso-backed task management.
 
-use crate::config::CONFIG;
+use crate::global_store;
 use crate::turso::{self, Connection, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -9,16 +9,12 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::time::Duration as StdDuration;
-use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 
-/// Global board store.
-pub static BOARD: OnceCell<BoardStore> = OnceCell::const_new();
-
-/// Initialize the global board store.
-pub async fn init_global() -> Result<()> {
-    let root = CONFIG.global_storage_root();
-    turso::register_global_store(&BOARD, "BOARD", || BoardStore::open(&root)).await
+global_store! {
+    /// Global board store.
+    pub static BOARD: BoardStore,
+    constructor = BoardStore::open,
 }
 
 /// Background task: auto-archive cancelled tickets older than 1 hour.
@@ -1682,18 +1678,6 @@ pub struct BoardStore {
 
 /// Returns a reference to the global [`BoardStore`] singleton.
 ///
-/// # Panics
-///
-/// Panics if the board store has not been initialized (e.g. during startup
-/// or after teardown). All production code initializes the store before
-/// any access, so this is a programming error.
-#[must_use]
-pub fn store() -> &'static BoardStore {
-    BOARD
-        .get()
-        .expect("BOARD not initialized — call init_global() first")
-}
-
 /// Open a BoardStore in a fresh temp directory (no global CONFIG dependency).
 ///
 /// Placed outside `mod tests` so that test code in sibling modules

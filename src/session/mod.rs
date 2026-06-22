@@ -5,14 +5,20 @@ pub use manager::Session;
 
 pub mod summarization;
 
-use crate::config::CONFIG;
+use crate::global_store;
 use crate::turso::{self, Connection, TxGuard, Value, params};
 use crate::{ChatMessage, Reasoning, ToolCall as ProviderToolCall};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
-use tokio::sync::OnceCell;
-/// Schema for the sessions database.
+
+global_store! {
+    /// Global session store.
+    pub static SESSIONS: SessionStorage,
+    constructor = SessionStorage::new_global,
+    expect = "SESSIONS not initialized",
+}
+
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_key TEXT NOT NULL,
@@ -44,20 +50,6 @@ CREATE TABLE IF NOT EXISTS session_metadata (
 /// must also be excluded from this list.
 pub(crate) const TRANSIENT_SESSION_PREFIXES: &[&str] =
     &["ticket_", "ask_", "maintainer_", "discovery_"];
-
-/// Global session store.
-pub static SESSIONS: OnceCell<SessionStorage> = OnceCell::const_new();
-
-pub fn store() -> &'static SessionStorage {
-    SESSIONS.get().expect("SESSIONS not initialized")
-}
-
-/// Initialize the global session store from CONFIG.
-pub async fn init_global() -> Result<()> {
-    let root = CONFIG.global_storage_root();
-    crate::turso::register_global_store(&SESSIONS, "SESSIONS", || SessionStorage::new_global(&root))
-        .await
-}
 
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {

@@ -6,35 +6,15 @@
 //! Each message gets a NanoID for deduplication.
 
 use crate::ChatDirection;
-use crate::config::CONFIG;
+use crate::global_store;
 use crate::turso::{self, Connection};
 use anyhow::{Context, Result};
 use std::path::Path;
-use tokio::sync::OnceCell;
 
-/// Global chat history store.
-pub static CHAT_HISTORY: OnceCell<ChatHistoryStore> = OnceCell::const_new();
-
-/// Initialize the global chat history store.
-pub async fn init_global() -> Result<()> {
-    let root = CONFIG.global_storage_root();
-    turso::register_global_store(&CHAT_HISTORY, "CHAT_HISTORY", || {
-        ChatHistoryStore::open(&root)
-    })
-    .await
-}
-
-/// Get a reference to the global chat history store.
-///
-/// # Panics
-///
-/// Panics if the chat history store has not been initialized. All production
-/// code initializes the store before any access, so this is a programming error.
-#[must_use]
-pub fn store() -> &'static ChatHistoryStore {
-    CHAT_HISTORY
-        .get()
-        .expect("CHAT_HISTORY not initialized — call init_global() first")
+global_store! {
+    /// Global chat history store.
+    pub static CHAT_HISTORY: ChatHistoryStore,
+    constructor = ChatHistoryStore::open,
 }
 
 /// Schema for fresh databases. The deprecated `session_key` column (always

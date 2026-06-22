@@ -4,38 +4,21 @@
 //! `std::sync::Mutex<HashMap<String, ToolUsage>>` and are flushed to
 //! the database on session finalization via [`StatsStore::flush_batch`].
 
-use crate::config::CONFIG;
+use crate::global_store;
 use crate::turso::{self, Connection};
 use anyhow::Result;
 use std::path::Path;
-use tokio::sync::OnceCell;
 
-/// Global stats store.
-pub static STATS_STORE: OnceCell<StatsStore> = OnceCell::const_new();
-
-/// Initialize the global stats store.
-pub async fn init_global() -> Result<()> {
-    let root = CONFIG.global_storage_root();
-    turso::register_global_store(&STATS_STORE, "STATS_STORE", || StatsStore::open(&root)).await
+global_store! {
+    /// Global stats store.
+    pub static STATS_STORE: StatsStore,
+    constructor = StatsStore::open,
 }
 
 /// Turso-backed tool usage stats storage.
 #[derive(Clone, Debug)]
 pub struct StatsStore {
     pub(crate) conn: Connection,
-}
-
-/// Returns a reference to the global stats store.
-///
-/// # Panics
-///
-/// Panics if the stats store has not been initialized. All production code
-/// initializes the store before any access, so this is a programming error.
-#[must_use]
-pub fn store() -> &'static StatsStore {
-    STATS_STORE
-        .get()
-        .expect("STATS_STORE not initialized — call init_global() first")
 }
 
 const SCHEMA: &str = "\
