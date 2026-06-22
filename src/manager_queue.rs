@@ -291,6 +291,12 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
             );
         }
 
+        // Extract common SendMessage fields once; only `recipient` differs
+        // between the broadcast+persist loop and the channel delivery loop.
+        let content = &response;
+        let agent_role = Some("manager".to_string());
+        let workspace = &job.workspace_name;
+
         // ── Broadcast + persist once per user ─────────────────────────
         // Before the channel transport loop: broadcast the agent response
         // to the GUI dashboard and persist to chat_history once per unique
@@ -307,11 +313,11 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
                     &user.name,
                     channel,
                     &SendMessage {
-                        content: response.clone(),
+                        content: content.clone(),
                         recipient: user.name.clone(),
                         reply_markup: reply_markup.clone(),
-                        agent_role: Some("manager".to_string()),
-                        workspace: job.workspace_name.clone(),
+                        agent_role: agent_role.clone(),
+                        workspace: workspace.clone(),
                     },
                 )
                 .await;
@@ -336,11 +342,11 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
                     };
                     if let Err(e) = channel
                         .send(&SendMessage {
-                            content: response.clone(),
+                            content: content.clone(),
                             recipient,
                             reply_markup: reply_markup.clone(),
-                            agent_role: Some("manager".to_string()),
-                            workspace: job.workspace_name.clone(),
+                            agent_role: agent_role.clone(),
+                            workspace: workspace.clone(),
                         })
                         .await
                     {
