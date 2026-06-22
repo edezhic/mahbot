@@ -872,37 +872,13 @@ pub fn unknown_tool_message(call_name: &str) -> String {
 
 /// Check whether `path` is safe to access within the given `workspace_root`.
 ///
-/// This is the central security gate for all file-path operations. It performs
-/// the following checks in order:
-///
-/// 1. **Whitespace trimming** — Leading/trailing whitespace is stripped before
-///    any other check, preventing trivial bypass attempts (e.g. `"  ../etc"`).
-/// 2. **Empty / whitespace-only paths** — After trimming, an empty path is
-///    treated as relative and allowed (safe).
-/// 3. **Null byte rejection** — Paths containing `\0` are immediately denied.
-/// 4. **Parent directory traversal** — Paths with `..` components (e.g.
-///    `"../etc/passwd"`, `"foo/../../bar"`) are denied.
-/// 5. **URL-encoded traversal** — Patterns `..%2f` and `%2f..` (case-insensitive)
-///    are denied, covering percent-encoded bypass attempts.
-/// 6. **Tilde validation** — Bare `~` is shorthand for the workspace root
-///    (see [`resolve_tool_path_with_base`]), `~/…` expands to the user's home
-///    directory and must be inside the workspace; everything else starting with
-///    `~` (e.g. `~root`, `~nobody`) is denied to prevent access to other users'
-///    home directories.
-/// 7. **Tilde expansion** — The leading `~` (if present) is expanded to the
-///    current user's home directory.
-/// 8. **Absolute path prefix check** — Absolute paths (including those produced
-///    by tilde expansion) must start with `workspace_root`. This is a lexical
-///    check only — no I/O is performed.
-/// 9. **Relative path allowance** — Relative paths that pass all previous checks
-///    (no traversal, no null bytes, valid tilde) are unconditionally allowed.
-///
-/// # Note
-///
-/// The prefix check for absolute paths is purely lexical and does not
-/// canonicalize the input. The caller is responsible for any post-canonicalization
-/// checks (see `resolve_write_target` / `resolve_read_target`), which catch
-/// symlink-based escapes that could bypass this pre-check.
+/// This is the central security gate for all file-path operations: it prevents
+/// directory-traversal attacks, null-byte injection, tilde-based escapes, and
+/// other common path-escape vectors before they reach any tool that reads or
+/// writes files. The check is purely lexical — no filesystem I/O is performed —
+/// so it cannot detect symlink-based escapes. The caller is responsible for
+/// that post-canonicalization validation (see [`resolve_read_target`] and
+/// [`resolve_write_target`]).
 #[must_use]
 pub fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
