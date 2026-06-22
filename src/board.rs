@@ -154,10 +154,9 @@ const COL_COMMENT_CREATED_AT: usize = 2;
 ///
 /// Note: [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
 /// of these (InDevelopment, InDiagnostics, InReview, InQa) plus Analysis — see its docs for
-/// rationale. [`TicketPhase::is_transitory_handoff`] identifies the phases
-/// (`DiagnosticsDone`, `Reviewed`, `QaPassed`) intentionally excluded from reset. The
-/// `tests::test_pipeline_blockers_coverage` test enforces that every non-transitory pipeline
-/// blocker has a corresponding reset transition.
+/// rationale. The remaining three phases ([`TRANSITORY_HANDOFF_PHASES`]) are transitory handoff
+/// states intentionally excluded from reset. The `tests::test_pipeline_blockers_coverage` test
+/// enforces that every non-transitory pipeline blocker has a corresponding reset transition.
 const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
@@ -165,6 +164,18 @@ const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
     TicketPhase::InReview,
     TicketPhase::Reviewed,
     TicketPhase::InQa,
+    TicketPhase::QaPassed,
+];
+
+/// Pipeline-blocking phases that are transitory handoff states — no agent is
+/// mid-execution in these phases, so they don't need a reset transition. The
+/// poller picks them up within seconds.
+///
+/// This is a subset of [`PIPELINE_BLOCKING_STATUSES`]. The relationship is
+/// mechanically verified by `tests::test_pipeline_blockers_coverage`.
+const TRANSITORY_HANDOFF_PHASES: &[TicketPhase] = &[
+    TicketPhase::DiagnosticsDone,
+    TicketPhase::Reviewed,
     TicketPhase::QaPassed,
 ];
 
@@ -426,16 +437,11 @@ impl TicketPhase {
     /// Returns `true` for transitory handoff phases — pipeline-blocking
     /// statuses where no agent is mid-execution.
     ///
-    /// These phases ([`TicketPhase::DiagnosticsDone`], [`TicketPhase::Reviewed`],
-    /// [`TicketPhase::QaPassed`]) are automatically picked up by the poller within
-    /// seconds, so they don't need a reset transition in
-    /// [`BoardStore::RESET_TRANSITIONS`].
+    /// Delegates to [`TRANSITORY_HANDOFF_PHASES`] so the transitory handoff set can never
+    /// accidentally diverge from the definition used in coverage tests.
     #[must_use]
     pub fn is_transitory_handoff(&self) -> bool {
-        matches!(
-            self,
-            TicketPhase::DiagnosticsDone | TicketPhase::Reviewed | TicketPhase::QaPassed
-        )
+        TRANSITORY_HANDOFF_PHASES.contains(self)
     }
 
     /// Returns `true` for phases that unblock dependent tickets.
@@ -1249,8 +1255,8 @@ impl BoardStore {
     /// get `pipeline_reservation = 1` so they are claimed before any fresh
     /// `ReadyForDevelopment` ticket — this preserves the rework priority across restarts.
     ///
-    /// Excludes `DiagnosticsDone`, `Reviewed`, and `QaPassed` — these are
-    /// transitory handoff states that the poller picks up within 2 seconds of restart.
+    /// Excludes [`TRANSITORY_HANDOFF_PHASES`] — these are transitory handoff states
+    /// that the poller picks up within 2 seconds of restart.
     ///
     /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests
     /// can verify coverage against `PIPELINE_BLOCKING_STATUSES`).
@@ -2320,15 +2326,30 @@ mod tests {
     ///
     /// [`PIPELINE_BLOCKING_STATUSES`] defines 7 phases; 4 of them (InDevelopment,
     /// InDiagnostics, InReview, InQa) have entries in [`RESET_TRANSITIONS`]. The remaining
-    /// 3 (DiagnosticsDone, Reviewed, QaPassed) are transitory handoff states that the
+    /// 3 phases ([`TRANSITORY_HANDOFF_PHASES`]) are transitory handoff states that the
     /// poller picks up within seconds — no agent is mid-execution in those states,
     /// so they don't need reset entries.
     ///
     /// This test does NOT assert the reverse direction (reset → pipeline blocker),
     /// because [`RESET_TRANSITIONS`] also includes `Analysis → Backlog`, and `Analysis`
     /// is intentionally not a pipeline blocker (it's a pre-flight phase).
+    ///
+    /// It also mechanically verifies that [`TRANSITORY_HANDOFF_PHASES`] is a subset of
+    /// [`PIPELINE_BLOCKING_STATUSES`], ensuring the two sets stay in sync.
     #[test]
     fn test_pipeline_blockers_coverage() {
+        // Verify that every transitory handoff phase is a pipeline blocker.
+        for phase in TRANSITORY_HANDOFF_PHASES {
+            assert!(
+                PIPELINE_BLOCKING_STATUSES.contains(phase),
+                "\
+TRANSITORY_HANDOFF_PHASES contains `{phase}` which is not in \
+PIPELINE_BLOCKING_STATUSES. Every transitory handoff phase must also \
+be a pipeline blocker.\
+                ",
+            );
+        }
+
         // Collect all `from` phases from BoardStore::RESET_TRANSITIONS for easy lookup.
         let reset_from: Vec<TicketPhase> = BoardStore::RESET_TRANSITIONS
             .iter()
