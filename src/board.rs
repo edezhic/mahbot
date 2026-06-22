@@ -3477,6 +3477,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     #[tokio::test]
     async fn test_set_commit_info() {
+        // Successfully set commit info
         let (store, _tmp, id) = setup().await;
 
         store
@@ -3491,13 +3492,10 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
         assert_eq!(ticket.lines_added, Some(10));
         assert_eq!(ticket.lines_removed, Some(5));
-    }
 
-    #[tokio::test]
-    async fn test_set_commit_info_nonexistent() {
-        let (store, _tmp) = open_test_store().await;
-
-        let result = store
+        // Non-existent ticket fails with appropriate error
+        let (store2, _tmp2) = open_test_store().await;
+        let result = store2
             .set_commit_info(
                 "nonexistent",
                 "0000000000000000000000000000000000000000",
@@ -3762,50 +3760,34 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
     }
 
-    /// Test that set_assigned_to(…, None) clears the assignee.
     #[tokio::test]
-    async fn test_set_assigned_to_none_clears_assignee() {
+    async fn test_set_assigned_to_none() {
+        // Successfully clear an assigned assignee
         let (store, _tmp, id) = setup().await;
 
-        // Set an assignee
         store
             .set_assigned_to(&id, Some("diagnostics"))
             .await
             .expect("set_assigned_to");
-
-        // Verify it's set
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         assert_eq!(ticket.assigned_to.as_deref(), Some("diagnostics"));
 
-        // Clear it
         store
             .set_assigned_to(&id, None)
             .await
-            .expect("set_assigned_to");
-
-        // Verify it's cleared
+            .expect("set_assigned_to(None) should clear assignee");
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         assert!(ticket.assigned_to.is_none(), "assigned_to should be NULL");
-    }
 
-    /// Test that set_assigned_to(…, None) on an already-cleared ticket succeeds.
-    #[tokio::test]
-    async fn test_set_assigned_to_none_idempotent() {
-        let (store, _tmp, id) = setup().await;
-
-        // Initially unassigned — clearing should succeed
+        // Idempotent: clearing an already-None assignee succeeds
         store
             .set_assigned_to(&id, None)
             .await
-            .expect("first set_assigned_to(None) should succeed");
-    }
+            .expect("second set_assigned_to(None) should also succeed");
 
-    /// Test that set_assigned_to(…, None) fails on a non-existent ticket.
-    #[tokio::test]
-    async fn test_set_assigned_to_none_nonexistent() {
-        let (store, _tmp) = open_test_store().await;
-
-        let result = store.set_assigned_to("nonexistent", None).await;
+        // Non-existent ticket fails
+        let (store2, _tmp2) = open_test_store().await;
+        let result = store2.set_assigned_to("nonexistent", None).await;
         assert!(
             result.is_err(),
             "set_assigned_to(None) on nonexistent ticket should fail"
