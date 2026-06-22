@@ -1014,13 +1014,38 @@ impl BoardStore {
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
     ) -> Result<()> {
+        self.transition_to_inner(id, expected_phase, target_phase, None)
+            .await
+    }
+
+    /// Transition a ticket to a new phase, optionally setting `pipeline_reservation`.
+    ///
+    /// When `reservation` is `None` (the common case), does not touch the
+    /// `pipeline_reservation` column.  When `Some(value)`, also sets
+    /// `pipeline_reservation` to the given boolean (needed for crash/restart
+    /// recovery and rework priority).
+    async fn transition_to_inner(
+        &self,
+        id: &str,
+        expected_phase: Option<TicketPhase>,
+        target_phase: TicketPhase,
+        reservation: Option<bool>,
+    ) -> Result<()> {
         let now = turso::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
-        let action = format!("set status to {}", target_phase.as_ref());
+        let action = match reservation {
+            Some(v) => format!(
+                "set status to {} (reservation={})",
+                target_phase.as_ref(),
+                v,
+            ),
+            None => format!("set status to {}", target_phase.as_ref()),
+        };
         self.execute_and_cancel(
-            "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2 \
+            "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
+             pipeline_reservation = COALESCE(?5, pipeline_reservation) \
              WHERE id = ?3 AND (?4 IS NULL OR status = ?4)",
-            turso::params![target_phase.as_ref(), now, id, guard],
+            turso::params![target_phase.as_ref(), now, id, guard, reservation],
             id,
             &action,
         )
@@ -1040,6 +1065,7 @@ impl BoardStore {
     /// This is a convenience helper for single-ticket mutation methods that
     /// follow the pattern: execute UPDATE → `ensure_ticket_found` → cancel stale
     /// agent. Used by [`transition_to`](Self::transition_to),
+    /// [`transition_to_inner`](Self::transition_to_inner),
     /// [`set_assigned_to`](Self::set_assigned_to), and
     /// [`set_archived`](Self::set_archived).
     ///
@@ -1179,28 +1205,8 @@ impl BoardStore {
         target_phase: TicketPhase,
         reservation: bool,
     ) -> Result<()> {
-        let now = turso::now();
-        let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
-        let action = format!(
-            "set status to {} (reservation={})",
-            target_phase.as_ref(),
-            reservation,
-        );
-        self.execute_and_cancel(
-            "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
-             pipeline_reservation = ?5 \
-             WHERE id = ?3 AND (?4 IS NULL OR status = ?4)",
-            turso::params![
-                target_phase.as_ref(),
-                now,
-                id,
-                guard,
-                i64::from(reservation)
-            ],
-            id,
-            &action,
-        )
-        .await
+        self.transition_to_inner(id, expected_phase, target_phase, Some(reservation))
+            .await
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify
