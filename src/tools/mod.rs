@@ -363,10 +363,6 @@ pub(crate) async fn resolve_directory_read_fallback(full_path: &Path) -> Option<
         return None;
     }
 
-    if let Ok(canon) = tokio::fs::canonicalize(full_path).await {
-        return Some(canon);
-    }
-
     let parent = full_path.parent()?;
     let name = full_path.file_name()?;
     let canon_parent = tokio::fs::canonicalize(parent).await.ok()?;
