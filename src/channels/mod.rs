@@ -365,26 +365,25 @@ fn finish_enrichment(
     content: &str,
 ) -> String {
     // ── Strip markers ──
-    let cleaned = match strategy {
-        EnrichmentStrategy::Multimodal { .. } => {
-            // Strip AUDIO and VIDEO markers; preserve IMAGE markers for vision API
-            // integration (to_message_content). This mirrors the conditional stripping
-            // pattern used by parse_image_markers() in compatible.rs — MEDIA_MARKER_RE
-            // is the single canonical source of truth for all media marker patterns.
-            MEDIA_MARKER_RE
-                .replace_all(content, |caps: &regex::Captures| {
-                    match caps.get(1).unwrap().as_str() {
-                        "IMAGE" => caps.get(0).unwrap().as_str().to_string(),
-                        _ => String::new(),
-                    }
-                })
-                .to_string()
-        }
-        EnrichmentStrategy::NonMultimodal => {
-            // Strip all markers; annotations are prepended by the caller above.
-            MEDIA_MARKER_RE.replace_all(content, "").to_string()
-        }
-    };
+    // In multimodal mode, IMAGE markers are preserved (needed for vision API
+    // integration via to_message_content); all other markers are stripped.
+    // In non-multimodal mode, all markers are stripped. The MEDIA_MARKER_RE
+    // is the single canonical source of truth for all media marker patterns.
+    //
+    // Note: using matches!() with a boolean guard means a future
+    // EnrichmentStrategy variant would silently default to marker-stripping
+    // (conservative behavior) rather than producing a compile error. This is
+    // intentional — stripping unknown markers is the safe default.
+    let keep_image = matches!(strategy, EnrichmentStrategy::Multimodal { .. });
+    let cleaned = MEDIA_MARKER_RE
+        .replace_all(content, |caps: &regex::Captures| {
+            if keep_image && caps.get(1).unwrap().as_str() == "IMAGE" {
+                caps.get(0).unwrap().as_str().to_string()
+            } else {
+                String::new()
+            }
+        })
+        .to_string();
     let cleaned = cleaned.trim().to_string();
 
     // ── Prepend annotations (if any) ──
