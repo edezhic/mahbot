@@ -66,8 +66,7 @@ impl Tool for ReadTool {
             }
         };
 
-        self.read_resolved(ws, &resolved_path, &path, None, &args)
-            .await
+        self.read_resolved(ws, &resolved_path, None, &args).await
     }
 
     fn should_scrub_output(&self, args: &serde_json::Value) -> bool {
@@ -156,7 +155,6 @@ impl ReadTool {
         &self,
         ws: &Workspace,
         resolved_path: &Path,
-        _requested_path: &str,
         recovery_note: Option<&str>,
         args: &serde_json::Value,
     ) -> anyhow::Result<String> {
@@ -242,9 +240,7 @@ impl ReadTool {
             let recovered = &matches[0];
             let resolved = super::resolve_read_target(ws.as_path(), recovered).await?;
             let note = format!("[Recovered path: requested '{path}', using '{recovered}']");
-            return self
-                .read_resolved(ws, &resolved, path, Some(&note), args)
-                .await;
+            return self.read_resolved(ws, &resolved, Some(&note), args).await;
         }
 
         anyhow::bail!("{original_err}\nDid you mean:\n  {}", matches.join("\n  "))
