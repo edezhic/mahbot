@@ -49,7 +49,7 @@ impl Tool for ReadTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        let path = super::get_normalized_path(&args)?;
+        let path = super::require_path_arg(&args)?;
 
         if super::path_contains_wildcard(&path) {
             return self.recover_wildcard_path(ws, &path).await;
@@ -70,7 +70,7 @@ impl Tool for ReadTool {
     }
 
     fn should_scrub_output(&self, args: &serde_json::Value) -> bool {
-        match super::lookup_path_arg(args) {
+        match super::find_path_arg(args) {
             Some(path) => super::should_scrub_file_path(path),
             None => true, // No path? Be safe and scrub.
         }
@@ -128,7 +128,7 @@ impl Tool for ReadTool {
     ) -> Option<String> {
         match phase {
             ToolOutputPhase::Before => {
-                let path = super::lookup_path_arg(args).unwrap_or("?");
+                let path = super::find_path_arg(args).unwrap_or("?");
                 let range = Self::format_range(args);
                 if range.is_empty() {
                     Some(format!("👀 {path}"))
@@ -141,7 +141,7 @@ impl Tool for ReadTool {
                 if outcome.success {
                     None
                 } else {
-                    let path = super::lookup_path_arg(args).unwrap_or("?");
+                    let path = super::find_path_arg(args).unwrap_or("?");
                     Some(format!("❌ Failed to read {path}"))
                 }
             }

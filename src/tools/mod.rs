@@ -28,10 +28,10 @@ pub(crate) const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 ///
 /// Tools accept `"file"` and `"filename"` as aliases for the primary `"path"`
 /// argument. This constant is the single source of truth for those aliases,
-/// used by [`lookup_path_arg`].
+/// used by [`find_path_arg`].
 ///
 /// If a new alias needs to be added, update this list — all path resolution
-/// goes through [`lookup_path_arg`] which picks it up automatically.
+/// goes through [`find_path_arg`] which picks it up automatically.
 pub(crate) const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
 /// Check that a file's size is within the allowed limit.
@@ -79,34 +79,32 @@ pub(crate) use crate::util::json::{
 /// returning the value of the first matching key as a string slice. Returns
 /// `None` if no matching key is present or the value is not a string.
 ///
-/// This is the borrowed counterpart of [`get_normalized_path`] — it returns
-/// `Option<&str>` (borrowed, optional) while [`get_normalized_path`] returns
+/// This is the borrowed counterpart of [`require_path_arg`] — it returns
+/// `Option<&str>` (borrowed, optional) while [`require_path_arg`] returns
 /// `Result<String>` (owned, required).
 #[must_use]
-pub(crate) fn lookup_path_arg(args: &serde_json::Value) -> Option<&str> {
+pub(crate) fn find_path_arg(args: &serde_json::Value) -> Option<&str> {
     std::iter::once("path")
         .chain(PATH_ALIAS_KEYS.iter().copied())
         .find_map(|k| args.get(k))
         .and_then(|v| v.as_str())
 }
 
-/// Extract a `"path"` argument from tool call arguments, respecting aliases.
+/// Extract a required `"path"` argument from tool call arguments, respecting aliases.
 ///
 /// Returns the path as an owned `String`, or a descriptive error if no path
 /// argument is present (even after checking [`PATH_ALIAS_KEYS`] aliases).
 ///
-/// This is the owned counterpart of [`lookup_path_arg`] — it returns
-/// `Result<String>` (owned, required) while [`lookup_path_arg`] returns
+/// This is the owned counterpart of [`find_path_arg`] — it returns
+/// `Result<String>` (owned, required) while [`find_path_arg`] returns
 /// `Option<&str>` (borrowed, optional).
-pub(crate) fn get_normalized_path(args: &serde_json::Value) -> anyhow::Result<String> {
-    lookup_path_arg(args)
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing required field: 'path'. \
+pub(crate) fn require_path_arg(args: &serde_json::Value) -> anyhow::Result<String> {
+    find_path_arg(args).map(ToString::to_string).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing required field: 'path'. \
                  Example: {{\"path\": \"src/main.rs\"}}"
-            )
-        })
+        )
+    })
 }
 
 /// Build a JSON schema for tool parameters.
@@ -265,7 +263,7 @@ pub fn format_file_tool_result(
     args: &serde_json::Value,
     outcome: &ToolExecutionOutcome,
 ) -> String {
-    let path = crate::tools::lookup_path_arg(args).unwrap_or("?");
+    let path = crate::tools::find_path_arg(args).unwrap_or("?");
     if !outcome.success {
         return format!("❌ {action} attempted on {path}");
     }
@@ -999,43 +997,42 @@ mod tests {
 
     // ── PATH_ALIAS_KEYS regression tests ──────────────────────────────
 
-    /// Direct tests for [`get_normalized_path`].
+    /// Direct tests for [`require_path_arg`].
     /// Covers alias resolution at the API boundary (owned `Result<String>`
-    /// with descriptive error), building on the [`lookup_path_arg`] tests
+    /// with descriptive error), building on the [`find_path_arg`] tests
     /// which cover the borrowed `Option<&str>` path already.
     #[test]
-    fn get_normalized_path_resolves_aliases() {
+    fn require_path_arg_resolves_aliases() {
         // "path" key works directly
         assert_eq!(
-            get_normalized_path(&serde_json::json!({"path": "src/main.rs"})).unwrap(),
+            require_path_arg(&serde_json::json!({"path": "src/main.rs"})).unwrap(),
             "src/main.rs"
         );
         // Falls back to "file" alias
         assert_eq!(
-            get_normalized_path(&serde_json::json!({"file": "lib.rs"})).unwrap(),
+            require_path_arg(&serde_json::json!({"file": "lib.rs"})).unwrap(),
             "lib.rs"
         );
         // Falls back to "filename" alias
         assert_eq!(
-            get_normalized_path(&serde_json::json!({"filename": "src/lib.rs"})).unwrap(),
+            require_path_arg(&serde_json::json!({"filename": "src/lib.rs"})).unwrap(),
             "src/lib.rs"
         );
         // "path" takes priority over "file"
         assert_eq!(
-            get_normalized_path(&serde_json::json!({"path": "main.rs", "file": "other.rs"}))
-                .unwrap(),
+            require_path_arg(&serde_json::json!({"path": "main.rs", "file": "other.rs"})).unwrap(),
             "main.rs"
         );
         // "file" takes priority over "filename"
         assert_eq!(
-            get_normalized_path(&serde_json::json!({"file": "a.rs", "filename": "b.rs"})).unwrap(),
+            require_path_arg(&serde_json::json!({"file": "a.rs", "filename": "b.rs"})).unwrap(),
             "a.rs"
         );
         // Missing path → descriptive error mentioning 'path'
-        let err = get_normalized_path(&serde_json::json!({"other": "value"})).unwrap_err();
+        let err = require_path_arg(&serde_json::json!({"other": "value"})).unwrap_err();
         assert!(err.to_string().contains("path"));
         // Non-string "path" exists as a key — no fallthrough to aliases, returns error
-        let err = get_normalized_path(&serde_json::json!({"path": ["invalid"], "file": "real.rs"}))
+        let err = require_path_arg(&serde_json::json!({"path": ["invalid"], "file": "real.rs"}))
             .unwrap_err();
         assert!(err.to_string().contains("path"));
     }

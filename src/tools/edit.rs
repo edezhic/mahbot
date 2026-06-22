@@ -54,7 +54,7 @@ impl Tool for EditTool {
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         // ── 1. Extract parameters ──────────────────────────────────
-        let path = super::get_normalized_path(&args)?;
+        let path = super::require_path_arg(&args)?;
 
         let old_string = super::get_opt_str(&args, "old_string");
 
