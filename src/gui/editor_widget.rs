@@ -1726,8 +1726,25 @@ fn build_rich_spans<'a>(
 }
 
 /// Push a span to `result`, merging it with the previous span if their
-/// `Attrs` match. Both slices must be contiguous views into `text`, so
-/// merging is a simple span extension into the source string.
+/// `Attrs` match and the slices are contiguous views into `text`.
+///
+/// When the slices are contiguous (i.e. `last.0` ends exactly where
+/// `new_text` begins in the source `text`), the merge extends the
+/// existing span rather than pushing a new entry — this avoids
+/// fragmentation in the rich-text buffer.
+///
+/// If the slices are **not** contiguous — meaning `new_text` does not
+/// immediately follow `last.0` in the source — the function safely
+/// falls back to pushing a separate entry. This prevents incorrect
+/// attribute application to characters in the gap region between the
+/// two slices.
+///
+/// # Safety
+///
+/// Both slices must be subslices of the same `text` allocation. The
+/// contiguity check uses pointer arithmetic and would produce undefined
+/// behavior if the slices came from different string allocations. All
+/// current callers uphold this requirement.
 pub(crate) fn push_or_merge<'a>(
     text: &'a str,
     result: &mut Vec<(&'a str, cosmic_text::Attrs<'a>)>,
@@ -1736,11 +1753,18 @@ pub(crate) fn push_or_merge<'a>(
 ) {
     if let Some(last) = result.last_mut() {
         if last.1 == new_attrs {
-            // Both slices are contiguous in `text`. Extend the last span.
+            // Compute byte offsets relative to `text` for both slices.
             let start = (last.0.as_ptr() as usize) - (text.as_ptr() as usize);
-            let end = (new_text.as_ptr() as usize + new_text.len()) - (text.as_ptr() as usize);
-            last.0 = &text[start..end];
-            return;
+            let last_end = start + last.0.len();
+            let new_start = (new_text.as_ptr() as usize) - (text.as_ptr() as usize);
+            // Only merge if the new slice immediately follows the last one
+            // in `text`. Non-contiguous slices are pushed separately to
+            // avoid applying the wrong attributes to the gap region.
+            if last_end == new_start {
+                let end = new_start + new_text.len();
+                last.0 = &text[start..end];
+                return;
+            }
         }
     }
     result.push((new_text, new_attrs));
@@ -3981,5 +4005,52 @@ mod tests {
         buf.perform_action(EditorAction::SelectTo { line: 1, col: 0 });
         buf.perform_action(EditorAction::Unindent);
         assert_eq!(buf.text(), "hello\nworld\nfoo");
+    }
+
+    // ── push_or_merge tests ────────────────────────────────────────────
+
+    #[test]
+    fn push_or_merge_contiguous_same_attrs_merges() {
+        let text = "hello world";
+        let attrs = cosmic_text::Attrs::new();
+        let mut result = Vec::new();
+        result.push((&text[0..5], attrs.clone()));
+        push_or_merge(text, &mut result, &text[5..11], attrs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "hello world");
+    }
+
+    #[test]
+    fn push_or_merge_non_contiguous_same_attrs_pushes_separately() {
+        let text = "hello---world";
+        let attrs = cosmic_text::Attrs::new();
+        let mut result = Vec::new();
+        result.push((&text[0..5], attrs.clone()));
+        // "world" starts at byte 8, not immediately after "hello" (5..8 is "---")
+        push_or_merge(text, &mut result, &text[8..13], attrs);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "hello");
+        assert_eq!(result[1].0, "world");
+    }
+
+    #[test]
+    fn push_or_merge_contiguous_different_attrs_pushes_separately() {
+        let text = "hello world";
+        let attrs1 = cosmic_text::Attrs::new();
+        let attrs2 = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
+        let mut result = Vec::new();
+        result.push((&text[0..5], attrs1));
+        push_or_merge(text, &mut result, &text[5..11], attrs2);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn push_or_merge_empty_result_pushes() {
+        let text = "hello";
+        let attrs = cosmic_text::Attrs::new();
+        let mut result = Vec::new();
+        push_or_merge(text, &mut result, &text[0..5], attrs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "hello");
     }
 }
