@@ -1863,181 +1863,12 @@ impl EditorState {
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
         match msg {
-            EditorMessage::WorkspaceSelected(name, path) => {
-                if name.is_empty() && path.is_empty() {
-                    self.selected_workspace_name = None;
-                    self.selected_workspace_path = None;
-                    self.clear_workspace_editor_state();
-                    return Task::none();
-                }
-
-                let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-
-                // Update selected workspace.
-                self.selected_workspace_name = Some(name.clone());
-                self.selected_workspace_path = Some(path.clone());
-
-                // Clear previous state.
-                let r#gen = self.generation.wrapping_add(1);
-                self.generation = r#gen;
-                self.clear_workspace_editor_state();
-
-                // ── Task 1: read root directory ───────────────────────
-                let root_path = path.clone();
-                let root_gen = r#gen;
-                let read_root_task = Task::perform(
-                    async move {
-                        let entries = read_directory_entries(&root_path, "").await;
-                        EditorMessage::DirExpanded {
-                            dir_path: String::new(),
-                            r#gen: root_gen,
-                            entries,
-                            quiet: false,
-                        }
-                    },
-                    |msg| msg,
-                );
-                tasks.push(read_root_task);
-
-                // ── Task 2: load tabs from DB + file contents ────────
-                let tab_ws = name.clone();
-                let tab_path = path.clone();
-                let tab_gen = r#gen;
-                let load_tabs_task = Task::perform(
-                    async move {
-                        let store = crate::workspace::store();
-                        let records = store.load_editor_tabs(&tab_ws).await.unwrap_or_default();
-                        let ws_path = tab_path;
-
-                        let mut loaded: Vec<SavedTabData> = Vec::new();
-                        for record in &records {
-                            // Belt-and-suspenders: skip tabs with empty file_path —
-                            // load_editor_tabs already filters these, but guard anyway.
-                            if record.file_path.is_empty() || record.file_path.trim().is_empty() {
-                                tracing::warn!(
-                                    workspace = %tab_ws,
-                                    tab_order = record.tab_order,
-                                    "Skipping editor tab with empty file_path in GUI loader"
-                                );
-                                continue;
-                            }
-                            let file_path = if ws_path.is_empty() {
-                                record.file_path.clone()
-                            } else {
-                                Path::new(&ws_path)
-                                    .join(&record.file_path)
-                                    .to_string_lossy()
-                                    .to_string()
-                            };
-                            if let Ok(bytes) = tokio::fs::read(&file_path).await {
-                                if (bytes.len() as u64) <= MAX_FILE_SIZE && !bytes.contains(&0) {
-                                    if let Ok(text) = String::from_utf8(bytes.clone()) {
-                                        let has_trailing = has_trailing_newline(&bytes);
-                                        let line_ending = detect_line_ending(&bytes);
-                                        loaded.push(SavedTabData {
-                                            file_path,
-                                            text,
-                                            was_dirty: record.is_dirty,
-                                            has_trailing_newline: has_trailing,
-                                            line_ending,
-                                            is_active: record.is_active,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        EditorMessage::SavedTabsLoaded {
-                            tabs_data: loaded,
-                            r#gen: tab_gen,
-                        }
-                    },
-                    |msg| msg,
-                );
-                tasks.push(load_tabs_task);
-
-                // ── Task 3: refresh git status for file tree coloring ──
-                let git_path = path.clone();
-                let git_task = Task::perform(
-                    async move { load_git_status(git_path).await },
-                    EditorMessage::GitStatusLoaded,
-                );
-                tasks.push(git_task);
-
-                Task::batch(tasks)
+            EditorMessage::WorkspaceSelected(ref name, ref path) => {
+                self.workspace_selected(name, path)
             }
 
             EditorMessage::SavedTabsLoaded { tabs_data, r#gen } => {
-                if r#gen != self.generation {
-                    return Task::none();
-                }
-
-                // Track which tab was active when persisted.
-                let mut active_idx = 0;
-
-                for (i, saved) in tabs_data.into_iter().enumerate() {
-                    let content = EditorBuffer::from_file(&saved.text, &saved.file_path);
-                    let file_name = Path::new(&saved.file_path).file_name().map_or_else(
-                        || saved.file_path.clone(),
-                        |n| n.to_string_lossy().to_string(),
-                    );
-
-                    let tab = Tab {
-                        path: saved.file_path.clone(),
-                        file_name,
-                        is_dirty: saved.was_dirty,
-                        has_trailing_newline: saved.has_trailing_newline,
-                        line_ending: saved.line_ending,
-                    };
-
-                    if saved.is_active {
-                        active_idx = i;
-                    }
-
-                    self.tabs.push(tab);
-                    let saved_hash = if saved.was_dirty {
-                        // Tab was dirty when persisted — the text in DB
-                        // differs from what's on disk.  Try to read the
-                        // on-disk version for an accurate saved hash;
-                        // fall back to the in-memory text if the file
-                        // is gone or unreadable.
-                        std::fs::read_to_string(&saved.file_path)
-                            .as_ref()
-                            .map_or_else(|_| hash_text(&saved.text), |disk| hash_text(disk))
-                    } else {
-                        hash_text(&saved.text)
-                    };
-                    let file_path = saved.file_path.clone();
-                    self.tab_contents.insert(
-                        saved.file_path,
-                        TabData {
-                            content,
-                            undo_stack: RefCell::new(UndoStack::new()),
-                            find_replace_state: None,
-                            saved_text_hash: saved_hash,
-                        },
-                    );
-                    // Record modification time for auto-refresh tracking.
-                    // Try the on-disk file first; if the file is missing
-                    // (e.g. it was saved dirty from a deleted file), no
-                    // mtime is recorded so the auto-refresh won't try to
-                    // reload a non-existent file.
-                    if let Ok(meta) = std::fs::metadata(&file_path) {
-                        if let Ok(mtime) = meta.modified() {
-                            self.file_mtimes.insert(file_path, mtime);
-                        }
-                    }
-                }
-
-                if !self.tabs.is_empty() {
-                    self.active_tab_index = active_idx.min(self.tabs.len().saturating_sub(1));
-                }
-                self.session_initialized = true;
-
-                if !self.tabs.is_empty() {
-                    self.scroll_to_active_tab()
-                } else {
-                    Task::none()
-                }
+                self.saved_tabs_loaded(tabs_data, r#gen)
             }
 
             EditorMessage::DirExpanded {
@@ -2045,48 +1876,7 @@ impl EditorState {
                 r#gen,
                 entries,
                 quiet,
-            } => {
-                if !dir_path.is_empty() && self.dir_generations.get(&dir_path) != Some(&r#gen) {
-                    return Task::none();
-                }
-
-                self.loading_dirs.remove(&dir_path);
-
-                match entries {
-                    Ok(entries) => {
-                        self.dir_entries.insert(dir_path.clone(), entries);
-                        self.rebuild_tree();
-                        // If this was triggered by Enter-on-directory, advance
-                        // focus to the first child now that children are loaded.
-                        if self.pending_enter_dir.as_deref() == Some(&dir_path) {
-                            self.pending_enter_dir = None;
-                            // Find the directory's position in the new visible list
-                            // and advance to the first child.
-                            if let Some(pos) = self
-                                .file_tree
-                                .visible_tree_nodes
-                                .iter()
-                                .position(|(p, _)| p == &dir_path)
-                            {
-                                if pos + 1 < self.file_tree.visible_tree_nodes.len() {
-                                    self.file_tree.tree_focus_index = pos + 1;
-                                    return widgets::scroll_to_tree_focus(&self.file_tree);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if quiet {
-                            tracing::warn!("Failed to read directory (refresh): {e}");
-                            return Task::none();
-                        }
-                        return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
-                            format!("Failed to read directory: {e}"),
-                        )));
-                    }
-                }
-                Task::none()
-            }
+            } => self.dir_expanded(&dir_path, r#gen, entries, quiet),
 
             EditorMessage::ToggleDir(dir_path) => {
                 if self.file_tree.expanded_dirs.contains(&dir_path) {
@@ -2218,87 +2008,7 @@ impl EditorState {
                 path,
                 r#gen,
                 result,
-            } => {
-                // Check per-file generation to prevent stale loads.
-                if self.file_generations.get(&path).copied() != Some(r#gen) {
-                    return Task::none();
-                }
-
-                match result {
-                    Ok(data) => {
-                        let content = EditorBuffer::from_file(&data.text, &data.path);
-                        let file_name = Path::new(&data.path)
-                            .file_name()
-                            .map_or_else(|| data.path.clone(), |n| n.to_string_lossy().to_string());
-
-                        let tab = Tab {
-                            path: data.path.clone(),
-                            file_name,
-                            is_dirty: false,
-                            has_trailing_newline: data.has_trailing_newline,
-                            line_ending: data.line_ending,
-                        };
-
-                        let saved_hash = hash_text(&data.text);
-                        self.tabs.push(tab);
-                        let file_path = data.path.clone();
-                        self.tab_contents.insert(
-                            data.path,
-                            TabData {
-                                content,
-                                undo_stack: RefCell::new(UndoStack::new()),
-                                find_replace_state: None,
-                                saved_text_hash: saved_hash,
-                            },
-                        );
-                        // Record modification time for auto-refresh tracking.
-                        if let Ok(meta) = std::fs::metadata(&file_path) {
-                            if let Ok(mtime) = meta.modified() {
-                                self.file_mtimes.insert(file_path, mtime);
-                            }
-                        }
-                        self.active_tab_index = self.tabs.len().saturating_sub(1);
-                        self.session_initialized = true;
-
-                        // ── Pending goto from global search ────────────
-                        // If this file was loaded for a global-search result click,
-                        // jump to the matching line. Only consume when both path and
-                        // generation match to avoid stealing from a different file load.
-                        if self
-                            .pending_goto
-                            .as_ref()
-                            .is_some_and(|(gp, _, gg)| *gp == path && *gg == r#gen)
-                        {
-                            if let Some((_, goto_line_1based, _)) = self.pending_goto.take() {
-                                let cursor_line = goto_line_1based.saturating_sub(1);
-                                let tab_path = self.tabs[self.active_tab_index].path.clone();
-                                if let Some(tab_data) = self.tab_contents.get_mut(&tab_path) {
-                                    let max_line = tab_data.content.line_count();
-                                    let line = cursor_line.min(max_line.saturating_sub(1));
-                                    tab_data.content.move_to(line, 0);
-                                }
-                            }
-                        }
-
-                        let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-                        tasks.push(self.scroll_to_active_tab());
-                        if let Some(save_task) = self.save_current_tabs() {
-                            tasks.push(save_task);
-                        }
-                        Task::batch(tasks)
-                    }
-                    Err(e) => {
-                        let toast = if e.starts_with("File too large")
-                            || e.starts_with("Binary file detected")
-                        {
-                            super::ToastMessage::Warning(e)
-                        } else {
-                            super::ToastMessage::Error(e)
-                        };
-                        Task::done(EditorMessage::Toast(toast))
-                    }
-                }
-            }
+            } => self.file_loaded(&path, r#gen, result),
 
             EditorMessage::TabSelected(idx) => {
                 if idx < self.tabs.len() {
@@ -2367,72 +2077,7 @@ impl EditorState {
                 path,
                 result,
                 saved_hash,
-            } => match result {
-                Ok(()) => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
-                        tab.is_dirty = false;
-                    }
-                    if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-                        tab_data.saved_text_hash = saved_hash;
-                    }
-                    // Update stored mtime so the next auto-refresh tick won't
-                    // detect the save-time mtime change as an external edit
-                    // and re-read the file, destroying the undo stack.
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if let Ok(mtime) = meta.modified() {
-                            self.file_mtimes.insert(path.clone(), mtime);
-                        }
-                    }
-
-                    // If this save was triggered by CloseDialog::Save, close the tab now.
-                    if let Some(close_idx) = self.pending_save_close.take() {
-                        if close_idx < self.tabs.len() {
-                            self.remove_tab_at(close_idx);
-                            // Save after removal + scroll.
-                            let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-                            if !self.tabs.is_empty() {
-                                tasks.push(self.scroll_to_active_tab());
-                            }
-                            if let Some(save_task) = self.save_current_tabs() {
-                                tasks.push(save_task);
-                            }
-                            return Task::batch(tasks);
-                        }
-                    }
-                    // If this save is part of a close-others save queue, continue.
-                    if let Some((keep_idx, mut remaining)) = self.pending_close_others.take() {
-                        return if remaining.is_empty() {
-                            // All dirty tabs saved — close everything except keep_idx.
-                            self.remove_all_tabs_except(keep_idx);
-                            // Save after removal.
-                            self.save_current_tabs().map_or_else(Task::none, |t| {
-                                Task::batch([
-                                    t,
-                                    Task::done(EditorMessage::Toast(super::ToastMessage::Saved)),
-                                ])
-                            })
-                        } else {
-                            // Save the next dirty tab.
-                            let next = remaining.remove(0);
-                            self.pending_close_others = Some((keep_idx, remaining));
-                            build_save_task(&self.tabs, &self.tab_contents, next)
-                        };
-                    }
-
-                    // Regular save (not from close dialog) — persist clean state.
-                    if let Some(save_task) = self.save_current_tabs() {
-                        save_task
-                    } else {
-                        Task::done(EditorMessage::Toast(super::ToastMessage::Saved))
-                    }
-                }
-                Err(e) => {
-                    self.pending_save_close = None;
-                    self.pending_close_others = None;
-                    let toast = super::ToastMessage::Error(e);
-                    Task::done(EditorMessage::Toast(toast))
-                }
-            },
+            } => self.save_result(&path, result, saved_hash),
 
             EditorMessage::CloseDialog { tab_index, action } => match action {
                 CloseAction::Save => {
@@ -2511,53 +2156,7 @@ impl EditorState {
                 Task::none()
             }
 
-            EditorMessage::Escape => {
-                // Close global search first (before find bar).
-                if self.global_search.is_some() {
-                    self.global_search = None;
-                    return Task::none();
-                }
-                // Close find bar on active tab next, if open.
-                if let Some(idx) = self.active_tab_idx() {
-                    let path = self.tabs[idx].path.clone();
-                    if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-                        if tab_data.find_replace_state.is_some() {
-                            tab_data.find_replace_state = None;
-                            return Task::none();
-                        }
-                    }
-                }
-                // Close go-to-line bar.
-                if self.goto_line_input.is_some() {
-                    self.goto_line_input = None;
-                    return Task::none();
-                }
-                // Close quick-open.
-                if self.quick_open.is_some() {
-                    self.quick_open = None;
-                    return Task::none();
-                }
-                // Close new-item input (before tree focus, after quick-open).
-                if self.new_item_input.is_some() {
-                    self.new_item_input = None;
-                    return Task::none();
-                }
-                // Close delete confirmation.
-                if self.delete_confirm.is_some() {
-                    self.delete_confirm = None;
-                    return Task::none();
-                }
-                if self.file_tree.tree_focused {
-                    self.file_tree.tree_focused = false;
-                    self.pending_enter_dir = None;
-                    return Task::none();
-                }
-                self.close_dialog = None;
-                self.close_others_target = None;
-                self.pending_save_close = None;
-                self.pending_close_others = None;
-                Task::none()
-            }
+            EditorMessage::Escape => self.escape(),
 
             // ── Go-to-line ────────────────────────────────────────────
             EditorMessage::GoToLineToggle => {
@@ -2608,79 +2207,7 @@ impl EditorState {
             }
 
             // ── Global search (find-in-files) ──────────────────────────
-            EditorMessage::GlobalSearchToggle => {
-                if self.global_search.is_some() {
-                    // Close if already open.
-                    self.global_search = None;
-                    return Task::none();
-                }
-                // Close find bar and go-to-line when opening global search.
-                if let Some(idx) = self.active_tab_idx() {
-                    let path = self.tabs[idx].path.clone();
-                    if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-                        tab_data.find_replace_state = None;
-                    }
-                }
-                self.goto_line_input = None;
-
-                let ws_path = match self.selected_workspace_path.as_ref() {
-                    Some(p) => p.clone(),
-                    None => return Task::none(),
-                };
-                let ws_name = match self.selected_workspace_name.as_ref() {
-                    Some(n) => n.clone(),
-                    None => return Task::none(),
-                };
-
-                self.global_search_gen = self.global_search_gen.wrapping_add(1);
-                let gs_gen = self.global_search_gen;
-
-                self.global_search = Some(GlobalSearchState {
-                    query: String::new(),
-                    results: Vec::new(),
-                    selected_index: 0,
-                    status: GlobalSearchStatus::Idle,
-                    search_gen: gs_gen,
-                });
-
-                // Start scanning the search engine and show readiness status.
-                let engine_task = Task::perform(
-                    async move {
-                        let ws = crate::Workspace {
-                            name: ws_name,
-                            path: ws_path,
-                            ..Default::default()
-                        };
-                        match crate::search_engine::get_or_init_engine(&ws) {
-                            Ok(entry) => match crate::search_engine::ensure_scanned(&entry).await {
-                                Ok(()) => EditorMessage::GlobalSearchResults {
-                                    r#gen: gs_gen,
-                                    results: Vec::new(),
-                                    error: None,
-                                },
-                                Err(e) => EditorMessage::GlobalSearchResults {
-                                    r#gen: gs_gen,
-                                    results: Vec::new(),
-                                    error: Some(e),
-                                },
-                            },
-                            Err(e) => EditorMessage::GlobalSearchResults {
-                                r#gen: gs_gen,
-                                results: Vec::new(),
-                                error: Some(e),
-                            },
-                        }
-                    },
-                    |msg| msg,
-                );
-
-                // Auto-focus the search input when the panel opens.
-                let focus_task = iced::widget::operation::focus::<EditorMessage>(Id::new(
-                    GLOBAL_SEARCH_INPUT_ID,
-                ));
-
-                Task::batch([engine_task, focus_task])
-            }
+            EditorMessage::GlobalSearchToggle => self.global_search_toggle(),
 
             EditorMessage::GlobalSearchInput(query) => {
                 let state = match self.global_search.as_mut() {
@@ -2723,45 +2250,7 @@ impl EditorState {
                 r#gen,
                 results,
                 error,
-            } => {
-                // Stale result? Discard (r#gen is never 0 from the async helper).
-                if r#gen != self.global_search_gen {
-                    return Task::none();
-                }
-
-                let state = match self.global_search.as_mut() {
-                    Some(s) => s,
-                    None => return Task::none(),
-                };
-
-                // Double-check: also discard if state has a newer generation.
-                if state.search_gen != r#gen {
-                    return Task::none();
-                }
-
-                if let Some(err) = error {
-                    state.status = GlobalSearchStatus::Error(err);
-                    state.results.clear();
-                    return Task::none();
-                }
-
-                if results.is_empty() && state.query.is_empty() {
-                    state.status = GlobalSearchStatus::Idle;
-                    return Task::none();
-                }
-
-                if results.is_empty() {
-                    state.status = GlobalSearchStatus::NoResults;
-                    state.results.clear();
-                    state.selected_index = 0;
-                    return Task::none();
-                }
-
-                state.results = results;
-                state.selected_index = 0;
-                state.status = GlobalSearchStatus::Done;
-                Task::none()
-            }
+            } => self.global_search_results(r#gen, results, error),
 
             EditorMessage::GlobalSearchSelect(idx) => {
                 let state = match self.global_search.as_ref() {
@@ -3442,49 +2931,7 @@ impl EditorState {
                 Task::none()
             }
 
-            EditorMessage::FindReplaceAll => {
-                let Some(idx) = self.active_tab_idx() else {
-                    return Task::none();
-                };
-                let path = self.tabs[idx].path.clone();
-                let mut toast = None;
-                if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-                    if let Some(ref state) = tab_data.find_replace_state {
-                        if !state.matches.is_empty() {
-                            // Take undo snapshot.
-                            tab_data
-                                .undo_stack
-                                .borrow_mut()
-                                .snap_before_edit(&tab_data.content);
-                            let text = tab_data.content.text();
-                            let replace = &state.replace;
-                            // Replace all in reverse order to preserve positions.
-                            let mut new_text = text.clone();
-                            for range in state.matches.iter().rev() {
-                                new_text.replace_range(range.start..range.end, replace);
-                            }
-                            tab_data.content = EditorBuffer::from_file(&new_text, &path);
-                            if let Some(tab) = self.tabs.get_mut(idx) {
-                                let current_hash = hash_text(&new_text);
-                                tab.is_dirty = current_hash != tab_data.saved_text_hash;
-                            }
-                            // Clear matches since they're all replaced.
-                            if let Some(ref mut state) = tab_data.find_replace_state {
-                                state.matches.clear();
-                                state.current_match_idx = 0;
-                            }
-                            toast = Some(EditorMessage::Toast(super::ToastMessage::SuccessMsg(
-                                "All matches replaced".to_string(),
-                            )));
-                        }
-                    }
-                }
-                if let Some(t) = toast {
-                    Task::done(t)
-                } else {
-                    Task::none()
-                }
-            }
+            EditorMessage::FindReplaceAll => self.find_replace_all(),
 
             EditorMessage::FindToggleCaseSensitivity => {
                 let Some(idx) = self.active_tab_idx() else {
@@ -3807,6 +3254,625 @@ impl EditorState {
             }
 
             EditorMessage::Toast(_) => Task::none(),
+        }
+    }
+
+    // ── Extracted handler methods ────────────────────────────────────
+
+    /// Handle workspace selection — initializes file tree, loads tabs, sets up workspace.
+    fn workspace_selected(&mut self, name: &str, path: &str) -> Task<EditorMessage> {
+        if name.is_empty() && path.is_empty() {
+            self.selected_workspace_name = None;
+            self.selected_workspace_path = None;
+            self.clear_workspace_editor_state();
+            return Task::none();
+        }
+
+        let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+
+        // Update selected workspace.
+        self.selected_workspace_name = Some(name.to_string());
+        self.selected_workspace_path = Some(path.to_string());
+
+        // Clear previous state.
+        let r#gen = self.generation.wrapping_add(1);
+        self.generation = r#gen;
+        self.clear_workspace_editor_state();
+
+        // ── Task 1: read root directory ───────────────────────
+        let root_path = path.to_string();
+        let root_gen = r#gen;
+        let read_root_task = Task::perform(
+            async move {
+                let entries = read_directory_entries(&root_path, "").await;
+                EditorMessage::DirExpanded {
+                    dir_path: String::new(),
+                    r#gen: root_gen,
+                    entries,
+                    quiet: false,
+                }
+            },
+            |msg| msg,
+        );
+        tasks.push(read_root_task);
+
+        // ── Task 2: load tabs from DB + file contents ────────
+        let tab_ws = name.to_string();
+        let tab_path = path.to_string();
+        let tab_gen = r#gen;
+        let load_tabs_task = Task::perform(
+            async move {
+                let store = crate::workspace::store();
+                let records = store.load_editor_tabs(&tab_ws).await.unwrap_or_default();
+                let ws_path = tab_path;
+
+                let mut loaded: Vec<SavedTabData> = Vec::new();
+                for record in &records {
+                    // Belt-and-suspenders: skip tabs with empty file_path —
+                    // load_editor_tabs already filters these, but guard anyway.
+                    if record.file_path.is_empty() || record.file_path.trim().is_empty() {
+                        tracing::warn!(
+                            workspace = %tab_ws,
+                            tab_order = record.tab_order,
+                            "Skipping editor tab with empty file_path in GUI loader"
+                        );
+                        continue;
+                    }
+                    let file_path = if ws_path.is_empty() {
+                        record.file_path.clone()
+                    } else {
+                        Path::new(&ws_path)
+                            .join(&record.file_path)
+                            .to_string_lossy()
+                            .to_string()
+                    };
+                    if let Ok(bytes) = tokio::fs::read(&file_path).await {
+                        if (bytes.len() as u64) <= MAX_FILE_SIZE && !bytes.contains(&0) {
+                            if let Ok(text) = String::from_utf8(bytes.clone()) {
+                                let has_trailing = has_trailing_newline(&bytes);
+                                let line_ending = detect_line_ending(&bytes);
+                                loaded.push(SavedTabData {
+                                    file_path,
+                                    text,
+                                    was_dirty: record.is_dirty,
+                                    has_trailing_newline: has_trailing,
+                                    line_ending,
+                                    is_active: record.is_active,
+                                });
+                            }
+                        }
+                    }
+                }
+                EditorMessage::SavedTabsLoaded {
+                    tabs_data: loaded,
+                    r#gen: tab_gen,
+                }
+            },
+            |msg| msg,
+        );
+        tasks.push(load_tabs_task);
+
+        // ── Task 3: refresh git status for file tree coloring ──
+        let git_path = path.to_string();
+        let git_task = Task::perform(
+            async move { load_git_status(git_path).await },
+            EditorMessage::GitStatusLoaded,
+        );
+        tasks.push(git_task);
+
+        Task::batch(tasks)
+    }
+
+    /// Handle saved tabs loaded from the database — deserializes tab data,
+    /// builds Tab/TabData structures.
+    fn saved_tabs_loaded(
+        &mut self,
+        tabs_data: Vec<SavedTabData>,
+        r#gen: u64,
+    ) -> Task<EditorMessage> {
+        if r#gen != self.generation {
+            return Task::none();
+        }
+
+        // Track which tab was active when persisted.
+        let mut active_idx = 0;
+
+        for (i, saved) in tabs_data.into_iter().enumerate() {
+            let content = EditorBuffer::from_file(&saved.text, &saved.file_path);
+            let file_name = Path::new(&saved.file_path).file_name().map_or_else(
+                || saved.file_path.clone(),
+                |n| n.to_string_lossy().to_string(),
+            );
+
+            let tab = Tab {
+                path: saved.file_path.clone(),
+                file_name,
+                is_dirty: saved.was_dirty,
+                has_trailing_newline: saved.has_trailing_newline,
+                line_ending: saved.line_ending,
+            };
+
+            if saved.is_active {
+                active_idx = i;
+            }
+
+            self.tabs.push(tab);
+            let saved_hash = if saved.was_dirty {
+                // Tab was dirty when persisted — the text in DB
+                // differs from what's on disk.  Try to read the
+                // on-disk version for an accurate saved hash;
+                // fall back to the in-memory text if the file
+                // is gone or unreadable.
+                std::fs::read_to_string(&saved.file_path)
+                    .as_ref()
+                    .map_or_else(|_| hash_text(&saved.text), |disk| hash_text(disk))
+            } else {
+                hash_text(&saved.text)
+            };
+            let file_path = saved.file_path.clone();
+            self.tab_contents.insert(
+                saved.file_path,
+                TabData {
+                    content,
+                    undo_stack: RefCell::new(UndoStack::new()),
+                    find_replace_state: None,
+                    saved_text_hash: saved_hash,
+                },
+            );
+            // Record modification time for auto-refresh tracking.
+            // Try the on-disk file first; if the file is missing
+            // (e.g. it was saved dirty from a deleted file), no
+            // mtime is recorded so the auto-refresh won't try to
+            // reload a non-existent file.
+            if let Ok(meta) = std::fs::metadata(&file_path) {
+                if let Ok(mtime) = meta.modified() {
+                    self.file_mtimes.insert(file_path, mtime);
+                }
+            }
+        }
+
+        if !self.tabs.is_empty() {
+            self.active_tab_index = active_idx.min(self.tabs.len().saturating_sub(1));
+        }
+        self.session_initialized = true;
+
+        if !self.tabs.is_empty() {
+            self.scroll_to_active_tab()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Handle directory expansion — populates dir_entries, rebuilds tree,
+    /// advances focus to first child if requested.
+    fn dir_expanded(
+        &mut self,
+        dir_path: &str,
+        r#gen: u64,
+        entries: Result<Vec<FsEntry>, String>,
+        quiet: bool,
+    ) -> Task<EditorMessage> {
+        if !dir_path.is_empty() && self.dir_generations.get(dir_path) != Some(&r#gen) {
+            return Task::none();
+        }
+
+        self.loading_dirs.remove(dir_path);
+
+        match entries {
+            Ok(entries) => {
+                self.dir_entries.insert(dir_path.to_string(), entries);
+                self.rebuild_tree();
+                // If this was triggered by Enter-on-directory, advance
+                // focus to the first child now that children are loaded.
+                if self.pending_enter_dir.as_deref() == Some(dir_path) {
+                    self.pending_enter_dir = None;
+                    // Find the directory's position in the new visible list
+                    // and advance to the first child.
+                    if let Some(pos) = self
+                        .file_tree
+                        .visible_tree_nodes
+                        .iter()
+                        .position(|(p, _)| p == dir_path)
+                    {
+                        if pos + 1 < self.file_tree.visible_tree_nodes.len() {
+                            self.file_tree.tree_focus_index = pos + 1;
+                            return widgets::scroll_to_tree_focus(&self.file_tree);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if quiet {
+                    tracing::warn!("Failed to read directory (refresh): {e}");
+                    return Task::none();
+                }
+                return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(format!(
+                    "Failed to read directory: {e}"
+                ))));
+            }
+        }
+        Task::none()
+    }
+
+    /// Handle a file being loaded from disk — opens a tab, initializes
+    /// EditorBuffer, sets hash/mtime, and handles pending goto from
+    /// global search.
+    fn file_loaded(
+        &mut self,
+        path: &str,
+        r#gen: u64,
+        result: Result<FileLoadData, String>,
+    ) -> Task<EditorMessage> {
+        // Check per-file generation to prevent stale loads.
+        if self.file_generations.get(path).copied() != Some(r#gen) {
+            return Task::none();
+        }
+
+        match result {
+            Ok(data) => {
+                let content = EditorBuffer::from_file(&data.text, &data.path);
+                let file_name = Path::new(&data.path)
+                    .file_name()
+                    .map_or_else(|| data.path.clone(), |n| n.to_string_lossy().to_string());
+
+                let tab = Tab {
+                    path: data.path.clone(),
+                    file_name,
+                    is_dirty: false,
+                    has_trailing_newline: data.has_trailing_newline,
+                    line_ending: data.line_ending,
+                };
+
+                let saved_hash = hash_text(&data.text);
+                self.tabs.push(tab);
+                let file_path = data.path.clone();
+                self.tab_contents.insert(
+                    data.path,
+                    TabData {
+                        content,
+                        undo_stack: RefCell::new(UndoStack::new()),
+                        find_replace_state: None,
+                        saved_text_hash: saved_hash,
+                    },
+                );
+                // Record modification time for auto-refresh tracking.
+                if let Ok(meta) = std::fs::metadata(&file_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        self.file_mtimes.insert(file_path, mtime);
+                    }
+                }
+                self.active_tab_index = self.tabs.len().saturating_sub(1);
+                self.session_initialized = true;
+
+                // ── Pending goto from global search ────────────
+                // If this file was loaded for a global-search result click,
+                // jump to the matching line. Only consume when both path and
+                // generation match to avoid stealing from a different file load.
+                if self
+                    .pending_goto
+                    .as_ref()
+                    .is_some_and(|(gp, _, gg)| *gp == path && *gg == r#gen)
+                {
+                    if let Some((_, goto_line_1based, _)) = self.pending_goto.take() {
+                        let cursor_line = goto_line_1based.saturating_sub(1);
+                        let tab_path = self.tabs[self.active_tab_index].path.clone();
+                        if let Some(tab_data) = self.tab_contents.get_mut(&tab_path) {
+                            let max_line = tab_data.content.line_count();
+                            let line = cursor_line.min(max_line.saturating_sub(1));
+                            tab_data.content.move_to(line, 0);
+                        }
+                    }
+                }
+
+                let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                tasks.push(self.scroll_to_active_tab());
+                if let Some(save_task) = self.save_current_tabs() {
+                    tasks.push(save_task);
+                }
+                Task::batch(tasks)
+            }
+            Err(e) => {
+                let toast =
+                    if e.starts_with("File too large") || e.starts_with("Binary file detected") {
+                        super::ToastMessage::Warning(e)
+                    } else {
+                        super::ToastMessage::Error(e)
+                    };
+                Task::done(EditorMessage::Toast(toast))
+            }
+        }
+    }
+
+    /// Handle the result of a save operation — updates dirty flags,
+    /// handles CloseDialog→close-tab and CloseOthers→save-queue flows.
+    fn save_result(
+        &mut self,
+        path: &str,
+        result: Result<(), String>,
+        saved_hash: u64,
+    ) -> Task<EditorMessage> {
+        match result {
+            Ok(()) => {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
+                    tab.is_dirty = false;
+                }
+                if let Some(tab_data) = self.tab_contents.get_mut(path) {
+                    tab_data.saved_text_hash = saved_hash;
+                }
+                // Update stored mtime so the next auto-refresh tick won't
+                // detect the save-time mtime change as an external edit
+                // and re-read the file, destroying the undo stack.
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if let Ok(mtime) = meta.modified() {
+                        self.file_mtimes.insert(path.to_string(), mtime);
+                    }
+                }
+
+                // If this save was triggered by CloseDialog::Save, close the tab now.
+                if let Some(close_idx) = self.pending_save_close.take() {
+                    if close_idx < self.tabs.len() {
+                        self.remove_tab_at(close_idx);
+                        // Save after removal + scroll.
+                        let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                        if !self.tabs.is_empty() {
+                            tasks.push(self.scroll_to_active_tab());
+                        }
+                        if let Some(save_task) = self.save_current_tabs() {
+                            tasks.push(save_task);
+                        }
+                        return Task::batch(tasks);
+                    }
+                }
+                // If this save is part of a close-others save queue, continue.
+                if let Some((keep_idx, mut remaining)) = self.pending_close_others.take() {
+                    return if remaining.is_empty() {
+                        // All dirty tabs saved — close everything except keep_idx.
+                        self.remove_all_tabs_except(keep_idx);
+                        // Save after removal.
+                        self.save_current_tabs().map_or_else(Task::none, |t| {
+                            Task::batch([
+                                t,
+                                Task::done(EditorMessage::Toast(super::ToastMessage::Saved)),
+                            ])
+                        })
+                    } else {
+                        // Save the next dirty tab.
+                        let next = remaining.remove(0);
+                        self.pending_close_others = Some((keep_idx, remaining));
+                        build_save_task(&self.tabs, &self.tab_contents, next)
+                    };
+                }
+
+                // Regular save (not from close dialog) — persist clean state.
+                if let Some(save_task) = self.save_current_tabs() {
+                    save_task
+                } else {
+                    Task::done(EditorMessage::Toast(super::ToastMessage::Saved))
+                }
+            }
+            Err(e) => {
+                self.pending_save_close = None;
+                self.pending_close_others = None;
+                let toast = super::ToastMessage::Error(e);
+                Task::done(EditorMessage::Toast(toast))
+            }
+        }
+    }
+
+    /// Handle Escape key — dismisses find bar, go-to-line, quick open,
+    /// close dialog, tree focus, and global search in priority order.
+    fn escape(&mut self) -> Task<EditorMessage> {
+        // Close global search first (before find bar).
+        if self.global_search.is_some() {
+            self.global_search = None;
+            return Task::none();
+        }
+        // Close find bar on active tab next, if open.
+        if let Some(idx) = self.active_tab_idx() {
+            let path = self.tabs[idx].path.clone();
+            if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                if tab_data.find_replace_state.is_some() {
+                    tab_data.find_replace_state = None;
+                    return Task::none();
+                }
+            }
+        }
+        // Close go-to-line bar.
+        if self.goto_line_input.is_some() {
+            self.goto_line_input = None;
+            return Task::none();
+        }
+        // Close quick-open.
+        if self.quick_open.is_some() {
+            self.quick_open = None;
+            return Task::none();
+        }
+        // Close new-item input (before tree focus, after quick-open).
+        if self.new_item_input.is_some() {
+            self.new_item_input = None;
+            return Task::none();
+        }
+        // Close delete confirmation.
+        if self.delete_confirm.is_some() {
+            self.delete_confirm = None;
+            return Task::none();
+        }
+        if self.file_tree.tree_focused {
+            self.file_tree.tree_focused = false;
+            self.pending_enter_dir = None;
+            return Task::none();
+        }
+        self.close_dialog = None;
+        self.close_others_target = None;
+        self.pending_save_close = None;
+        self.pending_close_others = None;
+        Task::none()
+    }
+
+    /// Handle global search toggle — opens/closes the search overlay,
+    /// spawns search engine initialization.
+    fn global_search_toggle(&mut self) -> Task<EditorMessage> {
+        if self.global_search.is_some() {
+            // Close if already open.
+            self.global_search = None;
+            return Task::none();
+        }
+        // Close find bar and go-to-line when opening global search.
+        if let Some(idx) = self.active_tab_idx() {
+            let path = self.tabs[idx].path.clone();
+            if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                tab_data.find_replace_state = None;
+            }
+        }
+        self.goto_line_input = None;
+
+        let ws_path = match self.selected_workspace_path.as_ref() {
+            Some(p) => p.clone(),
+            None => return Task::none(),
+        };
+        let ws_name = match self.selected_workspace_name.as_ref() {
+            Some(n) => n.clone(),
+            None => return Task::none(),
+        };
+
+        self.global_search_gen = self.global_search_gen.wrapping_add(1);
+        let gs_gen = self.global_search_gen;
+
+        self.global_search = Some(GlobalSearchState {
+            query: String::new(),
+            results: Vec::new(),
+            selected_index: 0,
+            status: GlobalSearchStatus::Idle,
+            search_gen: gs_gen,
+        });
+
+        // Start scanning the search engine and show readiness status.
+        let engine_task = Task::perform(
+            async move {
+                let ws = crate::Workspace {
+                    name: ws_name,
+                    path: ws_path,
+                    ..Default::default()
+                };
+                match crate::search_engine::get_or_init_engine(&ws) {
+                    Ok(entry) => match crate::search_engine::ensure_scanned(&entry).await {
+                        Ok(()) => EditorMessage::GlobalSearchResults {
+                            r#gen: gs_gen,
+                            results: Vec::new(),
+                            error: None,
+                        },
+                        Err(e) => EditorMessage::GlobalSearchResults {
+                            r#gen: gs_gen,
+                            results: Vec::new(),
+                            error: Some(e),
+                        },
+                    },
+                    Err(e) => EditorMessage::GlobalSearchResults {
+                        r#gen: gs_gen,
+                        results: Vec::new(),
+                        error: Some(e),
+                    },
+                }
+            },
+            |msg| msg,
+        );
+
+        // Auto-focus the search input when the panel opens.
+        let focus_task =
+            iced::widget::operation::focus::<EditorMessage>(Id::new(GLOBAL_SEARCH_INPUT_ID));
+
+        Task::batch([engine_task, focus_task])
+    }
+
+    /// Handle global search results — populates search results, handles
+    /// stale results, error states, and empty results.
+    fn global_search_results(
+        &mut self,
+        r#gen: u64,
+        results: Vec<OwnedGrepMatch>,
+        error: Option<String>,
+    ) -> Task<EditorMessage> {
+        // Stale result? Discard (r#gen is never 0 from the async helper).
+        if r#gen != self.global_search_gen {
+            return Task::none();
+        }
+
+        let state = match self.global_search.as_mut() {
+            Some(s) => s,
+            None => return Task::none(),
+        };
+
+        // Double-check: also discard if state has a newer generation.
+        if state.search_gen != r#gen {
+            return Task::none();
+        }
+
+        if let Some(err) = error {
+            state.status = GlobalSearchStatus::Error(err);
+            state.results.clear();
+            return Task::none();
+        }
+
+        if results.is_empty() && state.query.is_empty() {
+            state.status = GlobalSearchStatus::Idle;
+            return Task::none();
+        }
+
+        if results.is_empty() {
+            state.status = GlobalSearchStatus::NoResults;
+            state.results.clear();
+            state.selected_index = 0;
+            return Task::none();
+        }
+
+        state.results = results;
+        state.selected_index = 0;
+        state.status = GlobalSearchStatus::Done;
+        Task::none()
+    }
+
+    /// Handle FindReplaceAll — replaces all matches in the active buffer.
+    fn find_replace_all(&mut self) -> Task<EditorMessage> {
+        let Some(idx) = self.active_tab_idx() else {
+            return Task::none();
+        };
+        let path = self.tabs[idx].path.clone();
+        let mut toast = None;
+        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+            if let Some(ref state) = tab_data.find_replace_state {
+                if !state.matches.is_empty() {
+                    // Take undo snapshot.
+                    tab_data
+                        .undo_stack
+                        .borrow_mut()
+                        .snap_before_edit(&tab_data.content);
+                    let text = tab_data.content.text();
+                    let replace = &state.replace;
+                    // Replace all in reverse order to preserve positions.
+                    let mut new_text = text.clone();
+                    for range in state.matches.iter().rev() {
+                        new_text.replace_range(range.start..range.end, replace);
+                    }
+                    tab_data.content = EditorBuffer::from_file(&new_text, &path);
+                    if let Some(tab) = self.tabs.get_mut(idx) {
+                        let current_hash = hash_text(&new_text);
+                        tab.is_dirty = current_hash != tab_data.saved_text_hash;
+                    }
+                    // Clear matches since they're all replaced.
+                    if let Some(ref mut state) = tab_data.find_replace_state {
+                        state.matches.clear();
+                        state.current_match_idx = 0;
+                    }
+                    toast = Some(EditorMessage::Toast(super::ToastMessage::SuccessMsg(
+                        "All matches replaced".to_string(),
+                    )));
+                }
+            }
+        }
+        if let Some(t) = toast {
+            Task::done(t)
+        } else {
+            Task::none()
         }
     }
 
