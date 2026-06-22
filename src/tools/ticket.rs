@@ -157,12 +157,7 @@ impl Tool for UpdateTicketTool {
         let id = super::get_str(&args, "ticket_id")?;
         let new_status = super::get_str(&args, "status")?;
 
-        let Ok(parsed_status) = new_status.parse::<TicketPhase>() else {
-            anyhow::bail!(
-                "Invalid status '{new_status}'. Valid statuses: {}",
-                valid_phases_string(),
-            );
-        };
+        let parsed_status = parse_ticket_phase(new_status)?;
 
         let store = crate::board::store();
 
@@ -216,12 +211,7 @@ impl Tool for ListTicketsTool {
 
         let status_filter = match raw_status {
             Some(s) => {
-                let Ok(parsed) = s.parse::<TicketPhase>() else {
-                    anyhow::bail!(
-                        "Invalid status '{s}'. Valid statuses: {}",
-                        valid_phases_string(),
-                    );
-                };
+                let parsed = parse_ticket_phase(s)?;
                 Some(parsed)
             }
             None => None,
@@ -349,6 +339,17 @@ fn valid_phases_string() -> String {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Parse a status string into a [`TicketPhase`], returning a user-friendly
+/// error message listing all valid phases on failure.
+fn parse_ticket_phase(s: &str) -> Result<TicketPhase> {
+    s.parse::<TicketPhase>().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid status '{s}'. Valid statuses: {}",
+            valid_phases_string()
+        )
+    })
 }
 
 /// Guard: refuse to proceed if the ticket is in a pipeline-blocking phase.
@@ -524,6 +525,30 @@ mod tests {
         assert!(
             result.contains('A'),
             "Explicit 'backlog' filter should include ticket A"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_tickets_invalid_status() {
+        crate::util::test::init_test_stores().await;
+
+        let ws = crate::workspace::test_ws("/tmp");
+        let tool = ListTicketsTool;
+        let args = json!({"status": "bogus_status"});
+        let result = tool.execute(&ws, args).await;
+        assert!(result.is_err(), "Invalid status should fail");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("Invalid status"),
+            "Should mention invalid status"
+        );
+        assert!(
+            err.contains("backlog"),
+            "Error should list phase names (e.g. backlog)"
+        );
+        assert!(
+            err.contains("done"),
+            "Error should list phase names (e.g. done)"
         );
     }
 
