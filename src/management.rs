@@ -774,6 +774,26 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
 // - No Arc wrapping is needed because `Ticket` is moved by value into
 //   the spawned task.
 
+/// Transition a QaPassed ticket to Done with a descriptive reason.
+async fn move_ticket_to_done(board: &BoardStore, ticket: &Ticket, reason: &str) {
+    info!(ticket = %ticket.id, "{reason}");
+    if let Err(e) = transition_ticket(
+        board,
+        ticket,
+        TicketPhase::QaPassed,
+        TicketPhase::Done,
+        true,
+    )
+    .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "QA passed but transition to Done failed",
+        );
+    }
+}
+
 /// Auto-commit changes after QA passes and move the ticket to Done.
 ///
 /// Checks for a dirty working tree via `git status --porcelain`:
@@ -784,30 +804,23 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
 async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
-    // Capture `ticket` by shared ref, `reason` by value — owned String avoids lifetime issues in async
-    let move_to_done = |reason: String| {
-        let t = &ticket;
-        async move {
-            info!(ticket = %t.id, "{reason}");
-            if let Err(e) =
-                transition_ticket(board, t, TicketPhase::QaPassed, TicketPhase::Done, true).await
-            {
-                warn!(
-                    ticket = %t.id,
-                    error = %e,
-                    "QA passed but transition to Done failed",
-                );
-            }
-        }
-    };
-
     if !crate::diff_parse::git_is_installed().await {
-        move_to_done("Git not installed — moving to Done without commit".to_string()).await;
+        move_ticket_to_done(
+            board,
+            &ticket,
+            "Git not installed — moving to Done without commit",
+        )
+        .await;
         return;
     }
 
     if !crate::diff_parse::is_git_repo(repo_path).await {
-        move_to_done("Not a git repo — moving to Done without commit".to_string()).await;
+        move_ticket_to_done(
+            board,
+            &ticket,
+            "Not a git repo — moving to Done without commit",
+        )
+        .await;
         return;
     }
 
@@ -825,7 +838,12 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
     };
 
     if !has_changes {
-        move_to_done("Clean working tree — moving to Done without commit".to_string()).await;
+        move_ticket_to_done(
+            board,
+            &ticket,
+            "Clean working tree — moving to Done without commit",
+        )
+        .await;
         return;
     }
 
@@ -856,7 +874,12 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
             }
 
             // Transition to Done.
-            move_to_done(format!("Committed {short_hash}, moving to Done")).await;
+            move_ticket_to_done(
+                board,
+                &ticket,
+                &format!("Committed {short_hash}, moving to Done"),
+            )
+            .await;
         }
         Err(e) => {
             error!(
