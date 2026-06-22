@@ -857,6 +857,7 @@ fn has_cargo_fmt_check(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::shell::SHELL_PREFIXES;
 
     fn ok(cmd: &str) {
         assert!(
@@ -891,19 +892,14 @@ mod tests {
 
     // ── Git allowlist ──────────────────────────────────────────────
 
+    /// Tests that ALL entries in the production [`GIT_SAFE_SUBCOMMANDS`] constant
+    /// are accepted. Iterates the constant directly to prevent coverage drift
+    /// when entries are added or removed.
     #[test]
-    fn git_status() {
-        ok("git status");
-    }
-
-    #[test]
-    fn git_log_oneline() {
-        ok("git log --oneline");
-    }
-
-    #[test]
-    fn git_diff() {
-        ok("git diff HEAD~1");
+    fn all_git_safe_subcommands_allowed() {
+        for subcmd in GIT_SAFE_SUBCOMMANDS {
+            ok(&format!("git {subcmd}"));
+        }
     }
 
     #[test]
@@ -927,46 +923,6 @@ mod tests {
     }
 
     #[test]
-    fn git_branch_allowed() {
-        ok("git branch");
-    }
-
-    #[test]
-    fn git_tag_allowed() {
-        ok("git tag");
-    }
-
-    #[test]
-    fn git_remote_allowed() {
-        ok("git remote");
-    }
-
-    #[test]
-    fn git_blame_allowed() {
-        ok("git blame src/main.rs");
-    }
-
-    #[test]
-    fn git_cat_file_allowed() {
-        ok("git cat-file -p HEAD");
-    }
-
-    #[test]
-    fn git_worktree_list_allowed() {
-        ok("git worktree list");
-    }
-
-    #[test]
-    fn git_config_list_allowed() {
-        ok("git config --list");
-    }
-
-    #[test]
-    fn git_config_get_allowed() {
-        ok("git config --get user.name");
-    }
-
-    #[test]
     fn git_merge_rejected() {
         assert_rejected("git merge feature");
     }
@@ -978,19 +934,18 @@ mod tests {
 
     // ── Cargo allowlist ────────────────────────────────────────────
 
+    /// Tests that ALL entries in the production [`CARGO_SAFE_SUBCOMMANDS`] constant
+    /// (except `"fmt"`, which requires `--check`) are accepted.
+    /// Iterates the constant directly to prevent coverage drift
+    /// when entries are added or removed.
     #[test]
-    fn cargo_check() {
-        ok("cargo check");
-    }
-
-    #[test]
-    fn cargo_test() {
-        ok("cargo test");
-    }
-
-    #[test]
-    fn cargo_clippy() {
-        ok("cargo clippy");
+    fn all_cargo_safe_subcommands_allowed() {
+        for subcmd in CARGO_SAFE_SUBCOMMANDS {
+            if *subcmd == "fmt" {
+                continue; // requires --check flag — tested via cargo_fmt_check_allowed
+            }
+            ok(&format!("cargo {subcmd}"));
+        }
     }
 
     #[test]
@@ -1021,21 +976,6 @@ mod tests {
     #[test]
     fn cargo_fix_rejected() {
         assert_rejected("cargo fix");
-    }
-
-    #[test]
-    fn cargo_doc_allowed() {
-        ok("cargo doc");
-    }
-
-    #[test]
-    fn cargo_update_allowed() {
-        ok("cargo update");
-    }
-
-    #[test]
-    fn cargo_clean_allowed() {
-        ok("cargo clean");
     }
 
     // ── Unconditional rejections ──────────────────────────────────
@@ -1242,39 +1182,23 @@ mod tests {
 
     // ── Prefix stripping (P0) ──────────────────────────────────────
 
+    /// Tests that ALL delegating shell prefixes (those that forward their
+    /// arguments as a command) correctly expose mutating commands for rejection.
+    /// Iterates the production [`SHELL_PREFIXES`] constant directly, excluding
+    /// non-delegating builtins (`cd`, `pushd`, `popd`, `export`, `source`, `.`).
     #[test]
-    fn sudo_rm_rejected() {
-        assert_rejected("sudo rm file");
+    fn shell_prefix_mutating_rejected() {
+        for prefix in SHELL_PREFIXES {
+            match *prefix {
+                "cd" | "pushd" | "popd" | "export" | "source" | "." => continue,
+                _ => assert_rejected(&format!("{prefix} rm file")),
+            }
+        }
     }
 
     #[test]
     fn sudo_flag_rm_rejected() {
         assert_rejected("sudo -E rm file");
-    }
-
-    #[test]
-    fn env_rm_rejected() {
-        assert_rejected("env rm file");
-    }
-
-    #[test]
-    fn exec_rm_rejected() {
-        assert_rejected("exec rm file");
-    }
-
-    #[test]
-    fn nohup_rm_rejected() {
-        assert_rejected("nohup rm file");
-    }
-
-    #[test]
-    fn command_rm_rejected() {
-        assert_rejected("command rm file");
-    }
-
-    #[test]
-    fn eval_rm_rejected() {
-        assert_rejected("eval rm file");
     }
 
     #[test]
@@ -1346,60 +1270,6 @@ mod tests {
     #[test]
     fn kubectl_get_allowed() {
         ok("kubectl get pods");
-    }
-
-    // ── Git branch/tag/remote mutation flags (P3) ───────────────────
-
-    #[test]
-    fn git_branch_list_allowed() {
-        ok("git branch");
-    }
-
-    #[test]
-    fn git_branch_sort_allowed() {
-        ok("git branch --sort=-committerdate");
-    }
-
-    #[test]
-    fn git_tag_list_allowed() {
-        ok("git tag");
-    }
-
-    #[test]
-    fn git_remote_list_allowed() {
-        ok("git remote");
-    }
-
-    #[test]
-    fn git_remote_verbose_allowed() {
-        ok("git remote -v");
-    }
-
-    // ── New safe subcommands ───────────────────────────────────────
-
-    #[test]
-    fn git_reflog_allowed() {
-        ok("git reflog");
-    }
-
-    #[test]
-    fn git_range_diff_allowed() {
-        ok("git range-diff HEAD~3 HEAD~1 HEAD");
-    }
-
-    #[test]
-    fn cargo_version_allowed() {
-        ok("cargo version");
-    }
-
-    #[test]
-    fn cargo_help_allowed() {
-        ok("cargo help build");
-    }
-
-    #[test]
-    fn cargo_bench_allowed() {
-        ok("cargo bench");
     }
 
     // ── tar --list (P9) ────────────────────────────────────────────
