@@ -875,225 +875,192 @@ impl EditorBuffer {
 
     // ── Cursor movement helpers ───────────────────────────────────
 
-    /// Move cursor one character left.
-    fn do_move_left(&self, extend_selection: bool) {
+    /// Execute a cursor movement operation, handling the
+    /// `extend_selection` scaffolding automatically.
+    ///
+    /// If `extend_selection` is true, the current cursor position is
+    /// recorded as the selection anchor before moving. The `compute`
+    /// closure returns the target `(line, col)` or `None` to abort
+    /// (e.g. at document boundaries).
+    fn with_cursor_movement(
+        &self,
+        extend_selection: bool,
+        compute: impl FnOnce() -> Option<(usize, usize)>,
+    ) {
         if extend_selection {
             self.ensure_selection_anchor();
         }
-        let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
-        let target = if col > 0 {
-            (line, col - 1)
-        } else if line > 0 {
-            let prev_line = line - 1;
-            let prev_len = self
-                .buffer
-                .borrow()
-                .lines
-                .get(prev_line)
-                .map_or(0, |l| l.text().chars().count());
-            (prev_line, prev_len)
-        } else {
-            return; // Already at (0,0) — no movement.
-        };
-        if extend_selection {
-            self.set_cursor_pos(target.0, target.1);
-        } else {
-            self.move_to(target.0, target.1);
+        if let Some((line, col)) = compute() {
+            if extend_selection {
+                self.set_cursor_pos(line, col);
+            } else {
+                self.move_to(line, col);
+            }
         }
+    }
+
+    /// Move cursor one character left.
+    fn do_move_left(&self, extend_selection: bool) {
+        self.with_cursor_movement(extend_selection, || {
+            let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
+            if col > 0 {
+                Some((line, col - 1))
+            } else if line > 0 {
+                let prev_line = line - 1;
+                let prev_len = self
+                    .buffer
+                    .borrow()
+                    .lines
+                    .get(prev_line)
+                    .map_or(0, |l| l.text().chars().count());
+                Some((prev_line, prev_len))
+            } else {
+                None
+            }
+        });
     }
 
     /// Move cursor one character right.
     fn do_move_right(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
-        let max_line = self.line_count().saturating_sub(1);
-        let line_len = self
-            .buffer
-            .borrow()
-            .lines
-            .get(line)
-            .map_or(0, |l| l.text().chars().count());
-        let target = if col < line_len {
-            (line, col + 1)
-        } else if line < max_line {
-            (line + 1, 0)
-        } else {
-            return; // At end of document — no movement.
-        };
-        if extend_selection {
-            self.set_cursor_pos(target.0, target.1);
-        } else {
-            self.move_to(target.0, target.1);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
+            let max_line = self.line_count().saturating_sub(1);
+            let line_len = self
+                .buffer
+                .borrow()
+                .lines
+                .get(line)
+                .map_or(0, |l| l.text().chars().count());
+            if col < line_len {
+                Some((line, col + 1))
+            } else if line < max_line {
+                Some((line + 1, 0))
+            } else {
+                None
+            }
+        });
     }
 
     /// Move cursor one line up.
     fn do_move_up(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
-        if line > 0 {
-            if extend_selection {
-                self.set_cursor_pos(line - 1, col);
+        self.with_cursor_movement(extend_selection, || {
+            let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
+            if line > 0 {
+                Some((line - 1, col))
             } else {
-                self.move_to(line - 1, col);
+                None
             }
-        }
+        });
     }
 
     /// Move cursor one line down.
     fn do_move_down(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
-        let max_line = self.line_count().saturating_sub(1);
-        if line < max_line {
-            if extend_selection {
-                self.set_cursor_pos(line + 1, col);
+        self.with_cursor_movement(extend_selection, || {
+            let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
+            let max_line = self.line_count().saturating_sub(1);
+            if line < max_line {
+                Some((line + 1, col))
             } else {
-                self.move_to(line + 1, col);
+                None
             }
-        }
+        });
     }
 
     /// Move cursor to start of current line.
     fn do_move_home(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let line = self.cursor_line.get();
-        if extend_selection {
-            self.set_cursor_pos(line, 0);
-        } else {
-            self.move_to(line, 0);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let line = self.cursor_line.get();
+            Some((line, 0))
+        });
     }
 
     /// Move cursor to end of current line.
     fn do_move_end(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let line = self.cursor_line.get();
-        let line_len = self
-            .buffer
-            .borrow()
-            .lines
-            .get(line)
-            .map_or(0, |l| l.text().chars().count());
-        if extend_selection {
-            self.set_cursor_pos(line, line_len);
-        } else {
-            self.move_to(line, line_len);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let line = self.cursor_line.get();
+            let line_len = self
+                .buffer
+                .borrow()
+                .lines
+                .get(line)
+                .map_or(0, |l| l.text().chars().count());
+            Some((line, line_len))
+        });
     }
 
     /// Move cursor one word left.
     fn do_move_word_left(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let text = self.text();
-        let offset = line_col_to_byte_offset(&text, self.cursor_line.get(), self.cursor_col.get());
-        if offset == 0 {
-            return;
-        }
-        let (line, col) = byte_offset_to_line_col(&text, find_word_start(&text, offset));
-        if extend_selection {
-            self.set_cursor_pos(line, col);
-        } else {
-            self.move_to(line, col);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let text = self.text();
+            let offset =
+                line_col_to_byte_offset(&text, self.cursor_line.get(), self.cursor_col.get());
+            if offset == 0 {
+                None
+            } else {
+                Some(byte_offset_to_line_col(
+                    &text,
+                    find_word_start(&text, offset),
+                ))
+            }
+        });
     }
 
     /// Move cursor one word right.
     fn do_move_word_right(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let text = self.text();
-        let offset = line_col_to_byte_offset(&text, self.cursor_line.get(), self.cursor_col.get());
-        if offset >= text.len() {
-            return;
-        }
-        let (line, col) = byte_offset_to_line_col(&text, find_word_end(&text, offset));
-        if extend_selection {
-            self.set_cursor_pos(line, col);
-        } else {
-            self.move_to(line, col);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let text = self.text();
+            let offset =
+                line_col_to_byte_offset(&text, self.cursor_line.get(), self.cursor_col.get());
+            if offset >= text.len() {
+                None
+            } else {
+                Some(byte_offset_to_line_col(&text, find_word_end(&text, offset)))
+            }
+        });
     }
 
     /// Move cursor to start of document.
     fn do_move_doc_start(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        if extend_selection {
-            self.set_cursor_pos(0, 0);
-        } else {
-            self.move_to(0, 0);
-        }
+        self.with_cursor_movement(extend_selection, || Some((0, 0)));
     }
 
     /// Move cursor to end of document.
     fn do_move_doc_end(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let max_line = self.line_count().saturating_sub(1);
-        let line_len = self
-            .buffer
-            .borrow()
-            .lines
-            .get(max_line)
-            .map_or(0, |l| l.text().chars().count());
-        if extend_selection {
-            self.set_cursor_pos(max_line, line_len);
-        } else {
-            self.move_to(max_line, line_len);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let max_line = self.line_count().saturating_sub(1);
+            let line_len = self
+                .buffer
+                .borrow()
+                .lines
+                .get(max_line)
+                .map_or(0, |l| l.text().chars().count());
+            Some((max_line, line_len))
+        });
     }
 
     /// Move cursor one page up (by viewport height lines).
     fn do_move_page_up(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let line = self.cursor_line.get();
-        let page_lines = PAGE_SCROLL_LINES;
-        let col = self.cursor_col.get();
-        let target = if line > page_lines {
-            (line - page_lines, col)
-        } else {
-            (0, col)
-        };
-        if extend_selection {
-            self.set_cursor_pos(target.0, target.1);
-        } else {
-            self.move_to(target.0, target.1);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let line = self.cursor_line.get();
+            let col = self.cursor_col.get();
+            let page_lines = PAGE_SCROLL_LINES;
+            Some(if line > page_lines {
+                (line - page_lines, col)
+            } else {
+                (0, col)
+            })
+        });
     }
 
     /// Move cursor one page down.
     fn do_move_page_down(&self, extend_selection: bool) {
-        if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        let line = self.cursor_line.get();
-        let max_line = self.line_count().saturating_sub(1);
-        let page_lines = PAGE_SCROLL_LINES;
-        let col = self.cursor_col.get();
-        let target = (line.saturating_add(page_lines).min(max_line), col);
-        if extend_selection {
-            self.set_cursor_pos(target.0, target.1);
-        } else {
-            self.move_to(target.0, target.1);
-        }
+        self.with_cursor_movement(extend_selection, || {
+            let line = self.cursor_line.get();
+            let max_line = self.line_count().saturating_sub(1);
+            let col = self.cursor_col.get();
+            let page_lines = PAGE_SCROLL_LINES;
+            Some((line.saturating_add(page_lines).min(max_line), col))
+        });
     }
 
     fn ensure_selection_anchor(&self) {

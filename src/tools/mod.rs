@@ -310,10 +310,10 @@ fn normalize_tool_name_str(name: &str) -> &str {
 fn normalize_tool_name(name: &str, mut args: serde_json::Value) -> (String, serde_json::Value) {
     if name == "glob"
         && let Some(obj) = args.as_object_mut()
-            && !obj.contains_key("mode")
-        {
-            obj.insert("mode".to_string(), serde_json::json!("files"));
-        }
+        && !obj.contains_key("mode")
+    {
+        obj.insert("mode".to_string(), serde_json::json!("files"));
+    }
     let normalized = normalize_tool_name_str(name);
     (normalized.to_string(), args)
 }
