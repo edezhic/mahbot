@@ -32,21 +32,12 @@ use super::workspaces;
 
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
-    /// Field edits
-    ProviderKey(String),
-    ProviderEndpoint(String),
-    ImageTranscriptionModel(String),
-    AudioTranscriptionModel(String),
-    TranscriptionProvider(String),
-    AudioTranscriptionProvider(String),
-    ImageGenModel(String),
-    /// Newline-separated list of available image generation models.
-    ImageGenModels(String),
-    VideoGenModel(String),
-    /// Newline-separated list of available video generation models.
-    VideoGenModels(String),
-    ExaKey(String),
-    TelegramToken(String),
+    /// Generic editable config field identified by its snake_case key
+    /// (matches the keys in [`crate::config::ConfigData::set_string_field`]).
+    ConfigField {
+        key: &'static str,
+        value: String,
+    },
     /// Per-role model edits
     RoleModel {
         role: String,
@@ -180,52 +171,8 @@ impl SettingsState {
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
             // ── Config field edits ─────────────────────────────
-            SettingsMessage::ProviderKey(v) => {
-                self.config.provider_key = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::ProviderEndpoint(v) => {
-                self.config.provider_endpoint = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::ImageTranscriptionModel(v) => {
-                self.config.image_transcription_model = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::AudioTranscriptionModel(v) => {
-                self.config.audio_transcription_model = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::TranscriptionProvider(v) => {
-                self.config.transcription_provider = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::AudioTranscriptionProvider(v) => {
-                self.config.audio_transcription_provider = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::ImageGenModel(v) => {
-                self.config.image_gen_model = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::ImageGenModels(v) => {
-                self.config.image_gen_models = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::VideoGenModel(v) => {
-                self.config.video_gen_model = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::VideoGenModels(v) => {
-                self.config.video_gen_models = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::ExaKey(v) => {
-                self.config.exa_key = Some(v).filter(|s| !s.is_empty());
-                Task::none()
-            }
-            SettingsMessage::TelegramToken(v) => {
-                self.config.telegram_bot_token = Some(v).filter(|s| !s.is_empty());
+            SettingsMessage::ConfigField { key, value } => {
+                let _ = self.config.set_string_field(key, &value);
                 Task::none()
             }
             SettingsMessage::RoleModel { role, model } => {
@@ -1432,7 +1379,10 @@ impl SettingsState {
                         "sk-...",
                         self.config.provider_key.as_deref().unwrap_or_default(),
                         self.show_provider_key,
-                        SettingsMessage::ProviderKey,
+                        |v| SettingsMessage::ConfigField {
+                            key: "provider_key",
+                            value: v
+                        },
                         SettingsMessage::ToggleShowKey,
                     ),
                     None,
@@ -1443,7 +1393,10 @@ impl SettingsState {
                         "https://openrouter.ai/api/v1",
                         self.config.provider_endpoint.as_deref().unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::ProviderEndpoint)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "provider_endpoint",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
                     .into(),
@@ -1538,7 +1491,10 @@ impl SettingsState {
                             .as_deref()
                             .unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::ImageTranscriptionModel)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "image_transcription_model",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
                     .into(),
@@ -1553,7 +1509,10 @@ impl SettingsState {
                             .as_deref()
                             .unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::AudioTranscriptionModel)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "audio_transcription_model",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
                     .into(),
@@ -1568,7 +1527,10 @@ impl SettingsState {
                             .as_deref()
                             .unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::TranscriptionProvider)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "transcription_provider",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
                     .into(),
@@ -1583,7 +1545,10 @@ impl SettingsState {
                             .as_deref()
                             .unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::AudioTranscriptionProvider)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "audio_transcription_provider",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
                     .into(),
@@ -1603,7 +1568,10 @@ impl SettingsState {
                         "google/gemini-3.1-flash-image-preview",
                         self.config.image_gen_model.as_deref().unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::ImageGenModel)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "image_gen_model",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
                     .into(),
@@ -1615,7 +1583,10 @@ impl SettingsState {
                         "one model per line",
                         self.config.image_gen_models.as_deref().unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::ImageGenModels)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "image_gen_models",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(350.0))
                     .into(),
@@ -1627,7 +1598,10 @@ impl SettingsState {
                         "google/veo-3.1-lite",
                         self.config.video_gen_model.as_deref().unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::VideoGenModel)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "video_gen_model",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(250.0))
                     .into(),
@@ -1639,7 +1613,10 @@ impl SettingsState {
                         "one model per line",
                         self.config.video_gen_models.as_deref().unwrap_or_default(),
                     )
-                    .on_input(SettingsMessage::VideoGenModels)
+                    .on_input(|v| SettingsMessage::ConfigField {
+                        key: "video_gen_models",
+                        value: v
+                    })
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(350.0))
                     .into(),
@@ -1659,7 +1636,10 @@ impl SettingsState {
                         "sk-...",
                         self.config.exa_key.as_deref().unwrap_or_default(),
                         self.show_exa_key,
-                        SettingsMessage::ExaKey,
+                        |v| SettingsMessage::ConfigField {
+                            key: "exa_key",
+                            value: v
+                        },
                         SettingsMessage::ToggleShowExa,
                     ),
                     None,
@@ -1673,7 +1653,10 @@ impl SettingsState {
                             .as_deref()
                             .unwrap_or_default(),
                         self.show_telegram_token,
-                        SettingsMessage::TelegramToken,
+                        |v| SettingsMessage::ConfigField {
+                            key: "telegram_bot_token",
+                            value: v
+                        },
                         SettingsMessage::ToggleShowTelegram,
                     ),
                     Some("Applied automatically on save"),
@@ -1816,7 +1799,7 @@ fn password_input<'a>(
     placeholder: &str,
     value: &str,
     show: bool,
-    on_input: fn(String) -> SettingsMessage,
+    on_input: impl Fn(String) -> SettingsMessage + 'a,
     on_toggle: SettingsMessage,
 ) -> Element<'a, SettingsMessage> {
     let input: Element<_> = text_input(placeholder, value)
@@ -1906,54 +1889,20 @@ fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
 
 #[cfg(test)]
 mod tests {
-    /// Every string config field from [`crate::config::STRING_CONFIG_KEYS`] must have a
-    /// corresponding [`SettingsMessage`] variant used in the settings editor view.
-    ///
-    /// This is a manually-maintained mapping that catches newly-added fields that were
-    /// added to `STRING_CONFIG_KEYS` but forgot in the GUI.
+    /// Every string config field from [`crate::config::STRING_CONFIG_KEYS`] must be
+    /// accepted by [`ConfigData::set_string_field`] (used by the generic
+    /// [`SettingsMessage::ConfigField`] variant).  Adding a field to the macro
+    /// in `config.rs` automatically satisfies this — the test guards against
+    /// the key enumeration in `set_string_field` drifting from `STRING_CONFIG_KEYS`.
     #[test]
-    fn settings_message_variants_match_config_fields() {
-        // Manual mapping: SettingsMessage variant → config key
-        let expected_pairs: &[(&str, &str)] = &[
-            ("provider_key", "ProviderKey"),
-            ("provider_endpoint", "ProviderEndpoint"),
-            ("image_transcription_model", "ImageTranscriptionModel"),
-            ("audio_transcription_model", "AudioTranscriptionModel"),
-            ("transcription_provider", "TranscriptionProvider"),
-            ("audio_transcription_provider", "AudioTranscriptionProvider"),
-            ("image_gen_model", "ImageGenModel"),
-            ("image_gen_models", "ImageGenModels"),
-            ("video_gen_model", "VideoGenModel"),
-            ("video_gen_models", "VideoGenModels"),
-            ("exa_key", "ExaKey"),
-            ("telegram_bot_token", "TelegramToken"),
-        ];
-
-        // Count must match
-        assert_eq!(
-            expected_pairs.len(),
-            crate::config::STRING_CONFIG_KEYS.len(),
-            "expected_pairs count must match STRING_CONFIG_KEYS count — \
-             add or remove entries when config fields change"
-        );
-
-        // Verify every config key has a corresponding entry
-        for &(config_key, variant_name) in expected_pairs {
+    fn settings_message_config_field_accepts_all_config_keys() {
+        for &key in crate::config::STRING_CONFIG_KEYS {
+            let mut config = crate::config::ConfigData::default();
+            let ok = config.set_string_field(key, "test_value");
             assert!(
-                crate::config::STRING_CONFIG_KEYS.contains(&config_key),
-                "config key '{config_key}' (mapped to SettingsMessage::{variant_name}) \
-                 not found in STRING_CONFIG_KEYS — update STRING_CONFIG_KEYS, \
-                 string_fields(), and set_string_field()"
-            );
-        }
-
-        // Verify every STRING_CONFIG_KEYS entry has a SettingsMessage mapping
-        for &config_key in crate::config::STRING_CONFIG_KEYS {
-            let found = expected_pairs.iter().any(|(k, _)| *k == config_key);
-            assert!(
-                found,
-                "config key '{config_key}' has no SettingsMessage mapping — \
-                 add an entry to expected_pairs"
+                ok,
+                "ConfigField dispatch: set_string_field('{key}', ...) returned false — \
+                 key is in STRING_CONFIG_KEYS but not handled by set_string_field"
             );
         }
     }
