@@ -202,30 +202,6 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
-/// File paths whose read output should be scrubbed for credentials (`.env`, certs, keys).
-/// Other extensions (e.g. `.rs`, `.md`) are left intact so the model sees source accurately.
-#[must_use]
-pub fn should_scrub_file_path(path: &str) -> bool {
-    let Some(file_name) = std::path::Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-    else {
-        return true;
-    };
-    let lower = file_name.to_ascii_lowercase();
-
-    // Single rsplit_once handles both dotfiles (.env, .env.local) and regular extensions (.pem, .key).
-    // The `name == ".env"` arm catches `.env.local`-style dotfile prefixes.
-    match lower.rsplit_once('.') {
-        Some((name, ext)) => {
-            name == ".env"
-                || ext == "env"
-                || matches!(ext, "pem" | "key" | "p12" | "pfx" | "crt" | "cer")
-        }
-        None => false,
-    }
-}
-
 /// Scrub successful tool output; delegates the scrubbing policy to the tool.
 #[must_use]
 pub fn sanitize_success_tool_output(
@@ -501,23 +477,6 @@ mod tests {
 
         assert_media_marker!(ImageGenTool);
         assert_media_marker!(VideoGenTool);
-    }
-
-    // ── sanitize tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn should_scrub_file_path_env_and_certs() {
-        assert!(should_scrub_file_path(".env"));
-        assert!(should_scrub_file_path("proj/.env"));
-        assert!(should_scrub_file_path(".env.local"));
-        assert!(should_scrub_file_path("/abs/path/.env.production"));
-        assert!(should_scrub_file_path("secrets/local.env"));
-        assert!(should_scrub_file_path("tls/cert.pem"));
-        assert!(should_scrub_file_path("C:\\keys\\id_rsa.key"));
-
-        assert!(!should_scrub_file_path("src/main.rs"));
-        assert!(!should_scrub_file_path("crates/foo/lib.rs"));
-        assert!(!should_scrub_file_path("README.md"));
     }
 
     // ── PATH_ALIAS_KEYS regression tests ──────────────────────────────
