@@ -4681,6 +4681,25 @@ impl EditorState {
         iced::widget::stack([backdrop.into(), centered.into()]).into()
     }
 
+    /// Wrap dialog content in the shared dialog container and overlay it.
+    /// All standard dialogs use this to ensure consistent container dimensions,
+    /// padding, style, and backdrop behavior.
+    fn wrap_dialog<'a>(
+        content: impl Into<Element<'a, EditorMessage>>,
+        width: u32,
+        cancel_msg: EditorMessage,
+        opacity: f32,
+    ) -> Element<'a, EditorMessage> {
+        Self::overlay_dialog(
+            container(content)
+                .width(width)
+                .padding(24)
+                .style(Self::dialog_container_style),
+            cancel_msg,
+            opacity,
+        )
+    }
+
     /// Shared dialog container style used by all overlay dialogs:
     /// elevated background, strong border, 8px radius.
     fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
@@ -5097,7 +5116,7 @@ impl EditorState {
         description: String,
     ) -> Element<'static, EditorMessage> {
         // Dialog content.
-        let dialog = container(
+        Self::wrap_dialog(
             column![
                 row![
                     lucide::triangle_alert::<iced::Theme, iced::Renderer>()
@@ -5144,12 +5163,10 @@ impl EditorState {
             ]
             .spacing(16)
             .width(Length::Fill),
+            380,
+            on_cancel.clone(),
+            0.5,
         )
-        .width(380)
-        .padding(24)
-        .style(Self::dialog_container_style);
-
-        Self::overlay_dialog(dialog, on_cancel.clone(), 0.5)
     }
 
     /// Build the delete confirmation dialog overlay.
@@ -5173,7 +5190,7 @@ impl EditorState {
         };
 
         // Dialog content.
-        let dialog = container(
+        Self::wrap_dialog(
             column![
                 row![
                     lucide::triangle_alert::<iced::Theme, iced::Renderer>()
@@ -5217,12 +5234,10 @@ impl EditorState {
             ]
             .spacing(16)
             .width(Length::Fill),
+            400,
+            EditorMessage::CancelDelete,
+            0.5,
         )
-        .width(400)
-        .padding(24)
-        .style(Self::dialog_container_style);
-
-        Self::overlay_dialog(dialog, EditorMessage::CancelDelete, 0.5)
     }
 
     /// Build the new file/directory name input overlay.
@@ -5241,7 +5256,7 @@ impl EditorState {
             .padding(8);
 
         // Dialog content.
-        let dialog = container(
+        Self::wrap_dialog(
             column![
                 text(label).size(14).color(theme::TEXT_PRIMARY),
                 input,
@@ -5269,12 +5284,10 @@ impl EditorState {
             ]
             .spacing(12)
             .width(Length::Fill),
+            380,
+            EditorMessage::Escape,
+            0.4,
         )
-        .width(380)
-        .padding(24)
-        .style(Self::dialog_container_style);
-
-        Self::overlay_dialog(dialog, EditorMessage::Escape, 0.4)
     }
 
     // ── Context menu action handlers ───────────────────────────────
