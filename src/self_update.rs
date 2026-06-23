@@ -536,7 +536,7 @@ async fn run_cargo_build(manifest_dir: &Path, admin_target: Option<&String>) -> 
     let build_result = tokio::time::timeout(
         std::time::Duration::from_mins(30),
         tokio::process::Command::new("cargo")
-            .args(["build", "--release"])
+            .args(["build", "--release", "--locked"])
             .current_dir(manifest_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
