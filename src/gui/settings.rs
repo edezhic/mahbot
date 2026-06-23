@@ -21,6 +21,7 @@ use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use super::theme;
@@ -216,6 +217,14 @@ fn picker_config_fields<'a>(
     }
 }
 
+/// Which password field the visibility toggle applies to.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum PasswordTarget {
+    ProviderKey,
+    ExaKey,
+    TelegramToken,
+}
+
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
     /// Generic editable config field identified by its snake_case key
@@ -245,10 +254,8 @@ pub enum SettingsMessage {
     /// Actions
     Save,
     SaveResult(Result<(), String>),
-    /// Toggle password visibility
-    ToggleShowKey,
-    ToggleShowExa,
-    ToggleShowTelegram,
+    /// Toggle password visibility for a specific field.
+    TogglePasswordVisibility(PasswordTarget),
     // ── Workspace management (sub-messages) ─────────────────────
     /// Wrapped workspace message.
     WorkspaceMsg(workspaces::WorkspacesMessage),
@@ -294,10 +301,8 @@ pub struct SettingsState {
     saving: bool,
     /// Last error message from save.
     error: Option<String>,
-    /// Password visibility toggles.
-    show_provider_key: bool,
-    show_exa_key: bool,
-    show_telegram_token: bool,
+    /// Which password fields are currently visible.
+    password_visible: HashSet<PasswordTarget>,
 
     // ── Workspace management state ──────────────────────────────
     pub(crate) workspaces_state: workspaces::WorkspacesState,
@@ -332,9 +337,7 @@ impl SettingsState {
             config: CONFIG.snapshot(),
             saving: false,
             error: None,
-            show_provider_key: false,
-            show_exa_key: false,
-            show_telegram_token: false,
+            password_visible: HashSet::new(),
             workspaces_state: workspaces::WorkspacesState::new(),
             users_state: users::UsersState::new(),
             show_add_workspace_modal: false,
@@ -447,16 +450,12 @@ impl SettingsState {
                 }
                 Task::none()
             }
-            SettingsMessage::ToggleShowKey => {
-                self.show_provider_key = !self.show_provider_key;
-                Task::none()
-            }
-            SettingsMessage::ToggleShowExa => {
-                self.show_exa_key = !self.show_exa_key;
-                Task::none()
-            }
-            SettingsMessage::ToggleShowTelegram => {
-                self.show_telegram_token = !self.show_telegram_token;
+            SettingsMessage::TogglePasswordVisibility(target) => {
+                if self.password_visible.contains(&target) {
+                    self.password_visible.remove(&target);
+                } else {
+                    self.password_visible.insert(target);
+                }
                 Task::none()
             }
             SettingsMessage::Save => {
@@ -1598,12 +1597,12 @@ impl SettingsState {
                     password_input(
                         "sk-...",
                         self.config.provider_key.as_deref().unwrap_or_default(),
-                        self.show_provider_key,
+                        self.password_visible.contains(&PasswordTarget::ProviderKey),
                         |v| SettingsMessage::ConfigField {
                             key: "provider_key",
                             value: v
                         },
-                        SettingsMessage::ToggleShowKey,
+                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::ProviderKey),
                     ),
                     None,
                 ),
@@ -1822,12 +1821,12 @@ impl SettingsState {
                     password_input(
                         "sk-...",
                         self.config.exa_key.as_deref().unwrap_or_default(),
-                        self.show_exa_key,
+                        self.password_visible.contains(&PasswordTarget::ExaKey),
                         |v| SettingsMessage::ConfigField {
                             key: "exa_key",
                             value: v
                         },
-                        SettingsMessage::ToggleShowExa,
+                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::ExaKey),
                     ),
                     None,
                 ),
@@ -1839,12 +1838,13 @@ impl SettingsState {
                             .telegram_bot_token
                             .as_deref()
                             .unwrap_or_default(),
-                        self.show_telegram_token,
+                        self.password_visible
+                            .contains(&PasswordTarget::TelegramToken),
                         |v| SettingsMessage::ConfigField {
                             key: "telegram_bot_token",
                             value: v
                         },
-                        SettingsMessage::ToggleShowTelegram,
+                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::TelegramToken),
                     ),
                     Some("Applied automatically on save"),
                 ),
