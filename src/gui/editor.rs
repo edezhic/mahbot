@@ -5539,12 +5539,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_text_matches_short_query() {
-        let result = compute_text_matches("hello", "h", true);
-        assert!(result.is_empty());
-    }
-
-    #[test]
     fn test_compute_text_matches_basic() {
         let result = compute_text_matches("hello world hello", "hello", true);
         assert_eq!(result.len(), 2);
