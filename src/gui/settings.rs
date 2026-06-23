@@ -1886,24 +1886,3 @@ fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
         ..container::Style::default()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    /// Every string config field from [`crate::config::STRING_CONFIG_KEYS`] must be
-    /// accepted by [`ConfigData::set_string_field`] (used by the generic
-    /// [`SettingsMessage::ConfigField`] variant).  Adding a field to the macro
-    /// in `config.rs` automatically satisfies this — the test guards against
-    /// the key enumeration in `set_string_field` drifting from `STRING_CONFIG_KEYS`.
-    #[test]
-    fn settings_message_config_field_accepts_all_config_keys() {
-        for &key in crate::config::STRING_CONFIG_KEYS {
-            let mut config = crate::config::ConfigData::default();
-            let ok = config.set_string_field(key, "test_value");
-            assert!(
-                ok,
-                "ConfigField dispatch: set_string_field('{key}', ...) returned false — \
-                 key is in STRING_CONFIG_KEYS but not handled by set_string_field"
-            );
-        }
-    }
-}

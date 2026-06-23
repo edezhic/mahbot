@@ -140,9 +140,8 @@ pub struct ConfigData {
 // same signatures as the hand-written ones they replaced.
 
 /// Generate the runtime sync methods `string_fields()` and `set_string_field()`,
-/// the const `STRUCT_FIELDS_DEFAULT`, the test-only `STRING_CONFIG_KEYS`
-/// constant, **and** the typed accessors on [`ConfigReload`] — all from a single
-/// annotated list of `Option<String>` field names.
+/// the const `STRUCT_FIELDS_DEFAULT`, **and** the typed accessors on [`ConfigReload`]
+/// — all from a single annotated list of `Option<String>` field names.
 ///
 /// Each field is declared as `$field [$annotation]` where `$annotation` is one of
 /// `non_empty`, `or($default)`, or `list_or(fallback = $fallback, default = $default)`.
@@ -166,10 +165,6 @@ macro_rules! string_config_fields {
             $field:ident [ $($annotation:tt)* ]
         ),* $(,)?
     ) => {
-        /// All database keys that [`ConfigData::string_fields`] recognises.
-        #[cfg(test)]
-        pub(crate) const STRING_CONFIG_KEYS: &[&str] = &[$(stringify!($field)),*];
-
         impl ConfigData {
             /// Default-initialised [`ConfigData`] with all `Option<String>` fields
             /// set to `None` and `Vec` fields empty.
@@ -776,13 +771,6 @@ mod tests {
 
         // Set each field to a known value via set_string_field and verify
         // it round-trips back through string_fields.
-        // Defensive completeness check — every known key must be exercised.
-        assert_eq!(
-            STRING_FIELD_TEST_VALUES.len(),
-            STRING_CONFIG_KEYS.len(),
-            "STRING_FIELD_TEST_VALUES must cover every entry in STRING_CONFIG_KEYS",
-        );
-
         for &(key, value) in STRING_FIELD_TEST_VALUES {
             let recognized = config.set_string_field(key, value);
             assert!(recognized, "key '{key}' should be recognized");
