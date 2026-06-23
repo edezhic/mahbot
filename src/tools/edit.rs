@@ -479,10 +479,13 @@ fn ws_match_is_ambiguous(content: &str, old_string: &str) -> bool {
         return false;
     };
 
-    // Advance by 1 byte so overlapping matches are detected
-    // (e.g. content "a a a" with old_string "a a", normalized "a a a"
-    //  — occurrences at positions 0 and 2)
-    let search_start = first_pos + 1;
+    // Advance past the first character of norm_old so overlapping
+    // matches are detected (e.g. content "a a a" with old_string "a a",
+    // normalized "a a a" — occurrences at positions 0 and 2).
+    // Using char boundary instead of raw +1 avoids panicking on
+    // multi-byte (non-ASCII) first characters.
+    let first_char_len = norm_old.chars().next().map_or(1, char::len_utf8);
+    let search_start = first_pos + first_char_len;
     norm_content[search_start..].find(&norm_old).is_some()
 }
 
@@ -732,6 +735,12 @@ mod tests {
             ("let  x  =  1;\nlet  x  =  1;", "let x = 1;"),
             // Overlapping match in repeated tokens
             ("a a a", "a a"),
+            // Multi-byte first character (2-byte Latin ñ)
+            ("ñ b ñ b", "ñ b"),
+            // Multi-byte first character (3-byte CJK)
+            ("字 符 字 符", "字 符"),
+            // Multi-byte first character (4-byte emoji)
+            ("🚀 b 🚀 b", "🚀 b"),
         ];
         for (content, old) in ambiguous_cases {
             assert!(
@@ -754,6 +763,12 @@ mod tests {
             ("anything", ""),
             // Not found at all
             ("fn foo() {}", "fn bar() {}"),
+            // Multi-byte single match (2-byte Latin ñ)
+            ("fn  ñ  foo()  {}", "fn ñ foo()"),
+            // Multi-byte single match (3-byte CJK)
+            ("let  字  =  1;", "let 字 = 1;"),
+            // Multi-byte single match (4-byte emoji)
+            ("let  🚀  =  1;", "let 🚀 = 1;"),
         ];
         for (content, old) in unambiguous_cases {
             assert!(
