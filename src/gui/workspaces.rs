@@ -16,7 +16,7 @@ pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
     let Some(ref last_str) = ws.maintainer_last_run_at else {
         return Some("Next maintenance: pending".to_string());
     };
-    let last_time = match chrono::DateTime::parse_from_rfc3339(last_str) {
+    let last_time = match crate::turso::parse_utc_timestamp(last_str) {
         Ok(dt) => dt,
         Err(e) => {
             tracing::warn!(maintainer_last_run_at = %last_str, error = %e, "Failed to parse maintainer_last_run_at in workspace label, showing 'pending'");
@@ -24,8 +24,7 @@ pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
         }
     };
     let now = chrono::Utc::now();
-    let next_run = last_time.with_timezone(&chrono::Utc)
-        + chrono::Duration::minutes(ws.maintainer_debounce_mins.clamp(0, 240));
+    let next_run = last_time + chrono::Duration::minutes(ws.maintainer_debounce_mins.clamp(0, 240));
     let remaining = next_run - now;
     let mins = remaining.num_minutes();
     if mins <= 0 {

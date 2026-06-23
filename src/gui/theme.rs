@@ -256,7 +256,7 @@ static TIMESTAMP_PARSE_WARNED: AtomicBool = AtomicBool::new(false);
 /// If parsing fails, returns the first 16 characters as a fallback.
 #[must_use]
 pub fn format_timestamp(ts: &str) -> String {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+    if let Ok(dt) = crate::turso::parse_utc_timestamp(ts) {
         dt.format("%b %-d, %H:%M").to_string()
     } else {
         if !TIMESTAMP_PARSE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {

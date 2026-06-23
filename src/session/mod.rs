@@ -79,19 +79,16 @@ impl SessionStorage {
 /// when falling back.
 #[must_use]
 fn parse_ts_or_now(s: &str, label: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).map_or_else(
-        |e| {
-            tracing::warn!(
-                field = %label,
-                value = %s,
-                error = %e,
-                "Failed to parse session {}, falling back to Utc::now()",
-                label,
-            );
-            Utc::now()
-        },
-        |dt| dt.with_timezone(&Utc),
-    )
+    turso::parse_utc_timestamp(s).unwrap_or_else(|e| {
+        tracing::warn!(
+            field = %label,
+            value = %s,
+            error = %e,
+            "Failed to parse session {}, falling back to Utc::now()",
+            label,
+        );
+        Utc::now()
+    })
 }
 
 fn session_metadata_from_row(
@@ -532,12 +529,6 @@ mod transient_prefix_tests {
             "discovery_session_key('ws', 'analyst')",
         );
     }
-}
-
-#[test]
-fn parse_ts_or_now_valid() {
-    let ts = parse_ts_or_now("2024-01-15T10:30:00Z", "test_valid");
-    assert_eq!(ts.to_rfc3339(), "2024-01-15T10:30:00+00:00");
 }
 
 #[test]

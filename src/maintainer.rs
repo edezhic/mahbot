@@ -3,7 +3,7 @@
 //! The Maintainer scans workspaces for refactoring opportunities and creates
 //! planning tickets on the board. It does NOT make direct code changes.
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -68,9 +68,8 @@ pub async fn run_maintainer_loop() {
                 let now = Utc::now();
                 let debounce = ws.maintainer_debounce_mins.clamp(0, 240); // floor+cap guard
                 if let Some(ref last_str) = ws.maintainer_last_run_at {
-                    match DateTime::parse_from_rfc3339(last_str) {
+                    match crate::turso::parse_utc_timestamp(last_str) {
                         Ok(last_time) => {
-                            let last_time = last_time.with_timezone(&Utc);
                             let elapsed = now - last_time;
                             let mins_elapsed = elapsed.num_minutes();
                             if mins_elapsed < debounce {

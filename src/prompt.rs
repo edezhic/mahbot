@@ -105,7 +105,7 @@ pub(crate) fn format_ticket_block(ticket: &crate::board::Ticket) -> String {
 
 /// Parse an ISO 8601 timestamp and format it as local date+time.
 fn format_local_timestamp(iso_str: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(iso_str).map_or_else(
+    crate::turso::parse_utc_timestamp(iso_str).map_or_else(
         |e| {
             tracing::warn!(iso_str = %iso_str, error = %e, "Failed to parse timestamp, falling back to raw string");
             iso_str.to_string()
