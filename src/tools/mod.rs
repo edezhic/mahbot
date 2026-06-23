@@ -525,117 +525,112 @@ mod tests {
     // ── scrub_credentials tests ────────────────────────────────────────────
 
     #[test]
-    fn scrub_redacts_alphanumeric_unquoted_value() {
-        let input = "API_KEY=sk-1234567890abcdef";
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "should redact: {out}");
-        assert!(
-            !out.contains("1234567890abcdef"),
-            "should not leak full value: {out}"
-        );
-        assert!(out.starts_with("API_KEY=sk-1"), "should keep prefix: {out}");
+    fn scrub_redacts_credentials() {
+        /// Cases verifying `[REDACTED]` appears, with optional negative and
+        /// prefix checks. Fields: (name, input, must_not_contain, must_start_with).
+        /// Empty string for must_not_contain/must_start_with = skip check.
+        const CASES: &[(&str, &str, &str, &str)] = &[
+            (
+                "alphanumeric unquoted value",
+                "API_KEY=sk-1234567890abcdef",
+                "1234567890abcdef",
+                "API_KEY=sk-1",
+            ),
+            // Standard Base64-encoded secret containing +, /, =
+            (
+                "Base64 unquoted value with plus and slash",
+                "api_key=u2FsdGVkX1+h/wZ/L3Y+Q==",
+                "u2FsdGVkX1+h/wZ/L3Y+Q==",
+                "api_key=u2Fs",
+            ),
+            (
+                "double-quoted value with colon separator",
+                r#"token: "abcdefgh1234567890""#,
+                "1234567890",
+                "",
+            ),
+            (
+                "bearer colon-separated value",
+                "bearer: eyJhbGciOiJIUzI1NiJ9",
+                "eyJhbG",
+                "",
+            ),
+            // Hyphen-key variant: regex `user[_-]?key` also matches `user-key`.
+            (
+                "hyphen-key variant",
+                "user-key=abcdefgh12345678",
+                "12345678",
+                "user-key=abcd",
+            ),
+        ];
+
+        for &(name, input, not_contains, prefix) in CASES {
+            let out = scrub_credentials(input);
+            assert!(out.contains("[REDACTED]"), "{name}: should redact: {out}");
+            if !not_contains.is_empty() {
+                assert!(
+                    !out.contains(not_contains),
+                    "{name}: should not leak value: {out}"
+                );
+            }
+            if !prefix.is_empty() {
+                assert!(out.starts_with(prefix), "{name}: should keep prefix: {out}");
+            }
+        }
     }
 
     #[test]
-    fn scrub_redacts_base64_unquoted_value_with_plus_and_slash() {
-        // Standard Base64-encoded secret containing +, /, =
-        let input = "api_key=u2FsdGVkX1+h/wZ/L3Y+Q==";
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "should redact Base64: {out}");
-        assert!(
-            !out.contains("u2FsdGVkX1+h/wZ/L3Y+Q=="),
-            "should not leak value: {out}"
-        );
-        assert!(out.starts_with("api_key=u2Fs"), "prefix: {out}");
+    fn scrub_exact_output() {
+        /// Cases verifying exact output strings. Exact match is the strictest
+        /// assertion — it subsumes containment and non-leakage checks.
+        /// Fields: (name, input, expected_output).
+        const CASES: &[(&str, &str, &str)] = &[
+            // Single quotes must be preserved (the bug this test guards against).
+            (
+                "single-quoted value with colon separator",
+                "password: 's3cr3t_p@ssw0rd!!'",
+                "password: 's3cr*[REDACTED]'",
+            ),
+            (
+                "single-quoted value with equals separator",
+                "password='mysecretvalue123'",
+                "password='myse*[REDACTED]'",
+            ),
+            // Edge case: the key-level optional quote in the regex can produce
+            // full_match containing a double-quote from the key suffix, e.g.
+            // "password": 'secretvalue1234'. The capture-group approach correctly
+            // identifies this as a single-quoted value despite the double-quote
+            // appearing in the full match string.
+            // Note: the key-suffix " is consumed by the regex match and not
+            // reconstructed — this is a pre-existing cosmetic issue also present
+            // in the double-quote path, and out of scope for this fix.
+            (
+                "double-quoted key with single-quoted value",
+                r#""password": 'secretvalue123'"#,
+                "\"password: 'secr*[REDACTED]'",
+            ),
+        ];
+
+        for &(name, input, expected) in CASES {
+            assert_eq!(scrub_credentials(input), expected, "{name}");
+        }
     }
 
     #[test]
-    fn scrub_redacts_double_quoted_value() {
-        let input = r#"token: "abcdefgh1234567890""#;
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "should redact: {out}");
-        assert!(!out.contains("1234567890"), "should not leak value: {out}");
-    }
+    fn scrub_passthrough() {
+        /// Cases where the input is not a credential pattern and must pass
+        /// through unchanged. Fields: (name, input).
+        const CASES: &[(&str, &str)] = &[
+            ("short unquoted values (under 8 chars)", "key=short"),
+            (
+                "non-secret lines with = and /",
+                "normal line with = equals and / slash",
+            ),
+        ];
 
-    #[test]
-    fn scrub_redacts_single_quoted_value() {
-        let input = "password: 's3cr3t_p@ssw0rd!!'";
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "should redact: {out}");
-        assert!(!out.contains("s3cr3t"), "should not leak full: {out}");
-        // Single quotes must be preserved (the bug this test guards against).
-        assert_eq!(
-            out, "password: 's3cr*[REDACTED]'",
-            "single quotes should be preserved"
-        );
-    }
-
-    #[test]
-    fn scrub_single_quoted_value_equals_separator() {
-        let input = "password='mysecretvalue123'";
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "should redact: {out}");
-        assert_eq!(
-            out, "password='myse*[REDACTED]'",
-            "single quotes preserved with equals"
-        );
-    }
-
-    #[test]
-    fn scrub_double_quoted_key_single_quoted_value() {
-        // Edge case: the key-level optional quote in the regex can produce
-        // full_match containing a double-quote from the key suffix, e.g.
-        // "password": 'secretvalue1234'. The capture-group approach correctly
-        // identifies this as a single-quoted value despite the double-quote
-        // appearing in the full match string.
-        // Note: the key-suffix " is consumed by the regex match and not
-        // reconstructed — this is a pre-existing cosmetic issue also present
-        // in the double-quote path, and out of scope for this fix.
-        let input = r#""password": 'secretvalue123'"#;
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "should redact: {out}");
-        assert!(!out.contains("secretvalue"), "should not leak value: {out}");
-        assert_eq!(
-            out, "\"password: 'secr*[REDACTED]'",
-            "single quotes preserved when key is double-quoted"
-        );
-    }
-
-    #[test]
-    fn scrub_does_not_redact_short_unquoted_values() {
-        let input = "key=short";
-        let out = scrub_credentials(input);
-        assert_eq!(out, input, "short values should not redact");
-    }
-
-    #[test]
-    fn scrub_handles_colon_separator() {
-        let input = "bearer: eyJhbGciOiJIUzI1NiJ9";
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "should redact: {out}");
-        assert!(!out.contains("eyJhbG"), "should not leak: {out}");
-    }
-
-    #[test]
-    fn scrub_redacts_hyphen_key_variants() {
-        let input = "user-key=abcdefgh12345678";
-        let out = scrub_credentials(input);
-        assert!(out.contains("[REDACTED]"), "user-key: {out}");
-        assert!(
-            !out.contains("12345678"),
-            "should not leak full value: {out}"
-        );
-        assert!(
-            out.starts_with("user-key=abcd"),
-            "should keep prefix: {out}"
-        );
-    }
-
-    #[test]
-    fn scrub_keeps_non_secret_lines_unchanged() {
-        let input = "normal line with = equals and / slash";
-        let out = scrub_credentials(input);
-        assert_eq!(out, input, "non-secret line must be unchanged");
+        for &(name, input) in CASES {
+            assert_eq!(scrub_credentials(input), input, "{name}");
+        }
     }
 
     // ── save_generated_file tests ──────────────────────────────────────────
