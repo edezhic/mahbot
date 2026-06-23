@@ -83,19 +83,6 @@ pub enum Page {
 }
 
 impl Page {
-    const fn all() -> &'static [Page] {
-        &[
-            Page::Home,
-            Page::Sessions,
-            Page::Logs,
-            Page::ToolFailures,
-            Page::Diff,
-            Page::Shell,
-            Page::Editor,
-            Page::Settings,
-        ]
-    }
-
     /// Pages shown in the sidebar (Home, Editor, Diff, Shell).
     const fn sidebar_pages() -> &'static [Page] {
         &[Page::Home, Page::Editor, Page::Diff, Page::Shell]
@@ -1254,12 +1241,8 @@ impl Dashboard {
                     if let Some(digit) = latin.and_then(|c| c.to_digit(10)) {
                         let idx = digit as usize;
                         if idx >= 1 {
-                            let pages = Page::all();
+                            let pages = Page::sidebar_pages();
                             if let Some(page) = pages.get(idx - 1).copied() {
-                                // Editor page has no Cmd+number shortcut.
-                                if page == Page::Editor {
-                                    return None;
-                                }
                                 return Some(Message::Navigation(page));
                             }
                         }
