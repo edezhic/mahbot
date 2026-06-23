@@ -1347,7 +1347,8 @@ fn split_head_tail(
     }
 }
 
-/// Apply line truncation (head/tail sandwich + max_lines cap) in a single pass.
+/// Apply line truncation in a single pass: head/tail sandwich (byte-gated) with a
+/// defensive `max_lines` cap, `max_lines`-only absolute cap, or passthrough.
 ///
 /// Returns `(truncated_output, pre_truncation_copy)` where the copy captures the
 /// full output before truncation for potential spilling by `finish_shell_output`.
@@ -1365,8 +1366,8 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
 
     let line_count = output.lines().count();
 
-    // Capture pre-truncation output for spilling — same gate as below:
-    // byte threshold exceeded AND head/tail configured AND would actually truncate.
+    // Capture pre-truncation output for spilling — only when head/tail
+    // actually truncates (byte threshold exceeded + would reduce lines).
     let should_sandwich =
         (head > 0 || tail > 0) && line_count > head + tail && output.len() > SPILL_THRESHOLD_BYTES;
 
@@ -1376,29 +1377,47 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
         None
     };
 
-    // Phase A: head + tail sandwich (byte-gated)
+    // Single-pass truncation:
+    // 1. Head/tail sandwich (byte-gated) with a defensive max cap, OR
+    // 2. max_lines-only absolute cap, OR
+    // 3. passthrough.
     let mut result = if should_sandwich {
         let (head_lines, omitted, tail_lines) = split_head_tail(output, head, tail);
         let mut v = head_lines;
         v.push(format!("... ({omitted} lines omitted)"));
         v.extend(tail_lines);
         v.join("\n")
+    } else if let Some(max) = max {
+        cap_at_max_lines(output, max)
     } else {
         output.to_string()
     };
 
-    // Phase B: max_lines absolute cap
-    if let Some(max) = max {
-        let result_lines: Vec<&str> = result.lines().collect();
-        if result_lines.len() > max {
-            let truncated = result_lines.len() - max;
-            let mut capped = result_lines[..max].join("\n");
-            let _ = write!(capped, "\n... ({truncated} lines truncated)");
-            result = capped;
-        }
+    // Defensive max cap on the sandwich path: ensures the sandwich +
+    // omission marker doesn't exceed max_lines even if the
+    // head+tail+1 <= max invariant is violated.
+    if should_sandwich
+        && let Some(max) = max
+        && result.lines().count() > max
+    {
+        result = cap_at_max_lines(&result, max);
     }
 
     (result, pre_truncation)
+}
+
+/// Cap `output` to at most `max` lines, appending a truncation marker
+/// if lines were removed.
+fn cap_at_max_lines(output: &str, max: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() > max {
+        let truncated = lines.len() - max;
+        let mut capped = lines[..max].join("\n");
+        let _ = write!(capped, "\n... ({truncated} lines truncated)");
+        capped
+    } else {
+        output.to_string()
+    }
 }
 
 /// Run the full profile-based processing pipeline on pre-processed output.
@@ -2621,8 +2640,8 @@ mod tests {
             );
             if let (Some(head), Some(tail), Some(max)) = (p.head_lines, p.tail_lines, p.max_lines) {
                 assert!(
-                    head + tail <= max,
-                    "head+tail ({head}+{tail}) should not exceed max_lines ({max})"
+                    head + tail + 1 <= max,
+                    "head+tail+1 ({head}+{tail}+1) should not exceed max_lines ({max}) — omission marker would overflow"
                 );
             }
         }
@@ -2949,5 +2968,139 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── apply_line_truncation unit tests ──────────────────────────────
+
+    #[test]
+    fn truncate_no_config_passthrough() {
+        let p = Profile::new("passthrough");
+        let output = "line1\nline2\nline3";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output);
+        assert_eq!(pre, None);
+    }
+
+    #[test]
+    fn truncate_head_tail_only_small_output_no_sandwich() {
+        // Small output (< SPILL_THRESHOLD_BYTES) should not trigger sandwich
+        let p = Profile::new("test").head(2).tail(2);
+        let output = "line1\nline2\nline3\nline4\nline5";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output, "small output passes through");
+        assert_eq!(pre, None, "no pre-truncation for small output");
+    }
+
+    #[test]
+    fn truncate_head_tail_triggers_sandwich_large_output() {
+        let p = Profile::new("test").head(2).tail(2);
+        // Generate output large enough to exceed SPILL_THRESHOLD_BYTES
+        let lines: Vec<String> = (0..100)
+            .map(|i| {
+                format!(
+                    "line {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+            })
+            .collect();
+        let output = lines.join("\n");
+        assert!(
+            output.len() > SPILL_THRESHOLD_BYTES,
+            "test output must exceed threshold (got {} bytes)",
+            output.len()
+        );
+
+        let (result, pre) = apply_line_truncation(&output, &p);
+        assert!(pre.is_some(), "should capture pre-truncation output");
+        assert!(
+            result.contains("... (96 lines omitted)"),
+            "should have omission marker"
+        );
+        assert!(
+            result.starts_with("line 0 aaaaaaaa"),
+            "should start with head"
+        );
+        assert!(
+            result.ends_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "should end with tail"
+        );
+    }
+
+    #[test]
+    fn truncate_max_only_caps_at_limit() {
+        let p = Profile::new("test").max(3);
+        let output = "a\nb\nc\nd\ne";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(pre, None, "no pre-truncation for max-only");
+        assert_eq!(
+            result.lines().count(),
+            4, // 3 lines + 1 truncation marker
+            "should have max+1 lines (3 data + marker)"
+        );
+        assert!(result.contains("... (2 lines truncated)"));
+    }
+
+    #[test]
+    fn truncate_max_only_fits_no_truncation() {
+        let p = Profile::new("test").max(10);
+        let output = "a\nb\nc";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output, "fits within max, passthrough");
+        assert_eq!(pre, None);
+    }
+
+    #[test]
+    fn truncate_head_tail_plus_max_byte_threshold_exceeded() {
+        let p = Profile::new("test").head(2).tail(2).max(100);
+        let lines: Vec<String> = (0..100)
+            .map(|i| {
+                format!(
+                    "line {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+            })
+            .collect();
+        let output = lines.join("\n");
+        assert!(
+            output.len() > SPILL_THRESHOLD_BYTES,
+            "test output must exceed threshold (got {} bytes)",
+            output.len()
+        );
+
+        let (result, pre) = apply_line_truncation(&output, &p);
+        assert!(pre.is_some(), "should capture pre-truncation");
+        // head+tail+1 = 5 <= max=100, so defensive cap is no-op
+        assert!(
+            result.contains("... (96 lines omitted)"),
+            "should have sandwich omission marker"
+        );
+        assert!(
+            !result.contains("lines truncated"),
+            "defensive cap should not fire when head+tail+1 <= max"
+        );
+    }
+
+    #[test]
+    fn truncate_head_tail_plus_max_byte_threshold_not_exceeded() {
+        let p = Profile::new("test").head(2).tail(2).max(3);
+        // Small output: byte threshold NOT exceeded, so head/tail skipped,
+        // but max cap should still apply.
+        let output = "a\nb\nc\nd\ne";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(pre, None, "no pre-truncation for small output");
+        assert_eq!(
+            result.lines().count(),
+            4, // 3 lines + 1 truncation marker
+            "max cap should apply"
+        );
+        assert!(result.contains("... (2 lines truncated)"));
+    }
+
+    #[test]
+    fn truncate_head_tail_fits_when_under_limit() {
+        let p = Profile::new("test").head(5).tail(3);
+        // Only 4 lines total — fewer than head+tail (8), so no truncation
+        let output = "a\nb\nc\nd";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output, "not enough lines to truncate");
+        assert_eq!(pre, None);
     }
 }

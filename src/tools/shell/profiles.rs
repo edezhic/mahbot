@@ -42,7 +42,7 @@ pub(super) struct Profile {
 
 impl Profile {
     /// Create a new profile that matches `command_pattern` (a regex against the canonical command).
-    fn new(match_command: &str) -> Self {
+    pub(super) fn new(match_command: &str) -> Self {
         Self {
             match_command: Regex::new(match_command).expect("bad match_command regex"),
             strip_lines: None,
@@ -98,17 +98,17 @@ impl Profile {
         self
     }
 
-    const fn head(mut self, n: usize) -> Self {
+    pub(super) const fn head(mut self, n: usize) -> Self {
         self.head_lines = Some(n);
         self
     }
 
-    const fn tail(mut self, n: usize) -> Self {
+    pub(super) const fn tail(mut self, n: usize) -> Self {
         self.tail_lines = Some(n);
         self
     }
 
-    const fn max(mut self, n: usize) -> Self {
+    pub(super) const fn max(mut self, n: usize) -> Self {
         self.max_lines = Some(n);
         self
     }
