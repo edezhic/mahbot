@@ -148,6 +148,18 @@ pub async fn send_channel_reply_with_buttons(
         return;
     };
     let reply_markup = buttons.map(|b| serde_json::json!({ "inline_keyboard": [b] }));
+
+    // ── Broadcast agent response for live GUI display and chat_history ──
+    broadcast_and_persist_agent_response(
+        &msg.user_name,
+        &msg.source_channel,
+        &content,
+        agent_role.clone(),
+        &msg.workspace,
+        reply_markup.clone(),
+    )
+    .await;
+
     let reply = SendMessage {
         content,
         recipient: msg.reply_target.clone(),
@@ -155,17 +167,6 @@ pub async fn send_channel_reply_with_buttons(
         agent_role,
         workspace: msg.workspace.clone(),
     };
-
-    // ── Broadcast agent response for live GUI display and chat_history ──
-    broadcast_and_persist_agent_response(
-        &msg.user_name,
-        &msg.source_channel,
-        &reply.content,
-        reply.agent_role.clone(),
-        &reply.workspace,
-        reply.reply_markup.clone(),
-    )
-    .await;
 
     if let Err(e) = channel.send(&reply).await {
         tracing::error!("Failed to reply on {}: {e}", channel.name());
