@@ -368,7 +368,13 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .strip(&[r"^info\s", r"\[\d+/\d+\]"])
             .max(20),
         // ── Python ecosystem ──────────────────────────────────────────────
-        Profile::new(r"^(python\s+-m\s+pytest|poetry\s+run\s+pytest|pytest)\b")
+        // NOTE: Only `^pytest\b` is needed here — `python -m pytest` and
+        // `poetry run pytest` intentionally fall through to GEN_FALLBACK
+        // because canonical_command() strips intermediate flags (like `-m`)
+        // and doesn't treat `pytest` as a subcommand after `run`. The
+        // canonical forms become `python pytest` and `poetry run`
+        // respectively, neither of which match `^pytest\b`.
+        Profile::new(r"^pytest\b")
             .strip(&[
                 BLANK_LINE,
                 r"^\s*\.+\s*$",

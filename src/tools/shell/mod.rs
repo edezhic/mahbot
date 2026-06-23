@@ -2443,6 +2443,14 @@ mod tests {
             ("CC=gcc CXX=g++ make -j4", "make"), // multiple env assignments
             ("CC=gcc", ""),                      // only env assignments, no command
             ("sudo CC=gcc make", "make"),        // prefix + env assignment + command
+            // ── pytest dead-branch documentation ──────────────────────
+            // These cases document why `python -m pytest` and
+            // `poetry run pytest` cannot match the pytest profile:
+            // canonical_command strips `-m` (flag), producing "python pytest"
+            // that doesn't start with "pytest"; and treats `run` as the
+            // subcommand of `poetry`, producing "poetry run".
+            ("python -m pytest tests/", "python pytest"),
+            ("poetry run pytest tests/", "poetry run"),
         ];
         for &(input, expected) in cases {
             assert_eq!(
@@ -2734,6 +2742,33 @@ mod tests {
         assert!(
             !result.contains("collected"),
             "pytest strips collected count"
+        );
+    }
+
+    #[test]
+    fn profile_pytest_python_m_falls_through_to_generic() {
+        // Regression test: python -m pytest must NOT match the pytest profile
+        // because canonical_command strips the `-m` flag, producing
+        // "python pytest" which doesn't start with "^pytest\b".
+        // The "collected" line should be preserved (GEN_FALLBACK doesn't strip it).
+        let input = "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n";
+        let result = process_shell_output("python -m pytest tests/", input, "", 0, Duration::ZERO);
+        assert!(
+            result.contains("collected"),
+            "python -m pytest falls through to GEN_FALLBACK (collected preserved)"
+        );
+    }
+
+    #[test]
+    fn profile_pytest_poetry_run_falls_through_to_generic() {
+        // Regression test: poetry run pytest must NOT match the pytest profile
+        // because canonical_command treats `run` as poetry's subcommand,
+        // producing "poetry run" which doesn't match "^pytest\b".
+        let input = "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n";
+        let result = process_shell_output("poetry run pytest tests/", input, "", 0, Duration::ZERO);
+        assert!(
+            result.contains("collected"),
+            "poetry run pytest falls through to GEN_FALLBACK (collected preserved)"
         );
     }
 
