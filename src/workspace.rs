@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS editor_tabs (
     tab_order      INTEGER NOT NULL DEFAULT 0,
     is_active      INTEGER NOT NULL DEFAULT 0,
     is_dirty       INTEGER NOT NULL DEFAULT 0,
+    dirty_content  TEXT,
     PRIMARY KEY (workspace_name, file_path)
 );";
 
@@ -416,6 +417,36 @@ impl WorkspaceStorage {
     pub async fn open(root: &Path) -> Result<Self> {
         let db_path = root.join("db/workspaces.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+
+        // Migration v1: add dirty_content column for persisting unsaved editor text.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", turso::params![], |row| row.get(0))
+            .await
+            .unwrap_or(0);
+        if version < 1 {
+            let has_dirty_content = {
+                let rows = conn
+                    .query(
+                        "SELECT 1 FROM pragma_table_info('editor_tabs') \
+                         WHERE name = 'dirty_content'",
+                        turso::params![],
+                    )
+                    .await?;
+                !rows.is_empty()
+            };
+            if !has_dirty_content {
+                let _ = conn
+                    .execute(
+                        "ALTER TABLE editor_tabs ADD COLUMN dirty_content TEXT",
+                        turso::params![],
+                    )
+                    .await;
+            }
+            conn.execute("PRAGMA user_version = 1", turso::params![])
+                .await
+                .context("Failed to set PRAGMA user_version = 1")?;
+        }
+
         Ok(Self { conn })
     }
     /// Run a query that returns zero-or-one workspace row, mapping the result to
@@ -732,13 +763,14 @@ impl WorkspaceStorage {
         .await?;
         for tab in tabs {
             tx.execute(
-                "INSERT INTO editor_tabs (workspace_name, file_path, tab_order, is_active, is_dirty) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO editor_tabs (workspace_name, file_path, tab_order, is_active, is_dirty, dirty_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 turso::params![
                     workspace_name,
                     tab.file_path.clone(),
                     i64::try_from(tab.tab_order).unwrap_or(i64::MAX),
                     i64::from(tab.is_active),
                     i64::from(tab.is_dirty),
+                    tab.dirty_content.clone(),
                 ],
             )
             .await?;
@@ -751,7 +783,7 @@ impl WorkspaceStorage {
     pub async fn load_editor_tabs(&self, workspace_name: &str) -> Result<Vec<EditorTabRecord>> {
         let rows = self.conn
             .query_map(
-                "SELECT file_path, tab_order, is_active, is_dirty FROM editor_tabs WHERE workspace_name = ?1 ORDER BY tab_order",
+                "SELECT file_path, tab_order, is_active, is_dirty, dirty_content FROM editor_tabs WHERE workspace_name = ?1 ORDER BY tab_order",
                 turso::params![workspace_name],
                 |row| -> std::result::Result<EditorTabRecord, String> {
                     Ok(EditorTabRecord {
@@ -759,6 +791,7 @@ impl WorkspaceStorage {
                         tab_order: usize::try_from(row.get::<i64>(1).unwrap_or(0)).unwrap_or(0),
                         is_active: row.get::<i64>(2).unwrap_or(0) != 0,
                         is_dirty: row.get::<i64>(3).unwrap_or(0) != 0,
+                        dirty_content: row.get::<Option<String>>(4).unwrap_or(None),
                     })
                 },
             )
@@ -779,16 +812,6 @@ impl WorkspaceStorage {
         Ok(tabs)
     }
 
-    /// Clear dirty flags for all tabs on all workspaces (called on app startup).
-    pub async fn clear_all_editor_dirty_flags(&self) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE editor_tabs SET is_dirty = 0 WHERE is_dirty != 0",
-                turso::params![],
-            )
-            .await?;
-        Ok(())
-    }
 }
 
 /// A single editor tab record for persistence.
@@ -798,6 +821,8 @@ pub struct EditorTabRecord {
     pub tab_order: usize,
     pub is_active: bool,
     pub is_dirty: bool,
+    /// Unsaved buffer text when `is_dirty` is true.
+    pub dirty_content: Option<String>,
 }
 
 /// List all workspaces (for display).
@@ -1129,6 +1154,35 @@ mod tests {
         assert!(
             fetched.paused,
             "Persisted workspace must have paused = true"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_tabs_round_trip_dirty_content() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "ws1", "/tmp/ws1", false, 0).await;
+
+        let tabs = vec![EditorTabRecord {
+            file_path: "notes.md".to_string(),
+            tab_order: 0,
+            is_active: true,
+            is_dirty: true,
+            dirty_content: Some("draft text".to_string()),
+        }];
+        store
+            .save_editor_tabs("ws1", &tabs)
+            .await
+            .expect("save tabs");
+
+        let loaded = store
+            .load_editor_tabs("ws1")
+            .await
+            .expect("load tabs");
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].is_dirty);
+        assert_eq!(
+            loaded[0].dirty_content.as_deref(),
+            Some("draft text")
         );
     }
 }

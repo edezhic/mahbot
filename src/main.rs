@@ -169,15 +169,6 @@ async fn bootstrap_mahbot() -> Result<()> {
     mahbot::config::reload_from_db().await?;
     mahbot::providers::init_global().await?;
 
-    // Clear stale editor dirty flags from previous sessions.
-    // Dirty flags are meaningful only within a single session.
-    if let Err(e) = mahbot::workspace::store()
-        .clear_all_editor_dirty_flags()
-        .await
-    {
-        warn!(error = %e, "Failed to clear editor dirty flags on startup");
-    }
-
     spawn_background_tasks(log_store.clone());
 
     info!("MahBot initialized — dashboard ready");

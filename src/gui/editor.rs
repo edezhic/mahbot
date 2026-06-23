@@ -762,7 +762,11 @@ struct FileLoadMsg {
 
 /// Build the `EditorTabRecord` list from the current tab state.
 #[must_use]
-fn build_tab_records(tabs: &[Tab], active_index: usize) -> Vec<crate::workspace::EditorTabRecord> {
+fn build_tab_records(
+    tabs: &[Tab],
+    active_index: usize,
+    tab_contents: &HashMap<String, TabData>,
+) -> Vec<crate::workspace::EditorTabRecord> {
     tabs.iter()
         .enumerate()
         .map(|(i, t)| crate::workspace::EditorTabRecord {
@@ -770,6 +774,13 @@ fn build_tab_records(tabs: &[Tab], active_index: usize) -> Vec<crate::workspace:
             tab_order: i,
             is_active: i == active_index,
             is_dirty: t.is_dirty,
+            dirty_content: if t.is_dirty {
+                tab_contents
+                    .get(&t.path)
+                    .map(|d| d.content.text())
+            } else {
+                None
+            },
         })
         .collect()
 }
@@ -782,8 +793,7 @@ fn build_tab_records(tabs: &[Tab], active_index: usize) -> Vec<crate::workspace:
 /// discarding in the handler (belt-and-suspenders).
 fn save_tabs_to_db(
     workspace_name: String,
-    tabs: Vec<Tab>,
-    active_tab_index: usize,
+    records: Vec<crate::workspace::EditorTabRecord>,
     save_gen: u64,
     gen_counter: Arc<AtomicU64>,
 ) -> Task<EditorMessage> {
@@ -794,7 +804,6 @@ fn save_tabs_to_db(
             if gen_counter.load(Ordering::Acquire) != save_gen {
                 return;
             }
-            let records = build_tab_records(&tabs, active_tab_index);
             let store = crate::workspace::store();
             if let Err(e) = store.save_editor_tabs(&workspace_name, &records).await {
                 tracing::warn!("Failed to save editor tabs: {e}");
@@ -809,7 +818,6 @@ async fn save_file_to_disk(
     path: String,
     content: String,
     line_ending: LineEnding,
-    has_trailing_newline: bool,
 ) -> Result<(), String> {
     // Normalize to LF first to handle mixed line endings safely.
     let lf = content.replace("\r\n", "\n");
@@ -819,14 +827,7 @@ async fn save_file_to_disk(
         lf
     };
 
-    // Ensure trailing newline if the original file had one.
-    let final_content = if has_trailing_newline && !normalized.ends_with('\n') {
-        format!("{normalized}{}", line_ending.as_str())
-    } else {
-        normalized
-    };
-
-    tokio::fs::write(&path, &final_content)
+    tokio::fs::write(&path, &normalized)
         .await
         .map_err(|e| format!("Failed to write file: {e}"))
 }
@@ -849,7 +850,6 @@ fn build_save_task(
     );
     let path = tabs[idx].path.clone();
     let line_ending = tabs[idx].line_ending;
-    let has_trailing = tabs[idx].has_trailing_newline;
     let content = tab_contents
         .get(&path)
         .map(|d| d.content.text())
@@ -857,7 +857,7 @@ fn build_save_task(
     let saved_hash = hash_text(&content);
     Task::perform(
         async move {
-            let result = save_file_to_disk(path.clone(), content, line_ending, has_trailing).await;
+            let result = save_file_to_disk(path.clone(), content, line_ending).await;
             EditorMessage::SaveResult {
                 path,
                 result,
@@ -1587,10 +1587,10 @@ impl EditorState {
         // Publish to shared counter so in-flight async tasks can detect staleness.
         self.tab_save_counter.store(save_gen, Ordering::Release);
 
+        let records = build_tab_records(&self.tabs, self.active_tab_index, &self.tab_contents);
         Some(save_tabs_to_db(
             workspace_name.clone(),
-            self.tabs.clone(),
-            self.active_tab_index,
+            records,
             save_gen,
             self.tab_save_counter.clone(),
         ))
@@ -3268,21 +3268,31 @@ impl EditorState {
                             .to_string_lossy()
                             .to_string()
                     };
-                    if let Ok(bytes) = tokio::fs::read(&file_path).await {
+
+                    let loaded_text = if let Some(dirty) = record.dirty_content.clone() {
+                        Some(dirty)
+                    } else if let Ok(bytes) = tokio::fs::read(&file_path).await {
                         if (bytes.len() as u64) <= MAX_FILE_SIZE && !bytes.contains(&0) {
-                            if let Ok(text) = String::from_utf8(bytes.clone()) {
-                                let has_trailing = has_trailing_newline(&bytes);
-                                let line_ending = detect_line_ending(&bytes);
-                                loaded.push(SavedTabData {
-                                    file_path,
-                                    text,
-                                    was_dirty: record.is_dirty,
-                                    has_trailing_newline: has_trailing,
-                                    line_ending,
-                                    is_active: record.is_active,
-                                });
-                            }
+                            String::from_utf8(bytes).ok()
+                        } else {
+                            None
                         }
+                    } else {
+                        None
+                    };
+
+                    if let Some(text) = loaded_text {
+                        let bytes = text.as_bytes();
+                        let has_trailing = has_trailing_newline(bytes);
+                        let line_ending = detect_line_ending(bytes);
+                        loaded.push(SavedTabData {
+                            file_path,
+                            text,
+                            was_dirty: record.is_dirty,
+                            has_trailing_newline: has_trailing,
+                            line_ending,
+                            is_active: record.is_active,
+                        });
                     }
                 }
                 EditorMessage::SavedTabsLoaded {
@@ -3530,8 +3540,19 @@ impl EditorState {
     ) -> Task<EditorMessage> {
         match result {
             Ok(()) => {
+                let still_matches_saved = self.tab_contents.get(path).is_some_and(|tab_data| {
+                    hash_text(&tab_data.content.text()) == saved_hash
+                });
+                if !still_matches_saved {
+                    // A newer edit arrived while the save was in flight — keep dirty state.
+                    return Task::none();
+                }
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
                     tab.is_dirty = false;
+                    if let Some(tab_data) = self.tab_contents.get(path) {
+                        let text = tab_data.content.text();
+                        tab.has_trailing_newline = has_trailing_newline(text.as_bytes());
+                    }
                 }
                 if let Some(tab_data) = self.tab_contents.get_mut(path) {
                     tab_data.saved_text_hash = saved_hash;
@@ -4993,11 +5014,11 @@ impl EditorState {
                     .matches
                     .iter()
                     .filter_map(|range| {
-                        let (line, col) =
-                            byte_offset_to_cursor_pos(&tab_data.content, range.start)?;
-                        // Query has no embedded newlines, so the match
-                        // ends on the same line at col + query.len().
-                        Some((line, col, col + (range.end - range.start)))
+                        let text = tab_data.content.text();
+                        let (line, byte_col_start, line_start) =
+                            byte_offset_to_line_byte_col(&text, range.start)?;
+                        let byte_col_end = range.end.saturating_sub(line_start);
+                        Some((line, byte_col_start, byte_col_end))
                     })
                     .collect();
                 (tuples, state.current_match_idx)
@@ -5446,7 +5467,7 @@ impl EditorState {
 
 // ── Find/Replace helpers ───────────────────────────────────────────
 
-/// Convert a byte offset in the editor content to a cursor position.
+/// Convert a byte offset in the editor content to a (line, character column) pair.
 /// Returns `None` if the offset is out of range.
 #[must_use]
 fn byte_offset_to_cursor_pos(
@@ -5457,10 +5478,23 @@ fn byte_offset_to_cursor_pos(
     if offset > text.len() {
         return None;
     }
+    Some(super::editor_widget::byte_offset_to_line_col(&text, offset))
+}
+
+/// Convert a byte offset to (line, byte column within line, line byte start).
+#[must_use]
+fn byte_offset_to_line_byte_col(
+    text: &str,
+    offset: usize,
+) -> Option<(usize, usize, usize)> {
+    if offset > text.len() {
+        return None;
+    }
     let prefix = &text[..offset];
     let line = prefix.bytes().filter(|&b| b == b'\n').count();
-    let col = offset - prefix.rfind('\n').map_or(0, |p| p + 1);
-    Some((line, col))
+    let line_start = prefix.rfind('\n').map_or(0, |p| p + 1);
+    let byte_col = offset - line_start;
+    Some((line, byte_col, line_start))
 }
 
 /// Auto-jump the cursor to the first find match and reset the match index to 0.
@@ -5543,6 +5577,96 @@ mod tests {
     fn test_compute_text_matches_case_insensitive_no_match() {
         let result = compute_text_matches("Hello World", "xyz", false);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_byte_offset_to_cursor_pos_unicode() {
+        let content = EditorBuffer::with_text("Привет мир", None);
+        // Byte offset at start of "м" (multi-byte) is 13, char column 7.
+        let pos = byte_offset_to_cursor_pos(&content, 13).unwrap();
+        assert_eq!(pos, (0, 7));
+    }
+
+    #[test]
+    fn test_byte_offset_to_line_byte_col_unicode() {
+        let text = "Привет **мир**";
+        let (line, byte_col, line_start) = byte_offset_to_line_byte_col(text, 13).unwrap();
+        assert_eq!(line, 0);
+        assert_eq!(byte_col, 13);
+        assert_eq!(line_start, 0);
+        // End of match on "мир" — byte offset 21.
+        let (_, byte_end_col, line_start) = byte_offset_to_line_byte_col(text, 21).unwrap();
+        assert_eq!(byte_end_col, 21 - line_start);
+    }
+
+    #[test]
+    fn test_build_tab_records_persists_dirty_content() {
+        let tabs = vec![Tab {
+            path: "/tmp/foo.md".to_string(),
+            file_name: "foo.md".to_string(),
+            is_dirty: true,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        }];
+        let mut tab_contents = HashMap::new();
+        let buffer = EditorBuffer::with_text("unsaved edits", None);
+        tab_contents.insert(
+            "/tmp/foo.md".to_string(),
+            TabData {
+                content: buffer,
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: None,
+                saved_text_hash: 0,
+            },
+        );
+        let records = build_tab_records(&tabs, 0, &tab_contents);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].is_dirty);
+        assert_eq!(
+            records[0].dirty_content.as_deref(),
+            Some("unsaved edits")
+        );
+    }
+
+    #[test]
+    fn test_build_tab_records_clears_dirty_content_when_clean() {
+        let tabs = vec![Tab {
+            path: "/tmp/foo.md".to_string(),
+            file_name: "foo.md".to_string(),
+            is_dirty: false,
+            has_trailing_newline: false,
+            line_ending: LineEnding::Lf,
+        }];
+        let records = build_tab_records(&tabs, 0, &HashMap::new());
+        assert!(records[0].dirty_content.is_none());
+    }
+
+    #[test]
+    fn test_save_result_ignores_stale_save() {
+        let mut state = EditorState::new();
+        let path = "/tmp/stale.md".to_string();
+        state.tabs.push(Tab {
+            path: path.clone(),
+            file_name: "stale.md".to_string(),
+            is_dirty: true,
+            has_trailing_newline: false,
+            line_ending: LineEnding::Lf,
+        });
+        state.tab_contents.insert(
+            path.clone(),
+            TabData {
+                content: EditorBuffer::with_text("edited after save started", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: None,
+                saved_text_hash: hash_text("on disk"),
+            },
+        );
+        let saved_hash = hash_text("saved snapshot");
+        let _ = state.save_result(&path, Ok(()), saved_hash);
+        assert!(
+            state.tabs[0].is_dirty,
+            "stale save must not clear dirty flag"
+        );
     }
 
     // ── byte_offset_to_cursor_pos ───────────────────────────────

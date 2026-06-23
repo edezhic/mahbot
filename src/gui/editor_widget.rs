@@ -26,7 +26,7 @@ pub fn font_metrics() -> cosmic_text::Metrics {
 ///
 /// Both the editor widget and the diff viewer enforce this limit, sharing
 /// the same value to prevent accidental drift.
-pub(crate) const MAX_HIGHLIGHT_SIZE: usize = 2 * 1024 * 1024; // 2 MB
+pub(crate) const MAX_HIGHLIGHT_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Font size for line numbers in the editor gutter.
 /// Matches the diff page styling (JetBrains Mono 11px).
@@ -272,8 +272,6 @@ impl EditorBuffer {
     pub fn file_extension(&self) -> Option<String> {
         self.file_extension.borrow().clone()
     }
-
-    // ── Text access ───────────────────────────────────────────────
 
     /// Return the full text content.
     pub fn text(&self) -> String {
@@ -1155,44 +1153,48 @@ impl EditorBuffer {
         let end_line = end_line.min(line_count.saturating_sub(1));
 
         let text = self.text();
-        // Normalise \r\n → \n so str::lines() doesn't preserve stray \r chars.
-        let text = text.replace("\r\n", "\n");
-        let lines: Vec<&str> = text.lines().collect();
-
-        // Build new lines with toggled comments.
-        let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
         let mut first_toggled_col = None;
 
-        for (i, line_text) in lines.iter().enumerate() {
-            if i >= start_line && i <= end_line {
-                let trimmed = line_text.trim_start();
-                let leading_ws_len = line_text.len() - trimmed.len();
-                let leading_ws = &line_text[..leading_ws_len];
+        for line_idx in start_line..=end_line {
+            let Some((ls, le)) = line_byte_range(&text, line_idx) else {
+                continue;
+            };
+            let line_slice = &text[ls..le];
+            let (body, ending) = split_line_body_and_ending(line_slice);
+            let trimmed = body.trim_start();
+            let leading_ws_len = body.len() - trimmed.len();
+            let leading_ws = &body[..leading_ws_len];
 
-                if let Some(stripped) = trimmed.strip_prefix(prefix) {
-                    // Commented → uncomment. Preserve one space after prefix if present.
-                    let after_comment = stripped.strip_prefix(' ').unwrap_or(stripped);
-                    new_lines.push(format!("{leading_ws}{after_comment}"));
-                    if i == start_line {
-                        first_toggled_col = Some(leading_ws_len);
-                    }
-                } else {
-                    // Not commented → add comment prefix.
-                    new_lines.push(format!("{leading_ws}{prefix} {trimmed}"));
-                    if i == start_line {
-                        first_toggled_col = Some(leading_ws_len + prefix.len() + 1);
-                    }
-                }
+            let (new_body, toggled_col) = if let Some(stripped) = trimmed.strip_prefix(prefix) {
+                let after_comment = stripped.strip_prefix(' ').unwrap_or(stripped);
+                (
+                    format!("{leading_ws}{after_comment}"),
+                    Some(leading_ws_len),
+                )
             } else {
-                new_lines.push(line_text.to_string());
+                (
+                    format!("{leading_ws}{prefix} {trimmed}"),
+                    Some(leading_ws_len + prefix.len() + 1),
+                )
+            };
+
+            if line_idx == start_line {
+                first_toggled_col = toggled_col;
             }
+            replacements.push((ls, le, format!("{new_body}{ending}")));
         }
 
-        let new_text = new_lines.join("\n");
-        let target_line = start_line.min(new_lines.len().saturating_sub(1));
+        let target_line = start_line;
         let target_col = first_toggled_col.unwrap_or(0);
 
-        self.edit_text(|_| (new_text, Some((target_line, target_col))));
+        self.edit_text(|text| {
+            let mut new_text = text.to_string();
+            for (ls, le, replacement) in replacements.into_iter().rev() {
+                new_text.replace_range(ls..le, &replacement);
+            }
+            (new_text, Some((target_line, target_col)))
+        });
     }
 
     /// Jump cursor to the matching bracket (parentheses, brackets, braces).
@@ -1391,26 +1393,20 @@ impl EditorBuffer {
         let swap_line = start_line.saturating_sub(1);
 
         self.edit_text(|text| {
-            let text = text.replace("\r\n", "\n");
-            let lines: Vec<&str> = text.lines().collect();
-
-            // Swap the block of lines [swap_line..=end_line] so that
-            // the block [start_line..=end_line] moves up, and line
-            // swap_line moves down.
-            let mut new_lines = lines.clone();
-            // Extract the line(s) to move up.
-            let block: Vec<&str> = lines[start_line..=end_line].to_vec();
-            // Remove the block from its current position.
-            new_lines.splice(start_line..=end_line, std::iter::empty());
-            // Insert the block before swap_line (which is now at the
-            // same position since we removed the block above it).
-            new_lines.splice(swap_line..swap_line, block);
-
-            let new_text = new_lines.join("\n");
-
-            // Cursor goes to the moved block's start.
-            let target_line = swap_line;
-            (new_text, Some((target_line, 0)))
+            let default_ending = detect_default_line_ending(text);
+            let had_trailing = had_trailing_newline_text(text);
+            let mut lines = logical_lines(text);
+            if swap_line >= lines.len() || end_line >= lines.len() {
+                return (text.to_string(), None);
+            }
+            if start_line == end_line {
+                swap_lines_with_endings(&mut lines, swap_line, start_line);
+            } else {
+                let block: Vec<_> = lines.drain(start_line..=end_line).collect();
+                lines.splice(swap_line..swap_line, block);
+            }
+            fix_line_endings(&mut lines, had_trailing, default_ending);
+            (reassemble_lines(&lines), Some((swap_line, 0)))
         });
     }
 
@@ -1438,25 +1434,22 @@ impl EditorBuffer {
         let swap_line = end_line + 1;
 
         self.edit_text(|text| {
-            let text = text.replace("\r\n", "\n");
-            let lines: Vec<&str> = text.lines().collect();
-
-            // Swap the block of lines [start_line..=swap_line] so that
-            // line swap_line moves up, and the block [start_line..=end_line]
-            // moves down.
-            let mut new_lines = lines.clone();
-            // Extract the line below.
-            let below_line = lines[swap_line];
-            // Remove the line below.
-            new_lines.remove(swap_line);
-            // Insert it before the block (at start_line).
-            new_lines.insert(start_line, below_line);
-
-            let new_text = new_lines.join("\n");
-
-            // Cursor goes to the moved block's start.
-            let target_line = start_line + 1;
-            (new_text, Some((target_line, 0)))
+            let default_ending = detect_default_line_ending(text);
+            let had_trailing = had_trailing_newline_text(text);
+            let mut lines = logical_lines(text);
+            if swap_line >= lines.len() || end_line >= lines.len() {
+                return (text.to_string(), None);
+            }
+            if start_line == end_line {
+                swap_lines_with_endings(&mut lines, start_line, swap_line);
+            } else {
+                let below = lines.remove(swap_line);
+                let block: Vec<_> = lines.drain(start_line..=end_line).collect();
+                lines.splice(start_line..start_line, std::iter::once(below));
+                lines.splice(end_line + 1..end_line + 1, block);
+            }
+            fix_line_endings(&mut lines, had_trailing, default_ending);
+            (reassemble_lines(&lines), Some((start_line + 1, 0)))
         });
     }
 }
@@ -1806,9 +1799,106 @@ fn line_col_to_byte_offset(text: &str, line: usize, col: usize) -> usize {
     byte_offset
 }
 
+/// Byte range `[start, end)` for a logical line, including its line ending.
+fn line_byte_range(text: &str, line_idx: usize) -> Option<(usize, usize)> {
+    if text.is_empty() {
+        return (line_idx == 0).then_some((0, 0));
+    }
+    let mut current = 0usize;
+    let mut start = 0usize;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            if current == line_idx {
+                return Some((start, i + 1));
+            }
+            current += 1;
+            start = i + 1;
+        }
+    }
+    if current == line_idx {
+        return Some((start, text.len()));
+    }
+    None
+}
+
+/// Split a line slice into body text and trailing `\n` / `\r\n`.
+fn split_line_body_and_ending(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+/// Split buffer text into logical lines preserving each line's ending.
+fn logical_lines(text: &str) -> Vec<(String, String)> {
+    let mut lines = Vec::new();
+    let mut idx = 0;
+    while let Some((ls, le)) = line_byte_range(text, idx) {
+        let slice = &text[ls..le];
+        let (body, ending) = split_line_body_and_ending(slice);
+        lines.push((body.to_string(), ending.to_string()));
+        idx += 1;
+    }
+    if lines.is_empty() {
+        lines.push((String::new(), String::new()));
+    }
+    lines
+}
+
+fn reassemble_lines(lines: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (body, ending) in lines {
+        out.push_str(body);
+        out.push_str(ending);
+    }
+    out
+}
+
+fn detect_default_line_ending(text: &str) -> &'static str {
+    if text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn had_trailing_newline_text(text: &str) -> bool {
+    text.ends_with('\n')
+}
+
+fn swap_lines_with_endings(lines: &mut [(String, String)], i: usize, j: usize) {
+    let end_i = lines[i].1.clone();
+    let end_j = lines[j].1.clone();
+    lines.swap(i, j);
+    lines[i].1 = end_i;
+    lines[j].1 = end_j;
+}
+
+fn fix_line_endings(lines: &mut [(String, String)], had_trailing: bool, default_ending: &str) {
+    if lines.is_empty() {
+        return;
+    }
+    let last_idx = lines.len() - 1;
+    for line in &mut lines[..last_idx] {
+        if line.1.is_empty() {
+            line.1 = default_ending.to_string();
+        }
+    }
+    if had_trailing {
+        if lines[last_idx].1.is_empty() {
+            lines[last_idx].1 = default_ending.to_string();
+        }
+    } else {
+        lines[last_idx].1.clear();
+    }
+}
+
 /// Convert a byte offset into a (line, column) pair, where column is
 /// character-based (not byte-based).
-fn byte_offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
+pub(crate) fn byte_offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(text.len());
     let prefix = &text[..offset];
     let line = prefix.bytes().filter(|&b| b == b'\n').count();
@@ -3985,6 +4075,36 @@ mod tests {
         buf.move_to(1, 0);
         buf.perform_action(EditorAction::MoveLineDown);
         assert_eq!(buf.text(), "a\nb"); // No change
+    }
+
+    #[test]
+    fn test_line_helpers_preserve_crlf_on_move_down() {
+        let text = "a\r\nb\r\nc";
+        let mut lines = logical_lines(text);
+        swap_lines_with_endings(&mut lines, 1, 2);
+        fix_line_endings(
+            &mut lines,
+            had_trailing_newline_text(text),
+            detect_default_line_ending(text),
+        );
+        assert_eq!(reassemble_lines(&lines), "a\r\nc\r\nb");
+    }
+
+    #[test]
+    fn test_line_helpers_preserve_trailing_blank_line() {
+        let text = "line one\nline two\n\n";
+        let lines = logical_lines(text);
+        assert_eq!(lines[2].0, "");
+        assert_eq!(lines[2].1, "\n");
+        assert_eq!(reassemble_lines(&lines), text);
+    }
+
+    #[test]
+    fn test_toggle_line_comment_preserves_neighbor_lines() {
+        let buf = EditorBuffer::from_file("first\nsecond\nthird", "/tmp/test.rs");
+        buf.move_to(1, 0);
+        buf.perform_action(EditorAction::ToggleLineComment);
+        assert_eq!(buf.text(), "first\n// second\nthird");
     }
 
     // ── Multi-line indent/outdent ──────────────────────────────────

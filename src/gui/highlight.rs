@@ -270,46 +270,22 @@ pub(crate) fn build_markdown_highlights_from_tree(
 }
 
 /// Distribute byte-offset spans across lines, with gap-filling and
-/// converting to line-relative offsets. Uses the same algorithm as
-/// [`build_highlights_from_tree`].
+/// converting to line-relative offsets.
 ///
 /// # Overlap handling
 ///
 /// When multiple spans overlap at the same byte range (e.g. a delimiter
-/// span and its parent formatting span), only the first-encountered span
-/// is emitted for the overlapping region. The subsequent overlapping span
-/// emits its *non-overlapping tail* (from `cursor_pos` onward) rather than
-/// being skipped entirely.
-///
-/// This matters most for markdown inline formatting, where delimiters
-/// (`` ` `` / `*` / `**` / `_` / `__`) are captured both individually
-/// (as `punctuation.delimiter` → Operator) and as part of the parent
-/// formatting span (`text.emphasis` / `text.strong` / `text.literal`):
-///
-/// ```text
-///    delimiter span:  [0, 1)  Operator    ← emitted first (smaller end)
-///    parent span:     [0, 7)  Function    ← emits tail [1, 7)  (fix)
-/// ```
-///
-/// ## Known limitations
-///
-/// - **Closing delimiters lose Operator color**: The closing delimiter
-///   span (e.g. trailing `*` in `*italic*`) is subsumed into its parent
-///   formatting span's color because `cursor_pos` already covers it after
-///   the tail emission. Preserving the closing delimiter color would
-///   require span-splitting, which the current flat span model does not
-///   support.
-/// - **Emphasis inside headings** (`# *italic*`): The block-level
-///   `text.title` capture (Type) sorts before the inline `text.emphasis`
-///   capture (Function) at the same byte position due to stable sort order.
-///   The block capture wins visually, so emphasis highlighting is invisible
-///   within heading text. This is not a regression — it's inherent to the
-///   flat span model where block captures are collected before inline ones.
+/// span and its parent formatting span), the span with higher paint
+/// priority wins for that byte range. Delimiter spans (`Operator`) beat
+/// parent emphasis/strong spans (`Function` / `Keyword`), so both opening
+/// and closing `*` / `**` delimiters keep delimiter color.
 #[must_use]
 pub(crate) fn distribute_byte_spans(
     source: &str,
     byte_spans: &[(usize, usize, HighlightClass)],
 ) -> FileHighlights {
+    use std::collections::BTreeSet;
+
     // Compute byte offsets of each line start (and the past-end sentinel).
     let mut line_starts: Vec<usize> = Vec::with_capacity(source.lines().count() + 1);
     let mut pos = 0;
@@ -322,7 +298,6 @@ pub(crate) fn distribute_byte_spans(
     }
 
     let mut lines: Vec<Vec<HighlightSpan>> = Vec::with_capacity(line_starts.len());
-    let mut span_iter = byte_spans.iter().copied().peekable();
 
     for line_idx in 0..line_starts.len() {
         let line_start = line_starts[line_idx];
@@ -330,84 +305,87 @@ pub(crate) fn distribute_byte_spans(
             .get(line_idx + 1)
             .map_or(source.len(), |e| if *e > 0 { e - 1 } else { 0 });
 
-        let mut line_spans: Vec<HighlightSpan> = Vec::new();
-        let mut cursor_pos = line_start;
+        if line_start >= line_end {
+            lines.push(Vec::new());
+            continue;
+        }
 
-        // Advance through spans that overlap this line.
-        while let Some(&(span_start, span_end, class)) = span_iter.peek() {
-            if span_end <= line_start {
-                // Span is entirely before this line — skip it.
-                span_iter.next();
+        let mut clipped: Vec<(usize, usize, HighlightClass)> = Vec::new();
+        let mut boundaries: BTreeSet<usize> = BTreeSet::from([line_start, line_end]);
+
+        for &(span_start, span_end, class) in byte_spans {
+            if span_end <= line_start || span_start >= line_end {
                 continue;
             }
-            if span_start >= line_end {
-                // Span starts after this line — done with this line.
-                break;
-            }
-
             let s = span_start.max(line_start);
             let e = span_end.min(line_end);
-
-            if s < cursor_pos {
-                // Span overlaps a previously emitted span — skip the
-                // already-covered prefix but emit the non-overlapping tail
-                // (from cursor_pos onward). This typically happens when an
-                // inline delimiter span (emphasis_delimiter, code_span_delimiter,
-                // captured as Operator) overlaps with its parent formatting span
-                // (emphasis, strong_emphasis, code_span).
-                //
-                // See the function-level doc for known limitations of this
-                // approach (closing delimiter subsumption, emphasis in headings).
-                if e > cursor_pos {
-                    line_spans.push(HighlightSpan {
-                        start: cursor_pos - line_start,
-                        end: e - line_start,
-                        highlight_class: class,
-                    });
-                    cursor_pos = e;
-                }
-                span_iter.next();
-                continue;
-            }
-
-            if s > cursor_pos {
-                // Gap between cursor and next span — fill with Text.
-                line_spans.push(HighlightSpan {
-                    start: cursor_pos - line_start,
-                    end: s - line_start,
-                    highlight_class: HighlightClass::Text,
-                });
-            }
-
-            if e > s {
-                line_spans.push(HighlightSpan {
-                    start: s - line_start,
-                    end: e - line_start,
-                    highlight_class: class,
-                });
-                cursor_pos = e;
-            }
-
-            // If span extends past this line, keep it for the next line.
-            if span_end <= line_end {
-                span_iter.next();
-            } else {
-                break;
+            if s < e {
+                boundaries.insert(s);
+                boundaries.insert(e);
+                clipped.push((s, e, class));
             }
         }
 
-        if cursor_pos < line_end {
+        let bounds: Vec<usize> = boundaries.into_iter().collect();
+        let mut line_spans: Vec<HighlightSpan> = Vec::new();
+
+        for window in bounds.windows(2) {
+            let seg_start = window[0];
+            let seg_end = window[1];
+            if seg_start >= seg_end {
+                continue;
+            }
+
+            let mut best_class = HighlightClass::Text;
+            let mut best_pri = span_paint_priority(HighlightClass::Text);
+            for &(s, e, class) in &clipped {
+                if s <= seg_start && e >= seg_end {
+                    let pri = span_paint_priority(class);
+                    if pri < best_pri {
+                        best_pri = pri;
+                        best_class = class;
+                    }
+                }
+            }
+
             line_spans.push(HighlightSpan {
-                start: cursor_pos - line_start,
-                end: line_end - line_start,
-                highlight_class: HighlightClass::Text,
+                start: seg_start - line_start,
+                end: seg_end - line_start,
+                highlight_class: best_class,
             });
         }
 
-        lines.push(line_spans);
+        // Merge adjacent spans with the same class.
+        let mut merged: Vec<HighlightSpan> = Vec::with_capacity(line_spans.len());
+        for span in line_spans {
+            if let Some(last) = merged.last_mut() {
+                if last.highlight_class == span.highlight_class && last.end == span.start {
+                    last.end = span.end;
+                    continue;
+                }
+            }
+            merged.push(span);
+        }
+
+        lines.push(merged);
     }
 
     FileHighlights { spans: lines }
+}
+
+/// Lower values win when spans overlap at the same byte offset.
+const fn span_paint_priority(class: HighlightClass) -> u8 {
+    match class {
+        HighlightClass::Operator => 0,
+        HighlightClass::Type => 1,
+        HighlightClass::String => 2,
+        HighlightClass::Function => 3,
+        HighlightClass::Keyword => 4,
+        HighlightClass::Number => 5,
+        HighlightClass::Comment => 6,
+        HighlightClass::Search | HighlightClass::SearchCurrent => 7,
+        HighlightClass::Text => 255,
+    }
 }
 
 /// Build per-line highlight spans from an already-parsed tree-sitter tree.
@@ -1059,7 +1037,17 @@ mod tests {
         line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 1, "opening *");
         // Content between delimiters gets text.emphasis → Function.
         line0_has_class_in_range(&fh, HighlightClass::Function, 1, 7, "italic content");
-        // Closing delimiter is subsumed into emphasis span (known limitation).
+        line0_has_class_in_range(&fh, HighlightClass::Operator, 7, 8, "closing *");
+    }
+
+    #[test]
+    fn test_markdown_bold_single_char() {
+        let code = "**X**";
+        let fh = parse_markdown_highlights(code);
+        assert_eq!(fh.spans.len(), 1);
+        line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 2, "opening **");
+        line0_has_class_in_range(&fh, HighlightClass::Keyword, 2, 3, "X content");
+        line0_has_class_in_range(&fh, HighlightClass::Operator, 3, 5, "closing **");
     }
 
     #[test]
@@ -1071,6 +1059,7 @@ mod tests {
         line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 2, "opening **");
         // Content between delimiters gets text.strong → Keyword.
         line0_has_class_in_range(&fh, HighlightClass::Keyword, 2, 6, "bold content");
+        line0_has_class_in_range(&fh, HighlightClass::Operator, 6, 8, "closing **");
     }
 
     #[test]
@@ -1080,6 +1069,7 @@ mod tests {
         assert_eq!(fh.spans.len(), 1);
         line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 1, "opening _");
         line0_has_class_in_range(&fh, HighlightClass::Function, 1, 7, "italic content");
+        line0_has_class_in_range(&fh, HighlightClass::Operator, 7, 8, "closing _");
     }
 
     #[test]
@@ -1089,6 +1079,7 @@ mod tests {
         assert_eq!(fh.spans.len(), 1);
         line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 2, "opening __");
         line0_has_class_in_range(&fh, HighlightClass::Keyword, 2, 6, "bold content");
+        line0_has_class_in_range(&fh, HighlightClass::Operator, 6, 8, "closing __");
     }
 
     #[test]
@@ -1100,7 +1091,7 @@ mod tests {
         line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 1, "opening `");
         // Code content gets text.literal → String.
         line0_has_class_in_range(&fh, HighlightClass::String, 1, 5, "code content");
-        // Closing backtick is subsumed (known limitation).
+        line0_has_class_in_range(&fh, HighlightClass::Operator, 5, 6, "closing `");
     }
 
     #[test]
@@ -1198,7 +1189,7 @@ mod tests {
         ];
         let fh = distribute_byte_spans(source, &spans);
         assert_eq!(fh.spans.len(), 1, "single line");
-        // Expected: [0,2) Operator, [2,8) Keyword (closing delimiter subsumed).
+        // Expected: [0,2) Operator, [2,6) Keyword, [6,8) Operator.
         let expected = vec![
             HighlightSpan {
                 start: 0,
@@ -1207,11 +1198,16 @@ mod tests {
             },
             HighlightSpan {
                 start: 2,
-                end: 8,
+                end: 6,
                 highlight_class: HighlightClass::Keyword,
             },
+            HighlightSpan {
+                start: 6,
+                end: 8,
+                highlight_class: HighlightClass::Operator,
+            },
         ];
-        assert_eq!(fh.spans[0], expected, "overlap tail emission");
+        assert_eq!(fh.spans[0], expected, "delimiter priority overlap");
     }
 
     #[test]
@@ -1276,8 +1272,7 @@ mod tests {
             }],
             "line 0 plain text fill"
         );
-        // Line 1: [0,1) Operator, [1,7) Function (closing subsumed, line_relative).
-        // (byte offsets are line-relative: line 1 starts at byte 6)
+        // Line 1: [0,1) Operator, [1,6) Function, [6,7) Operator.
         let expected_line1 = vec![
             HighlightSpan {
                 start: 0,
@@ -1286,8 +1281,13 @@ mod tests {
             },
             HighlightSpan {
                 start: 1,
-                end: 7,
+                end: 6,
                 highlight_class: HighlightClass::Function,
+            },
+            HighlightSpan {
+                start: 6,
+                end: 7,
+                highlight_class: HighlightClass::Operator,
             },
         ];
         assert_eq!(fh.spans[1], expected_line1, "line 1 overlap");
