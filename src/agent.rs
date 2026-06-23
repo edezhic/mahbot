@@ -133,7 +133,7 @@ impl Agent {
         };
         if !stats.is_empty()
             && let Err(e) = crate::stats::store()
-                .flush_batch(&self.id, self.role.as_str(), &stats)
+                .flush_batch(&self.id, self.role.as_str(), &self.workspace.path, &stats)
                 .await
         {
             tracing::warn!(

@@ -6,7 +6,7 @@
 
 use crate::global_store;
 use crate::turso::{self, Connection};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 global_store! {
@@ -29,11 +29,13 @@ CREATE TABLE IF NOT EXISTS tool_usage (
     tool_name   TEXT NOT NULL,
     call_count  INTEGER NOT NULL,
     errors      TEXT NOT NULL DEFAULT '[]',
+    workspace   TEXT NOT NULL DEFAULT '',
     recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tool_usage_agent_id ON tool_usage(agent_id);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_role ON tool_usage(role);
-CREATE INDEX IF NOT EXISTS idx_tool_usage_recorded_at ON tool_usage(recorded_at);";
+CREATE INDEX IF NOT EXISTS idx_tool_usage_recorded_at ON tool_usage(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_workspace ON tool_usage(workspace);";
 
 /// A single tool error flattened from the `errors` JSON array.
 #[derive(Debug, Clone)]
@@ -41,25 +43,62 @@ pub struct ToolErrorEntry {
     pub tool_name: String,
     pub role: String,
     pub error: String,
+    pub workspace: String,
     pub recorded_at: String,
 }
 
 /// Query filters for [`StatsStore::query_tool_errors`] / [`StatsStore::count_tool_errors`].
 ///
-/// Both fields are optional — `None` means no filter is applied.
+/// All fields are optional — `None` means no filter is applied.
 #[derive(Debug, Clone, Default)]
 pub struct ToolErrorQuery {
     /// Optional role name filter (exact match via `WHERE role = ?`).
     pub role_filter: Option<String>,
+    /// Optional workspace name filter (exact match via `WHERE workspace = ?`).
+    pub workspace_filter: Option<String>,
     /// Optional search text filter (substring match via `LIKE` on error text).
     pub search: Option<String>,
 }
 
 impl StatsStore {
     /// Open (or create) the stats database at `root/db/stats.db`.
+    ///
+    /// ## Migration v1
+    ///
+    /// Adds the `workspace` column to `tool_usage` for existing databases
+    /// created before the column was added to the schema constant.
     pub async fn open(root: &Path) -> Result<Self> {
         let db_path = root.join("db/stats.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+
+        // ── Schema migration v1 ────────────────────────────────────────
+        //
+        // PRAGMA user_version returns 0 for unmigrated databases (SQLite
+        // default). We use this as a migration stamp to ensure the migration
+        // runs exactly once.
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", turso::params![], |row| {
+                row.get::<Option<i64>>(0)
+            })
+            .await
+            .context("Failed to read PRAGMA user_version")?
+            .unwrap_or(0);
+
+        if user_version < 1 {
+            // Use a silent ALTER TABLE ADD COLUMN — if the column already exists
+            // (from a concurrent fresh CREATE TABLE IF NOT EXISTS on a new DB),
+            // the error is harmless.
+            let _ = conn
+                .execute(
+                    "ALTER TABLE tool_usage ADD COLUMN workspace TEXT NOT NULL DEFAULT ''",
+                    turso::params![],
+                )
+                .await;
+            conn.execute("PRAGMA user_version = 1", turso::params![])
+                .await
+                .context("Failed to set PRAGMA user_version = 1")?;
+        }
+
         Ok(Self { conn })
     }
 
@@ -103,6 +142,11 @@ impl StatsStore {
         if let Some(ref role) = query.role_filter {
             params.push(turso::Value::Text(role.clone()));
             clauses.push("role = ?".to_string());
+        }
+
+        if let Some(ref workspace) = query.workspace_filter {
+            params.push(turso::Value::Text(workspace.clone()));
+            clauses.push("workspace = ?".to_string());
         }
 
         if let Some(ref search) = query.search {
@@ -159,7 +203,7 @@ impl StatsStore {
         // Build the SQL with filter params first, then limit/offset.
         // All placeholders use unnamed `?` — params_from_iter binds positionally.
         let sql = format!(
-            "SELECT tool_name, role, json_each.value AS error, recorded_at \
+            "SELECT tool_name, role, json_each.value AS error, workspace, recorded_at \
              FROM tool_usage, json_each(tool_usage.errors) \
              WHERE {where_clause} \
              ORDER BY recorded_at DESC \
@@ -181,7 +225,8 @@ impl StatsStore {
                 tool_name: turso::row_text(&row, 0)?,
                 role: turso::row_text(&row, 1)?,
                 error: turso::row_text(&row, 2)?,
-                recorded_at: turso::row_text(&row, 3)?,
+                workspace: turso::row_text(&row, 3)?,
+                recorded_at: turso::row_text(&row, 4)?,
             });
         }
 
@@ -193,6 +238,7 @@ impl StatsStore {
         &self,
         agent_id: &str,
         role: &str,
+        workspace: &str,
         stats: &std::collections::HashMap<String, crate::ToolUsage>,
     ) -> Result<()> {
         let recorded_at = turso::now();
@@ -200,8 +246,8 @@ impl StatsStore {
             let errors_json = serde_json::to_string(&usage.errors).unwrap_or_default();
             self.conn
                 .execute(
-                    "INSERT INTO tool_usage (agent_id, role, tool_name, call_count, errors, recorded_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO tool_usage (agent_id, role, tool_name, call_count, errors, workspace, recorded_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     turso::params![
                         agent_id,
                         role,
@@ -220,6 +266,7 @@ impl StatsStore {
                             })
                         },
                         errors_json,
+                        workspace.to_string(),
                         recorded_at.clone(),
                     ],
                 )
@@ -245,6 +292,7 @@ mod tests {
     fn test_build_tool_error_filter_role_only() {
         let query = ToolErrorQuery {
             role_filter: Some("Engineer".to_string()),
+            workspace_filter: None,
             search: None,
         };
         let (clause, params) = StatsStore::build_tool_error_filter(&query);
@@ -257,6 +305,7 @@ mod tests {
     fn test_build_tool_error_filter_search_only() {
         let query = ToolErrorQuery {
             role_filter: None,
+            workspace_filter: None,
             search: Some("timeout".to_string()),
         };
         let (clause, params) = StatsStore::build_tool_error_filter(&query);
@@ -266,9 +315,23 @@ mod tests {
     }
 
     #[test]
+    fn test_build_tool_error_filter_workspace_only() {
+        let query = ToolErrorQuery {
+            role_filter: None,
+            workspace_filter: Some("my-workspace".to_string()),
+            search: None,
+        };
+        let (clause, params) = StatsStore::build_tool_error_filter(&query);
+        assert_eq!(clause, "errors != '[]' AND workspace = ?");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], turso::Value::Text("my-workspace".to_string()));
+    }
+
+    #[test]
     fn test_build_tool_error_filter_both() {
         let query = ToolErrorQuery {
             role_filter: Some("Analyst".to_string()),
+            workspace_filter: None,
             search: Some("connection refused".to_string()),
         };
         let (clause, params) = StatsStore::build_tool_error_filter(&query);
@@ -290,6 +353,7 @@ mod tests {
         // responsibility to send None rather than empty).
         let query = ToolErrorQuery {
             role_filter: Some(String::new()),
+            workspace_filter: None,
             search: Some(String::new()),
         };
         let (clause, params) = StatsStore::build_tool_error_filter(&query);

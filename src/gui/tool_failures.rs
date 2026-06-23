@@ -1,16 +1,13 @@
 //! Tool Failures dashboard page — browse flattened tool call errors from stats.db.
 //!
-//! Filter bar (role picklist + search text input + refresh button), two-line row
-//! layout with role badges and HH:MM:SS timestamps, matching the Logs page style.
-//! No live streaming — manual refresh via the refresh button or filter changes.
+//! Two-line row layout with role badges and HH:MM:SS timestamps, matching the
+//! Logs page style. Filter bar is shared with the Logs page via [`super::logs`].
+//! No live streaming — data refreshes on filter changes or tab switch.
 
 use crate::stats::{ToolErrorEntry, ToolErrorQuery};
 
-use iced::widget::{
-    Column, Space, button, column, container, pick_list, row, scrollable, text, text_input, tooltip,
-};
+use iced::widget::{Column, Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Task};
-use std::time::Duration;
 
 use iced_fonts::lucide;
 
@@ -20,14 +17,14 @@ use super::widgets::selectable_text;
 
 #[derive(Debug, Clone)]
 pub enum ToolFailuresMessage {
-    /// Data refreshed from the store.
+    /// Data refreshed from the store. Carries entries and total count.
     Refreshed(Vec<ToolErrorEntry>, usize),
     /// Refresh query failed.
     RefreshError(String),
-    /// User clicked the manual refresh button.
-    RefreshRequested,
     /// Role filter changed.
     RoleFilterInput(String),
+    /// Workspace filter changed.
+    WorkspaceInput(String),
     /// Search text filter changed (debounced).
     SearchInput(String),
     /// Debounced refresh triggered after 300ms of inactivity.
@@ -58,11 +55,11 @@ pub struct ToolFailuresState {
 
     // Filters
     /// Role name filter (empty = all roles).
-    role_filter: String,
+    pub(crate) role_filter: String,
+    /// Workspace name filter (empty = all workspaces).
+    pub(crate) workspace_filter: String,
     /// Search text filter (empty = no search).
-    search_filter: String,
-    /// Dropdown options for the role picklist.
-    role_options: Vec<super::widgets::PickOption>,
+    pub(crate) search_filter: String,
 
     /// Visual highlight for search input (Cmd+F).
     focus_search: bool,
@@ -85,16 +82,8 @@ impl ToolFailuresState {
             page: 0,
             page_size: 50,
             role_filter: String::new(),
+            workspace_filter: String::new(),
             search_filter: String::new(),
-            role_options: <crate::Role as strum::IntoEnumIterator>::iter()
-                .map(|r| {
-                    let name = r.to_string();
-                    super::widgets::PickOption {
-                        value: name.clone(),
-                        label: name,
-                    }
-                })
-                .collect(),
             focus_search: false,
             debounce_generation: 0,
             debounce_pending: false,
@@ -115,6 +104,11 @@ impl ToolFailuresState {
                 None
             } else {
                 Some(self.role_filter.clone())
+            },
+            workspace_filter: if self.workspace_filter.is_empty() {
+                None
+            } else {
+                Some(self.workspace_filter.clone())
             },
             search: if self.search_filter.is_empty() {
                 None
@@ -164,12 +158,13 @@ impl ToolFailuresState {
                 self.has_loaded = true;
                 Task::none()
             }
-            ToolFailuresMessage::RefreshRequested => {
+            ToolFailuresMessage::RoleFilterInput(v) => {
+                self.role_filter = v;
                 self.page = 0;
                 self.refresh()
             }
-            ToolFailuresMessage::RoleFilterInput(v) => {
-                self.role_filter = v;
+            ToolFailuresMessage::WorkspaceInput(v) => {
+                self.workspace_filter = v;
                 self.page = 0;
                 self.refresh()
             }
@@ -229,86 +224,6 @@ impl ToolFailuresState {
             content = content.push(widgets::error_banner(err));
             content = content.push(Space::new().height(8));
         }
-
-        // Filter bar
-        let search_input: Element<'_, ToolFailuresMessage> = if self.focus_search {
-            container(
-                text_input("search errors…", &self.search_filter)
-                    .on_input(ToolFailuresMessage::SearchInput)
-                    .style(super::widgets::text_input_style)
-                    .size(13)
-                    .padding(4)
-                    .width(Length::Fixed(180.0)),
-            )
-            .padding(2)
-            .style(|_theme: &iced::Theme| container::Style {
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    width: 1.0,
-                    color: theme::ACCENT,
-                },
-                ..container::Style::default()
-            })
-            .into()
-        } else {
-            text_input("search errors…", &self.search_filter)
-                .on_input(ToolFailuresMessage::SearchInput)
-                .style(super::widgets::text_input_style)
-                .size(13)
-                .padding(4)
-                .width(Length::Fixed(180.0))
-                .into()
-        };
-
-        let role_pick_list = {
-            let role_selected = self
-                .role_options
-                .iter()
-                .find(|o| o.value == self.role_filter)
-                .cloned();
-            pick_list(self.role_options.as_slice(), role_selected, |opt| {
-                ToolFailuresMessage::RoleFilterInput(opt.value)
-            })
-            .placeholder("Role")
-            .style(super::widgets::pick_list_style)
-            .padding([4, 8])
-            .width(Length::Fixed(100.0))
-        };
-
-        let search_group = row![
-            lucide::search::<iced::Theme, iced::Renderer>()
-                .size(12)
-                .color(theme::TEXT_MUTED),
-            Space::new().width(4),
-            search_input,
-        ]
-        .align_y(Alignment::Center);
-
-        let refresh_button = tooltip(
-            button(
-                lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                    .size(14)
-                    .color(theme::TEXT_MUTED),
-            )
-            .style(theme::button_text)
-            .on_press(ToolFailuresMessage::RefreshRequested),
-            "Refresh",
-            tooltip::Position::Top,
-        )
-        .delay(Duration::from_millis(400));
-
-        let filter_row = row![
-            role_pick_list,
-            Space::new().width(Length::Fill),
-            search_group,
-            Space::new().width(8),
-            refresh_button,
-        ]
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
-
-        content = content.push(filter_row);
-        content = content.push(Space::new().height(8));
 
         // Entries or empty state
         if self.loading && !self.has_loaded {
@@ -379,7 +294,7 @@ impl ToolFailuresState {
     }
 
     /// Render a single error row with two-line layout:
-    ///   Line 1: HH:MM:SS timestamp | tool name badge | role badge
+    ///   Line 1: HH:MM:SS timestamp | tool name badge | role badge | workspace
     ///   Line 2: error message (selectable monospace text)
     fn render_error_row(entry: &ToolErrorEntry) -> iced::Element<'_, ToolFailuresMessage> {
         let (fg, bg) = theme::role_badge_color(&entry.role);
@@ -418,6 +333,12 @@ impl ToolFailuresState {
                     ..container::Style::default()
                 }),
             Space::new().width(Length::Fill),
+            // Workspace (if present)
+            if !entry.workspace.is_empty() {
+                text(&entry.workspace).size(10).color(theme::TEXT_MUTED)
+            } else {
+                text("")
+            },
         ]
         .align_y(Alignment::Center)
         .spacing(2);

@@ -22,7 +22,8 @@ use super::widgets::selectable_text;
 /// Tabs within the Logs page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogsTab {
-    Logs,
+    AllLogs,
+    Issues,
     ToolFailures,
 }
 
@@ -72,10 +73,8 @@ pub enum LogMessage {
     StreamLagged,
 
     // Filters
-    ToggleIssuesOnly,
     RoleFilterInput(String),
     WorkspaceInput(String),
-    TargetInput(String),
     SearchInput(String),
 
     // Tab switching
@@ -117,10 +116,8 @@ pub struct LogsState {
     has_loaded: bool,
 
     // Filters
-    issues_only: bool,
     role_filter: String,
     workspace_filter: String,
-    target_filter: String,
     search_filter: String,
 
     // Dropdown options (populated on refresh)
@@ -160,10 +157,8 @@ impl LogsState {
             error: None,
             loading: false,
             has_loaded: false,
-            issues_only: false,
             role_filter: String::new(),
             workspace_filter: String::new(),
-            target_filter: String::new(),
             search_filter: String::new(),
             role_options: <crate::Role as strum::IntoEnumIterator>::iter()
                 .map(|r| {
@@ -177,7 +172,7 @@ impl LogsState {
             workspace_options: Vec::new(),
             page: 0,
             page_size: 50,
-            active_tab: LogsTab::Logs,
+            active_tab: LogsTab::AllLogs,
             tool_failures_state: super::tool_failures::ToolFailuresState::new(),
             paused: false,
             focus_search: false,
@@ -192,19 +187,17 @@ impl LogsState {
     }
 
     fn build_query(&self) -> LogQuery {
-        let level = if self.issues_only {
-            Some("ERROR,WARN".to_string())
-        } else {
-            None
+        let level = match self.active_tab {
+            LogsTab::AllLogs => None,
+            LogsTab::Issues => Some("ERROR,WARN".to_string()),
+            LogsTab::ToolFailures => unreachable!(
+                "build_query called on LogsState for ToolFailures tab — should use ToolFailuresState"
+            ),
         };
 
         LogQuery {
             level,
-            target: if self.target_filter.is_empty() {
-                None
-            } else {
-                Some(self.target_filter.clone())
-            },
+            target: None,
             search: if self.search_filter.is_empty() {
                 None
             } else {
@@ -243,21 +236,25 @@ impl LogsState {
         let store = log_store.clone();
         Task::perform(
             async move {
-                let log_result = store.query(&query).await.map_err(|e| e.to_string());
-                let ws_options = crate::workspace::store()
-                    .list()
-                    .await
-                    .map(|ws_list| {
-                        ws_list
-                            .into_iter()
-                            .map(|ws| super::widgets::PickOption {
-                                value: ws.path,
-                                label: ws.name,
+                let (log_result, ws_result) = tokio::join!(
+                    async { store.query(&query).await.map_err(|e| e.to_string()) },
+                    async {
+                        crate::workspace::store()
+                            .list()
+                            .await
+                            .map(|ws_list| {
+                                ws_list
+                                    .into_iter()
+                                    .map(|ws| super::widgets::PickOption {
+                                        value: ws.path,
+                                        label: ws.name,
+                                    })
+                                    .collect::<Vec<_>>()
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                log_result.map(|(entries, total)| (entries, total, ws_options))
+                            .unwrap_or_default()
+                    },
+                );
+                log_result.map(|(entries, total)| (entries, total, ws_result))
             },
             |res| match res {
                 Ok((entries, total, ws_opts)) => LogMessage::Refreshed(entries, total, ws_opts),
@@ -267,7 +264,7 @@ impl LogsState {
     }
 
     pub fn subscription(&self) -> Subscription<LogMessage> {
-        let stream_sub = if self.paused || self.active_tab != LogsTab::Logs {
+        let stream_sub = if self.paused || self.active_tab != LogsTab::AllLogs {
             Subscription::none()
         } else {
             iced::Subscription::run(log_stream_producer)
@@ -284,18 +281,7 @@ impl LogsState {
                 self.loading = false;
                 self.has_loaded = true;
 
-                // Build role options from Role::iter()
-                self.role_options = <crate::Role as strum::IntoEnumIterator>::iter()
-                    .map(|r| {
-                        let name = r.to_string();
-                        super::widgets::PickOption {
-                            value: name.clone(),
-                            label: name,
-                        }
-                    })
-                    .collect();
-
-                // Build workspace options from registry (name → path lookup)
+                // Build workspace options from registry
                 self.workspace_options = ws_opts;
 
                 Task::none()
@@ -312,8 +298,14 @@ impl LogsState {
                     return Task::none();
                 }
 
-                // Filter check
-                let passes = !self.issues_only || entry.level == "ERROR" || entry.level == "WARN";
+                // Filter check — only for AllLogs tab; Issues tab uses DB filter.
+                // Live entries arrive regardless, but we filter them client-side
+                // to match the current active tab and filters.
+                let passes = match self.active_tab {
+                    LogsTab::AllLogs => true,
+                    LogsTab::Issues => entry.level == "ERROR" || entry.level == "WARN",
+                    LogsTab::ToolFailures => return Task::none(),
+                };
                 let passes = passes
                     && (self.role_filter.is_empty()
                         || entry
@@ -326,12 +318,6 @@ impl LogsState {
                             .workspace
                             .to_lowercase()
                             .contains(&self.workspace_filter.to_lowercase()));
-                let passes = passes
-                    && (self.target_filter.is_empty()
-                        || entry
-                            .target
-                            .to_lowercase()
-                            .starts_with(&self.target_filter.to_lowercase()));
                 let passes = passes
                     && (self.search_filter.is_empty()
                         || entry
@@ -373,43 +359,54 @@ impl LogsState {
                 // On lag, just refresh
                 self.refresh(log_store)
             }
-            LogMessage::ToggleIssuesOnly => {
-                self.issues_only = !self.issues_only;
-                self.page = 0;
-                self.refresh(log_store)
-            }
-            LogMessage::RoleFilterInput(v) => {
-                self.role_filter = v;
-                self.page = 0;
-                self.refresh(log_store)
-            }
-            LogMessage::WorkspaceInput(v) => {
-                self.workspace_filter = v;
-                self.page = 0;
-                self.refresh(log_store)
-            }
-            LogMessage::TargetInput(v) => {
-                self.target_filter = v;
-                self.page = 0;
-                self.debounce_generation = self.debounce_generation.wrapping_add(1);
-                self.debounce_pending = true;
-                let generation = self.debounce_generation;
-                Task::perform(
-                    widgets::debounce_sleep(300, generation),
-                    LogMessage::DebouncedRefresh,
-                )
-            }
-            LogMessage::SearchInput(v) => {
-                self.search_filter = v;
-                self.page = 0;
-                self.debounce_generation = self.debounce_generation.wrapping_add(1);
-                self.debounce_pending = true;
-                let generation = self.debounce_generation;
-                Task::perform(
-                    widgets::debounce_sleep(300, generation),
-                    LogMessage::DebouncedRefresh,
-                )
-            }
+            // ── Filter routing based on active tab ─────────────
+            LogMessage::RoleFilterInput(v) => match self.active_tab {
+                LogsTab::AllLogs | LogsTab::Issues => {
+                    self.role_filter = v;
+                    self.page = 0;
+                    self.refresh(log_store)
+                }
+                LogsTab::ToolFailures => {
+                    self.role_filter.clone_from(&v);
+                    self.tool_failures_state
+                        .update(super::tool_failures::ToolFailuresMessage::RoleFilterInput(
+                            v,
+                        ))
+                        .map(LogMessage::ToolFailures)
+                }
+            },
+            LogMessage::WorkspaceInput(v) => match self.active_tab {
+                LogsTab::AllLogs | LogsTab::Issues => {
+                    self.workspace_filter = v;
+                    self.page = 0;
+                    self.refresh(log_store)
+                }
+                LogsTab::ToolFailures => {
+                    self.workspace_filter.clone_from(&v);
+                    self.tool_failures_state
+                        .update(super::tool_failures::ToolFailuresMessage::WorkspaceInput(v))
+                        .map(LogMessage::ToolFailures)
+                }
+            },
+            LogMessage::SearchInput(v) => match self.active_tab {
+                LogsTab::AllLogs | LogsTab::Issues => {
+                    self.search_filter = v;
+                    self.page = 0;
+                    self.debounce_generation = self.debounce_generation.wrapping_add(1);
+                    self.debounce_pending = true;
+                    let generation = self.debounce_generation;
+                    Task::perform(
+                        widgets::debounce_sleep(300, generation),
+                        LogMessage::DebouncedRefresh,
+                    )
+                }
+                LogsTab::ToolFailures => {
+                    self.search_filter.clone_from(&v);
+                    self.tool_failures_state
+                        .update(super::tool_failures::ToolFailuresMessage::SearchInput(v))
+                        .map(LogMessage::ToolFailures)
+                }
+            },
             LogMessage::DebouncedRefresh(generation) => {
                 if widgets::debounce_should_process(
                     generation,
@@ -466,13 +463,12 @@ impl LogsState {
             LogMessage::TabSelected(tab) => {
                 self.active_tab = tab;
                 if tab == LogsTab::ToolFailures {
-                    // Refresh the tool failures data when switching to that tab,
-                    // mirroring the previous Page::ToolFailures refresh behavior
+                    // Refresh the tool failures data when switching to that tab
                     self.tool_failures_state
                         .refresh()
                         .map(LogMessage::ToolFailures)
                 } else {
-                    // Refresh logs when switching back
+                    // Refresh logs when switching to AllLogs or Issues
                     self.refresh(log_store)
                 }
             }
@@ -509,15 +505,23 @@ impl LogsState {
 
     pub fn view(&self) -> Element<'_, LogMessage> {
         // ── Tab bar ───────────────────────────────────────────────
-        let logs_btn = Self::tab_button("Logs", LogsTab::Logs, self.active_tab);
+        let all_logs_btn = Self::tab_button("All Logs", LogsTab::AllLogs, self.active_tab);
+        let issues_btn = Self::tab_button("Issues", LogsTab::Issues, self.active_tab);
         let tf_btn = Self::tab_button("Tool Failures", LogsTab::ToolFailures, self.active_tab);
 
-        let tab_bar = container(row![logs_btn, tf_btn].spacing(2).align_y(Alignment::Center))
-            .width(Length::Fill)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                ..container::Style::default()
-            });
+        let tab_bar = container(
+            row![all_logs_btn, issues_btn, tf_btn]
+                .spacing(2)
+                .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_SURFACE)),
+            ..container::Style::default()
+        });
+
+        // ── Shared filter bar ─────────────────────────────────────
+        let filter_bar = self.shared_filter_bar();
 
         // ── Tab content ────────────────────────────────────────────
         let body: Element<'_, LogMessage> = match self.active_tab {
@@ -525,10 +529,10 @@ impl LogsState {
                 .tool_failures_state
                 .view()
                 .map(LogMessage::ToolFailures),
-            LogsTab::Logs => self.logs_view(),
+            LogsTab::AllLogs | LogsTab::Issues => self.logs_view(),
         };
 
-        let content = column![tab_bar, body]
+        let content = column![tab_bar, filter_bar, body]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -542,17 +546,8 @@ impl LogsState {
             .into()
     }
 
-    /// Render the Logs tab content (filter bar + entries + pagination).
-    fn logs_view(&self) -> Element<'_, LogMessage> {
-        let mut content = Column::new();
-
-        // Error display
-        if let Some(ref err) = self.error {
-            content = content.push(widgets::error_banner(err));
-            content = content.push(Space::new().height(8));
-        }
-
-        // Filter bar
+    /// Render the shared filter bar: role picklist, workspace picklist, search input.
+    fn shared_filter_bar(&self) -> Element<'_, LogMessage> {
         let search_input: Element<'_, LogMessage> = if self.focus_search {
             container(
                 text_input("search", &self.search_filter)
@@ -581,26 +576,6 @@ impl LogsState {
                 .width(Length::Fixed(160.0))
                 .into()
         };
-
-        let issues_toggle = button(if self.issues_only {
-            iced::Element::<'_, LogMessage>::from(row![
-                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                    .size(11)
-                    .color(theme::TEXT_MUTED),
-                Space::new().width(4),
-                text("Only Issues").size(12),
-            ])
-        } else {
-            iced::Element::<'_, LogMessage>::from(row![
-                lucide::info::<iced::Theme, iced::Renderer>()
-                    .size(11)
-                    .color(theme::TEXT_MUTED),
-                Space::new().width(4),
-                text("All Logs").size(12),
-            ])
-        })
-        .style(theme::button_text)
-        .on_press(LogMessage::ToggleIssuesOnly);
 
         let role_pick_list = {
             let role_selected = self
@@ -631,13 +606,6 @@ impl LogsState {
             .padding([4, 8])
             .width(Length::Fixed(120.0))
         };
-
-        let target_input = text_input("target", &self.target_filter)
-            .on_input(LogMessage::TargetInput)
-            .style(super::widgets::text_input_style)
-            .size(13)
-            .padding(4)
-            .width(Length::Fixed(100.0));
 
         let search_group = row![
             lucide::search::<iced::Theme, iced::Renderer>()
@@ -671,23 +639,42 @@ impl LogsState {
         };
 
         let filter_row = row![
-            issues_toggle,
-            Space::new().width(8),
-            pause_button,
+            // Pause only visible on AllLogs tab
+            match self.active_tab {
+                LogsTab::AllLogs => {
+                    iced::Element::<'_, LogMessage>::from(pause_button)
+                }
+                _ => iced::Element::<'_, LogMessage>::from(Space::new().width(0)),
+            },
             Space::new().width(Length::Fill),
             role_pick_list,
             Space::new().width(Length::Fill),
             workspace_pick_list,
-            Space::new().width(Length::Fill),
-            target_input,
             Space::new().width(Length::Fill),
             search_group,
         ]
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        content = content.push(filter_row);
-        content = content.push(Space::new().height(8));
+        container(filter_row)
+            .width(Length::Fill)
+            .padding([8, 24])
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_SURFACE)),
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// Render the Logs/Issues tab content (entries list + pagination).
+    fn logs_view(&self) -> Element<'_, LogMessage> {
+        let mut content = Column::new();
+
+        // Error display
+        if let Some(ref err) = self.error {
+            content = content.push(widgets::error_banner(err));
+            content = content.push(Space::new().height(8));
+        }
 
         // Log entries
         if self.loading && !self.has_loaded {
