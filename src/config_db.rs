@@ -395,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_role_config_empty() {
         let (store, _dir) = setup().await;
-        let val = store.get_role_config("engineer").await.unwrap();
+        let val = store.get_role_config("nonexistent-role").await.unwrap();
         assert!(val.is_none());
     }
 

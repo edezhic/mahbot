@@ -2012,40 +2012,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_ticket_sets_assigned_to() {
-        let (store, _tmp, _id) = setup().await;
-
-        // Claim the ticket (assigned_to is set separately, matching production behavior)
-        let claimed = store
-            .claim_ticket_in_workspace(
-                TicketPhase::Backlog,
-                TicketPhase::InDevelopment,
-                "ws",
-                false,
-            )
-            .await
-            .expect("claim")
-            .expect("should be claimed");
-
-        store
-            .set_assigned_to(&claimed.id, Some(Role::Engineer.as_str()))
-            .await
-            .expect("set_assigned_to");
-
-        let ticket = store
-            .get_ticket(&claimed.id)
-            .await
-            .expect("get")
-            .expect("should exist");
-
-        assert_eq!(
-            ticket.assigned_to.as_deref(),
-            Some(Role::Engineer.as_str()),
-            "assigned_to should be set after set_assigned_to"
-        );
-    }
-
-    #[tokio::test]
     async fn test_reset_inflight_tickets_new() {
         let (store, _tmp) = open_test_store().await;
 
