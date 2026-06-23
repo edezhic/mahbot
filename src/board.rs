@@ -208,12 +208,14 @@ fn status_list_sql_fragment(statuses: &[TicketPhase]) -> String {
 
 fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
     serde_json::from_str(raw).with_context(|| {
-        let preview: String = if raw.len() > 200 {
-            format!("{}…", &raw[..raw.floor_char_boundary(200)])
+        if raw.len() > 200 {
+            format!(
+                "Corrupt prerequisites JSON in database: {}…",
+                &raw[..raw.floor_char_boundary(200)]
+            )
         } else {
-            raw.to_string()
-        };
-        format!("Corrupt prerequisites JSON in database: {preview}")
+            format!("Corrupt prerequisites JSON in database: {raw}")
+        }
     })
 }
 
@@ -327,26 +329,7 @@ impl Ticket {
     /// to prevent silent divergence.
     #[must_use]
     pub fn detailed_display(&self) -> String {
-        let mut prereq_str = String::new();
-        if !self.prerequisites.is_empty() {
-            prereq_str = format!("Prerequisites: {}\n", self.prerequisites.join(", "));
-        }
-        let supersedes_str = self
-            .supersedes
-            .as_deref()
-            .map(|s| format!("Supersedes: {s}\n"))
-            .unwrap_or_default();
-        let superseded_by_str = self
-            .superseded_by
-            .as_deref()
-            .map(|s| format!("Superseded by: {s}\n"))
-            .unwrap_or_default();
-        let archived_str = if self.is_archived {
-            "Archived: yes\n"
-        } else {
-            ""
-        };
-        format!(
+        let mut out = format!(
             "Ticket: {id}\n\
              Title: {title}\n\
              Description: {description}\n\
@@ -354,12 +337,7 @@ impl Ticket {
              Reporter: {reporter}\n\
              Workspace: {workspace}\n\
              Created: {created}\n\
-             Updated: {updated}\n\
-             {supersedes_str}\
-             {superseded_by_str}\
-             {prereq_str}\
-             {archived_str}\
-             {comments_str}",
+             Updated: {updated}\n",
             id = self.id,
             title = self.title,
             description = self.description,
@@ -368,8 +346,21 @@ impl Ticket {
             workspace = self.workspace_name,
             created = self.created_at,
             updated = self.updated_at,
-            comments_str = self.format_comments(),
-        )
+        );
+        if let Some(ref s) = self.supersedes {
+            let _ = writeln!(out, "Supersedes: {s}");
+        }
+        if let Some(ref s) = self.superseded_by {
+            let _ = writeln!(out, "Superseded by: {s}");
+        }
+        if !self.prerequisites.is_empty() {
+            let _ = writeln!(out, "Prerequisites: {}", self.prerequisites.join(", "));
+        }
+        if self.is_archived {
+            out.push_str("Archived: yes\n");
+        }
+        out.push_str(&self.format_comments());
+        out
     }
 
     /// Format comments as a `"Comments:"` block suitable for [`crate::tools::ticket::GetTicketTool`].
