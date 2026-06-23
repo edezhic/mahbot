@@ -94,14 +94,14 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         Role::Manager => &RoleInfo {
             selectable: true,
             temperature: 0.01,
-            badge_fg: (0.961, 0.620, 0.043),
+            badge_fg: (0.816, 0.635, 0.082),
             default_model: "deepseek/deepseek-v4-pro",
             display_label: "Manager",
             ..BASE_ROLE_INFO
         },
         Role::Engineer => &RoleInfo {
             selectable: true,
-            badge_fg: (0.976, 0.451, 0.086),
+            badge_fg: (0.855, 0.439, 0.173),
             default_model: "deepseek/deepseek-v4-pro",
             display_label: "Engineer",
             ..BASE_ROLE_INFO
@@ -109,31 +109,31 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         Role::Analyst => &RoleInfo {
             selectable: true,
             temperature: 0.3,
-            badge_fg: (0.231, 0.510, 0.965),
+            badge_fg: (0.263, 0.522, 0.745),
             display_label: "Analyst",
             ..BASE_ROLE_INFO
         },
         Role::Coder => &RoleInfo {
             temperature: 0.01,
-            badge_fg: (0.063, 0.725, 0.506),
+            badge_fg: (0.353, 0.604, 0.416),
             display_label: "Coder",
             ..BASE_ROLE_INFO
         },
         Role::Qa => &RoleInfo {
             temperature: 0.4,
-            badge_fg: (0.545, 0.361, 0.965),
+            badge_fg: (0.545, 0.494, 0.784),
             display_label: "QA",
             ..BASE_ROLE_INFO
         },
         Role::Reviewer => &RoleInfo {
             temperature: 0.2,
-            badge_fg: (0.388, 0.400, 0.945),
+            badge_fg: (0.431, 0.494, 0.784),
             display_label: "Reviewer",
             ..BASE_ROLE_INFO
         },
         Role::Discovery => &RoleInfo {
             has_discovery: false,
-            badge_fg: (0.024, 0.714, 0.831),
+            badge_fg: (0.227, 0.663, 0.624),
             display_label: "Discovery",
             ..BASE_ROLE_INFO
         },
@@ -141,7 +141,7 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             has_discovery: false,
             selectable: true,
             requires_multimodal: true,
-            badge_fg: (0.957, 0.247, 0.369),
+            badge_fg: (0.808, 0.365, 0.592),
             default_model: "qwen/qwen3.6-plus",
             default_reasoning_effort: "medium",
             display_label: "Artist",
@@ -149,7 +149,7 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         },
         Role::Maintainer => &RoleInfo {
             temperature: 0.5,
-            badge_fg: (0.925, 0.282, 0.600),
+            badge_fg: (0.753, 0.376, 0.502),
             default_model: "deepseek/deepseek-v4-pro",
             display_label: "Maintainer",
             ..BASE_ROLE_INFO
