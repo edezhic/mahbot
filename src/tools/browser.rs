@@ -727,11 +727,11 @@ impl Tool for BrowserTool {
 
         let output = match response.data {
             Some(data) => match &action {
-                BrowserAction::Snapshot { .. }
-                | BrowserAction::GetText { .. }
-                | BrowserAction::GetInnerText { .. } => extract_snapshot_text(&data)
-                    .or_else(|| serde_json::to_string_pretty(&data).ok())
-                    .unwrap_or_default(),
+                BrowserAction::Snapshot { .. } | BrowserAction::GetText { .. } => {
+                    extract_snapshot_text(&data)
+                        .or_else(|| serde_json::to_string_pretty(&data).ok())
+                        .unwrap_or_default()
+                }
                 BrowserAction::Open { .. } => {
                     let mut s = format!(
                         "Opened {}",
