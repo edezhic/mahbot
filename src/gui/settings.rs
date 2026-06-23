@@ -72,21 +72,31 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut O
 ///
 /// If the models list is empty but an active model is set, the active model
 /// is shown as the sole entry so it remains visible.
-// All 8 parameters are required axis of variation for this shared widget:
-// 2 data fields (model list + active model), 1 state field (add input buffer),
-// 1 placeholder string, and 4 message constructors. Bundling into a struct
-// would add ceremony without reducing call-site complexity for 2 consumers.
-#[allow(clippy::too_many_arguments)]
+/// Accepts a `target` to build the correct parameterized `SettingsMessage::ModelPicker`
+/// values internally, avoiding the need for callers to pass closures.
 fn model_picker_list<'a>(
+    target: ModelPickerTarget,
     models_field: Option<&'a str>,
     active_field: Option<&'a str>,
     add_input: &'a str,
     add_placeholder: &'static str,
-    on_add_input: impl Fn(String) -> SettingsMessage + 'a,
-    on_add: SettingsMessage,
-    on_remove: impl Fn(String) -> SettingsMessage + 'a,
-    on_set_active: impl Fn(String) -> SettingsMessage + 'a,
 ) -> Element<'a, SettingsMessage> {
+    let on_add_input = move |v| SettingsMessage::ModelPicker {
+        target,
+        action: ModelPickerAction::AddInput(v),
+    };
+    let on_add = SettingsMessage::ModelPicker {
+        target,
+        action: ModelPickerAction::AddModel,
+    };
+    let on_remove = move |m| SettingsMessage::ModelPicker {
+        target,
+        action: ModelPickerAction::RemoveModel(m),
+    };
+    let on_set_active = move |m| SettingsMessage::ModelPicker {
+        target,
+        action: ModelPickerAction::SetActive(m),
+    };
     let mut models = parse_models(models_field);
     let active = active_field;
 
@@ -169,6 +179,43 @@ fn model_picker_list<'a>(
 
 // ── Messages ─────────────────────────────────────────────────────
 
+/// Which model picker is being operated on.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum ModelPickerTarget {
+    ImageGen,
+    VideoGen,
+}
+
+impl ModelPickerTarget {
+    fn idx(self) -> usize {
+        match self {
+            ModelPickerTarget::ImageGen => 0,
+            ModelPickerTarget::VideoGen => 1,
+        }
+    }
+}
+
+/// Action performed on a model picker.
+#[derive(Debug, Clone)]
+pub enum ModelPickerAction {
+    AddInput(String),
+    AddModel,
+    RemoveModel(String),
+    SetActive(String),
+}
+
+/// Map a `ModelPickerTarget` to the corresponding `(models_list, active_model)` fields
+/// in `ConfigData`.
+fn picker_config_fields<'a>(
+    t: &'a ModelPickerTarget,
+    config: &'a mut ConfigData,
+) -> (&'a mut Option<String>, &'a mut Option<String>) {
+    match t {
+        ModelPickerTarget::ImageGen => (&mut config.image_gen_models, &mut config.image_gen_model),
+        ModelPickerTarget::VideoGen => (&mut config.video_gen_models, &mut config.video_gen_model),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
     /// Generic editable config field identified by its snake_case key
@@ -228,24 +275,12 @@ pub enum SettingsMessage {
     AddUserResult(Result<(), String>),
     /// Escape key pressed (dismisses modal if open).
     Escape,
-    // ── Image generation model picker ─────────────────────
-    /// Update the add-model text input for image generation.
-    ImageGenAddInput(String),
-    /// Add the model from the input buffer.
-    ImageGenAddModel,
-    /// Remove a model from the list.
-    ImageGenRemoveModel(String),
-    /// Set a model as the active image gen model.
-    ImageGenSetActive(String),
-    // ── Video generation model picker ─────────────────────
-    /// Update the add-model text input for video generation.
-    VideoGenAddInput(String),
-    /// Add the model from the input buffer.
-    VideoGenAddModel,
-    /// Remove a model from the list.
-    VideoGenRemoveModel(String),
-    /// Set a model as the active video gen model.
-    VideoGenSetActive(String),
+    // ── Model picker messages ─────────────────────────────
+    /// Operations on a model picker (add/remove/set-active model).
+    ModelPicker {
+        target: ModelPickerTarget,
+        action: ModelPickerAction,
+    },
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -287,10 +322,8 @@ pub struct SettingsState {
     add_user_adding: bool,
 
     // ── Model picker state ────────────────────────────────
-    /// Text input buffer for adding new image generation models.
-    image_gen_add_input: String,
-    /// Text input buffer for adding new video generation models.
-    video_gen_add_input: String,
+    /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
+    model_picker_inputs: [String; 2],
 }
 
 impl SettingsState {
@@ -312,8 +345,7 @@ impl SettingsState {
             add_user_sender: String::new(),
             add_user_permissions: String::new(),
             add_user_adding: false,
-            image_gen_add_input: String::new(),
-            video_gen_add_input: String::new(),
+            model_picker_inputs: [String::new(), String::new()],
         }
     }
 
@@ -578,54 +610,28 @@ impl SettingsState {
                 )))
             }
 
-            // ── Image generation model picker ─────────────────
-            SettingsMessage::ImageGenAddInput(v) => {
-                self.image_gen_add_input = v;
-                Task::none()
-            }
-            SettingsMessage::ImageGenAddModel => {
-                add_model_to_list(
-                    &mut self.image_gen_add_input,
-                    &mut self.config.image_gen_models,
-                );
-                Task::none()
-            }
-            SettingsMessage::ImageGenRemoveModel(model) => {
-                remove_model_from_list(
-                    &model,
-                    &mut self.config.image_gen_models,
-                    &mut self.config.image_gen_model,
-                );
-                Task::none()
-            }
-            SettingsMessage::ImageGenSetActive(model) => {
-                self.config.image_gen_model = Some(model);
-                Task::none()
-            }
-            // ── Video generation model picker ─────────────────
-            SettingsMessage::VideoGenAddInput(v) => {
-                self.video_gen_add_input = v;
-                Task::none()
-            }
-            SettingsMessage::VideoGenAddModel => {
-                add_model_to_list(
-                    &mut self.video_gen_add_input,
-                    &mut self.config.video_gen_models,
-                );
-                Task::none()
-            }
-            SettingsMessage::VideoGenRemoveModel(model) => {
-                remove_model_from_list(
-                    &model,
-                    &mut self.config.video_gen_models,
-                    &mut self.config.video_gen_model,
-                );
-                Task::none()
-            }
-            SettingsMessage::VideoGenSetActive(model) => {
-                self.config.video_gen_model = Some(model);
-                Task::none()
-            }
+            // ── Model picker messages ─────────────────────────
+            SettingsMessage::ModelPicker { target, action } => match (target, action) {
+                (t, ModelPickerAction::AddInput(v)) => {
+                    self.model_picker_inputs[t.idx()] = v;
+                    Task::none()
+                }
+                (t, ModelPickerAction::AddModel) => {
+                    let (models, _active) = picker_config_fields(&t, &mut self.config);
+                    add_model_to_list(&mut self.model_picker_inputs[t.idx()], models);
+                    Task::none()
+                }
+                (t, ModelPickerAction::RemoveModel(model)) => {
+                    let (models, active) = picker_config_fields(&t, &mut self.config);
+                    remove_model_from_list(&model, models, active);
+                    Task::none()
+                }
+                (t, ModelPickerAction::SetActive(model)) => {
+                    let (_models, active) = picker_config_fields(&t, &mut self.config);
+                    *active = Some(model);
+                    Task::none()
+                }
+            },
 
             SettingsMessage::Escape => {
                 if self.show_add_workspace_modal {
@@ -1784,14 +1790,11 @@ impl SettingsState {
                     .color(theme::ACCENT),
                 Space::new().height(2),
                 model_picker_list(
+                    ModelPickerTarget::ImageGen,
                     self.config.image_gen_models.as_deref(),
                     self.config.image_gen_model.as_deref(),
-                    &self.image_gen_add_input,
+                    self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()].as_str(),
                     "model name (e.g. google/gemini-...)",
-                    SettingsMessage::ImageGenAddInput,
-                    SettingsMessage::ImageGenAddModel,
-                    SettingsMessage::ImageGenRemoveModel,
-                    SettingsMessage::ImageGenSetActive,
                 ),
                 Space::new().height(12),
                 text("Video Generation")
@@ -1800,14 +1803,11 @@ impl SettingsState {
                     .color(theme::ACCENT),
                 Space::new().height(2),
                 model_picker_list(
+                    ModelPickerTarget::VideoGen,
                     self.config.video_gen_models.as_deref(),
                     self.config.video_gen_model.as_deref(),
-                    &self.video_gen_add_input,
+                    self.model_picker_inputs[ModelPickerTarget::VideoGen.idx()].as_str(),
                     "model name (e.g. google/veo-...)",
-                    SettingsMessage::VideoGenAddInput,
-                    SettingsMessage::VideoGenAddModel,
-                    SettingsMessage::VideoGenRemoveModel,
-                    SettingsMessage::VideoGenSetActive,
                 ),
             ],
         )
