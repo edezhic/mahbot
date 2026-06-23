@@ -1745,6 +1745,18 @@ mod tests {
         assert_eq!(ticket.status, TicketPhase::Backlog);
         assert!(ticket.assigned_to.is_none());
         assert!(ticket.comments.is_empty());
+        assert!(
+            ticket.commit_hash.is_none(),
+            "new ticket should have no commit_hash"
+        );
+        assert!(
+            ticket.lines_added.is_none(),
+            "new ticket should have no lines_added"
+        );
+        assert!(
+            ticket.lines_removed.is_none(),
+            "new ticket should have no lines_removed"
+        );
     }
 
     #[tokio::test]
@@ -1964,38 +1976,6 @@ mod tests {
         // Verify updated_at was bumped
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         assert!(ticket.updated_at > ticket.created_at);
-    }
-
-    #[tokio::test]
-    async fn test_claim_ticket() {
-        let (store, _tmp, id) = setup().await;
-
-        let claimed = store
-            .claim_ticket_in_workspace(
-                TicketPhase::Backlog,
-                TicketPhase::InDevelopment,
-                "ws",
-                false,
-            )
-            .await
-            .expect("claim")
-            .expect("should be claimed");
-
-        assert_eq!(claimed.id, id);
-        assert_eq!(claimed.status, TicketPhase::InDevelopment);
-        assert!(claimed.assigned_to.is_none());
-
-        // Second claim should return None (already claimed)
-        let second = store
-            .claim_ticket_in_workspace(
-                TicketPhase::Backlog,
-                TicketPhase::InDevelopment,
-                "ws",
-                false,
-            )
-            .await
-            .expect("claim");
-        assert!(second.is_none());
     }
 
     #[tokio::test]
@@ -2393,6 +2373,8 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("should claim ticket from ws_a");
         assert_eq!(claimed_a.id, id_a);
         assert_eq!(claimed_a.workspace_name, "workspace_a");
+        assert_eq!(claimed_a.status, TicketPhase::InDevelopment);
+        assert!(claimed_a.assigned_to.is_none());
 
         // Claim from workspace A again — should return None (no more backlog tickets)
         assert!(
@@ -2424,151 +2406,136 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert_eq!(claimed_b.workspace_name, "workspace_b");
     }
 
+    /// Table-driven tests for `claim_ticket_in_workspace` with `require_clear_pipeline: true`.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn test_claim_ticket_in_workspace_if_pipeline_free_blocks() {
+    async fn test_claim_ticket_in_workspace_if_pipeline_free() {
+        /// The pipeline scenario for a single test case.
+        enum Scenario {
+            /// Blocker in the same workspace — claim should be blocked.
+            SameWorkspace(TicketPhase),
+            /// Blocker in a different workspace — claim should succeed.
+            DifferentWorkspace(TicketPhase),
+            /// No blocker — claim should succeed.
+            NoBlocker,
+        }
+
+        struct Case {
+            name: &'static str,
+            /// Unique suffix for workspace names (isolates cases).
+            suffix: &'static str,
+            scenario: Scenario,
+        }
+
+        let cases = [
+            Case {
+                name: "blocked by same-workspace pipeline ticket",
+                suffix: "blocked",
+                scenario: Scenario::SameWorkspace(TicketPhase::InReview),
+            },
+            Case {
+                name: "not blocked by cross-workspace pipeline ticket",
+                suffix: "cross",
+                scenario: Scenario::DifferentWorkspace(TicketPhase::InDevelopment),
+            },
+            Case {
+                name: "no blocker succeeds",
+                suffix: "none",
+                scenario: Scenario::NoBlocker,
+            },
+        ];
+
         let (store, _tmp) = open_test_store().await;
 
-        let ws = test_ws_named("/ws", "ws");
+        for case in &cases {
+            let suffix = case.suffix;
 
-        // Create a pipeline blocker (InReview) in the workspace
-        store
-            .create_ticket(
-                "Blocker",
-                "already in pipeline",
-                &ws,
-                TicketPhase::InReview,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create blocker");
+            // Derive workspace names from the scenario.
+            let (claim_ws_name, blocker_ws_name) = match &case.scenario {
+                Scenario::DifferentWorkspace(_) => (
+                    format!("ws_{suffix}_claimable"),
+                    format!("ws_{suffix}_blocker"),
+                ),
+                // SameWorkspace and NoBlocker both use a single workspace name.
+                Scenario::SameWorkspace(_) | Scenario::NoBlocker => {
+                    let name = format!("ws_{suffix}");
+                    (name.clone(), name)
+                }
+            };
 
-        // Create a claimable ticket (ReadyForDevelopment) in the same workspace
-        let _id = store
-            .create_ticket(
-                "Claimable",
-                "ready for dev",
-                &ws,
-                TicketPhase::ReadyForDevelopment,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create claimable");
+            let expected_claim = !matches!(case.scenario, Scenario::SameWorkspace(_));
 
-        // Claim should return None — pipeline is occupied
-        let claimed = store
-            .claim_ticket_in_workspace(
-                TicketPhase::ReadyForDevelopment,
-                TicketPhase::InDevelopment,
-                "ws",
-                true,
-            )
-            .await
-            .expect("claim should not error");
-        assert!(
-            claimed.is_none(),
-            "claim should be blocked by existing pipeline ticket in same workspace"
-        );
-    }
+            let blocker_ws = test_ws_named(&format!("/{blocker_ws_name}"), &blocker_ws_name);
+            let claimable_ws = test_ws_named(&format!("/{claim_ws_name}"), &claim_ws_name);
 
-    #[tokio::test]
-    async fn test_claim_ticket_in_workspace_if_pipeline_free_cross_workspace() {
-        let (store, _tmp) = open_test_store().await;
+            // Create a pipeline blocker (if any)
+            if let Scenario::SameWorkspace(phase) | Scenario::DifferentWorkspace(phase) =
+                &case.scenario
+            {
+                // When blocker and claimable share a workspace, place the
+                // blocker in the claimable's workspace (they are the same).
+                let blocker_target = match &case.scenario {
+                    Scenario::DifferentWorkspace(_) => &blocker_ws,
+                    Scenario::SameWorkspace(_) => &claimable_ws,
+                    // Not reachable: NoBlocker is guarded by the enclosing if-let.
+                    Scenario::NoBlocker => unreachable!(),
+                };
+                store
+                    .create_ticket(
+                        "Blocker",
+                        "already in pipeline",
+                        blocker_target,
+                        *phase,
+                        &[],
+                        "test",
+                        None,
+                    )
+                    .await
+                    .expect("create blocker");
+            }
 
-        let ws_a = test_ws_named("/ws_a", "workspace_a");
-        let ws_b = test_ws_named("/ws_b", "workspace_b");
+            // Create a claimable ticket
+            let id = store
+                .create_ticket(
+                    "Claimable",
+                    "ready for dev",
+                    &claimable_ws,
+                    TicketPhase::ReadyForDevelopment,
+                    &[],
+                    "test",
+                    None,
+                )
+                .await
+                .expect("create claimable");
 
-        // Create a pipeline blocker in workspace A
-        store
-            .create_ticket(
-                "Blocker in A",
-                "blocking A",
-                &ws_a,
-                TicketPhase::InDevelopment,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create blocker in A");
+            // Claim with require_clear_pipeline=true
+            let claimed = store
+                .claim_ticket_in_workspace(
+                    TicketPhase::ReadyForDevelopment,
+                    TicketPhase::InDevelopment,
+                    &claim_ws_name,
+                    true,
+                )
+                .await
+                .expect("claim should not error");
 
-        // Create a claimable ticket in workspace B
-        let id_b = store
-            .create_ticket(
-                "Claimable in B",
-                "ready in B",
-                &ws_b,
-                TicketPhase::ReadyForDevelopment,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create claimable in B");
-
-        // Claim in workspace B should succeed — blocker in A is irrelevant
-        let claimed = store
-            .claim_ticket_in_workspace(
-                TicketPhase::ReadyForDevelopment,
-                TicketPhase::InDevelopment,
-                "workspace_b",
-                true,
-            )
-            .await
-            .expect("claim should not error")
-            .expect("should claim ticket from ws_b");
-        assert_eq!(claimed.id, id_b);
-        assert_eq!(claimed.workspace_name, "workspace_b");
-        assert_eq!(claimed.status, TicketPhase::InDevelopment);
-    }
-
-    #[tokio::test]
-    async fn test_claim_ticket_in_workspace_if_pipeline_free_no_blocker() {
-        let (store, _tmp) = open_test_store().await;
-
-        let ws = test_ws_named("/ws", "ws");
-
-        // Create a claimable ticket with no blockers
-        let id = store
-            .create_ticket(
-                "Claimable",
-                "ready",
-                &ws,
-                TicketPhase::ReadyForDevelopment,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create claimable");
-
-        // Claim should succeed — no pipeline blocker
-        let claimed = store
-            .claim_ticket_in_workspace(
-                TicketPhase::ReadyForDevelopment,
-                TicketPhase::InDevelopment,
-                "ws",
-                true,
-            )
-            .await
-            .expect("claim should not error")
-            .expect("should claim ticket");
-        assert_eq!(claimed.id, id);
-        assert_eq!(claimed.status, TicketPhase::InDevelopment);
-
-        store
-            .set_assigned_to(&claimed.id, Some(Role::Engineer.as_str()))
-            .await
-            .expect("set_assigned_to");
-        let ticket = store
-            .get_ticket(&id)
-            .await
-            .expect("get")
-            .expect("should exist");
-        assert_eq!(ticket.assigned_to.as_deref(), Some(Role::Engineer.as_str()));
+            if expected_claim {
+                let claimed = claimed.expect("should claim ticket");
+                assert_eq!(claimed.id, id, "Case '{}': wrong ticket id", case.name);
+                assert_eq!(
+                    claimed.status,
+                    TicketPhase::InDevelopment,
+                    "Case '{}': wrong status after claim",
+                    case.name
+                );
+            } else {
+                assert!(
+                    claimed.is_none(),
+                    "Case '{}': claim should be blocked",
+                    case.name
+                );
+            }
+        }
     }
 
     // ── Prerequisites ────────────────────────────────────────────
@@ -3345,79 +3312,96 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert!(d.prerequisites.is_empty());
     }
 
+    /// Table-driven tests for `supersede_and_create` with invalid inputs.
     #[tokio::test]
-    async fn test_supersede_nonexistent_ticket() {
+    async fn test_supersede_invalid_inputs() {
+        enum Scenario {
+            /// Supersede a nonexistent ticket.
+            NonExistent,
+            /// Supersede a ticket from a different workspace.
+            CrossWorkspace,
+            /// Supersede a ticket with a self-referencing prerequisite.
+            SelfReference,
+        }
+
+        struct Case {
+            name: &'static str,
+            scenario: Scenario,
+        }
+
+        let cases = [
+            Case {
+                name: "nonexistent original",
+                scenario: Scenario::NonExistent,
+            },
+            Case {
+                name: "cross-workspace supersede",
+                scenario: Scenario::CrossWorkspace,
+            },
+            Case {
+                name: "self-referencing prerequisites",
+                scenario: Scenario::SelfReference,
+            },
+        ];
+
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/ws", "ws");
-
-        let err = store
-            .supersede_and_create("nonexistent", "New", "desc", &ws, &[], "test", None)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("not found"),
-            "Should reject nonexistent ticket: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_supersede_cross_workspace() {
-        let (store, _tmp) = open_test_store().await;
-
-        // Create ticket in workspace A
-        let a_id = store
-            .create_ticket(
-                "A",
-                "in ws A",
-                &test_ws_named("/ws_a", "ws_a"),
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create A");
-
-        // Try to supersede from workspace B
         let ws_b = test_ws_named("/ws_b", "ws_b");
-        let err = store
-            .supersede_and_create(&a_id, "New", "desc", &ws_b, &[], "test", None)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Cross-workspace"),
-            "Should reject cross-workspace supersede: {err}"
-        );
-    }
 
-    #[tokio::test]
-    async fn test_supersede_self_reference() {
-        let (store, _tmp) = open_test_store().await;
-        let ws = test_ws_named("/ws", "ws");
+        for case in &cases {
+            let expected_error = match case.scenario {
+                Scenario::NonExistent => "not found",
+                Scenario::CrossWorkspace => "Cross-workspace",
+                Scenario::SelfReference => "supersede and depend",
+            };
 
-        // Create old ticket A
-        let a_id = store
-            .create_ticket("A", "old", &ws, DEFAULT_TICKET_PHASE, &[], "test", None)
-            .await
-            .expect("create A");
+            let original_id = match case.scenario {
+                Scenario::NonExistent => None,
+                Scenario::CrossWorkspace | Scenario::SelfReference => {
+                    let id = store
+                        .create_ticket("A", "desc", &ws, DEFAULT_TICKET_PHASE, &[], "test", None)
+                        .await
+                        .expect("create original");
+                    Some(id)
+                }
+            };
 
-        // Try to supersede A with a new ticket that depends on A
-        let err = store
-            .supersede_and_create(
-                &a_id,
-                "New",
-                "desc",
-                &ws,
-                std::slice::from_ref(&a_id),
-                "test",
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("supersede and depend"),
-            "Should reject self-reference: {err}"
-        );
+            let target_ws = match case.scenario {
+                Scenario::CrossWorkspace => &ws_b,
+                Scenario::NonExistent | Scenario::SelfReference => &ws,
+            };
+            let supersede_id: &str = original_id.as_deref().unwrap_or("nonexistent");
+            // prereqs include the original id only for SelfReference.
+            let prereqs: Vec<String> = match &case.scenario {
+                Scenario::SelfReference => {
+                    vec![
+                        original_id
+                            .clone()
+                            .expect("original must exist for SelfReference"),
+                    ]
+                }
+                Scenario::NonExistent | Scenario::CrossWorkspace => vec![],
+            };
+
+            let err = store
+                .supersede_and_create(
+                    supersede_id,
+                    "New",
+                    "desc",
+                    target_ws,
+                    &prereqs,
+                    "test",
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(expected_error),
+                "Case '{}': expected error containing '{}', got: {err}",
+                case.name,
+                expected_error
+            );
+        }
     }
 
     #[tokio::test]
@@ -3542,25 +3526,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert!(
             msg.contains("nonexistent"),
             "error should mention ticket id: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_new_ticket_has_none_commit_fields() {
-        let (store, _tmp, id) = setup().await;
-
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert!(
-            ticket.commit_hash.is_none(),
-            "new ticket should have no commit_hash"
-        );
-        assert!(
-            ticket.lines_added.is_none(),
-            "new ticket should have no lines_added"
-        );
-        assert!(
-            ticket.lines_removed.is_none(),
-            "new ticket should have no lines_removed"
         );
     }
 
@@ -4067,12 +4032,13 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert_eq!(rows[2].0, id_b, "third result should be Beta");
     }
 
+    /// Basic field layout of `detailed_display`: fields present, negative
+    /// assertions for absent fields, and "(no comments)" when empty.
     #[tokio::test]
     async fn test_detailed_display_basic() {
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/test-workspace", "test-ws");
 
-        // Create a prerequisite ticket first
         let prereq_id = store
             .create_ticket(
                 "Prereq",
@@ -4102,7 +4068,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ticket = store.get_ticket(&id).await.expect("get").expect("exists");
         let display = ticket.detailed_display();
 
-        // Verify all key fields are present
         assert!(
             display.contains(&format!("Ticket: {id}")),
             "should contain ticket id"
@@ -4145,7 +4110,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
         assert!(display.contains("(no comments)"), "should show no comments");
 
-        // Fields that should NOT appear
+        // Fields that should NOT appear when unset
         assert!(
             !display.contains("Supersedes:"),
             "no supersedes when not set"
@@ -4176,10 +4141,15 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
     }
 
+    /// `detailed_display` with comments (role labels, content) and multiple
+    /// prerequisites joined by comma+space.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn test_detailed_display_with_comments() {
+    async fn test_detailed_display_with_content() {
         let (store, _tmp) = open_test_store().await;
-        let ws = test_ws_named("/test-ws", "test-ws");
+        let ws = test_ws_named("/test-workspace", "test-ws");
+
+        // ── Comment formatting: two comments with different roles ──
 
         let id = store
             .create_ticket(
@@ -4222,10 +4192,76 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
         assert!(
             !display.contains("(no comments)"),
-            "should not say no comments when comments exist"
+            "should not say 'no comments' when comments exist"
+        );
+
+        // ── Multiple prerequisites: all three joined by comma+space ──
+
+        let pre_a = store
+            .create_ticket(
+                "Pre-A",
+                "desc",
+                &ws,
+                DEFAULT_TICKET_PHASE,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create pre-a");
+        let pre_b = store
+            .create_ticket(
+                "Pre-B",
+                "desc",
+                &ws,
+                DEFAULT_TICKET_PHASE,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create pre-b");
+        let pre_c = store
+            .create_ticket(
+                "Pre-C",
+                "desc",
+                &ws,
+                DEFAULT_TICKET_PHASE,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create pre-c");
+
+        let multi_id = store
+            .create_ticket(
+                "Multi prereq",
+                "desc",
+                &ws,
+                DEFAULT_TICKET_PHASE,
+                &[pre_a.clone(), pre_b.clone(), pre_c.clone()],
+                "test",
+                None,
+            )
+            .await
+            .expect("create");
+
+        let ticket = store
+            .get_ticket(&multi_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        let display = ticket.detailed_display();
+
+        assert!(
+            display.contains(&format!("Prerequisites: {pre_a}, {pre_b}, {pre_c}")),
+            "should show all prerequisites joined with comma+space"
         );
     }
 
+    /// `detailed_display` for supersedes chains: new ticket shows Supersedes,
+    /// old ticket shows Superseded by + Archived.
     #[tokio::test]
     async fn test_detailed_display_supersedes_chain() {
         let (store, _tmp) = open_test_store().await;
@@ -4278,72 +4314,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert!(
             old_display.contains("Archived: yes"),
             "old ticket should be archived"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_detailed_display_with_multiple_prerequisites() {
-        let (store, _tmp) = open_test_store().await;
-        let ws = test_ws_named("/ws", "ws");
-
-        // Create prerequisite tickets first
-        let pre_a = store
-            .create_ticket(
-                "Pre-A",
-                "desc",
-                &ws,
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create pre-a");
-        let pre_b = store
-            .create_ticket(
-                "Pre-B",
-                "desc",
-                &ws,
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create pre-b");
-        let pre_c = store
-            .create_ticket(
-                "Pre-C",
-                "desc",
-                &ws,
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create pre-c");
-
-        let id = store
-            .create_ticket(
-                "Multi prereq",
-                "desc",
-                &ws,
-                DEFAULT_TICKET_PHASE,
-                &[pre_a.clone(), pre_b.clone(), pre_c.clone()],
-                "test",
-                None,
-            )
-            .await
-            .expect("create");
-
-        let ticket = store.get_ticket(&id).await.expect("get").expect("exists");
-        let display = ticket.detailed_display();
-
-        // Verify all three prerequisites appear, joined by comma+space
-        assert!(
-            display.contains(&format!("Prerequisites: {pre_a}, {pre_b}, {pre_c}")),
-            "should show all prerequisites joined with comma+space"
         );
     }
 
