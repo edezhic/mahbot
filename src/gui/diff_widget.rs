@@ -26,8 +26,10 @@ use iced::advanced::graphics::text::{self as graphics_text, Raw as TextRaw};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text;
 use iced::advanced::widget::{self, Tree, Widget};
+use iced::advanced::{Clipboard, Shell};
 use iced::advanced::{mouse, renderer};
-use iced::{Color, Length, Point, Rectangle, Size};
+use iced::keyboard;
+use iced::{Color, Event, Length, Point, Rectangle, Size};
 
 use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 use crate::util::UnwrapPoison;
@@ -52,6 +54,12 @@ pub(crate) const REMOVED_COLOR: Color = theme::STATUS_ERROR;
 /// Context line foreground color.
 pub(crate) const CONTEXT_COLOR: Color = theme::TEXT_SECONDARY;
 
+/// Approximate pixel width of one monospace digit at [`GUTTER_FONT_SIZE`].
+const GUTTER_DIGIT_WIDTH: f32 = GUTTER_FONT_SIZE * 0.62;
+
+/// Selection highlight fill color.
+const SELECTION_COLOR: Color = theme::ACCENT_DIM;
+
 // ── Per-file buffer data (pre-computed in update) ───────────────────
 
 /// Pre-built data for rendering one diff file via [`DiffBufferWidget`].
@@ -68,6 +76,8 @@ pub struct DiffFileBuffer {
     /// Per-logical-line line numbers: `(old_num, new_num)`.
     /// Both `None` for hunk headers and lines without line numbers.
     pub line_numbers: Vec<(Option<usize>, Option<usize>)>,
+    /// Digit count for the widest old/new line number (minimum 1).
+    pub gutter_digits: usize,
     /// Whether this buffer has content to render (not binary / too-large).
     pub has_content: bool,
 }
@@ -81,6 +91,12 @@ struct DiffBufferState {
     buffer_for_render: Option<Arc<cosmic_text::Buffer>>,
     /// Cached gutter width in pixels (computed per frame in layout).
     gutter_width: f32,
+    /// Selection anchor byte offset in buffer text (`None` = no selection).
+    sel_anchor: Option<usize>,
+    /// Selection cursor/end byte offset in buffer text.
+    sel_cursor: Option<usize>,
+    /// Whether the left mouse button is held for drag-selection.
+    mouse_held: bool,
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -101,13 +117,123 @@ impl<'a> DiffBufferWidget<'a> {
     }
 }
 
+/// Compute the number of digits needed for the widest old/new line number.
+#[must_use]
+pub(crate) fn compute_gutter_digits(line_numbers: &[(Option<usize>, Option<usize>)]) -> usize {
+    line_numbers
+        .iter()
+        .flat_map(|(old, new)| [*old, *new])
+        .flatten()
+        .map(|n| n.to_string().len())
+        .max()
+        .unwrap_or(1)
+}
+
+/// Pixel width for a dual-column old/new line-number gutter.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub(crate) const fn gutter_width_from_digits(digits: usize) -> f32 {
+    digits as f32 * GUTTER_DIGIT_WIDTH * 2.0 + 14.0
+}
+
+/// Right-edge anchors for the old/new gutter columns.
+///
+/// `fill_text` uses the point as the right edge when `align_x` is `Right`.
+/// This mirrors the main editor gutter; passing each column's left edge clips
+/// or shifts line numbers into the gutter padding.
+fn gutter_column_right_edges(bounds_x: f32, padding: f32, gutter_width: f32) -> (f32, f32) {
+    let half_gutter = gutter_width / 2.0;
+    (
+        bounds_x + padding + half_gutter,
+        bounds_x + padding + gutter_width,
+    )
+}
+
+/// Convert a shaped-buffer hit to a global byte offset in the source text.
+fn hit_to_global_byte(buffer: &cosmic_text::Buffer, line: usize, index: usize) -> usize {
+    let mut global = 0usize;
+    for i in 0..line {
+        if let Some(l) = buffer.lines.get(i) {
+            global += l.text().len() + 1;
+        }
+    }
+    global + index
+}
+
+/// Convert a global byte offset back to a cosmic_text cursor.
+fn global_byte_to_cursor(buffer: &cosmic_text::Buffer, global: usize) -> cosmic_text::Cursor {
+    let mut pos = 0usize;
+    for (i, line) in buffer.lines.iter().enumerate() {
+        let text = line.text();
+        let line_len = text.len();
+        let next = pos.saturating_add(line_len);
+        if global <= next || i + 1 == buffer.lines.len() {
+            return cosmic_text::Cursor {
+                line: i,
+                index: global.saturating_sub(pos).min(line_len),
+                ..cosmic_text::Cursor::default()
+            };
+        }
+        pos = next + 1;
+    }
+    cosmic_text::Cursor::default()
+}
+
+/// Hit-test mouse position against the diff text area.
+fn hit_test(
+    buffer: &cosmic_text::Buffer,
+    layout: Layout<'_>,
+    cursor: mouse::Cursor,
+    gutter_width: f32,
+    padding: f32,
+) -> Option<usize> {
+    let bounds = layout.bounds();
+    let pos = cursor.position_in(bounds)?;
+
+    let text_x = padding + gutter_width + 4.0;
+    let text_y = padding;
+    let buf_x = pos.x - bounds.x - text_x;
+    let buf_y = pos.y - bounds.y - text_y;
+
+    if buf_x < 0.0 || buf_y < 0.0 {
+        return None;
+    }
+
+    let hit = buffer.hit(buf_x, buf_y)?;
+    Some(hit_to_global_byte(buffer, hit.line, hit.index))
+}
+
+/// Extract selected text from global byte offsets (excludes gutter numbers).
+fn selection_text(text: &str, anchor: usize, cursor: usize) -> Option<String> {
+    if anchor == cursor {
+        return None;
+    }
+    let (start, end) = if anchor < cursor {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    };
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return None;
+    }
+    Some(text[start..end].to_string())
+}
+
+/// Whether a non-empty selection is active.
+fn has_selection(anchor: Option<usize>, cursor: Option<usize>) -> bool {
+    match (anchor, cursor) {
+        (Some(a), Some(c)) => a != c,
+        _ => false,
+    }
+}
+
 // ── Iced Widget impl ─────────────────────────────────────────────────
 
 impl<Theme, Renderer> Widget<super::diff::DiffMessage, Theme, Renderer> for DiffBufferWidget<'_>
 where
     Renderer: iced::advanced::Renderer
         + iced::advanced::graphics::text::Renderer
-        + iced::advanced::text::Renderer,
+        + iced::advanced::text::Renderer<Font = iced::Font>,
 {
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Shrink)
@@ -132,12 +258,7 @@ where
         let state = tree.state.downcast_mut::<DiffBufferState>();
 
         // ── Gutter width ───────────────────────────────────────────
-        let line_count = self.data.line_kinds.len();
-        let gutter_width = {
-            let digits = (line_count.max(1).ilog10() + 1).min(6) as f32;
-            // Two columns side by side + gap + padding
-            digits * 5.0 * 2.0 + 14.0
-        };
+        let gutter_width = gutter_width_from_digits(self.data.gutter_digits);
         state.gutter_width = gutter_width;
 
         let text_x = self.padding + gutter_width + 4.0; // 4px gap
@@ -306,6 +427,8 @@ where
             let (old_num, new_num) = self.data.line_numbers[run.line_i];
 
             let half_gutter = gutter_width / 2.0;
+            let (old_right_x, new_right_x) =
+                gutter_column_right_edges(bounds.x, self.padding, gutter_width);
 
             // Draw old line number (right-aligned in left half)
             let old_str = old_num.map_or_else(String::new, |n| n.to_string());
@@ -315,7 +438,7 @@ where
                     bounds: Size::new(half_gutter, run.line_height),
                     size: iced::Pixels(GUTTER_FONT_SIZE),
                     line_height: text::LineHeight::Relative(1.3),
-                    font: renderer.default_font(),
+                    font: theme::FONT_REGULAR,
                     align_x: iced::alignment::Horizontal::Right.into(),
                     align_y: iced::alignment::Vertical::Center,
                     shaping: text::Shaping::Advanced,
@@ -324,7 +447,7 @@ where
                 renderer.fill_text(
                     num_text,
                     Point::new(
-                        bounds.x + self.padding,
+                        old_right_x,
                         text_y + run.line_top + run.line_height / 2.0,
                     ),
                     number_color,
@@ -340,7 +463,7 @@ where
                     bounds: Size::new(half_gutter, run.line_height),
                     size: iced::Pixels(GUTTER_FONT_SIZE),
                     line_height: text::LineHeight::Relative(1.3),
-                    font: renderer.default_font(),
+                    font: theme::FONT_REGULAR,
                     align_x: iced::alignment::Horizontal::Right.into(),
                     align_y: iced::alignment::Vertical::Center,
                     shaping: text::Shaping::Advanced,
@@ -349,7 +472,7 @@ where
                 renderer.fill_text(
                     num_text,
                     Point::new(
-                        bounds.x + self.padding + half_gutter,
+                        new_right_x,
                         text_y + run.line_top + run.line_height / 2.0,
                     ),
                     number_color,
@@ -358,13 +481,151 @@ where
             }
         }
 
-        // ── 3. Draw text via fill_raw ───────────────────────────────
+        // ── 3. Draw selection highlight (behind text) ───────────────
+        if has_selection(state.sel_anchor, state.sel_cursor) {
+            let (anchor, cursor) = (state.sel_anchor.unwrap(), state.sel_cursor.unwrap());
+            let (start, end) = if anchor < cursor {
+                (anchor, cursor)
+            } else {
+                (cursor, anchor)
+            };
+            let start_cur = global_byte_to_cursor(&buffer_for_draw, start);
+            let end_cur = global_byte_to_cursor(&buffer_for_draw, end);
+
+            for run in buffer_for_draw.layout_runs() {
+                if let Some(highlight) = run.highlight(start_cur, end_cur) {
+                    let sel_rect = Rectangle {
+                        x: text_x + highlight.0,
+                        y: text_y + run.line_top,
+                        width: highlight.1,
+                        height: run.line_height,
+                    };
+                    if let Some(clipped) = text_clip.intersection(&sel_rect) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: clipped,
+                                border: iced::Border::default(),
+                                ..renderer::Quad::default()
+                            },
+                            SELECTION_COLOR,
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── 4. Draw text via fill_raw ───────────────────────────────
         renderer.fill_raw(TextRaw {
             buffer: Arc::downgrade(&buffer_for_draw),
             position: Point::new(text_x, text_y),
             color: Color::WHITE, // neutral multiplier preserves per-glyph colors
             clip_bounds: text_clip,
         });
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, super::diff::DiffMessage>,
+        _viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<DiffBufferState>();
+        let buffer = match &state.buffer_for_render {
+            Some(arc) => arc.clone(),
+            None => return,
+        };
+
+        match event {
+            Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
+                if let Some(byte) = hit_test(
+                    &buffer,
+                    layout,
+                    cursor,
+                    state.gutter_width,
+                    self.padding,
+                ) {
+                    state.mouse_held = true;
+                    state.sel_anchor = Some(byte);
+                    state.sel_cursor = Some(byte);
+                    shell.request_redraw();
+                } else {
+                    state.mouse_held = false;
+                    state.sel_anchor = None;
+                    state.sel_cursor = None;
+                    shell.request_redraw();
+                }
+            }
+
+            Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                state.mouse_held = false;
+                if let (Some(a), Some(c)) = (state.sel_anchor, state.sel_cursor) {
+                    if a == c {
+                        state.sel_anchor = None;
+                        state.sel_cursor = None;
+                    }
+                }
+                shell.request_redraw();
+            }
+
+            Event::Mouse(iced::mouse::Event::CursorMoved { .. }) if state.mouse_held => {
+                if let Some(byte) = hit_test(
+                    &buffer,
+                    layout,
+                    cursor,
+                    state.gutter_width,
+                    self.padding,
+                ) {
+                    state.sel_cursor = Some(byte);
+                    shell.request_redraw();
+                }
+            }
+
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key_press,
+                modifiers,
+                physical_key,
+                ..
+            }) => {
+                #[cfg(target_os = "macos")]
+                let is_clipboard_mod = modifiers.command() && !modifiers.control();
+                #[cfg(not(target_os = "macos"))]
+                let is_clipboard_mod =
+                    (modifiers.command() || modifiers.control()) && !modifiers.alt();
+
+                if is_clipboard_mod
+                    && key_press.to_latin(*physical_key) == Some('c')
+                    && let (Some(anchor), Some(cursor_byte)) =
+                        (state.sel_anchor, state.sel_cursor)
+                    && let Some(text) =
+                        selection_text(&self.data.text, anchor, cursor_byte)
+                {
+                    clipboard.write(iced::advanced::clipboard::Kind::Standard, text);
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        let bounds = layout.bounds();
+        if cursor.position_over(bounds).is_some() {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::default()
+        }
     }
 }
 
@@ -374,11 +635,17 @@ where
 ///
 /// Called in `update()` when diff data or file selection changes.
 /// The resulting buffers are consumed by [`DiffBufferWidget`] in `view()`.
+///
+/// When `limits` is `Some((max_hunks, max_lines))`, stops building buffers once
+/// cumulative hunk/line counts would exceed the caps (matches view truncation).
 pub fn build_file_buffers(
     diff_files: &[super::diff::DiffFile],
     selected_file: Option<&str>,
+    limits: Option<(usize, usize)>,
 ) -> Vec<DiffFileBuffer> {
     let mut buffers: Vec<DiffFileBuffer> = Vec::new();
+    let mut total_hunks = 0usize;
+    let mut total_lines = 0usize;
 
     for file in diff_files {
         if let Some(sel) = selected_file {
@@ -392,6 +659,20 @@ pub fn build_file_buffers(
         // construction for binary and too-large files.
         if file.dfile.is_binary || file.dfile.too_large_size.is_some() {
             continue;
+        }
+
+        if let Some((max_hunks, max_lines)) = limits {
+            let file_hunks = file.dfile.hunks.len();
+            if total_hunks + file_hunks > max_hunks || total_lines > max_lines {
+                break;
+            }
+            total_hunks += file_hunks;
+            for hunk in &file.dfile.hunks {
+                total_lines += hunk.lines.len();
+                if total_lines > max_lines {
+                    return buffers;
+                }
+            }
         }
 
         buffers.push(build_single_file_buffer(file));
@@ -505,11 +786,14 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
     // prefix being pushed last in the highlighted case)
     span_data.sort_by_key(|(start, _, _)| *start);
 
+    let gutter_digits = compute_gutter_digits(&line_numbers);
+
     DiffFileBuffer {
         text,
         span_data,
         line_kinds,
         line_numbers,
+        gutter_digits,
         has_content: true,
     }
 }
@@ -572,7 +856,7 @@ mod tests {
     #[test]
     fn test_empty_file_has_no_buffers() {
         let files: Vec<super::super::diff::DiffFile> = Vec::new();
-        let buffers = build_file_buffers(&files, None);
+        let buffers = build_file_buffers(&files, None, None);
         assert!(buffers.is_empty());
     }
 
@@ -580,7 +864,7 @@ mod tests {
     fn test_binary_file_skipped() {
         let mut file = make_test_diff_file("binary.bin", vec![], DiffFileStatus::Modified);
         file.dfile.is_binary = true;
-        let buffers = build_file_buffers(&[file], None);
+        let buffers = build_file_buffers(&[file], None, None);
         assert!(buffers.is_empty());
     }
 
@@ -588,7 +872,7 @@ mod tests {
     fn test_too_large_file_skipped() {
         let mut file = make_test_diff_file("large.bin", vec![], DiffFileStatus::Modified);
         file.dfile.too_large_size = Some(5_000_000);
-        let buffers = build_file_buffers(&[file], None);
+        let buffers = build_file_buffers(&[file], None, None);
         assert!(buffers.is_empty());
     }
 
@@ -610,7 +894,7 @@ mod tests {
             )],
             DiffFileStatus::Modified,
         );
-        let buffers = build_file_buffers(&[file_a, file_b], Some("b.rs"));
+        let buffers = build_file_buffers(&[file_a, file_b], Some("b.rs"), None);
         assert_eq!(buffers.len(), 1);
         assert!(buffers[0].text.contains("new"));
     }
@@ -629,7 +913,7 @@ mod tests {
             )],
             DiffFileStatus::Modified,
         );
-        let buffers = build_file_buffers(&[file], None);
+        let buffers = build_file_buffers(&[file], None, None);
         assert_eq!(buffers.len(), 1);
 
         let buf = &buffers[0];
@@ -689,7 +973,7 @@ mod tests {
             )],
             DiffFileStatus::Modified,
         );
-        let buffers = build_file_buffers(&[file], None);
+        let buffers = build_file_buffers(&[file], None, None);
         let buf = &buffers[0];
 
         // The first span should cover the hunk header and have HUNK_HEADER_COLOR
@@ -712,7 +996,7 @@ mod tests {
             )],
             DiffFileStatus::Added,
         );
-        let buffers = build_file_buffers(&[file], None);
+        let buffers = build_file_buffers(&[file], None, None);
         let buf = &buffers[0];
         // Hunk header + added line
         assert_eq!(buf.line_kinds, vec![None, Some(DiffLineKind::Added)]);
@@ -737,10 +1021,56 @@ mod tests {
             ],
             DiffFileStatus::Modified,
         );
-        let buffers = build_file_buffers(&[file], None);
+        let buffers = build_file_buffers(&[file], None, None);
         let buf = &buffers[0];
         // Two hunk headers + 2 context + 1 removed = 5 logical lines
         assert_eq!(buf.line_kinds.len(), 5);
         assert_eq!(buf.line_numbers.len(), 5);
+    }
+
+    #[test]
+    fn test_gutter_digits_from_source_line_numbers_not_row_count() {
+        let file = make_test_diff_file(
+            "test.rs",
+            vec![make_hunk(
+                "@@ -12345,1 +12345,1 @@",
+                vec![make_line(
+                    DiffLineKind::Context,
+                    "far down",
+                    Some(12_345),
+                    Some(12_345),
+                )],
+            )],
+            DiffFileStatus::Modified,
+        );
+        let buffers = build_file_buffers(&[file], None, None);
+        assert_eq!(buffers[0].gutter_digits, 5);
+        assert!(
+            gutter_width_from_digits(5) > gutter_width_from_digits(1),
+            "high line numbers need a wider gutter"
+        );
+    }
+
+    #[test]
+    fn test_gutter_column_positions_are_right_edges() {
+        let width = gutter_width_from_digits(3);
+        let (old_right, new_right) = gutter_column_right_edges(10.0, 8.0, width);
+
+        assert_eq!(old_right, 10.0 + 8.0 + width / 2.0);
+        assert_eq!(new_right, 10.0 + 8.0 + width);
+        assert!(new_right > old_right);
+    }
+
+    #[test]
+    fn test_selection_text_excludes_gutter_and_handles_ranges() {
+        let text = "+ hello\n- world\n";
+        assert_eq!(selection_text(text, 0, 7), Some("+ hello".to_string()));
+        assert_eq!(selection_text(text, 7, 0), Some("+ hello".to_string()));
+        assert!(selection_text(text, 3, 3).is_none());
+    }
+
+    #[test]
+    fn test_compute_gutter_digits_empty_defaults_to_one() {
+        assert_eq!(compute_gutter_digits(&[]), 1);
     }
 }

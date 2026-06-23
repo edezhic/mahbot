@@ -2,11 +2,11 @@
 
 Mahbot is an autonomous agentic engineering system built for **reliable development with cheap models**. It treats software work as a managed pipeline, not a chat session: you talk to a **Manager** about product intent and scope; specialist agents implement, validate, and review; every change is analyzed before edits and checked again afterward. Reliability comes from **orchestration and process**, not from betting that the current frontier model will do everything right.
 
-Mahbot packages the best agentic engineering practices into one system: role separation, subagents, persistent state, deterministic diagnostics, independent review and QA, and automatic dev loops when validation fails. It is designed to make inexpensive open-weight and API models useful through structure—not to depend on opaque usage pools or a single expensive model doing everything.
+Mahbot packages the best agentic engineering practices into one system: role separation, subagents, persistent state, deterministic diagnostics, independent review and QA, and automatic dev loops when validation fails. It is designed to make inexpensive open-weight and API models useful through structure—not to depend on opaque usage pools or a single expensive model doing everything. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot now works on it's own codebase 24/7, spawns >1000 agents every day and this costs only about 10-15$/day.
 
 ## Why not just Claude Code, Codex, Pi or Cursor?
 
-Most coding assistants optimize for **interactive pair programming**: you prompt, the model edits, you review. That works for focused tasks, but autonomous work tends to drift into low-level implementation details, skip verification, or hit subscription limits when agents run for hours. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot is now working on it's own codebase 24/7 spawning >1000 agents for 10-15$ a day.
+Most coding assistants optimize for **interactive pair programming**: you prompt, the model edits, you review. That works for focused tasks, but autonomous work tends to drift into low-level implementation details, skip verification, or hit subscription limits when agents run for hours. 
 
 Also, mahbot is designed for real-world work from the ground up:
 
@@ -34,7 +34,7 @@ This matches what SOTA agentic systems are converging on: **execution-grounded v
 
 ### 3. Common chat-completions economics
 
-MahBot talks to models through **OpenRouter** (or any OpenAI-compatible chat-completions API). You pay for tokens on models you choose—defaults lean toward inexpensive options like DeepSeek v4 Flash/Pro—with per-role overrides and provider routing in config.
+MahBbot talks to models through **OpenRouter** (or any OpenAI-compatible chat-completions API). You pay for tokens on models you choose—defaults lean toward inexpensive options like DeepSeek v4 Flash/Pro—with per-role overrides and provider routing in config.
 
 That is a different economic shape from tools bundled into **$20–$200/month subscriptions** with rolling 5-hour windows, weekly caps, or agent credit pools. MahBot does not require a specific vendor subscription to be efficient; heavy use scales with API spend and orchestration design, not with upgrading a product tier.
 

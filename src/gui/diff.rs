@@ -151,6 +151,10 @@ pub struct DiffState {
     /// Current commit being viewed, if any.
     /// `None` means we're viewing the working-tree diff (`git diff HEAD`).
     current_commit_ref: Option<String>,
+    /// When true, the next successful [`DiffMessage::DiffLoaded`] recursively
+    /// expands all directory nodes in the file tree (nested folders included).
+    /// Cleared after expansion. Not set on periodic auto-refresh ticks.
+    tree_auto_expand_pending: bool,
 }
 
 impl DiffState {
@@ -172,6 +176,7 @@ impl DiffState {
             commit_message: String::new(),
             committing: false,
             current_commit_ref: None,
+            tree_auto_expand_pending: false,
         }
     }
 
@@ -180,8 +185,9 @@ impl DiffState {
         if self.selected_workspace_name.is_some() || self.personal_workspace_path.is_some() {
             subs.push(iced::time::every(Duration::from_secs(5)).map(|_| DiffMessage::Tick));
         }
-        // Always listen for keyboard events — tree navigation may be active.
-        subs.push(keyboard::listen().filter_map(|event| {
+        // Keyboard: Ctrl+B toggles tree focus; arrow/Enter only when tree focused.
+        let tree_focused = self.file_tree.tree_focused;
+        subs.push(keyboard::listen().filter_map(move |event| {
             use keyboard::{Event, Key};
             let Event::KeyPressed {
                 key,
@@ -201,6 +207,9 @@ impl DiffState {
             let altgr_active = false;
             if !altgr_active && is_cmd && key.to_latin(physical_key) == Some('b') {
                 return Some(DiffMessage::TreeFocusToggled);
+            }
+            if !tree_focused {
+                return None;
             }
             match &key {
                 Key::Named(named) => match named {
@@ -236,6 +245,7 @@ impl DiffState {
                     return Task::none();
                 }
                 self.file_tree.expanded_dirs.clear();
+                self.tree_auto_expand_pending = true;
                 self.commit_message.clear();
                 self.committing = false;
                 self.selected_workspace_name = Some(name.clone());
@@ -270,13 +280,14 @@ impl DiffState {
                             };
                         }
                         self.file_tree.nodes = build_tree(&files);
-                        // Expand all directories on first load; once the user toggles any
-                        // folder, auto-refresh (Tick) won't re-expand — their choices stick.
-                        if self.file_tree.expanded_dirs.is_empty() {
+                        // Expand all directories recursively on first load for this
+                        // workspace/commit context. Periodic refreshes do not reset this.
+                        if self.tree_auto_expand_pending {
                             collect_dir_paths(
                                 &self.file_tree.nodes,
                                 &mut self.file_tree.expanded_dirs,
                             );
+                            self.tree_auto_expand_pending = false;
                         }
                         // Preserve file selection across refreshes if the file still exists.
                         if let Some(ref sel) = self.selected_file {
@@ -326,6 +337,7 @@ impl DiffState {
                 self.personal_workspace_path = None;
                 self.error = None;
                 self.file_tree.expanded_dirs.clear();
+                self.tree_auto_expand_pending = true;
                 self.commit_message.clear();
                 self.committing = false;
                 self.selected_file = None;
@@ -349,6 +361,8 @@ impl DiffState {
                 // Set loading BEFORE clearing ref (prevents Tick race).
                 self.diff_loading = true;
                 self.current_commit_ref = None;
+                self.file_tree.expanded_dirs.clear();
+                self.tree_auto_expand_pending = true;
                 self.generation = self.generation.wrapping_add(1);
                 let generation_num = self.generation;
                 let ws_path = self.personal_workspace_path.clone();
@@ -385,6 +399,7 @@ impl DiffState {
             }
             DiffMessage::CommitMessageChanged(msg) => {
                 self.commit_message = msg;
+                self.file_tree.tree_focused = false;
                 Task::none()
             }
             DiffMessage::CommitClicked => {
@@ -1215,8 +1230,11 @@ impl DiffState {
             self.file_buffers.clear();
             return;
         }
-        self.file_buffers =
-            diff_widget::build_file_buffers(&self.diff_files, self.selected_file.as_deref());
+        self.file_buffers = diff_widget::build_file_buffers(
+            &self.diff_files,
+            self.selected_file.as_deref(),
+            Some((MAX_HUNKS, MAX_DIFF_LINES)),
+        );
         self.buffers_generation = self.generation;
     }
 }
@@ -1993,5 +2011,62 @@ mod tests {
             DiscardTarget::Directory,
         ));
         assert!(state_dir.diff_loading);
+    }
+
+    fn make_diff_loaded(files: Vec<DiffFile>) -> DiffState {
+        let mut state = DiffState::new();
+        state.tree_auto_expand_pending = true;
+        let _ = state.update(DiffMessage::DiffLoaded(
+            state.generation,
+            Ok(files),
+        ));
+        state
+    }
+
+    #[test]
+    fn test_tree_auto_expand_nested_on_first_load() {
+        let files = vec![
+            make_test_file("src/gui/diff.rs", 1, 0),
+            make_test_file("src/lib.rs", 0, 1),
+        ];
+        let state = make_diff_loaded(files);
+        assert!(state.file_tree.expanded_dirs.contains("src"));
+        assert!(state.file_tree.expanded_dirs.contains("src/gui"));
+        assert!(!state.tree_auto_expand_pending);
+    }
+
+    #[test]
+    fn test_collapsed_tree_preserved_on_refresh() {
+        let files = vec![make_test_file("src/main.rs", 1, 0)];
+        let mut state = make_diff_loaded(files);
+        state.file_tree.expanded_dirs.clear();
+        state.tree_auto_expand_pending = false;
+
+        let _ = state.update(DiffMessage::DiffLoaded(
+            state.generation,
+            Ok(vec![make_test_file("src/main.rs", 2, 0)]),
+        ));
+
+        assert!(state.file_tree.expanded_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_switch_resets_auto_expand() {
+        let mut state = DiffState::new();
+        state.tree_auto_expand_pending = false;
+        let _ = state.update(DiffMessage::WorkspaceSelected(
+            "ws".to_owned(),
+            Some("/tmp/ws".to_owned()),
+        ));
+        assert!(state.tree_auto_expand_pending);
+        assert!(state.file_tree.expanded_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_commit_message_clears_tree_focus() {
+        let mut state = make_diff_with_tree();
+        state.file_tree.tree_focused = true;
+        let _ = state.update(DiffMessage::CommitMessageChanged("fix bug".to_owned()));
+        assert!(!state.file_tree.tree_focused);
     }
 }
