@@ -2103,8 +2103,7 @@ mod tests {
         let large_len = large.len();
         assert!(
             large_len > 5_000,
-            "test data {} must exceed spill threshold",
-            large_len
+            "test data {large_len} must exceed spill threshold",
         );
         let result = try_spill_to_file(large, 5_000);
         assert!(
@@ -2936,10 +2935,12 @@ mod tests {
     // ── check_outside_quotes ──────────────────────────────────────────
     // Pure quote-tracking state machine — escape handling is caller's concern.
 
+    type QuoteStep = (char, bool, bool, bool);
+
     #[test]
     fn check_outside_quotes_cases() {
         // Each case: (name, &[(char, expected_return, in_single, in_double)])
-        let cases: &[(&str, &[(char, bool, bool, bool)])] = &[
+        let cases: &[(&str, &[QuoteStep])] = &[
             ("normal char outside", &[('a', true, false, false)]),
             (
                 "single quote blocks",

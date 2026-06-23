@@ -3688,6 +3688,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// pre-assignment rejection, wrong-phase rejection, and idempotency.
     #[tokio::test]
     async fn test_claim_diagnostics() {
+        #[allow(clippy::struct_excessive_bools)]
         struct Case {
             name: &'static str,
             move_to_diagnostics: bool,
