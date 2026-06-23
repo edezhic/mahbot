@@ -2944,84 +2944,108 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     #[tokio::test]
-    async fn test_archive_stale_cancelled_archives_old_tickets() {
-        let (store, _tmp, id) = setup().await;
+    async fn test_archive_stale_cancelled() {
+        let (store, _tmp) = open_test_store().await;
+        let ws = test_ws_named("/ws", "ws");
+
+        // Ticket 1: cancelled, old (2h) → should be archived
+        let old_cancelled_id = store
+            .create_ticket(
+                "old-cancelled",
+                "desc",
+                &ws,
+                TicketPhase::Backlog,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket");
+
+        let two_hours_ago = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+
         store
-            .transition_to(&id, None, TicketPhase::Cancelled)
+            .transition_to(&old_cancelled_id, None, TicketPhase::Cancelled)
             .await
             .expect("cancel");
-
-        // Backdate updated_at to 2 hours ago so it's stale.
-        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         store
             .conn
             .execute(
                 "UPDATE tickets SET updated_at = ?1 WHERE id = ?2",
-                crate::turso::params![old_ts, id.clone()],
+                crate::turso::params![two_hours_ago.clone(), old_cancelled_id.clone()],
             )
             .await
             .expect("backdate");
 
-        let count = store
-            .archive_stale_cancelled(1)
+        // Ticket 2: cancelled, fresh → should NOT be archived
+        let fresh_cancelled_id = store
+            .create_ticket(
+                "fresh-cancelled",
+                "desc",
+                &ws,
+                TicketPhase::Backlog,
+                &[],
+                "test",
+                None,
+            )
             .await
-            .expect("archive_stale_cancelled");
-        assert_eq!(count, 1, "Should archive exactly 1 stale cancelled ticket");
-
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert!(ticket.is_archived, "Ticket should be archived");
-        assert_eq!(
-            ticket.status,
-            TicketPhase::Cancelled,
-            "Status should remain Cancelled"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_archive_stale_cancelled_skips_recently_cancelled() {
-        let (store, _tmp, id) = setup().await;
+            .expect("create_ticket");
         store
-            .transition_to(&id, None, TicketPhase::Cancelled)
+            .transition_to(&fresh_cancelled_id, None, TicketPhase::Cancelled)
             .await
             .expect("cancel");
-        // No backdating — updated_at is fresh (now).
+        // No backdating — updated_at is now.
 
-        let count = store
-            .archive_stale_cancelled(1)
+        // Ticket 3: not cancelled (Backlog), old → should NOT be archived
+        let old_backlog_id = store
+            .create_ticket(
+                "old-backlog",
+                "desc",
+                &ws,
+                TicketPhase::Backlog,
+                &[],
+                "test",
+                None,
+            )
             .await
-            .expect("archive_stale_cancelled");
-        assert_eq!(count, 0, "Should skip recently cancelled ticket");
-
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
-        assert_eq!(
-            status,
-            TicketPhase::Cancelled,
-            "Status should remain Cancelled"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_archive_stale_cancelled_skips_non_cancelled() {
-        let (store, _tmp, id) = setup().await;
-        // Backdate but leave in Backlog — should not be touched.
-        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+            .expect("create_ticket");
         store
             .conn
             .execute(
                 "UPDATE tickets SET updated_at = ?1 WHERE id = ?2",
-                crate::turso::params![old_ts, id.clone()],
+                crate::turso::params![two_hours_ago.clone(), old_backlog_id.clone()],
             )
             .await
             .expect("backdate");
 
+        // Act
         let count = store
             .archive_stale_cancelled(1)
             .await
             .expect("archive_stale_cancelled");
-        assert_eq!(count, 0, "Should skip non-cancelled ticket");
+        assert_eq!(count, 1, "should archive only the old cancelled ticket");
 
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
-        assert_eq!(status, TicketPhase::Backlog, "Status should remain Backlog");
+        // Assert
+        let old_cancelled = crate::util::test::expect_ticket(&store, &old_cancelled_id).await;
+        assert!(
+            old_cancelled.is_archived,
+            "old cancelled ticket should be archived"
+        );
+        assert_eq!(old_cancelled.status, TicketPhase::Cancelled);
+
+        let fresh_cancelled = crate::util::test::expect_ticket(&store, &fresh_cancelled_id).await;
+        assert!(
+            !fresh_cancelled.is_archived,
+            "fresh cancelled ticket should NOT be archived"
+        );
+        assert_eq!(fresh_cancelled.status, TicketPhase::Cancelled);
+
+        let old_backlog = crate::util::test::expect_ticket(&store, &old_backlog_id).await;
+        assert!(
+            !old_backlog.is_archived,
+            "old non-cancelled ticket should NOT be archived"
+        );
+        assert_eq!(old_backlog.status, TicketPhase::Backlog);
     }
 
     #[tokio::test]
@@ -3036,63 +3060,76 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     #[tokio::test]
-    async fn test_archive_all_done_and_cancelled_archives_done() {
-        let (store, _tmp, id) = setup().await;
+    async fn test_archive_all_done_and_cancelled() {
+        let (store, _tmp) = open_test_store().await;
+        let ws = test_ws_named("/ws", "ws");
+
+        // Create three tickets: one Done, one Cancelled, one Backlog.
+        let done_id = store
+            .create_ticket("done", "desc", &ws, TicketPhase::Backlog, &[], "test", None)
+            .await
+            .expect("create_ticket");
         store
-            .transition_to(&id, None, TicketPhase::Done)
+            .transition_to(&done_id, None, TicketPhase::Done)
             .await
             .expect("set done");
 
-        let count = store
-            .archive_all_done_and_cancelled(None)
+        let cancelled_id = store
+            .create_ticket(
+                "cancelled",
+                "desc",
+                &ws,
+                TicketPhase::Backlog,
+                &[],
+                "test",
+                None,
+            )
             .await
-            .expect("archive_all_done_and_cancelled");
-        assert_eq!(count, 1, "Should archive 1 done ticket");
-
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert!(ticket.is_archived, "Ticket should be archived");
-        assert_eq!(
-            ticket.status,
-            TicketPhase::Done,
-            "Status should remain Done"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_archive_all_done_and_cancelled_archives_cancelled() {
-        let (store, _tmp, id) = setup().await;
+            .expect("create_ticket");
         store
-            .transition_to(&id, None, TicketPhase::Cancelled)
+            .transition_to(&cancelled_id, None, TicketPhase::Cancelled)
             .await
             .expect("cancel");
 
+        let backlog_id = store
+            .create_ticket(
+                "backlog",
+                "desc",
+                &ws,
+                TicketPhase::Backlog,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket");
+        // Leave in Backlog.
+
+        // Act
         let count = store
             .archive_all_done_and_cancelled(None)
             .await
-            .expect("archive_all_done_and_cancelled");
-        assert_eq!(count, 1, "Should archive 1 cancelled ticket");
+            .expect("archive");
+        assert_eq!(count, 2, "should archive Done and Cancelled tickets");
 
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert!(ticket.is_archived, "Ticket should be archived");
-        assert_eq!(
-            ticket.status,
-            TicketPhase::Cancelled,
-            "Status should remain Cancelled"
+        // Assert
+        let done_ticket = crate::util::test::expect_ticket(&store, &done_id).await;
+        assert!(done_ticket.is_archived, "Done ticket should be archived");
+        assert_eq!(done_ticket.status, TicketPhase::Done);
+
+        let cancelled_ticket = crate::util::test::expect_ticket(&store, &cancelled_id).await;
+        assert!(
+            cancelled_ticket.is_archived,
+            "Cancelled ticket should be archived"
         );
-    }
+        assert_eq!(cancelled_ticket.status, TicketPhase::Cancelled);
 
-    #[tokio::test]
-    async fn test_archive_all_done_and_cancelled_skips_other_statuses() {
-        let (store, _tmp, id) = setup().await;
-
-        let count = store
-            .archive_all_done_and_cancelled(None)
-            .await
-            .expect("archive_all_done_and_cancelled");
-        assert_eq!(count, 0, "Should skip non-done/cancelled ticket");
-
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
-        assert_eq!(status, TicketPhase::Backlog, "Status should remain Backlog");
+        let backlog_ticket = crate::util::test::expect_ticket(&store, &backlog_id).await;
+        assert!(
+            !backlog_ticket.is_archived,
+            "Backlog ticket should NOT be archived"
+        );
+        assert_eq!(backlog_ticket.status, TicketPhase::Backlog);
     }
 
     #[tokio::test]
@@ -3668,100 +3705,100 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     // ── claim_diagnostics tests ──
 
-    /// Test that claim_diagnostics succeeds when ticket is unassigned and
-    /// in InDiagnostics.
+    /// Table-driven tests for `claim_diagnostics` covering success,
+    /// pre-assignment rejection, wrong-phase rejection, and idempotency.
     #[tokio::test]
-    async fn test_claim_diagnostics_succeeds_unassigned_in_diagnostics() {
-        let (store, _tmp, id) = setup().await;
+    async fn test_claim_diagnostics() {
+        struct Case {
+            name: &'static str,
+            move_to_diagnostics: bool,
+            pre_assigned: bool,
+            expected_claim: bool,
+            check_idempotent: bool,
+        }
 
-        // Move ticket to InDiagnostics (without assigning anyone)
-        store
-            .transition_to(&id, None, TicketPhase::InDiagnostics)
-            .await
-            .expect("transition to InDiagnostics");
+        let cases = [
+            Case {
+                name: "unassigned in diagnostics succeeds",
+                move_to_diagnostics: true,
+                pre_assigned: false,
+                expected_claim: true,
+                check_idempotent: true,
+            },
+            Case {
+                name: "already assigned fails",
+                move_to_diagnostics: true,
+                pre_assigned: true,
+                expected_claim: false,
+                check_idempotent: false,
+            },
+            Case {
+                name: "wrong phase fails",
+                move_to_diagnostics: false,
+                pre_assigned: false,
+                expected_claim: false,
+                check_idempotent: false,
+            },
+        ];
 
-        let claimed = store
-            .claim_diagnostics(&id)
-            .await
-            .expect("claim_diagnostics");
-        assert!(claimed, "should claim an unassigned InDiagnostics ticket");
+        let (store, _tmp) = open_test_store().await;
+        let ws = test_ws_named("/ws", "ws");
 
-        // Verify assigned_to is now 'diagnostics'
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(
-            ticket.assigned_to.as_deref(),
-            Some("diagnostics"),
-            "assignee should be set"
-        );
-        assert_eq!(
-            ticket.status,
-            TicketPhase::InDiagnostics,
-            "status should remain InDiagnostics"
-        );
-    }
+        for (i, case) in cases.iter().enumerate() {
+            let title = format!("claim-{i}");
+            let id = store
+                .create_ticket(&title, "desc", &ws, TicketPhase::Backlog, &[], "test", None)
+                .await
+                .expect("create_ticket");
 
-    /// Test that claim_diagnostics fails when the ticket is already assigned.
-    #[tokio::test]
-    async fn test_claim_diagnostics_fails_already_assigned() {
-        let (store, _tmp, id) = setup().await;
+            if case.move_to_diagnostics {
+                store
+                    .transition_to(&id, None, TicketPhase::InDiagnostics)
+                    .await
+                    .expect("transition to InDiagnostics");
+            }
+            if case.pre_assigned {
+                store
+                    .set_assigned_to(&id, Some("diagnostics"))
+                    .await
+                    .expect("set_assigned_to");
+            }
 
-        // Move ticket to InDiagnostics
-        store
-            .transition_to(&id, None, TicketPhase::InDiagnostics)
-            .await
-            .expect("transition to InDiagnostics");
+            let claimed = store
+                .claim_diagnostics(&id)
+                .await
+                .expect("claim_diagnostics");
+            assert_eq!(
+                claimed, case.expected_claim,
+                "Case '{}': unexpected claim result",
+                case.name
+            );
 
-        // Pre-assign to simulate another dispatch
-        store
-            .set_assigned_to(&id, Some("diagnostics"))
-            .await
-            .expect("set_assigned_to");
+            if case.expected_claim {
+                let ticket = crate::util::test::expect_ticket(&store, &id).await;
+                assert_eq!(
+                    ticket.assigned_to.as_deref(),
+                    Some("diagnostics"),
+                    "Case '{}': assignee should be set",
+                    case.name
+                );
+                assert_eq!(
+                    ticket.status,
+                    TicketPhase::InDiagnostics,
+                    "Case '{}': status should remain InDiagnostics",
+                    case.name
+                );
+            }
 
-        // Now attempt to claim — should fail because assigned_to is already set
-        let claimed = store
-            .claim_diagnostics(&id)
-            .await
-            .expect("claim_diagnostics");
-        assert!(!claimed, "should not claim an already-assigned ticket");
-    }
-
-    /// Test that claim_diagnostics fails when ticket is not in InDiagnostics.
-    #[tokio::test]
-    async fn test_claim_diagnostics_fails_wrong_phase() {
-        let (store, _tmp, id) = setup().await;
-
-        // Ticket is in Backlog (default), not InDiagnostics
-        let claimed = store
-            .claim_diagnostics(&id)
-            .await
-            .expect("claim_diagnostics");
-        assert!(
-            !claimed,
-            "should not claim a ticket that is not in InDiagnostics"
-        );
-    }
-
-    /// Test that claim_diagnostics is idempotent — second attempt on a
-    /// claimed ticket returns false.
-    #[tokio::test]
-    async fn test_claim_diagnostics_idempotent() {
-        let (store, _tmp, id) = setup().await;
-
-        store
-            .transition_to(&id, None, TicketPhase::InDiagnostics)
-            .await
-            .expect("transition to InDiagnostics");
-
-        // First claim succeeds
-        let first = store.claim_diagnostics(&id).await.expect("first claim");
-        assert!(first, "first claim should succeed");
-
-        // Second claim on the same ticket fails (idempotent)
-        let second = store.claim_diagnostics(&id).await.expect("second claim");
-        assert!(
-            !second,
-            "second claim should return false (already claimed)"
-        );
+            if case.check_idempotent {
+                let second = store.claim_diagnostics(&id).await.expect("second claim");
+                assert!(
+                    !second,
+                    "Case '{}': second claim should return false (idempotent)",
+                    case.name
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4003,52 +4040,43 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert!(candidates.is_empty(), "no tickets at all");
     }
 
+    /// Tests for `list_tickets_minimal`: found by ID, nonexistent IDs omitted,
+    /// empty-ids early-return guard, and input order preservation.
     #[tokio::test]
-    async fn test_list_tickets_minimal_found() {
+    async fn test_list_tickets_minimal() {
         let (store, _tmp) = open_test_store().await;
-        let id = create_archived_ticket(&store, "Test title", "ws").await;
 
-        let rows = store
-            .list_tickets_minimal(std::slice::from_ref(&id))
-            .await
-            .expect("list minimal");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, id);
-        assert_eq!(rows[0].1, "Test title");
-        assert_eq!(rows[0].2, "done");
-    }
-
-    #[tokio::test]
-    async fn test_list_tickets_minimal_empty_ids_yields_empty() {
-        let (store, _tmp) = open_test_store().await;
-        let rows: Vec<(String, String, String)> = store
-            .list_tickets_minimal(&[] as &[String])
-            .await
-            .expect("list minimal");
-        assert!(rows.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_list_tickets_minimal_nonexistent_id_omitted() {
-        let (store, _tmp) = open_test_store().await;
-        let id = create_archived_ticket(&store, "Exists", "ws").await;
-
-        let rows = store
-            .list_tickets_minimal(&[id.clone(), "nonexistent".to_string()])
-            .await
-            .expect("list minimal");
-        assert_eq!(rows.len(), 1, "only the existing ticket should be returned");
-        assert_eq!(rows[0].0, id);
-    }
-
-    #[tokio::test]
-    async fn test_list_tickets_minimal_preserves_input_order() {
-        let (store, _tmp) = open_test_store().await;
+        // Create 3 archived tickets in a shared store.
         let id_a = create_archived_ticket(&store, "Alpha", "ws").await;
         let id_b = create_archived_ticket(&store, "Beta", "ws").await;
         let id_c = create_archived_ticket(&store, "Gamma", "ws").await;
 
-        // Request in non-insertion order
+        // 1. Found by ID.
+        let rows = store
+            .list_tickets_minimal(std::slice::from_ref(&id_a))
+            .await
+            .expect("list minimal");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, id_a);
+        assert_eq!(rows[0].1, "Alpha");
+        assert_eq!(rows[0].2, "done");
+
+        // 2. Nonexistent IDs omitted.
+        let rows = store
+            .list_tickets_minimal(&[id_a.clone(), "nonexistent".to_string()])
+            .await
+            .expect("list minimal");
+        assert_eq!(rows.len(), 1, "nonexistent IDs should be omitted");
+        assert_eq!(rows[0].0, id_a);
+
+        // 3. Empty ids returns empty (early-return guard).
+        let rows: Vec<(String, String, String)> = store
+            .list_tickets_minimal(&[] as &[String])
+            .await
+            .expect("list minimal");
+        assert!(rows.is_empty(), "empty ids should return empty results");
+
+        // 4. Preserves input order.
         let rows = store
             .list_tickets_minimal(&[id_c.clone(), id_a.clone(), id_b.clone()])
             .await
