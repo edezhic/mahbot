@@ -36,6 +36,7 @@ pub mod widgets;
 pub mod workspaces;
 
 use crate::board::{Ticket, TicketPhase};
+use crate::gui::tool_failures::ToolFailuresMessage;
 use crate::logs::LogStore;
 
 use iced::keyboard;
@@ -76,7 +77,6 @@ pub enum Page {
     Home,
     Sessions,
     Logs,
-    ToolFailures,
     Diff,
     Shell,
     Editor,
@@ -89,14 +89,9 @@ impl Page {
         &[Page::Home, Page::Editor, Page::Diff, Page::Shell]
     }
 
-    /// Pages shown in the footer nav (Sessions, Logs, Tool Failures).
+    /// Pages shown in the footer nav (Sessions, Logs, Settings).
     const fn footer_pages() -> &'static [Page] {
-        &[
-            Page::Sessions,
-            Page::Logs,
-            Page::ToolFailures,
-            Page::Settings,
-        ]
+        &[Page::Sessions, Page::Logs, Page::Settings]
     }
 
     const fn label(self) -> &'static str {
@@ -104,7 +99,6 @@ impl Page {
             Page::Home => "Home",
             Page::Sessions => "Sessions",
             Page::Logs => "Logs",
-            Page::ToolFailures => "Tool Failures",
             Page::Diff => "Diff",
             Page::Shell => "Shell",
             Page::Editor => "Editor",
@@ -216,7 +210,6 @@ pub enum Message {
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
     Sessions(sessions::SessionsMessage),
-    ToolFailures(tool_failures::ToolFailuresMessage),
     Diff(diff::DiffMessage),
     Shell(shell::ShellMessage),
     Editor(editor::EditorMessage),
@@ -260,7 +253,6 @@ pub struct Dashboard {
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
-    tool_failures_state: tool_failures::ToolFailuresState,
     diff_state: diff::DiffState,
     home_state: home::HomeState,
     shell_state: shell::ShellState,
@@ -289,7 +281,6 @@ impl Dashboard {
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
-            tool_failures_state: tool_failures::ToolFailuresState::new(),
             diff_state: diff::DiffState::new(),
             home_state: home::HomeState::new(),
             shell_state: shell::ShellState::new(),
@@ -426,10 +417,6 @@ impl Dashboard {
                 self.page = page;
                 match page {
                     Page::Logs => Task::none(),
-                    Page::ToolFailures => self
-                        .tool_failures_state
-                        .refresh()
-                        .map(Message::ToolFailures),
                     Page::Home => {
                         let load_users = self.home_state.load_users().map(Message::Home);
                         let ws_opts = Task::done(home::HomeMessage::WorkspaceOptions(
@@ -540,7 +527,12 @@ impl Dashboard {
             }
             Message::Shell(msg) if self.ready => self.shell_state.update(msg).map(Message::Shell),
             Message::Logs(msg) if self.ready => {
+                // Intercept Toast messages — both direct LogMessage::Toast
+                // and nested ToolFailuresMessage::Toast from the TF tab.
                 if let logs::LogMessage::Toast(ref tm) = msg {
+                    self.toasts.push(Toast::from_toast_msg(tm));
+                }
+                if let logs::LogMessage::ToolFailures(ToolFailuresMessage::Toast(ref tm)) = msg {
                     self.toasts.push(Toast::from_toast_msg(tm));
                 }
                 self.logs_state
@@ -578,14 +570,6 @@ impl Dashboard {
                     self.toasts.push(Toast::from_toast_msg(tm));
                 }
                 self.sessions_state.update(msg).map(Message::Sessions)
-            }
-            Message::ToolFailures(msg) if self.ready => {
-                if let tool_failures::ToolFailuresMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
-                self.tool_failures_state
-                    .update(msg)
-                    .map(Message::ToolFailures)
             }
             Message::Diff(msg) if self.ready => {
                 if let diff::DiffMessage::Toast(ref tm) = msg {
@@ -715,10 +699,6 @@ impl Dashboard {
                         self.log_store.as_ref().expect("ready"),
                     )
                     .map(Message::Logs),
-                Page::ToolFailures => self
-                    .tool_failures_state
-                    .update(tool_failures::ToolFailuresMessage::FocusSearch)
-                    .map(Message::ToolFailures),
                 _ => Task::none(),
             },
             Message::EscapePressed => match self.page {
@@ -743,10 +723,6 @@ impl Dashboard {
                     .sessions_state
                     .update(sessions::SessionsMessage::Escape)
                     .map(Message::Sessions),
-                Page::ToolFailures => self
-                    .tool_failures_state
-                    .update(tool_failures::ToolFailuresMessage::Escape)
-                    .map(Message::ToolFailures),
                 Page::Diff => self
                     .diff_state
                     .update(diff::DiffMessage::Escape)
@@ -851,7 +827,6 @@ impl Dashboard {
             | Message::Logs(_)
             | Message::Board(_)
             | Message::Sessions(_)
-            | Message::ToolFailures(_)
             | Message::Diff(_)
             | Message::Editor(_)
             | Message::Settings(_)
@@ -1007,7 +982,6 @@ impl Dashboard {
                 iced::widget::stack([base.into(), modal]).into()
             }
             Page::Logs => self.logs_state.view().map(Message::Logs),
-            Page::ToolFailures => self.tool_failures_state.view().map(Message::ToolFailures),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
             Page::Diff => self.diff_state.view().map(Message::Diff),
             Page::Shell => self.shell_state.view().map(Message::Shell),
@@ -1394,7 +1368,7 @@ impl Dashboard {
 
     /// 24px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
-        // Left: footer navigation (Sessions, Logs, Tool Failures, Settings)
+        // Left: footer navigation (Sessions, Logs, Settings)
         // Icon-only, 16px. Active page in ACCENT, inactive in TEXT_MUTED.
         let mut left_icons = Vec::with_capacity(6);
         for page in Page::footer_pages() {
@@ -1410,10 +1384,6 @@ impl Dashboard {
                     .color(color)
                     .into(),
                 Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>()
-                    .size(16)
-                    .color(color)
-                    .into(),
-                Page::ToolFailures => lucide::bug::<iced::Theme, iced::Renderer>()
                     .size(16)
                     .color(color)
                     .into(),

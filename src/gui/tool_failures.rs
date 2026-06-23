@@ -364,11 +364,7 @@ impl ToolFailuresState {
             .align_y(Alignment::Center);
 
             content = content.push(Space::new().height(8));
-            content = content.push(
-                container(pagination)
-                    .width(Length::Fill)
-                    .align_x(Alignment::Center),
-            );
+            content = content.push(pagination);
         }
 
         container(content)
@@ -437,12 +433,13 @@ impl ToolFailuresState {
         .spacing(1);
 
         container(row_content)
-            .padding([5, 10])
+            .padding(6)
             .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_SURFACE)),
                 border: iced::Border {
+                    radius: 4.0.into(),
                     width: 1.0,
                     color: theme::BORDER,
-                    ..Default::default()
                 },
                 ..container::Style::default()
             })
