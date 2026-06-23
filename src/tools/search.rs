@@ -99,32 +99,23 @@ fn normalize_search_args(args: &mut serde_json::Value) {
     }
 
     // Top-level mode conflated with grep_mode.
-    if let Some(mode) = obj.get("mode").and_then(|v| v.as_str()).map(str::to_string) {
-        match mode.as_str() {
-            "plain_text" => {
-                obj.insert("mode".to_string(), json!("grep"));
-                if !obj.contains_key("grep_mode") {
-                    obj.insert("grep_mode".to_string(), json!("plain_text"));
+    if let Some(mode) = obj.get("mode").and_then(|v| v.as_str()).map(str::to_string)
+        && matches!(mode.as_str(), "plain_text" | "regex" | "content" | "code") {
+            obj.insert("mode".to_string(), json!("grep"));
+            match mode.as_str() {
+                "plain_text" => {
+                    obj.entry("grep_mode".to_string())
+                        .or_insert(json!("plain_text"));
                 }
-            }
-            "regex" => {
-                obj.insert("mode".to_string(), json!("grep"));
-                if !obj.contains_key("grep_mode") {
-                    obj.insert("grep_mode".to_string(), json!("regex"));
+                "regex" => {
+                    obj.entry("grep_mode".to_string()).or_insert(json!("regex"));
                 }
-            }
-            "content" => {
-                obj.insert("mode".to_string(), json!("grep"));
-            }
-            "code" => {
-                obj.insert("mode".to_string(), json!("grep"));
-                if !obj.contains_key("grep_mode") {
-                    obj.insert("grep_mode".to_string(), json!("fuzzy"));
+                "code" => {
+                    obj.entry("grep_mode".to_string()).or_insert(json!("fuzzy"));
                 }
+                _ => {} // "content" — no grep_mode default
             }
-            _ => {}
         }
-    }
 
     // Invalid grep_mode values observed in production telemetry.
     if let Some(gm) = obj
