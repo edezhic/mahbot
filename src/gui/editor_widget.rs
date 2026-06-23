@@ -303,7 +303,10 @@ impl EditorBuffer {
 
     /// Return the current cursor state, including selection anchor if any.
     pub fn cursor(&self) -> CursorState {
-        let selection = if self.has_selection.get() {
+        let has_real_selection = self.has_selection.get()
+            && (self.sel_line.get() != self.cursor_line.get()
+                || self.sel_col.get() != self.cursor_col.get());
+        let selection = if has_real_selection {
             Some(Box::new(CursorState {
                 line: self.sel_line.get(),
                 column: self.sel_col.get(),
@@ -395,9 +398,14 @@ impl EditorBuffer {
                 let max_line = self.line_count().saturating_sub(1);
                 let line = line.min(max_line);
                 let col = self.clamp_col_to_line(line, col);
+                if line == self.cursor_line.get() && col == self.cursor_col.get() {
+                    self.has_selection.set(false);
+                    return;
+                }
                 self.cursor_line.set(line);
                 self.cursor_col.set(col);
                 self.has_selection.set(true);
+                self.normalize_selection();
             }
             EditorAction::SelectAll => self.select_all(),
             EditorAction::SelectWordAt { line, col } => {
@@ -415,6 +423,7 @@ impl EditorBuffer {
                     self.cursor_line.set(cursor_line);
                     self.cursor_col.set(cursor_col);
                     self.has_selection.set(true);
+                    self.normalize_selection();
                 }
             }
             EditorAction::Indent => self.do_indent(),
@@ -915,14 +924,18 @@ impl EditorBuffer {
         compute: impl FnOnce() -> Option<(usize, usize)>,
     ) {
         if extend_selection {
-            self.ensure_selection_anchor();
-        }
-        if let Some((line, col)) = compute() {
-            if extend_selection {
+            let anchor = (self.cursor_line.get(), self.cursor_col.get());
+            if let Some((line, col)) = compute() {
+                if !self.has_selection.get() {
+                    self.sel_line.set(anchor.0);
+                    self.sel_col.set(anchor.1);
+                    self.has_selection.set(true);
+                }
                 self.set_cursor_pos(line, col);
-            } else {
-                self.move_to(line, col);
+                self.normalize_selection();
             }
+        } else if let Some((line, col)) = compute() {
+            self.move_to(line, col);
         }
     }
 
@@ -1090,11 +1103,13 @@ impl EditorBuffer {
         });
     }
 
-    fn ensure_selection_anchor(&self) {
-        if !self.has_selection.get() {
-            self.sel_line.set(self.cursor_line.get());
-            self.sel_col.set(self.cursor_col.get());
-            self.has_selection.set(true);
+    /// Clear selection when anchor and cursor coincide (zero-width range).
+    fn normalize_selection(&self) {
+        if self.has_selection.get()
+            && self.sel_line.get() == self.cursor_line.get()
+            && self.sel_col.get() == self.cursor_col.get()
+        {
+            self.has_selection.set(false);
         }
     }
 
@@ -2213,6 +2228,9 @@ struct EditorWidgetState {
     /// duplicate `KeyPressed.text` that follows on some platforms (Linux/IBus).
     /// Cleared after suppression or when a non-matching key event arrives.
     ime_commit_suppress: Option<String>,
+    /// Last active buffer key (typically file path) — used to reset scroll
+    /// and interaction state when switching tabs.
+    last_buffer_key: Option<String>,
 }
 
 impl Default for EditorWidgetState {
@@ -2228,6 +2246,7 @@ impl Default for EditorWidgetState {
             last_click_time: None,
             last_click_pos: None,
             ime_commit_suppress: None,
+            last_buffer_key: None,
         }
     }
 }
@@ -2261,6 +2280,9 @@ pub struct EditorWidget<'a> {
     /// Matching bracket pair to highlight, if any.
     /// Each element is `(line, col)`.
     bracket_pair: Option<((usize, usize), (usize, usize))>,
+    /// Identity of the active buffer (typically file path). When this
+    /// changes, widget scroll and interaction state are reset.
+    buffer_key: Option<&'a str>,
 }
 
 impl<'a> EditorWidget<'a> {
@@ -2276,6 +2298,7 @@ impl<'a> EditorWidget<'a> {
             match_current_idx: 0,
             blink_gen: 0,
             bracket_pair: None,
+            buffer_key: None,
         }
     }
 
@@ -2346,6 +2369,13 @@ impl<'a> EditorWidget<'a> {
         self.bracket_pair = pair;
         self
     }
+
+    /// Set the buffer identity key used to detect tab switches.
+    #[must_use]
+    pub const fn buffer_key(mut self, key: Option<&'a str>) -> Self {
+        self.buffer_key = key;
+        self
+    }
 }
 
 impl<Theme, Renderer> Widget<EditorAction, Theme, Renderer> for EditorWidget<'_>
@@ -2374,6 +2404,17 @@ where
         let bounds = limits.max();
 
         let state = tree.state.downcast_mut::<EditorWidgetState>();
+
+        // Reset scroll/interaction state when the active buffer changes (tab switch).
+        let current_key = self.buffer_key.map(str::to_string);
+        if state.last_buffer_key != current_key {
+            state.scroll_y = 0.0;
+            state.auto_scroll_enabled = true;
+            state.mouse_held = false;
+            state.last_click_time = None;
+            state.last_click_pos = None;
+            state.last_buffer_key = current_key;
+        }
 
         // ── Gutter width ───────────────────────────────────────────────
         let line_count = self.buffer.line_count();
@@ -2799,8 +2840,6 @@ where
 
             // ── Mouse button press: move cursor to click point ───────
             Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
-                state.mouse_held = true;
-
                 // Re-shape the buffer with the current scroll BEFORE hit-test.
                 // layout() runs after events, but WheelScrolled only calls
                 // invalidate_layout() — the buffer still has the pre-scroll
@@ -2832,6 +2871,7 @@ where
                     state.gutter_width,
                     self.padding,
                 ) {
+                    state.mouse_held = true;
                     // Reset blink so cursor becomes visible immediately after click.
                     state.last_blink = std::time::Instant::now();
                     state.auto_scroll_enabled = true;
@@ -2862,6 +2902,7 @@ where
                     // Request redraw to keep the cursor blinking.
                     shell.request_redraw();
                 } else {
+                    state.mouse_held = false;
                     // Gutter/padding click — clear double-click tracking.
                     state.last_click_time = None;
                     state.last_click_pos = None;
@@ -4264,6 +4305,40 @@ mod tests {
         buf.perform_action(EditorAction::SelectTo { line: 1, col: 0 });
         buf.perform_action(EditorAction::Unindent);
         assert_eq!(buf.text(), "hello\nworld\nfoo");
+    }
+
+    // ── Selection normalization ─────────────────────────────────────
+
+    #[test]
+    fn test_shift_left_at_bof_no_selection() {
+        let buf = EditorBuffer::with_text("hello", None);
+        buf.perform_action(EditorAction::SelectLeft);
+        let cursor = buf.cursor();
+        assert_eq!(cursor.line, 0);
+        assert_eq!(cursor.column, 0);
+        assert!(cursor.selection.is_none());
+    }
+
+    #[test]
+    fn test_select_to_same_point_clears_selection() {
+        let buf = EditorBuffer::with_text("hello", None);
+        buf.move_to(0, 2);
+        buf.perform_action(EditorAction::SelectTo { line: 0, col: 3 });
+        assert!(buf.cursor().selection.is_some());
+        buf.perform_action(EditorAction::SelectTo { line: 0, col: 3 });
+        assert!(buf.cursor().selection.is_none());
+    }
+
+    #[test]
+    fn test_shift_right_then_back_collapses_selection() {
+        let buf = EditorBuffer::with_text("hello", None);
+        buf.move_to(0, 0);
+        buf.perform_action(EditorAction::SelectRight);
+        buf.perform_action(EditorAction::SelectLeft);
+        let cursor = buf.cursor();
+        assert_eq!(cursor.line, 0);
+        assert_eq!(cursor.column, 0);
+        assert!(cursor.selection.is_none());
     }
 
     // ── push_or_merge tests ────────────────────────────────────────────

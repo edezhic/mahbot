@@ -1565,6 +1565,18 @@ impl EditorState {
             .is_some()
     }
 
+    /// Returns `true` when a modal overlay or text input owns keyboard focus
+    /// and editor-wide shortcuts (undo, save, tab switch, etc.) must not run.
+    fn modal_overlay_blocks_editor_shortcuts(&self) -> bool {
+        self.quick_open.is_some()
+            || self.global_search.is_some()
+            || self.goto_line_input.is_some()
+            || self.new_item_input.is_some()
+            || self.close_dialog.is_some()
+            || self.close_others_target.is_some()
+            || self.delete_confirm.is_some()
+    }
+
     /// Save editor tabs to the database for the currently selected workspace.
     ///
     /// Returns a task that performs the async DB write, or [`None`] if:
@@ -2027,6 +2039,9 @@ impl EditorState {
             }
 
             EditorMessage::SaveActiveTab => {
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
+                }
                 let Some(idx) = self.active_tab_idx() else {
                     return Task::none();
                 };
@@ -2120,6 +2135,9 @@ impl EditorState {
 
             // ── Go-to-line ────────────────────────────────────────────
             EditorMessage::GoToLineToggle => {
+                if self.modal_overlay_blocks_editor_shortcuts() && self.goto_line_input.is_none() {
+                    return Task::none();
+                }
                 if self.active_tab_idx().is_some() {
                     if self.goto_line_input.is_some() {
                         self.goto_line_input = None;
@@ -2440,6 +2458,9 @@ impl EditorState {
 
             // ── Tab switching ─────────────────────────────────────────
             EditorMessage::TabSwitchNext => {
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
+                }
                 if self.tabs.len() > 1 {
                     let new_idx = (self.active_tab_index + 1) % self.tabs.len();
                     return self.switch_to_tab(new_idx);
@@ -2448,6 +2469,9 @@ impl EditorState {
             }
 
             EditorMessage::TabSwitchPrev => {
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
+                }
                 if self.tabs.len() > 1 {
                     let new_idx = if self.active_tab_index == 0 {
                         self.tabs.len() - 1
@@ -2460,6 +2484,9 @@ impl EditorState {
             }
 
             EditorMessage::CloseActiveTab => {
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
+                }
                 let idx = self.active_tab_index;
                 if idx < self.tabs.len() {
                     return self.close_tab_at(idx);
@@ -2713,7 +2740,7 @@ impl EditorState {
             }
 
             EditorMessage::Undo => {
-                if self.is_find_bar_open() {
+                if self.is_find_bar_open() || self.modal_overlay_blocks_editor_shortcuts() {
                     // Cmd+Z in the find bar's text input should undo within
                     // the text field, not undo the editor. Bail when find bar
                     // is open so the text_input handles Cmd+Z internally.
@@ -2723,7 +2750,7 @@ impl EditorState {
                 }
             }
             EditorMessage::Redo => {
-                if self.is_find_bar_open() {
+                if self.is_find_bar_open() || self.modal_overlay_blocks_editor_shortcuts() {
                     Task::none()
                 } else {
                     self.apply_undo_or_redo(true)
@@ -2731,6 +2758,9 @@ impl EditorState {
             }
 
             EditorMessage::FindToggle => {
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
+                }
                 let Some(idx) = self.active_tab_idx() else {
                     return Task::none();
                 };
@@ -2864,6 +2894,13 @@ impl EditorState {
                                         }
                                     } else {
                                         state.current_match_idx = 0;
+                                        // No remaining matches — place cursor at end
+                                        // of the replacement, not at buffer start.
+                                        if let Some((line, col)) =
+                                            byte_offset_to_cursor_pos(&tab_data.content, replace_end)
+                                        {
+                                            tab_data.content.move_to(line, col);
+                                        }
                                     }
                                 }
                             }
@@ -3804,6 +3841,7 @@ impl EditorState {
                         .undo_stack
                         .borrow_mut()
                         .snap_before_edit(&tab_data.content);
+                    let cursor_before = tab_data.content.cursor();
                     let text = tab_data.content.text();
                     let replace = &state.replace;
                     // Replace all in reverse order to preserve positions.
@@ -3812,6 +3850,9 @@ impl EditorState {
                         new_text.replace_range(range.start..range.end, replace);
                     }
                     tab_data.content = EditorBuffer::from_file(&new_text, &path);
+                    let max_line = tab_data.content.line_count().saturating_sub(1);
+                    let line = cursor_before.line.min(max_line);
+                    tab_data.content.move_to(line, cursor_before.column);
                     if let Some(tab) = self.tabs.get_mut(idx) {
                         let current_hash = hash_text(&new_text);
                         tab.is_dirty = current_hash != tab_data.saved_text_hash;
@@ -4981,8 +5022,8 @@ impl EditorState {
             .into();
         };
 
-        let path = self.tabs[idx].path.clone();
-        let Some(tab_data) = self.tab_contents.get(&path) else {
+        let path = &self.tabs[idx].path;
+        let Some(tab_data) = self.tab_contents.get(path) else {
             return container(
                 text("Error: tab content missing")
                     .size(EDITOR_FONT_SIZE)
@@ -5045,6 +5086,7 @@ impl EditorState {
 
         Self::build_highlighted_editor(
             content,
+            Some(path.as_str()),
             ignore_keyboard,
             block_editing,
             match_tuples,
@@ -5055,15 +5097,17 @@ impl EditorState {
     }
 
     /// Build an [`Element`] from an editor content reference.
-    fn build_highlighted_editor(
-        content: &super::editor_widget::EditorBuffer,
+    #[allow(clippy::too_many_arguments)]
+    fn build_highlighted_editor<'a>(
+        content: &'a super::editor_widget::EditorBuffer,
+        buffer_key: Option<&'a str>,
         ignore_keyboard: bool,
         block_editing: bool,
         matches: Vec<(usize, usize, usize)>,
         match_current_idx: usize,
         blink_gen: u64,
         bracket_pair: Option<super::editor_widget::BracketPair>,
-    ) -> Element<'_, EditorMessage> {
+    ) -> Element<'a, EditorMessage> {
         let editor = super::editor_widget::EditorWidget::new(content)
             .font_size(EDITOR_FONT_SIZE)
             .padding(8.0)
@@ -5071,7 +5115,8 @@ impl EditorState {
             .block_editing(block_editing)
             .matches(matches, match_current_idx)
             .blink_gen(blink_gen)
-            .bracket_pair(bracket_pair);
+            .bracket_pair(bracket_pair)
+            .buffer_key(buffer_key);
         let element = iced::Element::new(editor);
         let mapped = element.map(EditorMessage::EditorAction);
 
@@ -5523,7 +5568,7 @@ fn auto_jump_to_first_match(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::editor_widget::EditorBuffer;
+    use crate::gui::editor_widget::{EditorAction, EditorBuffer};
 
     #[test]
     fn test_has_trailing_newline() {
@@ -6731,5 +6776,94 @@ mod tests {
             state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
             "src/main.rs"
         );
+    }
+
+    // ── Focus gating and find/replace cursor tests ───────────────────
+
+    fn make_editor_with_single_tab(text: &str) -> EditorState {
+        let mut state = EditorState::new();
+        state.tabs.push(Tab {
+            path: "/test.rs".to_string(),
+            file_name: "test.rs".to_string(),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.active_tab_index = 0;
+        state.tab_contents.insert(
+            "/test.rs".to_string(),
+            TabData {
+                content: EditorBuffer::with_text(text, None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: None,
+                saved_text_hash: hash_text(text),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn test_undo_noop_when_quick_open_active() {
+        let mut state = make_editor_with_single_tab("hello");
+        let path = "/test.rs".to_string();
+        if let Some(tab_data) = state.tab_contents.get_mut(&path) {
+            tab_data
+                .undo_stack
+                .borrow_mut()
+                .snap_before_edit(&tab_data.content);
+            tab_data
+                .content
+                .perform_action(EditorAction::Insert('!'));
+        }
+        state.quick_open = Some(QuickOpenState {
+            filter: String::new(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+        let _ = state.update(EditorMessage::Undo);
+        assert_eq!(
+            state.tab_contents.get(&path).unwrap().content.text(),
+            "!hello"
+        );
+    }
+
+    #[test]
+    fn test_find_replace_cursor_after_last_match_removed() {
+        let mut state = make_editor_with_single_tab("ab");
+        let path = "/test.rs".to_string();
+        if let Some(tab_data) = state.tab_contents.get_mut(&path) {
+            tab_data.find_replace_state = Some(FindReplaceState {
+                query: "ab".to_string(),
+                replace: "xy".to_string(),
+                matches: vec![0..2],
+                current_match_idx: 0,
+                case_sensitive: true,
+            });
+        }
+        let _ = state.update(EditorMessage::FindReplace);
+        let cursor = state.tab_contents.get(&path).unwrap().content.cursor();
+        assert_eq!(cursor.line, 0);
+        assert_eq!(cursor.column, 2);
+        assert_eq!(state.tab_contents.get(&path).unwrap().content.text(), "xy");
+    }
+
+    #[test]
+    fn test_find_replace_all_preserves_cursor() {
+        let mut state = make_editor_with_single_tab("ab cd ab");
+        let path = "/test.rs".to_string();
+        if let Some(tab_data) = state.tab_contents.get_mut(&path) {
+            tab_data.content.move_to(0, 5);
+            tab_data.find_replace_state = Some(FindReplaceState {
+                query: "ab".to_string(),
+                replace: "xy".to_string(),
+                matches: vec![0..2, 6..8],
+                current_match_idx: 0,
+                case_sensitive: true,
+            });
+        }
+        let _ = state.update(EditorMessage::FindReplaceAll);
+        let cursor = state.tab_contents.get(&path).unwrap().content.cursor();
+        assert_eq!(cursor.line, 0);
+        assert_eq!(cursor.column, 5);
     }
 }
