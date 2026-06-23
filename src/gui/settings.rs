@@ -28,6 +28,145 @@ use super::users;
 use super::widgets;
 use super::workspaces;
 
+// ── Shared helpers ────────────────────────────────────────────────
+
+/// Parse a newline-separated model list into a vector of non-empty model names.
+///
+/// Delegates to [`crate::config::parse_newline_list`] — the shared implementation
+/// used by both the config typed accessors and the Settings GUI.
+fn parse_models(raw: Option<&str>) -> Vec<String> {
+    raw.map_or_else(Vec::new, crate::config::parse_newline_list)
+}
+
+/// Add a model from an input buffer to a model list, preventing duplicates.
+/// Clears the input buffer after the operation.
+fn add_model_to_list(input: &mut String, list: &mut Option<String>) {
+    let model = input.trim().to_string();
+    if !model.is_empty() {
+        let mut models = parse_models(list.as_deref());
+        if !models.contains(&model) {
+            models.push(model);
+            *list = Some(models.join("\n"));
+        }
+        input.clear();
+    }
+}
+
+/// Remove a model from a list. If the removed model was the active model,
+/// resets the active model to the first remaining entry (or clears it).
+fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut Option<String>) {
+    let mut models = parse_models(list.as_deref());
+    models.retain(|m| m != model);
+    *list = if models.is_empty() {
+        None
+    } else {
+        Some(models.join("\n"))
+    };
+    if active.as_deref() == Some(model) {
+        *active = models.first().cloned();
+    }
+}
+
+/// Render a model picker with a list of model entries, active indicator,
+/// remove buttons per entry, and an add-model row (text input + "Add" button).
+///
+/// If the models list is empty but an active model is set, the active model
+/// is shown as the sole entry so it remains visible.
+// All 8 parameters are required axis of variation for this shared widget:
+// 2 data fields (model list + active model), 1 state field (add input buffer),
+// 1 placeholder string, and 4 message constructors. Bundling into a struct
+// would add ceremony without reducing call-site complexity for 2 consumers.
+#[allow(clippy::too_many_arguments)]
+fn model_picker_list<'a>(
+    models_field: Option<&'a str>,
+    active_field: Option<&'a str>,
+    add_input: &'a str,
+    add_placeholder: &'static str,
+    on_add_input: impl Fn(String) -> SettingsMessage + 'a,
+    on_add: SettingsMessage,
+    on_remove: impl Fn(String) -> SettingsMessage + 'a,
+    on_set_active: impl Fn(String) -> SettingsMessage + 'a,
+) -> Element<'a, SettingsMessage> {
+    let mut models = parse_models(models_field);
+    let active = active_field;
+
+    // If the list is empty but an active model exists, show it as the sole entry.
+    if models.is_empty() {
+        if let Some(active_model) = active {
+            models.push(active_model.to_string());
+        }
+    }
+
+    let items: Vec<Element<'a, SettingsMessage>> = if models.is_empty() {
+        vec![
+            text("No models configured yet.")
+                .size(12)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+        ]
+    } else {
+        models
+            .iter()
+            .map(|model| {
+                let is_active = Some(model.as_str()) == active;
+                let indicator = if is_active {
+                    lucide::circle_check::<iced::Theme, iced::Renderer>()
+                        .size(12)
+                        .color(theme::BG_BASE)
+                } else {
+                    lucide::circle::<iced::Theme, iced::Renderer>()
+                        .size(12)
+                        .color(theme::TEXT_SECONDARY)
+                };
+                let mut model_btn = button(
+                    row![
+                        indicator,
+                        Space::new().width(4),
+                        text(model.clone()).size(12),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .padding(4);
+                if is_active {
+                    model_btn = model_btn.style(theme::button_primary);
+                } else {
+                    model_btn = model_btn.style(theme::button_secondary);
+                }
+                model_btn = model_btn.on_press(on_set_active(model.clone()));
+
+                let remove_btn = button(text("×").size(12))
+                    .padding(2)
+                    .style(theme::button_text_danger)
+                    .on_press(on_remove(model.clone()));
+
+                row![model_btn, Space::new().width(4), remove_btn]
+                    .align_y(Alignment::Center)
+                    .into()
+            })
+            .collect()
+    };
+
+    let add_row = row![
+        text_input(add_placeholder, add_input)
+            .on_input(on_add_input)
+            .style(super::widgets::text_input_style)
+            .width(Length::Fixed(300.0)),
+        Space::new().width(4),
+        button(text("Add").size(11))
+            .padding(4)
+            .style(theme::button_primary)
+            .on_press(on_add),
+    ]
+    .align_y(Alignment::Center);
+
+    column![
+        Column::from_iter(items).spacing(2),
+        Space::new().height(4),
+        add_row,
+    ]
+    .into()
+}
+
 // ── Messages ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -89,6 +228,24 @@ pub enum SettingsMessage {
     AddUserResult(Result<(), String>),
     /// Escape key pressed (dismisses modal if open).
     Escape,
+    // ── Image generation model picker ─────────────────────
+    /// Update the add-model text input for image generation.
+    ImageGenAddInput(String),
+    /// Add the model from the input buffer.
+    ImageGenAddModel,
+    /// Remove a model from the list.
+    ImageGenRemoveModel(String),
+    /// Set a model as the active image gen model.
+    ImageGenSetActive(String),
+    // ── Video generation model picker ─────────────────────
+    /// Update the add-model text input for video generation.
+    VideoGenAddInput(String),
+    /// Add the model from the input buffer.
+    VideoGenAddModel,
+    /// Remove a model from the list.
+    VideoGenRemoveModel(String),
+    /// Set a model as the active video gen model.
+    VideoGenSetActive(String),
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -128,6 +285,12 @@ pub struct SettingsState {
     add_user_permissions: String,
     /// Whether the add-user operation is in flight.
     add_user_adding: bool,
+
+    // ── Model picker state ────────────────────────────────
+    /// Text input buffer for adding new image generation models.
+    image_gen_add_input: String,
+    /// Text input buffer for adding new video generation models.
+    video_gen_add_input: String,
 }
 
 impl SettingsState {
@@ -149,6 +312,8 @@ impl SettingsState {
             add_user_sender: String::new(),
             add_user_permissions: String::new(),
             add_user_adding: false,
+            image_gen_add_input: String::new(),
+            video_gen_add_input: String::new(),
         }
     }
 
@@ -411,6 +576,55 @@ impl SettingsState {
                 Task::done(SettingsMessage::UserMsg(users::UsersMessage::Toast(
                     super::ToastMessage::Error(e),
                 )))
+            }
+
+            // ── Image generation model picker ─────────────────
+            SettingsMessage::ImageGenAddInput(v) => {
+                self.image_gen_add_input = v;
+                Task::none()
+            }
+            SettingsMessage::ImageGenAddModel => {
+                add_model_to_list(
+                    &mut self.image_gen_add_input,
+                    &mut self.config.image_gen_models,
+                );
+                Task::none()
+            }
+            SettingsMessage::ImageGenRemoveModel(model) => {
+                remove_model_from_list(
+                    &model,
+                    &mut self.config.image_gen_models,
+                    &mut self.config.image_gen_model,
+                );
+                Task::none()
+            }
+            SettingsMessage::ImageGenSetActive(model) => {
+                self.config.image_gen_model = Some(model);
+                Task::none()
+            }
+            // ── Video generation model picker ─────────────────
+            SettingsMessage::VideoGenAddInput(v) => {
+                self.video_gen_add_input = v;
+                Task::none()
+            }
+            SettingsMessage::VideoGenAddModel => {
+                add_model_to_list(
+                    &mut self.video_gen_add_input,
+                    &mut self.config.video_gen_models,
+                );
+                Task::none()
+            }
+            SettingsMessage::VideoGenRemoveModel(model) => {
+                remove_model_from_list(
+                    &model,
+                    &mut self.config.video_gen_models,
+                    &mut self.config.video_gen_model,
+                );
+                Task::none()
+            }
+            SettingsMessage::VideoGenSetActive(model) => {
+                self.config.video_gen_model = Some(model);
+                Task::none()
             }
 
             SettingsMessage::Escape => {
@@ -1558,69 +1772,42 @@ impl SettingsState {
         )
     }
 
+    // ── Model picker view helper ───────────────────────────────
+
     fn generation_section(&self) -> Element<'_, SettingsMessage> {
         section(
             "Generation",
             column![
-                field_row(
-                    "Image Gen Model (active)",
-                    text_input(
-                        "google/gemini-3.1-flash-image-preview",
-                        self.config.image_gen_model.as_deref().unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "image_gen_model",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
-                    .into(),
-                    None,
+                text("Image Generation")
+                    .size(13)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::ACCENT),
+                Space::new().height(2),
+                model_picker_list(
+                    self.config.image_gen_models.as_deref(),
+                    self.config.image_gen_model.as_deref(),
+                    &self.image_gen_add_input,
+                    "model name (e.g. google/gemini-...)",
+                    SettingsMessage::ImageGenAddInput,
+                    SettingsMessage::ImageGenAddModel,
+                    SettingsMessage::ImageGenRemoveModel,
+                    SettingsMessage::ImageGenSetActive,
                 ),
-                field_row(
-                    "Image Gen Models (one per line)",
-                    text_input(
-                        "one model per line",
-                        self.config.image_gen_models.as_deref().unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "image_gen_models",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(350.0))
-                    .into(),
-                    None,
-                ),
-                field_row(
-                    "Video Gen Model (active)",
-                    text_input(
-                        "google/veo-3.1-lite",
-                        self.config.video_gen_model.as_deref().unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "video_gen_model",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
-                    .into(),
-                    None,
-                ),
-                field_row(
-                    "Video Gen Models (one per line)",
-                    text_input(
-                        "one model per line",
-                        self.config.video_gen_models.as_deref().unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "video_gen_models",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(350.0))
-                    .into(),
-                    None,
+                Space::new().height(12),
+                text("Video Generation")
+                    .size(13)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::ACCENT),
+                Space::new().height(2),
+                model_picker_list(
+                    self.config.video_gen_models.as_deref(),
+                    self.config.video_gen_model.as_deref(),
+                    &self.video_gen_add_input,
+                    "model name (e.g. google/veo-...)",
+                    SettingsMessage::VideoGenAddInput,
+                    SettingsMessage::VideoGenAddModel,
+                    SettingsMessage::VideoGenRemoveModel,
+                    SettingsMessage::VideoGenSetActive,
                 ),
             ],
         )
@@ -1884,5 +2071,157 @@ fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
             color: theme::BORDER_STRONG,
         },
         ..container::Style::default()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_models ─────────────────────────────────────────
+
+    #[test]
+    fn parse_models_none_returns_empty() {
+        assert!(parse_models(None).is_empty());
+    }
+
+    #[test]
+    fn parse_models_empty_string_returns_empty() {
+        assert!(parse_models(Some("")).is_empty());
+    }
+
+    #[test]
+    fn parse_models_single_line() {
+        assert_eq!(
+            parse_models(Some("google/gemini-3.1-flash-image-preview")),
+            vec!["google/gemini-3.1-flash-image-preview"]
+        );
+    }
+
+    #[test]
+    fn parse_models_multiple_lines() {
+        assert_eq!(
+            parse_models(Some("model-a\nmodel-b\nmodel-c")),
+            vec!["model-a", "model-b", "model-c"]
+        );
+    }
+
+    #[test]
+    fn parse_models_trims_whitespace() {
+        assert_eq!(
+            parse_models(Some("  model-a  \n  model-b  ")),
+            vec!["model-a", "model-b"]
+        );
+    }
+
+    #[test]
+    fn parse_models_skips_empty_lines() {
+        assert_eq!(
+            parse_models(Some("model-a\n\n\nmodel-b")),
+            vec!["model-a", "model-b"]
+        );
+    }
+
+    #[test]
+    fn parse_models_skips_whitespace_only_lines() {
+        assert_eq!(
+            parse_models(Some("model-a\n   \nmodel-b")),
+            vec!["model-a", "model-b"]
+        );
+    }
+
+    // ── add_model_to_list ────────────────────────────────────
+
+    #[test]
+    fn add_model_to_list_empty_input_does_nothing() {
+        let mut input = String::new();
+        let mut list = None;
+        add_model_to_list(&mut input, &mut list);
+        assert!(list.is_none());
+    }
+
+    #[test]
+    fn add_model_to_list_whitespace_input_does_nothing() {
+        let mut input = "  ".to_string();
+        let mut list = None;
+        add_model_to_list(&mut input, &mut list);
+        assert!(list.is_none());
+    }
+
+    #[test]
+    fn add_model_to_list_adds_to_empty_list() {
+        let mut input = "model-a".to_string();
+        let mut list = None;
+        add_model_to_list(&mut input, &mut list);
+        assert_eq!(list, Some("model-a".to_string()));
+        assert!(input.is_empty(), "input buffer should be cleared");
+    }
+
+    #[test]
+    fn add_model_to_list_adds_to_existing_list() {
+        let mut input = "model-b".to_string();
+        let mut list = Some("model-a".to_string());
+        add_model_to_list(&mut input, &mut list);
+        assert_eq!(list, Some("model-a\nmodel-b".to_string()));
+    }
+
+    #[test]
+    fn add_model_to_list_skips_duplicates() {
+        let mut input = "model-a".to_string();
+        let mut list = Some("model-a\nmodel-b".to_string());
+        add_model_to_list(&mut input, &mut list);
+        // List unchanged
+        assert_eq!(list, Some("model-a\nmodel-b".to_string()));
+        // Input buffer still cleared
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn add_model_to_list_trims_input() {
+        let mut input = "  model-a  ".to_string();
+        let mut list = Some("model-b".to_string());
+        add_model_to_list(&mut input, &mut list);
+        assert_eq!(list, Some("model-b\nmodel-a".to_string()));
+    }
+
+    // ── remove_model_from_list ───────────────────────────────
+
+    #[test]
+    fn remove_model_from_list_removes_and_updates_active() {
+        let mut list = Some("model-a\nmodel-b\nmodel-c".to_string());
+        let mut active = Some("model-b".to_string());
+        remove_model_from_list("model-b", &mut list, &mut active);
+        assert_eq!(list, Some("model-a\nmodel-c".to_string()));
+        // Active resets to first remaining
+        assert_eq!(active, Some("model-a".to_string()));
+    }
+
+    #[test]
+    fn remove_model_from_list_non_active_keeps_active() {
+        let mut list = Some("model-a\nmodel-b\nmodel-c".to_string());
+        let mut active = Some("model-a".to_string());
+        remove_model_from_list("model-b", &mut list, &mut active);
+        assert_eq!(list, Some("model-a\nmodel-c".to_string()));
+        assert_eq!(active, Some("model-a".to_string()));
+    }
+
+    #[test]
+    fn remove_model_from_list_last_entry_clears_active() {
+        let mut list = Some("model-a".to_string());
+        let mut active = Some("model-a".to_string());
+        remove_model_from_list("model-a", &mut list, &mut active);
+        assert!(list.is_none());
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn remove_model_from_list_not_found_no_change() {
+        let mut list = Some("model-a\nmodel-b".to_string());
+        let mut active = Some("model-a".to_string());
+        remove_model_from_list("model-c", &mut list, &mut active);
+        assert_eq!(list, Some("model-a\nmodel-b".to_string()));
+        assert_eq!(active, Some("model-a".to_string()));
     }
 }

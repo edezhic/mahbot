@@ -309,6 +309,15 @@ pub(crate) fn trim_non_empty(s: &str) -> Option<String> {
     }
 }
 
+/// Parse a newline-separated string into a vector of non-empty, trimmed entries.
+#[must_use]
+pub(crate) fn parse_newline_list(s: &str) -> Vec<String> {
+    s.split('\n')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Treat an empty or whitespace-only string as `None`.
 /// The value is trimmed before being returned.
 /// Delegates to [`trim_non_empty`].
@@ -336,11 +345,7 @@ fn resolve_list_or(
     default_value: &str,
 ) -> Vec<String> {
     if let Some(raw) = list_field {
-        let parsed: Vec<String> = raw
-            .split('\n')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parsed = parse_newline_list(raw);
         if !parsed.is_empty() {
             return parsed;
         }
