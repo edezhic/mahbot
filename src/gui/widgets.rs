@@ -328,12 +328,81 @@ pub fn build_tree_panel<'a, Message: 'a>(
 
 // ── Tree node helpers ──────────────────────────────────────────────
 
-/// Calculate the horizontal indent for a tree node at the given depth.
-/// Each depth level adds 14 pixels of indentation.
+/// Build the guide-line prefix string for a tree node.
+///
+/// Returns box-drawing characters that visually connect tree siblings:
+///
+/// | Character | Meaning |
+/// |---|---|
+/// | `│` | Vertical continuation — the ancestor at this depth has more siblings below |
+/// | `├` | T-junction — this node has at least one more sibling after it |
+/// | `└` | Corner — this node is the last child of its parent |
+/// | ` `  | No continuation at this ancestor level |
+///
+/// Each depth level uses exactly two characters (guide char + one space), so
+/// the total visual width per level closely matches the existing 14 px indent.
+///
+/// `ancestor_mask` has bit `d` set iff the ancestor at depth `d` has more
+/// siblings after it (requiring a vertical continuation line at that column).
+/// `depth` is the current nesting depth (0 = root, which gets no prefix).
+/// `is_last` is true when this node is the last child of its parent.
+///
+/// # Panics
+///
+/// Panics in debug builds when `depth >= 64` (the u64 bitmask would overflow).
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
-pub const fn tree_indent(depth: usize) -> f32 {
-    (depth * 14) as f32
+pub fn tree_guide_prefix(ancestor_mask: u64, depth: usize, is_last: bool) -> String {
+    debug_assert!(
+        depth < 64,
+        "tree_guide_prefix: depth {depth} exceeds u64 bit limit (max 63)"
+    );
+    let mut s = String::new();
+    for d in 0..depth {
+        if ancestor_mask & (1u64 << d) != 0 {
+            s.push('│');
+        } else {
+            s.push(' ');
+        }
+        s.push(' ');
+    }
+    if depth > 0 {
+        if is_last {
+            s.push('└');
+        } else {
+            s.push('├');
+        }
+        s.push(' ');
+    }
+    s
+}
+
+/// Recursively render children of a tree node, computing the correct
+/// continuation mask and `is_last` state for each child.
+///
+/// `render_node` is called for each child with `(child, depth+1, child_mask, child_is_last)`.
+/// The returned elements share the lifetime `'a` of the tree nodes.
+/// Returns a `Vec` of child elements, one per child, in order.
+///
+/// This exists to avoid duplicating the child-iteration + mask-computation
+/// logic across the two render paths (editor and diff file trees).
+pub fn render_tree_children<'a, Message>(
+    children: &'a [TreeNode],
+    depth: usize,
+    ancestor_mask: u64,
+    is_last: bool,
+    render_node: impl Fn(&'a TreeNode, usize, u64, bool) -> Element<'a, Message>,
+) -> Vec<Element<'a, Message>> {
+    let child_count = children.len();
+    let cont_bit = if !is_last { 1u64 << depth } else { 0u64 };
+    let child_mask = ancestor_mask | cont_bit;
+    children
+        .iter()
+        .enumerate()
+        .map(|(i, child)| {
+            let child_is_last = i == child_count - 1;
+            render_node(child, depth + 1, child_mask, child_is_last)
+        })
+        .collect()
 }
 
 /// Check whether a tree node at the given path is currently focused
@@ -441,5 +510,111 @@ mod tests {
         assert_eq!(tree.tree_focus_index, 2);
         tree.focus_path("a");
         assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    // ── tree_guide_prefix tests ─────────────────────────────────────
+
+    /// Build the expected guide string from a literal. Makes it easier to
+    /// see the box-drawing characters in test output.
+    fn g(guide: &str) -> String {
+        guide.to_string()
+    }
+
+    #[test]
+    fn guide_prefix_depth_zero() {
+        // Root-level nodes have no guide lines regardless of mask or is_last.
+        assert_eq!(tree_guide_prefix(0, 0, false), g(""));
+        assert_eq!(tree_guide_prefix(0, 0, true), g(""));
+        assert_eq!(tree_guide_prefix(0b_1111, 0, false), g(""));
+    }
+
+    #[test]
+    fn guide_prefix_depth_one_not_last() {
+        // Depth 1, no ancestor continuation, non-last child.
+        // One ancestor level (blank) + ├ connector.
+        assert_eq!(tree_guide_prefix(0, 1, false), g("  ├ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_one_last() {
+        // Depth 1, no ancestor continuation, last child → └ connector.
+        assert_eq!(tree_guide_prefix(0, 1, true), g("  └ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_two_ancestor_continues_not_last() {
+        // Depth 1, ancestor at depth 0 has continuation (bit 0 = 1).
+        // Current node not last → │ ├
+        assert_eq!(tree_guide_prefix(0b_01, 1, false), g("│ ├ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_two_ancestor_continues_last() {
+        // Depth 1, ancestor continues, current node last → │ └
+        assert_eq!(tree_guide_prefix(0b_01, 1, true), g("│ └ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_three_mixed_ancestors() {
+        // Depth 2: ancestors depth 0 continues, depth 1 does NOT continue.
+        // mask = bit 0 set, bit 1 clear → "│   " for ancestors (2 levels).
+        // Current node at depth 2, not last → ├
+        assert_eq!(tree_guide_prefix(0b_01, 2, false), g("│   ├ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_three_all_ancestors_continue_not_last() {
+        // Both ancestors continue (mask bits 0 and 1 set).
+        // Current node not last → "│ │ ├ "
+        assert_eq!(tree_guide_prefix(0b_11, 2, false), g("│ │ ├ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_three_all_ancestors_continue_last() {
+        // Both ancestors continue, current node last → "│ │ └ "
+        assert_eq!(tree_guide_prefix(0b_11, 2, true), g("│ │ └ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_three_no_ancestor_continuation() {
+        // Depth 2: neither ancestor continues (mask bits 0 and 1 clear).
+        // Current node not last → "    ├ "
+        assert_eq!(tree_guide_prefix(0, 2, false), g("    ├ "));
+    }
+
+    #[test]
+    fn guide_prefix_depth_three_no_ancestor_continuation_last() {
+        // Depth 2: no ancestor continuation, last child → "    └ "
+        assert_eq!(tree_guide_prefix(0, 2, true), g("    └ "));
+    }
+
+    #[test]
+    fn guide_prefix_deep_tree() {
+        // Depth 5, ancestors at 0,1,3 continue; 2,4 do not.
+        // mask bits set: 0, 1, 3  →  binary 0b_1011
+        // Expected: "│ │   │   " (ancestors) + "├ " (connector, non-last)
+        //            d0 d1 d2  d3  d4
+        //            │  │  sp │  sp
+        assert_eq!(tree_guide_prefix(0b_1011, 5, false), g("│ │   │   ├ "));
+    }
+
+    #[test]
+    fn guide_prefix_deep_tree_last() {
+        // Same as above but last child → └ instead of ├
+        assert_eq!(tree_guide_prefix(0b_1011, 5, true), g("│ │   │   └ "));
+    }
+
+    #[test]
+    fn guide_prefix_mask_ignores_bits_above_depth() {
+        // Bits beyond depth should be ignored. depth=1 with high bits set.
+        assert_eq!(tree_guide_prefix(0b_1_0000_0000, 1, false), g("  ├ "));
+        assert_eq!(tree_guide_prefix(0b_1_0000_0000, 1, true), g("  └ "));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds u64 bit limit")]
+    fn guide_prefix_depth_overflow_debug() {
+        // debug_assert fires at depth >= 64 in debug builds.
+        let _ = tree_guide_prefix(0, 64, false);
     }
 }

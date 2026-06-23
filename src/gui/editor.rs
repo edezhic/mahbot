@@ -4048,7 +4048,8 @@ impl EditorState {
             .file_tree
             .nodes
             .iter()
-            .map(|n| self.render_tree_node(n, 0))
+            .enumerate()
+            .map(|(i, n)| self.render_tree_node(n, 0, 0, i == self.file_tree.nodes.len() - 1))
             .collect();
         let panel = widgets::build_tree_panel(&self.file_tree, elements);
 
@@ -4121,14 +4122,15 @@ impl EditorState {
         false
     }
 
-    /// Shared tree-node row helper.  Builds the indent + icon + name row,
+    /// Shared tree-node row helper.  Builds the guide-lines + icon + name row,
     /// wraps it in a `tree_node_button`, then wraps that in a `ContextMenu`
     /// with caller-specific items prepended before the common items
     /// (Copy Relative Path, Copy Absolute Path, Reveal in Finder).
     ///
     /// # Parameters
     ///
-    /// * `depth` — nesting depth for indent calculation.
+    /// * `guide` — pre-computed tree guide-line prefix string (empty for root-level
+    ///   nodes, otherwise contains box-drawing characters for hierarchy lines).
     /// * `icon` — pre-built icon element (size and colour already set).
     /// * `name` — pre-built name element (text content and style already set).
     /// * `highlight` — whether the row should show the highlight style.
@@ -4140,7 +4142,7 @@ impl EditorState {
     #[allow(clippy::too_many_arguments)]
     fn render_tree_node_row<'a>(
         &'a self,
-        depth: usize,
+        guide: String,
         icon: Element<'a, EditorMessage>,
         name: Element<'a, EditorMessage>,
         highlight: bool,
@@ -4148,10 +4150,11 @@ impl EditorState {
         extra_context_items: Vec<(String, EditorMessage)>,
         full_path: &str,
     ) -> Element<'a, EditorMessage> {
-        let indent = widgets::tree_indent(depth);
+        let guide_text: Element<'a, EditorMessage> =
+            text(guide).size(12).color(theme::TEXT_MUTED).into();
 
         let row = row![
-            Space::new().width(indent),
+            guide_text,
             icon,
             Space::new().width(4),
             name,
@@ -4186,11 +4189,13 @@ impl EditorState {
         &'a self,
         node: &'a widgets::TreeNode,
         depth: usize,
+        ancestor_mask: u64,
+        is_last: bool,
     ) -> Element<'a, EditorMessage> {
         if node.is_dir {
-            self.render_dir_node(node, depth)
+            self.render_dir_node(node, depth, ancestor_mask, is_last)
         } else {
-            self.render_file_node(node, depth)
+            self.render_file_node(node, depth, ancestor_mask, is_last)
         }
     }
 
@@ -4198,6 +4203,8 @@ impl EditorState {
         &'a self,
         node: &'a widgets::TreeNode,
         depth: usize,
+        ancestor_mask: u64,
+        is_last: bool,
     ) -> Element<'a, EditorMessage> {
         let is_expanded = self.file_tree.expanded_dirs.contains(&node.full_path);
         let is_loading = self.loading_dirs.contains(&node.full_path);
@@ -4249,8 +4256,9 @@ impl EditorState {
         let name_element: Element<'_, EditorMessage> =
             text(label_text).size(12).color(label_color).into();
 
+        let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
         let ctx_menu = self.render_tree_node_row(
-            depth,
+            guide,
             icon_element,
             name_element,
             is_focused,
@@ -4274,8 +4282,14 @@ impl EditorState {
 
         let mut col = column![ctx_menu].spacing(0);
         if is_expanded {
-            for child in &node.children {
-                col = col.push(self.render_tree_node(child, depth + 1));
+            for elem in widgets::render_tree_children(
+                &node.children,
+                depth,
+                ancestor_mask,
+                is_last,
+                |child, d, mask, last| self.render_tree_node(child, d, mask, last),
+            ) {
+                col = col.push(elem);
             }
         }
         col.into()
@@ -4285,8 +4299,12 @@ impl EditorState {
         &'a self,
         node: &'a widgets::TreeNode,
         depth: usize,
+        ancestor_mask: u64,
+        is_last: bool,
     ) -> Element<'a, EditorMessage> {
         let is_selected = self.selected_file.as_deref() == Some(&node.full_path);
+
+        let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
 
         let icon = lucide::file::<iced::Theme, iced::Renderer>();
         let is_ignored = self.is_path_ignored(&node.full_path);
@@ -4348,7 +4366,7 @@ impl EditorState {
         let icon_element: Element<'_, EditorMessage> = icon.size(12).color(icon_color).into();
 
         self.render_tree_node_row(
-            depth,
+            guide,
             icon_element,
             name_text,
             is_selected || is_focused,

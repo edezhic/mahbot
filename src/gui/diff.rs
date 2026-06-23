@@ -862,11 +862,12 @@ impl DiffState {
 
     /// Build the directory tree sidebar.
     fn build_tree_panel(&self) -> Element<'_, DiffMessage> {
-        let elements: Vec<Element<'_, DiffMessage>> = self
-            .file_tree
-            .nodes
+        let nodes = &self.file_tree.nodes;
+        let count = nodes.len();
+        let elements: Vec<Element<'_, DiffMessage>> = nodes
             .iter()
-            .map(|n| self.render_tree_node(n, 0))
+            .enumerate()
+            .map(|(i, n)| self.render_tree_node(n, 0, 0, i == count - 1))
             .collect();
         widgets::build_tree_panel(&self.file_tree, elements)
     }
@@ -876,11 +877,13 @@ impl DiffState {
         &'a self,
         node: &'a widgets::TreeNode,
         depth: usize,
+        ancestor_mask: u64,
+        is_last: bool,
     ) -> Element<'a, DiffMessage> {
         if node.is_dir {
-            self.render_dir_node(node, depth)
+            self.render_dir_node(node, depth, ancestor_mask, is_last)
         } else {
-            self.render_file_node(node, depth)
+            self.render_file_node(node, depth, ancestor_mask, is_last)
         }
     }
 
@@ -888,8 +891,9 @@ impl DiffState {
         &'a self,
         node: &'a widgets::TreeNode,
         depth: usize,
+        ancestor_mask: u64,
+        is_last: bool,
     ) -> Element<'a, DiffMessage> {
-        let indent = widgets::tree_indent(depth);
         let is_expanded = self.file_tree.expanded_dirs.contains(&node.full_path);
         let icon: iced::widget::Text<'static, iced::Theme, iced::Renderer> = if is_expanded {
             lucide::folder_open()
@@ -902,8 +906,12 @@ impl DiffState {
             theme::TEXT_MUTED
         };
 
+        let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
+        let guide_text: Element<'_, DiffMessage> =
+            text(guide).size(12).color(theme::TEXT_MUTED).into();
+
         let header_row = row![
-            Space::new().width(indent),
+            guide_text,
             icon.size(13).color(icon_color),
             Space::new().width(4),
             text(&node.name).size(12).color(theme::TEXT_SECONDARY),
@@ -937,8 +945,14 @@ impl DiffState {
 
         let mut col = column![header_element].spacing(0);
         if is_expanded {
-            for child in &node.children {
-                col = col.push(self.render_tree_node(child, depth + 1));
+            for elem in widgets::render_tree_children(
+                &node.children,
+                depth,
+                ancestor_mask,
+                is_last,
+                |child, d, mask, last| self.render_tree_node(child, d, mask, last),
+            ) {
+                col = col.push(elem);
             }
         }
         col.into()
@@ -948,13 +962,18 @@ impl DiffState {
         &'a self,
         node: &'a widgets::TreeNode,
         depth: usize,
+        ancestor_mask: u64,
+        is_last: bool,
     ) -> Element<'a, DiffMessage> {
-        let indent = widgets::tree_indent(depth);
         let file = self
             .diff_files
             .iter()
             .find(|f| f.dfile.path == node.full_path);
         let is_selected = self.selected_file.as_deref() == Some(&node.full_path);
+
+        let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
+        let guide_text: Element<'_, DiffMessage> =
+            text(guide).size(12).color(theme::TEXT_MUTED).into();
 
         // File status icon
         let (icon, icon_color) = if let Some(f) = file {
@@ -1021,7 +1040,7 @@ impl DiffState {
         };
 
         let btn_row = row![
-            Space::new().width(indent),
+            guide_text,
             icon.size(12).color(icon_color),
             Space::new().width(4),
             text(&node.name)
