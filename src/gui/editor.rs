@@ -280,7 +280,7 @@ enum GlobalSearchStatus {
 /// Owned representation of a single grep match, extracted from
 /// `fff_search::GrepResult` so it can cross async boundaries.
 #[derive(Debug, Clone)]
-pub(super) struct OwnedGrepMatch {
+pub struct OwnedGrepMatch {
     /// Absolute filesystem path to the matched file.
     abs_path: String,
     /// Relative path (for display).
@@ -533,7 +533,6 @@ pub enum EditorMessage {
     /// Query text changed in the global search input.
     GlobalSearchInput(String),
     /// Results returned from the async global search.
-    #[allow(private_interfaces)]
     GlobalSearchResults {
         /// Generation counter for stale-result prevention.
         r#gen: u64,
