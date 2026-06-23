@@ -34,7 +34,7 @@ use iced::{Color, Event, Length, Point, Rectangle, Size};
 use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 use crate::util::UnwrapPoison;
 
-use super::editor_widget::{
+use super::text_rendering::{
     GUTTER_FONT_SIZE, compute_total_height, font_metrics, gutter_clip_rect, iced_color_to_cosmic,
     push_or_merge, text_area_rect,
 };

@@ -11,8 +11,8 @@
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
 use super::diff_widget::{self, ADDED_COLOR, DiffBufferWidget, DiffFileBuffer, REMOVED_COLOR};
-use super::editor_widget::MAX_HIGHLIGHT_SIZE;
 use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
+use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 
 use crate::diff_parse::{
     CommitInfo, DiffFileStatus, DiffLineKind, git_has_commits, git_is_installed, is_git_repo,

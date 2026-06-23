@@ -28,6 +28,7 @@ pub mod logs;
 pub mod sessions;
 pub mod settings;
 pub mod shell;
+pub mod text_rendering;
 pub mod theme;
 pub mod tool_failures;
 pub mod users;
