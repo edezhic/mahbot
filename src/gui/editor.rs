@@ -4999,9 +4999,17 @@ impl EditorState {
         let content = &tab_data.content;
         let tree_focused = self.file_tree.tree_focused;
         let find_bar_open = tab_data.find_replace_state.is_some();
-        let block_editing =
-            find_bar_open || self.quick_open.is_some() || self.global_search.is_some();
-        let ignore_keyboard = tree_focused || block_editing;
+        // Modal overlays own keyboard input entirely — block all editor keys.
+        let modal_overlay_open = self.quick_open.is_some()
+            || self.global_search.is_some()
+            || self.goto_line_input.is_some()
+            || self.new_item_input.is_some()
+            || self.close_dialog.is_some()
+            || self.close_others_target.is_some()
+            || self.delete_confirm.is_some();
+        // Find/replace allows cursor navigation while its text inputs are focused.
+        let ignore_keyboard = tree_focused || modal_overlay_open || find_bar_open;
+        let block_editing = find_bar_open;
 
         // Compute match highlight tuples from find/replace state.
         // Each tuple is (line, byte_col_start, byte_col_end) for

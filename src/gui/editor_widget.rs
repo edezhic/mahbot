@@ -736,11 +736,10 @@ impl EditorBuffer {
             if offset >= text.len() {
                 return (text.to_string(), None);
             }
-            let next_boundary = if text.is_char_boundary(offset + 1) {
-                offset + 1
-            } else {
-                text.floor_char_boundary(offset + 1)
-            };
+            let next_boundary = text[offset..]
+                .chars()
+                .next()
+                .map_or(offset, |c| offset + c.len_utf8());
             let mut new_text = text.to_string();
             new_text.replace_range(offset..next_boundary, "");
             (new_text, None) // cursor stays the same
@@ -771,7 +770,7 @@ impl EditorBuffer {
     fn do_indent(&self) {
         if self.has_selection.get() {
             // Multi-line indent: prepend a tab to each line in the selection.
-            let (sl, _sc, el, _ec) = self.selection_range();
+            let (sl, sc, el, ec) = self.selection_range();
             let line_count = self.line_count();
             if sl >= line_count {
                 return;
@@ -785,11 +784,24 @@ impl EditorBuffer {
                     let offset = line_col_to_byte_offset(&new_text, line_idx, 0);
                     new_text.insert(offset, '\t');
                 }
-
-                // Cursor: move to start of the first indented line (column 0)
-                // and stretch the selection to cover the same lines.
-                (new_text, Some((sl, 0)))
+                (new_text, None)
             });
+
+            // Shift cursor and anchor columns right on indented lines (col 0
+            // stays at line start, which becomes the new tab).
+            let cl = self.cursor_line.get();
+            let cc = self.cursor_col.get();
+            if (sl..=el).contains(&cl) && cc > 0 {
+                self.cursor_col.set(cc + 1);
+            }
+            if self.has_selection.get() {
+                let anchor_line = self.sel_line.get();
+                let anchor_col = self.sel_col.get();
+                if (sl..=el).contains(&anchor_line) && anchor_col > 0 {
+                    self.sel_col.set(anchor_col + 1);
+                }
+            }
+            let _ = (sc, ec); // columns adjusted uniformly; range endpoints stay valid
         } else {
             let offset = line_col_to_byte_offset(
                 &self.text(),
@@ -811,13 +823,14 @@ impl EditorBuffer {
     /// line in the selection.
     fn do_unindent(&self) {
         if self.has_selection.get() {
-            let (sl, _sc, el, _ec) = self.selection_range();
+            let (sl, sc, el, ec) = self.selection_range();
             let line_count = self.line_count();
             if sl >= line_count {
                 return;
             }
             let el = el.min(line_count.saturating_sub(1));
 
+            let mut modified_lines: Vec<usize> = Vec::new();
             self.edit_text(|text| {
                 let mut new_text = text.to_string();
 
@@ -832,14 +845,30 @@ impl EditorBuffer {
                     if leading_count == 0 {
                         continue;
                     }
+                    modified_lines.push(line_idx);
                     let remove_count = 1.min(leading_count);
                     let remove_bytes = line_text[..remove_count].len();
                     let line_start = line_col_to_byte_offset(&new_text, line_idx, 0);
                     new_text.replace_range(line_start..line_start + remove_bytes, "");
                 }
 
-                (new_text, Some((sl, 0)))
+                (new_text, None)
             });
+
+            let adjust_col = |line: usize, col: usize| {
+                if modified_lines.contains(&line) && col > 0 {
+                    col - 1
+                } else {
+                    col
+                }
+            };
+            let cl = self.cursor_line.get();
+            self.cursor_col.set(adjust_col(cl, self.cursor_col.get()));
+            if self.has_selection.get() {
+                let anchor_line = self.sel_line.get();
+                self.sel_col.set(adjust_col(anchor_line, self.sel_col.get()));
+            }
+            let _ = (sc, ec);
         } else {
             let cl = self.cursor_line.get();
             let line_text = self
@@ -1907,6 +1936,23 @@ pub(crate) fn byte_offset_to_line_col(text: &str, offset: usize) -> (usize, usiz
     (line, col)
 }
 
+/// Convert a character-based column on a single line to a byte offset within
+/// that line's text. Used when passing indices to `cosmic_text::Cursor`.
+pub(crate) fn char_col_to_byte_offset_in_line(line_text: &str, char_col: usize) -> usize {
+    line_text.chars().take(char_col).map(char::len_utf8).sum()
+}
+
+/// Byte range `[start, end)` covering the single character at `char_col` on
+/// `line_text`, or an empty range at the line end if `char_col` is past EOF.
+pub(crate) fn char_col_to_byte_range_in_line(line_text: &str, char_col: usize) -> (usize, usize) {
+    let start = char_col_to_byte_offset_in_line(line_text, char_col);
+    let end = line_text[start..]
+        .chars()
+        .next()
+        .map_or(start, |c| start + c.len_utf8());
+    (start, end)
+}
+
 /// Classify a character for word boundary detection.
 /// Returns `true` if the character is alphanumeric or underscore.
 fn is_word_char(c: char) -> bool {
@@ -2163,9 +2209,10 @@ struct EditorWidgetState {
     last_click_time: Option<std::time::Instant>,
     /// (line, col) of the last mouse click, used for double-click proximity check.
     last_click_pos: Option<(usize, usize)>,
-    /// Whether an IME Commit event was just handled. Used to suppress the
+    /// Text from the most recent IME Commit, if any. Used to suppress the
     /// duplicate `KeyPressed.text` that follows on some platforms (Linux/IBus).
-    ime_commit_pending: bool,
+    /// Cleared after suppression or when a non-matching key event arrives.
+    ime_commit_suppress: Option<String>,
 }
 
 impl Default for EditorWidgetState {
@@ -2180,7 +2227,7 @@ impl Default for EditorWidgetState {
             auto_scroll_enabled: true,
             last_click_time: None,
             last_click_pos: None,
-            ime_commit_pending: false,
+            ime_commit_suppress: None,
         }
     }
 }
@@ -2564,6 +2611,11 @@ where
         if let Some(((open_line, open_col), (close_line, close_col))) = self.bracket_pair {
             let bracket_color = theme::BRACKET_MATCH;
             for &(b_line, b_col) in &[(open_line, open_col), (close_line, close_col)] {
+                let line_text = buffer_for_draw
+                    .lines
+                    .get(b_line)
+                    .map_or("", |l| l.text());
+                let (byte_start, byte_end) = char_col_to_byte_range_in_line(line_text, b_col);
                 for run in buffer_for_draw.layout_runs() {
                     if run.line_i != b_line {
                         continue;
@@ -2572,12 +2624,12 @@ where
                     if let Some(hl) = run.highlight(
                         cosmic_text::Cursor {
                             line: b_line,
-                            index: b_col,
+                            index: byte_start,
                             ..cosmic_text::Cursor::default()
                         },
                         cosmic_text::Cursor {
                             line: b_line,
-                            index: b_col + 1,
+                            index: byte_end,
                             ..cosmic_text::Cursor::default()
                         },
                     ) {
@@ -2616,16 +2668,25 @@ where
                 (end, start)
             };
 
+            let sel_start_byte = buffer_for_draw
+                .lines
+                .get(sel_start.0)
+                .map_or(0, |l| char_col_to_byte_offset_in_line(l.text(), sel_start.1));
+            let sel_end_byte = buffer_for_draw
+                .lines
+                .get(sel_end.0)
+                .map_or(0, |l| char_col_to_byte_offset_in_line(l.text(), sel_end.1));
+
             for run in buffer_for_draw.layout_runs() {
                 if let Some(highlight) = run.highlight(
                     cosmic_text::Cursor {
                         line: sel_start.0,
-                        index: sel_start.1,
+                        index: sel_start_byte,
                         ..cosmic_text::Cursor::default()
                     },
                     cosmic_text::Cursor {
                         line: sel_end.0,
-                        index: sel_end.1,
+                        index: sel_end_byte,
                         ..cosmic_text::Cursor::default()
                     },
                 ) {
@@ -3200,10 +3261,12 @@ where
                 if !is_platform_mod {
                     if let Some(committed) = text {
                         if !committed.is_empty() {
-                            if state.ime_commit_pending {
-                                // IME Commit already inserted this text.
-                                state.ime_commit_pending = false;
-                                return;
+                            if let Some(ref suppress) = state.ime_commit_suppress {
+                                if committed.as_ref() == suppress {
+                                    state.ime_commit_suppress = None;
+                                    return;
+                                }
+                                state.ime_commit_suppress = None;
                             }
                             let committed: &str = committed.as_ref();
                             if committed.chars().count() == 1 {
@@ -3266,7 +3329,7 @@ where
                         if committed.is_empty() {
                             return;
                         }
-                        state.ime_commit_pending = true;
+                        state.ime_commit_suppress = Some(committed.clone());
                         if committed.chars().count() == 1 {
                             let c = committed.chars().next().unwrap();
                             if !c.is_control() {
@@ -3709,6 +3772,82 @@ mod tests {
         buf.move_to(0, 5);
         buf.perform_action(EditorAction::Delete);
         assert_eq!(buf.text(), "hello");
+    }
+
+    #[test]
+    fn test_delete_multibyte_accent() {
+        let buf = EditorBuffer::with_text("café", None);
+        buf.move_to(0, 3); // before 'é'
+        buf.perform_action(EditorAction::Delete);
+        assert_eq!(buf.text(), "caf");
+    }
+
+    #[test]
+    fn test_delete_multibyte_cyrillic() {
+        let buf = EditorBuffer::with_text("привет", None);
+        buf.move_to(0, 0);
+        buf.perform_action(EditorAction::Delete);
+        assert_eq!(buf.text(), "ривет");
+    }
+
+    #[test]
+    fn test_delete_emoji_scalar() {
+        // Editor tracks scalar-value columns, not full grapheme clusters.
+        let buf = EditorBuffer::with_text("a🎉b", None);
+        buf.move_to(0, 1);
+        buf.perform_action(EditorAction::Delete);
+        assert_eq!(buf.text(), "ab");
+    }
+
+    #[test]
+    fn test_char_col_to_byte_offset_multibyte() {
+        let line = "héllo";
+        assert_eq!(char_col_to_byte_offset_in_line(line, 0), 0);
+        assert_eq!(char_col_to_byte_offset_in_line(line, 1), 1);
+        assert_eq!(char_col_to_byte_offset_in_line(line, 2), 3);
+        assert_eq!(char_col_to_byte_range_in_line(line, 1), (1, 3));
+    }
+
+    #[test]
+    fn test_multiline_indent_preserves_selection() {
+        let buf = EditorBuffer::with_text("- item one\n- item two\n- item three", None);
+        buf.move_to(0, 0);
+        buf.perform_action(EditorAction::SelectTo { line: 1, col: 100 });
+        assert!(buf.cursor().selection.is_some());
+
+        buf.perform_action(EditorAction::Indent);
+        assert_eq!(
+            buf.text(),
+            "\t- item one\n\t- item two\n- item three"
+        );
+        assert!(
+            buf.cursor().selection.is_some(),
+            "selection should survive first indent"
+        );
+        assert_eq!(
+            buf.selection(),
+            Some("\t- item one\n\t- item two".to_string())
+        );
+
+        buf.perform_action(EditorAction::Indent);
+        assert_eq!(
+            buf.text(),
+            "\t\t- item one\n\t\t- item two\n- item three"
+        );
+        assert!(
+            buf.cursor().selection.is_some(),
+            "selection should survive second indent"
+        );
+
+        buf.perform_action(EditorAction::Unindent);
+        assert_eq!(
+            buf.text(),
+            "\t- item one\n\t- item two\n- item three"
+        );
+        assert!(
+            buf.cursor().selection.is_some(),
+            "selection should survive unindent"
+        );
     }
 
     #[test]

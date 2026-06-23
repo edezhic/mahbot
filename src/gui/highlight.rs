@@ -1028,6 +1028,31 @@ mod tests {
         );
     }
 
+    fn line_has_class_in_range(
+        fh: &FileHighlights,
+        line: usize,
+        class: HighlightClass,
+        lo: usize,
+        hi: usize,
+        label: &str,
+    ) {
+        let spans = fh
+            .spans
+            .get(line)
+            .unwrap_or_else(|| panic!("expected line {line} to exist"));
+        let found = spans
+            .iter()
+            .any(|s| s.highlight_class == class && s.start < hi && s.end > lo);
+        assert!(
+            found,
+            "expected {label} ({class:?}) in [{lo},{hi}) on line {line}; spans: {:?}",
+            spans
+                .iter()
+                .map(|s| format!("({},{},{:?})", s.start, s.end, s.highlight_class))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_markdown_italic_star() {
         let code = "*italic*";
@@ -1143,6 +1168,59 @@ mod tests {
         assert!(has_type, "heading should have Type");
         // Since text.title subsumes text.strong, we won't see Keyword independently
         // on the heading line — but the important thing is that nothing regresses.
+    }
+
+    #[test]
+    fn test_markdown_inline_after_blank_line() {
+        let code = "First paragraph.\n\n*emphasis after blank*\n";
+        let fh = parse_markdown_highlights(code);
+        assert!(
+            fh.spans.len() >= 3,
+            "expected paragraph, blank, and emphasis lines; got {}",
+            fh.spans.len()
+        );
+        // Line 2: "*emphasis after blank*"
+        line_has_class_in_range(
+            &fh,
+            2,
+            HighlightClass::Function,
+            1,
+            22,
+            "emphasis content",
+        );
+        line_has_class_in_range(&fh, 2, HighlightClass::Operator, 0, 1, "opening *");
+    }
+
+    #[test]
+    fn test_markdown_inline_in_list_items() {
+        let code = "- **bold item**\n- *italic item*\n";
+        let fh = parse_markdown_highlights(code);
+        assert!(fh.spans.len() >= 2, "expected two list lines");
+        line_has_class_in_range(
+            &fh,
+            0,
+            HighlightClass::Keyword,
+            4,
+            13,
+            "bold list content",
+        );
+        line_has_class_in_range(
+            &fh,
+            1,
+            HighlightClass::Function,
+            4,
+            15,
+            "italic list content",
+        );
+    }
+
+    #[test]
+    fn test_markdown_inline_after_second_paragraph() {
+        let code = "Paragraph one.\n\nParagraph two with `code`.\n";
+        let fh = parse_markdown_highlights(code);
+        assert!(fh.spans.len() >= 3);
+        // Line 2 contains inline code in the second paragraph.
+        line_has_class_in_range(&fh, 2, HighlightClass::String, 20, 24, "inline code");
     }
 
     // ── Direct distribute_byte_spans tests ──────────────────────────
