@@ -3576,40 +3576,28 @@ with a comment explaining why no agent is mid-execution in that state.\
     // ── parse_prereqs unit tests ──
 
     #[test]
-    fn parse_prereqs_valid() {
-        let cases: &[(&str, &[&str])] = &[
+    fn test_parse_prereqs() {
+        // ── Valid JSON cases ──
+        let valid: &[(&str, &[&str])] = &[
             ("[]", &[] as &[&str]),
             (r#"["a","b","c"]"#, &["a", "b", "c"]),
         ];
-        for (input, expected) in cases {
-            assert_eq!(
-                parse_prereqs(input).expect("should parse valid JSON"),
-                *expected,
-                "input: {input:?}"
-            );
+        for (input, expected) in valid {
+            let got = parse_prereqs(input).expect("should parse valid JSON");
+            assert_eq!(got, *expected, "input: {input:?}");
         }
-    }
 
-    #[test]
-    fn parse_prereqs_invalid() {
-        let cases: &[(&str, &str)] = &[
-            ("", "empty string"),
-            ("not valid json {{{", "non-JSON garbage"),
-            (r#"{"key":"value"}"#, "valid JSON but not an array"),
-            ("[1, 2, 3]", "array of non-strings"),
-        ];
-        for (input, desc) in cases {
+        // ── Invalid / corrupt JSON cases ──
+        let invalid: &[&str] = &["", "not valid json {{{", r#"{"key":"value"}"#, "[1, 2, 3]"];
+        for input in invalid {
             let err = parse_prereqs(input).unwrap_err();
             assert!(
                 err.to_string().contains("Corrupt prerequisites JSON"),
-                "{desc}: expected 'Corrupt prerequisites JSON' error, got: {err}",
+                "input {input:?}: expected 'Corrupt prerequisites JSON' error, got: {err}",
             );
         }
-    }
 
-    #[test]
-    fn parse_prereqs_long_input_truncation() {
-        // Long input (>200 chars) — preview should be truncated with ellipsis
+        // ── Long ASCII input (>200 bytes) — preview truncated with ellipsis ──
         let long = format!(r#""{}...""#, "x".repeat(500));
         let msg = parse_prereqs(&long).unwrap_err().to_string();
         assert!(
@@ -3622,7 +3610,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             msg.len()
         );
 
-        // Multi-byte characters straddling byte 200 — no panic on truncation.
+        // ── Multi-byte character straddling byte 200 — no panic on truncation ──
         // Without floor_char_boundary, `&raw[..200]` would panic on the mid-char slice.
         let raw = format!("{}éééééééééémore", "x".repeat(199));
         assert!(raw.len() > 200, "need raw longer than 200 chars");
