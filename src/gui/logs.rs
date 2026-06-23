@@ -1,4 +1,5 @@
-//! Logs dashboard page — live log viewing with streaming, filters, pagination.
+//! Logs dashboard page — live log viewing with streaming, filters, pagination,
+//! plus a Tool Failures tab for browsing tool error entries.
 
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
@@ -17,6 +18,13 @@ use iced_fonts::lucide;
 use super::theme;
 use super::widgets;
 use super::widgets::selectable_text;
+
+/// Tabs within the Logs page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogsTab {
+    Logs,
+    ToolFailures,
+}
 
 fn log_stream_producer() -> impl futures_util::Stream<Item = LogMessage> {
     iced::stream::channel(
@@ -70,6 +78,9 @@ pub enum LogMessage {
     TargetInput(String),
     SearchInput(String),
 
+    // Tab switching
+    TabSelected(LogsTab),
+
     // Debounced refresh after text input (~300ms)
     DebouncedRefresh(u64),
 
@@ -91,6 +102,9 @@ pub enum LogMessage {
 
     /// Cmd+F keyboard shortcut — highlight the search input.
     FocusSearch,
+
+    /// Bridged Tool Failures sub-messages.
+    ToolFailures(super::tool_failures::ToolFailuresMessage),
 }
 
 pub struct LogsState {
@@ -116,6 +130,10 @@ pub struct LogsState {
     // Pagination
     page: usize,
     page_size: usize,
+
+    // Tab state
+    active_tab: LogsTab,
+    tool_failures_state: super::tool_failures::ToolFailuresState,
 
     // Stream control
     paused: bool,
@@ -159,6 +177,8 @@ impl LogsState {
             workspace_options: Vec::new(),
             page: 0,
             page_size: 50,
+            active_tab: LogsTab::Logs,
+            tool_failures_state: super::tool_failures::ToolFailuresState::new(),
             paused: false,
             focus_search: false,
             newest_entry_timestamp: None,
@@ -247,7 +267,7 @@ impl LogsState {
     }
 
     pub fn subscription(&self) -> Subscription<LogMessage> {
-        let stream_sub = if self.paused {
+        let stream_sub = if self.paused || self.active_tab != LogsTab::Logs {
             Subscription::none()
         } else {
             iced::Subscription::run(log_stream_producer)
@@ -423,18 +443,107 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::Escape => {
-                self.focus_search = false;
-                Task::none()
+                if self.active_tab == LogsTab::ToolFailures {
+                    self.tool_failures_state
+                        .update(super::tool_failures::ToolFailuresMessage::Escape)
+                        .map(LogMessage::ToolFailures)
+                } else {
+                    self.focus_search = false;
+                    Task::none()
+                }
             }
             LogMessage::Toast(_) => Task::none(),
             LogMessage::FocusSearch => {
-                self.focus_search = true;
-                Task::none()
+                if self.active_tab == LogsTab::ToolFailures {
+                    self.tool_failures_state
+                        .update(super::tool_failures::ToolFailuresMessage::FocusSearch)
+                        .map(LogMessage::ToolFailures)
+                } else {
+                    self.focus_search = true;
+                    Task::none()
+                }
             }
+            LogMessage::TabSelected(tab) => {
+                self.active_tab = tab;
+                if tab == LogsTab::ToolFailures {
+                    // Refresh the tool failures data when switching to that tab,
+                    // mirroring the previous Page::ToolFailures refresh behavior
+                    self.tool_failures_state
+                        .refresh()
+                        .map(LogMessage::ToolFailures)
+                } else {
+                    // Refresh logs when switching back
+                    self.refresh(log_store)
+                }
+            }
+            LogMessage::ToolFailures(msg) => self
+                .tool_failures_state
+                .update(msg)
+                .map(LogMessage::ToolFailures),
+        }
+    }
+
+    /// Build a tab button element. Returns a highlighted container when the
+    /// tab is active, or a plain container when inactive.
+    fn tab_button(label: &str, tab: LogsTab, active_tab: LogsTab) -> Element<'_, LogMessage> {
+        let is_active = tab == active_tab;
+        let color = if is_active {
+            theme::ACCENT
+        } else {
+            theme::TEXT_MUTED
+        };
+        let b = button(container(text(label.to_string()).size(13).color(color)).padding([6, 14]))
+            .style(theme::button_text)
+            .on_press(LogMessage::TabSelected(tab));
+        if is_active {
+            container(b)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+                    ..container::Style::default()
+                })
+                .into()
+        } else {
+            container(b).into()
         }
     }
 
     pub fn view(&self) -> Element<'_, LogMessage> {
+        // ── Tab bar ───────────────────────────────────────────────
+        let logs_btn = Self::tab_button("Logs", LogsTab::Logs, self.active_tab);
+        let tf_btn = Self::tab_button("Tool Failures", LogsTab::ToolFailures, self.active_tab);
+
+        let tab_bar = container(row![logs_btn, tf_btn].spacing(2).align_y(Alignment::Center))
+            .width(Length::Fill)
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_SURFACE)),
+                ..container::Style::default()
+            });
+
+        // ── Tab content ────────────────────────────────────────────
+        let body: Element<'_, LogMessage> = match self.active_tab {
+            LogsTab::ToolFailures => self
+                .tool_failures_state
+                .view()
+                .map(LogMessage::ToolFailures),
+            LogsTab::Logs => self.logs_view(),
+        };
+
+        let content = column![tab_bar, body]
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG_BASE)),
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// Render the Logs tab content (filter bar + entries + pagination).
+    fn logs_view(&self) -> Element<'_, LogMessage> {
         let mut content = Column::new();
 
         // Error display
