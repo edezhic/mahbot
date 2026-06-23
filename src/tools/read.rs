@@ -450,27 +450,19 @@ impl ReadTool {
         names.dedup();
 
         let wanted_lc = wanted.to_ascii_lowercase();
-        let mut ranked: Vec<String> = Vec::new();
-        for name in &names {
-            if name.to_ascii_lowercase() == wanted_lc {
-                ranked.push(name.clone());
-            }
-        }
-        for name in &names {
+        names.sort_by_cached_key(|name| {
             let name_lc = name.to_ascii_lowercase();
-            if name_lc != wanted_lc
-                && (name_lc.starts_with(&wanted_lc) || wanted_lc.starts_with(&name_lc))
-            {
-                ranked.push(name.clone());
-            }
-        }
-        for name in names {
-            if !ranked.contains(&name) {
-                ranked.push(name);
-            }
-        }
-        ranked.truncate(8);
-        ranked
+            let tier = if name_lc == wanted_lc {
+                0 // exact match
+            } else if name_lc.starts_with(&wanted_lc) || wanted_lc.starts_with(&name_lc) {
+                1 // prefix-related
+            } else {
+                2 // everything else
+            };
+            (tier, name_lc)
+        });
+        names.truncate(8);
+        names
     }
 }
 
