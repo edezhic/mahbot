@@ -130,19 +130,31 @@ pub enum HighlightClass {
 
 impl HighlightClass {
     /// Map to a theme color.
+    ///
+    /// Uses a neutral/muted palette inspired by the ayu dark theme (Zed editor).
+    /// All values are opaque — no alpha blending is applied here.
     #[must_use]
     pub const fn color(self) -> Color {
         match self {
-            HighlightClass::Keyword => Color::from_rgb(0.941, 0.439, 0.110),
-            HighlightClass::String => Color::from_rgb(0.298, 0.722, 0.114),
-            HighlightClass::Type => Color::from_rgb(0.231, 0.510, 0.965),
-            HighlightClass::Function => Color::from_rgb(0.925, 0.282, 0.600),
-            HighlightClass::Comment => Color::from_rgb(0.420, 0.420, 0.420),
-            HighlightClass::Number => Color::from_rgb(0.957, 0.247, 0.369),
-            HighlightClass::Operator => Color::from_rgb(0.357, 0.749, 0.710),
+            // Ayu dark keyword: #D580FF (purple)
+            HighlightClass::Keyword => Color::from_rgb(0.835, 0.502, 1.0),
+            // Ayu dark string: #C2D94C (olive green)
+            HighlightClass::String => Color::from_rgb(0.761, 0.851, 0.298),
+            // Ayu dark type: #59C2FF (sky blue)
+            HighlightClass::Type => Color::from_rgb(0.349, 0.761, 1.0),
+            // Ayu dark function: #FFB454 (warm orange)
+            HighlightClass::Function => Color::from_rgb(1.0, 0.706, 0.329),
+            // Ayu dark comment: #5A6673 (muted blue-gray)
+            HighlightClass::Comment => Color::from_rgb(0.353, 0.400, 0.451),
+            // Ayu dark number: #5CCFFF (light cyan)
+            HighlightClass::Number => Color::from_rgb(0.361, 0.812, 1.0),
+            // Ayu dark operator: #F29668 (peach)
+            HighlightClass::Operator => Color::from_rgb(0.949, 0.588, 0.408),
+            // Default text — matches the dashboard's primary text color
             HighlightClass::Text => theme::TEXT_PRIMARY,
-            HighlightClass::Search => Color::from_rgb(1.0, 0.667, 0.0), // amber
-            HighlightClass::SearchCurrent => Color::from_rgb(1.0, 0.8, 0.2), // brighter amber
+            // Search/find highlights — kept as amber (editor navigation, not syntax)
+            HighlightClass::Search => Color::from_rgb(1.0, 0.667, 0.0),
+            HighlightClass::SearchCurrent => Color::from_rgb(1.0, 0.8, 0.2),
         }
     }
 }

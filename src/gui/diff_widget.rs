@@ -42,8 +42,8 @@ use super::theme;
 
 // ── Constants ───────────────────────────────────────────────────────
 
-/// Hunk header text color.
-pub(crate) const HUNK_HEADER_COLOR: Color = Color::from_rgb(0.231, 0.510, 0.965);
+/// Hunk header text color — ayu dark sky blue (matches HighlightClass::Type).
+pub(crate) const HUNK_HEADER_COLOR: Color = Color::from_rgb(0.349, 0.761, 1.0);
 
 /// Added line foreground color.
 pub(crate) const ADDED_COLOR: Color = theme::STATUS_SUCCESS;
