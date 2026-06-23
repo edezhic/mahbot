@@ -185,9 +185,10 @@ impl DiffState {
         if self.selected_workspace_name.is_some() || self.personal_workspace_path.is_some() {
             subs.push(iced::time::every(Duration::from_secs(5)).map(|_| DiffMessage::Tick));
         }
-        // Keyboard: Ctrl+B toggles tree focus; arrow/Enter only when tree focused.
-        let tree_focused = self.file_tree.tree_focused;
-        subs.push(keyboard::listen().filter_map(move |event| {
+        // Keyboard: Ctrl+B toggles tree focus; arrow/Enter messages are ignored
+        // by update handlers unless the tree is currently focused. This closure
+        // must stay non-capturing because iced validates that in release builds.
+        subs.push(keyboard::listen().filter_map(|event| {
             use keyboard::{Event, Key};
             let Event::KeyPressed {
                 key,
@@ -207,9 +208,6 @@ impl DiffState {
             let altgr_active = false;
             if !altgr_active && is_cmd && key.to_latin(physical_key) == Some('b') {
                 return Some(DiffMessage::TreeFocusToggled);
-            }
-            if !tree_focused {
-                return None;
             }
             match &key {
                 Key::Named(named) => match named {
@@ -671,10 +669,9 @@ impl DiffState {
                     .parent()
                     .map(|p| p.to_string_lossy().to_string());
                 match parent {
-                    Some(ref p) if !p.is_empty()
-                        && self.file_tree.focus_path(p).is_some() => {
-                            return widgets::scroll_to_tree_focus(&self.file_tree);
-                        }
+                    Some(ref p) if !p.is_empty() && self.file_tree.focus_path(p).is_some() => {
+                        return widgets::scroll_to_tree_focus(&self.file_tree);
+                    }
                     _ => {} // Root-level item has no parent — no-op.
                 }
                 Task::none()
@@ -2016,10 +2013,7 @@ mod tests {
     fn make_diff_loaded(files: Vec<DiffFile>) -> DiffState {
         let mut state = DiffState::new();
         state.tree_auto_expand_pending = true;
-        let _ = state.update(DiffMessage::DiffLoaded(
-            state.generation,
-            Ok(files),
-        ));
+        let _ = state.update(DiffMessage::DiffLoaded(state.generation, Ok(files)));
         state
     }
 

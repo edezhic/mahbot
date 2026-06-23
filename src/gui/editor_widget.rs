@@ -884,7 +884,8 @@ impl EditorBuffer {
             self.cursor_col.set(adjust_col(cl, self.cursor_col.get()));
             if self.has_selection.get() {
                 let anchor_line = self.sel_line.get();
-                self.sel_col.set(adjust_col(anchor_line, self.sel_col.get()));
+                self.sel_col
+                    .set(adjust_col(anchor_line, self.sel_col.get()));
             }
             let _ = (sc, ec);
         } else {
@@ -1221,10 +1222,7 @@ impl EditorBuffer {
 
             let (new_body, toggled_col) = if let Some(stripped) = trimmed.strip_prefix(prefix) {
                 let after_comment = stripped.strip_prefix(' ').unwrap_or(stripped);
-                (
-                    format!("{leading_ws}{after_comment}"),
-                    Some(leading_ws_len),
-                )
+                (format!("{leading_ws}{after_comment}"), Some(leading_ws_len))
             } else {
                 (
                     format!("{leading_ws}{prefix} {trimmed}"),
@@ -1499,7 +1497,8 @@ impl EditorBuffer {
                 let below = lines.remove(swap_line);
                 let block: Vec<_> = lines.drain(start_line..=end_line).collect();
                 lines.splice(start_line..start_line, std::iter::once(below));
-                lines.splice(end_line + 1..end_line + 1, block);
+                let block_insert_at = start_line + 1;
+                lines.splice(block_insert_at..block_insert_at, block);
             }
             fix_line_endings(&mut lines, had_trailing, default_ending);
             (reassemble_lines(&lines), Some((start_line + 1, 0)))
@@ -1911,11 +1910,7 @@ fn reassemble_lines(lines: &[(String, String)]) -> String {
 }
 
 fn detect_default_line_ending(text: &str) -> &'static str {
-    if text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
 fn had_trailing_newline_text(text: &str) -> bool {
@@ -2661,10 +2656,7 @@ where
         if let Some(((open_line, open_col), (close_line, close_col))) = self.bracket_pair {
             let bracket_color = theme::BRACKET_MATCH;
             for &(b_line, b_col) in &[(open_line, open_col), (close_line, close_col)] {
-                let line_text = buffer_for_draw
-                    .lines
-                    .get(b_line)
-                    .map_or("", |l| l.text());
+                let line_text = buffer_for_draw.lines.get(b_line).map_or("", |l| l.text());
                 let (byte_start, byte_end) = char_col_to_byte_range_in_line(line_text, b_col);
                 for run in buffer_for_draw.layout_runs() {
                     if run.line_i != b_line {
@@ -2718,10 +2710,9 @@ where
                 (end, start)
             };
 
-            let sel_start_byte = buffer_for_draw
-                .lines
-                .get(sel_start.0)
-                .map_or(0, |l| char_col_to_byte_offset_in_line(l.text(), sel_start.1));
+            let sel_start_byte = buffer_for_draw.lines.get(sel_start.0).map_or(0, |l| {
+                char_col_to_byte_offset_in_line(l.text(), sel_start.1)
+            });
             let sel_end_byte = buffer_for_draw
                 .lines
                 .get(sel_end.0)
@@ -3850,10 +3841,7 @@ mod tests {
         assert!(buf.cursor().selection.is_some());
 
         buf.perform_action(EditorAction::Indent);
-        assert_eq!(
-            buf.text(),
-            "\t- item one\n\t- item two\n- item three"
-        );
+        assert_eq!(buf.text(), "\t- item one\n\t- item two\n- item three");
         assert!(
             buf.cursor().selection.is_some(),
             "selection should survive first indent"
@@ -3864,20 +3852,14 @@ mod tests {
         );
 
         buf.perform_action(EditorAction::Indent);
-        assert_eq!(
-            buf.text(),
-            "\t\t- item one\n\t\t- item two\n- item three"
-        );
+        assert_eq!(buf.text(), "\t\t- item one\n\t\t- item two\n- item three");
         assert!(
             buf.cursor().selection.is_some(),
             "selection should survive second indent"
         );
 
         buf.perform_action(EditorAction::Unindent);
-        assert_eq!(
-            buf.text(),
-            "\t- item one\n\t- item two\n- item three"
-        );
+        assert_eq!(buf.text(), "\t- item one\n\t- item two\n- item three");
         assert!(
             buf.cursor().selection.is_some(),
             "selection should survive unindent"

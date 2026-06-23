@@ -446,10 +446,7 @@ where
                 };
                 renderer.fill_text(
                     num_text,
-                    Point::new(
-                        old_right_x,
-                        text_y + run.line_top + run.line_height / 2.0,
-                    ),
+                    Point::new(old_right_x, text_y + run.line_top + run.line_height / 2.0),
                     number_color,
                     gutter_clip,
                 );
@@ -471,10 +468,7 @@ where
                 };
                 renderer.fill_text(
                     num_text,
-                    Point::new(
-                        new_right_x,
-                        text_y + run.line_top + run.line_height / 2.0,
-                    ),
+                    Point::new(new_right_x, text_y + run.line_top + run.line_height / 2.0),
                     number_color,
                     gutter_clip,
                 );
@@ -542,13 +536,9 @@ where
 
         match event {
             Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
-                if let Some(byte) = hit_test(
-                    &buffer,
-                    layout,
-                    cursor,
-                    state.gutter_width,
-                    self.padding,
-                ) {
+                if let Some(byte) =
+                    hit_test(&buffer, layout, cursor, state.gutter_width, self.padding)
+                {
                     state.mouse_held = true;
                     state.sel_anchor = Some(byte);
                     state.sel_cursor = Some(byte);
@@ -573,13 +563,9 @@ where
             }
 
             Event::Mouse(iced::mouse::Event::CursorMoved { .. }) if state.mouse_held => {
-                if let Some(byte) = hit_test(
-                    &buffer,
-                    layout,
-                    cursor,
-                    state.gutter_width,
-                    self.padding,
-                ) {
+                if let Some(byte) =
+                    hit_test(&buffer, layout, cursor, state.gutter_width, self.padding)
+                {
                     state.sel_cursor = Some(byte);
                     shell.request_redraw();
                 }
@@ -599,10 +585,8 @@ where
 
                 if is_clipboard_mod
                     && key_press.to_latin(*physical_key) == Some('c')
-                    && let (Some(anchor), Some(cursor_byte)) =
-                        (state.sel_anchor, state.sel_cursor)
-                    && let Some(text) =
-                        selection_text(&self.data.text, anchor, cursor_byte)
+                    && let (Some(anchor), Some(cursor_byte)) = (state.sel_anchor, state.sel_cursor)
+                    && let Some(text) = selection_text(&self.data.text, anchor, cursor_byte)
                 {
                     clipboard.write(iced::advanced::clipboard::Kind::Standard, text);
                 }

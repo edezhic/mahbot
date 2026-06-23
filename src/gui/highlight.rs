@@ -1180,14 +1180,7 @@ mod tests {
             fh.spans.len()
         );
         // Line 2: "*emphasis after blank*"
-        line_has_class_in_range(
-            &fh,
-            2,
-            HighlightClass::Function,
-            1,
-            22,
-            "emphasis content",
-        );
+        line_has_class_in_range(&fh, 2, HighlightClass::Function, 1, 22, "emphasis content");
         line_has_class_in_range(&fh, 2, HighlightClass::Operator, 0, 1, "opening *");
     }
 
@@ -1196,14 +1189,7 @@ mod tests {
         let code = "- **bold item**\n- *italic item*\n";
         let fh = parse_markdown_highlights(code);
         assert!(fh.spans.len() >= 2, "expected two list lines");
-        line_has_class_in_range(
-            &fh,
-            0,
-            HighlightClass::Keyword,
-            4,
-            13,
-            "bold list content",
-        );
+        line_has_class_in_range(&fh, 0, HighlightClass::Keyword, 4, 13, "bold list content");
         line_has_class_in_range(
             &fh,
             1,

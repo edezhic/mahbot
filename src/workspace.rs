@@ -811,7 +811,6 @@ impl WorkspaceStorage {
         }
         Ok(tabs)
     }
-
 }
 
 /// A single editor tab record for persistence.
@@ -1174,15 +1173,9 @@ mod tests {
             .await
             .expect("save tabs");
 
-        let loaded = store
-            .load_editor_tabs("ws1")
-            .await
-            .expect("load tabs");
+        let loaded = store.load_editor_tabs("ws1").await.expect("load tabs");
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].is_dirty);
-        assert_eq!(
-            loaded[0].dirty_content.as_deref(),
-            Some("draft text")
-        );
+        assert_eq!(loaded[0].dirty_content.as_deref(), Some("draft text"));
     }
 }

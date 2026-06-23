@@ -116,16 +116,6 @@ enum LineEnding {
     Crlf,
 }
 
-impl LineEnding {
-    #[must_use]
-    const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Lf => "\n",
-            Self::Crlf => "\r\n",
-        }
-    }
-}
-
 /// A single editor tab (metadata, no content).
 #[derive(Debug, Clone)]
 struct Tab {
@@ -784,9 +774,7 @@ fn build_tab_records(
             is_active: i == active_index,
             is_dirty: t.is_dirty,
             dirty_content: if t.is_dirty {
-                tab_contents
-                    .get(&t.path)
-                    .map(|d| d.content.text())
+                tab_contents.get(&t.path).map(|d| d.content.text())
             } else {
                 None
             },
@@ -2671,10 +2659,9 @@ impl EditorState {
                     .parent()
                     .map(|p| p.to_string_lossy().to_string());
                 match parent {
-                    Some(ref p) if !p.is_empty()
-                        && self.file_tree.focus_path(p).is_some() => {
-                            return widgets::scroll_to_tree_focus(&self.file_tree);
-                        }
+                    Some(ref p) if !p.is_empty() && self.file_tree.focus_path(p).is_some() => {
+                        return widgets::scroll_to_tree_focus(&self.file_tree);
+                    }
                     _ => {} // Root-level item has no parent — no-op.
                 }
                 Task::none()
@@ -2911,9 +2898,10 @@ impl EditorState {
                                         state.current_match_idx = 0;
                                         // No remaining matches — place cursor at end
                                         // of the replacement, not at buffer start.
-                                        if let Some((line, col)) =
-                                            byte_offset_to_cursor_pos(&tab_data.content, replace_end)
-                                        {
+                                        if let Some((line, col)) = byte_offset_to_cursor_pos(
+                                            &tab_data.content,
+                                            replace_end,
+                                        ) {
                                             tab_data.content.move_to(line, col);
                                         }
                                     }
@@ -3592,9 +3580,10 @@ impl EditorState {
     ) -> Task<EditorMessage> {
         match result {
             Ok(()) => {
-                let still_matches_saved = self.tab_contents.get(path).is_some_and(|tab_data| {
-                    hash_text(&tab_data.content.text()) == saved_hash
-                });
+                let still_matches_saved = self
+                    .tab_contents
+                    .get(path)
+                    .is_some_and(|tab_data| hash_text(&tab_data.content.text()) == saved_hash);
                 if !still_matches_saved {
                     // A newer edit arrived while the save was in flight — keep dirty state.
                     return Task::none();
@@ -5556,10 +5545,7 @@ fn byte_offset_to_cursor_pos(
 
 /// Convert a byte offset to (line, byte column within line, line byte start).
 #[must_use]
-fn byte_offset_to_line_byte_col(
-    text: &str,
-    offset: usize,
-) -> Option<(usize, usize, usize)> {
+fn byte_offset_to_line_byte_col(text: &str, offset: usize) -> Option<(usize, usize, usize)> {
     if offset > text.len() {
         return None;
     }
@@ -5695,10 +5681,7 @@ mod tests {
         let records = build_tab_records(&tabs, 0, &tab_contents);
         assert_eq!(records.len(), 1);
         assert!(records[0].is_dirty);
-        assert_eq!(
-            records[0].dirty_content.as_deref(),
-            Some("unsaved edits")
-        );
+        assert_eq!(records[0].dirty_content.as_deref(), Some("unsaved edits"));
     }
 
     #[test]
@@ -6831,9 +6814,7 @@ mod tests {
                 .undo_stack
                 .borrow_mut()
                 .snap_before_edit(&tab_data.content);
-            tab_data
-                .content
-                .perform_action(EditorAction::Insert('!'));
+            tab_data.content.perform_action(EditorAction::Insert('!'));
         }
         state.quick_open = Some(QuickOpenState {
             filter: String::new(),
