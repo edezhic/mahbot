@@ -785,6 +785,18 @@ fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
         .position(|w| !SHELL_PREFIXES.contains(w) && !w.starts_with('-') && !is_env_assignment(w))
 }
 
+/// Shared helper that returns both the index and the basename of the first
+/// command word in a shell segment. Used by [`first_command_word`] and
+/// [`canonical_command`] to avoid duplicating index unwrap + basename extraction.
+fn command_word_and_index<'a>(words: &[&'a str]) -> Option<(usize, &'a str)> {
+    let cmd_idx = find_first_command_word_index(words)?;
+    let basename = words[cmd_idx]
+        .rsplit('/')
+        .next()
+        .expect("rsplit always yields at least one element");
+    Some((cmd_idx, basename))
+}
+
 /// Extract just the first command word (basename) from a shell segment.
 ///
 /// Strips shell prefixes, environment variable assignments (`KEY=value`),
@@ -795,14 +807,10 @@ pub(super) fn first_command_word(segment: &str) -> &str {
     let trimmed = segment.trim();
     let words: Vec<&str> = trimmed.split_whitespace().collect();
 
-    let Some(cmd_idx) = find_first_command_word_index(&words) else {
+    let Some((_, cmd)) = command_word_and_index(&words) else {
         return "";
     };
-    let cmd_word = words[cmd_idx];
-    cmd_word
-        .rsplit('/')
-        .next()
-        .expect("rsplit always yields at least one element")
+    cmd
 }
 
 /// Extract a canonical command key from a shell segment for profile matching.
@@ -818,15 +826,9 @@ pub(super) fn canonical_command(segment: &str) -> String {
     let trimmed = segment.trim();
     let words: Vec<&str> = trimmed.split_whitespace().collect();
 
-    let Some(cmd_idx) = find_first_command_word_index(&words) else {
+    let Some((cmd_idx, cmd)) = command_word_and_index(&words) else {
         return String::new();
     };
-
-    let cmd_word = words[cmd_idx];
-    let cmd = cmd_word
-        .rsplit('/')
-        .next()
-        .expect("rsplit always yields at least one element");
 
     // If no more words after the command, return just the command
     let remaining = &words[cmd_idx + 1..];
