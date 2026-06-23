@@ -6,7 +6,7 @@ Mahbot packages the best agentic engineering practices into one system: role sep
 
 ## Why not just Claude Code, Codex, Pi or Cursor?
 
-Most coding assistants optimize for **interactive pair programming**: you prompt, the model edits, you review. That works for focused tasks, but autonomous work tends to drift into low-level implementation details, skip verification, or hit subscription limits when agents run for hours. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot is now working on it's own codebase 24/7 for 10-15$ a day.
+Most coding assistants optimize for **interactive pair programming**: you prompt, the model edits, you review. That works for focused tasks, but autonomous work tends to drift into low-level implementation details, skip verification, or hit subscription limits when agents run for hours. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot is now working on it's own codebase 24/7 spawning >1000 agents for 10-15$ a day.
 
 Also, mahbot is designed for real-world work from the ground up:
 
