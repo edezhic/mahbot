@@ -643,49 +643,10 @@ async fn handle_action_callback(msg: ChannelMessage) {
 
     match action.as_str() {
         "set_image_model" => {
-            if payload.is_empty() {
-                tracing::warn!("set_image_model action with empty payload");
-                answer_telegram_callback(&msg, Some("No model specified.".to_string())).await;
-                return;
-            }
-            // Direct-write to config_kv table (bypasses save_and_reload which
-            // triggers provider warmup — unnecessary for a model name change).
-            let store = mahbot::config_db::store();
-            if let Err(e) = store.set_kv("image_gen_model", &payload).await {
-                tracing::error!("Failed to save image_gen_model: {e}");
-                answer_telegram_callback(&msg, Some(format!("Failed to save model: {e}"))).await;
-                return;
-            }
-            // Lightweight in-memory update — no DB read, no provider warmup
-            let _ = CONFIG.set_string_field_and_apply("image_gen_model", &payload);
-
-            // Acknowledge callback with toast
-            answer_telegram_callback(
-                &msg,
-                Some(format!("Image generation model set to: {payload}")),
-            )
-            .await;
+            handle_set_model_action(&msg, &payload, "image_gen_model", "Image").await;
         }
         "set_video_model" => {
-            if payload.is_empty() {
-                tracing::warn!("set_video_model action with empty payload");
-                answer_telegram_callback(&msg, Some("No model specified.".to_string())).await;
-                return;
-            }
-            let store = mahbot::config_db::store();
-            if let Err(e) = store.set_kv("video_gen_model", &payload).await {
-                tracing::error!("Failed to save video_gen_model: {e}");
-                answer_telegram_callback(&msg, Some(format!("Failed to save model: {e}"))).await;
-                return;
-            }
-            // Lightweight in-memory update — no DB read, no provider warmup
-            let _ = CONFIG.set_string_field_and_apply("video_gen_model", &payload);
-
-            answer_telegram_callback(
-                &msg,
-                Some(format!("Video generation model set to: {payload}")),
-            )
-            .await;
+            handle_set_model_action(&msg, &payload, "video_gen_model", "Video").await;
         }
         "clear_session" => {
             // Acknowledge callback silently first (dismiss spinner)
@@ -704,6 +665,39 @@ async fn handle_action_callback(msg: ChannelMessage) {
             tracing::warn!(action = %action, "Unknown __act__ action — ignoring");
         }
     }
+}
+
+/// Common handler for setting a model config field via callback action.
+///
+/// Validates payload, writes to `config_kv` table, updates the in-memory
+/// config, and acknowledges the callback with a toast.
+async fn handle_set_model_action(
+    msg: &ChannelMessage,
+    payload: &str,
+    config_key: &str,
+    display_name: &str,
+) {
+    if payload.is_empty() {
+        tracing::warn!(config_key, "{config_key} action with empty payload");
+        answer_telegram_callback(msg, Some("No model specified.".to_string())).await;
+        return;
+    }
+    // Direct-write to config_kv table (bypasses save_and_reload which
+    // triggers provider warmup — unnecessary for a model name change).
+    let store = mahbot::config_db::store();
+    if let Err(e) = store.set_kv(config_key, payload).await {
+        tracing::error!(config_key, error = %e, "Failed to save {config_key}");
+        answer_telegram_callback(msg, Some(format!("Failed to save model: {e}"))).await;
+        return;
+    }
+    // Lightweight in-memory update — no DB read, no provider warmup
+    let _ = CONFIG.set_string_field_and_apply(config_key, payload);
+
+    answer_telegram_callback(
+        msg,
+        Some(format!("{display_name} generation model set to: {payload}")),
+    )
+    .await;
 }
 
 /// Acknowledge a Telegram callback query with an optional toast message.
