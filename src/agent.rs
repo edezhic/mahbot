@@ -8,9 +8,9 @@ use crate::providers::{chat, stream_chat};
 use crate::session::Session;
 use crate::tools::{
     AskTool, ToolExecutionOutcome, find_tool, format_tool_failure_feedback, normalize_tool_call,
-    sanitize_success_tool_output, scrub_credentials, unknown_tool_message,
+    sanitize_success_tool_output, unknown_tool_message,
 };
-use crate::util::{UnwrapPoison, plaintext_for_display};
+use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
 use crate::{
     Agent, ChatMessage, ChatRequest, ChatResponse, Reasoning, Role, StreamChunk, StreamEvent, Tool,
     ToolCall, ToolOutputPhase,

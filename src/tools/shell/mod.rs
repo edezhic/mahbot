@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::scrub_credentials;
+use crate::util::scrub_credentials;
 
 mod profiles;
 mod readonly;
