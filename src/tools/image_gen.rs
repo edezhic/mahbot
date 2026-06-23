@@ -94,8 +94,30 @@ impl Tool for ImageGenTool {
             "max_tokens": 4096,
         });
 
+        // Auto-detect aspect ratio from the first reference image when one is
+        // provided and the agent has not explicitly set `aspect_ratio`.
+        let resolved_aspect_ratio: String = match aspect_ratio {
+            Some(ar) => ar.into(),
+            None if !images.is_empty() => {
+                if let Some(ratio) = detect_aspect_ratio_from_image(Path::new(&images[0])) {
+                    tracing::debug!(
+                        "Auto-detected aspect ratio {ratio} from reference image `{}`",
+                        images[0],
+                    );
+                    ratio.into()
+                } else {
+                    tracing::debug!(
+                        "Could not detect aspect ratio from reference image `{}`, falling back to 9:16",
+                        images[0],
+                    );
+                    "9:16".into()
+                }
+            }
+            None => "9:16".into(),
+        };
+
         body["image_config"] = json!({
-            "aspect_ratio": aspect_ratio.unwrap_or("9:16"),
+            "aspect_ratio": resolved_aspect_ratio,
             "image_size": size.unwrap_or("2k"),
         });
 
@@ -130,6 +152,73 @@ impl Tool for ImageGenTool {
 
         Ok(output)
     }
+}
+
+/// All canonical aspect ratios supported by OpenRouter, mapped to their float
+/// value (width / height). Used to find the closest match when auto-detecting
+/// from a reference image.
+static CANONICAL_ASPECT_RATIOS: &[(&str, f64)] = &[
+    ("1:1", 1.0),
+    ("16:9", 16.0 / 9.0),
+    ("9:16", 9.0 / 16.0),
+    ("4:3", 4.0 / 3.0),
+    ("3:4", 3.0 / 4.0),
+    ("3:2", 3.0 / 2.0),
+    ("2:3", 2.0 / 3.0),
+    ("4:5", 4.0 / 5.0),
+    ("5:4", 5.0 / 4.0),
+    ("1:2", 1.0 / 2.0),
+    ("2:1", 2.0 / 1.0),
+    ("1:4", 1.0 / 4.0),
+    ("4:1", 4.0 / 1.0),
+    ("21:9", 21.0 / 9.0),
+    ("9:21", 9.0 / 21.0),
+    ("1:8", 1.0 / 8.0),
+    ("8:1", 8.0 / 1.0),
+    ("9:19.5", 9.0 / 19.5),
+    ("19.5:9", 19.5 / 9.0),
+    ("9:20", 9.0 / 20.0),
+    ("20:9", 20.0 / 9.0),
+];
+
+/// Detect the closest canonical aspect ratio from an image file.
+///
+/// Reads only the file header (no full decode) via the `imagesize` crate.
+/// Returns `None` if the file cannot be read, is an unsupported format, or
+/// has zero dimensions.
+fn detect_aspect_ratio_from_image(path: &Path) -> Option<&'static str> {
+    let size = imagesize::size(path).ok()?;
+    find_closest_aspect_ratio(size.width, size.height)
+}
+
+/// Find the closest canonical aspect ratio string for the given dimensions.
+///
+/// Returns `None` when either dimension is zero.
+#[allow(clippy::cast_precision_loss)]
+fn find_closest_aspect_ratio(width: usize, height: usize) -> Option<&'static str> {
+    // Guard against zero dimensions (would produce ∞ or panic at division)
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let ratio = width as f64 / height as f64;
+
+    // Find the closest canonical ratio by minimising absolute difference.
+    // When two ratios are equally close, the first in declaration order wins
+    // (a practical impossibility with the given spacing, but handled for
+    // correctness).
+    let mut best = CANONICAL_ASPECT_RATIOS[0];
+    let mut best_diff = (ratio - best.1).abs();
+
+    for entry in CANONICAL_ASPECT_RATIOS.iter().skip(1) {
+        let diff = (ratio - entry.1).abs();
+        if diff < best_diff {
+            best = *entry;
+            best_diff = diff;
+        }
+    }
+
+    Some(best.0)
 }
 
 /// The parts extracted from an image generation response.
@@ -339,6 +428,91 @@ mod tests {
     #[test]
     fn test_decode_data_uri_invalid() {
         let result = decode_data_uri("not-a-data-uri");
+        assert_eq!(result, None);
+    }
+
+    // ── find_closest_aspect_ratio tests ──────────────────────────────
+
+    #[test]
+    fn test_closest_ratio_exact_match() {
+        // Every canonical ratio should round-trip exactly.
+        for &(ratio_str, ratio_val) in CANONICAL_ASPECT_RATIOS {
+            let (w, h) = ratio_tuple_from_f64(ratio_val);
+            let result = find_closest_aspect_ratio(w, h);
+            assert_eq!(
+                result,
+                Some(ratio_str),
+                "mismatch for {ratio_str} (w={w}, h={h})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_closest_ratio_between_candidates() {
+        // 1400×900 ≈ 1.556 — closer to 3:2 (1.5) than to 16:9 (1.778)
+        assert_eq!(find_closest_aspect_ratio(1400, 900), Some("3:2"));
+        // 1700×900 ≈ 1.889 — closer to 16:9 (1.778) than to 3:2 (1.5)
+        assert_eq!(find_closest_aspect_ratio(1700, 900), Some("16:9"));
+        // 5×4 = 1.25 → exactly 5:4
+        assert_eq!(find_closest_aspect_ratio(5, 4), Some("5:4"));
+        // 17×20 = 0.85 — closer to 4:5 (0.8) than to 1:1 (1.0)
+        assert_eq!(find_closest_aspect_ratio(17, 20), Some("4:5"));
+    }
+
+    #[test]
+    fn test_closest_ratio_zero_dimensions() {
+        assert_eq!(find_closest_aspect_ratio(0, 100), None);
+        assert_eq!(find_closest_aspect_ratio(100, 0), None);
+        assert_eq!(find_closest_aspect_ratio(0, 0), None);
+    }
+
+    /// Helper: convert a f64 ratio into integer width/height that produce
+    /// the same ratio (within rounding). Used to construct test inputs.
+    fn ratio_tuple_from_f64(ratio: f64) -> (usize, usize) {
+        // Scale to avoid integer division rounding errors:
+        // multiply by a large power of 10 then reduce.
+        let scale = 10_000_000.0;
+        let w = (ratio * scale).round() as usize;
+        let h = scale as usize;
+        (w, h)
+    }
+
+    // ── detect_aspect_ratio_from_image integration tests ──────────────
+
+    /// A minimal valid 2×1 PNG (2:1 aspect ratio), base64-encoded.
+    /// Generated with: python3 -c "..."
+    const MINI_2X1_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAC0lEQVR4nGNgAAMAAAcAAbKGrPQAAAAASUVORK5CYII=";
+
+    /// A minimal valid 16×9 PNG (16:9 aspect ratio), base64-encoded.
+    const MINI_16X9_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAAADklEQVR4nGNgGAVDEgAAAbkAAftY4pIAAAAASUVORK5CYII=";
+
+    #[test]
+    fn test_detect_aspect_ratio_from_real_png() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let png_bytes = STANDARD.decode(MINI_2X1_PNG_B64).expect("valid base64");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.png");
+        std::fs::write(&path, &png_bytes).expect("write");
+
+        assert_eq!(detect_aspect_ratio_from_image(&path), Some("2:1"));
+    }
+
+    #[test]
+    fn test_detect_aspect_ratio_16x9_png() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let png_bytes = STANDARD.decode(MINI_16X9_PNG_B64).expect("valid base64");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wide.png");
+        std::fs::write(&path, &png_bytes).expect("write");
+
+        assert_eq!(detect_aspect_ratio_from_image(&path), Some("16:9"));
+    }
+
+    #[test]
+    fn test_detect_aspect_ratio_missing_file() {
+        let result = detect_aspect_ratio_from_image(Path::new("/nonexistent/image.png"));
         assert_eq!(result, None);
     }
 }
