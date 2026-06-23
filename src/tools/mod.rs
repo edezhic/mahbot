@@ -339,7 +339,7 @@ fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &st
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 ///
-/// Tool-name aliases are resolved via [`normalize_tool_name_str`] so that all
+/// Tool-name aliases are resolved via `normalize_tool_name_str` so that all
 /// callers benefit from the same alias mapping.  Prefer [`normalize_tool_call`]
 /// before dispatch when full argument normalization is also desired.
 #[must_use]

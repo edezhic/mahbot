@@ -27,7 +27,7 @@ pub fn now() -> String {
 /// [`Connection::open`] derives its `experimental_*()` builder calls from
 /// [`experimental_database_opts`], so this constant and [`experimental_database_opts`]
 /// are the two places that define which features are active. The
-/// [`experimental_features_are_consistent`] test verifies they match.
+/// `experimental_features_are_consistent` test verifies they match.
 ///
 /// # API naming asymmetries
 ///
@@ -45,7 +45,7 @@ pub fn now() -> String {
 /// - `experimental_triggers()` — Builder only (no-op for backwards compatibility).
 /// - `experimental_strict()` — Builder only (no-op for backwards compatibility).
 ///
-/// See the test [`builder_mapping_matches_experimental_features`] which verifies that
+/// See the test `builder_mapping_matches_experimental_features` which verifies that
 /// the field-by-field mapping in [`Connection::open`] enables exactly the features
 /// listed here.
 pub const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];

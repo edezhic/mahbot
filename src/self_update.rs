@@ -465,8 +465,8 @@ pub async fn execute_update() -> Result<()> {
     // 8. Notify: build complete, restarting.
     notify_admin("✅ Build complete. Restarting…", admin_target.as_ref()).await;
 
-    // 9. Notify: starting new instance (MUST be before shutdown — per manager
-    //    resolution, step 9 moves before step 8 so Telegram channel is still live).
+    // 9. Notify: starting new instance (MUST be before step 10 shutdown —
+    //    Telegram channel must still be live for this notification).
     notify_admin("🔄 Starting new instance…", admin_target.as_ref()).await;
 
     // 10. Shutdown: cancel all agents, close browser sessions, signal shutdown.

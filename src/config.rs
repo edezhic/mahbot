@@ -47,7 +47,7 @@ pub struct ModelRouting {
 ///
 /// 1. **Field declaration** — add the field here on [`ConfigData`].
 /// 2. **Macro** — add the field name to the `string_config_fields!` invocation (~line 200).
-///    The macro generates [`ConfigData::STRUCT_FIELDS_DEFAULT`] (used by [`ConfigReload::const_new`]),
+///    The macro generates `ConfigData::STRUCT_FIELDS_DEFAULT` (used by [`ConfigReload::const_new`]),
 ///    [`ConfigData::string_fields()`], and [`ConfigData::set_string_field()`] from this list.  The compiler
 ///    enforces that every field on [`ConfigData`] is present in `STRUCT_FIELDS_DEFAULT`,
 ///    so forgetting this step is a compile error.
@@ -58,7 +58,7 @@ pub struct ModelRouting {
 ///
 /// If a new `Option<String>` field is a runtime-only cache or otherwise NOT
 /// meant to be persisted as a config KV pair, do NOT add it to
-/// `string_config_fields!` and do NOT add it to [`ConfigData::STRUCT_FIELDS_DEFAULT`].
+/// `string_config_fields!` and do NOT add it to `ConfigData::STRUCT_FIELDS_DEFAULT`.
 /// It will not be persisted through `save_and_reload` — this is intentional.
 ///
 /// ## UX asymmetry warning
@@ -67,7 +67,7 @@ pub struct ModelRouting {
 /// (all fields).  But [`save_and_reload`] persists fields **only** through
 /// [`ConfigData::string_fields`], which is macro-generated.  A field missing from
 /// the macro would appear editable in the GUI but silently discard its value on
-/// every save.  The compiler guard on [`ConfigData::STRUCT_FIELDS_DEFAULT`] prevents this.
+/// every save.  The compiler guard on `ConfigData::STRUCT_FIELDS_DEFAULT` prevents this.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigData {
     /// API key for the LLM provider.
@@ -366,7 +366,7 @@ impl ConfigReload {
     /// This is intentionally lightweight — it only mutates the in-memory
     /// [`ConfigData`] without touching the database or triggering provider
     /// warmup. Callers are responsible for persisting the change to the
-    /// config DB separately (e.g. via [`crate::config_db::store().set_kv()`]).
+    /// config DB separately (e.g. via [`crate::config_db::ConfigStore::set_kv`]).
     ///
     /// Returns `true` if the key was recognised, `false` otherwise (unknown
     /// keys are silently ignored for forward compatibility).

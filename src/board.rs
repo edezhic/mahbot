@@ -433,7 +433,7 @@ impl TicketPhase {
     /// Returns `true` for transitory handoff phases — pipeline-blocking
     /// statuses where no agent is mid-execution.
     ///
-    /// Delegates to [`TRANSITORY_HANDOFF_PHASES`] so the transitory handoff set can never
+    /// Delegates to `TRANSITORY_HANDOFF_PHASES` so the transitory handoff set can never
     /// accidentally diverge from the definition used in coverage tests.
     #[must_use]
     pub fn is_transitory_handoff(&self) -> bool {
@@ -1251,7 +1251,7 @@ impl BoardStore {
     /// get `pipeline_reservation = 1` so they are claimed before any fresh
     /// `ReadyForDevelopment` ticket — this preserves the rework priority across restarts.
     ///
-    /// Excludes [`TRANSITORY_HANDOFF_PHASES`] — these are transitory handoff states
+    /// Excludes `TRANSITORY_HANDOFF_PHASES` — these are transitory handoff states
     /// that the poller picks up within 2 seconds of restart.
     ///
     /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests

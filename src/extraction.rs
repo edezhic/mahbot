@@ -86,7 +86,7 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
 /// Callback data prefix for dynamic option buttons.
 pub(crate) const CALLBACK_PREFIX: &str = "__opt__";
 
-/// Check whether `content` begins with [`CALLBACK_PREFIX`].
+/// Check whether `content` begins with `CALLBACK_PREFIX`.
 ///
 /// Fast prefix-only check — useful as an early filter before calling
 /// [`decode_callback`].
@@ -99,7 +99,7 @@ pub fn is_callback(content: &str) -> bool {
 ///
 /// Returns `(ticket_id, label)` on success (`ticket_id` is `None` when the
 /// callback data was generated without one).  Returns `None` when `content`
-/// does not carry the [`CALLBACK_PREFIX`].
+/// does not carry the `CALLBACK_PREFIX`.
 ///
 /// # Format contract
 ///
@@ -126,7 +126,7 @@ pub fn decode_callback(content: &str) -> Option<(Option<String>, String)> {
 /// Callback data prefix for action callbacks (e.g., model selection, clear session).
 pub(crate) const ACTION_PREFIX: &str = "__act__";
 
-/// Check whether `content` begins with [`ACTION_PREFIX`].
+/// Check whether `content` begins with `ACTION_PREFIX`.
 ///
 /// Fast prefix-only check — useful as an early filter before calling
 /// [`decode_action`].
@@ -138,7 +138,7 @@ pub fn is_action(content: &str) -> bool {
 /// Decode action callback data.
 ///
 /// Returns `(action, payload)` on success, `None` when `content` does not
-/// carry the [`ACTION_PREFIX`].
+/// carry the `ACTION_PREFIX`.
 ///
 /// # Format
 ///
