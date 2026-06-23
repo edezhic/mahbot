@@ -1,7 +1,9 @@
 //! Board dashboard page — ticket management.
 
 use std::collections::HashSet;
+use std::str::FromStr;
 
+use crate::Role;
 use crate::board::{Ticket, TicketPhase, UNBLOCKING_STATUSES};
 
 use iced::widget::{
@@ -764,7 +766,7 @@ impl BoardState {
                 ]
                 .spacing(2),
             )
-            .padding(8)
+            .padding(iced::Padding::new(8.0).bottom(2.0))
             .width(Length::Fill)
             .style(theme::button_text)
             .on_press(BoardMessage::OpenModal(ticket.id.clone()))
@@ -772,10 +774,10 @@ impl BoardState {
         ];
 
         // Badge + optional prereq indicator + icon row (below the clickable area)
-        card_children.push(badge_row.align_y(Alignment::Center).padding([4, 8]).into());
+        card_children.push(badge_row.align_y(Alignment::Center).padding([0, 8]).into());
 
         let card = Column::from_vec(card_children)
-            .spacing(2)
+            .spacing(0)
             .width(Length::Fill);
 
         container(card)
@@ -937,68 +939,74 @@ impl BoardState {
             .align_y(Alignment::Center)
             .spacing(8)
             .padding([4, 0]),
-            text(format!(
-                "Created: {}",
-                theme::format_timestamp(&ticket.created_at)
-            ))
-            .size(12)
-            .color(theme::TEXT_MUTED),
+            // Compact metadata header — inline with · separator
             {
-                let reporter_label = if ticket.reporter.is_empty() {
-                    "legacy"
+                let reporter_display = if ticket.reporter.is_empty() {
+                    "Legacy".to_string()
                 } else {
-                    &ticket.reporter
+                    Role::from_str(&ticket.reporter).map_or_else(
+                        |_| {
+                            let mut chars = ticket.reporter.chars();
+                            let first = chars.next().expect("non-empty checked above");
+                            first.to_uppercase().to_string() + chars.as_str()
+                        },
+                        |role| crate::role::role_info(&role).display_label.to_string(),
+                    )
                 };
-                text(format!("Reporter: {reporter_label}"))
-                    .size(12)
-                    .color(theme::TEXT_MUTED)
+                let created = theme::format_timestamp(&ticket.created_at);
+                let updated = theme::format_timestamp(&ticket.updated_at);
+
+                // Build the first row of metadata (always shown)
+                let meta_els: Vec<Element<'_, BoardMessage>> = vec![
+                    text(format!("Created: {created}"))
+                        .size(12)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                    text(" · ").size(12).color(theme::TEXT_MUTED).into(),
+                    text(format!("Updated: {updated}"))
+                        .size(12)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                    text(" · ").size(12).color(theme::TEXT_MUTED).into(),
+                    text(format!("Reporter: {reporter_display}"))
+                        .size(12)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                ];
+
+                // Collect secondary fields for second inline row
+                let mut secondary: Vec<String> = Vec::new();
+                if let Some(ref assignee) = ticket.assigned_to {
+                    secondary.push(format!("Assigned: {assignee}"));
+                }
+                if !ticket.prerequisites.is_empty() {
+                    secondary.push(format!(
+                        "Prerequisites: {}",
+                        ticket.prerequisites.join(", ")
+                    ));
+                }
+                if let Some(ref supersedes) = ticket.supersedes {
+                    secondary.push(format!("Supersedes: {supersedes}"));
+                }
+                if let Some(ref superseded_by) = ticket.superseded_by {
+                    secondary.push(format!("Superseded by: {superseded_by}"));
+                }
+
+                let first_row: Element<'_, BoardMessage> =
+                    Row::from_vec(meta_els).align_y(Alignment::Center).into();
+
+                if secondary.is_empty() {
+                    first_row
+                } else {
+                    let second_row: Element<'_, BoardMessage> = text(secondary.join(" · "))
+                        .size(12)
+                        .color(theme::TEXT_MUTED)
+                        .into();
+                    column![first_row, second_row].spacing(2).into()
+                }
             },
-            text(format!(
-                "Updated: {}",
-                theme::format_timestamp(&ticket.updated_at)
-            ))
-            .size(12)
-            .color(theme::TEXT_MUTED),
         ]
         .spacing(2);
-
-        if let Some(ref assignee) = ticket.assigned_to {
-            detail = detail.push(
-                text(format!("Assigned: {assignee}"))
-                    .size(12)
-                    .color(theme::TEXT_MUTED),
-            );
-        }
-
-        // Prerequisites
-        if !ticket.prerequisites.is_empty() {
-            detail = detail.push(
-                text(format!(
-                    "Prerequisites: {}",
-                    ticket.prerequisites.join(", ")
-                ))
-                .size(12)
-                .color(theme::TEXT_MUTED),
-            );
-        }
-
-        // Supersedes
-        if let Some(ref supersedes) = ticket.supersedes {
-            detail = detail.push(
-                text(format!("Supersedes: {supersedes}"))
-                    .size(12)
-                    .color(theme::TEXT_MUTED),
-            );
-        }
-
-        // Superseded by
-        if let Some(ref superseded_by) = ticket.superseded_by {
-            detail = detail.push(
-                text(format!("Superseded by: {superseded_by}"))
-                    .size(12)
-                    .color(theme::TEXT_MUTED),
-            );
-        }
 
         // Commit stats section
         if ticket.commit_hash.is_some() {
@@ -1074,7 +1082,6 @@ impl BoardState {
         // Description
         if !ticket.description.is_empty() {
             detail = detail.push(Space::new().height(8));
-            detail = detail.push(text("Description:").size(13).color(theme::TEXT_SECONDARY));
             let desc_md: Element<'_, BoardMessage> = if let Some(ref items) = self.description_md {
                 container(
                     scrollable(
