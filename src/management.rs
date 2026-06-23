@@ -109,33 +109,44 @@ async fn guard_phase_and_circuit_breaker(
     true
 }
 
+/// Controls whether a ticket transition triggers an immediate notification
+/// to the Manager (via [`notify_ticket`]) or is buffered for batched delivery.
+enum NotifyPolicy {
+    /// Immediately enqueue a Manager notification for this transition.
+    Notify,
+    /// Buffer the transition for batched delivery alongside the next
+    /// notification. See [`ticket_buffer`] for details.
+    Buffer,
+}
+
 /// Transition a ticket to `target` phase if it's still in `expected` phase.
 /// Returns `Ok(())` if the transition was applied (ticket was still in expected
 /// phase). Returns `Err(String)` with a descriptive message if the ticket was
 /// moved externally or an error occurred.
 ///
-/// If `notify` is true, calls `notify_ticket` on success; errors from
-/// notification are logged and discarded (not propagated).
+/// If `notify` is [`NotifyPolicy::Notify`], calls [`notify_ticket`] on success;
+/// errors from notification are logged and discarded (not propagated).
 ///
 /// # Note: workspace auto-pause on failure
 ///
 /// Auto-pausing the workspace on ticket failure (`Failed` status) is handled
-/// inside [`notify_ticket`] — it only fires when `notify=true`. If adding a
-/// `Failed` transition with `notify=false`, workspace pausing will NOT occur
-/// automatically; ensure appropriate handling at the call site.
+/// inside [`notify_ticket`] — it only fires when
+/// `notify` is [`NotifyPolicy::Notify`]. If adding a `Failed` transition with
+/// [`NotifyPolicy::Buffer`], workspace pausing will NOT occur automatically;
+/// ensure appropriate handling at the call site.
 async fn transition_ticket(
     board: &BoardStore,
     ticket: &Ticket,
     expected: TicketPhase,
     target: TicketPhase,
-    notify: bool,
+    notify: NotifyPolicy,
 ) -> Result<(), String> {
     match board
         .transition_to(&ticket.id, Some(expected), target)
         .await
     {
         Ok(()) => {
-            if notify {
+            if matches!(notify, NotifyPolicy::Notify) {
                 notify_ticket(ticket, target).await;
             } else if let Some(ws) =
                 resolve_ticket_workspace(ticket, "cannot buffer transition").await
@@ -149,7 +160,7 @@ async fn transition_ticket(
             }
 
             // Auto-pause on failure is handled inside `notify_ticket`.
-            // If a `Failed` transition with `notify=false` is added here,
+            // If a `Failed` transition with `NotifyPolicy::Buffer` is added here,
             // auto-pause will NOT occur — ensure workspace pausing is
             // handled explicitly if needed.
 
@@ -424,7 +435,7 @@ fn spawn_dispatch(board: &'static BoardStore, phase: PollPhase, ticket: Ticket, 
                     &ticket_for_failure,
                     target_phase,
                     TicketPhase::Failed,
-                    true,
+                    NotifyPolicy::Notify,
                 )
                 .await
                 {
@@ -567,6 +578,27 @@ const CLAIM_PHASES: &[PollPhase] = &[
     PollPhase::VerifierCheck(QA_VI),
 ];
 
+/// Run the given action for each ticket in `phase` for the named workspace.
+///
+/// Lists tickets via [`BoardStore::list_tickets_in_phase`], iterates, and logs
+/// a structured error on failure. Replaces the identical 14-line match blocks
+/// that previously appeared for Diagnostics and QaPassed dispatch.
+async fn for_tickets_in_phase(
+    board: &BoardStore,
+    phase: TicketPhase,
+    ws_name: &str,
+    mut action: impl FnMut(Ticket),
+) {
+    match board.list_tickets_in_phase(phase, ws_name).await {
+        Ok(tickets) => {
+            for ticket in tickets {
+                action(ticket);
+            }
+        }
+        Err(e) => error!(workspace = ws_name, phase = %phase, error = %e, "Phase listing failed"),
+    }
+}
+
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
 /// Single pass over workspaces — for each, attempt claims across all pipeline
@@ -641,20 +673,13 @@ async fn poll_round() -> anyhow::Result<()> {
         // completion). Instead, we list InDiagnostics tickets for this
         // workspace directly and guard against re-dispatch via
         // `assigned_to IS NULL`.
-        match board
-            .list_tickets_in_phase(TicketPhase::InDiagnostics, &ws.name)
-            .await
-        {
-            Ok(tickets) => {
-                for ticket in tickets {
-                    if ticket.assigned_to.is_some() {
-                        continue; // already dispatched, still running
-                    }
-                    spawn_dispatch(board, PollPhase::DiagnosticsCheck, ticket, ws.clone());
-                }
+        for_tickets_in_phase(board, TicketPhase::InDiagnostics, &ws.name, |ticket| {
+            if ticket.assigned_to.is_some() {
+                return; // already dispatched, still running
             }
-            Err(e) => error!(workspace = %ws.name, error = %e, "Diagnostics listing failed"),
-        }
+            spawn_dispatch(board, PollPhase::DiagnosticsCheck, ticket, ws.clone());
+        })
+        .await;
 
         // 3. Auto-commit QaPassed tickets.
         //
@@ -663,20 +688,13 @@ async fn poll_round() -> anyhow::Result<()> {
         // claim-based phases, there is no atomic source→target transition
         // — the ticket stays in QaPassed until the commit succeeds, so
         // re-dispatch is harmless (git status short-circuits a no-op).
-        match board
-            .list_tickets_in_phase(TicketPhase::QaPassed, &ws.name)
-            .await
-        {
-            Ok(tickets) => {
-                for ticket in tickets {
-                    let ws = ws.clone();
-                    tokio::spawn(async move {
-                        finalize_qa_passed(board, ticket, ws).await;
-                    });
-                }
-            }
-            Err(e) => error!(workspace = %ws.name, error = %e, "QaPassed listing failed"),
-        }
+        for_tickets_in_phase(board, TicketPhase::QaPassed, &ws.name, |ticket| {
+            let ws = ws.clone();
+            tokio::spawn(async move {
+                finalize_qa_passed(board, ticket, ws).await;
+            });
+        })
+        .await;
     }
 
     Ok(())
@@ -731,9 +749,13 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
     // Diagnostics are dispatched by the poll loop as a separate
     // PollPhase::DiagnosticsCheck — see poll_round().
     let (comment_text, target_phase, notify) = if let Some(ref text) = response {
-        (text.as_str(), TicketPhase::InDiagnostics, false)
+        (
+            text.as_str(),
+            TicketPhase::InDiagnostics,
+            NotifyPolicy::Buffer,
+        )
     } else {
-        ("Agent failed", TicketPhase::Failed, true)
+        ("Agent failed", TicketPhase::Failed, NotifyPolicy::Notify)
     };
 
     let _ = board
@@ -782,7 +804,7 @@ async fn move_ticket_to_done(board: &BoardStore, ticket: &Ticket, reason: &str) 
         ticket,
         TicketPhase::QaPassed,
         TicketPhase::Done,
-        true,
+        NotifyPolicy::Notify,
     )
     .await
     {
@@ -962,7 +984,7 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
             &ticket,
             TicketPhase::InDiagnostics,
             TicketPhase::DiagnosticsDone,
-            false,
+            NotifyPolicy::Buffer,
         )
         .await
         {
@@ -1036,8 +1058,14 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
 
     if target == TicketPhase::ReadyForDevelopment {
         bounce_back_to_development(board, &ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
-    } else if let Err(e) =
-        transition_ticket(board, &ticket, TicketPhase::InDiagnostics, target, false).await
+    } else if let Err(e) = transition_ticket(
+        board,
+        &ticket,
+        TicketPhase::InDiagnostics,
+        target,
+        NotifyPolicy::Buffer,
+    )
+    .await
     {
         warn!(
             ticket = %ticket.id,
@@ -1346,7 +1374,15 @@ async fn handle_analyst_verdicts(board: &BoardStore, ticket: &Ticket, results: &
     } else {
         TicketPhase::Paused
     };
-    if let Err(e) = transition_ticket(board, ticket, TicketPhase::Analysis, target, true).await {
+    if let Err(e) = transition_ticket(
+        board,
+        ticket,
+        TicketPhase::Analysis,
+        target,
+        NotifyPolicy::Notify,
+    )
+    .await
+    {
         warn!(
             ticket = %ticket.id,
             error = %e,
@@ -1422,7 +1458,7 @@ fn build_analyst_summary(
 ///
 /// When the target is [`TicketPhase::Failed`], the workspace is also paused
 /// automatically via [`notify_ticket`], called from
-/// [`transition_ticket`] with `notify=true`.
+/// [`transition_ticket`] with [`NotifyPolicy::Notify`].
 ///
 /// # Self-counting prevention
 ///
@@ -1492,7 +1528,7 @@ async fn run_circuit_breaker(
         .add_comment(&ticket.id, "system", &comment_text(count))
         .await;
 
-    if let Err(e) = transition_ticket(board, ticket, expected, target, true).await {
+    if let Err(e) = transition_ticket(board, ticket, expected, target, NotifyPolicy::Notify).await {
         warn!(
             ticket = %ticket.id,
             target = %target,
@@ -1503,7 +1539,7 @@ async fn run_circuit_breaker(
     }
 
     // Workspace auto-pause: if `target` is Failed, `notify_ticket` (called
-    // inside `transition_ticket` with notify=true) pauses the workspace
+    // inside `transition_ticket` with `NotifyPolicy::Notify`) pauses the workspace
     // automatically.
 
     true
@@ -1595,7 +1631,7 @@ async fn process_verdict_results(
         ticket,
         verifier.active_phase,
         verifier.success_phase,
-        false,
+        NotifyPolicy::Buffer,
     )
     .await
     {
@@ -1673,8 +1709,14 @@ async fn dispatch_verifiers(
                 ),
             )
             .await;
-        if let Err(e) =
-            transition_ticket(board, &ticket, vi.active_phase, TicketPhase::Failed, true).await
+        if let Err(e) = transition_ticket(
+            board,
+            &ticket,
+            vi.active_phase,
+            TicketPhase::Failed,
+            NotifyPolicy::Notify,
+        )
+        .await
         {
             warn!(
                 ticket = %ticket.id,
