@@ -968,7 +968,7 @@ fn finish_shell_output(
     }
 
     // No pre-truncation spill — try spilling the final combined output
-    try_spill_to_file(&combined, SPILL_THRESHOLD_BYTES)
+    try_spill_to_file(combined, SPILL_THRESHOLD_BYTES)
 }
 
 /// Collapse runs of blank lines to at most 2 consecutive.
@@ -1414,11 +1414,8 @@ fn apply_profile_pipeline(
     elapsed: Duration,
     is_chained: bool,
 ) -> String {
-    let mut processed = output.to_string();
-
     // Stage 1: try JSON preview — if output is JSON, return schema preview early
-    let (json_preview, is_json) = try_json_preview(&processed);
-    if is_json {
+    if let Some(json_preview) = try_json_preview(output) {
         return combine_output(
             &json_preview,
             stderr,
@@ -1429,9 +1426,11 @@ fn apply_profile_pipeline(
 
     // Stage 2: short-circuit on success patterns — skip for chained commands
     // to avoid suppressing output from later segments (e.g., `cargo build && echo done`).
-    if !is_chained && let Some(msg) = match_short_circuit(&processed, &profile.short_circuits) {
+    if !is_chained && let Some(msg) = match_short_circuit(output, &profile.short_circuits) {
         return combine_output(msg, stderr, exit_code, profile.keep_stderr.as_ref());
     }
+
+    let mut processed = output.to_string();
 
     // Stage 3: strip lines
     processed = apply_line_filters(&processed, profile);
@@ -1496,11 +1495,11 @@ fn strip_ansi_escapes(input: &str) -> String {
 }
 
 /// Try to parse as JSON/structured data and return a schema preview.
-/// Returns `(json_preview, true)` if JSON was parsed, `(input, false)` otherwise.
-fn try_json_preview(input: &str) -> (String, bool) {
+/// Returns `Some(preview)` if JSON was parsed, `None` otherwise.
+fn try_json_preview(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() || (!trimmed.starts_with('[') && !trimmed.starts_with('{')) {
-        return (input.to_string(), false);
+        return None;
     }
 
     // Try top-level array
@@ -1521,7 +1520,7 @@ fn try_json_preview(input: &str) -> (String, bool) {
                 input.len()
             )
         };
-        return (preview, true);
+        return Some(preview);
     }
 
     // Try top-level object
@@ -1539,10 +1538,10 @@ fn try_json_preview(input: &str) -> (String, bool) {
             fields.join("\n"),
             input.len()
         );
-        return (preview, true);
+        return Some(preview);
     }
 
-    (input.to_string(), false)
+    None
 }
 
 /// Infer a schema from a list of JSON values (typically array elements).
@@ -1728,12 +1727,12 @@ fn spill_output(output: &str) -> Option<std::path::PathBuf> {
 
 /// If output exceeds threshold, spill to a temp file and return a preview.
 /// The full output is saved to a file; the inline preview is a short summary.
-fn try_spill_to_file(output: &str, threshold_bytes: usize) -> String {
+fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
     if output.len() <= threshold_bytes {
-        return output.to_string();
+        return output;
     }
 
-    let scrubbed = scrub_credentials(output);
+    let scrubbed = scrub_credentials(&output);
     match spill_output(&scrubbed) {
         Some(path) => format_spill_preview(&scrubbed, &path),
         None => crate::util::format_tool_output(&scrubbed),
@@ -1962,8 +1961,9 @@ mod tests {
     #[test]
     fn json_array_preview() {
         let input = r#"[{"name": "alice", "age": 30}, {"name": "bob", "age": 25}]"#;
-        let (output, is_json) = try_json_preview(input);
-        assert!(is_json, "should detect JSON array");
+        let result = try_json_preview(input);
+        assert!(result.is_some(), "should detect JSON array");
+        let output = result.unwrap();
         assert!(output.contains("2 items"), "should show item count");
         assert!(
             output.contains("name: string"),
@@ -1975,8 +1975,9 @@ mod tests {
     #[test]
     fn json_object_preview() {
         let input = r#"{"status": "ok", "count": 42}"#;
-        let (output, is_json) = try_json_preview(input);
-        assert!(is_json, "should detect JSON object");
+        let result = try_json_preview(input);
+        assert!(result.is_some(), "should detect JSON object");
+        let output = result.unwrap();
         assert!(output.contains("2 fields"), "should show field count");
         assert!(output.contains("status"), "should show field name");
         assert!(output.contains("count"), "should show field name");
@@ -1985,9 +1986,8 @@ mod tests {
     #[test]
     fn non_json_passes_through() {
         let input = "hello world\nthis is not json";
-        let (output, is_json) = try_json_preview(input);
-        assert!(!is_json, "should not detect JSON");
-        assert_eq!(output, input, "non-JSON should pass through unchanged");
+        let result = try_json_preview(input);
+        assert!(result.is_none(), "should not detect JSON");
     }
 
     #[test]
@@ -2078,7 +2078,7 @@ mod tests {
     #[test]
     fn spill_writes_file_for_large_output() {
         let large = "x".repeat(10_000);
-        let result = try_spill_to_file(&large, 5_000);
+        let result = try_spill_to_file(large, 5_000);
         assert!(
             result.contains("[Output saved to"),
             "should contain spill path"
@@ -2100,12 +2100,13 @@ mod tests {
         // Many lines totalling well over 5K chars should produce head+tail preview
         let lines: Vec<String> = (0..800).map(|i| format!("line_{i:04}")).collect();
         let large = lines.join("\n");
+        let large_len = large.len();
         assert!(
-            large.len() > 5_000,
+            large_len > 5_000,
             "test data {} must exceed spill threshold",
-            large.len()
+            large_len
         );
-        let result = try_spill_to_file(&large, 5_000);
+        let result = try_spill_to_file(large, 5_000);
         assert!(
             result.contains("[Output saved to"),
             "should contain spill path"
@@ -2121,15 +2122,15 @@ mod tests {
         );
         assert!(result.contains("line_0799"), "should show last line");
         assert!(
-            result.len() < large.len(),
+            result.len() < large_len,
             "inline preview should be truncated"
         );
     }
 
     #[test]
     fn spill_returns_short_output_as_is() {
-        let short = "hello";
-        let result = try_spill_to_file(short, 5_000);
+        let short = "hello".to_string();
+        let result = try_spill_to_file(short.clone(), 5_000);
         assert_eq!(result, short, "short output should pass through unchanged");
     }
 
