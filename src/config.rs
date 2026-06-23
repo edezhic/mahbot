@@ -643,43 +643,9 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
 
     // Write per-role configs AND per-model routings inside a single
     // transaction so a crash between writes doesn't leave inconsistent state.
-    {
-        let tx = store.begin_tx().await?;
-        // ── config_role ──
-        for role in Role::all_roles() {
-            tx.execute(
-                "DELETE FROM config_role WHERE role = ?1",
-                crate::turso::params![role.as_str()],
-            )
-            .await?;
-        }
-        for rc in &config.per_role_configs {
-            tx.execute(
-                "INSERT INTO config_role (role, model, reasoning_effort) VALUES (?1, ?2, ?3)",
-                turso::params![
-                    rc.role.as_str(),
-                    rc.model.as_deref(),
-                    rc.reasoning_effort.as_deref()
-                ],
-            )
-            .await?;
-        }
-
-        // ── config_model_routing ──
-        tx.execute("DELETE FROM config_model_routing", crate::turso::params![])
-            .await?;
-        for mr in &config.model_routings {
-            let allow_int = mr.allow_fallbacks.map(i32::from);
-            tx.execute(
-                "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
-                 VALUES (?1, ?2, ?3)",
-                crate::turso::params![mr.model.as_str(), mr.provider_order.as_deref(), allow_int,],
-            )
-            .await?;
-        }
-
-        tx.commit().await?;
-    }
+    store
+        .save_routing_configs(&config.per_role_configs, &config.model_routings)
+        .await?;
 
     // ── Commit to runtime ─────────────────────────────────────
     // Warmup succeeded above — now persist runtime config and swap singletons.

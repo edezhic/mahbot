@@ -139,6 +139,50 @@ impl ConfigStore {
             })
             .collect()
     }
+
+    // ── batch save (role configs + model routings) ──────────────
+
+    /// Atomically replace all role configs and model routings in a single
+    /// transaction.
+    ///
+    /// Old rows are deleted with a blanket `DELETE` (no per-role iteration),
+    /// which is both simpler and prevents stale rows from surviving when a role
+    /// is removed from the enum.  The enclosing transaction guarantees that a
+    /// crash or error before commit rolls back to the prior state — partial
+    /// writes from the two tables are never visible.
+    pub async fn save_routing_configs(
+        &self,
+        role_configs: &[RoleConfig],
+        model_routings: &[ModelRouting],
+    ) -> Result<()> {
+        let tx = self.begin_tx().await?;
+        tx.execute("DELETE FROM config_role", turso::params![])
+            .await?;
+        for rc in role_configs {
+            tx.execute(
+                "INSERT INTO config_role (role, model, reasoning_effort) VALUES (?1, ?2, ?3)",
+                turso::params![
+                    rc.role.as_str(),
+                    rc.model.as_deref(),
+                    rc.reasoning_effort.as_deref()
+                ],
+            )
+            .await?;
+        }
+        tx.execute("DELETE FROM config_model_routing", turso::params![])
+            .await?;
+        for mr in model_routings {
+            let allow_int = mr.allow_fallbacks.map(i32::from);
+            tx.execute(
+                "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
+                 VALUES (?1, ?2, ?3)",
+                turso::params![mr.model.as_str(), mr.provider_order.as_deref(), allow_int],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -575,5 +619,199 @@ mod tests {
     async fn test_delete_model_routing_nonexistent() {
         let (store, _dir) = setup().await;
         store.delete_model_routing("ghost-model").await.unwrap();
+    }
+
+    // ── save_routing_configs ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_save_routing_configs_initial_save() {
+        let (store, _dir) = setup().await;
+
+        let mut role_configs = vec![
+            RoleConfig {
+                role: "engineer".to_string(),
+                model: Some("gpt-4".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+            RoleConfig {
+                role: "reviewer".to_string(),
+                model: Some("claude-3".to_string()),
+                reasoning_effort: None,
+            },
+        ];
+        let mut model_routings = vec![ModelRouting {
+            model: "gpt-4".to_string(),
+            provider_order: Some("OpenAI".to_string()),
+            allow_fallbacks: Some(true),
+        }];
+        // Sort to match the DB ORDER BY in get_all_* queries
+        role_configs.sort_by(|a, b| a.role.cmp(&b.role));
+        model_routings.sort_by(|a, b| a.model.cmp(&b.model));
+
+        store
+            .save_routing_configs(&role_configs, &model_routings)
+            .await
+            .unwrap();
+
+        let saved_roles = store.get_all_role_configs().await.unwrap();
+        assert_eq!(saved_roles, role_configs);
+
+        let saved_routings = store.get_all_model_routings().await.unwrap();
+        assert_eq!(saved_routings, model_routings);
+    }
+
+    #[tokio::test]
+    async fn test_save_routing_configs_replaces_old_rows() {
+        let (store, _dir) = setup().await;
+
+        // Insert initial data
+        let initial_roles = vec![RoleConfig {
+            role: "manager".to_string(),
+            model: Some("old-model".to_string()),
+            reasoning_effort: Some("low".to_string()),
+        }];
+        let initial_routings = vec![ModelRouting {
+            model: "old-model".to_string(),
+            provider_order: Some("OldProvider".to_string()),
+            allow_fallbacks: Some(false),
+        }];
+        store
+            .save_routing_configs(&initial_roles, &initial_routings)
+            .await
+            .unwrap();
+
+        // Replace with completely different data (sorted to match DB ORDER BY)
+        let new_roles = vec![RoleConfig {
+            role: "qa".to_string(),
+            model: Some("new-model".to_string()),
+            reasoning_effort: None,
+        }];
+        let mut new_routings = vec![
+            ModelRouting {
+                model: "fallback-model".to_string(),
+                provider_order: None,
+                allow_fallbacks: None,
+            },
+            ModelRouting {
+                model: "new-model".to_string(),
+                provider_order: Some("NewProvider".to_string()),
+                allow_fallbacks: Some(true),
+            },
+        ];
+        // Both slices must be sorted to match DB ORDER BY
+        new_routings.sort_by(|a, b| a.model.cmp(&b.model));
+        store
+            .save_routing_configs(&new_roles, &new_routings)
+            .await
+            .unwrap();
+
+        // Old rows must be gone; only new rows present
+        let saved_roles = store.get_all_role_configs().await.unwrap();
+        assert_eq!(
+            saved_roles, new_roles,
+            "old role configs should be completely replaced"
+        );
+
+        let saved_routings = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            saved_routings, new_routings,
+            "old model routings should be completely replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_routing_configs_empty_slices() {
+        let (store, _dir) = setup().await;
+
+        // Pre-insert some data
+        store
+            .set_role_config("should-be-cleared", Some("x"), None)
+            .await
+            .unwrap();
+        store
+            .set_model_routing("should-be-cleared", Some("y"), Some(true))
+            .await
+            .unwrap();
+
+        // Save with empty slices — should clear both tables
+        store.save_routing_configs(&[], &[]).await.unwrap();
+
+        let saved_roles = store.get_all_role_configs().await.unwrap();
+        assert!(saved_roles.is_empty(), "all role configs should be deleted");
+
+        let saved_routings = store.get_all_model_routings().await.unwrap();
+        assert!(
+            saved_routings.is_empty(),
+            "all model routings should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_routing_configs_duplicate_key_returns_err() {
+        let (store, _dir) = setup().await;
+
+        // Open a second connection *before* any transaction starts on the
+        // first one, so the schema DDL write can complete without lock
+        // contention.  Because SQLite's default isolation ensures that a
+        // separate connection never sees uncommitted changes from another
+        // connection, reading from `second` after a failed transaction proves
+        // that no durable trace was left.
+        let second = ConfigStore::open(_dir.path()).await.unwrap();
+
+        // Pre-populate with known data.
+        let mut original_roles = vec![
+            RoleConfig {
+                role: "alpha".to_string(),
+                model: Some("m1".to_string()),
+                reasoning_effort: None,
+            },
+            RoleConfig {
+                role: "beta".to_string(),
+                model: Some("m2".to_string()),
+                reasoning_effort: Some("low".to_string()),
+            },
+        ];
+        let mut original_routings = vec![ModelRouting {
+            model: "m1".to_string(),
+            provider_order: Some("ProviderX".to_string()),
+            allow_fallbacks: Some(true),
+        }];
+        original_roles.sort_by(|a, b| a.role.cmp(&b.role));
+        original_routings.sort_by(|a, b| a.model.cmp(&b.model));
+        store
+            .save_routing_configs(&original_roles, &original_routings)
+            .await
+            .unwrap();
+
+        // Attempt to save rows with a duplicate role key.
+        // The second INSERT will hit the PRIMARY KEY constraint and fail.
+        let conflicting_roles = vec![
+            RoleConfig {
+                role: "collides".to_string(),
+                model: Some("first".to_string()),
+                reasoning_effort: None,
+            },
+            RoleConfig {
+                role: "collides".to_string(),
+                model: Some("second".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+        ];
+        let result = store.save_routing_configs(&conflicting_roles, &[]).await;
+        assert!(result.is_err(), "duplicate role key should cause an error");
+
+        // Read from the separate connection — only committed state is visible,
+        // proving the failed transaction had no permanent effect.
+        let saved_roles = second.get_all_role_configs().await.unwrap();
+        assert_eq!(
+            saved_roles, original_roles,
+            "role configs should be unchanged after rollback"
+        );
+
+        let saved_routings = second.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            saved_routings, original_routings,
+            "model routings should be unchanged after rollback"
+        );
     }
 }
