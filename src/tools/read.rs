@@ -350,38 +350,27 @@ impl ReadTool {
 
     /// List all top-level AST symbols with line ranges.
     async fn execute_symbols(&self, resolved_path: &Path) -> anyhow::Result<String> {
-        let ps = read_and_parse(resolved_path, "symbol extraction").await?;
+        let ctx = prepare_symbol_query(resolved_path, "symbol extraction").await?;
 
-        let query = build_symbol_query(&ps)?;
-
-        let root_node = ps.tree.root_node();
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, root_node, ps.source.as_bytes());
-        let mut symbols: Vec<String> = Vec::new();
-        matches.advance();
-        while let Some(m) = matches.get() {
-            for capture in m.captures {
-                let node = capture.node;
-                let name = node.utf8_text(ps.source.as_bytes()).unwrap_or("?");
-                let start = node.start_position().row + 1; // 1-based
-                let end = node.end_position().row + 1;
-                let kind = node.parent().map_or("?", |p| p.kind());
-
-                // Determine the kind prefix for display
-                let kind_label = symbol_kind_label(kind);
-                symbols.push(format!("  {kind_label} `{name}` ({start}-{end})"));
-            }
-            matches.advance();
-        }
-
-        symbols.sort();
-        symbols.dedup();
+        let symbols = collect_symbols(&ctx.ps, &ctx.query);
+        let mut lines: Vec<String> = symbols
+            .iter()
+            .map(|s| {
+                let kind_label = symbol_kind_label(&s.kind);
+                format!(
+                    "  {kind_label} `{}` ({}-{})",
+                    s.name, s.start_line, s.end_line
+                )
+            })
+            .collect();
+        lines.sort();
+        lines.dedup();
 
         let filename = display_filename(resolved_path);
-        let output = if symbols.is_empty() {
+        let output = if lines.is_empty() {
             format!("[No symbols found in {filename}]")
         } else {
-            format!("[Symbols in {filename}]\n{}", symbols.join("\n"))
+            format!("[Symbols in {filename}]\n{}", lines.join("\n"))
         };
 
         Ok(output)
@@ -400,19 +389,17 @@ impl ReadTool {
             }
         };
 
-        let ps = read_and_parse(resolved_path, "zoom").await?;
+        let ctx = prepare_symbol_query(resolved_path, "zoom").await?;
 
         // Find the named symbol via query-based matching (restricts to declarations only)
-        let query = build_symbol_query(&ps)?;
-
-        let root_node = ps.tree.root_node();
+        let root_node = ctx.ps.tree.root_node();
         let mut qcursor = QueryCursor::new();
-        let mut qmatches = qcursor.matches(&query, root_node, ps.source.as_bytes());
+        let mut qmatches = qcursor.matches(&ctx.query, root_node, ctx.ps.source.as_bytes());
         let mut found_node = None;
         qmatches.advance();
         while let Some(m) = qmatches.get() {
             for c in m.captures {
-                if let Ok(name) = c.node.utf8_text(ps.source.as_bytes())
+                if let Ok(name) = c.node.utf8_text(ctx.ps.source.as_bytes())
                     && name == symbol_name
                 {
                     // Found the matching declaration — grab parent node for zoom
@@ -427,7 +414,7 @@ impl ReadTool {
         }
 
         let Some(node) = found_node else {
-            let suggestions = Self::symbol_suggestions(&ps, symbol_name);
+            let suggestions = Self::symbol_suggestions(&ctx.ps, &ctx.query, symbol_name);
             if suggestions.is_empty() {
                 anyhow::bail!(
                     "Symbol '{symbol_name}' not found in {}",
@@ -444,7 +431,7 @@ impl ReadTool {
         let start = node.start_position().row + 1;
         let end = node.end_position().row + 1;
         let byte_range = node.byte_range();
-        let extracted = &ps.source[byte_range.start..byte_range.end];
+        let extracted = &ctx.ps.source[byte_range.start..byte_range.end];
         let kind_label = symbol_kind_label(node.kind());
 
         Ok(format!(
@@ -453,23 +440,17 @@ impl ReadTool {
     }
 
     /// Suggest symbol names when zoom lookup fails.
-    fn symbol_suggestions(ps: &ParsedSource, wanted: &str) -> Vec<String> {
-        let Ok(query) = build_symbol_query(ps) else {
-            return vec![];
-        };
-        let root_node = ps.tree.root_node();
-        let mut qcursor = QueryCursor::new();
-        let mut qmatches = qcursor.matches(&query, root_node, ps.source.as_bytes());
-        let mut names: Vec<String> = Vec::new();
-        qmatches.advance();
-        while let Some(m) = qmatches.get() {
-            for c in m.captures {
-                if let Ok(name) = c.node.utf8_text(ps.source.as_bytes()) {
-                    names.push(name.to_string());
-                }
-            }
-            qmatches.advance();
-        }
+    fn symbol_suggestions(ps: &ParsedSource, query: &Query, wanted: &str) -> Vec<String> {
+        // Use collect_symbols for cursor iteration, then filter out any "?"
+        // placeholders that were substituted for non-UTF-8 bytes. This preserves
+        // the original behavior where unrepresentable identifiers were silently
+        // skipped (old code used `if let Ok(name) = utf8_text(...)`).
+        let symbols = collect_symbols(ps, query);
+        let mut names: Vec<String> = symbols
+            .into_iter()
+            .map(|s| s.name)
+            .filter(|n| n != "?")
+            .collect();
         names.sort();
         names.dedup();
 
@@ -500,6 +481,7 @@ fn display_filename(path: &Path) -> &str {
     path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
 }
 
+#[derive(Debug)]
 struct ParsedSource {
     source: String,
     ext: String,
@@ -673,6 +655,69 @@ fn build_symbol_query(ps: &ParsedSource) -> anyhow::Result<Query> {
     let query_str = language_support(&ps.ext).map_or("", |ls| ls.symbol_query);
     Query::new(&ps.language, query_str)
         .map_err(|e| anyhow::anyhow!("Failed to build symbol query: {e}"))
+}
+
+/// A single symbol extracted from a tree-sitter query match.
+#[derive(Debug)]
+struct SymbolMatch {
+    name: String,
+    start_line: usize,
+    end_line: usize,
+    kind: String,
+}
+
+/// Bundles a parsed source file with its compiled symbol query,
+/// avoiding redundant `build_symbol_query` calls.
+#[derive(Debug)]
+struct SymbolQueryContext {
+    ps: ParsedSource,
+    query: Query,
+}
+
+/// Parse and build a symbol query for the given file path.
+///
+/// Returns an error if the file cannot be read, has an unsupported extension,
+/// or the symbol query fails to compile.
+async fn prepare_symbol_query(
+    resolved_path: &Path,
+    mode: &str,
+) -> anyhow::Result<SymbolQueryContext> {
+    let ps = read_and_parse(resolved_path, mode).await?;
+    let query = build_symbol_query(&ps)?;
+    Ok(SymbolQueryContext { ps, query })
+}
+
+/// Collect all symbol matches from a parsed source using the given query.
+///
+/// Returns unsorted results — callers are responsible for sorting and dedup
+/// as needed. This function is infallible once a valid [`ParsedSource`] and
+/// [`Query`] have been obtained.
+fn collect_symbols(ps: &ParsedSource, query: &Query) -> Vec<SymbolMatch> {
+    let root_node = ps.tree.root_node();
+    let mut cursor = QueryCursor::new();
+    let mut matches_iter = cursor.matches(query, root_node, ps.source.as_bytes());
+    let mut symbols = Vec::new();
+    matches_iter.advance();
+    while let Some(m) = matches_iter.get() {
+        for capture in m.captures {
+            let node = capture.node;
+            let name = node
+                .utf8_text(ps.source.as_bytes())
+                .unwrap_or("?")
+                .to_string();
+            let start_line = node.start_position().row + 1;
+            let end_line = node.end_position().row + 1;
+            let kind = node.parent().map_or("?", |p| p.kind()).to_string();
+            symbols.push(SymbolMatch {
+                name,
+                start_line,
+                end_line,
+                kind,
+            });
+        }
+        matches_iter.advance();
+    }
+    symbols
 }
 
 /// Map tree-sitter node kind to a short human-readable label.
@@ -1405,5 +1450,124 @@ mod utils;
         assert!(!is_sensitive_file_path("src/main.rs"));
         assert!(!is_sensitive_file_path("crates/foo/lib.rs"));
         assert!(!is_sensitive_file_path("README.md"));
+    }
+
+    // ── prepare_symbol_query / collect_symbols ──────────────────────────────
+
+    #[tokio::test]
+    async fn prepare_symbol_query_valid_file() {
+        let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn hello() {}\nstruct World;\n")]);
+        let file_path = ws_path.join("lib.rs");
+
+        let result = prepare_symbol_query(&file_path, "test").await;
+        assert!(
+            result.is_ok(),
+            "prepare_symbol_query should succeed for .rs: {result:?}"
+        );
+
+        let ctx = result.unwrap();
+        // The query was built successfully
+        assert_eq!(ctx.ps.ext, "rs");
+        // collect_symbols should find our symbols
+        let symbols = collect_symbols(&ctx.ps, &ctx.query);
+        assert_eq!(symbols.len(), 2, "expected 2 symbols, got {symbols:?}");
+        // fn hello
+        assert!(symbols.iter().any(|s| s.name == "hello"));
+        // struct World
+        assert!(symbols.iter().any(|s| s.name == "World"));
+    }
+
+    #[tokio::test]
+    async fn prepare_symbol_query_unsupported_extension() {
+        let (_dir, ws_path) = temp_workspace(&[("data.txt", "hello world")]);
+        let file_path = ws_path.join("data.txt");
+
+        let result = prepare_symbol_query(&file_path, "test").await;
+        assert!(result.is_err(), "expected error for unsupported extension");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("Unsupported"),
+            "error should mention unsupported: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_symbols_empty_file() {
+        let (_dir, ws_path) = temp_workspace(&[("empty.rs", "")]);
+        let file_path = ws_path.join("empty.rs");
+
+        let ctx = prepare_symbol_query(&file_path, "test").await.unwrap();
+        let symbols = collect_symbols(&ctx.ps, &ctx.query);
+        assert!(
+            symbols.is_empty(),
+            "expected no symbols in empty file, got {symbols:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_symbols_multiple_captures() {
+        // A Rust file with various symbol types
+        let code = r#"
+fn foo() {}
+fn bar() {}
+struct Baz;
+enum Qux {}
+impl Baz {}
+"#;
+        let (_dir, ws_path) = temp_workspace(&[("main.rs", code)]);
+        let file_path = ws_path.join("main.rs");
+
+        let ctx = prepare_symbol_query(&file_path, "test").await.unwrap();
+        let symbols = collect_symbols(&ctx.ps, &ctx.query);
+        // We expect: foo, bar, Baz, Qux, Baz (impl)
+        assert_eq!(symbols.len(), 5, "expected 5 symbols, got {symbols:?}");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"foo"));
+        assert!(names.contains(&"bar"));
+        assert!(names.contains(&"Baz"));
+        assert!(names.contains(&"Qux"));
+    }
+
+    #[tokio::test]
+    async fn execute_symbols_integration() {
+        let (_dir, ws_path) = temp_workspace(&[("app.rs", "fn greet() {}\nstruct Person;\n")]);
+        let result = ReadTool
+            .execute(
+                &crate::workspace::test_ws(&ws_path),
+                json!({"path": "app.rs", "mode": "symbols"}),
+            )
+            .await;
+        assert!(result.is_ok(), "execute_symbols should succeed: {result:?}");
+        let output = result.unwrap();
+        assert!(
+            output.contains("`greet`"),
+            "output should contain greet: {output}"
+        );
+        assert!(
+            output.contains("`Person`"),
+            "output should contain Person: {output}"
+        );
+        assert!(
+            output.contains("fn"),
+            "output should have 'fn' kind label: {output}"
+        );
+        assert!(
+            output.contains("struct"),
+            "output should have 'struct' kind label: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_symbols_preserves_line_numbers() {
+        let code = "fn hello() {}\n\n\nfn world() {}\n";
+        let (_dir, ws_path) = temp_workspace(&[("lib.rs", code)]);
+        let file_path = ws_path.join("lib.rs");
+
+        let ctx = prepare_symbol_query(&file_path, "test").await.unwrap();
+        let symbols = collect_symbols(&ctx.ps, &ctx.query);
+        let hello = symbols.iter().find(|s| s.name == "hello").unwrap();
+        let world = symbols.iter().find(|s| s.name == "world").unwrap();
+        assert_eq!(hello.start_line, 1, "hello starts at line 1");
+        assert_eq!(world.start_line, 4, "world starts at line 4");
     }
 }
