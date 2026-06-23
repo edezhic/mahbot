@@ -625,7 +625,8 @@ Use this tool only for inspection: reading files, listing directories, running c
 //   2.  short_circuit          — match success patterns (skipped for chained
 //                                commands to preserve later-segment output)
 //   3.  strip lines            — drop lines via regex patterns
-//   4.  collapse               — collapse consecutive identical + blank lines
+//   4a. collapse_blank_lines    — collapse blank lines first (must precede 4b)
+//   4b. collapse_consecutive    — collapse consecutive identical content lines
 //   5.  max_line_len           — cap individual line length
 //   6.  line_truncation        — head/tail sandwich + max_lines cap
 //   7.  on_empty               — fallback message when all output stripped
@@ -1300,7 +1301,7 @@ fn match_short_circuit<'a>(output: &str, short_circuits: &'a [ShortCircuit]) -> 
 }
 
 /// Apply strip_lines filter.
-fn apply_line_filters(output: &str, profile: &Profile) -> String {
+fn apply_strip_lines(output: &str, profile: &Profile) -> String {
     output
         .lines()
         .filter(|l| {
@@ -1452,7 +1453,7 @@ fn apply_profile_pipeline(
     let mut processed = output.to_string();
 
     // Stage 3: strip lines
-    processed = apply_line_filters(&processed, profile);
+    processed = apply_strip_lines(&processed, profile);
 
     // Stage 4-4b: collapse blank lines first, then consecutive content lines.
     // Blank-line collapse must run first: otherwise collapse_consecutive_lines
@@ -1464,7 +1465,7 @@ fn apply_profile_pipeline(
 
     // Stage 5: truncate long lines
     if let Some(max) = profile.max_line_len {
-        processed = truncate_long_lines(&processed, max);
+        processed = truncate_line_width(&processed, max);
     }
 
     // Stage 6: line truncation (head/tail + max_lines).
@@ -1646,7 +1647,7 @@ fn collapse_consecutive_lines(input: &str) -> String {
 }
 
 /// Truncate any single line exceeding `max_line_len` with a note.
-fn truncate_long_lines(input: &str, max_line_len: usize) -> String {
+fn truncate_line_width(input: &str, max_line_len: usize) -> String {
     let mut result = String::with_capacity(input.len());
     for line in input.lines() {
         if !result.is_empty() {
@@ -2054,7 +2055,7 @@ mod tests {
     #[test]
     fn long_lines_truncated() {
         let long = "a".repeat(500);
-        let result = truncate_long_lines(&long, 100);
+        let result = truncate_line_width(&long, 100);
         assert!(result.len() < long.len() + 100, "should truncate");
         assert!(
             result.contains("more chars on this line"),
@@ -2081,7 +2082,7 @@ mod tests {
     #[test]
     fn short_lines_preserved() {
         let input = "hello\nworld";
-        let result = truncate_long_lines(input, 500);
+        let result = truncate_line_width(input, 500);
         assert_eq!(result, input, "short lines should pass through");
     }
 
