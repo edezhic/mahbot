@@ -189,7 +189,6 @@ pub fn spawn_scoped_typing_task(
             );
             return;
         };
-        let channel = channel;
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
