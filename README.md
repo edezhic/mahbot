@@ -23,7 +23,7 @@ Every ticket runs through a fixed lifecycle with **redundant checks**:
 | **Backlog → Analysis** | 3 parallel Analysts research and score the ticket |
 | **Planning** | Manager notified; moves the ticket to development when ready once the scope is confirmed |
 | **Ready → In development** | 1 Engineer implements using subagents when needed |
-| **In diagnostics** | Discovered project commands run (format, lint, build, test)—not an LLM guessing |
+| **In diagnostics** | Discovered project commands run (format, lint, build, test) |
 | **Diagnostics done → In review** | 3 parallel Reviewers (all must pass ≥ 9/10) |
 | **Reviewed → In QA** | 3 parallel QA agents (all must pass ≥ 9/10) |
 | **QA passed** | Auto `git commit` with the ticket's title if the tree is dirty → **Done** |
