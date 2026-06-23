@@ -14,6 +14,7 @@ use fff_search::parse_grep_query;
 use fff_search::{Constraint, GitStatusFilter};
 use serde_json::json;
 use std::fmt::Write;
+use std::sync::LazyLock;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
 const MAX_RESULTS_LIMIT: usize = 500;
@@ -50,29 +51,26 @@ pub(crate) const QUERY_ALIAS_KEYS: &[&str] = &["pattern", "search", "search_term
 /// - Constraint params: `path`, `ext`
 /// - Mode switch: `file_pattern`
 ///
-/// ⚠ Rust const slices cannot be concatenated at compile time, so the
-/// values are duplicated here. The regression test
-/// `known_keys_includes_query_alias_keys` enforces consistency.
-const KNOWN_KEYS: &[&str] = &[
-    // schema keys
-    "mode",
-    "query",
-    "grep_mode",
-    "case_sensitive",
-    "max_results",
-    "offset",
-    "context_lines",
+/// Built at runtime via [`LazyLock`] so that adding a new alias to
+/// [`QUERY_ALIAS_KEYS`] automatically propagates here — no manual
+/// duplication needed.
+static KNOWN_KEYS: LazyLock<Vec<&str>> = LazyLock::new(|| {
+    let mut keys = vec![
+        // schema keys
+        "mode",
+        "query",
+        "grep_mode",
+        "case_sensitive",
+        "max_results",
+        "offset",
+        "context_lines",
+    ];
     // query aliases (see QUERY_ALIAS_KEYS)
-    "pattern",
-    "search",
-    "search_term",
-    "grep_search",
-    // mode-switching alias (not a query alias — converts to files-mode)
-    "file_pattern",
-    // constraint params
-    "path",
-    "ext",
-];
+    keys.extend_from_slice(QUERY_ALIAS_KEYS);
+    // mode-switching alias + constraint params
+    keys.extend_from_slice(&["file_pattern", "path", "ext"]);
+    keys
+});
 
 /// Repair common agent mistakes in search tool arguments before execution.
 fn normalize_search_args(args: &mut serde_json::Value) {
@@ -1125,21 +1123,6 @@ mod tests {
     }
 
     // ── QUERY_ALIAS_KEYS / KNOWN_KEYS consistency ──────────────────────
-
-    #[test]
-    fn known_keys_includes_query_alias_keys() {
-        // Every query alias must appear in KNOWN_KEYS to prevent
-        // unknown-parameter false-positives. Since Rust const slices
-        // cannot be concatenated at compile time, this test enforces
-        // the invariant documented on KNOWN_KEYS.
-        for alias in QUERY_ALIAS_KEYS {
-            assert!(
-                KNOWN_KEYS.contains(alias),
-                "QUERY_ALIAS_KEYS entry \"{alias}\" is missing from KNOWN_KEYS; \
-                 update the duplicate list in KNOWN_KEYS"
-            );
-        }
-    }
 
     #[test]
     fn known_keys_contains_all_expected_keys() {
