@@ -708,39 +708,13 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> Result<CommitInf
     // Stage all changes (tracked, untracked, removed) in the worktree.
     run_git_command(repo_path, &["add", "-A"]).await?;
 
-    let output = tokio::process::Command::new("git")
-        .args(["commit", "-m", message])
-        .current_dir(repo_path)
-        .output()
+    run_git_command(repo_path, &["commit", "-m", message])
         .await
-        .map_err(|e| format!("Failed to run git commit: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("Commit failed: {}", stderr.trim()));
-    }
+        .map_err(|e| format!("Commit failed: {}", e.trim()))?;
 
     // Capture the full 40-char SHA — reliable source, not abbreviated.
-    let hash = match tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_path)
-        .env("LC_ALL", "C")
-        .output()
-        .await
-    {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            warn!(
-                stderr = %stderr.trim(),
-                "git rev-parse HEAD failed after successful commit — commit exists, returning unknown hash"
-            );
-            return Ok(CommitInfo {
-                hash: "unknown".into(),
-                lines_added: 0,
-                lines_removed: 0,
-            });
-        }
+    let hash = match run_git_command(repo_path, &["rev-parse", "HEAD"]).await {
+        Ok(out) => out.trim().to_string(),
         Err(e) => {
             warn!(
                 error = %e,
@@ -790,27 +764,14 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> Result<CommitInf
 /// is empty). Returns `None` on any error — command failure, non-zero exit,
 /// or spawn failure — after logging a warning. Stats are non-critical.
 async fn parse_numstat(repo_path: &Path, args: &[&str]) -> Option<(i64, i64)> {
-    let output = match tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .env("LC_ALL", "C")
-        .output()
-        .await
-    {
-        Ok(o) => o,
+    let stdout = match run_git_command(repo_path, args).await {
+        Ok(out) => out,
         Err(e) => {
-            warn!(error = %e, args = ?args, "git diff --numstat failed");
+            warn!(args = ?args, error = %e, "git diff --numstat failed");
             return None;
         }
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(stderr = %stderr.trim(), args = ?args, "git diff --numstat command failed");
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines_added: i64 = 0;
     let mut lines_removed: i64 = 0;
 
