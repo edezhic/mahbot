@@ -617,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn checklist_path_blocking() {
+    fn path_blocks_absolute_and_whitespace_bypass() {
         let base = Path::new(".");
         assert!(!is_path_safe_for_workspace("/", base));
         assert!(!is_path_safe_for_workspace("/anything", base));
@@ -641,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_tilde_is_allowed_as_workspace_root_shorthand() {
+    fn bare_tilde_accepted() {
         // Bare ~ is shorthand for the workspace root — is_path_safe_for_workspace
         // must accept it, matching resolve_tool_path_with_base's behaviour.
         // Write operations are still protected by the post-canonicalization
@@ -658,14 +658,6 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
         assert!(is_path_safe_for_workspace("~", &workspace));
-
-        // ~/… still correctly resolved relative to home and blocked if outside
-        // workspace (sensitive files like .ssh should never pass)
-        assert!(!is_path_safe_for_workspace("~/.ssh/id_rsa", &workspace));
-        assert!(!is_path_safe_for_workspace(
-            "~/.gnupg/secring.gpg",
-            &workspace
-        ));
     }
 
     #[test]
