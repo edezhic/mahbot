@@ -2936,60 +2936,55 @@ mod tests {
     // Pure quote-tracking state machine — escape handling is caller's concern.
 
     #[test]
-    fn check_outside_quotes_normal_chars() {
-        let (mut s, mut d) = (false, false);
-        assert!(check_outside_quotes('a', &mut s, &mut d));
-        assert!(!s && !d);
-    }
+    fn check_outside_quotes_cases() {
+        // Each case: (name, &[(char, expected_return, in_single, in_double)])
+        let cases: &[(&str, &[(char, bool, bool, bool)])] = &[
+            ("normal char outside", &[('a', true, false, false)]),
+            (
+                "single quote blocks",
+                &[
+                    ('\'', false, true, false),
+                    ('>', false, true, false),
+                    ('\'', false, false, false),
+                    ('>', true, false, false),
+                ],
+            ),
+            (
+                "double quote blocks",
+                &[
+                    ('"', false, false, true),
+                    ('>', false, false, true),
+                    ('"', false, false, false),
+                    ('>', true, false, false),
+                ],
+            ),
+            (
+                "single inside double",
+                &[('"', false, false, true), ('\'', false, false, true)],
+            ),
+            (
+                "double inside single",
+                &[('\'', false, true, false), ('"', false, true, false)],
+            ),
+        ];
 
-    #[test]
-    fn check_outside_quotes_single_quote_blocks() {
-        let (mut s, mut d) = (false, false);
-        assert!(!check_outside_quotes('\'', &mut s, &mut d)); // open
-        assert!(s);
-        assert!(!check_outside_quotes('>', &mut s, &mut d)); // inside
-        assert!(!check_outside_quotes('\'', &mut s, &mut d)); // close
-        assert!(!s);
-        assert!(check_outside_quotes('>', &mut s, &mut d)); // back outside
-    }
-
-    #[test]
-    fn check_outside_quotes_double_quote_blocks() {
-        let (mut s, mut d) = (false, false);
-        assert!(!check_outside_quotes('"', &mut s, &mut d)); // open
-        assert!(d);
-        assert!(!check_outside_quotes('>', &mut s, &mut d)); // inside
-        assert!(!check_outside_quotes('"', &mut s, &mut d)); // close
-        assert!(!d);
-        assert!(check_outside_quotes('>', &mut s, &mut d)); // back outside
-    }
-
-    #[test]
-    fn check_outside_quotes_single_inside_double() {
-        // "foo'bar" — single quote inside double quotes is just a char
-        let (mut s, mut d) = (false, false);
-        assert!(!check_outside_quotes('"', &mut s, &mut d)); // open double
-        assert!(d);
-        assert!(!check_outside_quotes('\'', &mut s, &mut d)); // ' inside " = no effect
-        assert!(d); // still inside double
-        assert!(!s); // single never opened
-    }
-
-    #[test]
-    fn check_outside_quotes_double_inside_single() {
-        // 'foo"bar' — double quote inside single quotes is just a char
-        let (mut s, mut d) = (false, false);
-        assert!(!check_outside_quotes('\'', &mut s, &mut d)); // open single
-        assert!(s);
-        assert!(!check_outside_quotes('"', &mut s, &mut d)); // " inside ' = no effect
-        assert!(s); // still inside single
-        assert!(!d); // double never opened
-    }
-
-    #[test]
-    fn check_outside_quotes_empty_input_no_panic() {
-        // No chars — the function is never called, but verify state is sane
-        let (s, d) = (false, false);
-        assert!(!s && !d);
+        for (name, steps) in cases {
+            let (mut s, mut d) = (false, false);
+            for (i, &(ch, exp_out, exp_s, exp_d)) in steps.iter().enumerate() {
+                let result = check_outside_quotes(ch, &mut s, &mut d);
+                assert_eq!(
+                    result, exp_out,
+                    "{name} step {i}: check_outside_quotes({ch:?}) returned {result}, expected {exp_out}",
+                );
+                assert_eq!(
+                    s, exp_s,
+                    "{name} step {i}: after {ch:?}, in_single={s}, expected {exp_s}",
+                );
+                assert_eq!(
+                    d, exp_d,
+                    "{name} step {i}: after {ch:?}, in_double={d}, expected {exp_d}",
+                );
+            }
+        }
     }
 }
