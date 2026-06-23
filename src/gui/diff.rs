@@ -368,27 +368,13 @@ impl DiffState {
                 self.file_tree.nodes = build_tree(&self.diff_files);
                 self.file_tree.rebuild_visible();
                 // Place focus on the toggled directory.
-                if let Some(pos) = self
-                    .file_tree
-                    .visible_tree_nodes
-                    .iter()
-                    .position(|(p, _)| p == &path)
-                {
-                    self.file_tree.tree_focus_index = pos;
-                }
+                self.file_tree.focus_path(&path);
                 Task::none()
             }
             DiffMessage::SelectFile(path) => {
                 self.file_tree.tree_focused = false;
                 // Remember the clicked file's position for Ctrl+B re-focus.
-                if let Some(pos) = self
-                    .file_tree
-                    .visible_tree_nodes
-                    .iter()
-                    .position(|(p, _)| p == &path)
-                {
-                    self.file_tree.tree_focus_index = pos;
-                }
+                self.file_tree.focus_path(&path);
                 if self.selected_file.as_deref() == Some(&path) {
                     self.selected_file = None;
                 } else {
@@ -659,13 +645,7 @@ impl DiffState {
                     self.file_tree.expanded_dirs.remove(&path);
                     self.file_tree.nodes = build_tree(&self.diff_files);
                     self.file_tree.rebuild_visible();
-                    if let Some(pos) = self
-                        .file_tree
-                        .visible_tree_nodes
-                        .iter()
-                        .position(|(p, _)| p == &path)
-                    {
-                        self.file_tree.tree_focus_index = pos;
+                    if self.file_tree.focus_path(&path).is_some() {
                         return widgets::scroll_to_tree_focus(&self.file_tree);
                     }
                     return Task::none();
@@ -676,17 +656,10 @@ impl DiffState {
                     .parent()
                     .map(|p| p.to_string_lossy().to_string());
                 match parent {
-                    Some(ref p) if !p.is_empty() => {
-                        if let Some(parent_idx) = self
-                            .file_tree
-                            .visible_tree_nodes
-                            .iter()
-                            .position(|(vp, _)| vp == p)
-                        {
-                            self.file_tree.tree_focus_index = parent_idx;
+                    Some(ref p) if !p.is_empty()
+                        && self.file_tree.focus_path(p).is_some() => {
                             return widgets::scroll_to_tree_focus(&self.file_tree);
                         }
-                    }
                     _ => {} // Root-level item has no parent — no-op.
                 }
                 Task::none()
@@ -714,12 +687,7 @@ impl DiffState {
                     self.file_tree.nodes = build_tree(&self.diff_files);
                     self.file_tree.rebuild_visible();
                     // Move focus to first child (right after the directory).
-                    if let Some(dir_idx) = self
-                        .file_tree
-                        .visible_tree_nodes
-                        .iter()
-                        .position(|(p, _)| p == &path)
-                    {
+                    if let Some(dir_idx) = self.file_tree.focus_path(&path) {
                         if dir_idx + 1 < self.file_tree.visible_tree_nodes.len() {
                             self.file_tree.tree_focus_index = dir_idx + 1;
                             return widgets::scroll_to_tree_focus(&self.file_tree);

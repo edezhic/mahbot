@@ -243,6 +243,20 @@ impl FileTree {
         self.tree_focus_index = 0;
         self.visible_tree_nodes.clear();
     }
+
+    /// Set the focus index to the visible-tree position of `path`, if found.
+    ///
+    /// Returns the found position, or [`None`] if `path` is not in the visible tree.
+    /// The caller can use the returned position for additional logic (e.g. advancing
+    /// focus past a directory to its first child).
+    pub fn focus_path(&mut self, path: &str) -> Option<usize> {
+        let pos = self
+            .visible_tree_nodes
+            .iter()
+            .position(|(p, _)| p == path)?;
+        self.tree_focus_index = pos;
+        Some(pos)
+    }
 }
 
 /// Estimated height per tree row for scroll-into-view on keyboard navigation.
@@ -370,4 +384,62 @@ pub fn tree_node_button<'a, Message: Clone + 'a>(
         btn = btn.on_press(msg);
     }
     btn.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a FileTree with known visible_tree_nodes for testing.
+    fn make_tree(nodes: Vec<(&str, bool)>) -> FileTree {
+        let mut tree = FileTree::new(iced::widget::Id::new("test"));
+        tree.visible_tree_nodes = nodes
+            .into_iter()
+            .map(|(p, is_dir)| (p.to_string(), is_dir))
+            .collect();
+        tree
+    }
+
+    #[test]
+    fn focus_path_found() {
+        let mut tree = make_tree(vec![
+            ("src", true),
+            ("src/main.rs", false),
+            ("Cargo.toml", false),
+        ]);
+        assert_eq!(tree.focus_path("src/main.rs"), Some(1));
+        assert_eq!(tree.tree_focus_index, 1);
+    }
+
+    #[test]
+    fn focus_path_not_found() {
+        let mut tree = make_tree(vec![("src", true), ("Cargo.toml", false)]);
+        tree.tree_focus_index = 42;
+        assert_eq!(tree.focus_path("nonexistent"), None);
+        assert_eq!(tree.tree_focus_index, 42);
+    }
+
+    #[test]
+    fn focus_path_empty_tree() {
+        let mut tree = make_tree(vec![]);
+        assert_eq!(tree.focus_path("anything"), None);
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn focus_path_first_node() {
+        let mut tree = make_tree(vec![("src", true), ("src/main.rs", false)]);
+        assert_eq!(tree.focus_path("src"), Some(0));
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn focus_path_updates_index_no_residual() {
+        let mut tree = make_tree(vec![("a", false), ("b", false), ("c", false)]);
+        // Focus on "c", then re-focus on "a" — should end up at index 0.
+        tree.focus_path("c");
+        assert_eq!(tree.tree_focus_index, 2);
+        tree.focus_path("a");
+        assert_eq!(tree.tree_focus_index, 0);
+    }
 }

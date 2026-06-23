@@ -1872,14 +1872,7 @@ impl EditorState {
                     self.rebuild_tree();
                     self.file_tree.tree_focused = true;
                     // Place focus on the collapsed directory.
-                    if let Some(pos) = self
-                        .file_tree
-                        .visible_tree_nodes
-                        .iter()
-                        .position(|(p, _)| p == &dir_path)
-                    {
-                        self.file_tree.tree_focus_index = pos;
-                    }
+                    self.file_tree.focus_path(&dir_path);
                     Task::none()
                 } else {
                     self.file_tree.expanded_dirs.insert(dir_path.clone());
@@ -1912,27 +1905,13 @@ impl EditorState {
                         self.rebuild_tree();
                         self.file_tree.tree_focused = true;
                         // Place focus on the expanding directory.
-                        if let Some(pos) = self
-                            .file_tree
-                            .visible_tree_nodes
-                            .iter()
-                            .position(|(p, _)| p == &dir_path)
-                        {
-                            self.file_tree.tree_focus_index = pos;
-                        }
+                        self.file_tree.focus_path(&dir_path);
                         read_task
                     } else {
                         self.rebuild_tree();
                         self.file_tree.tree_focused = true;
                         // Place focus on the expanding directory.
-                        if let Some(pos) = self
-                            .file_tree
-                            .visible_tree_nodes
-                            .iter()
-                            .position(|(p, _)| p == &dir_path)
-                        {
-                            self.file_tree.tree_focus_index = pos;
-                        }
+                        self.file_tree.focus_path(&dir_path);
                         Task::none()
                     }
                 }
@@ -1942,14 +1921,7 @@ impl EditorState {
                 self.file_tree.tree_focused = false;
                 self.pending_enter_dir = None;
                 // Remember the clicked file's position for Ctrl+B re-focus.
-                if let Some(pos) = self
-                    .file_tree
-                    .visible_tree_nodes
-                    .iter()
-                    .position(|(p, _)| p == &path)
-                {
-                    self.file_tree.tree_focus_index = pos;
-                }
+                self.file_tree.focus_path(&path);
                 self.selected_file = Some(path.clone());
 
                 // Resolve tree-relative path against workspace root so that
@@ -2646,13 +2618,7 @@ impl EditorState {
                     // Collapse expanded directory and keep focus on it.
                     self.file_tree.expanded_dirs.remove(&path);
                     self.rebuild_tree();
-                    if let Some(pos) = self
-                        .file_tree
-                        .visible_tree_nodes
-                        .iter()
-                        .position(|(p, _)| p == &path)
-                    {
-                        self.file_tree.tree_focus_index = pos;
+                    if self.file_tree.focus_path(&path).is_some() {
                         return widgets::scroll_to_tree_focus(&self.file_tree);
                     }
                     return Task::none();
@@ -2663,17 +2629,10 @@ impl EditorState {
                     .parent()
                     .map(|p| p.to_string_lossy().to_string());
                 match parent {
-                    Some(ref p) if !p.is_empty() => {
-                        if let Some(parent_idx) = self
-                            .file_tree
-                            .visible_tree_nodes
-                            .iter()
-                            .position(|(vp, _)| vp == p)
-                        {
-                            self.file_tree.tree_focus_index = parent_idx;
+                    Some(ref p) if !p.is_empty()
+                        && self.file_tree.focus_path(p).is_some() => {
                             return widgets::scroll_to_tree_focus(&self.file_tree);
                         }
-                    }
                     _ => {} // Root-level item has no parent — no-op.
                 }
                 Task::none()
@@ -2732,12 +2691,7 @@ impl EditorState {
                         return task;
                     }
                     // Synchronous expansion — children available now.
-                    if let Some(dir_idx) = self
-                        .file_tree
-                        .visible_tree_nodes
-                        .iter()
-                        .position(|(p, _)| p == &path)
-                    {
+                    if let Some(dir_idx) = self.file_tree.focus_path(&path) {
                         if dir_idx + 1 < self.file_tree.visible_tree_nodes.len() {
                             self.file_tree.tree_focus_index = dir_idx + 1;
                             return Task::batch([
@@ -3456,12 +3410,7 @@ impl EditorState {
                     self.pending_enter_dir = None;
                     // Find the directory's position in the new visible list
                     // and advance to the first child.
-                    if let Some(pos) = self
-                        .file_tree
-                        .visible_tree_nodes
-                        .iter()
-                        .position(|(p, _)| p == dir_path)
-                    {
+                    if let Some(pos) = self.file_tree.focus_path(dir_path) {
                         if pos + 1 < self.file_tree.visible_tree_nodes.len() {
                             self.file_tree.tree_focus_index = pos + 1;
                             return widgets::scroll_to_tree_focus(&self.file_tree);
