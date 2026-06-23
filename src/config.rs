@@ -104,10 +104,10 @@ pub struct ConfigData {
 // ── String config field mapping ──────────────────────────────────
 //
 // The three runtime sync items (`STRUCT_FIELDS_DEFAULT`, `string_fields()`,
-// `set_string_field()`) plus the test-only `STRING_CONFIG_KEYS` constant
-// are generated from a single field-name declaration by the
+// `set_string_field()`) plus the typed accessors on [`ConfigReload`]
+// are all generated from a single annotated field-name declaration by the
 // `string_config_fields!` macro — adding or removing a field in the
-// macro invocation updates all four automatically, eliminating the
+// macro invocation updates all items automatically, eliminating the
 // entire class of sync bugs.
 //
 // ══ Structural protection ═════════════════════════════════════════
@@ -126,16 +126,29 @@ pub struct ConfigData {
 // A field missing from the macro would appear editable in the UI but
 // silently discard on save.  The compiler guard above prevents this.
 //
-// Per-field accessors on [`ConfigReload`] are written explicitly
-// below (see "String config accessors") so IDE navigation works.
+// ══ Per-field accessor patterns ═════════════════════════════════════
+//
+// Each field is annotated with one of three patterns:
+//
+// * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
+// * `or(DEFAULT)` — returns `String`, falls back to the given default constant.
+// * `list_or(fallback = <field>, default = <const>)` — returns `Vec<String>`,
+//   parses a newline-separated list, falls back to the named field then
+//   the default constant.
+//
+// The generated accessors live on `impl ConfigReload` and follow the exact
+// same signatures as the hand-written ones they replaced.
 
 /// Generate the runtime sync methods `string_fields()` and `set_string_field()`,
-/// the const `STRUCT_FIELDS_DEFAULT`, and the test-only `STRING_CONFIG_KEYS`
-/// constant from a single list of `Option<String>` field names.
+/// the const `STRUCT_FIELDS_DEFAULT`, the test-only `STRING_CONFIG_KEYS`
+/// constant, **and** the typed accessors on [`ConfigReload`] — all from a single
+/// annotated list of `Option<String>` field names.
 ///
-/// Each field name corresponds to a field on [`ConfigData`] and becomes the
-/// database key (via `stringify!`).  All generated items are guaranteed to stay
-/// synchronised because they expand from the same source.
+/// Each field is declared as `$field [$annotation]` where `$annotation` is one of
+/// `non_empty`, `or($default)`, or `list_or(fallback = $fallback, default = $default)`.
+///
+/// All generated items are guaranteed to stay synchronised because they expand
+/// from the same source.
 ///
 /// ## Structural drift protection
 ///
@@ -147,7 +160,12 @@ pub struct ConfigData {
 /// error.  This eliminates the entire class of silent-drift bugs without manual
 /// count constants or runtime tests.
 macro_rules! string_config_fields {
-    ($($field:ident),* $(,)?) => {
+    // ── Entry point: parse annotated field list ─────────────────
+    (
+        $(
+            $field:ident [ $($annotation:tt)* ]
+        ),* $(,)?
+    ) => {
         /// All database keys that [`ConfigData::string_fields`] recognises.
         #[cfg(test)]
         pub(crate) const STRING_CONFIG_KEYS: &[&str] = &[$(stringify!($field)),*];
@@ -210,22 +228,76 @@ macro_rules! string_config_fields {
                 $(self.$field = non_empty(self.$field.take());)*
             }
         }
+
+        // ── Generate typed accessors on ConfigReload ────────────
+        impl ConfigReload {
+            $(
+                string_config_fields!(@accessor $field $($annotation)*);
+            )*
+        }
+    };
+
+    // ── Accessor pattern: non_empty ─────────────────────────────
+    //
+    // Returns Option<String>, collapses empty/whitespace to None.
+    (@accessor $field:ident non_empty) => {
+        #[doc = concat!(
+            "Returns the configured `", stringify!($field),
+            "`, with empty/whitespace values collapsed to `None`."
+        )]
+        #[must_use]
+        pub fn $field(&self) -> Option<String> {
+            non_empty(self.read().$field.clone())
+        }
+    };
+
+    // ── Accessor pattern: or(DEFAULT) ───────────────────────────
+    //
+    // Returns String, falls back to the given default constant.
+    (@accessor $field:ident or($default:expr)) => {
+        #[doc = concat!(
+            "Returns the configured `", stringify!($field),
+            "`, falling back to the default if unset."
+        )]
+        #[must_use]
+        pub fn $field(&self) -> String {
+            resolve_or(self.read().$field.clone(), $default)
+        }
+    };
+
+    // ── Accessor pattern: list_or(fallback = <field>, default = <const>) ──
+    //
+    // Returns Vec<String>, parses a newline-separated list, falls back to the
+    // named singular field then the hardcoded default constant.
+    (@accessor $field:ident list_or(fallback = $fallback:ident, default = $default:expr)) => {
+        #[doc = concat!(
+            "Returns the list of available `", stringify!($field), "`."
+        )]
+        #[must_use]
+        pub fn $field(&self) -> Vec<String> {
+            let guard = self.read();
+            resolve_list_or(
+                guard.$field.as_ref(),
+                guard.$fallback.clone(),
+                $default,
+            )
+        }
     };
 }
 
 string_config_fields! {
-    provider_key,
-    provider_endpoint,
-    image_transcription_model,
-    audio_transcription_model,
-    transcription_provider,
-    audio_transcription_provider,
-    image_gen_model,
-    image_gen_models,
-    video_gen_model,
-    video_gen_models,
-    exa_key,
-    telegram_bot_token,
+    provider_key [non_empty],
+    provider_endpoint [or(DEFAULT_PROVIDER_ENDPOINT)],
+    image_transcription_model [or(DEFAULT_IMAGE_TRANSCRIPTION_MODEL)],
+    audio_transcription_model [or(DEFAULT_AUDIO_TRANSCRIPTION_MODEL)],
+    transcription_provider [non_empty],
+    audio_transcription_provider [non_empty],
+    image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
+    image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
+    video_gen_model [or(DEFAULT_VIDEO_GEN_MODEL)],
+    video_gen_models [list_or(fallback = video_gen_model, default = DEFAULT_VIDEO_GEN_MODEL)],
+    exa_key [non_empty],
+    telegram_bot_token [non_empty],
 }
 
 // ── Config value helpers ────────────────────────────────────────────
@@ -443,123 +515,6 @@ impl ConfigReload {
             return Some(r.clone());
         }
         Some(role_info(&role).default_reasoning_effort.to_string())
-    }
-
-    // ── String config accessors ──────────────────────────────────
-    //
-    // These are written explicitly (rather than generated by a macro) so that
-    // IDE navigation (Ctrl+Click → definition) works and error messages point
-    // to the actual accessor, not macro-expanded code.
-    //
-    // The compiler catches an accessor referencing a non-existent `ConfigData`
-    // field, and `accessor_count_matches_field_count` covers the
-    // forward direction: every field listed in `string_config_fields!` has a
-    // corresponding accessor match arm.  The reverse direction — a field added
-    // to `ConfigData` but omitted from `string_config_fields!` — is caught by
-    // the compiler via [`ConfigData::STRUCT_FIELDS_DEFAULT`], which is a `const
-    // Self { … }` that must list every struct field.  Adding a field to the
-    // struct without adding it to the macro produces a compile error.
-
-    /// Get the configured provider API key, with empty/whitespace values collapsed to `None`.
-    #[must_use]
-    pub fn provider_key(&self) -> Option<String> {
-        non_empty(self.read().provider_key.clone())
-    }
-
-    /// Get the configured provider endpoint, falling back to the default.
-    #[must_use]
-    pub fn provider_endpoint(&self) -> String {
-        resolve_or(
-            self.read().provider_endpoint.clone(),
-            DEFAULT_PROVIDER_ENDPOINT,
-        )
-    }
-
-    /// Get the configured image transcription model, falling back to the default.
-    #[must_use]
-    pub fn image_transcription_model(&self) -> String {
-        resolve_or(
-            self.read().image_transcription_model.clone(),
-            DEFAULT_IMAGE_TRANSCRIPTION_MODEL,
-        )
-    }
-
-    /// Get the configured audio transcription model, falling back to the default.
-    #[must_use]
-    pub fn audio_transcription_model(&self) -> String {
-        resolve_or(
-            self.read().audio_transcription_model.clone(),
-            DEFAULT_AUDIO_TRANSCRIPTION_MODEL,
-        )
-    }
-
-    /// Get the configured transcription provider, with empty/whitespace values collapsed to
-    /// `None`.
-    #[must_use]
-    pub fn transcription_provider(&self) -> Option<String> {
-        non_empty(self.read().transcription_provider.clone())
-    }
-
-    /// Get the configured audio transcription provider, with empty/whitespace values
-    /// collapsed to `None`.
-    #[must_use]
-    pub fn audio_transcription_provider(&self) -> Option<String> {
-        non_empty(self.read().audio_transcription_provider.clone())
-    }
-
-    /// Get the configured image generation model, falling back to the default.
-    #[must_use]
-    pub fn image_gen_model(&self) -> String {
-        resolve_or(self.read().image_gen_model.clone(), DEFAULT_IMAGE_GEN_MODEL)
-    }
-
-    /// Get the configured video generation model, falling back to the default.
-    #[must_use]
-    pub fn video_gen_model(&self) -> String {
-        resolve_or(self.read().video_gen_model.clone(), DEFAULT_VIDEO_GEN_MODEL)
-    }
-
-    /// Get the list of available image generation models for selection UI.
-    ///
-    /// Returns the parsed newline-separated list from `image_gen_models` if set and
-    /// non-empty, otherwise falls back to a vec containing the currently active model
-    /// (or the hardcoded default).
-    #[must_use]
-    pub fn image_gen_models(&self) -> Vec<String> {
-        let guard = self.read();
-        resolve_list_or(
-            guard.image_gen_models.as_ref(),
-            guard.image_gen_model.clone(),
-            DEFAULT_IMAGE_GEN_MODEL,
-        )
-    }
-
-    /// Get the list of available video generation models for selection UI.
-    ///
-    /// Returns the parsed newline-separated list from `video_gen_models` if set and
-    /// non-empty, otherwise falls back to a vec containing the currently active model
-    /// (or the hardcoded default).
-    #[must_use]
-    pub fn video_gen_models(&self) -> Vec<String> {
-        let guard = self.read();
-        resolve_list_or(
-            guard.video_gen_models.as_ref(),
-            guard.video_gen_model.clone(),
-            DEFAULT_VIDEO_GEN_MODEL,
-        )
-    }
-
-    /// Get the configured Exa API key, with empty/whitespace values collapsed to `None`.
-    #[must_use]
-    pub fn exa_key(&self) -> Option<String> {
-        non_empty(self.read().exa_key.clone())
-    }
-
-    /// Get the configured Telegram bot token, with empty/whitespace values collapsed to
-    /// `None`.
-    #[must_use]
-    pub fn telegram_bot_token(&self) -> Option<String> {
-        non_empty(self.read().telegram_bot_token.clone())
     }
 }
 
@@ -870,174 +825,55 @@ mod tests {
         assert!(!config.set_string_field("nonexistent_key", "value"));
     }
 
-    /// All [`ConfigReload`] accessors exist and return the expected types.
+    /// Smoke test: macro-generated accessors roundtrip correctly for one
+    /// representative field of each pattern (`non_empty`, `or`, `list_or`).
     ///
-    /// Calling each accessor explicitly catches signature regressions
-    /// (e.g. `Option<String>` vs `String`). Iterates [`STRING_CONFIG_KEYS`] with a
-    /// self-validating match so that adding a new field to `STRING_CONFIG_KEYS`,
-    /// `string_fields()`, and `set_string_field()` without adding a match arm
-    /// produces a clear failure ("unknown config key '{key}'"), rather than a
-    /// cryptic "expected 10, got 11".
-    #[test]
-    fn accessor_count_matches_field_count() {
-        let reload = ConfigReload::const_new();
-        for &key in STRING_CONFIG_KEYS {
-            match key {
-                // ── non_empty accessors (Option<String>) ──
-                "provider_key" => {
-                    let _: Option<String> = reload.provider_key();
-                }
-                // ── or_default accessors (String) ──
-                "provider_endpoint" => {
-                    let _: String = reload.provider_endpoint();
-                }
-                "image_transcription_model" => {
-                    let _: String = reload.image_transcription_model();
-                }
-                "audio_transcription_model" => {
-                    let _: String = reload.audio_transcription_model();
-                }
-                "image_gen_model" => {
-                    let _: String = reload.image_gen_model();
-                }
-                "image_gen_models" => {
-                    let _: Vec<String> = reload.image_gen_models();
-                }
-                "video_gen_model" => {
-                    let _: String = reload.video_gen_model();
-                }
-                "video_gen_models" => {
-                    let _: Vec<String> = reload.video_gen_models();
-                }
-                // ── non_empty accessors (Option<String>) ──
-                "transcription_provider" => {
-                    let _: Option<String> = reload.transcription_provider();
-                }
-                "audio_transcription_provider" => {
-                    let _: Option<String> = reload.audio_transcription_provider();
-                }
-                "exa_key" => {
-                    let _: Option<String> = reload.exa_key();
-                }
-                "telegram_bot_token" => {
-                    let _: Option<String> = reload.telegram_bot_token();
-                }
-                _ => {
-                    panic!("unknown config key '{key}' — add a ConfigReload accessor and match arm")
-                }
-            }
-        }
-    }
-
-    /// Values set via [`ConfigData::set_string_field`] round-trip correctly through the
-    /// typed [`ConfigReload`] accessors, and the two accessor patterns (non_empty,
-    /// or_default) behave as documented.
+    /// Structural sync (every field has a correctly-typed accessor) is guaranteed
+    /// at compile time by the macro — this test only verifies runtime semantics.
     #[test]
     fn config_reload_accessors_roundtrip() {
         let reload = ConfigReload::const_new();
+
+        // ── non_empty: returns None when unset, Some(value) when set ──
+        assert_eq!(reload.provider_key(), None, "unset provider_key is None");
         let mut config = ConfigData::default();
-
-        // Set every string field via the DB interface (set_string_field)
-        // Defensive completeness check — every known key must be exercised.
-        assert_eq!(
-            STRING_FIELD_TEST_VALUES.len(),
-            STRING_CONFIG_KEYS.len(),
-            "STRING_FIELD_TEST_VALUES must cover every entry in STRING_CONFIG_KEYS",
-        );
-        for &(key, value) in STRING_FIELD_TEST_VALUES {
-            assert!(
-                config.set_string_field(key, value),
-                "set_string_field failed for '{key}'"
-            );
-        }
+        assert!(config.set_string_field("provider_key", "sk-test"));
         reload.swap(config);
+        assert_eq!(reload.provider_key(), Some("sk-test".to_string()));
 
-        // ── non_empty: returns the set value ──
-        assert_eq!(reload.provider_key(), Some("sk-test-key".to_string()));
-        assert_eq!(reload.transcription_provider(), Some("OpenAI".to_string()));
-        assert_eq!(
-            reload.audio_transcription_provider(),
-            Some("Deepgram".to_string())
-        );
-        assert_eq!(reload.exa_key(), Some("exa-test-key".to_string()));
-        assert_eq!(reload.telegram_bot_token(), Some("123:abc".to_string()));
-
-        // ── or_default: falls back when field is unset ──
+        // ── or: falls back to default when unset ──
         reload.swap(ConfigData::default());
         assert_eq!(
             reload.provider_endpoint(),
             DEFAULT_PROVIDER_ENDPOINT,
-            "unset provider_endpoint should fall back to default"
-        );
-        assert_eq!(
-            reload.image_transcription_model(),
-            DEFAULT_IMAGE_TRANSCRIPTION_MODEL,
-            "unset image_transcription_model should fall back to default"
-        );
-        assert_eq!(
-            reload.audio_transcription_model(),
-            DEFAULT_AUDIO_TRANSCRIPTION_MODEL,
-            "unset audio_transcription_model should fall back to default"
-        );
-        assert_eq!(
-            reload.image_gen_model(),
-            DEFAULT_IMAGE_GEN_MODEL,
-            "unset image_gen_model should fall back to default"
-        );
-        assert_eq!(
-            reload.video_gen_model(),
-            DEFAULT_VIDEO_GEN_MODEL,
-            "unset video_gen_model should fall back to default"
+            "unset provider_endpoint falls back to default"
         );
 
-        // ── Vec accessors: when list field is unset, falls back to active model ──
+        // ── non_empty: empty/whitespace → None ──
+        let mut empty = ConfigData::default();
+        assert!(empty.set_string_field("provider_key", ""));
+        reload.swap(empty);
+        assert_eq!(
+            reload.provider_key(),
+            None,
+            "empty string is collapsed to None"
+        );
+
+        // ── list_or: falls back to active model when list is unset ──
+        reload.swap(ConfigData::default());
         assert_eq!(
             reload.image_gen_models(),
             vec![DEFAULT_IMAGE_GEN_MODEL.to_string()],
-            "unset image_gen_models should fall back to active model"
-        );
-        assert_eq!(
-            reload.video_gen_models(),
-            vec![DEFAULT_VIDEO_GEN_MODEL.to_string()],
-            "unset video_gen_models should fall back to active model"
+            "unset image_gen_models falls back to active model"
         );
 
-        // When list field is set, returns parsed entries
+        // When list is set, returns parsed entries
         let mut list_config = ConfigData::default();
         assert!(list_config.set_string_field("image_gen_models", "model-a\nmodel-b\nmodel-c"));
-        assert!(list_config.set_string_field("video_gen_models", "vid-x\nvid-y"));
         reload.swap(list_config);
         assert_eq!(
             reload.image_gen_models(),
             vec!["model-a", "model-b", "model-c"]
-        );
-        assert_eq!(reload.video_gen_models(), vec!["vid-x", "vid-y"]);
-
-        // ── non_empty: empty/whitespace → None ──
-        let mut empty_config = ConfigData::default();
-        let _ = empty_config.set_string_field("provider_key", "");
-        let _ = empty_config.set_string_field("transcription_provider", "");
-        let _ = empty_config.set_string_field("audio_transcription_provider", "   ");
-        let _ = empty_config.set_string_field("exa_key", "");
-        let _ = empty_config.set_string_field("telegram_bot_token", "   ");
-        reload.swap(empty_config);
-        assert_eq!(reload.provider_key(), None);
-        assert_eq!(reload.transcription_provider(), None);
-        assert_eq!(reload.audio_transcription_provider(), None);
-        assert_eq!(reload.exa_key(), None);
-        assert_eq!(reload.telegram_bot_token(), None);
-
-        // Directly assign empty provider_key to the struct field (bypassing
-        // set_string_field) to verify the accessor itself applies non_empty.
-        let pk_config = ConfigData {
-            provider_key: Some(String::new()),
-            ..Default::default()
-        };
-        reload.swap(pk_config);
-        assert_eq!(
-            reload.provider_key(),
-            None,
-            "empty string in struct field is collapsed to None by non_empty accessor"
         );
     }
 
