@@ -11,32 +11,52 @@ use crate::providers::chat;
 use crate::util::parse_fenced_json;
 use crate::{ChatMessage, ChatRequest, ToolSpec};
 
+// ── Extraction config ─────────────────────────────────────────────────
+
+/// LLM parameters for structured extraction.
+///
+/// Groups the parameters that should be byte-identical to the original agent
+/// call so the provider can reuse the cached KV-cache prefix.  Provider
+/// routing is derived from [`model`](Self::model) by
+/// [`CONFIG.model_routing`] internally.
+///
+/// KV-cache preservation: callers must pass the same `temperature`,
+/// `reasoning_effort`, `model`, and `tool_specs` that the agent's work loop
+/// uses so the provider can reuse the cached prefix.
+pub(crate) struct ExtractionConfig<'a> {
+    /// The model identifier (used for both the LLM call and provider routing).
+    pub model: &'a str,
+    /// Tool specifications for function calling.  Pass `None` to omit tools.
+    pub tool_specs: Option<&'a [ToolSpec]>,
+    /// Temperature for the LLM call.
+    pub temperature: f32,
+    /// Reasoning effort (e.g. `"low"`, `"high"`).  `None` disables reasoning.
+    pub reasoning_effort: Option<String>,
+    /// Maximum retry attempts before bailing.
+    pub max_attempts: usize,
+}
+
 // ── Retry extraction ──────────────────────────────────────────────────
 
 /// Retry a structured JSON extraction from conversation history.
 ///
-/// Pushes `extraction_prompt` into the history, then loops up to `max_attempts`
-/// calling the LLM. On each iteration:
+/// Pushes `extraction_prompt` into the history, then loops up to
+/// [`config.max_attempts`](ExtractionConfig::max_attempts) calling the LLM.
+/// On each iteration:
 /// - Tool calls → treat as failure, push `retry_prompt`, retry
 /// - Non-parseable text → push raw assistant text + `retry_prompt`, retry
 /// - Valid JSON matching `T` → return immediately
 ///
 /// Pass `extraction_prompt = ""` if the prompt is already embedded in `history`.
 ///
-/// KV-cache preservation: callers must pass the same `temperature`,
-/// `reasoning_effort`, `model`, and `tool_specs` that the agent's work loop
-/// uses so the provider can reuse the cached prefix.
-#[allow(clippy::too_many_arguments)]
+/// KV-cache preservation: the [`config`](ExtractionConfig) fields (`model`,
+/// `temperature`, `reasoning_effort`, `tool_specs`) must be byte-identical to
+/// the original agent call so the provider can reuse the cached prefix.
 pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
     retry_prompt: &str,
-    tool_specs: Option<&[ToolSpec]>,
-    model: &str,
-    allow_image_parts: bool,
-    temperature: f32,
-    reasoning_effort: Option<String>,
-    max_attempts: usize,
+    config: ExtractionConfig<'_>,
 ) -> anyhow::Result<T> {
     let mut extraction_history = history.to_vec();
 
@@ -47,15 +67,15 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
 
     let mut last_raw = String::new();
 
-    for _attempt in 1..=max_attempts {
-        let routing = CONFIG.model_routing(model);
+    for _attempt in 1..=config.max_attempts {
+        let routing = CONFIG.model_routing(config.model);
         let response = chat(ChatRequest {
             messages: extraction_history.clone(),
-            tools: tool_specs.map(<[ToolSpec]>::to_vec),
-            model: model.to_string(),
-            allow_image_parts,
-            temperature,
-            reasoning_effort: reasoning_effort.clone(),
+            tools: config.tool_specs.map(<[ToolSpec]>::to_vec),
+            model: config.model.to_string(),
+            allow_image_parts: false, // extractions never need image parts
+            temperature: config.temperature,
+            reasoning_effort: config.reasoning_effort.clone(),
             provider_order: routing.provider_order,
             provider_allow_fallbacks: routing.allow_fallbacks,
         })
@@ -77,7 +97,8 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
 
     let snippet: String = last_raw.chars().take(300).collect();
     anyhow::bail!(
-        "Failed to extract structured response after {max_attempts} attempts. Last raw: {snippet}"
+        "Failed to extract structured response after {max_attempts} attempts. Last raw: {snippet}",
+        max_attempts = config.max_attempts,
     )
 }
 

@@ -619,16 +619,20 @@ impl Agent {
         retry_prompt: &str,
         max_attempts: usize,
     ) -> anyhow::Result<T> {
+        // Bind to local so the borrow lives across the .await.
+        let model = self.model();
+        let config = crate::extraction::ExtractionConfig {
+            model: &model,
+            tool_specs: Some(&self.tool_specs),
+            temperature: self.temperature(),
+            reasoning_effort: self.reasoning_effort(),
+            max_attempts,
+        };
         crate::extraction::retry_extract_structured(
             self.session.history(),
             extraction_prompt,
             retry_prompt,
-            Some(&self.tool_specs),
-            &self.model(),
-            false, // extractions never need image parts
-            self.temperature(),
-            self.reasoning_effort(),
-            max_attempts,
+            config,
         )
         .await
     }
