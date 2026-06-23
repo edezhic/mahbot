@@ -4103,6 +4103,67 @@ impl EditorState {
         false
     }
 
+    /// Shared tree-node row helper.  Builds the indent + icon + name row,
+    /// wraps it in a `tree_node_button`, then wraps that in a `ContextMenu`
+    /// with caller-specific items prepended before the common items
+    /// (Copy Relative Path, Copy Absolute Path, Reveal in Finder).
+    ///
+    /// # Parameters
+    ///
+    /// * `depth` — nesting depth for indent calculation.
+    /// * `icon` — pre-built icon element (size and colour already set).
+    /// * `name` — pre-built name element (text content and style already set).
+    /// * `highlight` — whether the row should show the highlight style.
+    /// * `message` — message to fire when the row is clicked.
+    /// * `extra_context_items` — caller-specific context menu items; they are
+    ///   placed *before* the three shared items listed above.
+    /// * `full_path` — workspace-relative path used to compute absolute/relative
+    ///   paths for the shared context menu items.
+    #[allow(clippy::too_many_arguments)]
+    fn render_tree_node_row<'a>(
+        &'a self,
+        depth: usize,
+        icon: Element<'a, EditorMessage>,
+        name: Element<'a, EditorMessage>,
+        highlight: bool,
+        message: EditorMessage,
+        extra_context_items: Vec<(String, EditorMessage)>,
+        full_path: &str,
+    ) -> Element<'a, EditorMessage> {
+        let indent = widgets::tree_indent(depth);
+
+        let row = row![
+            Space::new().width(indent),
+            icon,
+            Space::new().width(4),
+            name,
+            Space::new().width(Length::Fill),
+        ]
+        .align_y(Alignment::Center)
+        .padding([1, 8]);
+
+        let btn = widgets::tree_node_button(row, highlight, Some(message));
+
+        let abs_path = self.abs_path(full_path);
+        let rel_path = full_path.to_string();
+
+        let mut menu_items: Vec<(String, EditorMessage)> = extra_context_items;
+        menu_items.push((
+            "Copy Relative Path".into(),
+            EditorMessage::CopyRelativePath(rel_path),
+        ));
+        menu_items.push((
+            "Copy Absolute Path".into(),
+            EditorMessage::CopyAbsolutePath(abs_path.clone()),
+        ));
+        menu_items.push((
+            "Reveal in Finder".into(),
+            EditorMessage::RevealInFinder(abs_path),
+        ));
+
+        ContextMenu::new(btn, menu_items).into()
+    }
+
     fn render_tree_node<'a>(
         &'a self,
         node: &'a widgets::TreeNode,
@@ -4120,11 +4181,10 @@ impl EditorState {
         node: &'a widgets::TreeNode,
         depth: usize,
     ) -> Element<'a, EditorMessage> {
-        let indent = widgets::tree_indent(depth);
         let is_expanded = self.file_tree.expanded_dirs.contains(&node.full_path);
         let is_loading = self.loading_dirs.contains(&node.full_path);
         let is_ignored = self.is_path_ignored(&node.full_path);
-        let icon: iced::widget::Text<'static, iced::Theme, iced::Renderer> = if is_expanded {
+        let icon = if is_expanded {
             lucide::folder_open()
         } else {
             lucide::folder()
@@ -4165,30 +4225,18 @@ impl EditorState {
             (node.name.clone(), theme::TEXT_SECONDARY)
         };
 
-        let header_row = row![
-            Space::new().width(indent),
-            icon.size(13).color(icon_color),
-            Space::new().width(4),
-            text(label_text).size(12).color(label_color),
-            Space::new().width(Length::Fill),
-        ]
-        .align_y(Alignment::Center)
-        .padding([1, 8]);
-
-        let full_path = node.full_path.clone();
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
 
-        let header_btn = widgets::tree_node_button(
-            header_row,
-            is_focused,
-            Some(EditorMessage::ToggleDir(full_path.clone())),
-        );
+        let icon_element: Element<'_, EditorMessage> = icon.size(13).color(icon_color).into();
+        let name_element: Element<'_, EditorMessage> =
+            text(label_text).size(12).color(label_color).into();
 
-        // Wrap directory header in context menu (children remain outside).
-        let abs_path = self.abs_path(&node.full_path);
-        let rel_path = node.full_path.clone();
-        let ctx_menu = ContextMenu::new(
-            header_btn,
+        let ctx_menu = self.render_tree_node_row(
+            depth,
+            icon_element,
+            name_element,
+            is_focused,
+            EditorMessage::ToggleDir(node.full_path.clone()),
             vec![
                 (
                     "New File".into(),
@@ -4202,22 +4250,11 @@ impl EditorState {
                     "Delete".into(),
                     EditorMessage::DeleteDirectoryRequested(node.full_path.clone()),
                 ),
-                (
-                    "Copy Relative Path".into(),
-                    EditorMessage::CopyRelativePath(rel_path),
-                ),
-                (
-                    "Copy Absolute Path".into(),
-                    EditorMessage::CopyAbsolutePath(abs_path.clone()),
-                ),
-                (
-                    "Reveal in Finder".into(),
-                    EditorMessage::RevealInFinder(abs_path),
-                ),
             ],
+            &node.full_path,
         );
 
-        let mut col = column![Element::from(ctx_menu)].spacing(0);
+        let mut col = column![ctx_menu].spacing(0);
         if is_expanded {
             for child in &node.children {
                 col = col.push(self.render_tree_node(child, depth + 1));
@@ -4231,7 +4268,6 @@ impl EditorState {
         node: &'a widgets::TreeNode,
         depth: usize,
     ) -> Element<'a, EditorMessage> {
-        let indent = widgets::tree_indent(depth);
         let is_selected = self.selected_file.as_deref() == Some(&node.full_path);
 
         let icon = lucide::file::<iced::Theme, iced::Renderer>();
@@ -4289,49 +4325,22 @@ impl EditorState {
                 .into()
         };
 
-        let btn_row = row![
-            Space::new().width(indent),
-            icon.size(12).color(icon_color),
-            Space::new().width(4),
-            name_text,
-            Space::new().width(Length::Fill),
-        ]
-        .align_y(Alignment::Center)
-        .padding([1, 8]);
-
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
 
-        let full_path = node.full_path.clone();
-        let file_btn = widgets::tree_node_button(
-            btn_row,
-            is_selected || is_focused,
-            Some(EditorMessage::SelectFile(full_path.clone())),
-        );
+        let icon_element: Element<'_, EditorMessage> = icon.size(12).color(icon_color).into();
 
-        let abs_path = self.abs_path(&node.full_path);
-        let rel_path = node.full_path.clone();
-        ContextMenu::new(
-            file_btn,
-            vec![
-                (
-                    "Delete".into(),
-                    EditorMessage::DeleteFileRequested(node.full_path.clone()),
-                ),
-                (
-                    "Copy Relative Path".into(),
-                    EditorMessage::CopyRelativePath(rel_path),
-                ),
-                (
-                    "Copy Absolute Path".into(),
-                    EditorMessage::CopyAbsolutePath(abs_path.clone()),
-                ),
-                (
-                    "Reveal in Finder".into(),
-                    EditorMessage::RevealInFinder(abs_path),
-                ),
-            ],
+        self.render_tree_node_row(
+            depth,
+            icon_element,
+            name_text,
+            is_selected || is_focused,
+            EditorMessage::SelectFile(node.full_path.clone()),
+            vec![(
+                "Delete".into(),
+                EditorMessage::DeleteFileRequested(node.full_path.clone()),
+            )],
+            &node.full_path,
         )
-        .into()
     }
 
     // ── Editor panel ──────────────────────────────────────────────
