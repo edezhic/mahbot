@@ -853,227 +853,275 @@ mod tests {
 
     // ── normalize_search_args ──────────────────────────────────────────
 
-    #[test]
-    fn normalize_search_args_query_aliases() {
-        // Each alias (pattern, search, search_term, grep_search) is mapped
-        // to the canonical "query" key and removed.
-        let mut args = json!({"pattern": "foo"});
+    /// Assert that normalizing `input` produces `expected`.
+    fn assert_normalize(input: &serde_json::Value, expected: &serde_json::Value, name: &str) {
+        let mut args = input.clone();
         normalize_search_args(&mut args);
-        assert_eq!(args["query"], "foo");
-        assert!(args.get("pattern").is_none());
-
-        let mut args = json!({"search": "bar"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["query"], "bar");
-        assert!(args.get("search").is_none());
-
-        let mut args = json!({"search_term": "baz"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["query"], "baz");
-        assert!(args.get("search_term").is_none());
-
-        // grep_search is the lowest-priority alias, only recognized by
-        // normalize_search_args (not by resolve_query).
-        let mut args = json!({"grep_search": "qux"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["query"], "qux");
-        assert!(args.get("grep_search").is_none());
+        assert_eq!(args, *expected, "case '{name}' failed");
     }
 
+    /// Table-driven test for query alias resolution: pattern / search /
+    /// search_term / grep_search → canonical "query" key, priority ordering,
+    /// and the invariant that an existing "query" blocks alias consumption.
     #[test]
-    fn normalize_search_args_query_alias_priority() {
-        // When multiple aliases are present, first wins: pattern > search > search_term > grep_search
-        let mut args = json!({
-            "pattern": "from_pattern",
-            "search": "from_search",
-            "search_term": "from_search_term",
-            "grep_search": "from_grep_search"
-        });
-        normalize_search_args(&mut args);
-        assert_eq!(args["query"], "from_pattern");
-
-        // pattern absent, search present
-        let mut args = json!({
-            "search": "from_search",
-            "search_term": "from_search_term"
-        });
-        normalize_search_args(&mut args);
-        assert_eq!(args["query"], "from_search");
+    fn normalize_search_args_alias_mapping() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: serde_json::Value,
+        }
+        let cases = [
+            Case {
+                name: "pattern alias maps to query",
+                input: json!({"pattern": "foo"}),
+                expected: json!({"query": "foo"}),
+            },
+            Case {
+                name: "search alias maps to query",
+                input: json!({"search": "bar"}),
+                expected: json!({"query": "bar"}),
+            },
+            Case {
+                name: "search_term alias maps to query",
+                input: json!({"search_term": "baz"}),
+                expected: json!({"query": "baz"}),
+            },
+            Case {
+                name: "grep_search alias maps to query",
+                input: json!({"grep_search": "qux"}),
+                expected: json!({"query": "qux"}),
+            },
+            Case {
+                name: "pattern wins over other aliases",
+                input: json!({
+                    "pattern": "from_pattern",
+                    "search": "from_search",
+                    "search_term": "from_search_term",
+                    "grep_search": "from_grep_search"
+                }),
+                expected: json!({
+                    "query": "from_pattern",
+                    // Non-winning aliases remain as orphan keys
+                    "search": "from_search",
+                    "search_term": "from_search_term",
+                    "grep_search": "from_grep_search",
+                }),
+            },
+            Case {
+                name: "search wins when pattern absent",
+                input: json!({
+                    "search": "from_search",
+                    "search_term": "from_search_term"
+                }),
+                expected: json!({
+                    "query": "from_search",
+                    // search_term remains as orphan key
+                    "search_term": "from_search_term",
+                }),
+            },
+            Case {
+                name: "existing query blocks alias, alias stays as orphan",
+                input: json!({"query": "existing", "pattern": "alias"}),
+                expected: json!({"query": "existing", "pattern": "alias"}),
+            },
+        ];
+        for c in &cases {
+            assert_normalize(&c.input, &c.expected, c.name);
+        }
     }
 
+    /// Table-driven test for file_pattern → query mapping, including
+    /// mode inference and the orphan-key behavior when query already exists.
     #[test]
-    fn normalize_search_args_query_alias_does_not_overwrite_existing_query() {
-        // When `query` already exists, aliases are ignored
-        let mut args = json!({"query": "existing", "pattern": "alias"});
-        normalize_search_args(&mut args);
-        // query unchanged, pattern remains as orphan key
-        assert_eq!(args["query"], "existing");
-        assert_eq!(args["pattern"], "alias");
+    fn normalize_search_args_file_pattern() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: serde_json::Value,
+        }
+        let cases = [
+            Case {
+                name: "file_pattern without existing mode sets mode=files",
+                input: json!({"file_pattern": "*.rs"}),
+                expected: json!({"query": "*.rs", "mode": "files"}),
+            },
+            Case {
+                name: "file_pattern preserves existing mode",
+                input: json!({"file_pattern": "main.rs", "mode": "grep"}),
+                expected: json!({"query": "main.rs", "mode": "grep"}),
+            },
+            Case {
+                name: "file_pattern orphaned when query already exists",
+                input: json!({"query": "already", "file_pattern": "other.rs"}),
+                expected: json!({"query": "already", "file_pattern": "other.rs"}),
+            },
+            Case {
+                name: "file_pattern blocked by prior alias",
+                input: json!({"pattern": "my_query", "file_pattern": "*.rs"}),
+                expected: json!({"query": "my_query", "file_pattern": "*.rs"}),
+            },
+        ];
+        for c in &cases {
+            assert_normalize(&c.input, &c.expected, c.name);
+        }
     }
 
+    /// Table-driven test for mode-value remapping.
+    /// `plain_text`, `regex`, `content`, and `code` are all rewritten to
+    /// `"grep"` (with an implied `grep_mode`), while `"files"` and unknown
+    /// values pass through unchanged.
     #[test]
-    fn normalize_search_args_file_pattern_implies_files_mode() {
-        // file_pattern with no mode → files mode
-        let mut args = json!({"file_pattern": "*.rs"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "files");
-        assert_eq!(args["query"], "*.rs");
-        assert!(args.get("file_pattern").is_none());
-
-        // file_pattern with existing mode → mode preserved, query set
-        let mut args = json!({"file_pattern": "main.rs", "mode": "grep"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        assert_eq!(args["query"], "main.rs");
-
-        // file_pattern is NOT consumed when query already exists (orphan key behavior)
-        let mut args = json!({"query": "already", "file_pattern": "other.rs"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["query"], "already");
-        // file_pattern remains as orphan key (not removed when query exists)
-        assert_eq!(args["file_pattern"], "other.rs");
+    fn normalize_search_args_mode_mapping() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: serde_json::Value,
+        }
+        let cases = [
+            // ── plain_text ──────────────────────────────────────────────
+            Case {
+                name: "plain_text sets mode=grep and grep_mode=plain_text",
+                input: json!({"mode": "plain_text"}),
+                expected: json!({"mode": "grep", "grep_mode": "plain_text"}),
+            },
+            Case {
+                name: "plain_text does not overwrite existing grep_mode",
+                input: json!({"mode": "plain_text", "grep_mode": "fuzzy"}),
+                expected: json!({"mode": "grep", "grep_mode": "fuzzy"}),
+            },
+            // ── regex ───────────────────────────────────────────────────
+            Case {
+                name: "regex sets mode=grep and grep_mode=regex",
+                input: json!({"mode": "regex"}),
+                expected: json!({"mode": "grep", "grep_mode": "regex"}),
+            },
+            // ── content ─────────────────────────────────────────────────
+            Case {
+                name: "content sets mode=grep without grep_mode",
+                input: json!({"mode": "content"}),
+                expected: json!({"mode": "grep"}),
+            },
+            // ── code ────────────────────────────────────────────────────
+            Case {
+                name: "code sets mode=grep and grep_mode=fuzzy",
+                input: json!({"mode": "code"}),
+                expected: json!({"mode": "grep", "grep_mode": "fuzzy"}),
+            },
+            Case {
+                name: "code does not overwrite existing grep_mode",
+                input: json!({"mode": "code", "grep_mode": "regex"}),
+                expected: json!({"mode": "grep", "grep_mode": "regex"}),
+            },
+            // ── files (pass-through) ────────────────────────────────────
+            Case {
+                name: "files mode unchanged",
+                input: json!({"mode": "files", "query": "lib.rs"}),
+                expected: json!({"mode": "files", "query": "lib.rs"}),
+            },
+            // ── unknown (pass-through) ──────────────────────────────────
+            Case {
+                name: "unknown mode passes through unchanged",
+                input: json!({"mode": "unknown_value"}),
+                expected: json!({"mode": "unknown_value"}),
+            },
+        ];
+        for c in &cases {
+            assert_normalize(&c.input, &c.expected, c.name);
+        }
     }
 
+    /// Table-driven test for grep_mode rewrites.
+    ///
+    /// The first case covers the subtle double-mapping interaction:
+    /// mode=plain_text sets grep_mode=plain_text (stage 1), then the
+    /// grep_mode remapping sees the already-valid "plain_text" value and
+    /// leaves it unchanged rather than rewriting the original "exact".
     #[test]
-    fn normalize_search_args_file_pattern_blocked_by_early_alias() {
-        // If pattern was already consumed as query alias, file_pattern is the
-        // *second* fallback. Since query now exists, file_pattern is not processed.
-        let mut args = json!({"pattern": "my_query", "file_pattern": "*.rs"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["query"], "my_query");
-        // file_pattern remains as orphan key because query is already set by alias
-        assert_eq!(args["file_pattern"], "*.rs");
+    fn normalize_search_args_grep_mode_mapping() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: serde_json::Value,
+        }
+        let cases = [
+            // ════════════════════════════════════════════════════════════
+            // Double-mapping: mode remapping runs BEFORE grep_mode
+            // remapping.  "plain_text" mode first sets grep_mode to
+            // "plain_text" (since grep_mode is absent), then the
+            // grep_mode remapping sees the already-valid "plain_text"
+            // and leaves it — it does NOT re-process the original "exact".
+            // ════════════════════════════════════════════════════════════
+            Case {
+                name: "plain_text mode + exact grep_mode — mode remaps first, grep_mode sees already-valid plain_text",
+                input: json!({"mode": "plain_text", "grep_mode": "exact"}),
+                expected: json!({"mode": "grep", "grep_mode": "plain_text"}),
+            },
+            // ── exact → plain_text ──────────────────────────────────────
+            Case {
+                name: "exact grep_mode remapped to plain_text",
+                input: json!({"grep_mode": "exact"}),
+                expected: json!({"grep_mode": "plain_text"}),
+            },
+            // ── files → mode=files with grep_mode removed ──────────────
+            Case {
+                name: "files grep_mode promotes mode to files and removes grep_mode",
+                input: json!({"grep_mode": "files"}),
+                expected: json!({"mode": "files"}),
+            },
+            Case {
+                name: "files grep_mode with existing mode=files is fine",
+                input: json!({"mode": "files", "grep_mode": "files"}),
+                expected: json!({"mode": "files"}),
+            },
+            Case {
+                name: "files grep_mode overrides non-files mode to files",
+                input: json!({"mode": "grep", "grep_mode": "files"}),
+                expected: json!({"mode": "files"}),
+            },
+        ];
+        for c in &cases {
+            assert_normalize(&c.input, &c.expected, c.name);
+        }
     }
 
+    /// Edge cases: non-object values and empty objects pass through unchanged.
     #[test]
-    fn normalize_search_args_mode_plain_text() {
-        let mut args = json!({"mode": "plain_text"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        assert_eq!(args["grep_mode"], "plain_text");
-
-        // mode "plain_text" with existing grep_mode → mode remapped, grep_mode preserved
-        let mut args = json!({"mode": "plain_text", "grep_mode": "fuzzy"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        // grep_mode was already set, so it's NOT overwritten
-        assert_eq!(args["grep_mode"], "fuzzy");
-    }
-
-    #[test]
-    fn normalize_search_args_mode_regex() {
-        let mut args = json!({"mode": "regex"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        assert_eq!(args["grep_mode"], "regex");
-    }
-
-    #[test]
-    fn normalize_search_args_mode_content() {
-        let mut args = json!({"mode": "content"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        // grep_mode should NOT be set for "content"
-        assert!(
-            args.get("grep_mode").is_none(),
-            "content should not set grep_mode"
-        );
-    }
-
-    #[test]
-    fn normalize_search_args_mode_code() {
-        let mut args = json!({"mode": "code"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        assert_eq!(args["grep_mode"], "fuzzy");
-
-        // code with existing grep_mode → grep_mode preserved
-        let mut args = json!({"mode": "code", "grep_mode": "regex"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        assert_eq!(args["grep_mode"], "regex");
-    }
-
-    #[test]
-    fn normalize_search_args_mode_files_unchanged() {
-        // "files" is already a valid mode — no remapping
-        let mut args = json!({"mode": "files", "query": "lib.rs"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "files");
-    }
-
-    #[test]
-    fn normalize_search_args_unknown_mode_unchanged() {
-        // Unknown mode values pass through unchanged
-        let mut args = json!({"mode": "unknown_value"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "unknown_value");
-    }
-
-    #[test]
-    fn normalize_search_args_grep_mode_rewrites() {
-        // "exact" → "plain_text"
-        let mut args = json!({"grep_mode": "exact"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["grep_mode"], "plain_text");
-
-        // "files" → mode="files", grep_mode removed
-        let mut args = json!({"grep_mode": "files"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "files");
-        assert!(
-            args.get("grep_mode").is_none(),
-            "grep_mode should be removed when value is 'files'"
-        );
-
-        // "files" when mode already "files" → mode stays "files", grep_mode removed
-        let mut args = json!({"mode": "files", "grep_mode": "files"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "files");
-        assert!(args.get("grep_mode").is_none());
-
-        // "files" overrides a non-"files" mode to "files"
-        let mut args = json!({"mode": "grep", "grep_mode": "files"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "files");
-    }
-
-    #[test]
-    fn normalize_search_args_non_object_early_return() {
-        // Non-object values should return early (defensive guard)
-        let mut args = json!("string_value");
-        normalize_search_args(&mut args);
-        assert_eq!(args, json!("string_value"));
-
-        let mut args = json!(42);
-        normalize_search_args(&mut args);
-        assert_eq!(args, json!(42));
-
-        let mut args = json!(null);
-        normalize_search_args(&mut args);
-        assert_eq!(args, json!(null));
-
-        let mut args = json!([1, 2, 3]);
-        normalize_search_args(&mut args);
-        assert_eq!(args, json!([1, 2, 3]));
-    }
-
-    #[test]
-    fn normalize_search_args_empty_object_noop() {
-        let mut args = json!({});
-        normalize_search_args(&mut args);
-        assert_eq!(args, json!({}));
-    }
-
-    #[test]
-    fn normalize_search_args_mode_plain_text_and_grep_mode_exact_double_mapping() {
-        // Mode remapping runs before grep_mode remapping. "plain_text" mode first
-        // sets grep_mode to "plain_text" (because grep_mode is absent), then the
-        // grep_mode remapping sees the already-valid "plain_text" and leaves it.
-        let mut args = json!({"mode": "plain_text", "grep_mode": "exact"});
-        normalize_search_args(&mut args);
-        assert_eq!(args["mode"], "grep");
-        assert_eq!(args["grep_mode"], "plain_text");
+    fn normalize_search_args_edge_cases() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: serde_json::Value,
+        }
+        let cases = [
+            Case {
+                name: "non-object string passes through unchanged",
+                input: json!("string_value"),
+                expected: json!("string_value"),
+            },
+            Case {
+                name: "non-object number passes through unchanged",
+                input: json!(42),
+                expected: json!(42),
+            },
+            Case {
+                name: "non-object null passes through unchanged",
+                input: json!(null),
+                expected: json!(null),
+            },
+            Case {
+                name: "non-object array passes through unchanged",
+                input: json!([1, 2, 3]),
+                expected: json!([1, 2, 3]),
+            },
+            Case {
+                name: "empty object stays unchanged",
+                input: json!({}),
+                expected: json!({}),
+            },
+        ];
+        for c in &cases {
+            assert_normalize(&c.input, &c.expected, c.name);
+        }
     }
 
     // ── QUERY_ALIAS_KEYS / KNOWN_KEYS consistency ──────────────────────
@@ -1139,145 +1187,239 @@ mod tests {
 
     // ── resolve_query ──────────────────────────────────────────────────
 
-    #[test]
-    fn resolve_query_query_aliases() {
-        // Each non-canonical key maps to the effective query.
-        let args = json!({"pattern": "struct Foo"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("struct Foo"));
-
-        let args = json!({"search": "bar"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("bar"));
-
-        let args = json!({"search_term": "baz"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("baz"));
-
-        // grep_search is NOT recognized by resolve_query (only by normalize_search_args).
-        let args = json!({"grep_search": "qux"});
-        assert_eq!(resolve_query(&args), None);
+    /// Assert that resolving `input` produces `expected`.
+    fn assert_resolve(input: &serde_json::Value, expected: Option<&str>, name: &str) {
+        let result = resolve_query(input);
+        assert_eq!(result.as_deref(), expected, "case '{name}' failed");
     }
 
+    /// Table-driven test for query alias resolution: canonical "query"
+    /// takes priority, aliases follow pattern > search > search_term,
+    /// and grep_search is intentionally excluded from resolve_query.
     #[test]
-    fn resolve_query_query_overrides_aliases() {
-        // Canonical "query" key takes priority over aliases
-        let args = json!({
-            "query": "primary",
-            "pattern": "secondary",
-            "search": "tertiary",
-            "search_term": "quaternary"
-        });
-        assert_eq!(resolve_query(&args).as_deref(), Some("primary"));
+    fn resolve_query_alias_priority() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: Option<&'static str>,
+        }
+        let cases = [
+            // ── Individual aliases ──────────────────────────────────────
+            Case {
+                name: "pattern alias resolves to query",
+                input: json!({"pattern": "struct Foo"}),
+                expected: Some("struct Foo"),
+            },
+            Case {
+                name: "search alias resolves to query",
+                input: json!({"search": "bar"}),
+                expected: Some("bar"),
+            },
+            Case {
+                name: "search_term alias resolves to query",
+                input: json!({"search_term": "baz"}),
+                expected: Some("baz"),
+            },
+            Case {
+                name: "grep_search is NOT recognized by resolve_query",
+                input: json!({"grep_search": "qux"}),
+                expected: None,
+            },
+            // ── Priority ────────────────────────────────────────────────
+            Case {
+                name: "canonical query overrides all aliases",
+                input: json!({
+                    "query": "primary",
+                    "pattern": "secondary",
+                    "search": "tertiary",
+                    "search_term": "quaternary",
+                }),
+                expected: Some("primary"),
+            },
+            Case {
+                name: "pattern overrides search and search_term",
+                input: json!({
+                    "pattern": "from_pattern",
+                    "search": "from_search",
+                    "search_term": "from_term",
+                }),
+                expected: Some("from_pattern"),
+            },
+            Case {
+                name: "search overrides search_term",
+                input: json!({
+                    "search": "from_search",
+                    "search_term": "from_term",
+                }),
+                expected: Some("from_search"),
+            },
+        ];
+        for c in &cases {
+            assert_resolve(&c.input, c.expected, c.name);
+        }
     }
 
-    #[test]
-    fn resolve_query_pattern_overrides_search() {
-        let args = json!({
-            "pattern": "from_pattern",
-            "search": "from_search",
-            "search_term": "from_term"
-        });
-        assert_eq!(resolve_query(&args).as_deref(), Some("from_pattern"));
-    }
-
-    #[test]
-    fn resolve_query_search_overrides_search_term() {
-        let args = json!({
-            "search": "from_search",
-            "search_term": "from_term"
-        });
-        assert_eq!(resolve_query(&args).as_deref(), Some("from_search"));
-    }
-
+    /// Table-driven test for path constraint normalization:
+    /// trailing-slash enforcement and empty/root suppression.
     #[test]
     fn resolve_query_path_constraint() {
-        let args = json!({"path": "src"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("src/"));
-
-        // Path with trailing slash should have only one trailing slash
-        let args = json!({"path": "src/"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("src/"));
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                name: "path gets trailing slash",
+                input: json!({"path": "src"}),
+                expected: Some("src/"),
+            },
+            Case {
+                name: "path with trailing slash deduplicated",
+                input: json!({"path": "src/"}),
+                expected: Some("src/"),
+            },
+            Case {
+                name: "empty path returns None",
+                input: json!({"path": ""}),
+                expected: None,
+            },
+            Case {
+                name: "root path returns None",
+                input: json!({"path": "/"}),
+                expected: None,
+            },
+        ];
+        for c in &cases {
+            assert_resolve(&c.input, c.expected, c.name);
+        }
     }
 
-    #[test]
-    fn resolve_query_path_ignores_empty_or_root() {
-        let args = json!({"path": ""});
-        assert_eq!(resolve_query(&args), None);
-
-        let args = json!({"path": "/"});
-        assert_eq!(resolve_query(&args), None);
-    }
-
+    /// Table-driven test for ext constraint normalization:
+    /// glob prefix addition, leading-dot/asterisk stripping, empty suppression.
     #[test]
     fn resolve_query_ext_constraint() {
-        let args = json!({"ext": "rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("*.rs"));
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                name: "ext gets glob prefix",
+                input: json!({"ext": "rs"}),
+                expected: Some("*.rs"),
+            },
+            Case {
+                name: "leading dot stripped from ext",
+                input: json!({"ext": ".rs"}),
+                expected: Some("*.rs"),
+            },
+            Case {
+                name: "leading asterisk stripped from ext",
+                input: json!({"ext": "*.rs"}),
+                expected: Some("*.rs"),
+            },
+            Case {
+                name: "multiple leading asterisks stripped from ext",
+                input: json!({"ext": "**.rs"}),
+                expected: Some("*.rs"),
+            },
+            Case {
+                name: "empty ext returns None",
+                input: json!({"ext": ""}),
+                expected: None,
+            },
+        ];
+        for c in &cases {
+            assert_resolve(&c.input, c.expected, c.name);
+        }
     }
 
+    /// Table-driven test for constraint combinations and empty-query behavior.
     #[test]
-    fn resolve_query_ext_strips_leading_dots_and_asterisks() {
-        let args = json!({"ext": ".rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("*.rs"));
-
-        let args = json!({"ext": "*.rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("*.rs"));
-
-        let args = json!({"ext": "**.rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("*.rs"));
+    fn resolve_query_combinations_and_empty() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: Option<&'static str>,
+        }
+        let cases = [
+            // ── Constraint combinations ─────────────────────────────────
+            Case {
+                name: "query with path constraint",
+                input: json!({"query": "foo", "path": "src"}),
+                expected: Some("foo src/"),
+            },
+            Case {
+                name: "query with ext constraint",
+                input: json!({"query": "foo", "ext": "rs"}),
+                expected: Some("foo *.rs"),
+            },
+            Case {
+                name: "query with path and ext constraints",
+                input: json!({"query": "foo", "path": "src", "ext": "rs"}),
+                expected: Some("foo src/ *.rs"),
+            },
+            Case {
+                name: "path and ext without explicit query",
+                input: json!({"path": "src", "ext": "rs"}),
+                expected: Some("src/ *.rs"),
+            },
+            // ── Empty query behavior ────────────────────────────────────
+            Case {
+                name: "no query components returns None",
+                input: json!({}),
+                expected: None,
+            },
+            Case {
+                name: "explicit empty query string returns None",
+                input: json!({"query": ""}),
+                expected: None,
+            },
+            Case {
+                name: "empty query with path returns path constraint only",
+                input: json!({"query": "", "path": "src"}),
+                expected: Some("src/"),
+            },
+            Case {
+                name: "empty query with ext returns ext constraint only",
+                input: json!({"query": "", "ext": "rs"}),
+                expected: Some("*.rs"),
+            },
+        ];
+        for c in &cases {
+            assert_resolve(&c.input, c.expected, c.name);
+        }
     }
 
+    /// Non-string values are silently ignored (filtered by get_opt_str).
     #[test]
-    fn resolve_query_ext_ignores_empty() {
-        let args = json!({"ext": ""});
-        assert_eq!(resolve_query(&args), None);
-    }
-
-    #[test]
-    fn resolve_query_constraint_combinations() {
-        let args = json!({"query": "foo", "path": "src"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("foo src/"));
-
-        let args = json!({"query": "foo", "ext": "rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("foo *.rs"));
-
-        // Three-part: query, path, ext
-        let args = json!({"query": "foo", "path": "src", "ext": "rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("foo src/ *.rs"));
-
-        // No explicit query, path and ext only
-        let args = json!({"path": "src", "ext": "rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("src/ *.rs"));
-    }
-
-    #[test]
-    fn resolve_query_empty_query_behavior() {
-        // No query components at all → None
-        let args = json!({});
-        assert_eq!(resolve_query(&args), None);
-
-        // query key present but empty string → None
-        let args = json!({"query": ""});
-        assert_eq!(resolve_query(&args), None);
-
-        // Empty query with path → path constraint only
-        let args = json!({"query": "", "path": "src"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("src/"));
-
-        // Empty query with ext → ext constraint only
-        let args = json!({"query": "", "ext": "rs"});
-        assert_eq!(resolve_query(&args).as_deref(), Some("*.rs"));
-    }
-
-    #[test]
-    fn resolve_query_non_string_values_ignored() {
-        // Non-string values are filtered out by get_opt_str
-        let args = json!({"query": 42});
-        assert_eq!(resolve_query(&args), None);
-
-        // Non-string path is silently skipped, query still resolves
-        let args = json!({"query": "foo", "path": 42});
-        assert_eq!(resolve_query(&args).as_deref(), Some("foo"));
-
-        // Non-string ext is silently skipped, query still resolves
-        let args = json!({"query": "foo", "ext": true});
-        assert_eq!(resolve_query(&args).as_deref(), Some("foo"));
+    fn resolve_query_non_string_values() {
+        struct Case {
+            name: &'static str,
+            input: serde_json::Value,
+            expected: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                name: "non-string query returns None",
+                input: json!({"query": 42}),
+                expected: None,
+            },
+            Case {
+                name: "non-string path silently skipped, query still resolves",
+                input: json!({"query": "foo", "path": 42}),
+                expected: Some("foo"),
+            },
+            Case {
+                name: "non-string ext silently skipped, query still resolves",
+                input: json!({"query": "foo", "ext": true}),
+                expected: Some("foo"),
+            },
+        ];
+        for c in &cases {
+            assert_resolve(&c.input, c.expected, c.name);
+        }
     }
 }
