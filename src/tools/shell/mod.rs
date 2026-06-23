@@ -1991,26 +1991,17 @@ mod tests {
     }
 
     #[test]
-    fn collapse_consecutive_lines_basic() {
-        let input = "a\nb\nb\nb\nb\nb\nb\nc";
-        let result = collapse_consecutive_lines(input);
-        assert!(
-            result.contains("[repeated 6 times]"),
-            "should collapse 6 identical lines"
-        );
-        assert!(
-            !result.contains("b\nb\nb\nb\nb\nb"),
-            "should not keep individual lines"
-        );
-        assert!(result.contains('a'), "should keep surrounding context");
-        assert!(result.contains('c'), "should keep surrounding context");
-    }
-
-    #[test]
-    fn collapse_does_not_touch_below_threshold() {
-        let input = "a\nb\nb\nb\nc";
-        let result = collapse_consecutive_lines(input);
-        assert_eq!(result, input, "should pass through when below threshold");
+    fn collapse_consecutive_lines_cases() {
+        let cases: &[(&str, &str)] = &[
+            // 6 identical "b" lines → collapsed with [repeated N times] marker
+            ("a\nb\nb\nb\nb\nb\nb\nc", "a\nb\n[repeated 6 times]\nc"),
+            // 3 identical "b" lines → below threshold (5), pass through unchanged
+            ("a\nb\nb\nb\nc", "a\nb\nb\nb\nc"),
+        ];
+        for (input, expected) in cases {
+            let result = collapse_consecutive_lines(input);
+            assert_eq!(result, *expected, "input: {input:?}");
+        }
     }
 
     #[test]
@@ -2192,35 +2183,21 @@ mod tests {
     // ── New feature tests ───────────────────────────────────────────
 
     #[test]
-    fn collapse_blank_lines_basic() {
-        let input = "a\n\n\n\nb\n\n\nc";
-        let result = collapse_blank_lines(input);
-        assert_eq!(result, "a\n\n\nb\n\n\nc", "3+ blank runs collapsed to 2");
-    }
-
-    #[test]
-    fn collapse_blank_lines_single_double_preserved() {
-        let input = "a\n\nb\n\n\nc\n\n\n\nd";
-        let result = collapse_blank_lines(input);
-        assert_eq!(
-            result, "a\n\nb\n\n\nc\n\n\nd",
-            "runs ≤2 left alone, longer collapsed"
-        );
-    }
-
-    #[test]
-    fn collapse_blank_lines_no_blank_lines() {
-        let input = "a\nb\nc";
-        let result = collapse_blank_lines(input);
-        assert_eq!(result, input, "no blank lines — pass through");
-    }
-
-    #[test]
-    fn collapse_blank_lines_all_blank() {
-        let input = "\n\n\n\n\n";
-        let result = collapse_blank_lines(input);
-        assert!(result.len() < input.len(), "blank run collapsed");
-        assert!(result.lines().count() <= 2, "at most 2 blank lines remain");
+    fn collapse_blank_lines_cases() {
+        let cases: &[(&str, &str)] = &[
+            // 3+ consecutive blank lines collapse to 2
+            ("a\n\n\n\nb\n\n\nc", "a\n\n\nb\n\n\nc"),
+            // runs ≤2 left alone, longer runs collapse to 2
+            ("a\n\nb\n\n\nc\n\n\n\nd", "a\n\nb\n\n\nc\n\n\nd"),
+            // no blank lines → pass through unchanged
+            ("a\nb\nc", "a\nb\nc"),
+            // all-blank input collapses completely (no anchor lines)
+            ("\n\n\n\n\n", ""),
+        ];
+        for (input, expected) in cases {
+            let result = collapse_blank_lines(input);
+            assert_eq!(result, *expected, "input: {input:?}");
+        }
     }
 
     /// 5+ consecutive blank lines should collapse to 2, not produce `[repeated]` markers.
@@ -2381,50 +2358,34 @@ mod tests {
     // ── Chained command and canonical command tests ─────────────────
 
     #[test]
-    fn extract_segments_simple() {
-        let segs = extract_command_segments("cargo build");
-        assert_eq!(segs, vec!["cargo build"]);
-    }
-
-    #[test]
-    fn extract_segments_chained_and() {
-        let segs = extract_command_segments("cd project && cargo build");
-        assert_eq!(segs, vec!["cd project", "cargo build"]);
-    }
-
-    #[test]
-    fn extract_segments_chained_pipe() {
-        let segs = extract_command_segments("npm run build 2>&1 | tee build.log");
-        assert_eq!(segs.len(), 2);
-        assert!(segs[0].contains("npm"));
-        assert!(segs[1].contains("tee"));
-    }
-
-    #[test]
-    fn extract_segments_respects_quotes() {
-        let segs = extract_command_segments("echo 'foo && bar' | cat");
-        assert_eq!(segs.len(), 2);
-        assert_eq!(segs[0], "echo 'foo && bar'");
-        assert_eq!(segs[1], "cat");
-    }
-
-    #[test]
-    fn extract_segments_semicolon() {
-        let segs = extract_command_segments("cargo build ; cargo test");
-        assert_eq!(segs.len(), 2);
-    }
-
-    #[test]
-    fn quoted_ampersand_not_split() {
-        let segs = extract_command_segments("echo 'foo && bar'");
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0], "echo 'foo && bar'");
-    }
-
-    #[test]
-    fn double_quoted_pipe_not_split() {
-        let segs = extract_command_segments("echo \"pipe | test\"");
-        assert_eq!(segs.len(), 1);
+    fn extract_segments_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            // simple single command
+            ("cargo build", &["cargo build"]),
+            // chained with &&
+            ("cd project && cargo build", &["cd project", "cargo build"]),
+            // pipe (|) splits commands
+            (
+                "npm run build 2>&1 | tee build.log",
+                &["npm run build 2>&1", "tee build.log"],
+            ),
+            // single quotes protect && and | from being treated as separators
+            ("echo 'foo && bar' | cat", &["echo 'foo && bar'", "cat"]),
+            // semicolon splits commands
+            ("cargo build ; cargo test", &["cargo build", "cargo test"]),
+            // single-quoted && preserved as one segment
+            ("echo 'foo && bar'", &["echo 'foo && bar'"]),
+            // double-quoted pipe preserved as one segment
+            ("echo \"pipe | test\"", &["echo \"pipe | test\""]),
+        ];
+        for (input, expected) in cases {
+            let result = extract_command_segments(input);
+            assert_eq!(
+                result.iter().map(String::as_str).collect::<Vec<_>>(),
+                *expected,
+                "input: {input:?}"
+            );
+        }
     }
 
     #[test]
