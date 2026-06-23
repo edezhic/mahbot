@@ -274,47 +274,7 @@ impl Agent {
                 // preserved in `all_outcomes`.
                 self.log_tool_notifications(&tool_calls, None, ToolOutputPhase::Before);
 
-                // Determine side_effects for each tool call. Unknown tools are
-                // conservatively treated as side-effecting (default: true).
-                let side_flags: Vec<bool> = tool_calls
-                    .iter()
-                    .map(|call| {
-                        find_tool(&self.tools, &call.name)
-                            .is_none_or(|tool| tool.side_effects(&call.arguments))
-                    })
-                    .collect();
-
-                let mut all_outcomes: Vec<ToolExecutionOutcome> =
-                    Vec::with_capacity(tool_calls.len());
-
-                let mut i = 0usize;
-                while i < tool_calls.len() {
-                    if side_flags[i] {
-                        // Side-effecting: single-call group, executed alone.
-                        let outcome = self
-                            .execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone())
-                            .await;
-                        all_outcomes.push(outcome);
-                        i += 1;
-                    } else {
-                        // Read-only group: extend while consecutive calls are also read-only.
-                        let group_start = i;
-                        while i < tool_calls.len() && !side_flags[i] {
-                            i += 1;
-                        }
-                        let group_calls = &tool_calls[group_start..i];
-
-                        // Execute the entire read-only group in parallel.
-                        let group_outcomes: Vec<_> = futures_util::future::join_all(
-                            group_calls
-                                .iter()
-                                .map(|call| self.execute_tool(&call.name, call.arguments.clone())),
-                        )
-                        .await;
-
-                        all_outcomes.extend(group_outcomes);
-                    }
-                }
+                let all_outcomes = self.execute_tool_group(&tool_calls).await;
 
                 self.log_tool_notifications(
                     &tool_calls,
@@ -337,6 +297,54 @@ impl Agent {
         }
         .instrument(span)
         .await
+    }
+
+    /// Execute a batch of tool calls respecting side-effect ordering.
+    ///
+    /// Read-only tools run in parallel within groups; side-effecting tools
+    /// run one at a time. Groups execute sequentially in the original call
+    /// order. The returned outcomes correspond one-to-one with `tool_calls`.
+    async fn execute_tool_group(&self, tool_calls: &[ToolCall]) -> Vec<ToolExecutionOutcome> {
+        // Determine side_effects for each tool call. Unknown tools are
+        // conservatively treated as side-effecting (default: true).
+        let side_flags: Vec<bool> = tool_calls
+            .iter()
+            .map(|call| {
+                find_tool(&self.tools, &call.name)
+                    .is_none_or(|tool| tool.side_effects(&call.arguments))
+            })
+            .collect();
+
+        let mut outcomes: Vec<ToolExecutionOutcome> = Vec::with_capacity(tool_calls.len());
+        let mut i = 0usize;
+        while i < tool_calls.len() {
+            if side_flags[i] {
+                // Side-effecting: single-call group, executed alone.
+                let outcome = self
+                    .execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone())
+                    .await;
+                outcomes.push(outcome);
+                i += 1;
+            } else {
+                // Read-only group: extend while consecutive calls are also read-only.
+                let group_start = i;
+                while i < tool_calls.len() && !side_flags[i] {
+                    i += 1;
+                }
+                let group_calls = &tool_calls[group_start..i];
+
+                // Execute the entire read-only group in parallel.
+                let group_outcomes: Vec<_> = futures_util::future::join_all(
+                    group_calls
+                        .iter()
+                        .map(|call| self.execute_tool(&call.name, call.arguments.clone())),
+                )
+                .await;
+
+                outcomes.extend(group_outcomes);
+            }
+        }
+        outcomes
     }
 
     /// Construct a failure outcome tuple for an error reason.
