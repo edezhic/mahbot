@@ -222,9 +222,10 @@ pub fn format_tool_failure_feedback(
     tool_args: &serde_json::Value,
     reason: &str,
 ) -> String {
-    // Callers must pre-scrub `reason` before passing it; this function does
-    // not scrub to avoid double-scrubbing — scrubbing is the responsibility
-    // of [`failure_outcome`](crate::agent::Agent::failure_outcome).
+    // The `reason` parameter is pre-scrubbed by the caller
+    // ([`failure_outcome`](crate::agent::Agent::failure_outcome)) and passed
+    // through as-is to avoid double-scrubbing. The `tool_args` are scrubbed
+    // here since they're formatted for display.
     let args_preview = scrub_credentials(&crate::util::truncate(&tool_args.to_string(), 1000));
     format!(
         "Tool call failed.\n\
