@@ -219,7 +219,7 @@ pub enum Command {
 impl Command {
     /// Whether this command requires a full-permission user.
     #[must_use]
-    pub fn needs_full_user(&self) -> bool {
+    pub const fn needs_full_user(&self) -> bool {
         false
     }
 }
@@ -716,7 +716,7 @@ impl Reasoning {
     }
 
     #[must_use]
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.reasoning.is_none()
             && self.reasoning_content.is_none()
             && self.reasoning_details.is_none()

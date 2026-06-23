@@ -301,7 +301,7 @@ pub struct ShellTool {
 impl ShellTool {
     /// Create a new [`ShellTool`] with the given execution mode.
     #[must_use]
-    pub fn new(mode: ShellMode) -> Self {
+    pub const fn new(mode: ShellMode) -> Self {
         Self { mode }
     }
 }
@@ -335,7 +335,7 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
 }
 
 #[cfg(unix)]
-fn default_search_path_without_parent_env() -> &'static str {
+const fn default_search_path_without_parent_env() -> &'static str {
     "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 }
 
@@ -679,7 +679,7 @@ static SPILL_DIR_CLEANED: AtomicBool = AtomicBool::new(false);
 /// negative for redirect detection = allows command; no redirect inside
 /// double-quoted strings is actually harmful since the redirect operator is
 /// quoted).
-fn check_outside_quotes(c: char, in_single: &mut bool, in_double: &mut bool) -> bool {
+const fn check_outside_quotes(c: char, in_single: &mut bool, in_double: &mut bool) -> bool {
     match c {
         '\'' if !*in_double => {
             *in_single = !*in_single;

@@ -109,7 +109,7 @@ enum LineEnding {
 
 impl LineEnding {
     #[must_use]
-    fn as_str(&self) -> &'static str {
+    const fn as_str(&self) -> &'static str {
         match self {
             Self::Lf => "\n",
             Self::Crlf => "\r\n",
@@ -181,7 +181,7 @@ const LARGE_FILE_UNDO_THRESHOLD: usize = 100_000;
 
 impl UndoStack {
     #[must_use]
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1548,7 +1548,7 @@ impl EditorState {
     }
 
     /// Returns the active tab index, or `None` if there are no tabs open.
-    fn active_tab_idx(&self) -> Option<usize> {
+    const fn active_tab_idx(&self) -> Option<usize> {
         let idx = self.active_tab_index;
         if idx >= self.tabs.len() {
             None

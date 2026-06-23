@@ -71,7 +71,7 @@ pub struct UsersState {
 }
 
 impl UsersState {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             users: Vec::new(),
             error: None,

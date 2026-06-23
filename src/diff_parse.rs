@@ -51,7 +51,7 @@ pub struct DiffFile {
 impl DiffFile {
     /// Create a placeholder entry for binary or too-large untracked files.
     #[must_use]
-    pub fn placeholder(path: String, is_binary: bool, too_large_size: Option<u64>) -> Self {
+    pub const fn placeholder(path: String, is_binary: bool, too_large_size: Option<u64>) -> Self {
         Self {
             path,
             old_path: None,

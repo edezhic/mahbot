@@ -297,7 +297,7 @@ impl EditorBuffer {
 
     /// Return the associated highlight language, if any.
     #[must_use]
-    pub fn language(&self) -> Option<HighlightLanguage> {
+    pub const fn language(&self) -> Option<HighlightLanguage> {
         self.language
     }
 
@@ -545,7 +545,7 @@ impl EditorBuffer {
     }
 
     /// Return the normalised selection range (start before end).
-    fn selection_range(&self) -> (usize, usize, usize, usize) {
+    const fn selection_range(&self) -> (usize, usize, usize, usize) {
         let cl = self.cursor_line.get();
         let cc = self.cursor_col.get();
         let sl = self.sel_line.get();
@@ -2128,7 +2128,7 @@ pub struct EditorWidget<'a> {
 
 impl<'a> EditorWidget<'a> {
     /// Create a new [`EditorWidget`].
-    pub fn new(buffer: &'a EditorBuffer) -> Self {
+    pub const fn new(buffer: &'a EditorBuffer) -> Self {
         Self {
             buffer,
             font_size: 13.0,
@@ -2144,14 +2144,14 @@ impl<'a> EditorWidget<'a> {
 
     /// Set the font size.
     #[must_use]
-    pub fn font_size(mut self, size: f32) -> Self {
+    pub const fn font_size(mut self, size: f32) -> Self {
         self.font_size = size;
         self
     }
 
     /// Set the padding.
     #[must_use]
-    pub fn padding(mut self, padding: f32) -> Self {
+    pub const fn padding(mut self, padding: f32) -> Self {
         self.padding = padding;
         self
     }
@@ -2160,7 +2160,7 @@ impl<'a> EditorWidget<'a> {
     /// Set this when another UI element (tree panel, find/replace bar)
     /// has keyboard focus and should receive the events instead.
     #[must_use]
-    pub fn ignore_keyboard(mut self, ignore: bool) -> Self {
+    pub const fn ignore_keyboard(mut self, ignore: bool) -> Self {
         self.ignore_keyboard = ignore;
         self
     }
@@ -2171,7 +2171,7 @@ impl<'a> EditorWidget<'a> {
     /// Used when the find/replace bar is open so the editor can still
     /// scroll and navigate while the text_input handles its own editing.
     #[must_use]
-    pub fn block_editing(mut self, block: bool) -> Self {
+    pub const fn block_editing(mut self, block: bool) -> Self {
         self.block_editing = block;
         self
     }
@@ -2196,7 +2196,7 @@ impl<'a> EditorWidget<'a> {
     /// This is passed from the editor state's `BlinkTick` handler to force
     /// Iced to detect a widget change and schedule a redraw on each tick.
     #[must_use]
-    pub fn blink_gen(mut self, blink_gen: u64) -> Self {
+    pub const fn blink_gen(mut self, blink_gen: u64) -> Self {
         self.blink_gen = blink_gen;
         self
     }
@@ -2205,7 +2205,7 @@ impl<'a> EditorWidget<'a> {
     /// `pair` is `((open_line, open_col), (close_line, close_col))`.
     /// Pass `None` to hide bracket highlighting.
     #[must_use]
-    pub fn bracket_pair(mut self, pair: Option<((usize, usize), (usize, usize))>) -> Self {
+    pub const fn bracket_pair(mut self, pair: Option<((usize, usize), (usize, usize))>) -> Self {
         self.bracket_pair = pair;
         self
     }
@@ -3236,7 +3236,7 @@ where
 
 /// Returns `true` if the key is a cursor-movement key (arrow keys,
 /// Home, End, PageUp, PageDown).
-fn is_cursor_movement_key(key: &key::Key) -> bool {
+const fn is_cursor_movement_key(key: &key::Key) -> bool {
     matches!(
         key,
         key::Key::Named(
@@ -3253,7 +3253,7 @@ fn is_cursor_movement_key(key: &key::Key) -> bool {
 }
 
 /// Returns `true` when the action moves the cursor (including extending selection).
-fn is_action_cursor_movement(action: &EditorAction) -> bool {
+const fn is_action_cursor_movement(action: &EditorAction) -> bool {
     matches!(
         action,
         EditorAction::MoveLeft

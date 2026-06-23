@@ -28,7 +28,7 @@ enum ErrorClass {
 }
 
 impl ErrorClass {
-    fn reason_label(self) -> &'static str {
+    const fn reason_label(self) -> &'static str {
         match self {
             Self::Retryable => "retryable",
             Self::NonRetryable => "non_retryable",

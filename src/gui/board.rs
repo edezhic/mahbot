@@ -794,7 +794,7 @@ impl BoardState {
 
     /// Whether a ticket detail modal is currently open (or loading).
     #[must_use]
-    pub fn is_modal_open(&self) -> bool {
+    pub const fn is_modal_open(&self) -> bool {
         self.selected_ticket.is_some() || self.selected_loading
     }
 

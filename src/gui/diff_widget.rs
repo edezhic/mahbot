@@ -96,7 +96,7 @@ pub struct DiffBufferWidget<'a> {
 
 impl<'a> DiffBufferWidget<'a> {
     /// Create a new [`DiffBufferWidget`] from pre-computed buffer data.
-    pub fn new(data: &'a DiffFileBuffer) -> Self {
+    pub const fn new(data: &'a DiffFileBuffer) -> Self {
         Self { data, padding: 8.0 }
     }
 }

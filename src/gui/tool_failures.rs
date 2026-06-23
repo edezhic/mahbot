@@ -101,7 +101,7 @@ impl ToolFailuresState {
         }
     }
 
-    fn total_pages(&self) -> usize {
+    const fn total_pages(&self) -> usize {
         if self.total == 0 {
             0
         } else {

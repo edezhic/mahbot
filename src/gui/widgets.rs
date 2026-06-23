@@ -137,7 +137,11 @@ pub async fn debounce_sleep(ms: u64, generation: u64) -> u64 {
 /// counter, and the pending flag.  This prevents stale debounce tasks
 /// from triggering a refresh after a newer task has been spawned.
 #[must_use]
-pub fn debounce_should_process(generation: u64, current_generation: u64, pending: bool) -> bool {
+pub const fn debounce_should_process(
+    generation: u64,
+    current_generation: u64,
+    pending: bool,
+) -> bool {
     generation == current_generation && pending
 }
 
@@ -314,7 +318,7 @@ pub fn build_tree_panel<'a, Message: 'a>(
 /// Each depth level adds 14 pixels of indentation.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn tree_indent(depth: usize) -> f32 {
+pub const fn tree_indent(depth: usize) -> f32 {
     (depth * 14) as f32
 }
 

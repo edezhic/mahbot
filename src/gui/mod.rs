@@ -83,7 +83,7 @@ pub enum Page {
 }
 
 impl Page {
-    fn all() -> &'static [Page] {
+    const fn all() -> &'static [Page] {
         &[
             Page::Home,
             Page::Sessions,
@@ -97,12 +97,12 @@ impl Page {
     }
 
     /// Pages shown in the sidebar (Home, Editor, Diff, Shell).
-    fn sidebar_pages() -> &'static [Page] {
+    const fn sidebar_pages() -> &'static [Page] {
         &[Page::Home, Page::Editor, Page::Diff, Page::Shell]
     }
 
     /// Pages shown in the footer nav (Sessions, Logs, Tool Failures).
-    fn footer_pages() -> &'static [Page] {
+    const fn footer_pages() -> &'static [Page] {
         &[
             Page::Sessions,
             Page::Logs,
@@ -111,7 +111,7 @@ impl Page {
         ]
     }
 
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Page::Home => "Home",
             Page::Sessions => "Sessions",
@@ -181,7 +181,7 @@ impl Toast {
         }
     }
 
-    fn duration(&self) -> Duration {
+    const fn duration(&self) -> Duration {
         match self.kind {
             ToastKind::Success => Duration::from_secs(2),
             ToastKind::Warning | ToastKind::Error => Duration::from_secs(4),
@@ -341,7 +341,7 @@ impl Dashboard {
         }
     }
 
-    pub fn theme(&self) -> iced::Theme {
+    pub const fn theme(&self) -> iced::Theme {
         iced::Theme::Dark
     }
 
@@ -1554,7 +1554,7 @@ pub struct WindowState {
 impl WindowState {
     /// Position to use when restoring the window.
     #[allow(clippy::cast_precision_loss)]
-    pub fn position(&self) -> iced::window::Position {
+    pub const fn position(&self) -> iced::window::Position {
         iced::window::Position::Specific(iced::Point::new(self.x as f32, self.y as f32))
     }
 }

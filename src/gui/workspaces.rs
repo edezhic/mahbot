@@ -97,7 +97,7 @@ pub struct WorkspacesState {
 }
 
 impl WorkspacesState {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             workspaces: Vec::new(),
             error: None,

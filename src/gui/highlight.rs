@@ -131,7 +131,7 @@ pub enum HighlightClass {
 impl HighlightClass {
     /// Map to a theme color.
     #[must_use]
-    pub fn color(self) -> Color {
+    pub const fn color(self) -> Color {
         match self {
             HighlightClass::Keyword => Color::from_rgb(0.941, 0.439, 0.110),
             HighlightClass::String => Color::from_rgb(0.298, 0.722, 0.114),
@@ -612,7 +612,7 @@ impl HighlightLanguage {
     /// Used to look up the shared tree-sitter [`Language`] via
     /// [`crate::util::tree_sitter::tree_sitter_language_for_extension`].
     #[must_use]
-    pub fn extension(self) -> &'static str {
+    pub const fn extension(self) -> &'static str {
         match self {
             HighlightLanguage::Rust => "rs",
             HighlightLanguage::JavaScript => "js",

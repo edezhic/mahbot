@@ -347,7 +347,7 @@ pub async fn init_tracing(
 // ── Tracing integration ──────────────────────────────────────────
 
 /// A [`MakeWriter`] that sends JSON log lines over an unbounded channel.
-fn make_log_writer(tx: UnboundedSender<String>) -> LogWriter {
+const fn make_log_writer(tx: UnboundedSender<String>) -> LogWriter {
     LogWriter { tx }
 }
 

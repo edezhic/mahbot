@@ -84,7 +84,7 @@ struct ContextMenuState {
 }
 
 impl ContextMenuState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             show: false,
             position: Point::ORIGIN,

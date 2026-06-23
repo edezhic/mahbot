@@ -39,7 +39,7 @@ pub struct ImageTranscriber {
 
 impl ImageTranscriber {
     #[must_use]
-    pub(crate) fn from_inner(inner: MediaTranscriber) -> Self {
+    pub(crate) const fn from_inner(inner: MediaTranscriber) -> Self {
         Self { inner }
     }
 
@@ -97,7 +97,7 @@ pub struct AudioTranscriber {
 
 impl AudioTranscriber {
     #[must_use]
-    pub(crate) fn from_inner(inner: MediaTranscriber) -> Self {
+    pub(crate) const fn from_inner(inner: MediaTranscriber) -> Self {
         Self { inner }
     }
 

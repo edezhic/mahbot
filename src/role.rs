@@ -89,7 +89,7 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
 /// Never — this is a complete match over all [`Role`] variants.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn role_info(role: &Role) -> &'static RoleInfo {
+pub const fn role_info(role: &Role) -> &'static RoleInfo {
     match role {
         Role::Manager => &RoleInfo {
             selectable: true,
@@ -190,13 +190,13 @@ impl Role {
 
     /// Whether users can explicitly select this role.
     #[must_use]
-    pub fn is_selectable(&self) -> bool {
+    pub const fn is_selectable(&self) -> bool {
         role_info(self).selectable
     }
 
     /// Whether this role requires a vision-capable (multimodal) model.
     #[must_use]
-    pub fn requires_multimodal(&self) -> bool {
+    pub const fn requires_multimodal(&self) -> bool {
         role_info(self).requires_multimodal
     }
 

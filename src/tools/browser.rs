@@ -766,7 +766,7 @@ impl Tool for BrowserTool {
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Get the platform-appropriate agent-browser binary name.
-fn agent_browser_bin() -> &'static str {
+const fn agent_browser_bin() -> &'static str {
     if cfg!(target_os = "windows") {
         "agent-browser.cmd"
     } else {

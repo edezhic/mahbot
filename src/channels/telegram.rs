@@ -207,7 +207,7 @@ impl TelegramAttachmentKind {
         }
     }
 
-    fn meta(self) -> AttachmentMeta {
+    const fn meta(self) -> AttachmentMeta {
         match self {
             Self::Image => AttachmentMeta {
                 api_method: "sendPhoto",
@@ -658,7 +658,7 @@ impl TelegramChannel {
         });
     }
 
-    fn http_client(&self) -> &reqwest::Client {
+    const fn http_client(&self) -> &reqwest::Client {
         &self.http_client
     }
 

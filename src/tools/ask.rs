@@ -25,7 +25,7 @@ pub struct AskTool {
 
 impl AskTool {
     #[must_use]
-    pub fn new(allowed_roles: Vec<Role>, caller_agent_id: Option<String>) -> Self {
+    pub const fn new(allowed_roles: Vec<Role>, caller_agent_id: Option<String>) -> Self {
         Self {
             allowed_roles,
             caller_agent_id,

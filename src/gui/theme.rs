@@ -82,7 +82,7 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
 /// (it defaults from `BASE_ROLE_INFO`), but the `badge_colors_set` test in
 /// `role.rs` guards against silent black fallthrough.
 #[must_use]
-pub fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
+pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
     let info = crate::role::role_info(role);
     let (r, g, b) = info.badge_fg;
     (Color::from_rgb(r, g, b), Color::from_rgba(r, g, b, 0.1))
@@ -173,7 +173,7 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
 // ── Ticket status badge colors (from Board.tsx STATUS_STYLE) ─────
 // 15 TicketPhase variants, exhaustively matched — no catch-all.
 
-pub fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
+pub const fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
         Analysis, Backlog, Cancelled, DiagnosticsDone, Done, Failed, InDevelopment, InDiagnostics,
         InQa, InReview, Paused, Planning, QaPassed, ReadyForDevelopment, Reviewed,

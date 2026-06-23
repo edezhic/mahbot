@@ -93,27 +93,27 @@ impl Profile {
         self
     }
 
-    fn max_line_len(mut self, n: usize) -> Self {
+    const fn max_line_len(mut self, n: usize) -> Self {
         self.max_line_len = Some(n);
         self
     }
 
-    fn head(mut self, n: usize) -> Self {
+    const fn head(mut self, n: usize) -> Self {
         self.head_lines = Some(n);
         self
     }
 
-    fn tail(mut self, n: usize) -> Self {
+    const fn tail(mut self, n: usize) -> Self {
         self.tail_lines = Some(n);
         self
     }
 
-    fn max(mut self, n: usize) -> Self {
+    const fn max(mut self, n: usize) -> Self {
         self.max_lines = Some(n);
         self
     }
 
-    fn on_empty(mut self, msg: &'static str) -> Self {
+    const fn on_empty(mut self, msg: &'static str) -> Self {
         self.on_empty = Some(msg);
         self
     }
@@ -131,7 +131,7 @@ impl Profile {
     /// with its sensible truncation defaults. This is useful for transforms like
     /// `compact_ls` that assume homogeneous output and would silently drop
     /// output from later command segments.
-    fn standalone_only(mut self) -> Self {
+    const fn standalone_only(mut self) -> Self {
         self.standalone_only = true;
         self
     }

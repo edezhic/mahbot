@@ -553,7 +553,7 @@ impl Agent {
     }
 
     /// Resolve temperature for this agent's role from static role metadata.
-    fn temperature(&self) -> f32 {
+    const fn temperature(&self) -> f32 {
         crate::role::role_info(&self.role).temperature
     }
 

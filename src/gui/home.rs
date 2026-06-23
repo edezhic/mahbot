@@ -188,7 +188,7 @@ struct UndoSnapshot {
 }
 
 impl UndoStack {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             undo: Vec::new(),
             redo: Vec::new(),
@@ -387,7 +387,7 @@ impl HomeState {
 
     /// Reset pagination and auto-scroll state. Called at all cleanup sites
     /// (user change, workspace change, role change, clear, stream lag).
-    fn reset_pagination_state(&mut self) {
+    const fn reset_pagination_state(&mut self) {
         self.oldest_loaded_id = None;
         self.has_more = false;
         self.loading_older = false;
