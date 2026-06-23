@@ -251,10 +251,7 @@ async fn save_image_to_workspace(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("png");
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let timestamp = crate::util::unix_millis();
     let dest_name = format!("upload_{timestamp}.{ext}");
     let dest_path = dir.join(&dest_name);
     tokio::fs::copy(image_path, &dest_path).await.ok()?;

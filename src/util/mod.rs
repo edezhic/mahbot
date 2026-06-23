@@ -55,6 +55,17 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
     }
 }
 
+/// Current Unix timestamp in milliseconds since the epoch.
+///
+/// Returns `0` if the system clock is set before the Unix epoch (January 1, 1970).
+#[must_use]
+pub(crate) fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Produce a short human-readable summary of tool arguments.
 #[must_use]
 pub fn summarize_args(args: &serde_json::Value) -> String {
@@ -706,5 +717,20 @@ mod scrub_tests {
         for &(name, input) in CASES {
             assert_eq!(scrub_credentials(input), input, "{name}");
         }
+    }
+
+    #[test]
+    fn unix_millis_is_reasonable() {
+        // Any reasonable system: timestamp should be > year 2020 (~1_577_836_800_000)
+        // and < year 2100 (~4_102_444_800_000) to catch drastic clock skew.
+        let ts = super::unix_millis();
+        assert!(
+            ts > 1_577_836_800_000,
+            "unix_millis() seems too small: {ts}"
+        );
+        assert!(
+            ts < 4_102_444_800_000,
+            "unix_millis() seems too large: {ts}"
+        );
     }
 }

@@ -298,10 +298,7 @@ pub(crate) async fn save_generated_file(
             )
         })?;
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let timestamp = crate::util::unix_millis();
     let output_path = generated_dir.join(format!("{prefix}_{timestamp}.{ext}"));
 
     tokio::fs::write(&output_path, bytes)
