@@ -60,6 +60,15 @@ const FIND_REPLACE_ID: &str = "find_replace_input";
 /// Widget ID for the global search input.
 const GLOBAL_SEARCH_INPUT_ID: &str = "global_search_input";
 
+/// Widget ID for the go-to-line input.
+const GOTO_LINE_INPUT_ID: &str = "goto_line_input";
+
+/// Widget ID for the quick-open filter input.
+const QUICK_OPEN_INPUT_ID: &str = "quick_open_input";
+
+/// Widget ID for the new file/directory name input.
+const NEW_ITEM_INPUT_ID: &str = "new_item_input";
+
 /// Maximum number of global search results to display.
 const MAX_GLOBAL_SEARCH_RESULTS: usize = 200;
 
@@ -2141,16 +2150,19 @@ impl EditorState {
                 if self.active_tab_idx().is_some() {
                     if self.goto_line_input.is_some() {
                         self.goto_line_input = None;
-                    } else {
-                        // Close find bar when opening go-to-line.
-                        if let Some(idx) = self.active_tab_idx() {
-                            let path = self.tabs[idx].path.clone();
-                            if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-                                tab_data.find_replace_state = None;
-                            }
-                        }
-                        self.goto_line_input = Some(String::new());
+                        return Task::none();
                     }
+                    // Close find bar when opening go-to-line.
+                    if let Some(idx) = self.active_tab_idx() {
+                        let path = self.tabs[idx].path.clone();
+                        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                            tab_data.find_replace_state = None;
+                        }
+                    }
+                    self.goto_line_input = Some(String::new());
+                    return iced::widget::operation::focus::<EditorMessage>(Id::new(
+                        GOTO_LINE_INPUT_ID,
+                    ));
                 }
                 Task::none()
             }
@@ -2340,7 +2352,7 @@ impl EditorState {
                     ws_root: ws.clone(),
                     input_text: String::new(),
                 });
-                Task::none()
+                iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
             }
 
             EditorMessage::NewDirectoryRequested(parent_dir) => {
@@ -2362,7 +2374,7 @@ impl EditorState {
                     ws_root: ws.clone(),
                     input_text: String::new(),
                 });
-                Task::none()
+                iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
             }
 
             EditorMessage::RevealInFinder(path) => Self::perform_reveal_in_finder(path),
@@ -2422,6 +2434,9 @@ impl EditorState {
                     self.quick_open = None;
                     return Task::none();
                 }
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
+                }
 
                 // Refresh file list from all currently expanded directories.
                 self.scan_all_workspace_files();
@@ -2431,7 +2446,7 @@ impl EditorState {
                     selected_index: 0,
                     results: Vec::new(),
                 });
-                Task::none()
+                iced::widget::operation::focus::<EditorMessage>(Id::new(QUICK_OPEN_INPUT_ID))
             }
 
             EditorMessage::QuickOpenInput(filter) => {
@@ -3712,6 +3727,9 @@ impl EditorState {
             self.global_search = None;
             return Task::none();
         }
+        if self.modal_overlay_blocks_editor_shortcuts() {
+            return Task::none();
+        }
         // Close find bar and go-to-line when opening global search.
         if let Some(idx) = self.active_tab_idx() {
             let path = self.tabs[idx].path.clone();
@@ -4623,6 +4641,7 @@ impl EditorState {
         let line_input = text_input("Line #", input_text)
             .on_input(EditorMessage::GoToLineInput)
             .on_submit(EditorMessage::GoToLineGo)
+            .id(Id::new(GOTO_LINE_INPUT_ID))
             .style(widgets::text_input_style)
             .width(Length::Fixed(120.0))
             .size(13);
@@ -4734,6 +4753,7 @@ impl EditorState {
                 .on_submit(qo.results.first().map_or(EditorMessage::Escape, |_| {
                     EditorMessage::QuickOpenSelect(qo.selected_index)
                 }))
+                .id(Id::new(QUICK_OPEN_INPUT_ID))
                 .style(widgets::text_input_style)
                 .size(14)
                 .width(Length::Fill)
@@ -5272,7 +5292,7 @@ impl EditorState {
         };
 
         let input = text_input("Name…", &target.input_text)
-            .id(Id::new("new-item-input"))
+            .id(Id::new(NEW_ITEM_INPUT_ID))
             .on_input(EditorMessage::NewItemInput)
             .on_submit(EditorMessage::NewItemSubmit(target.input_text.clone()))
             .style(widgets::text_input_style)
@@ -6865,5 +6885,39 @@ mod tests {
         let cursor = state.tab_contents.get(&path).unwrap().content.cursor();
         assert_eq!(cursor.line, 0);
         assert_eq!(cursor.column, 5);
+    }
+
+    #[test]
+    fn test_quick_open_toggle_blocked_when_goto_line_open() {
+        let mut state = make_editor_with_single_tab("hello");
+        state.goto_line_input = Some(String::new());
+        let _ = state.update(EditorMessage::QuickOpenToggle);
+        assert!(state.quick_open.is_none());
+    }
+
+    #[test]
+    fn test_quick_open_toggle_closes_when_already_open() {
+        let mut state = make_editor_with_single_tab("hello");
+        state.quick_open = Some(QuickOpenState {
+            filter: "foo".to_string(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+        let _ = state.update(EditorMessage::QuickOpenToggle);
+        assert!(state.quick_open.is_none());
+    }
+
+    #[test]
+    fn test_global_search_toggle_blocked_when_quick_open_open() {
+        let mut state = make_editor_with_single_tab("hello");
+        state.selected_workspace_name = Some("ws".to_string());
+        state.selected_workspace_path = Some("/tmp/ws".to_string());
+        state.quick_open = Some(QuickOpenState {
+            filter: String::new(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+        let _ = state.update(EditorMessage::GlobalSearchToggle);
+        assert!(state.global_search.is_none());
     }
 }

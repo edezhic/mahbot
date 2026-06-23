@@ -399,6 +399,15 @@ impl EditorBuffer {
                 let line = line.min(max_line);
                 let col = self.clamp_col_to_line(line, col);
                 if line == self.cursor_line.get() && col == self.cursor_col.get() {
+                    // Duplicate SelectTo at the current endpoint (e.g. repeated
+                    // CursorMoved during drag) must not clear an existing
+                    // non-empty selection.
+                    if self.has_selection.get()
+                        && (self.sel_line.get() != self.cursor_line.get()
+                            || self.sel_col.get() != self.cursor_col.get())
+                    {
+                        return;
+                    }
                     self.has_selection.set(false);
                     return;
                 }
@@ -2827,6 +2836,9 @@ where
         match event {
             // ── Mouse wheel scrolling ───────────────────────────────
             Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
+                if cursor.position_in(layout.bounds()).is_none() {
+                    return;
+                }
                 let line_height = font_metrics().line_height;
                 let pixel_delta = match delta {
                     ScrollDelta::Lines { y, .. } => y * line_height,
@@ -2974,30 +2986,11 @@ where
                 // Skip keyboard processing when another UI element has
                 // keyboard focus (tree panel, quick-open, etc.).
                 if self.ignore_keyboard {
-                    if self.block_editing {
-                        // Find/replace bar is open — allow cursor movement
-                        // (arrows, Home, End, PgUp/PgDown) through so the
-                        // editor can still navigate while the text_input
-                        // handles its own editing keys.
-                        match key_press {
-                            key::Key::Named(
-                                key::Named::ArrowLeft
-                                | key::Named::ArrowRight
-                                | key::Named::ArrowUp
-                                | key::Named::ArrowDown
-                                | key::Named::Home
-                                | key::Named::End
-                                | key::Named::PageUp
-                                | key::Named::PageDown,
-                            ) => {
-                                // Fall through to cursor movement handling below.
-                            }
-                            _ => return,
-                        }
-                    } else {
-                        // Tree panel or quick-open — block ALL keyboard.
-                        return;
-                    }
+                    // Find/replace inputs own keyboard focus — block all editor
+                    // keys (including arrows) so navigation does not move the
+                    // code cursor while editing the search/replace fields.
+                    // Tree panel and modal overlays block everything too.
+                    return;
                 }
                 // Any keyboard cursor movement re-enables auto-scroll
                 if is_cursor_movement_key(key_press) {
@@ -3908,6 +3901,22 @@ mod tests {
     }
 
     #[test]
+    fn test_select_to_duplicate_endpoint_preserves_selection() {
+        let buf = EditorBuffer::with_text("hello world", None);
+        buf.move_to(0, 0);
+        buf.perform_action(EditorAction::SelectTo { line: 0, col: 5 });
+        assert_eq!(buf.selection(), Some("hello".to_string()));
+
+        // Repeated SelectTo at the drag endpoint (duplicate CursorMoved).
+        buf.perform_action(EditorAction::SelectTo { line: 0, col: 5 });
+        assert_eq!(
+            buf.selection(),
+            Some("hello".to_string()),
+            "duplicate SelectTo must not clear an existing selection"
+        );
+    }
+
+    #[test]
     fn test_indent() {
         let buf = EditorBuffer::with_text("hello", None);
         buf.perform_action(EditorAction::Indent);
@@ -4320,13 +4329,15 @@ mod tests {
     }
 
     #[test]
-    fn test_select_to_same_point_clears_selection() {
+    fn test_select_to_same_endpoint_preserves_non_empty_selection() {
         let buf = EditorBuffer::with_text("hello", None);
         buf.move_to(0, 2);
         buf.perform_action(EditorAction::SelectTo { line: 0, col: 3 });
         assert!(buf.cursor().selection.is_some());
+        // Duplicate SelectTo at the drag endpoint must not collapse the range.
         buf.perform_action(EditorAction::SelectTo { line: 0, col: 3 });
-        assert!(buf.cursor().selection.is_none());
+        assert!(buf.cursor().selection.is_some());
+        assert_eq!(buf.selection(), Some("l".to_string()));
     }
 
     #[test]
