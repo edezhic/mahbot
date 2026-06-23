@@ -319,6 +319,18 @@ const MENU_PADDING: f32 = 8.0;
 const MENU_MIN_WIDTH: f32 = 140.0;
 const MENU_FONT_SIZE: f32 = 14.0;
 
+/// Convert a y-offset (relative to menu origin, minus padding) into a
+/// menu item index.
+/// Returns None if the offset is negative or beyond the last item.
+fn item_index_from_y(rel_y: f32, item_count: usize) -> Option<usize> {
+    if rel_y < 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let idx = (rel_y / MENU_ITEM_HEIGHT) as usize;
+    if idx < item_count { Some(idx) } else { None }
+}
+
 impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
     for ContextMenuOverlay<'_, '_, Message>
 where
@@ -462,39 +474,24 @@ where
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 // Update hovered item index.
-                *self.hovered = if let Some(pos) = cursor.position_in(bounds) {
-                    let rel_y = pos.y - MENU_PADDING;
-                    if rel_y >= 0.0 {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let idx = (rel_y / MENU_ITEM_HEIGHT) as usize;
-                        if idx < self.menu_items.len() {
-                            Some(idx)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                *self.hovered = cursor
+                    .position_in(bounds)
+                    .and_then(|pos| item_index_from_y(pos.y - MENU_PADDING, self.menu_items.len()));
                 shell.request_redraw();
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(cursor_pos) = cursor.position() {
                     if bounds.contains(cursor_pos) {
-                        let rel_y = cursor_pos.y - bounds.y - MENU_PADDING;
-                        if rel_y >= 0.0 {
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                            let idx = (rel_y / MENU_ITEM_HEIGHT) as usize;
-                            if idx < self.menu_items.len() {
-                                // Fire the action and dismiss.
-                                let action = self.menu_items[idx].1.clone();
-                                *self.show = false;
-                                shell.publish(action);
-                                shell.capture_event();
-                                return;
-                            }
+                        if let Some(idx) = item_index_from_y(
+                            cursor_pos.y - bounds.y - MENU_PADDING,
+                            self.menu_items.len(),
+                        ) {
+                            // Fire the action and dismiss.
+                            let action = self.menu_items[idx].1.clone();
+                            *self.show = false;
+                            shell.publish(action);
+                            shell.capture_event();
+                            return;
                         }
                     }
                 }
