@@ -523,7 +523,7 @@ pub trait Tool: Send + Sync {
     /// Human-readable description of this tool.
     ///
     /// The default implementation loads the description from
-    /// `prompt/tool/{name}.md` in the embedded prompt assets.
+    /// `src/prompt/tool/{name}.md` in the embedded prompt assets.
     fn description(&self) -> String {
         crate::prompt::load_prompt(&format!("tool/{}.md", self.name()))
     }

@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 // ── Prompt Asset Loading ─────────────────────────────────────────────
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "prompt"]
+#[folder = "src/prompt"]
 struct PromptAssets;
 
 /// Regex for single-pass template substitution.

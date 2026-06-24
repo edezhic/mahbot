@@ -206,8 +206,8 @@ impl Session {
     /// Returns system-level messages in this order:
     ///
     /// ```text
-    /// role_description       — from prompt/role/{role}.md (always)
-    /// workspace boilerplate  — from prompt/workspace.md, substituted (always)
+    /// role_description       — from src/prompt/role/{role}.md (always)
+    /// workspace boilerplate  — from src/prompt/workspace.md, substituted (always)
     /// skills                 — if any skills exist in the workspace
     /// board_context          — Manager role only, when active tickets exist
     /// ticket_block           — when a ticket is assigned to this session
