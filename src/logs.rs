@@ -515,6 +515,22 @@ fn extract_agent_from_span(val: &serde_json::Value) -> (String, String, String) 
 mod tests {
     use super::*;
 
+    /// Verify that the number of columns in [`LOGS_COLUMNS`] matches the highest
+    /// column-index constant + 1. If this test fails, a column was added or removed
+    /// from the string list without updating the corresponding `COL_LOGS_*` constants,
+    /// or vice versa — a silent data corruption hazard.
+    #[test]
+    fn logs_columns_count_matches_column_constants() {
+        let count = LOGS_COLUMNS.split(',').count();
+        assert_eq!(
+            COL_LOGS_WORKSPACE + 1,
+            count,
+            "LOGS_COLUMNS has {count} entries but COL_LOGS_WORKSPACE ({}) + 1 = {}",
+            COL_LOGS_WORKSPACE,
+            COL_LOGS_WORKSPACE + 1,
+        );
+    }
+
     #[test]
     fn test_parse_tracing_json_full() {
         let line = r#"{"timestamp":"2025-05-06T12:34:56.000000Z","level":"INFO","target":"mahbot::orchestrator","span":{"name":"agent","agent_id":"00000000-0000-0000-0000-000000000000","role":"lead","workspace":"/some/workspace"},"fields":{"message":"Hello world","key":"value"}}"#;

@@ -1692,6 +1692,36 @@ mod tests {
     use strum::IntoEnumIterator;
     use tempfile::TempDir;
 
+    /// Verify that the number of columns in [`TICKET_COLUMNS`] matches the highest
+    /// column-index constant + 1. If this test fails, a column was added or removed
+    /// from the string list without updating the corresponding `COL_TICKET_*` constants,
+    /// or vice versa — a silent data corruption hazard.
+    #[test]
+    fn ticket_columns_count_matches_column_constants() {
+        let count = TICKET_COLUMNS.split(',').count();
+        assert_eq!(
+            COL_TICKET_PIPELINE_RESERVATION + 1,
+            count,
+            "TICKET_COLUMNS has {count} entries but COL_TICKET_PIPELINE_RESERVATION ({}) + 1 = {}",
+            COL_TICKET_PIPELINE_RESERVATION,
+            COL_TICKET_PIPELINE_RESERVATION + 1,
+        );
+    }
+
+    /// Verify that the number of columns in [`COMMENT_COLUMNS`] matches the highest
+    /// column-index constant + 1.
+    #[test]
+    fn comment_columns_count_matches_column_constants() {
+        let count = COMMENT_COLUMNS.split(',').count();
+        assert_eq!(
+            COL_COMMENT_CREATED_AT + 1,
+            count,
+            "COMMENT_COLUMNS has {count} entries but COL_COMMENT_CREATED_AT ({}) + 1 = {}",
+            COL_COMMENT_CREATED_AT,
+            COL_COMMENT_CREATED_AT + 1,
+        );
+    }
+
     /// Open a test store and create a default ticket.
     /// Returns (store, temp_dir, ticket_id).
     async fn setup() -> (BoardStore, TempDir, String) {

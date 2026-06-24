@@ -222,9 +222,26 @@ impl ChatHistoryStore {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::chat_history::ChatHistoryStore;
     use crate::turso;
     use tempfile::TempDir;
+
+    /// Verify that the number of columns in [`CHAT_HISTORY_COLUMNS`] matches the highest
+    /// column-index constant + 1. If this test fails, a column was added or removed
+    /// from the string list without updating the corresponding `COL_CH_*` constants,
+    /// or vice versa — a silent data corruption hazard.
+    #[test]
+    fn chat_history_columns_count_matches_column_constants() {
+        let count = CHAT_HISTORY_COLUMNS.split(',').count();
+        assert_eq!(
+            COL_CH_WORKSPACE + 1,
+            count,
+            "CHAT_HISTORY_COLUMNS has {count} entries but COL_CH_WORKSPACE ({}) + 1 = {}",
+            COL_CH_WORKSPACE,
+            COL_CH_WORKSPACE + 1,
+        );
+    }
 
     fn test_setup() -> (TempDir, std::path::PathBuf) {
         let tmp = TempDir::new().expect("failed to create test temp dir");

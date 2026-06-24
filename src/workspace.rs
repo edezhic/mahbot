@@ -892,6 +892,22 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Verify that the number of columns in [`WORKSPACE_COLUMNS`] matches the highest
+    /// column-index constant + 1. If this test fails, a column was added or removed
+    /// from the string list without updating the corresponding `COL_WS_*` constants,
+    /// or vice versa — a silent data corruption hazard.
+    #[test]
+    fn workspace_columns_count_matches_column_constants() {
+        let count = WORKSPACE_COLUMNS.split(',').count();
+        assert_eq!(
+            COL_WS_DIAGNOSTICS_UPDATED_AT + 1,
+            count,
+            "WORKSPACE_COLUMNS has {count} entries but COL_WS_DIAGNOSTICS_UPDATED_AT ({}) + 1 = {}",
+            COL_WS_DIAGNOSTICS_UPDATED_AT,
+            COL_WS_DIAGNOSTICS_UPDATED_AT + 1,
+        );
+    }
+
     /// Open a temporary workspace store for testing.
     /// Returns (store, temp_dir). The temp_dir is kept alive for the lifetime
     /// of the store (~ the test function).

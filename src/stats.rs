@@ -308,6 +308,25 @@ impl StatsStore {
 mod tests {
     use super::*;
 
+    /// Verify that the number of columns in [`TOOL_ERROR_COLUMNS`] matches the highest
+    /// column-index constant + 1. If this test fails, a column was added or removed
+    /// from the string list without updating the corresponding `COL_TE_*` constants,
+    /// or vice versa — a silent data corruption hazard.
+    ///
+    /// Note: [`COL_TU_CALL_COUNT`] and [`COL_TE_COUNT`] are single-column query
+    /// constants and are intentionally excluded from this assertion.
+    #[test]
+    fn tool_error_columns_count_matches_column_constants() {
+        let count = TOOL_ERROR_COLUMNS.split(',').count();
+        assert_eq!(
+            COL_TE_RECORDED_AT + 1,
+            count,
+            "TOOL_ERROR_COLUMNS has {count} entries but COL_TE_RECORDED_AT ({}) + 1 = {}",
+            COL_TE_RECORDED_AT,
+            COL_TE_RECORDED_AT + 1,
+        );
+    }
+
     #[test]
     fn test_build_tool_error_filter_no_filters() {
         let query = ToolErrorQuery::default();
