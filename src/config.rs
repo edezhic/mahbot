@@ -408,7 +408,7 @@ impl ConfigReload {
             .clone()
     }
 
-    /// Like [`global_storage_root`], but returns `None` instead of panicking if
+    /// Like [`Self::global_storage_root`], but returns `None` instead of panicking if
     /// storage root has not been set yet. Useful for code paths that can tolerate
     /// an uninitialized config (e.g., graceful degradation in tests).
     #[must_use]

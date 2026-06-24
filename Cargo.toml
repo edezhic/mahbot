@@ -1,13 +1,18 @@
 [package]
 name = "mahbot"
 version = "0.1.0"
+authors = ["edezhic <edezhic@gmail.com>"]
+description = "An autonomous agentic engineering system that manages software development through role separation, subagents, and deterministic diagnostics."
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/edezhic/mahbot"
+homepage = "https://github.com/edezhic/mahbot"
 readme = "README.md"
 keywords = ["ai", "agent"]
+categories = ["development-tools"]
 rust-version = "1.96"
 resolver = "2"
-publish = false
+exclude = [".DS_Store"]
 
 [[bin]]
 name = "mahbot"

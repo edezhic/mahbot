@@ -1,6 +1,6 @@
 //! Shared text rendering helpers for the editor and diff widgets.
 //!
-//! These utilities were extracted from [`editor_widget`] so that the diff
+//! These utilities were extracted from [`super::editor_widget`] so that the diff
 //! widget can use the same font metrics, gutter geometry, colour conversion,
 //! and rich-span merging routines without depending on editor-internal code.
 //!
