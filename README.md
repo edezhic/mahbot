@@ -24,9 +24,7 @@ cd mahbot
 cargo run --release
 ```
 
-Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**.
-
-OpenRouter API key and an optional [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI are needed for full functionality — see [Prerequisites](#prerequisites) below.
+Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and an optional [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute arbitrary SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself.
 
 ## Why not just Claude Code, Codex, Pi or Cursor?
 
