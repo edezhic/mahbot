@@ -52,6 +52,30 @@ CREATE TABLE IF NOT EXISTS user_channels (
     UNIQUE(channel, identifier)
 );";
 
+// ── Column index constants ──────────────────────────────────
+//
+// These prevent silent data corruption when SELECT column order
+// changes.  See the assertions in test module below.
+
+// users table (4-column SELECT: name, permissions, selected_workspace, selected_role)
+const USERS_COLUMNS: &str = "name, permissions, selected_workspace, selected_role";
+const COL_USERS_NAME: usize = 0;
+const COL_USERS_PERMISSIONS: usize = 1;
+const COL_USERS_SELECTED_WORKSPACE: usize = 2;
+const COL_USERS_SELECTED_ROLE: usize = 3;
+
+// user_channels table (3-column SELECT: channel, identifier, reply_target)
+const USER_CHANNEL_COLUMNS: &str = "channel, identifier, reply_target";
+const COL_UC_CHANNEL: usize = 0;
+const COL_UC_IDENTIFIER: usize = 1;
+const COL_UC_REPLY_TARGET: usize = 2;
+
+// Single-column query constants (no COLUMNS string needed, matching stats.rs pattern)
+const COL_PERMISSIONS: usize = 0; // SELECT permissions FROM users
+const COL_SELECTED_WORKSPACE: usize = 0; // SELECT selected_workspace FROM users
+const COL_SELECTED_ROLE: usize = 0; // SELECT selected_role FROM users
+const COL_USER_NAME: usize = 0; // SELECT user_name FROM user_channels
+
 impl UserStorage {
     /// Open (or create) the users database at `root/db/users.db`.
     /// On fresh databases, auto-creates the `admin` user with full permissions.
@@ -124,7 +148,7 @@ impl UserStorage {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(0)?),
+            Some(row) => Ok(row.get::<Option<String>>(COL_PERMISSIONS)?),
             None => Ok(None),
         }
     }
@@ -154,7 +178,7 @@ impl UserStorage {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(0)?),
+            Some(row) => Ok(row.get::<Option<String>>(COL_SELECTED_WORKSPACE)?),
             None => Ok(None),
         }
     }
@@ -183,7 +207,7 @@ impl UserStorage {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(0)?),
+            Some(row) => Ok(row.get::<Option<String>>(COL_SELECTED_ROLE)?),
             None => Ok(None),
         }
     }
@@ -258,7 +282,7 @@ impl UserStorage {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(Some(row.get::<String>(0)?)),
+            Some(row) => Ok(Some(row.get::<String>(COL_USER_NAME)?)),
             None => Ok(None),
         }
     }
@@ -268,16 +292,16 @@ impl UserStorage {
         let rows = self
             .conn
             .query(
-                "SELECT channel, identifier, reply_target FROM user_channels WHERE user_name = ?1",
+                &format!("SELECT {USER_CHANNEL_COLUMNS} FROM user_channels WHERE user_name = ?1"),
                 turso::params![user_name],
             )
             .await?;
         let mut bindings = Vec::new();
         for row in rows {
             bindings.push(ChannelBinding {
-                channel: row.get::<String>(0)?,
-                identifier: row.get::<String>(1)?,
-                reply_target: row.get::<Option<String>>(2)?,
+                channel: row.get::<String>(COL_UC_CHANNEL)?,
+                identifier: row.get::<String>(COL_UC_IDENTIFIER)?,
+                reply_target: row.get::<Option<String>>(COL_UC_REPLY_TARGET)?,
             });
         }
         Ok(bindings)
@@ -285,12 +309,12 @@ impl UserStorage {
 
     /// Convert a `users` table row into a [`UserRecord`], loading channel bindings.
     async fn user_record_from_row(&self, row: &turso::Row) -> Result<UserRecord> {
-        let name: String = row.get(0)?;
+        let name: String = row.get(COL_USERS_NAME)?;
         Ok(UserRecord {
             name: name.clone(),
-            permissions: row.get::<Option<String>>(1)?,
-            selected_workspace: row.get::<Option<String>>(2)?,
-            selected_role: row.get::<Option<String>>(3)?,
+            permissions: row.get::<Option<String>>(COL_USERS_PERMISSIONS)?,
+            selected_workspace: row.get::<Option<String>>(COL_USERS_SELECTED_WORKSPACE)?,
+            selected_role: row.get::<Option<String>>(COL_USERS_SELECTED_ROLE)?,
             channels: self.get_user_channels(&name).await.unwrap_or_default(),
         })
     }
@@ -303,8 +327,10 @@ impl UserStorage {
         let rows = self
             .conn
             .query(
-                "SELECT name, permissions, selected_workspace, selected_role \
-                 FROM users WHERE selected_workspace = ?1",
+                &format!(
+                    "SELECT {USERS_COLUMNS} \
+                 FROM users WHERE selected_workspace = ?1"
+                ),
                 turso::params![workspace_name],
             )
             .await?;
@@ -320,7 +346,7 @@ impl UserStorage {
         let rows = self
             .conn
             .query(
-                "SELECT name, permissions, selected_workspace, selected_role FROM users",
+                &format!("SELECT {USERS_COLUMNS} FROM users"),
                 turso::params![],
             )
             .await?;
@@ -577,6 +603,32 @@ pub async fn update_channel_contact(
 #[must_use]
 pub fn is_personal_workspace(workspace_name: &str) -> bool {
     workspace_name.starts_with("personal:")
+}
+
+// ── Column index assertion tests ─────────────────────────────
+
+#[test]
+fn users_columns_count_matches_column_constants() {
+    let count = USERS_COLUMNS.split(',').count();
+    assert_eq!(
+        COL_USERS_SELECTED_ROLE + 1,
+        count,
+        "USERS_COLUMNS has {count} entries but COL_USERS_SELECTED_ROLE ({}) + 1 = {}",
+        COL_USERS_SELECTED_ROLE,
+        COL_USERS_SELECTED_ROLE + 1,
+    );
+}
+
+#[test]
+fn user_channel_columns_count_matches_column_constants() {
+    let count = USER_CHANNEL_COLUMNS.split(',').count();
+    assert_eq!(
+        COL_UC_REPLY_TARGET + 1,
+        count,
+        "USER_CHANNEL_COLUMNS has {count} entries but COL_UC_REPLY_TARGET ({}) + 1 = {}",
+        COL_UC_REPLY_TARGET,
+        COL_UC_REPLY_TARGET + 1,
+    );
 }
 
 #[cfg(test)]

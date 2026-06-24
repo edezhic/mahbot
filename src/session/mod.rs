@@ -34,6 +34,24 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     last_activity TEXT NOT NULL
 );";
 
+// ── Column index constants ──────────────────────────────────
+//
+// These prevent silent data corruption when SELECT column order
+// changes.  See the assertions in test module below.
+
+// Session messages (2-column SELECT: role, content)
+const SESSION_MESSAGE_COLUMNS: &str = "role, content";
+const COL_SM_ROLE: usize = 0;
+const COL_SM_CONTENT: usize = 1;
+
+// Session list with metadata (4-column SELECT: sm.session_key, sm.created_at,
+// sm.last_activity, COUNT(s.id))
+const SESSION_LIST_COLUMNS: &str = "sm.session_key, sm.created_at, sm.last_activity, COUNT(s.id)";
+const COL_SL_SESSION_KEY: usize = 0;
+const COL_SL_CREATED_AT: usize = 1;
+const COL_SL_LAST_ACTIVITY: usize = 2;
+const COL_SL_MESSAGE_COUNT: usize = 3;
+
 /// Session key prefixes for transient (background-only, non-user-facing) sessions.
 ///
 /// These sessions are created automatically by agents (analysts, engineers, maintainer,
@@ -143,12 +161,12 @@ impl SessionStorage {
         let rows = match self
             .conn
             .query_map(
-                "SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+                &format!("SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE session_key = ?1 ORDER BY id ASC"),
                 params![session_key],
                 |row| {
                     Ok::<_, anyhow::Error>(ChatMessage {
-                        role: row.get(0)?,
-                        content: row.get(1)?,
+                        role: row.get(COL_SM_ROLE)?,
+                        content: row.get(COL_SM_CONTENT)?,
                     })
                 },
             )
@@ -224,18 +242,20 @@ impl SessionStorage {
         let rows = match self
             .conn
             .query_map(
-                "SELECT sm.session_key, sm.created_at, sm.last_activity, COUNT(s.id) \
-                 FROM session_metadata sm \
-                 LEFT JOIN sessions s ON s.session_key = sm.session_key \
-                 GROUP BY sm.session_key \
-                 ORDER BY sm.last_activity DESC",
+                &format!(
+                    "SELECT {SESSION_LIST_COLUMNS} \
+                     FROM session_metadata sm \
+                     LEFT JOIN sessions s ON s.session_key = sm.session_key \
+                     GROUP BY sm.session_key \
+                     ORDER BY sm.last_activity DESC",
+                ),
                 (),
                 |row| {
                     Ok::<_, anyhow::Error>(session_metadata_from_row(
-                        &row.get::<String>(0)?,
-                        &row.get::<String>(1)?,
-                        &row.get::<String>(2)?,
-                        row.get::<i64>(3)?,
+                        &row.get::<String>(COL_SL_SESSION_KEY)?,
+                        &row.get::<String>(COL_SL_CREATED_AT)?,
+                        &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
+                        row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
                     ))
                 },
             )
@@ -675,4 +695,30 @@ pub(crate) fn decode_native_history_message(
     }
 
     None
+}
+
+// ── Column index assertion tests ─────────────────────────────
+
+#[test]
+fn session_message_columns_count_matches_column_constants() {
+    let count = SESSION_MESSAGE_COLUMNS.split(',').count();
+    assert_eq!(
+        COL_SM_CONTENT + 1,
+        count,
+        "SESSION_MESSAGE_COLUMNS has {count} entries but COL_SM_CONTENT ({}) + 1 = {}",
+        COL_SM_CONTENT,
+        COL_SM_CONTENT + 1,
+    );
+}
+
+#[test]
+fn session_list_columns_count_matches_column_constants() {
+    let count = SESSION_LIST_COLUMNS.split(',').count();
+    assert_eq!(
+        COL_SL_MESSAGE_COUNT + 1,
+        count,
+        "SESSION_LIST_COLUMNS has {count} entries but COL_SL_MESSAGE_COUNT ({}) + 1 = {}",
+        COL_SL_MESSAGE_COUNT,
+        COL_SL_MESSAGE_COUNT + 1,
+    );
 }

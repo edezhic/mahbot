@@ -42,6 +42,43 @@ CREATE TABLE IF NOT EXISTS config_model_routing (
     allow_fallbacks    INTEGER
 );";
 
+// ── Column index constants ──────────────────────────────────
+//
+// These prevent silent data corruption when SELECT column order
+// changes.  See the assertions in test module below.
+
+// config_kv table (2-column SELECT: key, value)
+const KV_COLUMNS: &str = "key, value";
+const COL_KV_KEY: usize = 0;
+const COL_KV_VALUE: usize = 1;
+
+// config_role table (3-column SELECT: role, model, reasoning_effort)
+const ROLE_CONFIG_COLUMNS: &str = "role, model, reasoning_effort";
+const COL_RC_ROLE: usize = 0;
+const COL_RC_MODEL: usize = 1;
+const COL_RC_REASONING_EFFORT: usize = 2;
+
+// config_model_routing table (3-column SELECT: model, provider_order, allow_fallbacks)
+const MODEL_ROUTING_COLUMNS: &str = "model, provider_order, allow_fallbacks";
+const COL_MR_MODEL: usize = 0;
+const COL_MR_PROVIDER_ORDER: usize = 1;
+const COL_MR_ALLOW_FALLBACKS: usize = 2;
+
+// Test-only column constants (used by #[cfg(test)] query helpers)
+
+#[cfg(test)]
+const COL_KV_VALUE_SINGLE: usize = 0; // SELECT value FROM config_kv
+
+#[cfg(test)]
+const COL_RC_TEST_MODEL: usize = 0; // SELECT model FROM config_role (in get_role_config)
+#[cfg(test)]
+const COL_RC_TEST_REASONING_EFFORT: usize = 1;
+
+#[cfg(test)]
+const COL_MR_TEST_PROVIDER_ORDER: usize = 0; // SELECT provider_order FROM config_model_routing
+#[cfg(test)]
+const COL_MR_TEST_ALLOW_FALLBACKS: usize = 1;
+
 impl ConfigStore {
     /// Open (or create) the config database at `root/db/config.db`.
     pub async fn open(root: &Path) -> Result<Self> {
@@ -83,12 +120,17 @@ impl ConfigStore {
         let rows = self
             .conn
             .query(
-                "SELECT key, value FROM config_kv ORDER BY key",
+                &format!("SELECT {KV_COLUMNS} FROM config_kv ORDER BY key"),
                 turso::params![],
             )
             .await?;
         rows.into_iter()
-            .map(|row| Ok((turso::row_text(&row, 0)?, turso::row_text(&row, 1)?)))
+            .map(|row| {
+                Ok((
+                    turso::row_text(&row, COL_KV_KEY)?,
+                    turso::row_text(&row, COL_KV_VALUE)?,
+                ))
+            })
             .collect()
     }
 
@@ -99,15 +141,15 @@ impl ConfigStore {
         let rows = self
             .conn
             .query(
-                "SELECT role, model, reasoning_effort FROM config_role ORDER BY role",
+                &format!("SELECT {ROLE_CONFIG_COLUMNS} FROM config_role ORDER BY role"),
                 turso::params![],
             )
             .await?;
         rows.into_iter()
             .map(|row| {
-                let role = turso::row_text(&row, 0)?;
-                let model = turso::row_text_opt(&row, 1)?;
-                let reasoning_effort = turso::row_text_opt(&row, 2)?;
+                let role = turso::row_text(&row, COL_RC_ROLE)?;
+                let model = turso::row_text_opt(&row, COL_RC_MODEL)?;
+                let reasoning_effort = turso::row_text_opt(&row, COL_RC_REASONING_EFFORT)?;
                 Ok(RoleConfig {
                     role,
                     model,
@@ -124,15 +166,15 @@ impl ConfigStore {
         let rows = self
             .conn
             .query(
-                "SELECT model, provider_order, allow_fallbacks FROM config_model_routing ORDER BY model",
+                &format!("SELECT {MODEL_ROUTING_COLUMNS} FROM config_model_routing ORDER BY model"),
                 turso::params![],
             )
             .await?;
         rows.into_iter()
             .map(|row| {
-                let model = turso::row_text(&row, 0)?;
-                let provider_order = turso::row_text_opt(&row, 1)?;
-                let allow_fallbacks = turso::row_bool_opt(&row, 2)?;
+                let model = turso::row_text(&row, COL_MR_MODEL)?;
+                let provider_order = turso::row_text_opt(&row, COL_MR_PROVIDER_ORDER)?;
+                let allow_fallbacks = turso::row_bool_opt(&row, COL_MR_ALLOW_FALLBACKS)?;
                 Ok(ModelRouting {
                     model,
                     provider_order,
@@ -196,7 +238,7 @@ impl ConfigStore {
             .query_row(
                 "SELECT value FROM config_kv WHERE key = ?1",
                 turso::params![key],
-                |row| row.get_value(0),
+                |row| row.get_value(COL_KV_VALUE_SINGLE),
             )
             .await
         {
@@ -217,9 +259,9 @@ impl ConfigStore {
                 "SELECT model, reasoning_effort FROM config_role WHERE role = ?1",
                 turso::params![role],
                 |row| {
-                    let model = turso::row_text_opt(row, 0)
+                    let model = turso::row_text_opt(row, COL_RC_TEST_MODEL)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
-                    let reasoning_effort = turso::row_text_opt(row, 1)
+                    let reasoning_effort = turso::row_text_opt(row, COL_RC_TEST_REASONING_EFFORT)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
                     Ok::<RoleConfig, ::turso::Error>(RoleConfig {
                         role: role_owned,
@@ -277,9 +319,9 @@ impl ConfigStore {
                 "SELECT provider_order, allow_fallbacks FROM config_model_routing WHERE model = ?1",
                 turso::params![model],
                 |row| {
-                    let provider_order = turso::row_text_opt(row, 0)
+                    let provider_order = turso::row_text_opt(row, COL_MR_TEST_PROVIDER_ORDER)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
-                    let allow_fallbacks = turso::row_bool_opt(row, 1)
+                    let allow_fallbacks = turso::row_bool_opt(row, COL_MR_TEST_ALLOW_FALLBACKS)
                         .map_err(|e| ::turso::Error::Error(e.to_string()))?;
                     Ok::<ModelRouting, ::turso::Error>(ModelRouting {
                         model: model_owned,
@@ -826,4 +868,42 @@ mod tests {
             "model routings should be unchanged after rollback"
         );
     }
+}
+
+// ── Column index assertion tests ─────────────────────────────
+
+#[test]
+fn kv_columns_count_matches_column_constants() {
+    let count = KV_COLUMNS.split(',').count();
+    assert_eq!(
+        COL_KV_VALUE + 1,
+        count,
+        "KV_COLUMNS has {count} entries but COL_KV_VALUE ({}) + 1 = {}",
+        COL_KV_VALUE,
+        COL_KV_VALUE + 1,
+    );
+}
+
+#[test]
+fn role_config_columns_count_matches_column_constants() {
+    let count = ROLE_CONFIG_COLUMNS.split(',').count();
+    assert_eq!(
+        COL_RC_REASONING_EFFORT + 1,
+        count,
+        "ROLE_CONFIG_COLUMNS has {count} entries but COL_RC_REASONING_EFFORT ({}) + 1 = {}",
+        COL_RC_REASONING_EFFORT,
+        COL_RC_REASONING_EFFORT + 1,
+    );
+}
+
+#[test]
+fn model_routing_columns_count_matches_column_constants() {
+    let count = MODEL_ROUTING_COLUMNS.split(',').count();
+    assert_eq!(
+        COL_MR_ALLOW_FALLBACKS + 1,
+        count,
+        "MODEL_ROUTING_COLUMNS has {count} entries but COL_MR_ALLOW_FALLBACKS ({}) + 1 = {}",
+        COL_MR_ALLOW_FALLBACKS,
+        COL_MR_ALLOW_FALLBACKS + 1,
+    );
 }
