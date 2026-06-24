@@ -918,7 +918,7 @@ impl DiffState {
             Space::new().width(Length::Fill),
         ]
         .align_y(Alignment::Center)
-        .padding([1, 8]);
+        .padding([0, 8]);
 
         let full_path = node.full_path.clone();
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
@@ -1055,7 +1055,7 @@ impl DiffState {
             Space::new().width(6),
         ]
         .align_y(Alignment::Center)
-        .padding([1, 8]);
+        .padding([0, 8]);
 
         let full_path = node.full_path.clone();
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);

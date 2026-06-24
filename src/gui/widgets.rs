@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use iced::widget::{self, button, column, container, pick_list, text, text_input};
-use iced::{Alignment, Color, Element, Length, Task};
+use iced::{Alignment, Color, Element, Length, Padding, Task};
 
 use iced_selection;
 
@@ -260,7 +260,7 @@ impl FileTree {
 }
 
 /// Estimated height per tree row for scroll-into-view on keyboard navigation.
-pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = 22.0;
+pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = 16.0;
 
 /// Scroll the tree panel to bring the focused row into view.
 #[allow(clippy::cast_precision_loss)]
@@ -448,7 +448,8 @@ pub fn tree_node_button<'a, Message: Clone + 'a>(
 ) -> Element<'a, Message> {
     let mut btn = widget::button(content)
         .style(tree_node_button_style(is_highlighted))
-        .width(Length::Fill);
+        .width(Length::Fill)
+        .padding(Padding::ZERO);
     if let Some(msg) = on_press {
         btn = btn.on_press(msg);
     }
