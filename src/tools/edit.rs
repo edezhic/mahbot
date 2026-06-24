@@ -130,7 +130,9 @@ impl Tool for EditTool {
 
                     if exact_count == 0 {
                         // Try a whitespace-insensitive match for a better error message
-                        if use_ws_matching && find_ws_insensitive(&content, old_string).is_some() {
+                        if use_ws_matching
+                            && find_ws_insensitive(&content, old_string).is_ok_and(|r| r.is_some())
+                        {
                             anyhow::bail!(
                                 "old_string not found exactly (whitespace differs); try without multiple=true"
                             );
@@ -150,13 +152,8 @@ impl Tool for EditTool {
                         }
                         0 if use_ws_matching => {
                             // No exact match — try whitespace-insensitive matching
-                            if ws_match_is_ambiguous(&content, old_string) {
-                                anyhow::bail!(
-                                    "old_string matches multiple times after whitespace normalization; provide more surrounding context to disambiguate"
-                                );
-                            }
                             match find_ws_insensitive(&content, old_string) {
-                                Some(ws_match) => {
+                                Ok(Some(ws_match)) => {
                                     new_content = format!(
                                         "{}{}{}",
                                         &content[..ws_match.start],
@@ -165,10 +162,13 @@ impl Tool for EditTool {
                                     );
                                     replaced_count = 1;
                                 }
-                                None => {
+                                Ok(None) => {
                                     anyhow::bail!(
                                         "old_string not found in file (whitespace-insensitive matching tried)"
                                     );
+                                }
+                                Err(e) => {
+                                    return Err(e);
                                 }
                             }
                         }
@@ -387,7 +387,7 @@ fn normalize_ws(s: &str) -> (String, Vec<Segment>) {
 }
 
 /// Result of a whitespace-insensitive match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct WsMatch {
     /// Byte offset in the original content where the match starts.
     start: usize,
@@ -401,7 +401,7 @@ struct WsMatch {
 fn segment_at(pos: usize, segments: &[Segment]) -> Result<&Segment> {
     segments
         .iter()
-        .find(|seg| pos < seg.norm_range.end)
+        .find(|seg| pos < seg.norm_range.end && pos >= seg.norm_range.start)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "segment_at: position {pos} not found in {len} segments",
@@ -442,51 +442,45 @@ fn map_norm_span(
 /// Find `old_string` in `content` using whitespace-insensitive matching.
 ///
 /// Consecutive whitespace outside string literals is collapsed to single
-/// spaces before matching. Returns the byte range in the original `content`
-/// where the match was found.
-fn find_ws_insensitive(content: &str, old_string: &str) -> Option<WsMatch> {
+/// spaces before matching. Normalizes both strings once, then checks for
+/// ambiguity (multiple normalized occurrences of `old_string`). Returns:
+///
+/// - `Ok(Some(WsMatch))` — a single unambiguous match found.
+/// - `Ok(None)` — pattern not found after normalization.
+/// - `Err(...)` — ambiguous (pattern matches multiple times after
+///   normalization) or a normalization bug in `map_norm_span`.
+fn find_ws_insensitive(content: &str, old_string: &str) -> anyhow::Result<Option<WsMatch>> {
     if old_string.is_empty() || content.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let (norm_content, segments) = normalize_ws(content);
     let (norm_old, _) = normalize_ws(old_string);
 
-    let norm_pos = norm_content.find(&norm_old)?;
-    let norm_end = norm_pos.saturating_add(norm_old.len());
-
-    let (start, end) = map_norm_span(norm_pos, norm_end, &segments).ok()?;
-
-    Some(WsMatch { start, end })
-}
-
-/// Check whether `old_string` matches at multiple positions in `content`
-/// after whitespace-insensitive normalization.
-///
-/// Returns `true` if the normalized `old_string` appears more than once in the
-/// normalized `content`, meaning the caller cannot reliably pick one match.
-#[must_use]
-fn ws_match_is_ambiguous(content: &str, old_string: &str) -> bool {
-    let (norm_content, _) = normalize_ws(content);
-    let (norm_old, _) = normalize_ws(old_string);
-
     if norm_old.is_empty() {
-        return false;
+        return Ok(None);
     }
 
-    // Find the first match
-    let Some(first_pos) = norm_content.find(&norm_old) else {
-        return false;
+    // Find the first occurrence
+    let Some(norm_pos) = norm_content.find(&norm_old) else {
+        return Ok(None);
     };
+    let norm_end = norm_pos + norm_old.len();
 
-    // Advance past the first character of norm_old so overlapping
-    // matches are detected (e.g. content "a a a" with old_string "a a",
-    // normalized "a a a" — occurrences at positions 0 and 2).
-    // Using char boundary instead of raw +1 avoids panicking on
-    // multi-byte (non-ASCII) first characters.
+    // Check for ambiguity: a second occurrence after the first char of norm_old.
+    // Using char boundary instead of raw +1 avoids panicking on multi-byte chars.
     let first_char_len = norm_old.chars().next().map_or(1, char::len_utf8);
-    let search_start = first_pos + first_char_len;
-    norm_content[search_start..].find(&norm_old).is_some()
+    let search_start = norm_pos + first_char_len;
+    if norm_content[search_start..].find(&norm_old).is_some() {
+        anyhow::bail!(
+            "old_string matches multiple times after whitespace normalization; \
+             provide more surrounding context to disambiguate"
+        );
+    }
+
+    let (start, end) = map_norm_span(norm_pos, norm_end, &segments)?;
+
+    Ok(Some(WsMatch { start, end }))
 }
 
 #[cfg(test)]
@@ -669,7 +663,6 @@ mod tests {
             "fn other() {}",
             "fn  other()  {}",
         ),
-        ("a  b  a  b  a  b", "a b", "a  b"),
         (
             "let x = \"hello \\\"world\\\"  foo\";",
             "let x = \"hello \\\"world\\\"  foo\";",
@@ -705,6 +698,7 @@ mod tests {
     fn ws_insensitive_should_match() {
         for (content, old, expected) in MATCH_CASES {
             let m = find_ws_insensitive(content, old)
+                .unwrap()
                 .unwrap_or_else(|| panic!("Expected match: content={content:?} old={old:?}"));
             assert_eq!(
                 &content[m.start..m.end],
@@ -718,7 +712,7 @@ mod tests {
     fn ws_insensitive_should_not_match() {
         for (content, old) in NOMATCH_CASES {
             assert!(
-                find_ws_insensitive(content, old).is_none(),
+                find_ws_insensitive(content, old).unwrap().is_none(),
                 "Expected no match: content={content:?} old={old:?}"
             );
         }
@@ -743,9 +737,15 @@ mod tests {
             ("🚀 b 🚀 b", "🚀 b"),
         ];
         for (content, old) in ambiguous_cases {
+            let result = find_ws_insensitive(content, old);
             assert!(
-                ws_match_is_ambiguous(content, old),
-                "Expected ambiguous: content={content:?} old={old:?}"
+                result.is_err(),
+                "Expected ambiguous error: content={content:?} old={old:?} got {result:?}"
+            );
+            let err = format!("{}", result.unwrap_err());
+            assert!(
+                err.contains("multiple times after whitespace normalization"),
+                "Error should mention ambiguity, got: {err}"
             );
         }
     }
@@ -771,9 +771,10 @@ mod tests {
             ("let  🚀  =  1;", "let 🚀 = 1;"),
         ];
         for (content, old) in unambiguous_cases {
+            let result = find_ws_insensitive(content, old);
             assert!(
-                !ws_match_is_ambiguous(content, old),
-                "Expected unambiguous: content={content:?} old={old:?}"
+                result.is_ok(),
+                "Expected no ambiguity error: content={content:?} old={old:?} got {result:?}"
             );
         }
     }
@@ -781,17 +782,15 @@ mod tests {
     #[test]
     fn segment_at_rejects_malformed_segments() {
         // Normal segments always cover the full span contiguously, but a
-        // future normalize_ws bug could leave the trailing end uncovered.
-        // Verify that segment_at returns an error instead of panicking.
+        // future normalize_ws bug could leave gaps. Verify that segment_at
+        // returns an error for gap positions, not just positions beyond all segments.
         let segments = vec![
             Segment {
                 norm_range: 0..5,
                 orig_range: 0..5,
             },
-            // Gap: positions 6-9 not covered. Note that segment_at is
-            // forward-gap-tolerant (only checks pos < end), so positions in
-            // the gap resolve to the next segment. The true error case is
-            // a position beyond all segments.
+            // Gap: positions 5-6 not covered (first segment covers 0..4,
+            // second starts at 7). Positions 5-6 are in the gap.
             Segment {
                 norm_range: 7..10,
                 orig_range: 10..13,
@@ -801,6 +800,11 @@ mod tests {
         assert!(segment_at(15, &segments).is_err());
         // Empty segments should produce an error
         assert!(segment_at(0, &[]).is_err());
+        // Positions in the gap between segments should produce an error
+        assert!(
+            segment_at(6, &segments).is_err(),
+            "position 6 is in the gap (0..5, 7..10)"
+        );
         // Valid position in first segment should still work
         assert!(segment_at(3, &segments).is_ok());
         // Valid position at segment boundary is ok
