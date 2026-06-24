@@ -25,8 +25,12 @@ static TEMPLATE_RE: LazyLock<Regex> =
 /// (the asset was not embedded or the asset key is misspelled).
 #[must_use]
 pub(crate) fn load_prompt(asset_key: &str) -> String {
-    let file = PromptAssets::get(asset_key)
-        .unwrap_or_else(|| panic!("Embedded prompt '{asset_key}' not found"));
+    let file = PromptAssets::get(asset_key).unwrap_or_else(|| {
+        panic!(
+            "Embedded prompt '{asset_key}' not found. \
+             Create the file at src/prompt/{asset_key} and rebuild."
+        )
+    });
     String::from_utf8_lossy(file.data.as_ref()).into_owned()
 }
 
@@ -281,5 +285,99 @@ mod tests {
         let rules = discover_claude_rules(dir.path()).await;
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].1.len(), 100_000);
+    }
+
+    #[test]
+    fn all_tool_descriptions_exist_in_embedded_assets() {
+        /// Extract the tool name from an embedded asset key like `"tool/shell.md"`.
+        /// Returns `None` if the key is not a `tool/*.md` asset.
+        fn tool_name_from_asset_key(key: &str) -> Option<&str> {
+            const PREFIX: &str = "tool/";
+            const SUFFIX: &str = ".md";
+            if key.starts_with(PREFIX) && key.ends_with(SUFFIX) {
+                Some(&key[PREFIX.len()..key.len() - SUFFIX.len()])
+            } else {
+                None
+            }
+        }
+
+        // ── Build the set of expected tool names ────────────────────────
+        //
+        // Iterate over every role's tool list so that adding a new tool to
+        // Role::tools() automatically checks it here.  web_search is
+        // conditionally added when an Exa API key is configured, so it may
+        // not appear in tests — we add it explicitly.
+        use crate::Role;
+        use std::collections::HashSet;
+
+        let mut expected: HashSet<String> = HashSet::new();
+        for role in <Role as strum::IntoEnumIterator>::iter() {
+            for tool in role.tools() {
+                expected.insert(tool.name().to_string());
+            }
+        }
+        // web_search is gated on CONFIG.exa_key() which is None in tests.
+        expected.insert("web_search".to_string());
+
+        // ── Collect available tool description files from embedded assets ─
+        let mut available: HashSet<String> = HashSet::new();
+        for asset_key in PromptAssets::iter() {
+            // asset_key is Cow<'static, str> (from rust-embed).
+            // Filter to only tool/*.md files and extract the tool name.
+            if let Some(tool_name) = tool_name_from_asset_key(&asset_key) {
+                available.insert(tool_name.to_string());
+            }
+        }
+
+        // ── Forward check: every expected tool must have a description file ─
+        let mut missing: Vec<&str> = expected
+            .difference(&available)
+            .map(|s| s.as_str())
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "Missing embedded tool description file(s):\n\
+             {}\n\
+             Each tool returned by Role::tools() must have a corresponding\n\
+             src/prompt/tool/<name>.md file. Create one for each missing tool.",
+            missing
+                .iter()
+                .map(|n| format!("  tool/{n}.md"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        // ── Reverse check: every description file must map to a known tool ─
+        let mut orphaned: Vec<&str> = available
+            .difference(&expected)
+            .map(|s| s.as_str())
+            .collect();
+        orphaned.sort();
+        assert!(
+            orphaned.is_empty(),
+            "Orphaned tool description file(s) — no tool uses them:\n\
+             {}\n\
+             Remove or archive the extraneous src/prompt/tool/<name>.md file(s).",
+            orphaned
+                .iter()
+                .map(|n| format!("  tool/{n}.md"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        // ── Content check: every description file must be non-empty ─────
+        for name in &available {
+            let key = format!("tool/{name}.md");
+            let asset = PromptAssets::get(&key)
+                .unwrap_or_else(|| panic!("asset {key} disappeared between iter and get"));
+            let content = String::from_utf8_lossy(asset.data.as_ref());
+            assert!(
+                !content.trim().is_empty(),
+                "Tool description file '{key}' is empty or whitespace-only.\n\
+                 Add a meaningful description for the tool '{}'.",
+                name,
+            );
+        }
     }
 }
