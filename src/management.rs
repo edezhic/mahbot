@@ -1056,7 +1056,7 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
         }
     }
 
-    // 4. Final outcome.
+    // 3. Final outcome.
     let target = if all_passed {
         comment.push_str("\n\n---\n✅ All diagnostics passed");
         TicketPhase::DiagnosticsDone
