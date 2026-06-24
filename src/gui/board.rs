@@ -369,7 +369,7 @@ impl BoardState {
                             .parse()
                             .map_err(|_| format!("Invalid status: {new_status}"))?;
                         board
-                            .transition_to(&ticket_id, None, phase)
+                            .transition_to(&ticket_id, None, phase, None)
                             .await
                             .map_err(|e| e.to_string())
                     },

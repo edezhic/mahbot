@@ -164,7 +164,9 @@ impl Tool for UpdateTicketTool {
         // Guard: refuse to update a ticket that is in a pipeline-blocking phase.
         guard_not_pipeline_blocking(store, ticket_id).await?;
 
-        store.transition_to(ticket_id, None, parsed_status).await?;
+        store
+            .transition_to(ticket_id, None, parsed_status, None)
+            .await?;
 
         Ok(format!(
             "Ticket {ticket_id} status updated to '{new_status}'"
@@ -500,11 +502,16 @@ mod tests {
             .expect("create");
         // Transition C to 'done' and B to 'cancelled'
         store
-            .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done)
+            .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done, None)
             .await
             .expect("transition to done");
         store
-            .transition_to(&id_b, Some(TicketPhase::Backlog), TicketPhase::Cancelled)
+            .transition_to(
+                &id_b,
+                Some(TicketPhase::Backlog),
+                TicketPhase::Cancelled,
+                None,
+            )
             .await
             .expect("transition to cancelled");
 

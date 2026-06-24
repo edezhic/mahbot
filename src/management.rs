@@ -142,7 +142,7 @@ async fn transition_ticket(
     notify: NotifyPolicy,
 ) -> Result<(), String> {
     match board
-        .transition_to(&ticket.id, Some(expected), target)
+        .transition_to(&ticket.id, Some(expected), target, None)
         .await
     {
         Ok(()) => {
@@ -229,11 +229,11 @@ async fn bounce_back_to_development(
     log_label: &str,
 ) {
     match board
-        .transition_to_with_reservation(
+        .transition_to(
             &ticket.id,
             Some(source_phase),
             TicketPhase::ReadyForDevelopment,
-            true,
+            Some(true),
         )
         .await
     {

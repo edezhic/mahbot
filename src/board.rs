@@ -970,13 +970,19 @@ impl BoardStore {
     ///
     /// # Note on [`pipeline_reservation`](Ticket::pipeline_reservation)
     ///
-    /// This method does **not** change [`pipeline_reservation`](Ticket::pipeline_reservation).
-    /// The reservation is deliberately left untouched so that:
+    /// When `reservation` is `None` (the common case), the
+    /// [`pipeline_reservation`](Ticket::pipeline_reservation) column is left
+    /// untouched. This is deliberate so that:
     /// - Bounce-back transitions (diagnostics/review/QA failure → ReadyForDevelopment)
-    ///   can set it atomically via [`transition_to_with_reservation`](Self::transition_to_with_reservation).
+    ///   can set the reservation atomically by passing `Some(true)`.
     /// - Manual transitions (GUI/UpdateTicketTool) to terminal phases
     ///   leave stale reservations inert — the claim and blocker queries filter by
     ///   status, so a cancelled/paused/failed ticket with reservation=1 is harmless.
+    ///
+    /// When `reservation` is `Some(value)`, the column is set to the given boolean
+    /// in the same UPDATE statement. This is needed for crash/restart recovery and
+    /// rework priority to avoid a race where a ticket is claimed between the
+    /// transition and a subsequent separate call to set the reservation.
     ///
     /// # Errors
     ///
@@ -984,22 +990,6 @@ impl BoardStore {
     /// exists but is not in `expected_phase` when a guard is active) or when a
     /// database error occurs.
     pub async fn transition_to(
-        &self,
-        id: &str,
-        expected_phase: Option<TicketPhase>,
-        target_phase: TicketPhase,
-    ) -> Result<()> {
-        self.transition_to_inner(id, expected_phase, target_phase, None)
-            .await
-    }
-
-    /// Transition a ticket to a new phase, optionally setting `pipeline_reservation`.
-    ///
-    /// When `reservation` is `None` (the common case), does not touch the
-    /// `pipeline_reservation` column.  When `Some(value)`, also sets
-    /// `pipeline_reservation` to the given boolean (needed for crash/restart
-    /// recovery and rework priority).
-    async fn transition_to_inner(
         &self,
         id: &str,
         expected_phase: Option<TicketPhase>,
@@ -1040,7 +1030,6 @@ impl BoardStore {
     /// This is a convenience helper for single-ticket mutation methods that
     /// follow the pattern: execute UPDATE → `ensure_ticket_found` → cancel stale
     /// agent. Used by [`transition_to`](Self::transition_to),
-    /// [`transition_to_inner`](Self::transition_to_inner),
     /// [`set_assigned_to`](Self::set_assigned_to), and
     /// [`set_archived`](Self::set_archived).
     ///
@@ -1162,26 +1151,6 @@ impl BoardStore {
         Self::ensure_ticket_found(rows, id, "set commit info")?;
 
         Ok(())
-    }
-
-    /// Transition a ticket to `target_phase` while atomically setting the
-    /// pipeline reservation to `reservation`.
-    ///
-    /// This is identical to [`transition_to`](Self::transition_to) except it
-    /// also sets `pipeline_reservation` in the same UPDATE statement. Use this
-    /// for bounce-back transitions (diagnostics/review/QA failure →
-    /// ReadyForDevelopment) to avoid a race where a non-reserved ticket is
-    /// claimed between the transition and the subsequent
-    /// separate call to set the reservation.
-    pub async fn transition_to_with_reservation(
-        &self,
-        id: &str,
-        expected_phase: Option<TicketPhase>,
-        target_phase: TicketPhase,
-        reservation: bool,
-    ) -> Result<()> {
-        self.transition_to_inner(id, expected_phase, target_phase, Some(reservation))
-            .await
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify
@@ -1802,7 +1771,7 @@ mod tests {
 
         // After transition, reflects new status.
         store
-            .transition_to(&id, None, TicketPhase::ReadyForDevelopment)
+            .transition_to(&id, None, TicketPhase::ReadyForDevelopment, None)
             .await
             .expect("set");
         let status = crate::util::test::expect_ticket_status(&store, &id).await;
@@ -1898,7 +1867,7 @@ mod tests {
 
         // Update status — this should clear assigned_to
         store
-            .transition_to(&id, None, TicketPhase::DiagnosticsDone)
+            .transition_to(&id, None, TicketPhase::DiagnosticsDone, None)
             .await
             .expect("update");
 
@@ -1916,7 +1885,12 @@ mod tests {
 
         // Ticket is in Backlog; guard expects Done — should fail.
         let result = store
-            .transition_to(&id, Some(TicketPhase::Done), TicketPhase::InDevelopment)
+            .transition_to(
+                &id,
+                Some(TicketPhase::Done),
+                TicketPhase::InDevelopment,
+                None,
+            )
             .await;
         assert!(
             result.is_err(),
@@ -1934,7 +1908,12 @@ mod tests {
 
         // Ticket is in Backlog; guard expects Backlog — should succeed.
         store
-            .transition_to(&id, Some(TicketPhase::Backlog), TicketPhase::InDevelopment)
+            .transition_to(
+                &id,
+                Some(TicketPhase::Backlog),
+                TicketPhase::InDevelopment,
+                None,
+            )
             .await
             .expect("guarded transition with correct phase should succeed");
 
@@ -2111,11 +2090,11 @@ mod tests {
 
         // Set reservation on the second ticket
         store
-            .transition_to_with_reservation(
+            .transition_to(
                 &reserved_id,
                 Some(TicketPhase::ReadyForDevelopment),
                 TicketPhase::ReadyForDevelopment,
-                true,
+                Some(true),
             )
             .await
             .expect("set reservation");
@@ -2192,11 +2171,11 @@ mod tests {
 
         // After setting reservation, it should be a blocker
         store
-            .transition_to_with_reservation(
+            .transition_to(
                 &id,
                 Some(TicketPhase::ReadyForDevelopment),
                 TicketPhase::ReadyForDevelopment,
-                true,
+                Some(true),
             )
             .await
             .expect("set reservation");
@@ -2210,11 +2189,11 @@ mod tests {
 
         // After removing reservation, it should not be a blocker
         store
-            .transition_to_with_reservation(
+            .transition_to(
                 &id,
                 Some(TicketPhase::ReadyForDevelopment),
                 TicketPhase::ReadyForDevelopment,
-                false,
+                Some(false),
             )
             .await
             .expect("clear reservation");
@@ -2760,7 +2739,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Move P to done
         store
-            .transition_to(&p, None, TicketPhase::Done)
+            .transition_to(&p, None, TicketPhase::Done, None)
             .await
             .expect("set done");
 
@@ -2824,7 +2803,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Move A to done
         store
-            .transition_to(&a, None, TicketPhase::Done)
+            .transition_to(&a, None, TicketPhase::Done, None)
             .await
             .expect("done a");
 
@@ -2838,7 +2817,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Move B to done
         store
-            .transition_to(&b, None, TicketPhase::Done)
+            .transition_to(&b, None, TicketPhase::Done, None)
             .await
             .expect("done b");
 
@@ -2883,7 +2862,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let two_hours_ago = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
 
         store
-            .transition_to(&old_cancelled_id, None, TicketPhase::Cancelled)
+            .transition_to(&old_cancelled_id, None, TicketPhase::Cancelled, None)
             .await
             .expect("cancel");
         store
@@ -2909,7 +2888,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("create_ticket");
         store
-            .transition_to(&fresh_cancelled_id, None, TicketPhase::Cancelled)
+            .transition_to(&fresh_cancelled_id, None, TicketPhase::Cancelled, None)
             .await
             .expect("cancel");
         // No backdating — updated_at is now.
@@ -2987,7 +2966,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("create_ticket");
         store
-            .transition_to(&done_id, None, TicketPhase::Done)
+            .transition_to(&done_id, None, TicketPhase::Done, None)
             .await
             .expect("set done");
 
@@ -3004,7 +2983,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("create_ticket");
         store
-            .transition_to(&cancelled_id, None, TicketPhase::Cancelled)
+            .transition_to(&cancelled_id, None, TicketPhase::Cancelled, None)
             .await
             .expect("cancel");
 
@@ -3056,12 +3035,12 @@ with a comment explaining why no agent is mid-execution in that state.\
         // Create a done ticket in ws1 and another in ws2.
         let id1 = default_ticket(&store, "/ws1", "ws1", "test").await;
         store
-            .transition_to(&id1, None, TicketPhase::Done)
+            .transition_to(&id1, None, TicketPhase::Done, None)
             .await
             .expect("set done");
         let id2 = default_ticket(&store, "/ws2", "ws2", "test").await;
         store
-            .transition_to(&id2, None, TicketPhase::Done)
+            .transition_to(&id2, None, TicketPhase::Done, None)
             .await
             .expect("set done");
 
@@ -3097,7 +3076,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         // Create a ticket and set it to Done.
         let id = default_ticket(&store, "/ws", "ws", "test").await;
         store
-            .transition_to(&id, None, TicketPhase::Done)
+            .transition_to(&id, None, TicketPhase::Done, None)
             .await
             .expect("set done");
 
@@ -3409,7 +3388,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Cancel the ticket (created by setup)
         store
-            .transition_to(&old_id, None, TicketPhase::Cancelled)
+            .transition_to(&old_id, None, TicketPhase::Cancelled, None)
             .await
             .expect("cancel");
 
@@ -3646,7 +3625,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
             if case.move_to_diagnostics {
                 store
-                    .transition_to(&id, None, TicketPhase::InDiagnostics)
+                    .transition_to(&id, None, TicketPhase::InDiagnostics, None)
                     .await
                     .expect("transition to InDiagnostics");
             }
