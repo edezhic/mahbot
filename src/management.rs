@@ -242,7 +242,7 @@ async fn bounce_back_to_development(
                 &ticket.workspace_name,
                 &ticket.id,
                 source_phase.as_ref(),
-                "ready_for_development",
+                TicketPhase::ReadyForDevelopment.as_ref(),
             );
             info!(
                 ticket = %ticket.id,
