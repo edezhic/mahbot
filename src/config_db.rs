@@ -1,8 +1,10 @@
-//! Config key-value and per-role model overrides stored in `config.db`.
+//! Config key-value, per-role model overrides, and per-model routing rules
+//! stored in `config.db`.
 //!
-//! Two tables:
+//! Three tables:
 //! - `config_kv` — generic key-value string pairs for runtime configuration.
 //! - `config_role` — per-role model and reasoning_effort overrides.
+//! - `config_model_routing` — per-model provider order and fallback settings.
 
 use crate::config::{ModelRouting, RoleConfig};
 use crate::global_store;
@@ -150,7 +152,7 @@ impl ConfigStore {
     /// is removed from the enum.  The enclosing transaction guarantees that a
     /// crash or error before commit rolls back to the prior state — partial
     /// writes from the two tables are never visible.
-    pub async fn save_routing_configs(
+    pub async fn save_role_and_routing_configs(
         &self,
         role_configs: &[RoleConfig],
         model_routings: &[ModelRouting],
@@ -620,10 +622,10 @@ mod tests {
         );
     }
 
-    // ── save_routing_configs ───────────────────────────────────
+    // ── save_role_and_routing_configs ──────────────────────────
 
     #[tokio::test]
-    async fn test_save_routing_configs_initial_save() {
+    async fn test_save_role_and_routing_configs_initial_save() {
         let (store, _dir) = setup().await;
 
         let mut role_configs = vec![
@@ -648,7 +650,7 @@ mod tests {
         model_routings.sort_by(|a, b| a.model.cmp(&b.model));
 
         store
-            .save_routing_configs(&role_configs, &model_routings)
+            .save_role_and_routing_configs(&role_configs, &model_routings)
             .await
             .unwrap();
 
@@ -666,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_save_routing_configs_replaces_old_rows() {
+    async fn test_save_role_and_routing_configs_replaces_old_rows() {
         let (store, _dir) = setup().await;
 
         // Insert initial data
@@ -681,7 +683,7 @@ mod tests {
             allow_fallbacks: Some(false),
         }];
         store
-            .save_routing_configs(&initial_roles, &initial_routings)
+            .save_role_and_routing_configs(&initial_roles, &initial_routings)
             .await
             .unwrap();
 
@@ -706,7 +708,7 @@ mod tests {
         // Both slices must be sorted to match DB ORDER BY
         new_routings.sort_by(|a, b| a.model.cmp(&b.model));
         store
-            .save_routing_configs(&new_roles, &new_routings)
+            .save_role_and_routing_configs(&new_roles, &new_routings)
             .await
             .unwrap();
 
@@ -725,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_save_routing_configs_empty_slices() {
+    async fn test_save_role_and_routing_configs_empty_slices() {
         let (store, _dir) = setup().await;
 
         // Pre-insert some data
@@ -739,7 +741,7 @@ mod tests {
             .unwrap();
 
         // Save with empty slices — should clear both tables
-        store.save_routing_configs(&[], &[]).await.unwrap();
+        store.save_role_and_routing_configs(&[], &[]).await.unwrap();
 
         let saved_roles = store.get_all_role_configs().await.unwrap();
         assert!(
@@ -755,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_save_routing_configs_duplicate_key_returns_err() {
+    async fn test_save_role_and_routing_configs_duplicate_key_returns_err() {
         let (store, dir) = setup().await;
 
         // Open a second connection *before* any transaction starts on the
@@ -787,7 +789,7 @@ mod tests {
         original_roles.sort_by(|a, b| a.role.cmp(&b.role));
         original_routings.sort_by(|a, b| a.model.cmp(&b.model));
         store
-            .save_routing_configs(&original_roles, &original_routings)
+            .save_role_and_routing_configs(&original_roles, &original_routings)
             .await
             .unwrap();
 
@@ -805,7 +807,9 @@ mod tests {
                 reasoning_effort: Some("high".to_string()),
             },
         ];
-        let result = store.save_routing_configs(&conflicting_roles, &[]).await;
+        let result = store
+            .save_role_and_routing_configs(&conflicting_roles, &[])
+            .await;
         assert!(result.is_err(), "duplicate role key should cause an error");
 
         // Read from the separate connection — only committed state is visible,

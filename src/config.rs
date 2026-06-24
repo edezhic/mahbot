@@ -660,7 +660,7 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
     // Write per-role configs AND per-model routings inside a single
     // transaction so a crash between writes doesn't leave inconsistent state.
     store
-        .save_routing_configs(&config.per_role_configs, &config.model_routings)
+        .save_role_and_routing_configs(&config.per_role_configs, &config.model_routings)
         .await?;
 
     // ── Commit to runtime ─────────────────────────────────────
