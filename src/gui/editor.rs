@@ -1538,6 +1538,97 @@ impl EditorState {
         self.file_tree.rebuild_visible();
     }
 
+    /// Start an async load of a directory's entries.
+    ///
+    /// Returns `Some(Task)` with the async load if a workspace is selected and
+    /// the directory needs loading (the caller is responsible for checking
+    /// `!self.dir_entries.contains_key(dir_path)` before calling this).
+    /// Returns `None` if no workspace is selected (caller should
+    /// early-return `Task::none()`).
+    ///
+    /// After calling this, the caller MUST call [`Self::rebuild_tree`] (or
+    /// equivalent) to reflect the expanded state.  If the caller needs focus
+    /// advancement after the load completes (Enter/Right navigation), it should
+    /// set `self.pending_enter_dir` after this call.
+    fn load_dir_async(&mut self, dir_path: &str, label: &str) -> Option<Task<EditorMessage>> {
+        debug_assert!(
+            !self.dir_entries.contains_key(dir_path),
+            "load_dir_async: caller must check !dir_entries.contains_key(dir_path) first"
+        );
+        let ws_path = if let Some(p) = self.selected_workspace_path.as_ref() {
+            p.clone()
+        } else {
+            tracing::error!("{label} without workspace selected");
+            return None;
+        };
+        let dir_gen = self.generation.wrapping_add(1);
+        self.generation = dir_gen;
+        self.dir_generations.insert(dir_path.to_string(), dir_gen);
+        self.loading_dirs.insert(dir_path.to_string());
+        let d_path = dir_path.to_string();
+        Some(Task::perform(
+            async move {
+                let entries = read_directory_entries(&ws_path, &d_path).await;
+                EditorMessage::DirExpanded {
+                    dir_path: d_path,
+                    r#gen: dir_gen,
+                    entries,
+                    quiet: false,
+                }
+            },
+            |msg| msg,
+        ))
+    }
+
+    /// Expand a directory and either start an async load or focus the first child.
+    ///
+    /// If the directory's entries are not yet cached, starts an async load and
+    /// sets [`Self::pending_enter_dir`] so [`Self::dir_expanded`] can advance
+    /// focus when data arrives.  If the entries are already cached (sync path),
+    /// expands and immediately focuses the first child.
+    ///
+    /// Returns `Task::none()` if no workspace is selected (caller should
+    /// propagate this return).
+    fn expand_dir_and_focus(&mut self, path: &str, label: &str) -> Task<EditorMessage> {
+        self.file_tree.expanded_dirs.insert(path.to_string());
+
+        let needs_async_load = !self.dir_entries.contains_key(path);
+
+        if needs_async_load {
+            let task = match self.load_dir_async(path, label) {
+                Some(t) => t,
+                None => return Task::none(),
+            };
+            self.pending_enter_dir = Some(path.to_string());
+            // Rebuild tree for the expanded-but-still-loading state.
+            self.rebuild_tree();
+            return task;
+        }
+
+        // Sync path — children are already cached.
+        self.rebuild_tree();
+        self.file_tree
+            .expand_dir_and_focus_first_child::<EditorMessage>(path)
+    }
+
+    /// Collapse an expanded directory and keep keyboard focus on it.
+    ///
+    /// Removes `path` from [`expanded_dirs`], rebuilds the tree, and delegates
+    /// focus-and-scroll management to [`FileTree::collapse_dir_and_keep_focus`].
+    /// The caller is responsible for ensuring `expanded_dirs` contains `path`
+    /// before calling.
+    ///
+    /// Note: [`FileTree::collapse_dir_and_keep_focus`] calls [`rebuild_visible`]
+    /// internally, so this helper uses raw [`build_hierarchical_tree`] (not
+    /// [`rebuild_tree`]) to avoid rebuilding the visible list twice.
+    fn collapse_dir(&mut self, path: &str) -> Task<EditorMessage> {
+        self.file_tree.expanded_dirs.remove(path);
+        self.file_tree.nodes =
+            build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
+        self.file_tree
+            .collapse_dir_and_keep_focus::<EditorMessage>(path)
+    }
+
     /// Build an inline rename [`TextInput`] element for a tree node that is
     /// currently being renamed.  Returns [`None`] when the node is not the
     /// rename target, so callers can fall through to their normal label rendering.
@@ -2116,57 +2207,25 @@ impl EditorState {
                     self.rename_target = None;
                 }
                 if self.file_tree.expanded_dirs.contains(&dir_path) {
-                    self.file_tree.expanded_dirs.remove(&dir_path);
-                    self.file_tree.nodes = build_hierarchical_tree(
-                        &self.dir_entries,
-                        &self.file_tree.expanded_dirs,
-                        "",
-                    );
-                    // Place focus on the collapsed directory.
                     self.file_tree.tree_focused = true;
-                    return self
-                        .file_tree
-                        .collapse_dir_and_keep_focus::<EditorMessage>(&dir_path);
+                    return self.collapse_dir(&dir_path);
                 }
                 self.file_tree.expanded_dirs.insert(dir_path.clone());
 
-                if !self.dir_entries.contains_key(&dir_path) {
-                    let Some(ref ws_path) = self.selected_workspace_path else {
-                        tracing::error!("ToggleDir without workspace selected");
-                        return Task::none();
-                    };
-                    let dir_gen = self.generation.wrapping_add(1);
-                    self.generation = dir_gen;
-                    self.dir_generations.insert(dir_path.clone(), dir_gen);
-                    self.loading_dirs.insert(dir_path.clone());
-
-                    let d_path = dir_path.clone();
-                    let r_path = ws_path.clone();
-                    let read_task = Task::perform(
-                        async move {
-                            let entries = read_directory_entries(&r_path, &d_path).await;
-                            EditorMessage::DirExpanded {
-                                dir_path: d_path,
-                                r#gen: dir_gen,
-                                entries,
-                                quiet: false,
-                            }
-                        },
-                        |msg| msg,
-                    );
-
-                    self.rebuild_tree();
-                    self.file_tree.tree_focused = true;
-                    // Place focus on the expanding directory.
-                    self.file_tree.focus_path(&dir_path);
-                    read_task
+                let read_task = if !self.dir_entries.contains_key(&dir_path) {
+                    match self.load_dir_async(&dir_path, "ToggleDir") {
+                        Some(t) => t,
+                        None => return Task::none(),
+                    }
                 } else {
-                    self.rebuild_tree();
-                    self.file_tree.tree_focused = true;
-                    // Place focus on the expanding directory.
-                    self.file_tree.focus_path(&dir_path);
                     Task::none()
-                }
+                };
+
+                self.rebuild_tree();
+                self.file_tree.tree_focused = true;
+                // Place focus on the expanding directory.
+                self.file_tree.focus_path(&dir_path);
+                read_task
             }
 
             EditorMessage::SelectFile(path) => {
@@ -3153,61 +3212,10 @@ impl EditorState {
                 if is_dir {
                     if self.file_tree.expanded_dirs.contains(&path) {
                         // Collapse: rebuild and keep focus on the collapsed directory.
-                        self.file_tree.expanded_dirs.remove(&path);
-                        self.file_tree.nodes = build_hierarchical_tree(
-                            &self.dir_entries,
-                            &self.file_tree.expanded_dirs,
-                            "",
-                        );
-                        return self
-                            .file_tree
-                            .collapse_dir_and_keep_focus::<EditorMessage>(&path);
+                        return self.collapse_dir(&path);
                     }
                     // Expand: insert, rebuild, jump to first child.
-                    self.file_tree.expanded_dirs.insert(path.clone());
-                    let mut task = Task::none();
-                    let needs_async_load = !self.dir_entries.contains_key(&path);
-                    if needs_async_load {
-                        let Some(ref ws_path) = self.selected_workspace_path else {
-                            tracing::error!("TreeNavEnter without workspace selected");
-                            return Task::none();
-                        };
-                        let dir_gen = self.generation.wrapping_add(1);
-                        self.generation = dir_gen;
-                        self.dir_generations.insert(path.clone(), dir_gen);
-                        self.loading_dirs.insert(path.clone());
-                        let d_path = path.clone();
-                        let r_path = ws_path.clone();
-                        task = Task::perform(
-                            async move {
-                                let entries = read_directory_entries(&r_path, &d_path).await;
-                                EditorMessage::DirExpanded {
-                                    dir_path: d_path,
-                                    r#gen: dir_gen,
-                                    entries,
-                                    quiet: false,
-                                }
-                            },
-                            |msg| msg,
-                        );
-                        // Remember to advance focus to first child after async load.
-                        self.pending_enter_dir = Some(path.clone());
-                    }
-                    self.file_tree.nodes = build_hierarchical_tree(
-                        &self.dir_entries,
-                        &self.file_tree.expanded_dirs,
-                        "",
-                    );
-                    if needs_async_load {
-                        // Children not loaded yet — keep focus on directory,
-                        // DirExpanded will advance focus when data arrives.
-                        return task;
-                    }
-                    // Synchronous expansion — children available immediately.
-                    let scroll = self
-                        .file_tree
-                        .expand_dir_and_focus_first_child::<EditorMessage>(&path);
-                    return Task::batch([scroll, task]);
+                    return self.expand_dir_and_focus(&path, "TreeNavEnter");
                 }
                 // Open file.
                 Task::done(EditorMessage::SelectFile(path))
@@ -3230,15 +3238,7 @@ impl EditorState {
 
                 if is_dir && self.file_tree.expanded_dirs.contains(&path) {
                     // Collapse expanded directory and keep focus on it.
-                    self.file_tree.expanded_dirs.remove(&path);
-                    self.file_tree.nodes = build_hierarchical_tree(
-                        &self.dir_entries,
-                        &self.file_tree.expanded_dirs,
-                        "",
-                    );
-                    return self
-                        .file_tree
-                        .collapse_dir_and_keep_focus::<EditorMessage>(&path);
+                    return self.collapse_dir(&path);
                 }
 
                 // ArrowLeft on collapsed directory or file — navigate to parent.
@@ -3276,49 +3276,7 @@ impl EditorState {
 
                 if !self.file_tree.expanded_dirs.contains(&path) {
                     // Expand directory and move focus to first child.
-                    self.file_tree.expanded_dirs.insert(path.clone());
-                    let mut task = Task::none();
-                    let needs_async_load = !self.dir_entries.contains_key(&path);
-                    if needs_async_load {
-                        let Some(ref ws_path) = self.selected_workspace_path else {
-                            tracing::error!("TreeNavRight without workspace selected");
-                            return Task::none();
-                        };
-                        let dir_gen = self.generation.wrapping_add(1);
-                        self.generation = dir_gen;
-                        self.dir_generations.insert(path.clone(), dir_gen);
-                        self.loading_dirs.insert(path.clone());
-                        let d_path = path.clone();
-                        let r_path = ws_path.clone();
-                        task = Task::perform(
-                            async move {
-                                let entries = read_directory_entries(&r_path, &d_path).await;
-                                EditorMessage::DirExpanded {
-                                    dir_path: d_path,
-                                    r#gen: dir_gen,
-                                    entries,
-                                    quiet: false,
-                                }
-                            },
-                            |msg| msg,
-                        );
-                        // DirExpanded will advance focus to first child.
-                        self.pending_enter_dir = Some(path.clone());
-                    }
-                    self.file_tree.nodes = build_hierarchical_tree(
-                        &self.dir_entries,
-                        &self.file_tree.expanded_dirs,
-                        "",
-                    );
-                    if needs_async_load {
-                        // Keep focus on directory until async load completes.
-                        return task;
-                    }
-                    // Synchronous expansion — children available now.
-                    let scroll = self
-                        .file_tree
-                        .expand_dir_and_focus_first_child::<EditorMessage>(&path);
-                    return Task::batch([scroll, task]);
+                    return self.expand_dir_and_focus(&path, "TreeNavRight");
                 }
 
                 // Already expanded directory — move focus to first child (if any).
@@ -4041,8 +3999,7 @@ impl EditorState {
         match entries {
             Ok(entries) => {
                 self.dir_entries.insert(dir_path.to_string(), entries);
-                self.file_tree.nodes =
-                    build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
+                self.rebuild_tree();
                 // If this was triggered by Enter-on-directory, advance
                 // focus to the first child now that children are loaded.
                 if self.pending_enter_dir.as_deref() == Some(dir_path) {
@@ -6706,6 +6663,76 @@ mod tests {
         // Focus should have advanced to the first child.
         assert_eq!(state.pending_enter_dir, None);
         assert_eq!(state.file_tree.tree_focus_index, 1); // "src/main.rs"
+    }
+
+    #[test]
+    fn test_toggle_dir_async_load_and_complete() {
+        let mut state = EditorState::new();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        // "src" dir has no cached entries → needs async load.
+        state.dir_entries.insert(
+            String::new(),
+            vec![FsEntry {
+                name: "src".to_string(),
+                full_path: "src".to_string(),
+                is_dir: true,
+                error: None,
+            }],
+        );
+        state.rebuild_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src"
+
+        let _task = state.update(EditorMessage::ToggleDir("src".to_string()));
+        // ToggleDir sets loading_dirs and dir_generations.
+        assert!(state.loading_dirs.contains("src"));
+        assert!(state.dir_generations.contains_key("src"));
+        // ToggleDir does NOT set pending_enter_dir.
+        assert_eq!(state.pending_enter_dir, None);
+        // Focus is on "src".
+        assert!(state.file_tree.tree_focused);
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+
+        // Simulate DirExpanded completing with children.
+        let dir_gen = *state.dir_generations.get("src").unwrap();
+        let entries = vec![FsEntry {
+            name: "main.rs".to_string(),
+            full_path: "src/main.rs".to_string(),
+            is_dir: false,
+            error: None,
+        }];
+        let _task = state.update(EditorMessage::DirExpanded {
+            dir_path: "src".to_string(),
+            r#gen: dir_gen,
+            entries: Ok(entries),
+            quiet: false,
+        });
+        // Entries are now cached.
+        assert!(state.dir_entries.contains_key("src"));
+        assert_eq!(state.dir_entries["src"].len(), 1);
+        // loading_dirs is cleared.
+        assert!(!state.loading_dirs.contains("src"));
+        // pending_enter_dir was never set.
+        assert_eq!(state.pending_enter_dir, None);
+        // visible_tree_nodes is correctly rebuilt (rebuild_tree was called).
+        assert!(state.file_tree.visible_tree_nodes.len() >= 2);
+        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
+        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
+    }
+
+    #[test]
+    fn test_toggle_dir_no_workspace_returns_none() {
+        let mut state = EditorState::new();
+        // Precondition: "src" is not yet in expanded_dirs before the call.
+        assert!(!state.file_tree.expanded_dirs.contains("src"));
+        // No workspace set — async load should return None (early return).
+        let _task = state.update(EditorMessage::ToggleDir("src".to_string()));
+        // expanded_dirs is modified (insert happens before the workspace guard),
+        // but no async load was spawned since there's no workspace path.
+        assert!(state.file_tree.expanded_dirs.contains("src"));
+        assert_eq!(state.generation, 0);
+        assert!(state.loading_dirs.is_empty());
+        assert!(state.dir_generations.is_empty());
     }
 
     // ── Git status porcelain parsing tests ─────────────────────────
