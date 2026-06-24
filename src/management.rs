@@ -39,10 +39,10 @@ const PARALLEL_AGENT_COUNT: usize = 3;
 const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 50;
 
 /// Maximum number of cumulative diagnostics failures allowed before the circuit
-/// breaker trips. The breaker trips when `count > DIAGNOSTICS_CIRCUIT_BREAKER_MAX_ALLOWED`
+/// breaker trips. The breaker trips when `count > DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`
 /// (i.e., at ≥5 failures), failing the ticket and pausing the workspace to
 /// prevent thrashing.
-const DIAGNOSTICS_CIRCUIT_BREAKER_MAX_ALLOWED: usize = 4;
+const DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD: usize = 4;
 
 /// Minimum acceptable verification score (0-10) for analysis phase.
 const ANALYSIS_THRESHOLD: u8 = 7;
@@ -951,7 +951,7 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 /// sequentially. Stops at the first failure. After execution, transitions
 /// the ticket to either `DiagnosticsDone` (all passed) or `ReadyForDevelopment`
 /// (any failure), unless the circuit breaker trips (see
-/// [`DIAGNOSTICS_CIRCUIT_BREAKER_MAX_ALLOWED`]).
+/// [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
 #[allow(clippy::too_many_lines)]
 async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
     match board.claim_diagnostics(&ticket.id).await {
@@ -1089,7 +1089,7 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
 
 /// Diagnostics-specific circuit breaker: counts prior diagnostics system
 /// comments that indicate failures, and fails the ticket (plus pauses the
-/// workspace) if the count exceeds [`DIAGNOSTICS_CIRCUIT_BREAKER_MAX_ALLOWED`]
+/// workspace) if the count exceeds [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]
 /// (i.e., trip at ≥5 failures).
 ///
 /// Re-fetches comments because the ticket snapshot may be stale.
@@ -1106,7 +1106,7 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(board: &BoardStore, ticket
         ticket,
         TicketPhase::InDiagnostics,
         TicketPhase::Failed,
-        DIAGNOSTICS_CIRCUIT_BREAKER_MAX_ALLOWED,
+        DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
         |comments| {
             comments
                 .iter()
