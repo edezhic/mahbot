@@ -1105,7 +1105,6 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(board: &BoardStore, ticket
         board,
         ticket,
         TicketPhase::InDiagnostics,
-        TicketPhase::Failed,
         DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
         |comments| {
             comments
@@ -1462,16 +1461,15 @@ fn build_analyst_summary(
 // ── Shared Circuit Breaker ──────────────────────────────
 
 /// Shared circuit breaker skeleton: fetch comments, count, compare to threshold,
-/// add a system comment (first, for crash-safety), then transition to `target`
-/// (e.g., [`TicketPhase::Failed`] or [`TicketPhase::Paused`]).
+/// add a system comment (first, for crash-safety), then transition to
+/// [`TicketPhase::Failed`].
 ///
 /// Both concrete breakers (diagnostics and general) delegate to this helper,
-/// supplying their target phase, counting logic, threshold, comment format, and
-/// log label via parameters and closures. This eliminates ~80% structural
-/// duplication while preserving exact behavioral semantics.
+/// supplying their counting logic, threshold, comment format, and log label via
+/// parameters and closures. This eliminates ~80% structural duplication while
+/// preserving exact behavioral semantics.
 ///
-/// When the target is [`TicketPhase::Failed`], the workspace is also paused
-/// automatically via [`notify_ticket`], called from
+/// The workspace is paused automatically via [`notify_ticket`], called from
 /// [`transition_ticket`] with [`NotifyPolicy::Notify`].
 ///
 /// # Self-counting prevention
@@ -1495,18 +1493,15 @@ fn build_analyst_summary(
 ///
 /// * `expected` — the phase the ticket must currently be in for the transition
 ///   to succeed (passed through to [`transition_ticket`]).
-/// * `target` — the phase to transition the ticket to when the breaker trips.
 /// * `threshold` — the count at which the breaker trips (using `>` comparison).
 /// * `count_fn` — extracts the count from the fetched comment list. Responsible
 ///   for its own filtering (including self-counting prevention).
 /// * `comment_text` — formats the system comment body given the count.
-#[allow(clippy::too_many_arguments)]
 #[must_use]
 async fn run_circuit_breaker(
     board: &BoardStore,
     ticket: &Ticket,
     expected: TicketPhase,
-    target: TicketPhase,
     threshold: usize,
     count_fn: impl Fn(&[TicketComment]) -> usize,
     comment_text: impl Fn(usize) -> String,
@@ -1542,19 +1537,25 @@ async fn run_circuit_breaker(
         .add_comment(&ticket.id, "system", &comment_text(count))
         .await;
 
-    if let Err(e) = transition_ticket(board, ticket, expected, target, NotifyPolicy::Notify).await {
+    if let Err(e) = transition_ticket(
+        board,
+        ticket,
+        expected,
+        TicketPhase::Failed,
+        NotifyPolicy::Notify,
+    )
+    .await
+    {
         warn!(
             ticket = %ticket.id,
-            target = %target,
             error = %e,
-            "Circuit breaker tripped but transition to {target} failed",
+            "Circuit breaker tripped but transition to Failed failed",
         );
         return true;
     }
 
-    // Workspace auto-pause: if `target` is Failed, `notify_ticket` (called
-    // inside `transition_ticket` with `NotifyPolicy::Notify`) pauses the workspace
-    // automatically.
+    // Workspace auto-pause: `transition_ticket` (called with
+    // `NotifyPolicy::Notify`) pauses the workspace automatically.
 
     true
 }
@@ -1581,7 +1582,6 @@ async fn trip_circuit_breaker_if_exceeded(
         board,
         ticket,
         expected,
-        TicketPhase::Failed,
         CIRCUIT_BREAKER_COMMENT_THRESHOLD,
         <[TicketComment]>::len,
         |count| {
