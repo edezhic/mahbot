@@ -588,6 +588,10 @@ pub async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Result<Co
         .await
         .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
+    conn.execute("PRAGMA foreign_keys = ON;", ())
+        .await
+        .context("Failed to enable foreign key enforcement")?;
+
     conn.execute_batch(schema)
         .await
         .context(format!("Failed to run schema {schema}"))?;
