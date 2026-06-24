@@ -824,8 +824,8 @@ fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
 }
 
 /// Shared helper that returns both the index and the basename of the first
-/// command word in a shell segment. Used by [`first_command_word`] and
-/// [`canonical_command`] to avoid duplicating index unwrap + basename extraction.
+/// command word from a bare list of words. Used by [`command_word_from_segment`]
+/// to avoid duplicating index unwrap + basename extraction.
 fn command_word_and_index<'a>(words: &[&'a str]) -> Option<(usize, &'a str)> {
     let cmd_idx = find_first_command_word_index(words)?;
     let basename = words[cmd_idx]
@@ -835,6 +835,18 @@ fn command_word_and_index<'a>(words: &[&'a str]) -> Option<(usize, &'a str)> {
     Some((cmd_idx, basename))
 }
 
+/// Extract the first command word index, basename, and the whitespace-split words
+/// from a shell segment.
+///
+/// Trims the segment, splits on whitespace, and delegates to [`command_word_and_index`].
+/// Returns `None` when no command word is found (e.g., only prefixes/flags/env assignments).
+fn command_word_from_segment(segment: &str) -> Option<(usize, &str, Vec<&str>)> {
+    let trimmed = segment.trim();
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let (idx, cmd) = command_word_and_index(&words)?;
+    Some((idx, cmd, words))
+}
+
 /// Extract just the first command word (basename) from a shell segment.
 ///
 /// Strips shell prefixes, environment variable assignments (`KEY=value`),
@@ -842,10 +854,7 @@ fn command_word_and_index<'a>(words: &[&'a str]) -> Option<(usize, &'a str)> {
 /// This is the lightweight alternative to [`canonical_command`] for callers
 /// that only need the command name (e.g., `check_segment`).
 pub(super) fn first_command_word(segment: &str) -> &str {
-    let trimmed = segment.trim();
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-
-    let Some((_, cmd)) = command_word_and_index(&words) else {
+    let Some((_, cmd, _)) = command_word_from_segment(segment) else {
         return "";
     };
     cmd
@@ -861,10 +870,7 @@ pub(super) fn first_command_word(segment: &str) -> &str {
 /// returned key won't match any profile, falling through to generic filtering,
 /// which is the same end state as the pre-fix behavior.
 pub(super) fn canonical_command(segment: &str) -> String {
-    let trimmed = segment.trim();
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-
-    let Some((cmd_idx, cmd)) = command_word_and_index(&words) else {
+    let Some((cmd_idx, cmd, words)) = command_word_from_segment(segment) else {
         return String::new();
     };
 

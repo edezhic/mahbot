@@ -216,7 +216,6 @@ fn strip_heredoc_bodies(command: &str) -> String {
             }
 
             // Skip body until a line equals the delimiter
-            let delim_bytes = delimiter.as_bytes();
             while i < chars.len() {
                 let line_start = chars[i].0;
                 if command[line_start..].starts_with(&delimiter)
@@ -245,7 +244,6 @@ fn strip_heredoc_bodies(command: &str) -> String {
                     i += 1;
                 }
             }
-            let _ = delim_bytes; // delimiter compared via starts_with above
             continue;
         }
 
