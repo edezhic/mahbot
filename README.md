@@ -50,7 +50,7 @@ Instead of bolting skills, subagents, and review onto a chat UI, MahBot ships th
 - **Workspace discovery** — per-role codebase summaries + auto-detected diagnostics commands
 - **Built-in dev surface** — native dashboard: chat, ticket board, editor, diff, shell, sessions, logs, tool-failure stats, settings; optional **Telegram** channel on the same pipeline
 - **Background Maintainer** — scans for refactor opportunities and creates **planning tickets only** (no silent edits)
-- **Archived ticket search** — hybrid FTS + local ONNX embeddings, Manager can efficiently search over all the past work
+- **Archived ticket search** — hybrid FTS + local Candle + GGUF embeddings, Manager can efficiently search over all the past work
 
 ## Architecture (sketch)
 

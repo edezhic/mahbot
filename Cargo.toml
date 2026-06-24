@@ -74,10 +74,13 @@ regex = "1.10"
 # Fast file/content search for the tools
 fff-search = "0.9"
 
+# SHA256 checksum verification for model downloads
+sha2 = "0.10"
+
 # Embeddings
-ndarray = "0.17"
 tokenizers = "0.22"
-ort = { version = "=2.0.0-rc.12", features = ["ndarray", "download-binaries"] }
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
 
 # Enum derive helpers
 strum = { version = "0.27", features = ["derive"] }

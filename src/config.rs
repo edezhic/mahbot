@@ -408,10 +408,26 @@ impl ConfigReload {
             .clone()
     }
 
+    /// Like [`global_storage_root`], but returns `None` instead of panicking if
+    /// storage root has not been set yet. Useful for code paths that can tolerate
+    /// an uninitialized config (e.g., graceful degradation in tests).
+    #[must_use]
+    pub fn try_storage_root(&self) -> Option<PathBuf> {
+        self.storage_root.get().cloned()
+    }
+
     pub(crate) fn set_storage_root(&self, root: PathBuf) {
         self.storage_root
             .set(root)
             .expect("CONFIG storage_root already set");
+    }
+
+    /// Like [`set_storage_root`], but returns `Err` instead of panicking if
+    /// already set. Useful in test environments where the root may have been
+    /// set by a previously-running test.
+    #[cfg(test)]
+    pub(crate) fn try_set_storage_root(&self, root: PathBuf) -> std::result::Result<(), PathBuf> {
+        self.storage_root.set(root)
     }
 
     // ── Snapshot access ─────────────────────────────────────────

@@ -15,7 +15,7 @@ use tracing::debug;
 
 /// Search archived tickets only, by keyword + semantic similarity.
 ///
-/// Uses the board's FTS index (`BoardStore::search_archived_by_fts`) and ONNX
+/// Uses the board's FTS index (`BoardStore::search_archived_by_fts`) and local
 /// embeddings (`embedder::embed()`) with RRF merge (`vector::hybrid_merge`).
 pub struct SearchArchivedTicketsTool;
 

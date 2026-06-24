@@ -1231,7 +1231,7 @@ mod tests {
         // Set a throwaway storage root if not already set (the OnceLock
         // panics on double-set, so we only set if not already set).
         let tmp_root = TempDir::new().expect("storage root temp dir");
-        crate::config::CONFIG.set_storage_root(tmp_root.path().to_path_buf());
+        let _ = crate::config::CONFIG.try_set_storage_root(tmp_root.path().to_path_buf());
         crate::config::CONFIG.swap(crate::config::ConfigData::default());
 
         let ws = store

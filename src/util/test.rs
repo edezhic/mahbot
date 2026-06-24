@@ -86,6 +86,9 @@ pub async fn init_test_stores() {
 
     static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     INIT.get_or_init(|| async {
+        // Set CONFIG storage root (no-op if already set by another test)
+        let _ = crate::config::CONFIG.try_set_storage_root(test_root().clone());
+
         crate::session::SESSIONS
             .set(
                 SessionStorage::new_global(test_root())
