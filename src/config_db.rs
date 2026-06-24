@@ -874,36 +874,15 @@ mod tests {
 
 #[test]
 fn kv_columns_count_matches_column_constants() {
-    let count = KV_COLUMNS.split(',').count();
-    assert_eq!(
-        COL_KV_VALUE + 1,
-        count,
-        "KV_COLUMNS has {count} entries but COL_KV_VALUE ({}) + 1 = {}",
-        COL_KV_VALUE,
-        COL_KV_VALUE + 1,
-    );
+    crate::assert_column_count!(KV_COLUMNS, COL_KV_VALUE);
 }
 
 #[test]
 fn role_config_columns_count_matches_column_constants() {
-    let count = ROLE_CONFIG_COLUMNS.split(',').count();
-    assert_eq!(
-        COL_RC_REASONING_EFFORT + 1,
-        count,
-        "ROLE_CONFIG_COLUMNS has {count} entries but COL_RC_REASONING_EFFORT ({}) + 1 = {}",
-        COL_RC_REASONING_EFFORT,
-        COL_RC_REASONING_EFFORT + 1,
-    );
+    crate::assert_column_count!(ROLE_CONFIG_COLUMNS, COL_RC_REASONING_EFFORT);
 }
 
 #[test]
 fn model_routing_columns_count_matches_column_constants() {
-    let count = MODEL_ROUTING_COLUMNS.split(',').count();
-    assert_eq!(
-        COL_MR_ALLOW_FALLBACKS + 1,
-        count,
-        "MODEL_ROUTING_COLUMNS has {count} entries but COL_MR_ALLOW_FALLBACKS ({}) + 1 = {}",
-        COL_MR_ALLOW_FALLBACKS,
-        COL_MR_ALLOW_FALLBACKS + 1,
-    );
+    crate::assert_column_count!(MODEL_ROUTING_COLUMNS, COL_MR_ALLOW_FALLBACKS);
 }

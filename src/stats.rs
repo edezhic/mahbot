@@ -287,14 +287,7 @@ mod tests {
     /// constants and are intentionally excluded from this assertion.
     #[test]
     fn tool_error_columns_count_matches_column_constants() {
-        let count = TOOL_ERROR_COLUMNS.split(',').count();
-        assert_eq!(
-            COL_TE_RECORDED_AT + 1,
-            count,
-            "TOOL_ERROR_COLUMNS has {count} entries but COL_TE_RECORDED_AT ({}) + 1 = {}",
-            COL_TE_RECORDED_AT,
-            COL_TE_RECORDED_AT + 1,
-        );
+        crate::assert_column_count!(TOOL_ERROR_COLUMNS, COL_TE_RECORDED_AT);
     }
 
     #[test]

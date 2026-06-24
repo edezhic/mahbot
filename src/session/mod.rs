@@ -701,24 +701,10 @@ pub(crate) fn decode_native_history_message(
 
 #[test]
 fn session_message_columns_count_matches_column_constants() {
-    let count = SESSION_MESSAGE_COLUMNS.split(',').count();
-    assert_eq!(
-        COL_SM_CONTENT + 1,
-        count,
-        "SESSION_MESSAGE_COLUMNS has {count} entries but COL_SM_CONTENT ({}) + 1 = {}",
-        COL_SM_CONTENT,
-        COL_SM_CONTENT + 1,
-    );
+    crate::assert_column_count!(SESSION_MESSAGE_COLUMNS, COL_SM_CONTENT);
 }
 
 #[test]
 fn session_list_columns_count_matches_column_constants() {
-    let count = SESSION_LIST_COLUMNS.split(',').count();
-    assert_eq!(
-        COL_SL_MESSAGE_COUNT + 1,
-        count,
-        "SESSION_LIST_COLUMNS has {count} entries but COL_SL_MESSAGE_COUNT ({}) + 1 = {}",
-        COL_SL_MESSAGE_COUNT,
-        COL_SL_MESSAGE_COUNT + 1,
-    );
+    crate::assert_column_count!(SESSION_LIST_COLUMNS, COL_SL_MESSAGE_COUNT);
 }

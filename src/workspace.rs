@@ -871,14 +871,7 @@ mod tests {
     /// or vice versa — a silent data corruption hazard.
     #[test]
     fn workspace_columns_count_matches_column_constants() {
-        let count = WORKSPACE_COLUMNS.split(',').count();
-        assert_eq!(
-            COL_WS_DIAGNOSTICS_UPDATED_AT + 1,
-            count,
-            "WORKSPACE_COLUMNS has {count} entries but COL_WS_DIAGNOSTICS_UPDATED_AT ({}) + 1 = {}",
-            COL_WS_DIAGNOSTICS_UPDATED_AT,
-            COL_WS_DIAGNOSTICS_UPDATED_AT + 1,
-        );
+        crate::assert_column_count!(WORKSPACE_COLUMNS, COL_WS_DIAGNOSTICS_UPDATED_AT);
     }
 
     /// Open a temporary workspace store for testing.

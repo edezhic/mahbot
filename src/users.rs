@@ -609,26 +609,12 @@ pub fn is_personal_workspace(workspace_name: &str) -> bool {
 
 #[test]
 fn users_columns_count_matches_column_constants() {
-    let count = USERS_COLUMNS.split(',').count();
-    assert_eq!(
-        COL_USERS_SELECTED_ROLE + 1,
-        count,
-        "USERS_COLUMNS has {count} entries but COL_USERS_SELECTED_ROLE ({}) + 1 = {}",
-        COL_USERS_SELECTED_ROLE,
-        COL_USERS_SELECTED_ROLE + 1,
-    );
+    crate::assert_column_count!(USERS_COLUMNS, COL_USERS_SELECTED_ROLE);
 }
 
 #[test]
 fn user_channel_columns_count_matches_column_constants() {
-    let count = USER_CHANNEL_COLUMNS.split(',').count();
-    assert_eq!(
-        COL_UC_REPLY_TARGET + 1,
-        count,
-        "USER_CHANNEL_COLUMNS has {count} entries but COL_UC_REPLY_TARGET ({}) + 1 = {}",
-        COL_UC_REPLY_TARGET,
-        COL_UC_REPLY_TARGET + 1,
-    );
+    crate::assert_column_count!(USER_CHANNEL_COLUMNS, COL_UC_REPLY_TARGET);
 }
 
 #[cfg(test)]

@@ -521,14 +521,7 @@ mod tests {
     /// or vice versa — a silent data corruption hazard.
     #[test]
     fn logs_columns_count_matches_column_constants() {
-        let count = LOGS_COLUMNS.split(',').count();
-        assert_eq!(
-            COL_LOGS_WORKSPACE + 1,
-            count,
-            "LOGS_COLUMNS has {count} entries but COL_LOGS_WORKSPACE ({}) + 1 = {}",
-            COL_LOGS_WORKSPACE,
-            COL_LOGS_WORKSPACE + 1,
-        );
+        crate::assert_column_count!(LOGS_COLUMNS, COL_LOGS_WORKSPACE);
     }
 
     #[test]

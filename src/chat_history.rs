@@ -235,14 +235,7 @@ mod tests {
     /// or vice versa — a silent data corruption hazard.
     #[test]
     fn chat_history_columns_count_matches_column_constants() {
-        let count = CHAT_HISTORY_COLUMNS.split(',').count();
-        assert_eq!(
-            COL_CH_WORKSPACE + 1,
-            count,
-            "CHAT_HISTORY_COLUMNS has {count} entries but COL_CH_WORKSPACE ({}) + 1 = {}",
-            COL_CH_WORKSPACE,
-            COL_CH_WORKSPACE + 1,
-        );
+        crate::assert_column_count!(CHAT_HISTORY_COLUMNS, COL_CH_WORKSPACE);
     }
 
     fn test_setup() -> (TempDir, std::path::PathBuf) {
