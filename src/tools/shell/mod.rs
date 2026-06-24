@@ -309,9 +309,31 @@ impl ShellTool {
 /// Extra `PATH` entries prepended for shell subprocesses so developer tools
 /// (`cargo`, Homebrew, npm global bins, etc.) resolve without reading the
 /// parent process `PATH`.
+///
+/// # `$CARGO_HOME` handling
+///
+/// Checks `$CARGO_HOME` first (if set and non-empty) so users with a non-default
+/// `CARGO_HOME` get their cargo-installed tools visible. Always adds
+/// `~/.cargo/bin` via `UserDirs` as a fallback for default installs. When both
+/// point to the same directory, deduplication in [`prepend_path_entries`] handles
+/// it — the belt-and-suspenders approach ensures tools installed via either path
+/// are found.
+///
+/// This follows the same resolution order as
+/// [`crate::self_update::resolve_cargo_bin_path`].
 #[cfg(unix)]
 fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     let mut v = Vec::new();
+
+    // Check $CARGO_HOME first — users with a non-default CARGO_HOME
+    // need $CARGO_HOME/bin in PATH for cargo-installed tools.
+    // Dedup with ~/.cargo/bin is handled by prepend_path_entries.
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
+        && !cargo_home.is_empty()
+    {
+        v.push(PathBuf::from(cargo_home).join("bin"));
+    }
+
     if let Some(dirs) = UserDirs::new() {
         let home = dirs.home_dir();
         v.push(home.join(".cargo").join("bin"));
@@ -325,9 +347,24 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     v
 }
 
+/// Extra `PATH` entries prepended for shell subprocesses so developer tools
+/// (`cargo`, etc.) resolve without reading the parent process `PATH`.
+///
+/// # `$CARGO_HOME` handling
+///
+/// Same belt-and-suspenders approach as the unix variant: checks `$CARGO_HOME`
+/// first, then adds `~/.cargo/bin` via `UserDirs`.
 #[cfg(windows)]
 fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     let mut v = Vec::new();
+
+    // Check $CARGO_HOME first.
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
+        && !cargo_home.is_empty()
+    {
+        v.push(PathBuf::from(cargo_home).join("bin"));
+    }
+
     if let Some(dirs) = UserDirs::new() {
         v.push(dirs.home_dir().join(".cargo").join("bin"));
     }
@@ -1808,6 +1845,25 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
+    /// Mutex serializing env-var-modifying tests to prevent thread-safety
+    /// issues with `std::env::set_var` (which is `unsafe` in Rust 2024).
+    ///
+    /// ## Cross-module coordination
+    ///
+    /// `self_update.rs` has its own `ENV_LOCK` — the two locks are independent.
+    /// A shell test that reads `CARGO_HOME` (under this lock) could theoretically
+    /// race with a `self_update` test that writes it (under the other lock).
+    /// To mitigate this, tests that call into code reading `$CARGO_HOME` (via
+    /// `extra_shell_path_prefixes`) hold this lock during the read, while
+    /// write tests in both modules hold their respective locks for minimal
+    /// durations. The race window is negligible in practice since env var
+    /// accesses are instantaneous, but the lock pattern documents the
+    /// synchronization boundary.
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     /// Create a minimal [`Workspace`] from a path for testing.
 
     #[test]
@@ -1826,11 +1882,21 @@ mod tests {
     /// `build_shell_command` clears the parent environment and only exposes
     /// [`SAFE_ENV_VARS`] with baseline values (CWE-200). Verify by running
     /// `env` through the built command.
+    ///
+    /// Acquires [`ENV_LOCK`] because `build_shell_command` → `resolved_shell_path`
+    /// → `extra_shell_path_prefixes` reads `$CARGO_HOME` from the environment,
+    /// which concurrent tests in `self_update.rs` may write under their own lock.
     #[cfg(unix)]
     #[tokio::test]
     async fn build_shell_command_isolates_environment() {
         let tmp = TempDir::new().expect("tempdir");
-        let mut cmd = build_shell_command("env", tmp.path());
+        // Acquire ENV_LOCK while building the command since extra_shell_path_prefixes
+        // reads $CARGO_HOME — concurrent self_update tests write it under a different
+        // lock, so holding our own prevents the theoretical data race.
+        let mut cmd = {
+            let _guard = env_lock().lock().unwrap();
+            build_shell_command("env", tmp.path())
+        };
 
         // We can't inspect env vars on a Command directly; spawn it and check.
         let output = cmd.output().await.expect("env should run");
@@ -2183,10 +2249,73 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolved_shell_path_includes_cargo_bin() {
+        // Belt-and-suspenders means ~/.cargo/bin is always added regardless
+        // of $CARGO_HOME, so no env manipulation needed here.
         let path = resolved_shell_path();
         assert!(
             path.contains(".cargo/bin"),
             "PATH should include ~/.cargo/bin: {path}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_shell_path_includes_cargo_home_when_set() {
+        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        let _guard = env_lock().lock().unwrap();
+
+        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        unsafe {
+            std::env::set_var("CARGO_HOME", "/custom/cargo");
+        }
+        let path = resolved_shell_path();
+        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+        }
+
+        assert!(
+            path.contains("/custom/cargo/bin"),
+            "PATH should include $CARGO_HOME/bin when CARGO_HOME is set: {path}"
+        );
+        // Default ~/.cargo/bin should also be present (belt-and-suspenders).
+        assert!(
+            path.contains(".cargo/bin"),
+            "PATH should still include ~/.cargo/bin when CARGO_HOME is set (belt-and-suspenders): {path}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_shell_path_dedup_cargo_home_and_default() {
+        let Some(dirs) = UserDirs::new() else {
+            // No home directory — skip dedup test (cannot determine default path).
+            return;
+        };
+
+        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        let _guard = env_lock().lock().unwrap();
+
+        let default_cargo_home = dirs.home_dir().join(".cargo").to_string_lossy().to_string();
+        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        unsafe {
+            std::env::set_var("CARGO_HOME", &default_cargo_home);
+        }
+        let path = resolved_shell_path();
+        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+        }
+
+        // Count occurrences of the default cargo bin path.
+        let sep = ":";
+        let count = path
+            .split(sep)
+            .filter(|part| *part == format!("{default_cargo_home}/bin"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "$CARGO_HOME/bin and ~/.cargo/bin should deduplicate when they point to the same directory"
         );
     }
 

@@ -8,9 +8,10 @@
 //! checkpoint all Turso databases → `exit(0)`.
 //!
 //! The cargo install path resolution uses `$CARGO_HOME` if set, else
-//! `~/.cargo/bin` via `directories::UserDirs`, matching the shell tool's PATH
-//! resolution at `src/tools/shell/mod.rs:145` — this ensures the self-updated
-//! binary is visible to the shell tool and the user's PATH.
+//! `~/.cargo/bin` via `directories::UserDirs` — this ensures the
+//! self-updated binary is visible to the shell tool and the user's PATH
+//! (the shell tool's `extra_shell_path_prefixes` includes both paths when
+//! they differ, so the single resolved path is always covered).
 //!
 //! The WAL checkpoint before `exit(0)` is critical: `std::process::exit(0)` bypasses
 //! all Rust destructors, so Turso connections are never properly closed. Without an
@@ -436,11 +437,11 @@ pub async fn execute_update() -> Result<()> {
     });
 
     // Resolve the cargo install bin path. Checks `$CARGO_HOME` first, then
-    // falls back to `~/.cargo/bin` via `directories::UserDirs`. Note: the
-    // shell tool at `src/tools/shell/mod.rs:145` unconditionally uses
-    // `UserDirs` without `$CARGO_HOME` — the additive `$CARGO_HOME` handling
-    // here is a superset that resolves correctly for users with a non-default
-    // `CARGO_HOME`, while matching the shell tool's resolution for all others.
+    // falls back to `~/.cargo/bin` via `directories::UserDirs`. Unlike the
+    // shell tool's `extra_shell_path_prefixes` (which adds both paths as a
+    // belt-and-suspenders measure), this function returns a single path —
+    // whichever is selected is guaranteed to be present in the shell PATH
+    // since `extra_shell_path_prefixes` includes both.
     let cargo_bin_path = resolve_cargo_bin_path();
 
     // 5. Run cargo build.
@@ -619,8 +620,8 @@ pub async fn notify_admin(message: &str, target: Option<&String>) {
 /// Resolution order:
 /// 1. `$CARGO_HOME/bin/mahbot{EXE_SUFFIX}` if `CARGO_HOME` environment variable is set.
 /// 2. `~/.cargo/bin/mahbot{EXE_SUFFIX}` using `directories::UserDirs`
-///    (matching the resolution used by the shell tool at
-///    `src/tools/shell/mod.rs:145`).
+///    (following the same resolution order as the shell tool's
+///    `extra_shell_path_prefixes`).
 /// 3. `None` — no home directory or cargo home available (extremely unusual,
 ///    e.g., containerized environments without a home dir).
 fn resolve_cargo_bin_path() -> Option<PathBuf> {
