@@ -561,49 +561,6 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Build a chat completions request payload shared by [`Provider::chat`] and [`Provider::stream_chat`].
-    #[allow(clippy::too_many_arguments)]
-    fn build_chat_request(
-        &self,
-        model: &str,
-        messages: Vec<NativeMessage>,
-        tools: Option<Vec<serde_json::Value>>,
-        stream: bool,
-        temperature: f64,
-        reasoning_effort: Option<&str>,
-        provider_order: Option<&str>,
-        provider_allow_fallbacks: Option<bool>,
-    ) -> ChatCompletionRequest {
-        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
-        let mut extra = serde_json::Map::new();
-
-        // Provider routing — per-request values only; no global fallback.
-        // If provider_order is present and non-empty, build the routing block.
-        if let Some(order) = provider_order
-            && let Some(routing) =
-                provider_routing_json(order, provider_allow_fallbacks.unwrap_or(false))
-        {
-            extra.insert("provider".to_string(), routing);
-        }
-
-        // Reasoning effort
-        if let Some(effort) = reasoning_effort.filter(|e| !e.is_empty()) {
-            extra.insert("reasoning_effort".to_string(), serde_json::json!(effort));
-        }
-
-        ChatCompletionRequest {
-            model: model.to_string(),
-            messages,
-            temperature,
-            max_tokens: 32000,
-            stream: Some(stream),
-            tool_stream: self.tool_stream_for_tools(has_tools),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-            extra,
-        }
-    }
-
     /// Build the HTTP request for both synchronous [`Provider::chat`] and streaming [`Provider::stream_chat`] calls.
     fn build_chat_request_raw(
         &self,
@@ -613,16 +570,40 @@ impl OpenAiCompatibleProvider {
         let native =
             Self::convert_messages_for_native(&request.messages, request.allow_image_parts);
         let tool_specs = Self::convert_tool_specs(request.tools.as_deref());
-        let payload = self.build_chat_request(
-            &request.model,
-            native,
-            tool_specs,
-            stream,
-            f64::from(request.temperature),
-            request.reasoning_effort.as_deref(),
-            request.provider_order.as_deref(),
-            request.provider_allow_fallbacks,
-        );
+
+        let has_tools = tool_specs.as_ref().is_some_and(|t| !t.is_empty());
+        let mut extra = serde_json::Map::new();
+
+        // Provider routing — per-request values only; no global fallback.
+        // If provider_order is present and non-empty, build the routing block.
+        if let Some(order) = &request.provider_order
+            && let Some(routing) =
+                provider_routing_json(order, request.provider_allow_fallbacks.unwrap_or(false))
+        {
+            extra.insert("provider".to_string(), routing);
+        }
+
+        // Reasoning effort
+        if let Some(effort) = request
+            .reasoning_effort
+            .as_deref()
+            .filter(|e| !e.is_empty())
+        {
+            extra.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+        }
+
+        let payload = ChatCompletionRequest {
+            model: request.model.clone(),
+            messages: native,
+            temperature: f64::from(request.temperature),
+            max_tokens: 32000,
+            stream: Some(stream),
+            tool_stream: self.tool_stream_for_tools(has_tools),
+            tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
+            tools: tool_specs,
+            extra,
+        };
+
         let url = ensure_chat_completions_url(&self.base_url);
         let builder = self.http_client().post(url).json(&payload);
         self.attach_auth_header(builder)
