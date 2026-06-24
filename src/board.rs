@@ -3776,7 +3776,8 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     /// Round-trip test that exercises ALL column-index constants in
     /// [`ticket_from_row`] by creating a ticket, setting every mutable field
-    /// via public API, then verifying every [`Ticket`] field survives the
+    /// via public API, then verifying every [`Ticket`] field (including
+    /// `pipeline_reservation` via its SQL `DEFAULT 0`) survives the
     /// SELECT → `ticket_from_row` deserialization path.
     ///
     /// Catches silent field mapping bugs where [`TICKET_COLUMNS`] column order
@@ -3870,6 +3871,10 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert!(
             !ticket.is_archived,
             "is_archived should be false before archiving",
+        );
+        assert!(
+            !ticket.pipeline_reservation,
+            "pipeline_reservation should be false for fresh ticket",
         );
 
         // ── Exercise is_archived i64→bool conversion ──────────────────
