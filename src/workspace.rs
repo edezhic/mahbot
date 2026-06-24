@@ -721,12 +721,12 @@ impl WorkspaceStorage {
     }
 
     /// Get a single context entry by workspace name and role.
-    pub async fn get_context(&self, workspace_name: &str, role: &str) -> Result<Option<String>> {
+    pub async fn get_context(&self, name: &str, role: &str) -> Result<Option<String>> {
         match self
             .conn
             .query_row(
                 "SELECT content FROM workspace_contexts WHERE workspace_name = ?1 AND role = ?2",
-                turso::params![workspace_name, role],
+                turso::params![name, role],
                 |row| row.get::<String>(0),
             )
             .await
@@ -738,13 +738,13 @@ impl WorkspaceStorage {
     }
 
     /// Upsert a single context entry for a workspace and role.
-    pub async fn set_context(&self, workspace_name: &str, role: &str, content: &str) -> Result<()> {
+    pub async fn set_context(&self, name: &str, role: &str, content: &str) -> Result<()> {
         let now = turso::now();
         self.conn
             .execute(
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(workspace_name, role) DO UPDATE SET content = excluded.content, created_at = excluded.created_at",
-                turso::params![workspace_name, role, content, now],
+                turso::params![name, role, content, now],
             )
             .await?;
         Ok(())
@@ -754,22 +754,18 @@ impl WorkspaceStorage {
 
     /// Save the current set of open editor tabs for a workspace.
     /// Replaces all existing records for this workspace.
-    pub async fn save_editor_tabs(
-        &self,
-        workspace_name: &str,
-        tabs: &[EditorTabRecord],
-    ) -> Result<()> {
+    pub async fn save_editor_tabs(&self, name: &str, tabs: &[EditorTabRecord]) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
             "DELETE FROM editor_tabs WHERE workspace_name = ?1",
-            turso::params![workspace_name],
+            turso::params![name],
         )
         .await?;
         for tab in tabs {
             tx.execute(
                 "INSERT INTO editor_tabs (workspace_name, file_path, tab_order, is_active, is_dirty, dirty_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 turso::params![
-                    workspace_name,
+                    name,
                     tab.file_path.clone(),
                     i64::try_from(tab.tab_order).unwrap_or(i64::MAX),
                     i64::from(tab.is_active),
@@ -784,11 +780,11 @@ impl WorkspaceStorage {
     }
 
     /// Load the saved open editor tabs for a workspace.
-    pub async fn load_editor_tabs(&self, workspace_name: &str) -> Result<Vec<EditorTabRecord>> {
+    pub async fn load_editor_tabs(&self, name: &str) -> Result<Vec<EditorTabRecord>> {
         let rows = self.conn
             .query_map(
                 "SELECT file_path, tab_order, is_active, is_dirty, dirty_content FROM editor_tabs WHERE workspace_name = ?1 ORDER BY tab_order",
-                turso::params![workspace_name],
+                turso::params![name],
                 |row| -> std::result::Result<EditorTabRecord, String> {
                     Ok(EditorTabRecord {
                         file_path: row.get::<String>(0).unwrap_or_default(),
@@ -805,7 +801,7 @@ impl WorkspaceStorage {
             let tab = row.map_err(|e| anyhow::anyhow!("Failed to parse editor tab row: {e}"))?;
             if tab.file_path.is_empty() || tab.file_path.trim().is_empty() {
                 warn!(
-                    workspace = %workspace_name,
+                    workspace = %name,
                     tab_order = tab.tab_order,
                     "Skipping editor tab with empty file_path — would resolve to workspace root"
                 );
