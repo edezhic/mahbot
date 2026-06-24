@@ -142,6 +142,10 @@ pub enum HomeMessage {
     WorkspacePicked(String),
     /// Clear chat button pressed — reset session and display.
     ClearChat,
+    /// Chat history cleared successfully — number of rows deleted.
+    ChatCleared(u64),
+    /// Chat history clear failed.
+    ChatClearError(String),
     /// Toast notification to show via Dashboard.
     /// Intercepted by Dashboard; never reaches Home's own update handler.
     Toast(ToastMessage),
@@ -990,7 +994,7 @@ impl HomeState {
                 self.typing_tick_state = 0;
                 self.reset_pagination_state();
 
-                // Build session key and spawn async cleanup.
+                // Build session key and schedule async cleanup.
                 let sender = match &self.selected_user {
                     Some(s) => s.clone(),
                     None => return Task::none(),
@@ -998,32 +1002,50 @@ impl HomeState {
                 let Some(ws) = self.resolve_workspace_name() else {
                     return Task::none();
                 };
-                tokio::spawn(async move {
-                    // Look up the user's active role from DB (set via the Users page).
-                    let role = crate::users::get_active_role(&sender)
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "manager".to_string());
-                    // Clear the session.
-                    let session_key = if role == "manager" {
-                        crate::session::manager_session_key(&ws)
-                    } else {
-                        crate::session::direct_session_key("gui", &sender, &role, &ws)
-                    };
-                    crate::session::Session::reset(&session_key).await;
-                    // Clear chat history so refresh_history doesn't reload old messages.
-                    let store = crate::chat_history::store();
-                    if let Err(e) = store.delete_for_user(&sender, &ws).await {
-                        tracing::warn!(
-                            user = %sender,
-                            workspace = %ws,
-                            error = %e,
-                            "Home: failed to delete chat history for user"
-                        );
-                    }
-                });
-                Task::none()
+                Task::perform(
+                    async move {
+                        // Look up the user's active role from DB (set via the Users page).
+                        let role = crate::users::get_active_role(&sender)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| Role::Manager.as_str().to_string());
+                        // Clear the session.
+                        let session_key = if role == Role::Manager.as_str() {
+                            crate::session::manager_session_key(&ws)
+                        } else {
+                            crate::session::direct_session_key("gui", &sender, &role, &ws)
+                        };
+                        let _ = crate::session::Session::reset(&session_key).await;
+                        // Clear chat history so refresh_history doesn't reload old messages.
+                        let store = crate::chat_history::store();
+                        match store.delete_for_user(&sender, &ws).await {
+                            Ok(n) => Ok(n),
+                            Err(e) => {
+                                tracing::warn!(
+                                    user = %sender,
+                                    workspace = %ws,
+                                    error = %e,
+                                    "Home: failed to delete chat history for user"
+                                );
+                                Err(e.to_string())
+                            }
+                        }
+                    },
+                    |result| match result {
+                        Ok(n) => HomeMessage::ChatCleared(n),
+                        Err(e) => HomeMessage::ChatClearError(e),
+                    },
+                )
+            }
+            HomeMessage::ChatCleared(n) if n > 0 => Task::done(HomeMessage::Toast(
+                ToastMessage::SuccessMsg(format!("Cleared {n} message(s)")),
+            )),
+            HomeMessage::ChatCleared(_) => Task::done(HomeMessage::Toast(ToastMessage::Warning(
+                "No messages found to clear".to_string(),
+            ))),
+            HomeMessage::ChatClearError(e) => {
+                Task::done(HomeMessage::Toast(ToastMessage::Error(e)))
             }
             HomeMessage::ChatEvent(event) => match event {
                 crate::ChatEvent::Message {
