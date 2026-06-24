@@ -9,7 +9,7 @@ use crate::Role;
 use crate::chat_history::ChatHistoryEntry;
 use futures_util::SinkExt;
 use iced::widget::{
-    Column, Id, Space, button, column, container, row, scrollable, text, text_editor,
+    Column, Id, Space, button, column, container, row, scrollable, stack, text, text_editor,
 };
 use iced::{Alignment, Element, Length, Task, keyboard};
 use iced_fonts::lucide;
@@ -680,22 +680,23 @@ impl HomeState {
             });
 
         let send_btn = button(
-            container(
-                lucide::send::<iced::Theme, iced::Renderer>()
-                    .size(14)
-                    .color(theme::BG_BASE),
-            )
-            .padding([4, 8]),
+            lucide::send::<iced::Theme, iced::Renderer>()
+                .size(14)
+                .color(if self.sending {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::ACCENT
+                }),
         )
-        .style(move |_t: &iced::Theme, _status| {
+        .style(move |_t: &iced::Theme, status| {
             use iced::widget::button;
-            let base = if self.sending {
-                theme::TEXT_MUTED
-            } else {
-                theme::ACCENT
+            let bg = match status {
+                button::Status::Hovered => theme::HOVER_STRONG,
+                button::Status::Pressed => theme::ACCENT_DIM,
+                _ => iced::Color::TRANSPARENT,
             };
             button::Style {
-                background: Some(iced::Background::Color(base)),
+                background: Some(iced::Background::Color(bg)),
                 border: iced::Border {
                     radius: 6.0.into(),
                     width: 0.0,
@@ -708,35 +709,39 @@ impl HomeState {
             None
         } else {
             Some(HomeMessage::SendMessage)
+        })
+        .padding(4);
+
+        // Stack the editor with the send button overlaid at bottom-right
+        let input_area = container(stack([
+            input_editor.into(),
+            container(send_btn)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::End)
+                .align_y(Alignment::End)
+                .padding(iced::Padding::default().right(8.0).bottom(8.0))
+                .into(),
+        ]))
+        .padding(8)
+        .style(|_theme: &iced::Theme| {
+            use iced::widget::container;
+            container::Style {
+                background: Some(iced::Background::Color(theme::BG_BASE)),
+                border: iced::Border {
+                    radius: 0.0.into(),
+                    width: 0.0,
+                    color: theme::BORDER,
+                },
+                ..container::Style::default()
+            }
         });
 
-        let input_row = row![
-            container(input_editor).width(Length::Fill),
-            Space::new().width(4),
-            send_btn,
-        ]
-        .align_y(Alignment::End)
-        .padding(8);
-
         // ── Full layout ──────────────────────────────────────────
-        column![
-            chat_area,
-            container(input_row).style(|_theme: &iced::Theme| {
-                use iced::widget::container;
-                container::Style {
-                    background: Some(iced::Background::Color(theme::BG_BASE)),
-                    border: iced::Border {
-                        radius: 0.0.into(),
-                        width: 0.0,
-                        color: theme::BORDER,
-                    },
-                    ..container::Style::default()
-                }
-            }),
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        column![chat_area, input_area,]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     pub fn subscription(&self) -> iced::Subscription<HomeMessage> {
