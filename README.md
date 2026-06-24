@@ -6,20 +6,22 @@ Mahbot packages the best agentic engineering practices into one system: role sep
 
 ## Getting Started
 
-Two ways to start using MahBot:
+Currently there are two ways to start using mahbot:
 
-**Build from source** (works today — recommended for contributors or to try the latest changes):
+**Install from crates.io**:
+
+```bash
+cargo install mahbot
+```
+
+OR
+
+**Build from source**:
 
 ```bash
 git clone https://github.com/edezhic/mahbot
 cd mahbot
 cargo run --release
-```
-
-**Install from crates.io** (coming soon — once published):
-
-```bash
-cargo install mahbot
 ```
 
 Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**.
