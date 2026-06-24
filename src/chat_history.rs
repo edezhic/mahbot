@@ -7,7 +7,7 @@
 
 use crate::ChatDirection;
 use crate::global_store;
-use crate::turso::{self, Connection};
+use crate::turso::{self, Connection, Row};
 use anyhow::Result;
 use std::path::Path;
 
@@ -54,6 +54,53 @@ pub struct ChatHistoryEntry {
 
 /// Maximum number of history entries to load at once.
 const HISTORY_LIMIT: i64 = 100;
+
+/// Column list for chat history SELECT queries.
+///
+/// The column order here must match the positional indices defined in
+/// [`COL_CH_ID`] through [`COL_CH_WORKSPACE`], which are used in
+/// [`entry_from_row`].
+///
+/// Note: The column order differs from the schema declaration order
+/// (id, message_id, user_name, channel, role, direction, content,
+/// agent_role, workspace, created_at). This ad-hoc ordering predates
+/// named constants and must be preserved to avoid silent column swaps.
+const CHAT_HISTORY_COLUMNS: &str = "id, message_id, user_name, content, direction, agent_role, \
+     created_at, workspace";
+
+/// Column-index constants for [`CHAT_HISTORY_COLUMNS`].
+///
+/// These replace hardcoded positional indices in [`entry_from_row`].
+/// With named constants, the compiler catches references to undefined
+/// column constants — for instance, removing a constant but forgetting to
+/// update a `row.get()` call produces a compile error rather than a silent
+/// field mapping bug.
+const COL_CH_ID: usize = 0;
+const COL_CH_MESSAGE_ID: usize = 1;
+const COL_CH_USER_NAME: usize = 2;
+const COL_CH_CONTENT: usize = 3;
+const COL_CH_DIRECTION: usize = 4;
+const COL_CH_AGENT_ROLE: usize = 5;
+const COL_CH_CREATED_AT: usize = 6;
+const COL_CH_WORKSPACE: usize = 7;
+
+/// Convert a database row to a [`ChatHistoryEntry`] using the column-index
+/// constants from [`CHAT_HISTORY_COLUMNS`].
+fn entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
+    Ok(ChatHistoryEntry {
+        id: row.get::<i64>(COL_CH_ID)?,
+        message_id: row.get::<String>(COL_CH_MESSAGE_ID)?,
+        user_name: row.get::<String>(COL_CH_USER_NAME)?,
+        content: row.get::<String>(COL_CH_CONTENT)?,
+        direction: match row.get::<String>(COL_CH_DIRECTION)?.as_str() {
+            "agent" => ChatDirection::Agent,
+            _ => ChatDirection::User,
+        },
+        agent_role: row.get::<Option<String>>(COL_CH_AGENT_ROLE)?,
+        created_at: row.get::<String>(COL_CH_CREATED_AT)?,
+        workspace: row.get::<String>(COL_CH_WORKSPACE)?,
+    })
+}
 
 /// Turso-backed chat history storage.
 #[derive(Clone, Debug)]
@@ -114,30 +161,19 @@ impl ChatHistoryStore {
         let rows = self
             .conn
             .query(
-                "SELECT id, message_id, user_name, content, direction, agent_role, \
-                 created_at, workspace \
-                 FROM chat_history \
-                 WHERE user_name = ?1 AND workspace = ?2 \
-                 ORDER BY id DESC \
-                 LIMIT ?3",
+                &format!(
+                    "SELECT {CHAT_HISTORY_COLUMNS} \
+                     FROM chat_history \
+                     WHERE user_name = ?1 AND workspace = ?2 \
+                     ORDER BY id DESC \
+                     LIMIT ?3",
+                ),
                 turso::params![user_name, workspace, HISTORY_LIMIT],
             )
             .await?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(ChatHistoryEntry {
-                id: row.get::<i64>(0)?,
-                message_id: row.get::<String>(1)?,
-                user_name: row.get::<String>(2)?,
-                content: row.get::<String>(3)?,
-                direction: match row.get::<String>(4)?.as_str() {
-                    "agent" => ChatDirection::Agent,
-                    _ => ChatDirection::User,
-                },
-                agent_role: row.get::<Option<String>>(5)?,
-                created_at: row.get::<String>(6)?,
-                workspace: row.get::<String>(7)?,
-            });
+            entries.push(entry_from_row(&row)?);
         }
         entries.reverse();
         Ok(entries)
@@ -156,30 +192,19 @@ impl ChatHistoryStore {
         let rows = self
             .conn
             .query(
-                "SELECT id, message_id, user_name, content, direction, agent_role, \
-                 created_at, workspace \
-                 FROM chat_history \
-                 WHERE user_name = ?1 AND workspace = ?2 AND id < ?3 \
-                 ORDER BY id DESC \
-                 LIMIT ?4",
+                &format!(
+                    "SELECT {CHAT_HISTORY_COLUMNS} \
+                     FROM chat_history \
+                     WHERE user_name = ?1 AND workspace = ?2 AND id < ?3 \
+                     ORDER BY id DESC \
+                     LIMIT ?4",
+                ),
                 turso::params![user_name, workspace, before_id, limit],
             )
             .await?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(ChatHistoryEntry {
-                id: row.get::<i64>(0)?,
-                message_id: row.get::<String>(1)?,
-                user_name: row.get::<String>(2)?,
-                content: row.get::<String>(3)?,
-                direction: match row.get::<String>(4)?.as_str() {
-                    "agent" => ChatDirection::Agent,
-                    _ => ChatDirection::User,
-                },
-                agent_role: row.get::<Option<String>>(5)?,
-                created_at: row.get::<String>(6)?,
-                workspace: row.get::<String>(7)?,
-            });
+            entries.push(entry_from_row(&row)?);
         }
         // Reverse for chronological display order.
         entries.reverse();
