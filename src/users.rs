@@ -283,6 +283,18 @@ impl UserStorage {
         Ok(bindings)
     }
 
+    /// Convert a `users` table row into a [`UserRecord`], loading channel bindings.
+    async fn user_record_from_row(&self, row: &turso::Row) -> Result<UserRecord> {
+        let name: String = row.get(0)?;
+        Ok(UserRecord {
+            name: name.clone(),
+            permissions: row.get::<Option<String>>(1)?,
+            selected_workspace: row.get::<Option<String>>(2)?,
+            selected_role: row.get::<Option<String>>(3)?,
+            channels: self.get_user_channels(&name).await.unwrap_or_default(),
+        })
+    }
+
     // ── Lookup / listing ──────────────────────────────────────
 
     /// Find all users whose `selected_workspace` matches the given name
@@ -298,14 +310,7 @@ impl UserStorage {
             .await?;
         let mut users = Vec::new();
         for row in rows {
-            let name: String = row.get(0)?;
-            users.push(UserRecord {
-                name: name.clone(),
-                permissions: row.get::<Option<String>>(1)?,
-                selected_workspace: row.get::<Option<String>>(2)?,
-                selected_role: row.get::<Option<String>>(3)?,
-                channels: self.get_user_channels(&name).await.unwrap_or_default(),
-            });
+            users.push(self.user_record_from_row(&row).await?);
         }
         Ok(users)
     }
@@ -321,14 +326,7 @@ impl UserStorage {
             .await?;
         let mut users = Vec::new();
         for row in rows {
-            let name: String = row.get(0)?;
-            users.push(UserRecord {
-                name: name.clone(),
-                permissions: row.get::<Option<String>>(1)?,
-                selected_workspace: row.get::<Option<String>>(2)?,
-                selected_role: row.get::<Option<String>>(3)?,
-                channels: self.get_user_channels(&name).await.unwrap_or_default(),
-            });
+            users.push(self.user_record_from_row(&row).await?);
         }
         Ok(users)
     }
