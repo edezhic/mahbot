@@ -7456,6 +7456,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn test_find_replace_cursor_after_last_match_removed() {
         let mut state = make_editor_with_single_tab("ab");
         let path = "/test.rs".to_string();

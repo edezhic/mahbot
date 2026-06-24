@@ -1036,6 +1036,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_gutter_column_positions_are_right_edges() {
         let width = gutter_width_from_digits(3);
         let (old_right, new_right) = gutter_column_right_edges(10.0, 8.0, width);

@@ -748,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_routing_configs_duplicate_key_returns_err() {
-        let (store, _dir) = setup().await;
+        let (store, dir) = setup().await;
 
         // Open a second connection *before* any transaction starts on the
         // first one, so the schema DDL write can complete without lock
@@ -756,7 +756,7 @@ mod tests {
         // separate connection never sees uncommitted changes from another
         // connection, reading from `second` after a failed transaction proves
         // that no durable trace was left.
-        let second = ConfigStore::open(_dir.path()).await.unwrap();
+        let second = ConfigStore::open(dir.path()).await.unwrap();
 
         // Pre-populate with known data.
         let mut original_roles = vec![

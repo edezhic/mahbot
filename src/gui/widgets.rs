@@ -611,8 +611,8 @@ mod tests {
     #[test]
     fn guide_prefix_mask_ignores_bits_above_depth() {
         // Bits beyond depth should be ignored. depth=1 with high bits set.
-        assert_eq!(tree_guide_prefix(0b_1_0000_0000, 1, false), g("├ "));
-        assert_eq!(tree_guide_prefix(0b_1_0000_0000, 1, true), g("└ "));
+        assert_eq!(tree_guide_prefix(0b1_0000_0000, 1, false), g("├ "));
+        assert_eq!(tree_guide_prefix(0b1_0000_0000, 1, true), g("└ "));
     }
 
     #[test]

@@ -2649,8 +2649,8 @@ mod tests {
             );
             if let (Some(head), Some(tail), Some(max)) = (p.head_lines, p.tail_lines, p.max_lines) {
                 assert!(
-                    head + tail + 1 <= max,
-                    "head+tail+1 ({head}+{tail}+1) should not exceed max_lines ({max}) — omission marker would overflow"
+                    head + tail < max,
+                    "head+tail ({head}+{tail}) should be strictly less than max_lines ({max}) — omission marker would overflow"
                 );
             }
         }

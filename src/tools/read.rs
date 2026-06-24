@@ -1507,13 +1507,13 @@ mod utils;
     #[tokio::test]
     async fn collect_symbols_multiple_captures() {
         // A Rust file with various symbol types
-        let code = r#"
+        let code = r"
 fn foo() {}
 fn bar() {}
 struct Baz;
 enum Qux {}
 impl Baz {}
-"#;
+";
         let (_dir, ws_path) = temp_workspace(&[("main.rs", code)]);
         let file_path = ws_path.join("main.rs");
 
