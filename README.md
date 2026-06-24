@@ -4,6 +4,28 @@ Mahbot is an autonomous agentic engineering system built for **reliable developm
 
 Mahbot packages the best agentic engineering practices into one system: role separation, subagents, persistent state, deterministic diagnostics, independent review and QA, and automatic dev loops when validation fails. It is designed to make inexpensive open-weight and API models useful through structure—not to depend on opaque usage pools or a single expensive model doing everything. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot now works on it's own codebase 24/7, spawns >1000 agents every day and this costs only about 10-15$/day.
 
+## Getting Started
+
+Two ways to start using MahBot:
+
+**Build from source** (works today — recommended for contributors or to try the latest changes):
+
+```bash
+git clone https://github.com/edezhic/mahbot
+cd mahbot
+cargo run --release
+```
+
+**Install from crates.io** (coming soon — once published):
+
+```bash
+cargo install mahbot
+```
+
+Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**.
+
+OpenRouter API key and an optional [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI are needed for full functionality — see [Prerequisites](#prerequisites) below.
+
 ## Why not just Claude Code, Codex, Pi or Cursor?
 
 Most coding assistants optimize for **interactive pair programming**: you prompt, the model edits, you review. That works for focused tasks, but autonomous work tends to drift into low-level implementation details, skip verification, or hit subscription limits when agents run for hours. 
