@@ -4745,8 +4745,10 @@ impl EditorState {
         extra_context_items: Vec<(String, EditorMessage)>,
         full_path: &str,
     ) -> Element<'a, EditorMessage> {
-        let guide_text: Element<'a, EditorMessage> =
-            text(guide).size(12).color(theme::TEXT_MUTED).into();
+        let guide_text: Element<'a, EditorMessage> = text(guide)
+            .size(widgets::TREE_FONT_SIZE)
+            .color(theme::TEXT_MUTED)
+            .into();
 
         let row = row![
             guide_text,
@@ -4847,10 +4849,15 @@ impl EditorState {
 
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
 
-        let icon_element: Element<'_, EditorMessage> = icon.size(13).color(icon_color).into();
-        let name_element: Element<'_, EditorMessage> = self
-            .build_rename_input(node)
-            .unwrap_or_else(|| text(label_text).size(12).color(label_color).into());
+        let icon_element: Element<'_, EditorMessage> =
+            icon.size(widgets::TREE_ICON_SIZE).color(icon_color).into();
+        let name_element: Element<'_, EditorMessage> =
+            self.build_rename_input(node).unwrap_or_else(|| {
+                text(label_text)
+                    .size(widgets::TREE_FONT_SIZE)
+                    .color(label_color)
+                    .into()
+            });
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
         let ctx_menu = self.render_tree_node_row(
@@ -4941,7 +4948,7 @@ impl EditorState {
                 if node.error.is_some() {
                     row![
                         text(&node.name)
-                            .size(12)
+                            .size(widgets::TREE_FONT_SIZE)
                             .color(name_color)
                             .font(iced::Font {
                                 weight: name_weight,
@@ -4954,7 +4961,7 @@ impl EditorState {
                     .into()
                 } else {
                     text(&node.name)
-                        .size(12)
+                        .size(widgets::TREE_FONT_SIZE)
                         .color(name_color)
                         .font(iced::Font {
                             weight: name_weight,
@@ -4966,7 +4973,8 @@ impl EditorState {
 
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
 
-        let icon_element: Element<'_, EditorMessage> = icon.size(12).color(icon_color).into();
+        let icon_element: Element<'_, EditorMessage> =
+            icon.size(widgets::TREE_FONT_SIZE).color(icon_color).into();
 
         self.render_tree_node_row(
             guide,

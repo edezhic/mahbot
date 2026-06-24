@@ -259,8 +259,16 @@ impl FileTree {
     }
 }
 
+/// Font size for file tree item labels and connector guides.
+pub const TREE_FONT_SIZE: f32 = 14.0;
+
+/// Icon size for directory nodes in the file tree (slightly larger than
+/// [`TREE_FONT_SIZE`] to compensate for lucide icons appearing smaller
+/// at the same nominal point size).
+pub const TREE_ICON_SIZE: f32 = 15.0;
+
 /// Estimated height per tree row for scroll-into-view on keyboard navigation.
-pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = 16.0;
+pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = 20.0;
 
 /// Scroll the tree panel to bring the focused row into view.
 #[allow(clippy::cast_precision_loss)]

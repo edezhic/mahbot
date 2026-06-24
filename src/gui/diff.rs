@@ -907,14 +907,18 @@ impl DiffState {
         };
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
-        let guide_text: Element<'_, DiffMessage> =
-            text(guide).size(12).color(theme::TEXT_MUTED).into();
+        let guide_text: Element<'_, DiffMessage> = text(guide)
+            .size(widgets::TREE_FONT_SIZE)
+            .color(theme::TEXT_MUTED)
+            .into();
 
         let header_row = row![
             guide_text,
-            icon.size(13).color(icon_color),
+            icon.size(widgets::TREE_ICON_SIZE).color(icon_color),
             Space::new().width(4),
-            text(&node.name).size(12).color(theme::TEXT_SECONDARY),
+            text(&node.name)
+                .size(widgets::TREE_FONT_SIZE)
+                .color(theme::TEXT_SECONDARY),
             Space::new().width(Length::Fill),
         ]
         .align_y(Alignment::Center)
@@ -972,8 +976,10 @@ impl DiffState {
         let is_selected = self.selected_file.as_deref() == Some(&node.full_path);
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
-        let guide_text: Element<'_, DiffMessage> =
-            text(guide).size(12).color(theme::TEXT_MUTED).into();
+        let guide_text: Element<'_, DiffMessage> = text(guide)
+            .size(widgets::TREE_FONT_SIZE)
+            .color(theme::TEXT_MUTED)
+            .into();
 
         // File status icon
         let (icon, icon_color) = if let Some(f) = file {
@@ -1041,10 +1047,10 @@ impl DiffState {
 
         let btn_row = row![
             guide_text,
-            icon.size(12).color(icon_color),
+            icon.size(widgets::TREE_FONT_SIZE).color(icon_color),
             Space::new().width(4),
             text(&node.name)
-                .size(12)
+                .size(widgets::TREE_FONT_SIZE)
                 .color(name_color)
                 .font(iced::Font {
                     weight: name_weight,
