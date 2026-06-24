@@ -88,7 +88,7 @@ USING fts (title) WITH (tokenizer = 'ngram')";
 /// Column list for ticket SELECT/RETURNING queries.
 ///
 /// The column order here must match the positional indices defined in
-/// [`COL_TICKET_ID`] through [`COL_TICKET_IS_ARCHIVED`], which are used in
+/// [`COL_TICKET_ID`] through [`COL_TICKET_PIPELINE_RESERVATION`], which are used in
 /// [`BoardStore::ticket_from_row`].
 const TICKET_COLUMNS: &str = "id, title, description, status, assigned_to, \
      workspace_name, created_at, updated_at, prerequisites, supersedes, \
