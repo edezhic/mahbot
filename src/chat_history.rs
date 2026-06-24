@@ -61,8 +61,10 @@ const HISTORY_LIMIT: i64 = 100;
 ///
 /// Note: The column order differs from the schema declaration order
 /// (id, message_id, user_name, channel, role, direction, content,
-/// agent_role, workspace, created_at). This ad-hoc ordering predates
-/// named constants and must be preserved to avoid silent column swaps.
+/// agent_role, workspace, created_at). The `COL_CH_*` constants are
+/// the source of truth for field mapping; the
+/// [`chat_history_columns_count_matches_column_constants`] test
+/// catches count drift.
 const CHAT_HISTORY_COLUMNS: &str = "id, message_id, user_name, content, direction, agent_role, \
      created_at, workspace";
 
