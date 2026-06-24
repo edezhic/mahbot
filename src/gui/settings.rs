@@ -796,12 +796,12 @@ impl SettingsState {
                 let ws_row = container(
                     column![
                         row![
-                            // Name column - 15%
+                            // Name column (FillPortion: 15)
                             container(text(&ws_item.name).size(14).color(theme::TEXT_PRIMARY))
                                 .width(Length::FillPortion(15))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
-                            // Status column - 10%
+                            // Status column (FillPortion: 10)
                             container(
                                 container(text(&ws_item.status).size(11).color(status_color))
                                     .padding([2, 8])
@@ -817,12 +817,12 @@ impl SettingsState {
                             .width(Length::FillPortion(10))
                             .align_x(Alignment::Start)
                             .align_y(Alignment::Center),
-                            // Path column - 35%
+                            // Path column (FillPortion: 35)
                             container(text(&ws_item.path).size(12).color(theme::TEXT_MUTED))
                                 .width(Length::FillPortion(35))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
-                            // Agent icons column - 25%
+                            // Agent icons column (FillPortion: 25)
                             {
                                 let mut role_btns = Row::new().spacing(2);
                                 for role in <crate::Role as strum::IntoEnumIterator>::iter()
@@ -846,7 +846,7 @@ impl SettingsState {
                                     .align_x(Alignment::Start)
                                     .align_y(Alignment::Center)
                             },
-                            // Actions column - 15%
+                            // Actions column (FillPortion: 15)
                             container(
                                 row![
                                     // Maintainer toggle
@@ -1173,7 +1173,7 @@ impl SettingsState {
                 let user_row = container(
                     column![
                         row![
-                            // Name + permissions column - 15%
+                            // Name + permissions column (FillPortion: 20)
                             {
                                 let user_elem: Element<'_, SettingsMessage> = if let Some(p) =
                                     user.permissions.as_deref().filter(|p| !p.is_empty())
@@ -1189,11 +1189,11 @@ impl SettingsState {
                                     text(&user.name).size(14).color(theme::TEXT_PRIMARY).into()
                                 };
                                 container(user_elem)
-                                    .width(Length::FillPortion(15))
+                                    .width(Length::FillPortion(20))
                                     .align_x(Alignment::Start)
                                     .align_y(Alignment::Center)
                             },
-                            // Workspace column - 20%
+                            // Workspace column (FillPortion: 20)
                             {
                                 let ws_value = user.selected_workspace.as_deref().unwrap_or("");
                                 let ws_selected = us
@@ -1216,13 +1216,13 @@ impl SettingsState {
                                     )
                                     .style(widgets::pick_list_style)
                                     .padding([4, 8])
-                                    .width(Length::Fill),
+                                    .width(Length::Fixed(200.0)),
                                 )
                                 .width(Length::FillPortion(20))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center)
                             },
-                            // Role column - 15%
+                            // Role column (FillPortion: 15)
                             {
                                 let role_selected = user
                                     .selected_role
@@ -1240,13 +1240,13 @@ impl SettingsState {
                                     })
                                     .style(widgets::pick_list_style)
                                     .padding([4, 8])
-                                    .width(Length::Fill),
+                                    .width(Length::Fixed(200.0)),
                                 )
                                 .width(Length::FillPortion(15))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center)
                             },
-                            // Actions column - 50% (switch icon + delete)
+                            // Actions column (FillPortion: 50) — switch icon + delete
                             container({
                                 let mut actions = Row::new().align_y(Alignment::Center);
                                 actions = actions.push(switch_icon);
