@@ -15,8 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{
@@ -1915,13 +1914,28 @@ impl EditorState {
         )
     }
 
-    /// Switch to the tab at `new_idx`, updating active index and scrolling.
-    fn switch_to_tab(&mut self, new_idx: usize) -> Task<EditorMessage> {
+    /// Scroll to the tab at `new_idx` without saving tabs.
+    /// Sets the active index and scrolls the tab bar, but does not persist.
+    fn scroll_to_tab(&mut self, new_idx: usize) -> Task<EditorMessage> {
         if new_idx >= self.tabs.len() {
             return Task::none();
         }
         self.active_tab_index = new_idx;
         self.scroll_to_active_tab()
+    }
+
+    /// Switch to the tab at `idx`, updating active index, scrolling, and
+    /// persisting the tab list to the database.
+    fn switch_to_tab(&mut self, idx: usize) -> Task<EditorMessage> {
+        if idx >= self.tabs.len() {
+            return Task::none();
+        }
+        self.active_tab_index = idx;
+        let mut tasks = vec![self.scroll_to_active_tab()];
+        if let Some(save_task) = self.save_current_tabs() {
+            tasks.push(save_task);
+        }
+        Task::batch(tasks)
     }
 
     /// Collect all file paths from the workspace's directory entries for
@@ -1992,7 +2006,7 @@ impl EditorState {
 
         // If already open, just switch to that tab.
         if let Some(existing_idx) = self.tabs.iter().position(|t| t.path == abs_path) {
-            return self.switch_to_tab(existing_idx);
+            return self.scroll_to_tab(existing_idx);
         }
 
         // Mark tree as not focused when a file is opened.
@@ -2249,13 +2263,7 @@ impl EditorState {
                 let abs_path = Path::new(ws).join(&path).to_string_lossy().to_string();
 
                 if let Some(pos) = self.tabs.iter().position(|t| t.path == abs_path) {
-                    self.active_tab_index = pos;
-                    let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-                    tasks.push(self.scroll_to_active_tab());
-                    if let Some(save_task) = self.save_current_tabs() {
-                        tasks.push(save_task);
-                    }
-                    return Task::batch(tasks);
+                    return self.switch_to_tab(pos);
                 }
 
                 // Per-file generation: keyed by absolute path.
@@ -2285,19 +2293,7 @@ impl EditorState {
                 result,
             } => self.file_loaded(&path, r#gen, result),
 
-            EditorMessage::TabSelected(idx) => {
-                if idx < self.tabs.len() {
-                    self.active_tab_index = idx;
-                    let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-                    tasks.push(self.scroll_to_active_tab());
-                    if let Some(save_task) = self.save_current_tabs() {
-                        tasks.push(save_task);
-                    }
-                    Task::batch(tasks)
-                } else {
-                    Task::none()
-                }
-            }
+            EditorMessage::TabSelected(idx) => self.switch_to_tab(idx),
 
             EditorMessage::TabClosed(idx) => self.close_tab_at(idx),
 
@@ -3082,7 +3078,7 @@ impl EditorState {
                 }
                 if self.tabs.len() > 1 {
                     let new_idx = (self.active_tab_index + 1) % self.tabs.len();
-                    return self.switch_to_tab(new_idx);
+                    return self.scroll_to_tab(new_idx);
                 }
                 Task::none()
             }
@@ -3097,7 +3093,7 @@ impl EditorState {
                     } else {
                         self.active_tab_index - 1
                     };
-                    return self.switch_to_tab(new_idx);
+                    return self.scroll_to_tab(new_idx);
                 }
                 Task::none()
             }
