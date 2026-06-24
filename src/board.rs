@@ -2870,6 +2870,16 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_archive_stale_cancelled() {
         let (store, _tmp) = open_test_store().await;
+
+        // Empty DB returns 0
+        {
+            let count = store
+                .archive_stale_cancelled(1)
+                .await
+                .expect("archive_stale_cancelled");
+            assert_eq!(count, 0, "Empty DB should return 0");
+        }
+
         let ws = test_ws_named("/ws", "ws");
 
         // Ticket 1: cancelled, old (2h) → should be archived
@@ -2973,19 +2983,18 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     #[tokio::test]
-    async fn test_archive_stale_cancelled_empty_db() {
-        let (store, _tmp) = open_test_store().await;
-
-        let count = store
-            .archive_stale_cancelled(1)
-            .await
-            .expect("archive_stale_cancelled");
-        assert_eq!(count, 0, "Empty DB should return 0");
-    }
-
-    #[tokio::test]
     async fn test_archive_all_done_and_cancelled() {
         let (store, _tmp) = open_test_store().await;
+
+        // Empty DB returns 0
+        {
+            let count = store
+                .archive_all_done_and_cancelled(None)
+                .await
+                .expect("archive_all_done_and_cancelled");
+            assert_eq!(count, 0, "Empty DB should return 0");
+        }
+
         let ws = test_ws_named("/ws", "ws");
 
         // Create three tickets: one Done, one Cancelled, one Backlog.
@@ -3054,17 +3063,6 @@ with a comment explaining why no agent is mid-execution in that state.\
             "Backlog ticket should NOT be archived"
         );
         assert_eq!(backlog_ticket.status, TicketPhase::Backlog);
-    }
-
-    #[tokio::test]
-    async fn test_archive_all_done_and_cancelled_empty_db() {
-        let (store, _tmp) = open_test_store().await;
-
-        let count = store
-            .archive_all_done_and_cancelled(None)
-            .await
-            .expect("archive_all_done_and_cancelled");
-        assert_eq!(count, 0, "Empty DB should return 0");
     }
 
     #[tokio::test]
@@ -3944,13 +3942,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
     }
 
-    #[tokio::test]
-    async fn test_list_archived_with_embeddings_empty_when_no_tickets() {
-        let (store, _tmp) = open_test_store().await;
-        let candidates = store.list_archived_with_embeddings().await.expect("list");
-        assert!(candidates.is_empty(), "no tickets at all");
-    }
-
     /// Tests for `list_tickets_minimal`: found by ID, nonexistent IDs omitted,
     /// empty-ids early-return guard, and input order preservation.
     #[tokio::test]
@@ -4286,6 +4277,13 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_list_archived_with_embeddings_returns_deserialized() {
         let (store, _tmp) = open_test_store().await;
+
+        // Empty DB returns empty
+        {
+            let candidates = store.list_archived_with_embeddings().await.expect("list");
+            assert!(candidates.is_empty(), "no tickets at all");
+        }
+
         let ws = test_ws("ws");
 
         // Create a ticket with a known embedding blob (two small f32s)
