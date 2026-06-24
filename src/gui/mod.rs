@@ -415,6 +415,9 @@ impl Dashboard {
             Message::Navigation(_) if !self.ready => Task::none(),
             Message::Navigation(page) => {
                 self.page = page;
+                // Notify sessions state when navigating to/from Sessions page
+                // so the auto-refresh timer starts/stops accordingly.
+                self.sessions_state.set_page_active(page == Page::Sessions);
                 match page {
                     Page::Logs => Task::none(),
                     Page::Home => {

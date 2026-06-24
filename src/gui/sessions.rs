@@ -3,7 +3,7 @@
 use crate::ChatMessage;
 use crate::session::{DecodedNativeHistoryMessage, SessionMetadata, decode_native_history_message};
 
-use iced::widget::{Column, Space, button, column, container, markdown, row, scrollable, text};
+use iced::widget::{Column, Id, Space, button, column, container, markdown, row, scrollable, text};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_anim::Animated;
@@ -27,6 +27,13 @@ pub enum SessionsMessage {
     ToggleToolRound(usize),
     ToggleThinkingBlock(usize),
     AnimTick(Instant),
+
+    /// Auto-refresh the currently selected session's transcript.
+    AutoRefreshMessages,
+    /// Result of an auto-refresh message load.
+    AutoRefreshResult(String, Vec<ChatMessage>),
+    /// Scroll position changed in the transcript viewport.
+    ScrollChanged(scrollable::Viewport),
 
     /// Dismiss modals/panels (Escape key).
     Escape,
@@ -69,6 +76,17 @@ pub struct SessionsState {
     /// `view()` builds widgets from this data on every frame; `selected_progress`
     /// animation is applied at widget-construction time outside the cache.
     cached_session_items: Option<Vec<CachedSessionItem>>,
+
+    // ── Auto-refresh fields ──────────────────────────────────────
+    /// Stable scrollable ID for the transcript area, preserves scroll position
+    /// across widget rebuilds.
+    scrollable_id: Id,
+    /// Whether auto-scroll-to-bottom is enabled (user is at or near the bottom).
+    auto_scroll_enabled: bool,
+    /// Whether the Sessions page is currently visible (controls subscription).
+    page_active: bool,
+    /// Guard to prevent overlapping auto-refresh tasks.
+    messages_refreshing: bool,
 }
 
 impl SessionsState {
@@ -89,11 +107,32 @@ impl SessionsState {
                 Easing::EASE_OUT.with_duration(Duration::from_millis(theme::ANIM_SELECTED_MS)),
             ),
             cached_session_items: None,
+            scrollable_id: Id::new("session_transcript_scroll"),
+            auto_scroll_enabled: false,
+            page_active: false,
+            messages_refreshing: false,
         }
     }
 
     pub fn subscription(&self) -> iced::Subscription<SessionsMessage> {
-        window::frames().map(SessionsMessage::AnimTick)
+        // Emit a 1-second timer for auto-refresh when the page is active and
+        // a session is selected.
+        if self.page_active && self.selected_session.is_some() {
+            iced::Subscription::batch([
+                window::frames().map(SessionsMessage::AnimTick),
+                iced::time::every(Duration::from_secs(1))
+                    .map(|_| SessionsMessage::AutoRefreshMessages),
+            ])
+        } else {
+            window::frames().map(SessionsMessage::AnimTick)
+        }
+    }
+
+    /// Notify the sessions state whether the Sessions page is currently visible.
+    /// This controls the auto-refresh subscription — when the page is hidden,
+    /// polling stops.
+    pub fn set_page_active(&mut self, active: bool) {
+        self.page_active = active;
     }
 
     pub fn refresh(&self) -> Task<SessionsMessage> {
@@ -135,6 +174,10 @@ impl SessionsState {
                 self.selected_loading = true;
                 self.expanded_thinking_blocks.clear();
                 self.expanded_tool_rounds.clear();
+                // Do NOT set auto_scroll_enabled here — let ScrollChanged
+                // determine it from the user's scroll behavior. The initial
+                // snap to bottom happens eagerly in SessionMessages instead
+                // of being delayed to the next auto-refresh tick.
                 Task::perform(
                     async move {
                         let store = crate::session::store();
@@ -149,38 +192,72 @@ impl SessionsState {
             }
             SessionsMessage::SessionMessages(key, messages) => {
                 if self.selected_session.as_deref() == Some(&key) {
-                    // Parse markdown for each message content, decoding
-                    // JSON-wrapped native messages first so the parser
-                    // receives plain text rather than a JSON literal.
-                    self.selected_md_items = messages
-                        .iter()
-                        .map(|m| {
-                            let display_text = decode_native_history_message(m)
-                                .and_then(|d| match d {
-                                    DecodedNativeHistoryMessage::AssistantToolCalls {
-                                        content,
-                                        ..
-                                    }
-                                    | DecodedNativeHistoryMessage::AssistantReasoning {
-                                        content,
-                                        ..
-                                    } => content,
-                                    DecodedNativeHistoryMessage::ToolResult { content, .. } => {
-                                        Some(content)
-                                    }
-                                })
-                                .unwrap_or_else(|| m.content.clone());
-                            markdown::parse(&display_text).collect()
-                        })
-                        .collect();
+                    self.selected_md_items = parse_messages_to_md_items(&messages);
                     self.selected_messages = messages;
                     self.selected_loading = false;
+                    // Snap to bottom so the user sees the most recent messages
+                    // immediately, rather than waiting for the next auto-refresh
+                    // tick (which would cause a delayed jump).
+                    return iced::widget::operation::snap_to_end(self.scrollable_id.clone());
                 }
                 Task::none()
             }
             SessionsMessage::SessionError(e) => {
                 self.error = Some(e);
                 self.selected_loading = false;
+                self.messages_refreshing = false;
+                Task::none()
+            }
+            SessionsMessage::AutoRefreshMessages => {
+                // Guard: skip if a refresh is already in-flight or no session selected.
+                if self.messages_refreshing {
+                    return Task::none();
+                }
+                let key = match self.selected_session.clone() {
+                    Some(k) => k,
+                    None => return Task::none(),
+                };
+                self.messages_refreshing = true;
+                Task::perform(
+                    async move {
+                        let store = crate::session::store();
+                        let messages = store.load(&key).await;
+                        Ok::<_, String>((key, messages))
+                    },
+                    |res| match res {
+                        Ok((key, messages)) => SessionsMessage::AutoRefreshResult(key, messages),
+                        Err(e) => SessionsMessage::SessionError(e),
+                    },
+                )
+            }
+            SessionsMessage::AutoRefreshResult(key, messages) => {
+                // Stale guard: ignore results for a different (deselected/overwritten) session.
+                if self.selected_session.as_deref() != Some(&key) {
+                    self.messages_refreshing = false;
+                    return Task::none();
+                }
+                // Parse markdown for each message (same as SessionMessages but
+                // without touching selected_loading, preserving scrollable identity).
+                self.selected_md_items = parse_messages_to_md_items(&messages);
+                self.selected_messages = messages;
+                self.messages_refreshing = false;
+
+                // Auto-scroll to bottom when the user is already at the bottom.
+                if self.auto_scroll_enabled {
+                    iced::widget::operation::snap_to_end(self.scrollable_id.clone())
+                } else {
+                    Task::none()
+                }
+            }
+            SessionsMessage::ScrollChanged(viewport) => {
+                let bounds = viewport.bounds();
+                let content = viewport.content_bounds();
+                let at_bottom = if content.height > bounds.height {
+                    viewport.relative_offset().y >= 0.99
+                } else {
+                    content.height <= bounds.height
+                };
+                self.auto_scroll_enabled = at_bottom;
                 Task::none()
             }
             SessionsMessage::ToggleToolRound(idx) => {
@@ -233,6 +310,7 @@ impl SessionsState {
         md_items: &'a [Vec<markdown::Item>],
         expanded_rounds: &'a std::collections::HashSet<usize>,
         expanded_thinking: &'a std::collections::HashSet<usize>,
+        scrollable_id: &Id,
     ) -> Element<'a, SessionsMessage> {
         // Inner types used in transcript rendering
         #[derive(Debug, Clone)]
@@ -843,6 +921,8 @@ impl SessionsState {
         }
 
         scrollable(items)
+            .id(scrollable_id.clone())
+            .on_scroll(SessionsMessage::ScrollChanged)
             .height(Length::Fill)
             .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
             .style(theme::scrollbar_style)
@@ -965,6 +1045,7 @@ impl SessionsState {
                     &self.selected_md_items,
                     &self.expanded_tool_rounds,
                     &self.expanded_thinking_blocks,
+                    &self.scrollable_id,
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -999,4 +1080,23 @@ impl SessionsState {
             })
             .into()
     }
+}
+
+/// Decode native history messages and parse their content into markdown items.
+/// Shared between initial load (`SessionMessages`) and auto-refresh
+/// (`AutoRefreshResult`) to keep the decoding logic in a single place.
+fn parse_messages_to_md_items(messages: &[ChatMessage]) -> Vec<Vec<markdown::Item>> {
+    messages
+        .iter()
+        .map(|m| {
+            let display_text = decode_native_history_message(m)
+                .and_then(|d| match d {
+                    DecodedNativeHistoryMessage::AssistantToolCalls { content, .. }
+                    | DecodedNativeHistoryMessage::AssistantReasoning { content, .. } => content,
+                    DecodedNativeHistoryMessage::ToolResult { content, .. } => Some(content),
+                })
+                .unwrap_or_else(|| m.content.clone());
+            markdown::parse(&display_text).collect()
+        })
+        .collect()
 }
