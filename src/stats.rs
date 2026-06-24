@@ -37,6 +37,34 @@ CREATE INDEX IF NOT EXISTS idx_tool_usage_role ON tool_usage(role);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_recorded_at ON tool_usage(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_workspace ON tool_usage(workspace);";
 
+/// Column list for tool error SELECT queries in [`StatsStore::query_tool_errors`].
+///
+/// The column order here must match the positional indices defined in
+/// [`COL_TE_TOOL_NAME`] through [`COL_TE_RECORDED_AT`].
+const TOOL_ERROR_COLUMNS: &str =
+    "tool_name, role, json_each.value AS error, workspace, recorded_at";
+
+/// Column-index constants for [`TOOL_ERROR_COLUMNS`].
+///
+/// These replace hardcoded positional indices in [`StatsStore::query_tool_errors`].
+/// With named constants, the compiler catches references to undefined column
+/// constants — for instance, removing a constant but forgetting to update a
+/// `row_text()` call produces a compile error rather than a silent field
+/// mapping bug.
+const COL_TE_TOOL_NAME: usize = 0;
+const COL_TE_ROLE: usize = 1;
+const COL_TE_ERROR: usize = 2;
+const COL_TE_WORKSPACE: usize = 3;
+const COL_TE_RECORDED_AT: usize = 4;
+
+/// Column-index constant for the single-column SELECT in
+/// [`StatsStore::query_tool_usage`] (`call_count`).
+const COL_TU_CALL_COUNT: usize = 0;
+
+/// Column-index constant for the single-column COUNT(*) SELECT in
+/// [`StatsStore::count_tool_errors`].
+const COL_TE_COUNT: usize = 0;
+
 /// A single tool error flattened from the `errors` JSON array.
 #[derive(Debug, Clone)]
 pub struct ToolErrorEntry {
@@ -115,7 +143,7 @@ impl StatsStore {
                  WHERE agent_id = ?1 AND tool_name = ?2 \
                  ORDER BY id DESC LIMIT 1",
                 turso::params![agent_id, tool_name],
-                |row| row.get::<i64>(0),
+                |row| row.get::<i64>(COL_TU_CALL_COUNT),
             )
             .await
         {
@@ -172,7 +200,7 @@ impl StatsStore {
             .query(&sql, turso::params_from_iter(params))
             .await?;
         let count = match rows.into_iter().next() {
-            Some(row) => match row.get_value(0)? {
+            Some(row) => match row.get_value(COL_TE_COUNT)? {
                 turso::Value::Integer(n) => usize::try_from(n).unwrap_or(0),
                 _ => 0,
             },
@@ -203,7 +231,7 @@ impl StatsStore {
         // Build the SQL with filter params first, then limit/offset.
         // All placeholders use unnamed `?` — params_from_iter binds positionally.
         let sql = format!(
-            "SELECT tool_name, role, json_each.value AS error, workspace, recorded_at \
+            "SELECT {TOOL_ERROR_COLUMNS} \
              FROM tool_usage, json_each(tool_usage.errors) \
              WHERE {where_clause} \
              ORDER BY recorded_at DESC \
@@ -222,11 +250,11 @@ impl StatsStore {
         let mut entries = Vec::new();
         for row in rows {
             entries.push(ToolErrorEntry {
-                tool_name: turso::row_text(&row, 0)?,
-                role: turso::row_text(&row, 1)?,
-                error: turso::row_text(&row, 2)?,
-                workspace: turso::row_text(&row, 3)?,
-                recorded_at: turso::row_text(&row, 4)?,
+                tool_name: turso::row_text(&row, COL_TE_TOOL_NAME)?,
+                role: turso::row_text(&row, COL_TE_ROLE)?,
+                error: turso::row_text(&row, COL_TE_ERROR)?,
+                workspace: turso::row_text(&row, COL_TE_WORKSPACE)?,
+                recorded_at: turso::row_text(&row, COL_TE_RECORDED_AT)?,
             });
         }
 
