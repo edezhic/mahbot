@@ -33,6 +33,30 @@ pub struct LogEntry {
     pub workspace: String,
 }
 
+/// Column list for log SELECT queries.
+///
+/// The column order here must match the positional indices defined in
+/// [`COL_LOGS_TIMESTAMP`] through [`COL_LOGS_WORKSPACE`], which are used
+/// in [`row_to_entry`].
+const LOGS_COLUMNS: &str =
+    "timestamp, level, target, message, fields, agent_id, agent_role, workspace";
+
+/// Column-index constants for [`LOGS_COLUMNS`].
+///
+/// These replace hardcoded positional indices in [`row_to_entry`].
+/// With named constants, the compiler catches references to undefined
+/// column constants — for instance, removing a constant but forgetting to
+/// update a `row_text()` call produces a compile error rather than a silent
+/// field mapping bug.
+const COL_LOGS_TIMESTAMP: usize = 0;
+const COL_LOGS_LEVEL: usize = 1;
+const COL_LOGS_TARGET: usize = 2;
+const COL_LOGS_MESSAGE: usize = 3;
+const COL_LOGS_FIELDS: usize = 4;
+const COL_LOGS_AGENT_ID: usize = 5;
+const COL_LOGS_AGENT_ROLE: usize = 6;
+const COL_LOGS_WORKSPACE: usize = 7;
+
 /// Turso-backed log store.
 #[derive(Clone, Debug)]
 pub struct LogStore {
@@ -126,7 +150,7 @@ impl LogStore {
         values.push(Value::Integer(offset));
 
         let sql = format!(
-            "SELECT timestamp, level, target, message, fields, agent_id, agent_role, workspace FROM logs {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT {LOGS_COLUMNS} FROM logs {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
         );
 
         (sql, values)
@@ -279,11 +303,11 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
 }
 
 fn row_to_entry(row: &Row) -> anyhow::Result<LogEntry> {
-    let timestamp = row_text(row, 0)?;
-    let level = row_text(row, 1)?;
-    let target = row_text(row, 2)?;
-    let message = row_text(row, 3)?;
-    let fields_str = match row.get_value(4)? {
+    let timestamp = row_text(row, COL_LOGS_TIMESTAMP)?;
+    let level = row_text(row, COL_LOGS_LEVEL)?;
+    let target = row_text(row, COL_LOGS_TARGET)?;
+    let message = row_text(row, COL_LOGS_MESSAGE)?;
+    let fields_str = match row.get_value(COL_LOGS_FIELDS)? {
         Value::Text(s) => s,
         Value::Null => "{}".to_string(),
         _ => anyhow::bail!("expected text for fields"),
@@ -291,9 +315,9 @@ fn row_to_entry(row: &Row) -> anyhow::Result<LogEntry> {
     let fields: serde_json::Value =
         serde_json::from_str(&fields_str).unwrap_or(serde_json::Value::Null);
 
-    let agent_id = row_text(row, 5).unwrap_or_default();
-    let agent_role = row_text(row, 6).unwrap_or_default();
-    let workspace = row_text(row, 7).unwrap_or_default();
+    let agent_id = row_text(row, COL_LOGS_AGENT_ID)?;
+    let agent_role = row_text(row, COL_LOGS_AGENT_ROLE)?;
+    let workspace = row_text(row, COL_LOGS_WORKSPACE)?;
 
     Ok(LogEntry {
         timestamp,
