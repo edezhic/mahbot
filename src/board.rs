@@ -1880,10 +1880,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_guarded_transition_with_wrong_phase_fails() {
+    async fn test_guarded_transition() {
         let (store, _tmp, id) = setup().await;
 
-        // Ticket is in Backlog; guard expects Done — should fail.
+        // Wrong expected phase — should fail, ticket unchanged.
         let result = store
             .transition_to(
                 &id,
@@ -1896,17 +1896,10 @@ mod tests {
             result.is_err(),
             "guarded transition with wrong phase should fail"
         );
-
-        // Ticket should still be in Backlog.
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         assert_eq!(ticket.status, TicketPhase::Backlog);
-    }
 
-    #[tokio::test]
-    async fn test_guarded_transition_with_correct_phase_succeeds() {
-        let (store, _tmp, id) = setup().await;
-
-        // Ticket is in Backlog; guard expects Backlog — should succeed.
+        // Correct expected phase — should succeed.
         store
             .transition_to(
                 &id,
@@ -1916,7 +1909,6 @@ mod tests {
             )
             .await
             .expect("guarded transition with correct phase should succeed");
-
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         assert_eq!(ticket.status, TicketPhase::InDevelopment);
     }
