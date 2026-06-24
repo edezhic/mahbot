@@ -151,10 +151,11 @@ fn ensure_embedder() -> bool {
             }
             Err(e) => {
                 warn!(reason = %e, "Failed to load cached embedding model");
-                // Don't delete cached files here — the retry loop handles
-                // corruption detection and re-download if needed. Deleting
-                // on every transient error forces an unnecessary ~167 MB
-                // re-download with 1-minute minimum delay.
+                // Don't delete cached files here — let the retry loop attempt
+                // to load again with backoff. The files passed SHA256 verification
+                // at download time, so the failure is likely a code-level issue
+                // (not corruption). Deleting on every transient error would force
+                // an unnecessary ~167 MB re-download with 1-minute minimum delay.
                 false
             }
         }
@@ -253,10 +254,9 @@ async fn download_retry_loop() {
                 STATE.store(STATE_READY, Ordering::Release);
                 return;
             }
-            // Loading failed — corrupt files. Re-download both.
-            warn!("Cached model files are corrupt, re-downloading");
-            let _ = std::fs::remove_file(&model_dest);
-            let _ = std::fs::remove_file(&tokenizer_dest);
+            // Loading failed — could be a code bug, not necessarily corrupted files.
+            // Don't delete cached files; the backoff will apply and we'll retry.
+            warn!("Failed to load embedding model from cached files, retrying with backoff");
         }
 
         // Download both files concurrently, skipping files that already exist.
@@ -303,10 +303,9 @@ async fn download_retry_loop() {
                     return;
                 }
                 Err(e) => {
-                    warn!(reason = %e, "Downloaded model files are corrupt, retrying download");
-                    // Remove corrupt files and retry
-                    let _ = std::fs::remove_file(&model_dest);
-                    let _ = std::fs::remove_file(&tokenizer_dest);
+                    warn!(reason = %e, "Failed to load model after download, retrying with backoff (files preserved)");
+                    // Don't delete cached files — load failure may be a code bug,
+                    // not file corruption. The backoff will apply and we'll retry.
                 }
             }
         } else {
@@ -549,6 +548,7 @@ impl Layer {
         let scale = 1.0_f64 / (head_dim as f64).sqrt();
         let att = q.matmul(&k.t()?)?;
         let att = (att * scale)?;
+        let mask = mask.broadcast_as(att.shape())?;
         let att = (att + mask)?;
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         let y = att.matmul(&v)?;
