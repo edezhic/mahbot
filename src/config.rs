@@ -724,9 +724,15 @@ fn validate_config(config: &ConfigData) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// Shared test values for every string config field, used by multiple roundtrip tests.
     /// Each entry is a (db_key, test_value) pair.
+    ///
+    /// ⚠ When adding a new field to `string_config_fields!`, you **must** also add
+    /// a corresponding entry here.  The assertion at the top of
+    /// [`string_fields_roundtrip`] enforces this: the test will fail unless every
+    /// key from `string_fields()` is present in this list.
     const STRING_FIELD_TEST_VALUES: &[(&str, &str)] = &[
         ("provider_key", "sk-test-key"),
         ("provider_endpoint", "https://example.com/api"),
@@ -750,6 +756,19 @@ mod tests {
     #[test]
     fn string_fields_roundtrip() {
         let mut config = ConfigData::default();
+
+        // ── Structural guard ─────────────────────────────────────
+        // Every field declared in string_config_fields! must have a test value
+        // in STRING_FIELD_TEST_VALUES.  This assertion fails at the top of the
+        // test so the developer sees the mismatch immediately.
+        let field_keys: HashSet<&str> = config.string_fields().iter().map(|(k, _)| *k).collect();
+        let test_keys: HashSet<&str> = STRING_FIELD_TEST_VALUES.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            field_keys, test_keys,
+            "STRING_FIELD_TEST_VALUES is out of sync with string_config_fields! \
+             macro invocation — add (or remove) an entry for each field listed \
+             above/below"
+        );
 
         // Verify the initial state: all fields are None.
         for (_key, value) in config.string_fields() {
