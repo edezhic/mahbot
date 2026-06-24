@@ -5131,7 +5131,7 @@ impl EditorState {
         container(
             scrollable(scrollable_content)
                 .id(self.tab_scroll_id.clone())
-                .direction(scrollable::Direction::Horizontal(theme::thin_scrollbar()))
+                .direction(theme::horizontal_scrollbar())
                 .style(theme::scrollbar_style)
                 .width(Length::Fill)
                 .height(Length::Shrink),

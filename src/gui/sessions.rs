@@ -924,7 +924,7 @@ impl SessionsState {
             .id(scrollable_id.clone())
             .on_scroll(SessionsMessage::ScrollChanged)
             .height(Length::Fill)
-            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+            .direction(theme::vertical_scrollbar())
             .style(theme::scrollbar_style)
             .into()
     }
@@ -1025,7 +1025,7 @@ impl SessionsState {
 
             let session_scroll = scrollable(session_list)
                 .width(Length::Fixed(350.0))
-                .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                .direction(theme::vertical_scrollbar())
                 .style(theme::scrollbar_style);
 
             // Transcript on the right side

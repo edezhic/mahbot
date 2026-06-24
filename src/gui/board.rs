@@ -1091,7 +1091,7 @@ impl BoardState {
                         iced_selection::markdown::view(items, theme::markdown_settings())
                             .map(BoardMessage::LinkClicked),
                     )
-                    .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                    .direction(theme::vertical_scrollbar())
                     .style(theme::scrollbar_style),
                 )
                 .padding(8)
@@ -1237,7 +1237,7 @@ impl BoardState {
 
         scrollable(detail.spacing(4))
             .height(Length::Fill)
-            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+            .direction(theme::vertical_scrollbar())
             .style(theme::scrollbar_style)
             .into()
     }

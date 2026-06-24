@@ -700,7 +700,7 @@ impl SettingsState {
         let scroll = scrollable(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+            .direction(theme::vertical_scrollbar())
             .style(theme::scrollbar_style);
 
         // Floating save button near bottom-right
@@ -1026,20 +1026,18 @@ impl SettingsState {
                                 },
                             );
                         view_col = view_col.push(
-                            container(scrollable(md).direction(scrollable::Direction::Vertical(
-                                theme::thin_scrollbar(),
-                            )))
-                            .padding(4)
-                            .height(Length::Fixed(300.0))
-                            .style(|_theme: &iced::Theme| container::Style {
-                                background: Some(iced::Background::Color(theme::BG_BASE)),
-                                border: iced::Border {
-                                    radius: 4.0.into(),
-                                    width: 1.0,
-                                    color: theme::BORDER,
-                                },
-                                ..Default::default()
-                            }),
+                            container(scrollable(md).direction(theme::vertical_scrollbar()))
+                                .padding(4)
+                                .height(Length::Fixed(300.0))
+                                .style(|_theme: &iced::Theme| container::Style {
+                                    background: Some(iced::Background::Color(theme::BG_BASE)),
+                                    border: iced::Border {
+                                        radius: 4.0.into(),
+                                        width: 1.0,
+                                        color: theme::BORDER,
+                                    },
+                                    ..Default::default()
+                                }),
                         );
                     }
 

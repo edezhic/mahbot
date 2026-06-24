@@ -1275,7 +1275,7 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
         }
         scrollable(groups)
             .height(Length::Fill)
-            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+            .direction(theme::vertical_scrollbar())
             .style(theme::scrollbar_style)
             .into()
     };

@@ -707,7 +707,7 @@ impl LogsState {
                     .spacing(2),
                 )
                 .height(Length::Fill)
-                .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                .direction(theme::vertical_scrollbar())
                 .style(theme::scrollbar_style);
 
                 // Stick to bottom when not paused (latest entries at top, but we

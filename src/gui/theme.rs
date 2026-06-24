@@ -316,6 +316,26 @@ pub fn thin_scrollbar() -> scrollable::Scrollbar {
     scrollable::Scrollbar::new().width(6).scroller_width(6)
 }
 
+/// Returns a vertical [`scrollable::Direction`] with the thin scrollbar.
+///
+/// Convenience wrapper around [`thin_scrollbar`] — prefer this over
+/// spelling out `scrollable::Direction::Vertical(theme::thin_scrollbar())`
+/// at every call site.
+#[must_use]
+pub fn vertical_scrollbar() -> scrollable::Direction {
+    scrollable::Direction::Vertical(thin_scrollbar())
+}
+
+/// Returns a horizontal [`scrollable::Direction`] with the thin scrollbar.
+///
+/// Convenience wrapper around [`thin_scrollbar`] — prefer this over
+/// spelling out `scrollable::Direction::Horizontal(theme::thin_scrollbar())`
+/// at every call site.
+#[must_use]
+pub fn horizontal_scrollbar() -> scrollable::Direction {
+    scrollable::Direction::Horizontal(thin_scrollbar())
+}
+
 /// Standard scrollbar style for the dark Flexoki theme.
 ///
 /// Uses [`TEXT_PRIMARY`] as the scroller base color, varying opacity:

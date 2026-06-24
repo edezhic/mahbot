@@ -299,9 +299,7 @@ pub fn build_tree_panel<'a, Message: 'a>(
         .id(file_tree.tree_scroll_id.clone())
         .width(Length::Fill)
         .height(Length::Fill)
-        .direction(widget::scrollable::Direction::Vertical(
-            theme::thin_scrollbar(),
-        ))
+        .direction(theme::vertical_scrollbar())
         .style(theme::scrollbar_style);
 
     let tree_inner: Element<'_, Message> = container(tree_body)

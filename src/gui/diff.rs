@@ -1093,7 +1093,7 @@ impl DiffState {
                 scrollable(column![])
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                    .direction(theme::vertical_scrollbar())
                     .style(theme::scrollbar_style),
             )
             .width(Length::Fill)
@@ -1232,7 +1232,7 @@ impl DiffState {
             scrollable(column(rows).spacing(0).width(Length::Fill))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                .direction(theme::vertical_scrollbar())
                 .style(theme::scrollbar_style),
         )
         .width(Length::Fill)

@@ -394,7 +394,7 @@ impl ShellState {
 
         container(
             scrollable(scrollable_content)
-                .direction(scrollable::Direction::Horizontal(theme::thin_scrollbar()))
+                .direction(theme::horizontal_scrollbar())
                 .style(theme::scrollbar_style)
                 .width(Length::Fill)
                 .height(Length::Shrink),

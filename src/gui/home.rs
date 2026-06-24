@@ -613,7 +613,7 @@ impl HomeState {
                 scrollable(Column::with_children(children).spacing(12).padding(8))
                     .id(CHAT_SCROLL_ID)
                     .on_scroll(HomeMessage::ScrollChanged)
-                    .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                    .direction(theme::vertical_scrollbar())
                     .style(theme::scrollbar_style)
                     .width(Length::Fill)
                     .height(Length::Fill),
