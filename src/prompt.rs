@@ -332,9 +332,9 @@ mod tests {
         // ── Forward check: every expected tool must have a description file ─
         let mut missing: Vec<&str> = expected
             .difference(&available)
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .collect();
-        missing.sort();
+        missing.sort_unstable();
         assert!(
             missing.is_empty(),
             "Missing embedded tool description file(s):\n\
@@ -351,9 +351,9 @@ mod tests {
         // ── Reverse check: every description file must map to a known tool ─
         let mut orphaned: Vec<&str> = available
             .difference(&expected)
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .collect();
-        orphaned.sort();
+        orphaned.sort_unstable();
         assert!(
             orphaned.is_empty(),
             "Orphaned tool description file(s) — no tool uses them:\n\
@@ -375,8 +375,7 @@ mod tests {
             assert!(
                 !content.trim().is_empty(),
                 "Tool description file '{key}' is empty or whitespace-only.\n\
-                 Add a meaningful description for the tool '{}'.",
-                name,
+                 Add a meaningful description for the tool '{name}'.",
             );
         }
     }
