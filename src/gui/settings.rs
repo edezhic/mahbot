@@ -161,7 +161,7 @@ fn model_picker_list<'a>(
         text_input(add_placeholder, add_input)
             .on_input(on_add_input)
             .style(super::widgets::text_input_style)
-            .width(Length::Fixed(300.0)),
+            .width(Length::Fixed(450.0)),
         Space::new().width(4),
         button(text("Add").size(11))
             .padding(4)
@@ -796,27 +796,33 @@ impl SettingsState {
                 let ws_row = container(
                     column![
                         row![
-                            text(&ws_item.name)
-                                .size(14)
-                                .color(theme::TEXT_PRIMARY)
-                                .width(Length::Fixed(140.0)),
-                            container(text(&ws_item.status).size(11).color(status_color),)
-                                .padding([2, 8])
-                                .style(move |_theme: &iced::Theme| container::Style {
-                                    background: Some(iced::Background::Color(status_bg)),
-                                    border: iced::Border {
-                                        radius: 4.0.into(),
-                                        ..iced::Border::default()
-                                    },
-                                    ..container::Style::default()
-                                }),
-                            Space::new().width(8),
-                            text(&ws_item.path)
-                                .size(12)
-                                .color(theme::TEXT_MUTED)
-                                .width(Length::Fixed(200.0)),
-                            Space::new().width(4),
-                            // Per-agent context edit buttons (icon only, color-coded)
+                            // Name column - 15%
+                            container(text(&ws_item.name).size(14).color(theme::TEXT_PRIMARY))
+                                .width(Length::FillPortion(15))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center),
+                            // Status column - 10%
+                            container(
+                                container(text(&ws_item.status).size(11).color(status_color))
+                                    .padding([2, 8])
+                                    .style(move |_theme: &iced::Theme| container::Style {
+                                        background: Some(iced::Background::Color(status_bg)),
+                                        border: iced::Border {
+                                            radius: 4.0.into(),
+                                            ..iced::Border::default()
+                                        },
+                                        ..container::Style::default()
+                                    }),
+                            )
+                            .width(Length::FillPortion(10))
+                            .align_x(Alignment::Start)
+                            .align_y(Alignment::Center),
+                            // Path column - 35%
+                            container(text(&ws_item.path).size(12).color(theme::TEXT_MUTED))
+                                .width(Length::FillPortion(35))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center),
+                            // Agent icons column - 25%
                             {
                                 let mut role_btns = Row::new().spacing(2);
                                 for role in <crate::Role as strum::IntoEnumIterator>::iter()
@@ -835,45 +841,62 @@ impl SettingsState {
                                             )),
                                     );
                                 }
-                                role_btns
+                                container(role_btns)
+                                    .width(Length::FillPortion(25))
+                                    .align_x(Alignment::Start)
+                                    .align_y(Alignment::Center)
                             },
-                            Space::new().width(Length::Fill),
-                            // Maintainer toggle
-                            button(
-                                column![
-                                    text("Maint").size(8).color(theme::TEXT_MUTED),
-                                    text(if maintainer_on { "ON" } else { "OFF" })
-                                        .size(9)
-                                        .color(if maintainer_on {
-                                            theme::ACCENT
-                                        } else {
-                                            theme::TEXT_MUTED
-                                        },),
+                            // Actions column - 15%
+                            container(
+                                row![
+                                    // Maintainer toggle
+                                    button(
+                                        column![
+                                            text("Maint").size(8).color(theme::TEXT_MUTED),
+                                            text(if maintainer_on { "ON" } else { "OFF" })
+                                                .size(9)
+                                                .color(if maintainer_on {
+                                                    theme::ACCENT
+                                                } else {
+                                                    theme::TEXT_MUTED
+                                                },),
+                                        ]
+                                        .spacing(0)
+                                        .align_x(Alignment::Center),
+                                    )
+                                    .style(theme::button_text)
+                                    .on_press(
+                                        SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::ToggleMaintainer(
+                                                ws_item.name.clone(),
+                                                !maintainer_on,
+                                            ),
+                                        )
+                                    ),
+                                    Space::new().width(4),
+                                    button(row![
+                                        lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+                                            .size(11)
+                                            .color(theme::TEXT_MUTED),
+                                        Space::new().width(4),
+                                        text("Re-analyze").size(11),
+                                    ])
+                                    .style(theme::button_text)
+                                    .on_press(
+                                        SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::Reanalyze(
+                                                ws_item.name.clone()
+                                            ),
+                                        )
+                                    ),
+                                    Space::new().width(4),
+                                    delete_btn,
                                 ]
-                                .spacing(0)
-                                .align_x(Alignment::Center),
+                                .align_y(Alignment::Center)
                             )
-                            .style(theme::button_text)
-                            .on_press(SettingsMessage::WorkspaceMsg(
-                                workspaces::WorkspacesMessage::ToggleMaintainer(
-                                    ws_item.name.clone(),
-                                    !maintainer_on,
-                                ),
-                            )),
-                            Space::new().width(4),
-                            button(row![
-                                lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                                    .size(11)
-                                    .color(theme::TEXT_MUTED),
-                                Space::new().width(4),
-                                text("Re-analyze").size(11),
-                            ])
-                            .style(theme::button_text)
-                            .on_press(SettingsMessage::WorkspaceMsg(
-                                workspaces::WorkspacesMessage::Reanalyze(ws_item.name.clone()),
-                            )),
-                            Space::new().width(4),
-                            delete_btn,
+                            .width(Length::FillPortion(15))
+                            .align_x(Alignment::End)
+                            .align_y(Alignment::Center),
                         ]
                         .align_y(Alignment::Center),
                         {
@@ -946,21 +969,17 @@ impl SettingsState {
             }
         }
 
-        // "Add Workspace" button
-        let add_btn = row![
-            Space::new().width(Length::Fill),
-            button(row![
-                lucide::plus::<iced::Theme, iced::Renderer>()
-                    .size(13)
-                    .color(theme::ACCENT),
-                Space::new().width(4),
-                text("Add Workspace").size(13),
-            ])
-            .style(theme::button_primary)
-            .on_press(SettingsMessage::ToggleAddWorkspaceModal),
-        ];
+        // Inline "+" button in the section header
+        let plus_btn: Element<'_, SettingsMessage> = button(
+            lucide::plus::<iced::Theme, iced::Renderer>()
+                .size(16)
+                .color(theme::ACCENT),
+        )
+        .style(theme::button_text)
+        .on_press(SettingsMessage::ToggleAddWorkspaceModal)
+        .into();
 
-        let mut section_content = column![rows, Space::new().height(8), add_btn];
+        let mut section_content = column![rows];
 
         // Context view overlay — read-only markdown (inline in section)
         if let Some((ref _ws_name, ref role, ref md_items_opt)) = ws.context_view {
@@ -1061,7 +1080,7 @@ impl SettingsState {
             section_content = section_content.push(view_container);
         }
 
-        section("Workspaces", section_content)
+        section_with_header_action("Workspaces", plus_btn, section_content)
     }
 
     /// Render the users section for the Settings page.
@@ -1154,8 +1173,7 @@ impl SettingsState {
                 let user_row = container(
                     column![
                         row![
-                            switch_icon,
-                            Space::new().width(8),
+                            // Name + permissions column - 15%
                             {
                                 let user_elem: Element<'_, SettingsMessage> = if let Some(p) =
                                     user.permissions.as_deref().filter(|p| !p.is_empty())
@@ -1170,9 +1188,12 @@ impl SettingsState {
                                 } else {
                                     text(&user.name).size(14).color(theme::TEXT_PRIMARY).into()
                                 };
-                                container(user_elem).width(Length::FillPortion(3))
+                                container(user_elem)
+                                    .width(Length::FillPortion(15))
+                                    .align_x(Alignment::Start)
+                                    .align_y(Alignment::Center)
                             },
-                            // Workspace dropdown for inline editing
+                            // Workspace column - 20%
                             {
                                 let ws_value = user.selected_workspace.as_deref().unwrap_or("");
                                 let ws_selected = us
@@ -1180,18 +1201,28 @@ impl SettingsState {
                                     .iter()
                                     .find(|o| o.value == ws_value)
                                     .cloned();
-                                pick_list(us.workspace_options.as_slice(), ws_selected, |opt| {
-                                    SettingsMessage::UserMsg(users::UsersMessage::UpdateWorkspace(
-                                        user.name.clone(),
-                                        opt.value,
-                                    ))
-                                })
-                                .style(widgets::pick_list_style)
-                                .padding([4, 8])
-                                .width(Length::Fixed(140.0))
+                                container(
+                                    pick_list(
+                                        us.workspace_options.as_slice(),
+                                        ws_selected,
+                                        |opt| {
+                                            SettingsMessage::UserMsg(
+                                                users::UsersMessage::UpdateWorkspace(
+                                                    user.name.clone(),
+                                                    opt.value,
+                                                ),
+                                            )
+                                        },
+                                    )
+                                    .style(widgets::pick_list_style)
+                                    .padding([4, 8])
+                                    .width(Length::Fill),
+                                )
+                                .width(Length::FillPortion(20))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center)
                             },
-                            Space::new().width(6),
-                            // Role dropdown for inline editing
+                            // Role column - 15%
                             {
                                 let role_selected = user
                                     .selected_role
@@ -1200,18 +1231,34 @@ impl SettingsState {
                                         us.role_options.iter().find(|o| o.value == *name)
                                     })
                                     .cloned();
-                                pick_list(us.role_options.as_slice(), role_selected, |opt| {
-                                    SettingsMessage::UserMsg(users::UsersMessage::UpdateRole(
-                                        user.name.clone(),
-                                        opt.value,
-                                    ))
-                                })
-                                .style(widgets::pick_list_style)
-                                .padding([4, 8])
-                                .width(Length::Fixed(120.0))
+                                container(
+                                    pick_list(us.role_options.as_slice(), role_selected, |opt| {
+                                        SettingsMessage::UserMsg(users::UsersMessage::UpdateRole(
+                                            user.name.clone(),
+                                            opt.value,
+                                        ))
+                                    })
+                                    .style(widgets::pick_list_style)
+                                    .padding([4, 8])
+                                    .width(Length::Fill),
+                                )
+                                .width(Length::FillPortion(15))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center)
                             },
-                            Space::new().width(Length::FillPortion(7)),
-                            delete_btn,
+                            // Actions column - 50% (switch icon + delete)
+                            container({
+                                let mut actions = Row::new().align_y(Alignment::Center);
+                                actions = actions.push(switch_icon);
+                                if !is_admin {
+                                    actions = actions.push(Space::new().width(8));
+                                    actions = actions.push(delete_btn);
+                                }
+                                actions
+                            })
+                            .width(Length::FillPortion(50))
+                            .align_x(Alignment::End)
+                            .align_y(Alignment::Center),
                         ]
                         .align_y(Alignment::Center),
                         // Second row: Telegram channel binding
@@ -1235,7 +1282,7 @@ impl SettingsState {
                                         .style(widgets::text_input_style)
                                         .size(13)
                                         .padding([2, 6])
-                                        .width(Length::Fixed(180.0))
+                                        .width(Length::Fixed(270.0))
                                         .into(),
                                     Space::new().width(8).into(),
                                 ];
@@ -1346,21 +1393,17 @@ impl SettingsState {
             }
         }
 
-        // "Add User" button
-        let add_btn = row![
-            Space::new().width(Length::Fill),
-            button(row![
-                lucide::plus::<iced::Theme, iced::Renderer>()
-                    .size(13)
-                    .color(theme::ACCENT),
-                Space::new().width(4),
-                text("Add User").size(13),
-            ])
-            .style(theme::button_primary)
-            .on_press(SettingsMessage::ToggleAddUserModal),
-        ];
+        // Inline "+" button in the section header
+        let plus_btn: Element<'_, SettingsMessage> = button(
+            lucide::plus::<iced::Theme, iced::Renderer>()
+                .size(16)
+                .color(theme::ACCENT),
+        )
+        .style(theme::button_text)
+        .on_press(SettingsMessage::ToggleAddUserModal)
+        .into();
 
-        section("Users", column![rows, Space::new().height(8), add_btn])
+        section_with_header_action("Users", plus_btn, column![rows])
     }
 
     /// Render the add-workspace or add-user modal overlay. Returns a
@@ -1402,7 +1445,7 @@ impl SettingsState {
                     text_input("workspace name", &self.add_workspace_name)
                         .on_input(SettingsMessage::AddWorkspaceName)
                         .style(widgets::text_input_style)
-                        .width(Length::Fixed(250.0))
+                        .width(Length::Fixed(375.0))
                         .into(),
                     None,
                 ),
@@ -1412,7 +1455,7 @@ impl SettingsState {
                     text_input("/path/to/workspace", &self.add_workspace_path)
                         .on_input(SettingsMessage::AddWorkspacePath)
                         .style(widgets::text_input_style)
-                        .width(Length::Fixed(250.0))
+                        .width(Length::Fixed(375.0))
                         .into(),
                     None,
                 ),
@@ -1447,7 +1490,7 @@ impl SettingsState {
             ]
             .padding(24),
         )
-        .width(Length::Fixed(420.0))
+        .width(Length::Fixed(620.0))
         .style(dialog_container_style)
         .into()
     }
@@ -1466,7 +1509,7 @@ impl SettingsState {
                     text_input("user name", &self.add_user_sender)
                         .on_input(SettingsMessage::AddUserSender)
                         .style(widgets::text_input_style)
-                        .width(Length::Fixed(250.0))
+                        .width(Length::Fixed(375.0))
                         .into(),
                     None,
                 ),
@@ -1476,7 +1519,7 @@ impl SettingsState {
                     text_input("optional", &self.add_user_permissions)
                         .on_input(SettingsMessage::AddUserPermissions)
                         .style(widgets::text_input_style)
-                        .width(Length::Fixed(250.0))
+                        .width(Length::Fixed(375.0))
                         .into(),
                     None,
                 ),
@@ -1508,7 +1551,7 @@ impl SettingsState {
             ]
             .padding(24),
         )
-        .width(Length::Fixed(420.0))
+        .width(Length::Fixed(620.0))
         .style(dialog_container_style)
         .into()
     }
@@ -1617,7 +1660,7 @@ impl SettingsState {
                         value: v
                     })
                     .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
+                    .width(Length::Fixed(375.0))
                     .into(),
                     None,
                 ),
@@ -1646,7 +1689,7 @@ impl SettingsState {
                         model: v,
                     })
                     .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
+                    .width(Length::Fixed(375.0))
                     .into(),
                 Some(default),
             )
@@ -1715,7 +1758,7 @@ impl SettingsState {
                         value: v
                     })
                     .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
+                    .width(Length::Fixed(375.0))
                     .into(),
                     None,
                 ),
@@ -1733,7 +1776,7 @@ impl SettingsState {
                         value: v
                     })
                     .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
+                    .width(Length::Fixed(375.0))
                     .into(),
                     None,
                 ),
@@ -1751,7 +1794,7 @@ impl SettingsState {
                         value: v
                     })
                     .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
+                    .width(Length::Fixed(375.0))
                     .into(),
                     None,
                 ),
@@ -1769,7 +1812,7 @@ impl SettingsState {
                         value: v
                     })
                     .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(250.0))
+                    .width(Length::Fixed(375.0))
                     .into(),
                     None,
                 ),
@@ -1905,7 +1948,7 @@ impl SettingsState {
                     order: v,
                 })
                 .style(super::widgets::text_input_style)
-                .width(Length::Fixed(250.0));
+                .width(Length::Fixed(375.0));
 
             let allow_toggle = toggler(current_allow.unwrap_or(false)).on_toggle(move |b| {
                 SettingsMessage::ModelRoutingAllowFallbacks {
@@ -1948,16 +1991,40 @@ fn section<'a>(
     title: &'static str,
     content: Column<'a, SettingsMessage>,
 ) -> Element<'a, SettingsMessage> {
-    column![
-        text(title)
-            .font(iced::Font::MONOSPACE)
-            .size(16)
-            .color(theme::ACCENT),
-        Space::new().height(4),
-        content.spacing(4),
-    ]
-    .spacing(2)
-    .into()
+    section_impl(title, None, content)
+}
+
+/// Section heading with an action button inline in the header row.
+fn section_with_header_action<'a>(
+    title: &'static str,
+    action: Element<'a, SettingsMessage>,
+    content: Column<'a, SettingsMessage>,
+) -> Element<'a, SettingsMessage> {
+    section_impl(title, Some(action), content)
+}
+
+/// Shared implementation: renders a section header (plain text or text +
+/// right-aligned action), a spacer, and the content column.
+fn section_impl<'a>(
+    title: &'static str,
+    action: Option<Element<'a, SettingsMessage>>,
+    content: Column<'a, SettingsMessage>,
+) -> Element<'a, SettingsMessage> {
+    let styled_title = text(title)
+        .font(iced::Font::MONOSPACE)
+        .size(16)
+        .color(theme::ACCENT);
+
+    let header: Element<'a, SettingsMessage> = match action {
+        Some(btn) => row![styled_title, Space::new().width(Length::Fill), btn,]
+            .align_y(Alignment::Center)
+            .into(),
+        None => styled_title.into(),
+    };
+
+    column![header, Space::new().height(4), content.spacing(4)]
+        .spacing(2)
+        .into()
 }
 
 /// Label on the left, input on the right, optional hint below.
@@ -1993,7 +2060,7 @@ fn password_input<'a>(
         .secure(!show)
         .on_input(on_input)
         .style(super::widgets::text_input_style)
-        .width(Length::Fixed(250.0))
+        .width(Length::Fixed(375.0))
         .into();
 
     let eye_text: Element<_> = if show {
