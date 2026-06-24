@@ -683,8 +683,9 @@ fn check_git_subcommand_mutation(
 fn extract_git_subcommand(segment: &str) -> String {
     let words: Vec<&str> = segment.split_whitespace().collect();
 
-    // Skip leading env assignments to find "git" (e.g., GIT_DIR=/tmp git push).
-    let git_idx = words.iter().position(|w| !super::is_env_assignment(w));
+    // Skip shell prefixes, env assignments, and flags to find "git"
+    // (e.g., GIT_DIR=/tmp git push, sudo git push, env git push).
+    let git_idx = super::find_first_command_word_index(&words);
     if git_idx.is_none_or(|idx| words[idx] != "git") {
         return String::new();
     }
@@ -1193,6 +1194,31 @@ mod tests {
         }
     }
 
+    /// Tests that ALL delegating shell prefixes correctly expose `git push`
+    /// (a mutating git subcommand) for rejection — ensuring that no prefix
+    /// masks the git command word from read-only validation.
+    #[test]
+    fn shell_prefix_git_push_rejected() {
+        for prefix in SHELL_PREFIXES {
+            match *prefix {
+                "cd" | "pushd" | "popd" | "export" | "source" | "." => {}
+                _ => assert_rejected(&format!("{prefix} git push")),
+            }
+        }
+    }
+
+    /// Tests that ALL delegating shell prefixes still allow safe git commands
+    /// like `git status` through.
+    #[test]
+    fn shell_prefix_git_status_allowed() {
+        for prefix in SHELL_PREFIXES {
+            match *prefix {
+                "cd" | "pushd" | "popd" | "export" | "source" | "." => {}
+                _ => ok(&format!("{prefix} git status")),
+            }
+        }
+    }
+
     #[test]
     fn sudo_flag_rm_rejected() {
         assert_rejected("sudo -E rm file");
@@ -1206,6 +1232,28 @@ mod tests {
     #[test]
     fn sudo_cargo_check_allowed() {
         ok("sudo cargo check");
+    }
+
+    // ── Git prefix bypass regression tests (P0) ────────────────────
+
+    #[test]
+    fn sudo_git_push_rejected() {
+        assert_rejected("sudo git push");
+    }
+
+    #[test]
+    fn env_git_push_rejected() {
+        assert_rejected("env git push");
+    }
+
+    #[test]
+    fn env_sudo_git_push_rejected() {
+        assert_rejected("GIT_DIR=/tmp sudo git push");
+    }
+
+    #[test]
+    fn sudo_git_stash_list_allowed() {
+        ok("sudo git stash list");
     }
 
     #[test]
@@ -1430,11 +1478,30 @@ mod tests {
     }
 
     #[test]
-    fn extract_git_subcommand_shell_prefix_not_skipped() {
-        // Shell prefixes like `sudo` are NOT skipped — only env assignments.
-        // `sudo` is not "git", so this returns empty (read-only validation
-        // will reject the command as unknown).
-        assert_eq!(extract_git_subcommand("sudo git status"), "");
+    fn extract_git_subcommand_with_sudo_skipped() {
+        // Shell prefixes like `sudo` ARE skipped by `find_first_command_word_index`,
+        // so "git" is correctly located and its subcommand extracted.
+        assert_eq!(extract_git_subcommand("sudo git status"), "status");
+    }
+
+    #[test]
+    fn extract_git_subcommand_with_env_skipped() {
+        assert_eq!(extract_git_subcommand("env git status"), "status");
+    }
+
+    #[test]
+    fn extract_git_subcommand_env_and_sudo() {
+        // Combined env assignment + shell prefix
+        assert_eq!(
+            extract_git_subcommand("GIT_DIR=/tmp sudo git status"),
+            "status"
+        );
+    }
+
+    #[test]
+    fn extract_git_subcommand_sudo_push() {
+        // Mutating subcommand with shell prefix — should extract "push"
+        assert_eq!(extract_git_subcommand("sudo git push"), "push");
     }
 
     #[test]

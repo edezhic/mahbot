@@ -817,7 +817,7 @@ pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<
 ///
 /// Shared helper used by [`first_command_word`] and [`canonical_command`]
 /// to avoid duplicating the scanning logic.
-fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
+pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
     words
         .iter()
         .position(|w| !SHELL_PREFIXES.contains(w) && !w.starts_with('-') && !is_env_assignment(w))
