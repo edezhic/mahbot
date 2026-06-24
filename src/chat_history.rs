@@ -17,8 +17,6 @@ global_store! {
     constructor = ChatHistoryStore::open,
 }
 
-/// Schema for fresh databases. The deprecated `session_key` column was
-/// removed in a prior version and is no longer relevant.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS chat_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,10 +108,6 @@ pub struct ChatHistoryStore {
 
 impl ChatHistoryStore {
     /// Open (or create) the chat history database at `root/db/chat_history.db`.
-    ///
-    /// The deprecated `session_key` column was removed in a prior version;
-    /// fresh databases never create it and old databases are unaffected since
-    /// no code reads or writes that column.
     pub async fn open(root: &Path) -> Result<Self> {
         let db_path = root.join("db/chat_history.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
