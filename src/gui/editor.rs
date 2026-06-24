@@ -2063,6 +2063,34 @@ impl EditorState {
         self.rename_target = None;
     }
 
+    /// Start creating a new item (file or directory) in the given parent directory.
+    ///
+    /// Cancels any inline rename, resolves the absolute parent path, and sets up
+    /// the `new_item_input` state so the user can type a name.
+    fn start_new_item_creation(&mut self, parent_dir: String, is_dir: bool) -> Task<EditorMessage> {
+        // Cancel inline rename if open.
+        self.rename_target = None;
+        let Some(ref ws) = self.selected_workspace_path else {
+            return Task::none();
+        };
+        let abs_parent = if parent_dir.is_empty() {
+            ws.clone()
+        } else {
+            Path::new(ws)
+                .join(&parent_dir)
+                .to_string_lossy()
+                .to_string()
+        };
+        self.new_item_input = Some(NewItemTarget {
+            parent_dir,
+            is_dir,
+            abs_parent,
+            ws_root: ws.clone(),
+            input_text: String::new(),
+        });
+        iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
         match msg {
@@ -2541,51 +2569,11 @@ impl EditorState {
             }
 
             EditorMessage::NewFileRequested(parent_dir) => {
-                // Cancel inline rename if open.
-                self.rename_target = None;
-                let Some(ref ws) = self.selected_workspace_path else {
-                    return Task::none();
-                };
-                let abs_parent = if parent_dir.is_empty() {
-                    ws.clone()
-                } else {
-                    Path::new(ws)
-                        .join(&parent_dir)
-                        .to_string_lossy()
-                        .to_string()
-                };
-                self.new_item_input = Some(NewItemTarget {
-                    parent_dir,
-                    is_dir: false,
-                    abs_parent,
-                    ws_root: ws.clone(),
-                    input_text: String::new(),
-                });
-                iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
+                self.start_new_item_creation(parent_dir, false)
             }
 
             EditorMessage::NewDirectoryRequested(parent_dir) => {
-                // Cancel inline rename if open.
-                self.rename_target = None;
-                let Some(ref ws) = self.selected_workspace_path else {
-                    return Task::none();
-                };
-                let abs_parent = if parent_dir.is_empty() {
-                    ws.clone()
-                } else {
-                    Path::new(ws)
-                        .join(&parent_dir)
-                        .to_string_lossy()
-                        .to_string()
-                };
-                self.new_item_input = Some(NewItemTarget {
-                    parent_dir,
-                    is_dir: true,
-                    abs_parent,
-                    ws_root: ws.clone(),
-                    input_text: String::new(),
-                });
-                iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
+                self.start_new_item_creation(parent_dir, true)
             }
 
             EditorMessage::RevealInFinder(path) => Self::perform_reveal_in_finder(path),
