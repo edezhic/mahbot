@@ -569,6 +569,32 @@ pub enum EditorMessage {
     NewItemInput(String),
     /// Internal: reveal-in-finder operation completed (no-op).
     RevealDone,
+    // ── Inline rename ───────────────────────────────────────────
+    /// Context menu: rename a file or directory (starts inline rename).
+    RenameRequested(String),
+    /// User changed the rename input text.
+    RenameInput(String),
+    /// User submitted the rename (Enter pressed in inline input).
+    RenameSubmit,
+    /// User cancelled the inline rename.
+    RenameCancel,
+    /// Async rename operation completed.
+    RenameCompleted {
+        /// Old relative path (workspace-relative).
+        old_path: String,
+        /// New relative path (workspace-relative).
+        new_path: String,
+        /// Whether the renamed item was a directory.
+        is_dir: bool,
+        /// Result of the filesystem rename.
+        result: Result<(), String>,
+        /// Re-read parent directory entries.
+        dir_entries: Result<Vec<FsEntry>, String>,
+        /// Generation counter for the parent directory's `dir_generations`
+        /// slot.  Used for stale-result prevention via the standard
+        /// generation invalidation protocol (see `dir_expanded`).
+        rename_gen: u64,
+    },
 }
 
 // ── Context menu types ──────────────────────────────────────────
@@ -599,6 +625,140 @@ struct NewItemTarget {
     ws_root: String,
     /// Current input text.
     input_text: String,
+}
+
+/// Target for the inline rename operation.
+#[derive(Debug, Clone)]
+struct RenameTarget {
+    /// Full path (relative to workspace root) of the item being renamed.
+    path: String,
+    /// Absolute path of the item being renamed.
+    abs_path: String,
+    /// Whether this is a directory.
+    is_dir: bool,
+    /// Absolute path of the workspace root.
+    ws_root: String,
+    /// Current input text (the new name being edited).
+    input_text: String,
+    /// Optional inline error message (e.g., "File already exists").
+    error: Option<String>,
+}
+
+/// Style for the inline rename text input — transparent background, no border,
+/// matching the appearance of the tree node label it replaces.
+#[must_use]
+fn rename_input_style(_theme: &iced::Theme, _status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: iced::Background::Color(iced::Color::TRANSPARENT),
+        border: iced::Border {
+            radius: 0.0.into(),
+            width: 0.0,
+            color: iced::Color::TRANSPARENT,
+        },
+        icon: theme::TEXT_MUTED,
+        placeholder: theme::TEXT_MUTED,
+        value: theme::TEXT_PRIMARY,
+        selection: theme::ACCENT_DIM,
+    }
+}
+
+/// Validate a user-supplied file/directory name for new-item or rename operations.
+///
+/// Returns `Some(error_message)` when the name is invalid, `None` when it passes
+/// all checks.  Used by both [`NewItemSubmit`] and [`RenameSubmit`] to avoid
+/// duplicating the common validation rules.
+///
+/// Checks performed:
+/// - Empty (or all-whitespace) name
+/// - Path separators (`/`, `\`, NUL)
+/// - Reserved path components (`.`, `..`)
+/// - OS-reserved names (CON, NUL, PRN, AUX, COM1–COM9, LPT1–LPT9)
+#[must_use]
+fn validate_item_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("Name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Some("Name cannot contain path separators");
+    }
+    if name == "." || name == ".." {
+        return Some("Invalid name");
+    }
+    // OS-reserved names (Windows-style, checked on all platforms for safety).
+    let reserved = [
+        "con", "nul", "prn", "aux", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    let stem = name.split('.').next().unwrap_or(name);
+    if reserved.contains(&stem.to_lowercase().as_str()) {
+        return Some("Name is reserved by the operating system");
+    }
+    None
+}
+
+// ── Helpers — prefix-based collection re-keying ───────────────────
+
+/// Re-key entries in a `HashMap<String, V>` whose keys start with
+/// `old_prefix` to use `new_prefix` instead.  Each value passes through
+/// `modify` before re-insertion (use `|_| {}` when no modification is
+/// needed).  The old prefix should include a trailing separator (e.g.
+/// `"old_dir/"`), and `rest` is the portion of the key after it; the
+/// new key is `"{new_prefix}/{rest}"` (or just `new_prefix` when
+/// `rest` is empty — i.e. when the key exactly equals `old_prefix`).
+fn rekey_map_prefix<V>(
+    map: &mut HashMap<String, V>,
+    old_prefix: &str,
+    new_prefix: &str,
+    modify: impl Fn(&mut V),
+) {
+    let keys: Vec<String> = map
+        .keys()
+        .filter(|k| k.starts_with(old_prefix))
+        .cloned()
+        .collect();
+    for k in keys {
+        if let Some(mut v) = map.remove(&k) {
+            modify(&mut v);
+            let rest = k.strip_prefix(old_prefix).unwrap_or("");
+            let new_key = if rest.is_empty() {
+                new_prefix.to_string()
+            } else {
+                format!("{new_prefix}/{rest}")
+            };
+            map.insert(new_key, v);
+        }
+    }
+}
+
+/// Re-key entries in a `HashSet<String>` whose keys start with
+/// `old_prefix` to use `new_prefix` instead.  Same prefix conventions
+/// as [`rekey_map_prefix`].
+fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &str) {
+    let keys: Vec<String> = set
+        .iter()
+        .filter(|k| k.starts_with(old_prefix))
+        .cloned()
+        .collect();
+    for k in keys {
+        set.remove(&k);
+        let rest = k.strip_prefix(old_prefix).unwrap_or("");
+        let new_key = if rest.is_empty() {
+            new_prefix.to_string()
+        } else {
+            format!("{new_prefix}/{rest}")
+        };
+        set.insert(new_key);
+    }
+}
+
+/// Update the `full_path` of a single [`FsEntry`] by replacing `old_prefix`
+/// with `new_prefix` when the path starts with `old_prefix`.  Used during
+/// directory-rename migrations to keep `FsEntry` paths in sync with their
+/// new directory key.
+fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
+    if let Some(tail) = entry.full_path.strip_prefix(old_prefix) {
+        entry.full_path = format!("{new_prefix}/{tail}");
+    }
 }
 
 // ── Helpers — detection ──────────────────────────────────────────
@@ -1295,6 +1455,8 @@ pub struct EditorState {
     delete_confirm: Option<DeleteConfirmTarget>,
     /// Pending new file/directory name input.
     new_item_input: Option<NewItemTarget>,
+    /// Current inline rename target (None when not renaming).
+    rename_target: Option<RenameTarget>,
 }
 
 /// State for the quick-open file picker.
@@ -1348,6 +1510,7 @@ impl EditorState {
             pending_goto: None,
             delete_confirm: None,
             new_item_input: None,
+            rename_target: None,
         }
     }
 
@@ -1373,6 +1536,39 @@ impl EditorState {
         self.file_tree.nodes =
             build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
         self.file_tree.rebuild_visible();
+    }
+
+    /// Build an inline rename [`TextInput`] element for a tree node that is
+    /// currently being renamed.  Returns [`None`] when the node is not the
+    /// rename target, so callers can fall through to their normal label rendering.
+    fn build_rename_input<'a>(
+        &'a self,
+        node: &'a widgets::TreeNode,
+    ) -> Option<Element<'a, EditorMessage>> {
+        let rt = self
+            .rename_target
+            .as_ref()
+            .filter(|rt| rt.path == node.full_path)?;
+        let input: Element<'a, EditorMessage> = text_input("", &rt.input_text)
+            .id(Id::from(format!("rename_input_{}", node.full_path)))
+            .on_input(EditorMessage::RenameInput)
+            .on_submit(EditorMessage::RenameSubmit)
+            .size(12)
+            .padding([0, 2])
+            .style(rename_input_style)
+            .into();
+        // Only wrap in a Column when an inline error needs to be shown
+        // below the input.  The common (no-error) case returns a bare
+        // TextInput to keep widget nesting shallow.
+        if let Some(ref err) = rt.error {
+            Some(
+                column![input, text(err).size(10).color(theme::STATUS_ERROR)]
+                    .spacing(0)
+                    .into(),
+            )
+        } else {
+            Some(input)
+        }
     }
 
     pub fn subscription(&self) -> Subscription<EditorMessage> {
@@ -1569,9 +1765,18 @@ impl EditorState {
             || self.global_search.is_some()
             || self.goto_line_input.is_some()
             || self.new_item_input.is_some()
+            || self.rename_target.is_some()
             || self.close_dialog.is_some()
             || self.close_others_target.is_some()
             || self.delete_confirm.is_some()
+    }
+
+    /// Returns `true` when an inline rename is active.  Tree keyboard
+    /// navigation keys must be suppressed during inline editing — the
+    /// text input handles its own navigation (cursor movement, etc.).
+    #[inline]
+    fn is_renaming(&self) -> bool {
+        self.rename_target.is_some()
     }
 
     /// Save editor tabs to the database for the currently selected workspace.
@@ -1855,6 +2060,7 @@ impl EditorState {
         self.pending_goto = None;
         self.delete_confirm = None;
         self.new_item_input = None;
+        self.rename_target = None;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1876,6 +2082,11 @@ impl EditorState {
             } => self.dir_expanded(&dir_path, r#gen, entries, quiet),
 
             EditorMessage::ToggleDir(dir_path) => {
+                // Cancel inline rename (clicking a tree row while renaming
+                // means the user is dismissing the rename).
+                if self.rename_target.is_some() {
+                    self.rename_target = None;
+                }
                 if self.file_tree.expanded_dirs.contains(&dir_path) {
                     self.file_tree.expanded_dirs.remove(&dir_path);
                     self.rebuild_tree();
@@ -1927,6 +2138,11 @@ impl EditorState {
             }
 
             EditorMessage::SelectFile(path) => {
+                // Cancel inline rename (clicking a tree row while renaming
+                // means the user is dismissing the rename).
+                if self.rename_target.is_some() {
+                    self.rename_target = None;
+                }
                 self.file_tree.tree_focused = false;
                 self.pending_enter_dir = None;
                 // Remember the clicked file's position for Ctrl+B re-focus.
@@ -2276,6 +2492,8 @@ impl EditorState {
 
             // ── Context menu actions ─────────────────────────────────
             EditorMessage::DeleteFileRequested(path) => {
+                // Cancel inline rename if open (mutual exclusion).
+                self.rename_target = None;
                 let Some(ref ws) = self.selected_workspace_path else {
                     return Task::none();
                 };
@@ -2290,6 +2508,8 @@ impl EditorState {
             }
 
             EditorMessage::DeleteDirectoryRequested(path) => {
+                // Cancel inline rename if open (mutual exclusion).
+                self.rename_target = None;
                 // Guard: don't allow deleting the root directory.
                 if path.is_empty() {
                     return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
@@ -2322,6 +2542,8 @@ impl EditorState {
             }
 
             EditorMessage::NewFileRequested(parent_dir) => {
+                // Cancel inline rename if open.
+                self.rename_target = None;
                 let Some(ref ws) = self.selected_workspace_path else {
                     return Task::none();
                 };
@@ -2344,6 +2566,8 @@ impl EditorState {
             }
 
             EditorMessage::NewDirectoryRequested(parent_dir) => {
+                // Cancel inline rename if open.
+                self.rename_target = None;
                 let Some(ref ws) = self.selected_workspace_path else {
                     return Task::none();
                 };
@@ -2393,14 +2617,9 @@ impl EditorState {
                     return Task::none();
                 };
                 let trimmed = name.trim();
-                if trimmed.is_empty()
-                    || trimmed.contains('/')
-                    || trimmed.contains('\0')
-                    || trimmed == "."
-                    || trimmed == ".."
-                {
+                if let Some(msg) = validate_item_name(trimmed) {
                     return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
-                        "Invalid name".into(),
+                        msg.into(),
                     )));
                 }
                 self.new_item_input = None;
@@ -2412,6 +2631,353 @@ impl EditorState {
                     target.input_text = new_text;
                 }
                 Task::none()
+            }
+
+            // ── Inline rename ────────────────────────────────────────────
+            EditorMessage::RenameRequested(path) => {
+                let Some(ref ws) = self.selected_workspace_path else {
+                    return Task::none();
+                };
+                // Guard: don't allow renaming root directory.
+                if path.is_empty() {
+                    return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
+                        "Cannot rename root directory".into(),
+                    )));
+                }
+                // Cancel new-item dialog and delete confirmation if open
+                // (mutual exclusion — only one modal state at a time).
+                self.new_item_input = None;
+                self.delete_confirm = None;
+                let abs_path = self.abs_path(&path);
+                let file_name = Path::new(&abs_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // Determine if it's a directory by checking the actual filesystem.
+                let is_dir = Path::new(&abs_path).is_dir();
+
+                self.rename_target = Some(RenameTarget {
+                    abs_path,
+                    ws_root: ws.clone(),
+                    path: path.clone(),
+                    is_dir,
+                    input_text: file_name,
+                    error: None,
+                });
+                iced::widget::operation::focus::<EditorMessage>(Id::from(format!(
+                    "rename_input_{path}"
+                )))
+            }
+
+            EditorMessage::RenameInput(new_text) => {
+                if let Some(ref mut target) = self.rename_target {
+                    target.input_text = new_text;
+                    // Clear error when user starts typing again.
+                    if target.error.is_some() {
+                        target.error = None;
+                    }
+                }
+                Task::none()
+            }
+
+            EditorMessage::RenameSubmit => {
+                let Some(target) = self.rename_target.clone() else {
+                    return Task::none();
+                };
+                // All-space names fall through to the empty-name check below.
+                let trimmed = target.input_text.trim().to_string();
+
+                // ── Validation ────────────────────────────────────────
+                // validate_item_name covers empty name, path separators,
+                // dot/dotdot, and OS-reserved names.
+                let error_msg = validate_item_name(&trimmed);
+                if let Some(msg) = error_msg {
+                    if let Some(ref mut rt) = self.rename_target {
+                        rt.error = Some(msg.into());
+                    }
+                    return Task::none();
+                }
+
+                // Compute the new absolute and relative paths.
+                let parent_dir = Path::new(&target.path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let new_rel_path = if parent_dir.is_empty() {
+                    trimmed.clone()
+                } else {
+                    format!("{parent_dir}/{trimmed}")
+                };
+                let new_abs_path = Path::new(&target.ws_root)
+                    .join(&new_rel_path)
+                    .to_string_lossy()
+                    .to_string();
+
+                // Check if target already exists.
+                if Path::new(&new_abs_path).exists() {
+                    if let Some(ref mut rt) = self.rename_target {
+                        rt.error = Some("A file or directory with that name already exists".into());
+                    }
+                    return Task::none();
+                }
+
+                // All validations passed — clear the inline rename state
+                // and fire the async rename task.
+                self.rename_target = None;
+
+                let old_abs = target.abs_path.clone();
+                let old_rel = target.path.clone();
+                let is_dir = target.is_dir;
+                let parent_dir_clone = parent_dir;
+                let ws_root = target.ws_root.clone();
+                // Follow the same generation-based invalidation protocol as
+                // every other async directory operation (ToggleDir, TreeNavEnter,
+                // perform_create_item, etc.): bump self.generation and register
+                // it in dir_generations so that any in-flight DirExpanded for
+                // this directory is invalidated (its generation won't match).
+                let dir_gen = self.generation.wrapping_add(1);
+                self.generation = dir_gen;
+                self.dir_generations
+                    .insert(parent_dir_clone.clone(), dir_gen);
+
+                Task::perform(
+                    async move {
+                        // Handle case-only rename on case-insensitive filesystems
+                        // via a two-step rename through a temporary name.
+                        let old_lower = old_rel.to_lowercase();
+                        let new_lower = new_rel_path.to_lowercase();
+                        let result = if old_lower == new_lower && old_rel != new_rel_path {
+                            // Case-only rename: rename to a temp name first, then to the target.
+                            let temp_name = format!(
+                                "{}_{}",
+                                &trimmed,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_nanos())
+                            );
+                            let temp_abs = Path::new(&ws_root)
+                                .join(&parent_dir_clone)
+                                .join(&temp_name)
+                                .to_string_lossy()
+                                .to_string();
+                            if let Err(e) = tokio::fs::rename(&old_abs, &temp_abs).await {
+                                Err(format!("Rename failed: {e}"))
+                            } else {
+                                tokio::fs::rename(&temp_abs, &new_abs_path)
+                                    .await
+                                    .map_err(|e| format!("Rename failed: {e}"))
+                            }
+                        } else {
+                            tokio::fs::rename(&old_abs, &new_abs_path)
+                                .await
+                                .map_err(|e| format!("Rename failed: {e}"))
+                        };
+
+                        // Re-read parent directory regardless of success/failure
+                        // so the tree reflects the current filesystem state.
+                        let entries = read_directory_entries(&ws_root, &parent_dir_clone).await;
+
+                        EditorMessage::RenameCompleted {
+                            old_path: old_rel,
+                            new_path: new_rel_path,
+                            is_dir,
+                            result,
+                            dir_entries: entries,
+                            rename_gen: dir_gen,
+                        }
+                    },
+                    |msg| msg,
+                )
+            }
+
+            EditorMessage::RenameCancel => {
+                self.rename_target = None;
+                Task::none()
+            }
+
+            EditorMessage::RenameCompleted {
+                old_path,
+                new_path,
+                is_dir,
+                result,
+                dir_entries,
+                rename_gen,
+            } => {
+                // Stale-result prevention via the standard dir_generations
+                // protocol (same as dir_expanded).  Compute the parent dir
+                // and check if we still own the generation slot.
+                let re_path = Path::new(&old_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if !re_path.is_empty() && self.dir_generations.get(&re_path) != Some(&rename_gen) {
+                    return Task::none();
+                }
+                // Own the generation — consume it so a future operation can
+                // take the slot.
+                self.dir_generations.remove(&re_path);
+
+                match result {
+                    Ok(()) => {
+                        // ── Update selected_file if it matches ────
+                        if self.selected_file.as_deref() == Some(&old_path) {
+                            self.selected_file = Some(new_path.clone());
+                        }
+
+                        // ── Update open tab paths ────────────────
+                        let old_abs = self.abs_path(&old_path);
+                        let new_abs = self.abs_path(&new_path);
+
+                        // Build a prefix-based replacement for directory renames.
+                        if is_dir {
+                            let old_prefix = format!("{old_abs}/");
+                            for tab in &mut self.tabs {
+                                if tab.path.starts_with(&old_prefix) {
+                                    let rest = tab.path.strip_prefix(&old_prefix).unwrap_or("");
+                                    tab.path = format!("{new_abs}/{rest}");
+                                    tab.file_name = Path::new(&tab.path)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                }
+                            }
+                            // Re-key tab_contents for affected files.
+                            rekey_map_prefix(
+                                &mut self.tab_contents,
+                                &format!("{}/", &old_abs),
+                                &new_abs,
+                                |_| {},
+                            );
+
+                            // Update expanded_dirs to replace old_path with new_path.
+                            if self.file_tree.expanded_dirs.remove(&old_path) {
+                                self.file_tree.expanded_dirs.insert(new_path.clone());
+                            }
+                            // Also update any child expanded dirs (e.g., dir/subdir → newdir/subdir).
+                            rekey_set_prefix(
+                                &mut self.file_tree.expanded_dirs,
+                                &format!("{old_path}/"),
+                                &new_path,
+                            );
+
+                            // Migrate dir_entries for child paths so expanded children
+                            // don't vanish on rebuild.  build_hierarchical_tree looks up
+                            // each expanded directory in dir_entries by full_path, so we
+                            // must re-key those entries under the new prefix and update
+                            // each entry's full_path to reflect the new path.
+                            let old_entries_prefix = format!("{old_path}/");
+                            let new_path_clone = new_path.clone();
+                            rekey_map_prefix(
+                                &mut self.dir_entries,
+                                &old_entries_prefix,
+                                &new_path,
+                                |entries: &mut Vec<FsEntry>| {
+                                    for entry in entries.iter_mut() {
+                                        update_entry_path(
+                                            entry,
+                                            &old_entries_prefix,
+                                            &new_path_clone,
+                                        );
+                                    }
+                                },
+                            );
+
+                            // Also migrate the renamed directory's own dir_entries entry
+                            // so it doesn't vanish from the tree on rebuild.
+                            // Must update the child entries' full_path to reflect the
+                            // new path prefix (same as the child-entries loop above).
+                            if let Some(mut own_entries) = self.dir_entries.remove(&old_path) {
+                                for entry in &mut own_entries {
+                                    update_entry_path(entry, &old_entries_prefix, &new_path);
+                                }
+                                self.dir_entries.insert(new_path.clone(), own_entries);
+                            }
+                        } else {
+                            // File rename: update single tab.
+                            for tab in &mut self.tabs {
+                                if tab.path == old_abs {
+                                    tab.path.clone_from(&new_abs);
+                                    tab.file_name = Path::new(&new_abs)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    break;
+                                }
+                            }
+                            if let Some(data) = self.tab_contents.remove(&old_abs) {
+                                self.tab_contents.insert(new_abs.clone(), data);
+                            }
+                        }
+
+                        // ── Migrate file_mtimes and deleted_file_toasted ──
+                        // Re-key entries from old absolute path to new absolute
+                        // path so auto-refresh doesn't spuriously stat the old path.
+                        if is_dir {
+                            let old_abs_prefix = format!("{old_abs}/");
+                            rekey_map_prefix(
+                                &mut self.file_mtimes,
+                                &old_abs_prefix,
+                                &new_abs,
+                                |_| {},
+                            );
+                            rekey_set_prefix(
+                                &mut self.deleted_file_toasted,
+                                &old_abs_prefix,
+                                &new_abs,
+                            );
+                        } else {
+                            // File rename — migrate single entry.
+                            if let Some(mtime) = self.file_mtimes.remove(&old_abs) {
+                                self.file_mtimes.insert(new_abs.clone(), mtime);
+                            }
+                            if self.deleted_file_toasted.remove(&old_abs) {
+                                self.deleted_file_toasted.insert(new_abs);
+                            }
+                        }
+
+                        // ── Update dir entries and rebuild tree ───
+                        match dir_entries {
+                            Ok(entries) => {
+                                // re_path was computed at the top of the
+                                // handler for the staleness check; we own
+                                // the generation slot, so insert unconditionally.
+                                self.dir_entries.insert(re_path, entries);
+                                self.rebuild_tree();
+                                // Focus on the renamed entry.
+                                self.file_tree.focus_path(&new_path);
+                            }
+                            Err(e) => {
+                                self.rebuild_tree();
+                                return Task::done(EditorMessage::Toast(
+                                    super::ToastMessage::Error(format!(
+                                        "Rename succeeded but failed to refresh tree: {e}"
+                                    )),
+                                ));
+                            }
+                        }
+
+                        Task::batch([
+                            self.save_current_tabs().unwrap_or(Task::none()),
+                            Task::done(EditorMessage::Toast(super::ToastMessage::SuccessMsg(
+                                format!("Renamed \"{old_path}\" → \"{new_path}\""),
+                            ))),
+                        ])
+                    }
+                    Err(e) => {
+                        // re_path is already computed at the top of the
+                        // handler; we own the generation slot.
+                        match dir_entries {
+                            Ok(entries) => {
+                                self.dir_entries.insert(re_path, entries);
+                                self.rebuild_tree();
+                            }
+                            Err(_) => {
+                                self.rebuild_tree();
+                            }
+                        }
+                        Task::done(EditorMessage::Toast(super::ToastMessage::Error(e)))
+                    }
+                }
             }
 
             EditorMessage::RevealDone => Task::none(),
@@ -2499,6 +3065,10 @@ impl EditorState {
 
             // ── Tree keyboard navigation ─────────────────────────────
             EditorMessage::TreeFocusToggled => {
+                // Suppress during inline rename.
+                if self.is_renaming() {
+                    return Task::none();
+                }
                 self.file_tree.tree_focused = !self.file_tree.tree_focused;
                 if self.file_tree.tree_focused && self.file_tree.visible_tree_nodes.is_empty() {
                     self.file_tree.rebuild_visible();
@@ -2511,6 +3081,10 @@ impl EditorState {
             }
 
             EditorMessage::TreeNavUp => {
+                // Suppress during inline rename.
+                if self.is_renaming() {
+                    return Task::none();
+                }
                 // When global search is active, navigate the results list.
                 if let Some(ref mut gs) = self.global_search {
                     if gs.selected_index > 0 {
@@ -2533,6 +3107,10 @@ impl EditorState {
             }
 
             EditorMessage::TreeNavDown => {
+                // Suppress during inline rename.
+                if self.is_renaming() {
+                    return Task::none();
+                }
                 // When global search is active, navigate the results list.
                 if let Some(ref mut gs) = self.global_search {
                     if gs.selected_index + 1 < gs.results.len() {
@@ -2557,6 +3135,10 @@ impl EditorState {
             }
 
             EditorMessage::TreeNavEnter => {
+                // Suppress during inline rename.
+                if self.is_renaming() {
+                    return Task::none();
+                }
                 // When global search is active, Enter selects the highlighted result.
                 // Borrow to extract the index without cloning the entire state.
                 if let Some(gs) = self.global_search.as_ref() {
@@ -2634,6 +3216,10 @@ impl EditorState {
             }
 
             EditorMessage::TreeNavLeft => {
+                // Suppress during inline rename.
+                if self.is_renaming() {
+                    return Task::none();
+                }
                 if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
                     return Task::none();
                 }
@@ -2668,6 +3254,10 @@ impl EditorState {
             }
 
             EditorMessage::TreeNavRight => {
+                // Suppress during inline rename.
+                if self.is_renaming() {
+                    return Task::none();
+                }
                 if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
                     return Task::none();
                 }
@@ -3686,7 +4276,12 @@ impl EditorState {
             self.quick_open = None;
             return Task::none();
         }
-        // Close new-item input (before tree focus, after quick-open).
+        // Close rename inline editor (before new-item, after quick-open).
+        if self.rename_target.is_some() {
+            self.rename_target = None;
+            return Task::none();
+        }
+        // Close new-item input (before tree focus, after quick-open/rename).
         if self.new_item_input.is_some() {
             self.new_item_input = None;
             return Task::none();
@@ -4253,8 +4848,9 @@ impl EditorState {
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
 
         let icon_element: Element<'_, EditorMessage> = icon.size(13).color(icon_color).into();
-        let name_element: Element<'_, EditorMessage> =
-            text(label_text).size(12).color(label_color).into();
+        let name_element: Element<'_, EditorMessage> = self
+            .build_rename_input(node)
+            .unwrap_or_else(|| text(label_text).size(12).color(label_color).into());
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
         let ctx_menu = self.render_tree_node_row(
@@ -4271,6 +4867,10 @@ impl EditorState {
                 (
                     "New Directory".into(),
                     EditorMessage::NewDirectoryRequested(node.full_path.clone()),
+                ),
+                (
+                    "Rename".into(),
+                    EditorMessage::RenameRequested(node.full_path.clone()),
                 ),
                 (
                     "Delete".into(),
@@ -4336,30 +4936,33 @@ impl EditorState {
             iced::font::Weight::Normal
         };
 
-        let name_text: Element<'a, EditorMessage> = if node.error.is_some() {
-            row![
-                text(&node.name)
-                    .size(12)
-                    .color(name_color)
-                    .font(iced::Font {
-                        weight: name_weight,
-                        ..theme::FONT_REGULAR
-                    }),
-                Space::new().width(4),
-                text("[⚠]").size(11).color(theme::STATUS_ERROR),
-            ]
-            .align_y(Alignment::Center)
-            .into()
-        } else {
-            text(&node.name)
-                .size(12)
-                .color(name_color)
-                .font(iced::Font {
-                    weight: name_weight,
-                    ..theme::FONT_REGULAR
-                })
-                .into()
-        };
+        let name_text: Element<'a, EditorMessage> =
+            self.build_rename_input(node).unwrap_or_else(|| {
+                if node.error.is_some() {
+                    row![
+                        text(&node.name)
+                            .size(12)
+                            .color(name_color)
+                            .font(iced::Font {
+                                weight: name_weight,
+                                ..theme::FONT_REGULAR
+                            }),
+                        Space::new().width(4),
+                        text("[⚠]").size(11).color(theme::STATUS_ERROR),
+                    ]
+                    .align_y(Alignment::Center)
+                    .into()
+                } else {
+                    text(&node.name)
+                        .size(12)
+                        .color(name_color)
+                        .font(iced::Font {
+                            weight: name_weight,
+                            ..theme::FONT_REGULAR
+                        })
+                        .into()
+                }
+            });
 
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
 
@@ -4371,10 +4974,16 @@ impl EditorState {
             name_text,
             is_selected || is_focused,
             EditorMessage::SelectFile(node.full_path.clone()),
-            vec![(
-                "Delete".into(),
-                EditorMessage::DeleteFileRequested(node.full_path.clone()),
-            )],
+            vec![
+                (
+                    "Rename".into(),
+                    EditorMessage::RenameRequested(node.full_path.clone()),
+                ),
+                (
+                    "Delete".into(),
+                    EditorMessage::DeleteFileRequested(node.full_path.clone()),
+                ),
+            ],
             &node.full_path,
         )
     }
@@ -6918,5 +7527,440 @@ mod tests {
         });
         let _ = state.update(EditorMessage::GlobalSearchToggle);
         assert!(state.global_search.is_none());
+    }
+
+    // ── Inline rename tests ────────────────────────────────────
+
+    #[test]
+    fn test_rename_request_sets_target() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        assert!(state.rename_target.is_some());
+        let rt = state.rename_target.unwrap();
+        assert_eq!(rt.path, "Cargo.toml");
+        assert_eq!(rt.input_text, "Cargo.toml");
+        assert!(!rt.is_dir);
+    }
+
+    #[test]
+    fn test_rename_request_on_directory_sets_is_dir() {
+        // Use a real temp directory so Path::is_dir() returns true.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir_path = tmp_dir.path().join("src");
+        std::fs::create_dir(&dir_path).unwrap();
+        let mut state = EditorState::new();
+        state.selected_workspace_path = Some(tmp_dir.path().to_string_lossy().to_string());
+        state.dir_entries.insert(
+            String::new(),
+            vec![FsEntry {
+                name: "src".to_string(),
+                full_path: "src".to_string(),
+                is_dir: true,
+                error: None,
+            }],
+        );
+        let _ = state.update(EditorMessage::RenameRequested("src".into()));
+        assert!(state.rename_target.is_some());
+        let rt = state.rename_target.unwrap();
+        assert_eq!(rt.path, "src");
+        assert_eq!(rt.input_text, "src");
+        assert!(rt.is_dir);
+    }
+
+    #[test]
+    fn test_rename_request_on_root_dir_rejected() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        let _ = state.update(EditorMessage::RenameRequested(String::new()));
+        assert!(state.rename_target.is_none());
+    }
+
+    #[test]
+    fn test_rename_input_updates_text_and_clears_error() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        // Simulate a validation error
+        state.rename_target.as_mut().unwrap().error = Some("bad".into());
+        // Type new text
+        let _ = state.update(EditorMessage::RenameInput("new_name".into()));
+        assert_eq!(state.rename_target.as_ref().unwrap().input_text, "new_name");
+        // Error should be cleared when user types
+        assert!(state.rename_target.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn test_rename_cancel_clears_target() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        assert!(state.rename_target.is_some());
+        let _ = state.update(EditorMessage::RenameCancel);
+        assert!(state.rename_target.is_none());
+    }
+
+    #[test]
+    fn test_escape_cancels_rename() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        assert!(state.rename_target.is_some());
+        let _ = state.update(EditorMessage::Escape);
+        assert!(state.rename_target.is_none());
+    }
+
+    #[test]
+    fn test_tree_nav_suppressed_during_rename() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        // Expand "src" so TreeNavEnter/TreeNavLeft/TreeNavRight have targets.
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = true;
+        // Focus on "src" so TreeNavLeft (collapse) and TreeNavRight (expand)
+        // have an effect when not suppressed.
+        state.file_tree.tree_focus_index = 0; // "src"
+
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        let prev_focus = state.file_tree.tree_focus_index;
+        // All 6 tree-navigation messages must be suppressed during rename.
+        let nav_msgs: &[EditorMessage] = &[
+            EditorMessage::TreeNavUp,
+            EditorMessage::TreeNavDown,
+            EditorMessage::TreeNavEnter,
+            EditorMessage::TreeNavLeft,
+            EditorMessage::TreeNavRight,
+            EditorMessage::TreeFocusToggled,
+        ];
+        for msg in nav_msgs {
+            let _ = state.update(msg.clone());
+            assert_eq!(
+                state.file_tree.tree_focus_index, prev_focus,
+                "{msg:?} should be suppressed during rename"
+            );
+        }
+        // After the rename is cancelled, navigation should work again.
+        let _ = state.update(EditorMessage::RenameCancel);
+        let _ = state.update(EditorMessage::TreeNavDown);
+        // Focus should have moved now that rename is gone.
+        assert_ne!(state.file_tree.tree_focus_index, prev_focus);
+    }
+
+    #[test]
+    fn test_rename_mutual_exclusion_with_new_item() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+
+        // Start rename, then NewFileRequested should cancel it.
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        assert!(state.rename_target.is_some());
+        let _ = state.update(EditorMessage::NewFileRequested("src".into()));
+        assert!(state.rename_target.is_none());
+        assert!(state.new_item_input.is_some());
+
+        // Clear new_item, start rename again — rename should cancel new_item.
+        state.new_item_input = None;
+        let _ = state.update(EditorMessage::NewFileRequested(String::new()));
+        assert!(state.new_item_input.is_some());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        assert!(state.rename_target.is_some());
+        assert!(state.new_item_input.is_none());
+    }
+
+    // ── Rename validation tests ────────────────────────────────
+
+    /// Helper: set up state for rename validation tests.
+    fn setup_rename_state(state: &mut EditorState, input_text: &str) {
+        state.selected_workspace_path = Some("/tmp".to_string());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        state.rename_target.as_mut().unwrap().input_text = input_text.to_string();
+    }
+
+    #[test]
+    fn test_rename_validation_empty_name() {
+        let mut state = make_editor_with_tree();
+        setup_rename_state(&mut state, "   ");
+        let _ = state.update(EditorMessage::RenameSubmit);
+        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        assert_eq!(err, Some("Name cannot be empty"));
+    }
+
+    #[test]
+    fn test_rename_validation_path_separators() {
+        let mut state = make_editor_with_tree();
+        setup_rename_state(&mut state, "foo/bar.rs");
+        let _ = state.update(EditorMessage::RenameSubmit);
+        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        assert_eq!(err, Some("Name cannot contain path separators"));
+
+        // Backslash
+        let mut state = make_editor_with_tree();
+        setup_rename_state(&mut state, "foo\\bar.rs");
+        let _ = state.update(EditorMessage::RenameSubmit);
+        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        assert_eq!(err, Some("Name cannot contain path separators"));
+
+        // Null byte
+        let mut state = make_editor_with_tree();
+        setup_rename_state(&mut state, "foo\0bar.rs");
+        let _ = state.update(EditorMessage::RenameSubmit);
+        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        assert_eq!(err, Some("Name cannot contain path separators"));
+    }
+
+    #[test]
+    fn test_rename_validation_dot_dotdot() {
+        let mut state = make_editor_with_tree();
+        setup_rename_state(&mut state, ".");
+        let _ = state.update(EditorMessage::RenameSubmit);
+        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        assert_eq!(err, Some("Invalid name"));
+
+        let mut state = make_editor_with_tree();
+        setup_rename_state(&mut state, "..");
+        let _ = state.update(EditorMessage::RenameSubmit);
+        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        assert_eq!(err, Some("Invalid name"));
+    }
+
+    #[test]
+    fn test_rename_validation_os_reserved_names() {
+        let reserved = ["con", "NUL", "prn", "AUX", "com1", "lpt3"];
+        for name in &reserved {
+            let mut state = make_editor_with_tree();
+            setup_rename_state(&mut state, name);
+            let _ = state.update(EditorMessage::RenameSubmit);
+            let err = state.rename_target.as_ref().unwrap().error.as_deref();
+            assert_eq!(
+                err,
+                Some("Name is reserved by the operating system"),
+                "expected '{name}' to be rejected as reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rename_validation_target_already_exists() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let ws = tmp_dir.path().to_string_lossy().to_string();
+        // Create a file that would conflict.
+        let existing = tmp_dir.path().join("existing.txt");
+        std::fs::write(&existing, "").unwrap();
+
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some(ws.clone());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        state.rename_target.as_mut().unwrap().input_text = "existing.txt".to_string();
+        let _ = state.update(EditorMessage::RenameSubmit);
+        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        assert_eq!(
+            err,
+            Some("A file or directory with that name already exists")
+        );
+    }
+
+    #[test]
+    fn test_rename_stale_generation_discarded() {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        // Expand src so it's visible for RenameRequested.
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.rebuild_tree();
+
+        // Dispatch a rename for a non-root path (src/main.rs) so that the
+        // staleness check in RenameCompleted (which only applies when the
+        // parent dir is non-empty) is actually exercised.
+        let _ = state.update(EditorMessage::RenameRequested("src/main.rs".into()));
+        state.rename_target.as_mut().unwrap().input_text = "lib.rs".to_string();
+        let _ = state.update(EditorMessage::RenameSubmit);
+
+        // Simulate a stale RenameCompleted whose rename_gen does not
+        // match the current dir_generations entry for the parent dir ("src").
+        // It passes dir_entries: Ok(vec![]) — if the staleness guard fails and
+        // this result is applied, it would overwrite dir_entries["src"] with
+        // an empty vec, losing the original children.
+        let task = state.update(EditorMessage::RenameCompleted {
+            old_path: "src/main.rs".into(),
+            new_path: "src/lib.rs".into(),
+            is_dir: false,
+            result: Ok(()),
+            dir_entries: Ok(vec![]),
+            rename_gen: 0, // stale — doesn't match dir_generations["src"]
+        });
+        // The stale result should be a no-op (discarded silently).
+        let _ = task;
+        // dir_entries["src"] must still contain its original entries — if
+        // the stale result were applied, the empty vec would have replaced them.
+        let src_entries = state.dir_entries.get("src");
+        assert!(
+            src_entries.is_some(),
+            "dir_entries[\"src\"] should still exist"
+        );
+        if let Some(entries) = src_entries {
+            assert_eq!(entries.len(), 1, "should still have one entry");
+            assert_eq!(entries[0].name, "main.rs");
+            assert_eq!(entries[0].full_path, "src/main.rs");
+        }
+        // selected_file should not have been updated.
+        assert_eq!(state.selected_file, None);
+    }
+
+    // ── Click-outside cancel tests (consolidated) ───────────────
+
+    #[test]
+    fn test_rename_cancelled_by_tree_click() {
+        // Both ToggleDir and SelectFile should cancel a pending rename.
+        let triggers: &[EditorMessage] = &[
+            EditorMessage::ToggleDir("src".into()),
+            EditorMessage::SelectFile("src/main.rs".into()),
+        ];
+        for trigger in triggers {
+            let mut state = make_editor_with_tree();
+            state.selected_workspace_path = Some("/tmp".to_string());
+            let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+            assert!(
+                state.rename_target.is_some(),
+                "rename should be active before {trigger:?}"
+            );
+            let _ = state.update(trigger.clone());
+            assert!(
+                state.rename_target.is_none(),
+                "rename should be cancelled by {trigger:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rename_mutual_exclusion_cancelled_by_other_modals() {
+        // Starting a different modal operation should cancel an active rename.
+        // Each test case carries a message to dispatch and a check closure
+        // that verifies the expected modal state after the message fires.
+        struct Case {
+            msg: EditorMessage,
+            /// Assert the expected modal state after the message fires.
+            check: fn(&EditorState),
+        }
+        let cases: &[Case] = &[
+            Case {
+                msg: EditorMessage::NewFileRequested("src".into()),
+                check: |s| assert!(s.new_item_input.is_some()),
+            },
+            Case {
+                msg: EditorMessage::NewDirectoryRequested("src".into()),
+                check: |s| assert!(s.new_item_input.is_some()),
+            },
+            Case {
+                msg: EditorMessage::DeleteFileRequested("other.rs".into()),
+                check: |s| {
+                    assert!(s.delete_confirm.is_some());
+                    assert_eq!(s.delete_confirm.as_ref().unwrap().path, "other.rs");
+                },
+            },
+            Case {
+                msg: EditorMessage::DeleteDirectoryRequested("src".into()),
+                check: |s| {
+                    assert!(s.delete_confirm.is_some());
+                    assert_eq!(s.delete_confirm.as_ref().unwrap().path, "src");
+                },
+            },
+        ];
+        for case in cases {
+            let mut state = make_editor_with_tree();
+            state.selected_workspace_path = Some("/tmp".to_string());
+
+            // Start rename.
+            let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+            assert!(state.rename_target.is_some(), "case {:?}", case.msg);
+
+            // Fire the competing modal message.
+            let _ = state.update(case.msg.clone());
+            assert!(
+                state.rename_target.is_none(),
+                "rename should be cancelled by {:?}",
+                case.msg
+            );
+            (case.check)(&state);
+        }
+    }
+
+    #[test]
+    fn test_rename_dir_entries_migration_own_entry_and_full_path() {
+        // Verify that after a directory rename completes, the renamed
+        // directory's own dir_entries key is migrated (old_path -> new_path)
+        // and child entries have their full_path fields updated.
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+
+        // Set up state as if the user expanded "src" and we have its children.
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        // Add a subdirectory entry for recursive testing.
+        state.dir_entries.insert(
+            "src/subdir".to_string(),
+            vec![FsEntry {
+                name: "helper.rs".to_string(),
+                full_path: "src/subdir/helper.rs".to_string(),
+                is_dir: false,
+                error: None,
+            }],
+        );
+
+        // Simulate a rename of "src" -> "lib" completing successfully.
+        let _ = state.update(EditorMessage::RenameCompleted {
+            old_path: "src".into(),
+            new_path: "lib".into(),
+            is_dir: true,
+            result: Ok(()),
+            dir_entries: Ok(vec![FsEntry {
+                name: "lib".to_string(),
+                full_path: "lib".to_string(),
+                is_dir: true,
+                error: None,
+            }]),
+            rename_gen: 0, // matches default dir_generations for ""
+        });
+
+        // The directory's own dir_entries entry should be migrated.
+        assert!(
+            !state.dir_entries.contains_key("src"),
+            "old path key should be removed"
+        );
+        let own_entries = state.dir_entries.get("lib");
+        assert!(
+            own_entries.is_some(),
+            "new path key should exist for the renamed directory"
+        );
+        // The own-key entry's children must have their full_path updated.
+        if let Some(entries) = own_entries {
+            assert_eq!(entries.len(), 1, "src had one child (main.rs)");
+            assert_eq!(entries[0].full_path, "lib/main.rs");
+        }
+
+        // The child directory entry should be migrated with updated full_path.
+        let child_entries = state.dir_entries.get("lib/subdir");
+        assert!(
+            child_entries.is_some(),
+            "child dir_entries key should be migrated"
+        );
+        if let Some(entries) = child_entries {
+            if let Some(entry) = entries.first() {
+                assert_eq!(
+                    entry.full_path, "lib/subdir/helper.rs",
+                    "entry full_path should be updated to new prefix"
+                );
+            }
+        }
+
+        // The expanded_dirs should have been migrated.
+        assert!(
+            !state.file_tree.expanded_dirs.contains("src"),
+            "old expanded_dir should be removed"
+        );
+        assert!(
+            state.file_tree.expanded_dirs.contains("lib"),
+            "new expanded_dir should exist"
+        );
     }
 }
