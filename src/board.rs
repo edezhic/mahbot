@@ -254,8 +254,11 @@ pub struct Ticket {
     pub lines_added: Option<i64>,
     /// Lines removed (non-negative) from the associated commit.
     pub lines_removed: Option<i64>,
-    /// Who created this ticket — set by the tool at construction time.
-    /// Either "manager" or "maintainer"; "" for pre-migration tickets.
+    /// Creator/tool identity — set at construction time.
+    /// Also used in the GUI board display: when the value matches a known role
+    /// name, the role's display label is shown (e.g. "Manager"); otherwise the
+    /// content is shown with the first character uppercased (e.g. "Test" for
+    /// "test"). Empty string for pre-migration tickets.
     pub reporter: String,
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
