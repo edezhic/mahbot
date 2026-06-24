@@ -1088,9 +1088,8 @@ mod tests {
 
     #[test]
     fn test_embedder_init() {
-        let emb = match test_embedder() {
-            Some(e) => e,
-            None => return, // Skip if no model available
+        let Some(emb) = test_embedder() else {
+            return; // Skip if no model available
         };
         let v = emb.embed_documents(&["hello world"]).unwrap();
         assert_eq!(v.len(), 1);
@@ -1106,10 +1105,7 @@ mod tests {
 
     #[test]
     fn test_embed_documents() {
-        let emb = match test_embedder() {
-            Some(e) => e,
-            None => return,
-        };
+        let Some(emb) = test_embedder() else { return };
         let docs = &["first document", "second document about something"];
         let v = emb.embed_documents(docs).unwrap();
         assert_eq!(v.len(), 2);
@@ -1125,10 +1121,7 @@ mod tests {
 
     #[test]
     fn test_embed_queries() {
-        let emb = match test_embedder() {
-            Some(e) => e,
-            None => return,
-        };
+        let Some(emb) = test_embedder() else { return };
         let v = emb.embed_queries(&["what is rust?"]).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].len(), 768);
@@ -1136,10 +1129,7 @@ mod tests {
 
     #[test]
     fn test_similar_embeddings_are_similar() {
-        let emb = match test_embedder() {
-            Some(e) => e,
-            None => return,
-        };
+        let Some(emb) = test_embedder() else { return };
         let v = emb
             .embed_documents(&[
                 "rust programming language",
@@ -1157,10 +1147,7 @@ mod tests {
 
     #[test]
     fn test_empty_input_fails() {
-        let emb = match test_embedder() {
-            Some(e) => e,
-            None => return,
-        };
+        let Some(emb) = test_embedder() else { return };
         let result = emb.embed_documents(&[]);
         assert!(result.is_err(), "empty input should produce an error");
     }
