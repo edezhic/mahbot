@@ -370,16 +370,17 @@ impl DiffState {
             }
             DiffMessage::ToggleDir(path) => {
                 self.file_tree.tree_focused = true;
-                let path_clone = path.clone();
-                if self.file_tree.expanded_dirs.contains(&path_clone) {
-                    self.file_tree.expanded_dirs.remove(&path_clone);
-                } else {
-                    self.file_tree.expanded_dirs.insert(path_clone);
+                if self.file_tree.expanded_dirs.contains(&path) {
+                    self.file_tree.expanded_dirs.remove(&path);
+                    self.file_tree.nodes = build_tree(&self.diff_files);
+                    return self
+                        .file_tree
+                        .collapse_dir_and_keep_focus::<DiffMessage>(&path);
                 }
-                // Rebuild tree with updated expanded state.
+                self.file_tree.expanded_dirs.insert(path.clone());
+                // Expand: rebuild, keep focus on the directory (don't advance).
                 self.file_tree.nodes = build_tree(&self.diff_files);
                 self.file_tree.rebuild_visible();
-                // Place focus on the toggled directory.
                 self.file_tree.focus_path(&path);
                 Task::none()
             }
@@ -617,28 +618,26 @@ impl DiffState {
                     .file_tree
                     .tree_focus_index
                     .min(self.file_tree.visible_tree_nodes.len() - 1);
-                let (ref path, is_dir) = self.file_tree.visible_tree_nodes[idx];
+                let path = self.file_tree.visible_tree_nodes[idx].0.clone();
+                let is_dir = self.file_tree.visible_tree_nodes[idx].1;
                 if is_dir {
-                    // Expand directory and move focus to the first child.
-                    if self.file_tree.expanded_dirs.contains(path) {
-                        self.file_tree.expanded_dirs.remove(path);
+                    if self.file_tree.expanded_dirs.contains(&path) {
+                        // Collapse: rebuild and keep focus on the collapsed directory.
+                        self.file_tree.expanded_dirs.remove(&path);
                         self.file_tree.nodes = build_tree(&self.diff_files);
-                        self.file_tree.rebuild_visible();
-                        return Task::none();
+                        return self
+                            .file_tree
+                            .collapse_dir_and_keep_focus::<DiffMessage>(&path);
                     }
+                    // Expand directory and move focus to the first child.
                     self.file_tree.expanded_dirs.insert(path.clone());
                     self.file_tree.nodes = build_tree(&self.diff_files);
-                    self.file_tree.rebuild_visible();
-                    // Move focus to first child (right after the directory).
-                    if idx + 1 < self.file_tree.visible_tree_nodes.len() {
-                        self.file_tree.tree_focus_index = idx + 1;
-                        return widgets::scroll_to_tree_focus(&self.file_tree);
-                    }
-                    Task::none()
-                } else {
-                    // Open file.
-                    Task::done(DiffMessage::SelectFile(path.clone()))
+                    return self
+                        .file_tree
+                        .expand_dir_and_focus_first_child::<DiffMessage>(&path);
                 }
+                // Open file.
+                Task::done(DiffMessage::SelectFile(path))
             }
 
             DiffMessage::TreeNavLeft => {
@@ -656,11 +655,9 @@ impl DiffState {
                     // Collapse expanded directory and keep focus on it.
                     self.file_tree.expanded_dirs.remove(&path);
                     self.file_tree.nodes = build_tree(&self.diff_files);
-                    self.file_tree.rebuild_visible();
-                    if self.file_tree.focus_path(&path).is_some() {
-                        return widgets::scroll_to_tree_focus(&self.file_tree);
-                    }
-                    return Task::none();
+                    return self
+                        .file_tree
+                        .collapse_dir_and_keep_focus::<DiffMessage>(&path);
                 }
 
                 // ArrowLeft on collapsed directory or file — navigate to parent.
@@ -693,18 +690,12 @@ impl DiffState {
                 }
 
                 if !self.file_tree.expanded_dirs.contains(&path) {
-                    // Expand directory.
+                    // Expand directory and move focus to the first child.
                     self.file_tree.expanded_dirs.insert(path.clone());
                     self.file_tree.nodes = build_tree(&self.diff_files);
-                    self.file_tree.rebuild_visible();
-                    // Move focus to first child (right after the directory).
-                    if let Some(dir_idx) = self.file_tree.focus_path(&path) {
-                        if dir_idx + 1 < self.file_tree.visible_tree_nodes.len() {
-                            self.file_tree.tree_focus_index = dir_idx + 1;
-                            return widgets::scroll_to_tree_focus(&self.file_tree);
-                        }
-                    }
-                    return Task::none();
+                    return self
+                        .file_tree
+                        .expand_dir_and_focus_first_child::<DiffMessage>(&path);
                 }
 
                 // Already expanded directory — move focus to first child (if any).
@@ -1897,6 +1888,82 @@ mod tests {
         let _ = state.update(DiffMessage::TreeNavRight);
         // ArrowRight on file does nothing
         assert_eq!(state.file_tree.tree_focus_index, 1);
+    }
+
+    // ── TreeNavEnter tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_diff_tree_nav_enter_on_collapsed_dir_expands_and_advances() {
+        let mut state = make_diff_with_tree();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src" (collapsed)
+
+        let _ = state.update(DiffMessage::TreeNavEnter);
+        assert!(state.file_tree.expanded_dirs.contains("src"));
+        // After expanding, focus moves to first child (sorted: lib.rs before main.rs).
+        assert!(state.file_tree.tree_focus_index < state.file_tree.visible_tree_nodes.len());
+        assert_eq!(
+            state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn test_diff_tree_nav_enter_on_expanded_dir_collapses_and_keeps_focus() {
+        let mut state = make_diff_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes = build_tree(&state.diff_files);
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src" (already expanded)
+
+        let _ = state.update(DiffMessage::TreeNavEnter);
+        // Directory should be collapsed.
+        assert!(!state.file_tree.expanded_dirs.contains("src"));
+        // Focus should remain on "src".
+        assert_eq!(state.file_tree.tree_focus_index, 0);
+        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
+    }
+
+    #[test]
+    fn test_diff_tree_nav_enter_on_file_does_not_expand_or_collapse() {
+        let mut state = make_diff_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes = build_tree(&state.diff_files);
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 1; // "src/main.rs" (file)
+
+        let expanded_before = state.file_tree.expanded_dirs.clone();
+        let _ = state.update(DiffMessage::TreeNavEnter);
+        // File should not trigger any expand/collapse — tree unchanged.
+        assert_eq!(state.file_tree.expanded_dirs, expanded_before);
+        // tree_focused remains true (SelectFile does not clear it).
+        assert!(state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_diff_tree_nav_enter_not_focused_noop() {
+        let mut state = make_diff_with_tree();
+        state.file_tree.tree_focused = false;
+        let focus_before = state.file_tree.tree_focus_index;
+
+        let _ = state.update(DiffMessage::TreeNavEnter);
+        // No state changes when not focused.
+        assert_eq!(state.file_tree.tree_focus_index, focus_before);
+        assert!(!state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_diff_tree_nav_enter_empty_tree_noop() {
+        let mut state = DiffState::new();
+        state.file_tree.tree_focused = true;
+
+        let _ = state.update(DiffMessage::TreeNavEnter);
+        // Empty tree, no diff_files — tree focus unchanged.
+        assert!(state.file_tree.visible_tree_nodes.is_empty());
+        assert!(state.file_tree.tree_focused);
+        assert_eq!(state.file_tree.tree_focus_index, 0);
     }
 
     // ── Click-to-select focus index tests ────────────────────────────

@@ -2117,51 +2117,55 @@ impl EditorState {
                 }
                 if self.file_tree.expanded_dirs.contains(&dir_path) {
                     self.file_tree.expanded_dirs.remove(&dir_path);
+                    self.file_tree.nodes = build_hierarchical_tree(
+                        &self.dir_entries,
+                        &self.file_tree.expanded_dirs,
+                        "",
+                    );
+                    // Place focus on the collapsed directory.
+                    self.file_tree.tree_focused = true;
+                    return self
+                        .file_tree
+                        .collapse_dir_and_keep_focus::<EditorMessage>(&dir_path);
+                }
+                self.file_tree.expanded_dirs.insert(dir_path.clone());
+
+                if !self.dir_entries.contains_key(&dir_path) {
+                    let Some(ref ws_path) = self.selected_workspace_path else {
+                        tracing::error!("ToggleDir without workspace selected");
+                        return Task::none();
+                    };
+                    let dir_gen = self.generation.wrapping_add(1);
+                    self.generation = dir_gen;
+                    self.dir_generations.insert(dir_path.clone(), dir_gen);
+                    self.loading_dirs.insert(dir_path.clone());
+
+                    let d_path = dir_path.clone();
+                    let r_path = ws_path.clone();
+                    let read_task = Task::perform(
+                        async move {
+                            let entries = read_directory_entries(&r_path, &d_path).await;
+                            EditorMessage::DirExpanded {
+                                dir_path: d_path,
+                                r#gen: dir_gen,
+                                entries,
+                                quiet: false,
+                            }
+                        },
+                        |msg| msg,
+                    );
+
                     self.rebuild_tree();
                     self.file_tree.tree_focused = true;
-                    // Place focus on the collapsed directory.
+                    // Place focus on the expanding directory.
+                    self.file_tree.focus_path(&dir_path);
+                    read_task
+                } else {
+                    self.rebuild_tree();
+                    self.file_tree.tree_focused = true;
+                    // Place focus on the expanding directory.
                     self.file_tree.focus_path(&dir_path);
                     Task::none()
-                } else {
-                    self.file_tree.expanded_dirs.insert(dir_path.clone());
-
-                    if !self.dir_entries.contains_key(&dir_path) {
-                        let Some(ref ws_path) = self.selected_workspace_path else {
-                            tracing::error!("ToggleDir without workspace selected");
-                            return Task::none();
-                        };
-                        let dir_gen = self.generation.wrapping_add(1);
-                        self.generation = dir_gen;
-                        self.dir_generations.insert(dir_path.clone(), dir_gen);
-                        self.loading_dirs.insert(dir_path.clone());
-
-                        let d_path = dir_path.clone();
-                        let r_path = ws_path.clone();
-                        let read_task = Task::perform(
-                            async move {
-                                let entries = read_directory_entries(&r_path, &d_path).await;
-                                EditorMessage::DirExpanded {
-                                    dir_path: d_path,
-                                    r#gen: dir_gen,
-                                    entries,
-                                    quiet: false,
-                                }
-                            },
-                            |msg| msg,
-                        );
-
-                        self.rebuild_tree();
-                        self.file_tree.tree_focused = true;
-                        // Place focus on the expanding directory.
-                        self.file_tree.focus_path(&dir_path);
-                        read_task
-                    } else {
-                        self.rebuild_tree();
-                        self.file_tree.tree_focused = true;
-                        // Place focus on the expanding directory.
-                        self.file_tree.focus_path(&dir_path);
-                        Task::none()
-                    }
                 }
             }
 
@@ -3144,19 +3148,25 @@ impl EditorState {
                     .file_tree
                     .tree_focus_index
                     .min(self.file_tree.visible_tree_nodes.len() - 1);
-                let (ref path, is_dir) = self.file_tree.visible_tree_nodes[idx];
+                let path = self.file_tree.visible_tree_nodes[idx].0.clone();
+                let is_dir = self.file_tree.visible_tree_nodes[idx].1;
                 if is_dir {
-                    // Expand directory and move focus to the first child.
-                    if self.file_tree.expanded_dirs.contains(path) {
-                        // Collapse: remove from expanded, rebuild, keep focus.
-                        self.file_tree.expanded_dirs.remove(path);
-                        self.rebuild_tree();
-                        return Task::none();
+                    if self.file_tree.expanded_dirs.contains(&path) {
+                        // Collapse: rebuild and keep focus on the collapsed directory.
+                        self.file_tree.expanded_dirs.remove(&path);
+                        self.file_tree.nodes = build_hierarchical_tree(
+                            &self.dir_entries,
+                            &self.file_tree.expanded_dirs,
+                            "",
+                        );
+                        return self
+                            .file_tree
+                            .collapse_dir_and_keep_focus::<EditorMessage>(&path);
                     }
                     // Expand: insert, rebuild, jump to first child.
                     self.file_tree.expanded_dirs.insert(path.clone());
                     let mut task = Task::none();
-                    let needs_async_load = !self.dir_entries.contains_key(path);
+                    let needs_async_load = !self.dir_entries.contains_key(&path);
                     if needs_async_load {
                         let Some(ref ws_path) = self.selected_workspace_path else {
                             tracing::error!("TreeNavEnter without workspace selected");
@@ -3183,23 +3193,24 @@ impl EditorState {
                         // Remember to advance focus to first child after async load.
                         self.pending_enter_dir = Some(path.clone());
                     }
-                    self.rebuild_tree();
+                    self.file_tree.nodes = build_hierarchical_tree(
+                        &self.dir_entries,
+                        &self.file_tree.expanded_dirs,
+                        "",
+                    );
                     if needs_async_load {
                         // Children not loaded yet — keep focus on directory,
                         // DirExpanded will advance focus when data arrives.
                         return task;
                     }
                     // Synchronous expansion — children available immediately.
-                    // Move focus to the first child (right after the directory).
-                    if idx + 1 < self.file_tree.visible_tree_nodes.len() {
-                        self.file_tree.tree_focus_index = idx + 1;
-                        return Task::batch([widgets::scroll_to_tree_focus(&self.file_tree), task]);
-                    }
-                    // No children — keep focus on directory.
-                    return task;
+                    let scroll = self
+                        .file_tree
+                        .expand_dir_and_focus_first_child::<EditorMessage>(&path);
+                    return Task::batch([scroll, task]);
                 }
                 // Open file.
-                Task::done(EditorMessage::SelectFile(path.clone()))
+                Task::done(EditorMessage::SelectFile(path))
             }
 
             EditorMessage::TreeNavLeft => {
@@ -3220,11 +3231,14 @@ impl EditorState {
                 if is_dir && self.file_tree.expanded_dirs.contains(&path) {
                     // Collapse expanded directory and keep focus on it.
                     self.file_tree.expanded_dirs.remove(&path);
-                    self.rebuild_tree();
-                    if self.file_tree.focus_path(&path).is_some() {
-                        return widgets::scroll_to_tree_focus(&self.file_tree);
-                    }
-                    return Task::none();
+                    self.file_tree.nodes = build_hierarchical_tree(
+                        &self.dir_entries,
+                        &self.file_tree.expanded_dirs,
+                        "",
+                    );
+                    return self
+                        .file_tree
+                        .collapse_dir_and_keep_focus::<EditorMessage>(&path);
                 }
 
                 // ArrowLeft on collapsed directory or file — navigate to parent.
@@ -3291,23 +3305,20 @@ impl EditorState {
                         // DirExpanded will advance focus to first child.
                         self.pending_enter_dir = Some(path.clone());
                     }
-                    self.rebuild_tree();
+                    self.file_tree.nodes = build_hierarchical_tree(
+                        &self.dir_entries,
+                        &self.file_tree.expanded_dirs,
+                        "",
+                    );
                     if needs_async_load {
                         // Keep focus on directory until async load completes.
                         return task;
                     }
                     // Synchronous expansion — children available now.
-                    if let Some(dir_idx) = self.file_tree.focus_path(&path) {
-                        if dir_idx + 1 < self.file_tree.visible_tree_nodes.len() {
-                            self.file_tree.tree_focus_index = dir_idx + 1;
-                            return Task::batch([
-                                widgets::scroll_to_tree_focus(&self.file_tree),
-                                task,
-                            ]);
-                        }
-                    }
-                    // No children — keep focus on directory.
-                    return task;
+                    let scroll = self
+                        .file_tree
+                        .expand_dir_and_focus_first_child::<EditorMessage>(&path);
+                    return Task::batch([scroll, task]);
                 }
 
                 // Already expanded directory — move focus to first child (if any).
@@ -4030,19 +4041,15 @@ impl EditorState {
         match entries {
             Ok(entries) => {
                 self.dir_entries.insert(dir_path.to_string(), entries);
-                self.rebuild_tree();
+                self.file_tree.nodes =
+                    build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
                 // If this was triggered by Enter-on-directory, advance
                 // focus to the first child now that children are loaded.
                 if self.pending_enter_dir.as_deref() == Some(dir_path) {
                     self.pending_enter_dir = None;
-                    // Find the directory's position in the new visible list
-                    // and advance to the first child.
-                    if let Some(pos) = self.file_tree.focus_path(dir_path) {
-                        if pos + 1 < self.file_tree.visible_tree_nodes.len() {
-                            self.file_tree.tree_focus_index = pos + 1;
-                            return widgets::scroll_to_tree_focus(&self.file_tree);
-                        }
-                    }
+                    return self
+                        .file_tree
+                        .expand_dir_and_focus_first_child::<EditorMessage>(dir_path);
                 }
             }
             Err(e) => {

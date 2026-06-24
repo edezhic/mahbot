@@ -257,6 +257,56 @@ impl FileTree {
         self.tree_focus_index = pos;
         Some(pos)
     }
+
+    /// Expand a directory and move keyboard focus to its first child.
+    ///
+    /// Caller must have already inserted `path` into [`expanded_dirs`](Self::expanded_dirs)
+    /// and updated [`nodes`](Self::nodes). This method rebuilds the visible tree, locates
+    /// the directory in the new flattened list via [`Self::focus_path`], advances focus
+    /// to the entry immediately after it (the first child), and returns a scroll-into-view
+    /// task.
+    ///
+    /// Returns [`Task::none()`] if the directory is no longer in the visible tree or has
+    /// no children — focus stays on the directory itself in that case.
+    pub fn expand_dir_and_focus_first_child<Message: 'static>(
+        &mut self,
+        path: &str,
+    ) -> Task<Message> {
+        debug_assert!(
+            self.expanded_dirs.contains(path),
+            "expand_dir_and_focus_first_child: path must be in expanded_dirs before calling"
+        );
+        self.rebuild_visible();
+        if let Some(dir_idx) = self.focus_path(path) {
+            if dir_idx + 1 < self.visible_tree_nodes.len() {
+                self.tree_focus_index = dir_idx + 1;
+                return scroll_to_tree_focus(self);
+            }
+        }
+        Task::none()
+    }
+
+    /// Collapse an expanded directory and keep keyboard focus on it.
+    ///
+    /// Caller must have already removed `path` from [`expanded_dirs`](Self::expanded_dirs)
+    /// and updated [`nodes`](Self::nodes). This method rebuilds the visible tree,
+    /// re-focuses the now-collapsed directory via [`Self::focus_path`], and returns a
+    /// scroll-into-view task.
+    ///
+    /// Returns [`Task::none()`] if the directory is no longer in the visible tree —
+    /// focus is left at whatever position it ended up at after rebuilding.
+    pub fn collapse_dir_and_keep_focus<Message: 'static>(&mut self, path: &str) -> Task<Message> {
+        debug_assert!(
+            !self.expanded_dirs.contains(path),
+            "collapse_dir_and_keep_focus: path must have been removed from expanded_dirs \
+             before calling"
+        );
+        self.rebuild_visible();
+        if self.focus_path(path).is_some() {
+            return scroll_to_tree_focus(self);
+        }
+        Task::none()
+    }
 }
 
 /// Font size for file tree item labels and connector guides.
@@ -626,5 +676,139 @@ mod tests {
     fn guide_prefix_depth_overflow_debug() {
         // debug_assert fires at depth >= 64 in debug builds.
         let _ = tree_guide_prefix(0, 64, false);
+    }
+
+    // ── expand_dir_and_focus_first_child / collapse_dir_and_keep_focus tests ──
+
+    /// Build a `FileTree` with a `src/` directory containing `lib.rs` and `main.rs`.
+    /// The returned tree has `nodes` populated (pre-sorted) and `visible_tree_nodes`
+    /// initially empty. Callers expand/collapse `"src"` as needed and call the helpers.
+    fn tree_with_src_dir() -> FileTree {
+        let mut tree = FileTree::new(iced::widget::Id::new("test"));
+        tree.nodes = vec![TreeNode {
+            name: "src".into(),
+            full_path: "src".into(),
+            is_dir: true,
+            children: vec![
+                TreeNode {
+                    name: "lib.rs".into(),
+                    full_path: "src/lib.rs".into(),
+                    is_dir: false,
+                    children: vec![],
+                    error: None,
+                },
+                TreeNode {
+                    name: "main.rs".into(),
+                    full_path: "src/main.rs".into(),
+                    is_dir: false,
+                    children: vec![],
+                    error: None,
+                },
+            ],
+            error: None,
+        }];
+        tree
+    }
+
+    #[test]
+    fn expand_dir_advances_to_first_child() {
+        let mut tree = tree_with_src_dir();
+        tree.expanded_dirs.insert("src".into());
+        // No visible nodes yet — rebuild is part of the helper.
+        assert!(tree.visible_tree_nodes.is_empty());
+
+        let _task = tree.expand_dir_and_focus_first_child::<()>("src");
+
+        // Rebuilt visible tree: src, src/lib.rs, src/main.rs
+        assert_eq!(tree.visible_tree_nodes.len(), 3);
+        assert_eq!(tree.visible_tree_nodes[0].0, "src");
+        assert_eq!(tree.visible_tree_nodes[1].0, "src/lib.rs");
+        assert_eq!(tree.visible_tree_nodes[2].0, "src/main.rs");
+        // Focus advances to the first child (right after "src").
+        assert_eq!(tree.tree_focus_index, 1);
+    }
+
+    #[test]
+    fn expand_dir_no_children_stays_on_dir() {
+        let mut tree = tree_with_src_dir();
+        tree.expanded_dirs.insert("src".into());
+        // Remove children so the directory has no expandable content.
+        tree.nodes[0].children.clear();
+
+        let _task = tree.expand_dir_and_focus_first_child::<()>("src");
+
+        // Only "src" in the visible tree.
+        assert_eq!(tree.visible_tree_nodes.len(), 1);
+        assert_eq!(tree.visible_tree_nodes[0].0, "src");
+        // Focus stays on "src" because there is no child to advance to.
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn expand_dir_not_in_expanded_dirs_panics_in_debug() {
+        let mut tree = tree_with_src_dir();
+        // Intentionally NOT inserting into expanded_dirs — the debug_assert
+        // should fire. Use a catch_unwind to avoid test failure in release builds.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _task = tree.expand_dir_and_focus_first_child::<()>("src");
+        }));
+        // In debug builds this panics; in release builds it doesn't.
+        #[cfg(debug_assertions)]
+        assert!(
+            result.is_err(),
+            "debug_assert should fire when path not in expanded_dirs"
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(result.is_ok(), "no panic expected in release builds");
+    }
+
+    #[test]
+    fn collapse_dir_keeps_focus_on_directory() {
+        let mut tree = tree_with_src_dir();
+        // Pre-expand so collapsing has an effect.
+        tree.expanded_dirs.insert("src".into());
+        tree.rebuild_visible();
+        assert_eq!(tree.visible_tree_nodes.len(), 3); // src, lib.rs, main.rs
+
+        // Now collapse — remove from expanded_dirs and call the helper.
+        tree.expanded_dirs.remove("src");
+        let _task = tree.collapse_dir_and_keep_focus::<()>("src");
+
+        // Collapsed: only "src" visible.
+        assert_eq!(tree.visible_tree_nodes.len(), 1);
+        assert_eq!(tree.visible_tree_nodes[0].0, "src");
+        // Focus stays on "src".
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn collapse_dir_not_in_visible_tree_still_finds_it() {
+        let mut tree = tree_with_src_dir();
+        // "src" has been removed from expanded_dirs and visible_tree_nodes is empty.
+        // Even without an explicit rebuild_visible first, the helper should
+        // rebuild and find "src" since it's still in nodes.
+        let _task = tree.collapse_dir_and_keep_focus::<()>("src");
+
+        // After rebuild_visible, "src" should appear (it's in nodes).
+        assert_eq!(tree.visible_tree_nodes.len(), 1);
+        assert_eq!(tree.visible_tree_nodes[0].0, "src");
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn collapse_dir_still_in_expanded_dirs_panics_in_debug() {
+        let mut tree = tree_with_src_dir();
+        tree.expanded_dirs.insert("src".into());
+        // Call without removing from expanded_dirs first — debug_assert fires.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _task = tree.collapse_dir_and_keep_focus::<()>("src");
+        }));
+        #[cfg(debug_assertions)]
+        assert!(
+            result.is_err(),
+            "debug_assert should fire when path still in expanded_dirs"
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(result.is_ok(), "no panic expected in release builds");
     }
 }
