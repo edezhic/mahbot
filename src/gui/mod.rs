@@ -1387,7 +1387,7 @@ impl Dashboard {
                     .size(16)
                     .color(color)
                     .into(),
-                Page::Settings => lucide::cog::<iced::Theme, iced::Renderer>()
+                Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>()
                     .size(16)
                     .color(color)
                     .into(),
