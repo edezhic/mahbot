@@ -560,8 +560,9 @@ impl WorkspaceStorage {
         let now = turso::now();
         let val: i64 = i64::from(enabled);
         if enabled {
-            // Reset debounce state so the maintainer runs at the next 5-minute
-            // poll, regardless of how long the previous debounce interval was.
+            // Reset debounce state so the maintainer runs on the very next
+            // 1-minute poll cycle (last_run_at = NULL bypasses the debounce
+            // gate), regardless of how long the previous interval was.
             self.conn
                 .execute(
                     "UPDATE workspaces SET maintenance = ?1, maintainer_debounce_mins = 5, maintainer_last_run_at = NULL, updated_at = ?2 WHERE name = ?3",

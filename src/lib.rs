@@ -117,8 +117,10 @@ pub struct Workspace {
     pub maintenance: bool,
     /// Whether the pipeline is paused for this workspace (no new tickets claimed).
     pub paused: bool,
-    /// Minutes until the next maintainer run (5 → 10 → 20 → … → 240 cap).
-    /// Reset to 5 when a run produces tickets, doubled on empty runs.
+    /// Minutes until the next maintainer run.
+    /// Reset to 1 when a run creates tickets; doubled on empty runs
+    /// (clamped to [5, 240] before doubling, hard‑capped at 240).
+    /// Sequence after ticket creation: 1 → (if next empty) 10 → 20 → … → 240.
     pub maintainer_debounce_mins: i64,
     /// RFC 3339 timestamp of the last completed maintainer run.
     /// `None` means the workspace has never been maintained.
