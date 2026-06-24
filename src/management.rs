@@ -385,7 +385,7 @@ pub async fn run_management() {
 /// to [`TicketPhase::Failed`] with notification so the manager can investigate.
 fn spawn_dispatch(board: &'static BoardStore, phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let phase_info = phase.info();
-    let target_phase = phase_info.target;
+    let target_phase = phase_info.claim_target;
 
     info!(
         ticket = %ticket.id,
@@ -498,7 +498,7 @@ const QA_VI: VerifierInfo = VerifierInfo {
 #[derive(Copy, Clone)]
 struct PollPhaseInfo {
     source: TicketPhase,
-    target: TicketPhase,
+    claim_target: TicketPhase,
     /// Whether this phase requires a clear pipeline (only one ticket at a
     /// time through development → review → QA).
     require_clear_pipeline: bool,
@@ -526,25 +526,25 @@ impl PollPhase {
         match self {
             Self::BacklogAnalysis => PollPhaseInfo {
                 source: TicketPhase::Backlog,
-                target: TicketPhase::Analysis,
+                claim_target: TicketPhase::Analysis,
                 require_clear_pipeline: false,
                 role_label: Role::Analyst.as_str(),
             },
             Self::EngineerDevelopment => PollPhaseInfo {
                 source: TicketPhase::ReadyForDevelopment,
-                target: TicketPhase::InDevelopment,
+                claim_target: TicketPhase::InDevelopment,
                 require_clear_pipeline: true,
                 role_label: Role::Engineer.as_str(),
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
                 source: TicketPhase::InDiagnostics,
-                target: TicketPhase::InDiagnostics,
+                claim_target: TicketPhase::InDiagnostics,
                 require_clear_pipeline: false,
                 role_label: "diagnostics",
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
                 source: vi.source,
-                target: vi.active_phase,
+                claim_target: vi.active_phase,
                 require_clear_pipeline: false,
                 role_label: vi.role.as_str(),
             },
@@ -564,7 +564,7 @@ impl PollPhase {
     }
 }
 
-/// Pipeline phases that use atomic source→target claim transitions.
+/// Pipeline phases that use atomic source→claim_target claim transitions.
 ///
 /// DiagnosticsCheck is intentionally excluded — it keeps the ticket in
 /// InDiagnostics while running and guards re-dispatch via `assigned_to`.
@@ -632,7 +632,7 @@ async fn poll_round() -> anyhow::Result<()> {
                 let ticket = match board
                     .claim_ticket_in_workspace(
                         info.source,
-                        info.target,
+                        info.claim_target,
                         &ws.name,
                         info.require_clear_pipeline,
                     )
@@ -640,7 +640,7 @@ async fn poll_round() -> anyhow::Result<()> {
                 {
                     Ok(Some(t)) => {
                         // Buffer the claim transition. The returned ticket already
-                        // has status = info.target (from SQL RETURNING), so record
+                        // has status = info.claim_target (from SQL RETURNING), so record
                         // the transition from info.source.
                         ticket_buffer::push(
                             &ws.name,
