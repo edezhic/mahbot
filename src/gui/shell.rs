@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use iced::widget::{Space, button, column, container, row, scrollable, text};
-use iced::{Alignment, Element, Length, Subscription, Task};
+use iced::{Alignment, Element, Length, Size, Subscription, Task};
 use iced_fonts::lucide;
-use iced_term::TerminalView;
+use iced_term::{BackendCommand, TerminalView};
 
 use super::context_menu::ContextMenu;
 use super::theme;
@@ -107,6 +107,10 @@ pub struct ShellState {
     workspace_states: HashMap<String, WorkspaceShellState>,
     /// Monotonically increasing counter for unique terminal IDs.
     next_term_id: u64,
+    /// The most recent layout pixel size captured from `BackendCommand::Resize`
+    /// events.  Replayed onto newly created terminals so they immediately get
+    /// the correct character grid instead of the tiny ~8×2 default.
+    last_seen_layout_size: Option<Size>,
 }
 
 impl ShellState {
@@ -115,6 +119,7 @@ impl ShellState {
             selected_workspace_name: None,
             workspace_states: HashMap::new(),
             next_term_id: 0,
+            last_seen_layout_size: None,
         }
     }
 
@@ -125,9 +130,16 @@ impl ShellState {
     /// are silently ignored — in practice workspace paths don't change after
     /// selection, so this asymmetry is harmless.
     fn ensure_workspace_state(&mut self, ws_name: &str, working_dir: Option<String>) {
+        let layout_size = self.last_seen_layout_size;
         self.workspace_states
             .entry(ws_name.to_string())
-            .or_insert_with(|| Self::new_workspace_state(&mut self.next_term_id, working_dir));
+            .or_insert_with(|| {
+                let mut ws = Self::new_workspace_state(&mut self.next_term_id, working_dir);
+                if let Some(tab) = ws.tabs.first_mut() {
+                    Self::replay_layout_size(&mut tab.terminal, layout_size);
+                }
+                ws
+            });
     }
 
     /// Build a fresh workspace state with one default tab.
@@ -182,6 +194,18 @@ impl ShellState {
                 terminal,
             }),
             Err(e) => Err(format!("Failed to create terminal: {e}")),
+        }
+    }
+
+    /// If a known layout pixel size has been captured from a previous
+    /// terminal, replay it onto `terminal` so it immediately gets the
+    /// correct character grid instead of the tiny ~8×2 default.
+    fn replay_layout_size(terminal: &mut iced_term::Terminal, layout_size: Option<Size>) {
+        if let Some(size) = layout_size {
+            let _ = terminal.handle(iced_term::Command::ProxyToBackend(BackendCommand::Resize(
+                Some(size),
+                None,
+            )));
         }
     }
 
@@ -404,6 +428,13 @@ impl ShellState {
                 Task::none()
             }
             ShellMessage::TerminalEvent(iced_term::Event::BackendCall(id, cmd)) => {
+                // Capture the most recent layout resize so we can replay it
+                // onto newly created terminals (see NewTab / TabClosed /
+                // ensure_workspace_state).
+                if let BackendCommand::Resize(Some(layout_size), _) = &cmd {
+                    self.last_seen_layout_size = Some(*layout_size);
+                }
+
                 // Route event by terminal ID across ALL workspaces.
                 // We subscribe to all terminals globally to prevent PTY stalls,
                 // so the handler must match globally too — matching only the
@@ -443,8 +474,12 @@ impl ShellState {
                         let label = "Shell 1";
                         let wd = ws_state.workspace_path.clone();
                         match ShellState::spawn_one_terminal(&mut self.next_term_id, label, wd) {
-                            Ok(tab) => {
+                            Ok(mut tab) => {
                                 ws_state.label_counter = 1;
+                                Self::replay_layout_size(
+                                    &mut tab.terminal,
+                                    self.last_seen_layout_size,
+                                );
                                 ws_state.tabs.push(tab);
                                 ws_state.active_idx = 0;
                                 ws_state.spawn_error = None;
@@ -475,9 +510,10 @@ impl ShellState {
                     let label = format!("Shell {next_counter}");
                     let wd = ws_state.workspace_path.clone();
                     match ShellState::spawn_one_terminal(&mut self.next_term_id, &label, wd) {
-                        Ok(tab) => {
+                        Ok(mut tab) => {
                             ws_state.label_counter = next_counter;
                             let new_idx = ws_state.tabs.len();
+                            Self::replay_layout_size(&mut tab.terminal, self.last_seen_layout_size);
                             ws_state.tabs.push(tab);
                             ws_state.active_idx = new_idx;
                             ws_state.spawn_error = None;
