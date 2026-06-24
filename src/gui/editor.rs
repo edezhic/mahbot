@@ -3145,7 +3145,7 @@ impl EditorState {
                     return Task::done(EditorMessage::GlobalSearchSelect(idx));
                 }
                 // When quick-open is active, Enter selects the highlighted file.
-                if let Some(ref qo) = self.quick_open.clone() {
+                if let Some(ref qo) = self.quick_open {
                     let idx = qo.selected_index.min(qo.results.len().saturating_sub(1));
                     return Task::done(EditorMessage::QuickOpenSelect(idx));
                 }
