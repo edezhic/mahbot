@@ -806,7 +806,7 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
 //   the spawned task.
 
 /// Transition a QaPassed ticket to Done with a descriptive reason.
-async fn move_ticket_to_done(board: &BoardStore, ticket: &Ticket, reason: &str) {
+async fn transition_qa_to_done(board: &BoardStore, ticket: &Ticket, reason: &str) {
     info!(ticket = %ticket.id, "{reason}");
     if let Err(e) = transition_ticket(
         board,
@@ -836,7 +836,7 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
     if !crate::diff_parse::git_is_installed().await {
-        move_ticket_to_done(
+        transition_qa_to_done(
             board,
             &ticket,
             "Git not installed — moving to Done without commit",
@@ -846,7 +846,7 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
     }
 
     if !crate::diff_parse::is_git_repo(repo_path).await {
-        move_ticket_to_done(
+        transition_qa_to_done(
             board,
             &ticket,
             "Not a git repo — moving to Done without commit",
@@ -869,7 +869,7 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
     };
 
     if !has_changes {
-        move_ticket_to_done(
+        transition_qa_to_done(
             board,
             &ticket,
             "Clean working tree — moving to Done without commit",
@@ -905,7 +905,7 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
             }
 
             // Transition to Done.
-            move_ticket_to_done(
+            transition_qa_to_done(
                 board,
                 &ticket,
                 &format!("Committed {short_hash}, moving to Done"),
