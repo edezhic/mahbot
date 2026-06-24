@@ -958,8 +958,7 @@ fn last_token_pool_and_l2_normalize(
 
     // Sum attention mask along seq dimension to find last real token position
     // last_pos = sum(mask) - 1 (0-indexed)
-    let mask_f32 = attention_mask.to_dtype(DType::F32)?;
-    let seq_lengths: Vec<i64> = mask_f32.sum(1)?.to_vec1()?;
+    let seq_lengths: Vec<i64> = attention_mask.sum(1)?.to_vec1()?;
 
     for (i, &seq_len) in seq_lengths.iter().enumerate().take(batch_size) {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
