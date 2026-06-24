@@ -197,12 +197,22 @@ pub enum Message {
     /// Toggle the selected workspace's pipeline pause state.
     TogglePause,
     /// Result of a per-workspace pause toggle DB write. Carries (result, workspace_name, intended_state).
-    /// On error, local state is reverted and an error toast is shown.
+    /// On success, workspace state is refreshed from DB; on error an error toast is shown.
     TogglePauseResult(Result<(), String>, String, bool),
-    /// Workspace options loaded during boot (options, paths, paused, restored selection).
+    /// Toggle the selected workspace's maintainer toggle.
+    ToggleMaintenance,
+    /// Result of a per-workspace maintenance toggle DB write.
+    ToggleMaintenanceResult(Result<(), String>, String, bool),
+    /// Periodic refresh of workspace paused/maintenance state from DB.
+    WorkspaceStatesRefreshed(HashMap<String, bool>, HashMap<String, bool>),
+    /// No-op — produced by refresh helpers on transient DB errors to avoid
+    /// sending empty state maps that would wipe cached toggle state.
+    Nop,
+    /// Workspace options loaded during boot (options, paths, paused, maintenance, restored selection).
     BootWorkspaces(
         Vec<PickOption>,
         HashMap<String, String>,
+        HashMap<String, bool>,
         HashMap<String, bool>,
         Option<String>,
     ),
@@ -239,6 +249,8 @@ pub struct Dashboard {
     workspace_paths: HashMap<String, String>,
     /// Maps workspace name → paused state (for sidebar toggle).
     workspace_paused: HashMap<String, bool>,
+    /// Maps workspace name → maintenance state (for sidebar toggle).
+    workspace_maintenance: HashMap<String, bool>,
     /// Currently selected workspace name from the global picker.
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
@@ -249,6 +261,8 @@ pub struct Dashboard {
     update_available: bool,
     /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
     paused: bool,
+    /// Whether the selected workspace's maintainer is enabled.
+    maintenance: bool,
 
     logs_state: logs::LogsState,
     board_state: board::BoardState,
@@ -273,11 +287,13 @@ impl Dashboard {
             workspace_options: Vec::new(),
             workspace_paths: HashMap::new(),
             workspace_paused: HashMap::new(),
+            workspace_maintenance: HashMap::new(),
             selected_workspace_name: None,
             selected_user_name: None,
             updating: false,
             update_available,
             paused: false,
+            maintenance: false,
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -343,17 +359,23 @@ impl Dashboard {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Boot(result) => self.finish_boot(result),
-            Message::BootWorkspaces(options, paths, paused_map, restored_name) => {
+            Message::BootWorkspaces(options, paths, paused_map, maintenance_map, restored_name) => {
                 self.workspace_options.clone_from(&options);
                 self.workspace_paths = paths;
-                // Clone the paused map before moving it into self so the closure
-                // below can reference it without borrowing from self.
+                // Clone the maps before moving them into self so the closure
+                // below can reference them without borrowing from self.
                 let paused_map_for_closure = paused_map.clone();
+                let maintenance_map_for_closure = maintenance_map.clone();
                 self.workspace_paused = paused_map;
-                // Derive paused state from the selected workspace.
-                let update_paused = |dash: &mut Self, ws_name: Option<&str>| {
+                self.workspace_maintenance = maintenance_map;
+                // Derive paused & maintenance states from the selected workspace.
+                let update_states = |dash: &mut Self, ws_name: Option<&str>| {
                     dash.paused = ws_name
                         .and_then(|n| paused_map_for_closure.get(n))
+                        .copied()
+                        .unwrap_or(false);
+                    dash.maintenance = ws_name
+                        .and_then(|n| maintenance_map_for_closure.get(n))
                         .copied()
                         .unwrap_or(false);
                 };
@@ -372,7 +394,7 @@ impl Dashboard {
                     if name.is_empty() {
                         // "Personal" workspace — no shared workspace selected.
                         self.selected_workspace_name = None;
-                        update_paused(self, None);
+                        update_states(self, None);
                         return Task::batch([
                             self.propagate_workspace_selection(""),
                             home_opts,
@@ -380,7 +402,7 @@ impl Dashboard {
                         ]);
                     }
                     self.selected_workspace_name = Some(name.clone());
-                    update_paused(self, Some(name));
+                    update_states(self, Some(name));
                     return Task::batch([
                         self.propagate_workspace_selection(name),
                         home_opts,
@@ -393,7 +415,7 @@ impl Dashboard {
                 if let Some(first) = options.first() {
                     if first.value.is_empty() {
                         self.selected_workspace_name = None;
-                        update_paused(self, None);
+                        update_states(self, None);
                         return Task::batch([
                             self.propagate_workspace_selection(""),
                             home_opts,
@@ -401,7 +423,7 @@ impl Dashboard {
                         ]);
                     }
                     self.selected_workspace_name = Some(first.value.clone());
-                    update_paused(self, Some(&first.value));
+                    update_states(self, Some(&first.value));
                     return Task::batch([
                         self.propagate_workspace_selection(&first.value),
                         home_opts,
@@ -409,7 +431,7 @@ impl Dashboard {
                     ]);
                 }
                 self.selected_workspace_name = None;
-                update_paused(self, None);
+                update_states(self, None);
                 Task::batch([home_opts, load_users])
             }
             Message::Navigation(_) if !self.ready => Task::none(),
@@ -460,7 +482,17 @@ impl Dashboard {
                 if !self.ready {
                     return Task::none();
                 }
-                match self.page {
+
+                // Auto-refresh workspace paused/maintenance state every tick.
+                // Only runs when a workspace is selected — the toggle result
+                // handler already re-reads authoritative state after writes.
+                let ws_refresh = if self.has_active_workspace() {
+                    refresh_workspace_states_task()
+                } else {
+                    Task::none()
+                };
+
+                let page_task = match self.page {
                     Page::Home if !self.board_state.loading => {
                         self.board_state.loading = true;
                         self.board_state.refresh().map(Message::Board)
@@ -494,7 +526,9 @@ impl Dashboard {
                     }
                     Page::Diff => Task::none(),
                     _ => Task::none(),
-                }
+                };
+
+                Task::batch([ws_refresh, page_task])
             }
             Message::Home(msg) if self.ready => {
                 // Intercept RequestWorkspaceChange: the Home page detected
@@ -779,27 +813,17 @@ impl Dashboard {
                 }
             },
             Message::TogglePause if self.ready => {
-                let ws_name = match self.selected_workspace_name.clone() {
-                    Some(n) if !n.is_empty() => n,
-                    _ => {
-                        self.toasts.push(Toast::new(
-                            "No workspace selected — select a workspace first".to_string(),
-                            ToastKind::Warning,
-                        ));
-                        return Task::none();
-                    }
+                let ws_name = if let Some(n) = self.active_workspace_name() {
+                    n
+                } else {
+                    self.toasts.push(Toast::new(
+                        "No workspace selected — select a workspace first".to_string(),
+                        ToastKind::Warning,
+                    ));
+                    return Task::none();
                 };
                 let new_paused = !self.paused;
-                // Optimistic local update for responsive UI.
-                self.paused = new_paused;
-                self.workspace_paused.insert(ws_name.clone(), new_paused);
-                let msg = if new_paused {
-                    format!("Pipeline paused for {ws_name}")
-                } else {
-                    format!("Pipeline resumed for {ws_name}")
-                };
-                self.toasts.push(Toast::new(msg, ToastKind::Success));
-                // Persist to DB — revert on failure.
+                // Persist to DB; refresh state from DB on completion.
                 let ws_name_clone = ws_name.clone();
                 Task::perform(
                     async move {
@@ -813,15 +837,87 @@ impl Dashboard {
                 )
             }
             Message::TogglePauseResult(result, ws_name, intended_state) if self.ready => {
-                if let Err(e) = result {
-                    // Revert local state on DB write failure to prevent drift.
-                    let actual = !intended_state;
-                    self.paused = actual;
-                    self.workspace_paused.insert(ws_name, actual);
+                match result {
+                    Ok(()) => {
+                        self.toasts.push(Toast::new(
+                            if intended_state {
+                                format!("Pipeline paused for {ws_name}")
+                            } else {
+                                format!("Pipeline resumed for {ws_name}")
+                            },
+                            ToastKind::Success,
+                        ));
+                        refresh_workspace_states_task()
+                    }
+                    Err(e) => {
+                        self.toasts.push(Toast::new(
+                            format!("Failed to toggle pipeline pause: {e}"),
+                            ToastKind::Error,
+                        ));
+                        Task::none()
+                    }
+                }
+            }
+            Message::ToggleMaintenance if self.ready => {
+                let ws_name = if let Some(n) = self.active_workspace_name() {
+                    n
+                } else {
                     self.toasts.push(Toast::new(
-                        format!("Failed to toggle pipeline pause: {e}"),
-                        ToastKind::Error,
+                        "No workspace selected — select a workspace first".to_string(),
+                        ToastKind::Warning,
                     ));
+                    return Task::none();
+                };
+                let new_enabled = !self.maintenance;
+                // Persist to DB; refresh state from DB on completion.
+                let ws_name_clone = ws_name.clone();
+                Task::perform(
+                    async move {
+                        let store = crate::workspace::store();
+                        store
+                            .set_maintenance(&ws_name_clone, new_enabled)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| Message::ToggleMaintenanceResult(result, ws_name, new_enabled),
+                )
+            }
+            Message::ToggleMaintenanceResult(result, ws_name, intended_state) if self.ready => {
+                match result {
+                    Ok(()) => {
+                        self.toasts.push(Toast::new(
+                            if intended_state {
+                                format!("Maintainer enabled for {ws_name}")
+                            } else {
+                                format!("Maintainer disabled for {ws_name}")
+                            },
+                            ToastKind::Success,
+                        ));
+                        refresh_workspace_states_task()
+                    }
+                    Err(e) => {
+                        self.toasts.push(Toast::new(
+                            format!("Failed to toggle maintainer: {e}"),
+                            ToastKind::Error,
+                        ));
+                        Task::none()
+                    }
+                }
+            }
+            Message::WorkspaceStatesRefreshed(paused_map, maintenance_map) if self.ready => {
+                self.workspace_paused = paused_map;
+                self.workspace_maintenance = maintenance_map;
+                // Update active state for the currently selected workspace.
+                if let Some(ref name) = self.selected_workspace_name {
+                    self.paused = self.workspace_paused.get(name).copied().unwrap_or(false);
+                    self.maintenance = self
+                        .workspace_maintenance
+                        .get(name)
+                        .copied()
+                        .unwrap_or(false);
+                } else {
+                    self.paused = false;
+                    self.maintenance = false;
                 }
                 Task::none()
             }
@@ -836,7 +932,11 @@ impl Dashboard {
             | Message::UpdateBot
             | Message::UpdateResult(_)
             | Message::TogglePause
-            | Message::TogglePauseResult(..) => Task::none(),
+            | Message::TogglePauseResult(..)
+            | Message::ToggleMaintenance
+            | Message::ToggleMaintenanceResult(..)
+            | Message::WorkspaceStatesRefreshed(..)
+            | Message::Nop => Task::none(),
         }
     }
 
@@ -849,6 +949,7 @@ impl Dashboard {
         if name.is_empty() {
             self.selected_workspace_name = None;
             self.paused = false;
+            self.maintenance = false;
             save_window_state(
                 self.last_position,
                 self.last_size,
@@ -859,6 +960,11 @@ impl Dashboard {
         } else {
             self.selected_workspace_name = Some(name.to_string());
             self.paused = self.workspace_paused.get(name).copied().unwrap_or(false);
+            self.maintenance = self
+                .workspace_maintenance
+                .get(name)
+                .copied()
+                .unwrap_or(false);
             save_window_state(
                 self.last_position,
                 self.last_size,
@@ -934,6 +1040,23 @@ impl Dashboard {
             load_workspace_options(prev_selection),
             std::convert::identity,
         )
+    }
+
+    /// Return the selected workspace name, or `None` if no shared workspace
+    /// is currently selected (empty-string "Personal" is treated as None).
+    fn active_workspace_name(&self) -> Option<String> {
+        match self.selected_workspace_name.as_deref() {
+            Some(n) if !n.is_empty() => Some(n.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` when a shared (non-Personal) workspace is selected.
+    /// Avoids the allocation of [`active_workspace_name`] for presence-only checks.
+    fn has_active_workspace(&self) -> bool {
+        self.selected_workspace_name
+            .as_deref()
+            .is_some_and(|n| !n.is_empty())
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -1328,13 +1451,56 @@ impl Dashboard {
             nav_col = nav_col.push(btn);
         }
 
-        // Spacer to push pause button to the bottom of the sidebar
+        // Spacer to push buttons to the bottom of the sidebar
         nav_col = nav_col.push(Space::new().height(Length::Fill));
+
+        // Determine whether a shared workspace is selected (Personal mode has no
+        // workspace-level pipeline or maintainer toggles).
+        let has_ws = self.has_active_workspace();
+
+        // Per-workspace Maintainer toggle.
+        // Positioned immediately above the pause button.
+        let maint_icon = column![
+            text("Maint").size(8).color(theme::TEXT_MUTED),
+            text(if self.maintenance { "ON" } else { "OFF" })
+                .size(9)
+                .color(if self.maintenance {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_MUTED
+                }),
+        ]
+        .spacing(0)
+        .align_x(Alignment::Center);
+        let maint_btn = tooltip(
+            button(
+                container(maint_icon)
+                    .width(Length::Fill)
+                    .center_x(Length::Fill)
+                    .padding([4, 0]),
+            )
+            .width(Length::Fill)
+            .padding(0)
+            .style(theme::button_text)
+            .on_press_maybe(if has_ws {
+                Some(Message::ToggleMaintenance)
+            } else {
+                None
+            }),
+            text(if !has_ws {
+                "Select a workspace to toggle maintainer"
+            } else if self.maintenance {
+                "Maintainer ON"
+            } else {
+                "Maintainer OFF"
+            })
+            .size(11),
+            tooltip::Position::Top,
+        );
+        nav_col = nav_col.push(maint_btn);
 
         // Per-workspace pipeline pause/unpause toggle.
         // Disabled when no workspace is selected (Personal mode).
-        let has_ws = self.selected_workspace_name.is_some()
-            && self.selected_workspace_name.as_deref() != Some("");
         let pause_icon = if !has_ws {
             lucide::pause::<iced::Theme, iced::Renderer>()
                 .size(28)
@@ -1592,6 +1758,39 @@ fn save_window_state(
     }
 }
 
+/// Lightweight async task that re-reads all workspace paused and maintenance
+/// states from the DB, returning a [`Message::WorkspaceStatesRefreshed`].
+///
+/// This is a targeted refresh of only the boolean toggle state — unlike
+/// [`load_workspace_options`] it does not rebuild the workspace picker list,
+/// trigger page re-propagation, or load users.
+fn refresh_workspace_states_task() -> Task<Message> {
+    Task::perform(
+        async {
+            let store = crate::workspace::store();
+            match store.list_states().await {
+                Ok(states) => {
+                    let mut paused = HashMap::with_capacity(states.len());
+                    let mut maintenance = HashMap::with_capacity(states.len());
+                    for (name, is_paused, is_maint) in states {
+                        paused.insert(name.clone(), is_paused);
+                        maintenance.insert(name, is_maint);
+                    }
+                    Message::WorkspaceStatesRefreshed(paused, maintenance)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to refresh workspace states: {e}");
+                    // Keep existing cached state — don't loop back into the
+                    // periodic tick handler.  The next real 1-second Tick will
+                    // re-attempt the refresh.
+                    Message::Nop
+                }
+            }
+        },
+        std::convert::identity,
+    )
+}
+
 /// Load workspace `PickOption` list and path map from the workspace store,
 /// resolving `prev_selection` against the loaded list. Falls back to the
 /// first available workspace when `prev_selection` is absent or stale.
@@ -1601,6 +1800,7 @@ async fn load_workspace_options(prev_selection: Option<String>) -> Message {
     let mut options = Vec::new();
     let mut paths = HashMap::new();
     let mut paused_map = HashMap::new();
+    let mut maintenance_map = HashMap::new();
     let mut restored_name = None;
 
     // "Personal" option — represents a user's personal workspace (selected_workspace=NULL).
@@ -1614,6 +1814,7 @@ async fn load_workspace_options(prev_selection: Option<String>) -> Message {
             let display = ws.display_name();
             paths.insert(ws.name.clone(), ws.path.clone());
             paused_map.insert(ws.name.clone(), ws.paused);
+            maintenance_map.insert(ws.name.clone(), ws.maintenance);
             options.push(PickOption {
                 value: ws.name.clone(),
                 label: display,
@@ -1631,7 +1832,7 @@ async fn load_workspace_options(prev_selection: Option<String>) -> Message {
         restored_name = Some(options[0].value.clone());
     }
 
-    Message::BootWorkspaces(options, paths, paused_map, restored_name)
+    Message::BootWorkspaces(options, paths, paused_map, maintenance_map, restored_name)
 }
 
 /// Open a URL in the system browser (fire-and-forget).

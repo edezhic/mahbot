@@ -522,6 +522,27 @@ impl WorkspaceStorage {
         Ok(workspaces)
     }
 
+    /// Lightweight fetch of only name, paused, and maintenance columns.
+    /// Used by the GUI sidebar's periodic state refresh — avoids fetching
+    /// all workspace columns when only toggle state is needed.
+    pub async fn list_states(&self) -> Result<Vec<(String, bool, bool)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT name, paused, maintenance FROM workspaces ORDER BY name",
+                turso::params![],
+            )
+            .await?;
+        let mut states = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name: String = row.get(0)?;
+            let paused: bool = row.get(1)?;
+            let maintenance: bool = row.get(2)?;
+            states.push((name, paused, maintenance));
+        }
+        Ok(states)
+    }
+
     /// Look up a workspace by name.
     pub async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
         self.query_one("name = ?1", turso::params![name]).await
@@ -561,22 +582,28 @@ impl WorkspaceStorage {
     /// Set or clear the maintenance toggle for a workspace.
     pub async fn set_maintenance(&self, name: &str, enabled: bool) -> Result<()> {
         let now = turso::now();
+        let val: i64 = i64::from(enabled);
         if enabled {
             // Reset debounce state so the maintainer runs at the next 5-minute
             // poll, regardless of how long the previous debounce interval was.
             self.conn
                 .execute(
-                    "UPDATE workspaces SET maintenance = 1, maintainer_debounce_mins = 5, maintainer_last_run_at = NULL, updated_at = ?1 WHERE name = ?2",
-                    turso::params![now, name],
+                    "UPDATE workspaces SET maintenance = ?1, maintainer_debounce_mins = 5, maintainer_last_run_at = NULL, updated_at = ?2 WHERE name = ?3",
+                    turso::params![val, now, name],
                 )
                 .await?;
         } else {
             self.conn
                 .execute(
-                    "UPDATE workspaces SET maintenance = 0, updated_at = ?1 WHERE name = ?2",
-                    turso::params![now, name],
+                    "UPDATE workspaces SET maintenance = ?1, updated_at = ?2 WHERE name = ?3",
+                    turso::params![val, now, name],
                 )
                 .await?;
+        }
+        if enabled {
+            tracing::info!(workspace = name, "Maintainer enabled");
+        } else {
+            tracing::info!(workspace = name, "Maintainer disabled");
         }
         Ok(())
     }
@@ -884,16 +911,18 @@ mod tests {
         name: &str,
         path: &str,
         paused: bool,
+        maintenance: bool,
         discovery_generation: i64,
     ) -> Workspace {
         let now = crate::turso::now();
         let paused_int: i64 = i64::from(paused);
+        let maint_int: i64 = i64::from(maintenance);
         store
             .conn
             .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at, paused, discovery_generation) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                crate::turso::params![name, path, now.clone(), now.clone(), paused_int, discovery_generation],
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused, maintenance, discovery_generation) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                crate::turso::params![name, path, now.clone(), now.clone(), paused_int, maint_int, discovery_generation],
             )
             .await
             .expect("insert workspace");
@@ -903,7 +932,7 @@ mod tests {
             status: "pending".to_string(),
             created_at: now.clone(),
             updated_at: now.clone(),
-            maintenance: false,
+            maintenance,
             paused,
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: None,
@@ -917,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn new_workspace_starts_paused() {
         let (store, _tmp) = test_store().await;
-        let ws = insert_direct(&store, "test_ws", "/tmp/test_ws", true, 0).await;
+        let ws = insert_direct(&store, "test_ws", "/tmp/test_ws", true, false, 0).await;
         assert!(ws.paused, "In-memory workspace should have paused = true");
 
         // Round-trip through the DB.
@@ -961,7 +990,7 @@ mod tests {
     #[tokio::test]
     async fn set_paused_toggles_pause_state() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "toggle_test", "/tmp/toggle_test", true, 0).await;
+        insert_direct(&store, "toggle_test", "/tmp/toggle_test", true, false, 0).await;
 
         // Unpause
         store.set_paused("toggle_test", false).await.unwrap();
@@ -985,13 +1014,76 @@ mod tests {
         assert!(fetched.paused, "Should be paused after set_paused(true)");
     }
 
+    #[tokio::test]
+    async fn set_maintenance_toggles_maintenance_state() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "maint_test", "/tmp/maint_test", true, false, 0).await;
+
+        // Enable maintenance
+        store.set_maintenance("maint_test", true).await.unwrap();
+        let fetched = store
+            .get_by_name("maint_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(
+            fetched.maintenance,
+            "Should have maintenance enabled after set_maintenance(true)"
+        );
+
+        // Disable maintenance
+        store.set_maintenance("maint_test", false).await.unwrap();
+        let fetched = store
+            .get_by_name("maint_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(
+            !fetched.maintenance,
+            "Should have maintenance disabled after set_maintenance(false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_states_returns_name_paused_maintenance() {
+        let (store, _tmp) = test_store().await;
+
+        // Insert two workspaces with different toggle states.
+        insert_direct(&store, "alice", "/tmp/alice", true, false, 0).await;
+        store.set_maintenance("alice", false).await.unwrap();
+
+        insert_direct(&store, "bob", "/tmp/bob", false, false, 0).await;
+        store.set_maintenance("bob", true).await.unwrap();
+
+        let states = store.list_states().await.expect("list_states");
+        assert_eq!(states.len(), 2, "Should return both workspaces");
+
+        // Build a map for assertion.
+        let mut map: std::collections::HashMap<&str, (bool, bool)> =
+            std::collections::HashMap::new();
+        for (name, paused, maintenance) in &states {
+            map.insert(name.as_str(), (*paused, *maintenance));
+        }
+
+        assert_eq!(
+            map.get("alice").copied(),
+            Some((true, false)),
+            "Alice: paused=true, maintenance=false"
+        );
+        assert_eq!(
+            map.get("bob").copied(),
+            Some((false, true)),
+            "Bob: paused=false, maintenance=true"
+        );
+    }
+
     // ── finalize_discovery — auto-unpause invariants ─────────────
 
     #[tokio::test]
     async fn finalize_discovery_success_gen0_auto_unpauses() {
         let (store, _tmp) = test_store().await;
         // Start paused with discovery_generation = 0.
-        insert_direct(&store, "gen0", "/tmp/gen0", true, 0).await;
+        insert_direct(&store, "gen0", "/tmp/gen0", true, false, 0).await;
 
         // Act: simulate initial discovery completion (all_ok = true, gen 0).
         finalize_discovery(&store, "gen0", 0, true, &[]).await;
@@ -1009,7 +1101,7 @@ mod tests {
     async fn finalize_discovery_success_gen1_no_auto_unpause() {
         let (store, _tmp) = test_store().await;
         // Start paused with discovery_generation = 1 (rediscovery case).
-        insert_direct(&store, "gen1", "/tmp/gen1", true, 1).await;
+        insert_direct(&store, "gen1", "/tmp/gen1", true, false, 1).await;
 
         // Act: simulate rediscovery completing successfully (generation 1).
         finalize_discovery(&store, "gen1", 1, true, &[]).await;
@@ -1029,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_discovery_failure_keeps_paused() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "fail_gen0", "/tmp/fail_gen0", true, 0).await;
+        insert_direct(&store, "fail_gen0", "/tmp/fail_gen0", true, false, 0).await;
 
         // Act: discovery failed (all_ok = false).
         let errors = vec!["Diagnostics discovery failed: timeout".to_string()];
@@ -1048,7 +1140,7 @@ mod tests {
     async fn finalize_discovery_stale_generation_skips_writes() {
         let (store, _tmp) = test_store().await;
         // Start paused with generation 0.
-        insert_direct(&store, "stale", "/tmp/stale", true, 0).await;
+        insert_direct(&store, "stale", "/tmp/stale", true, false, 0).await;
 
         // Bump the generation behind the scenes (simulates a concurrent
         // rediscover() call).
@@ -1087,7 +1179,15 @@ mod tests {
         let (store, _tmp) = test_store().await;
         // Start with paused = false and status = ready (simulating a fully
         // discovered workspace).
-        insert_direct(&store, "rediscover_test", "/tmp/rediscover_test", false, 0).await;
+        insert_direct(
+            &store,
+            "rediscover_test",
+            "/tmp/rediscover_test",
+            false,
+            false,
+            0,
+        )
+        .await;
         store.set_status("rediscover_test", "ready").await.unwrap();
 
         let ws = store
@@ -1159,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn editor_tabs_round_trip_dirty_content() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "ws1", "/tmp/ws1", false, 0).await;
+        insert_direct(&store, "ws1", "/tmp/ws1", false, false, 0).await;
 
         let tabs = vec![EditorTabRecord {
             file_path: "notes.md".to_string(),
