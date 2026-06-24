@@ -306,6 +306,11 @@ impl HomeState {
         self.refresh_history()
     }
 
+    /// Whether the clear-chat action is available (requires both user and workspace).
+    pub(crate) fn can_clear_chat(&self) -> bool {
+        self.selected_user.is_some() && self.selected_workspace.is_some()
+    }
+
     /// Load users for the user picker.
     pub fn load_users(&self) -> Task<HomeMessage> {
         Task::perform(
@@ -405,35 +410,6 @@ impl HomeState {
     }
 
     pub fn view(&self) -> Element<'_, HomeMessage> {
-        // ── Clear button ─────────────────────────────────────────
-        let clear_disabled = self.selected_user.is_none() || self.selected_workspace.is_none();
-        let clear_btn = button(container(row![
-            lucide::eraser::<iced::Theme, iced::Renderer>()
-                .size(14)
-                .color(if clear_disabled {
-                    theme::TEXT_FAINT
-                } else {
-                    theme::TEXT_MUTED
-                }),
-        ]))
-        .style(move |_t: &iced::Theme, _status| {
-            use iced::widget::button;
-            button::Style {
-                background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    width: 0.0,
-                    color: iced::Color::TRANSPARENT,
-                },
-                ..button::Style::default()
-            }
-        })
-        .on_press_maybe(if clear_disabled {
-            None
-        } else {
-            Some(HomeMessage::ClearChat)
-        });
-
         // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
             let empty_hint = if self.selected_user.is_none() {
@@ -550,17 +526,17 @@ impl HomeState {
 
                     // 75% width, side-aligned via FillPortion row (3:1 ratio).
                     if is_user {
-                        // User: spacer left, bubble right
+                        // User: bubble left, spacer right
                         row![
-                            Space::new().width(Length::FillPortion(1)),
                             bubble.width(Length::FillPortion(3)),
+                            Space::new().width(Length::FillPortion(1)),
                         ]
                         .into()
                     } else {
-                        // Agent: bubble left, spacer right
+                        // Agent: spacer left, bubble right
                         row![
-                            bubble.width(Length::FillPortion(3)),
                             Space::new().width(Length::FillPortion(1)),
+                            bubble.width(Length::FillPortion(3)),
                         ]
                         .into()
                     }
@@ -592,8 +568,8 @@ impl HomeState {
 
                 children.push(
                     row![
-                        typing_bubble.width(Length::FillPortion(3)),
                         Space::new().width(Length::FillPortion(1)),
+                        typing_bubble.width(Length::FillPortion(3)),
                     ]
                     .into(),
                 );
@@ -657,15 +633,23 @@ impl HomeState {
             .placeholder("Type a message... (Enter to send, Shift+Enter for newline)")
             .min_height(66.0_f32)
             .max_height(330.0_f32)
-            .style(|theme: &iced::Theme, status| {
-                let mut base = text_editor::default(theme, status);
-                if matches!(status, text_editor::Status::Focused { .. }) {
-                    base.border = iced::Border {
-                        color: theme::ACCENT,
-                        ..base.border
-                    };
+            .style(|_theme: &iced::Theme, status| {
+                let is_focused = matches!(status, text_editor::Status::Focused { .. });
+                text_editor::Style {
+                    background: iced::Background::Color(theme::BG_ELEVATED),
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        width: if is_focused { 1.0 } else { 0.0 },
+                        color: if is_focused {
+                            theme::ACCENT
+                        } else {
+                            iced::Color::TRANSPARENT
+                        },
+                    },
+                    placeholder: theme::TEXT_MUTED,
+                    value: theme::TEXT_PRIMARY,
+                    selection: theme::ACCENT_DIM,
                 }
-                base
             })
             .key_binding(|key_press| {
                 // Intercept Cmd+Z / Cmd+Shift+Z — handled by keyboard subscription.
@@ -697,16 +681,11 @@ impl HomeState {
 
         let send_btn = button(
             container(
-                row![
-                    lucide::send::<iced::Theme, iced::Renderer>()
-                        .size(14)
-                        .color(theme::BG_BASE),
-                    text("Send").size(13).color(theme::BG_BASE),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
+                lucide::send::<iced::Theme, iced::Renderer>()
+                    .size(14)
+                    .color(theme::BG_BASE),
             )
-            .padding([4, 12]),
+            .padding([4, 8]),
         )
         .style(move |_t: &iced::Theme, _status| {
             use iced::widget::button;
@@ -734,9 +713,7 @@ impl HomeState {
         let input_row = row![
             container(input_editor).width(Length::Fill),
             Space::new().width(4),
-            column![clear_btn, send_btn]
-                .spacing(4)
-                .align_x(Alignment::Center),
+            send_btn,
         ]
         .align_y(Alignment::End)
         .padding(8);
@@ -747,7 +724,7 @@ impl HomeState {
             container(input_row).style(|_theme: &iced::Theme| {
                 use iced::widget::container;
                 container::Style {
-                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
+                    background: Some(iced::Background::Color(theme::BG_BASE)),
                     border: iced::Border {
                         radius: 0.0.into(),
                         width: 0.0,

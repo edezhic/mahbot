@@ -973,7 +973,8 @@ impl Dashboard {
         let content = match self.page {
             Page::Home => {
                 let home_view = self.home_state.view().map(Message::Home);
-                let sidebar = ticket_sidebar(&self.board_state);
+                let clear_enabled = self.home_state.can_clear_chat();
+                let sidebar = ticket_sidebar(&self.board_state, clear_enabled);
                 let base = row![
                     container(home_view).width(Length::FillPortion(7)),
                     container(sidebar).width(Length::FillPortion(3))
@@ -1051,7 +1052,7 @@ impl Dashboard {
 /// Ticket sidebar shown on the right side of the Home page.
 /// Displays all non-archived tickets grouped by status, with a
 /// batch-archive button for completed tickets.
-fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
+fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Element<'_, Message> {
     let (pending, pipeline, completed) = board::BoardState::partition_tickets(&board_state.tickets);
 
     // Split pipeline into "pinned" (actively working) and "ready"
@@ -1071,8 +1072,26 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     let has_completed = !completed.is_empty();
     let is_empty = pending.is_empty() && pipeline.is_empty() && completed.is_empty();
 
-    // Header row: "Tickets" title + archive button
-    let title = text("Tickets").size(14).color(theme::TEXT_PRIMARY);
+    // Header row: Clear button (replaces "Tickets" title) + archive button
+    let clear_icon = lucide::eraser::<iced::Theme, iced::Renderer>()
+        .size(14)
+        .color(if clear_enabled {
+            theme::TEXT_MUTED
+        } else {
+            theme::TEXT_FAINT
+        });
+    let clear_btn = tooltip(
+        button(clear_icon)
+            .on_press_maybe(if clear_enabled {
+                Some(Message::Home(home::HomeMessage::ClearChat))
+            } else {
+                None
+            })
+            .padding(4)
+            .style(theme::button_text),
+        text("Clear chat").size(11),
+        tooltip::Position::Bottom,
+    );
     let archive_icon = lucide::archive::<iced::Theme, iced::Renderer>()
         .size(12)
         .color(if has_completed {
@@ -1093,7 +1112,7 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         tooltip::Position::Top,
     );
     let header =
-        row![title, Space::new().width(Length::Fill), archive_btn].align_y(Alignment::Center);
+        row![clear_btn, Space::new().width(Length::Fill), archive_btn].align_y(Alignment::Center);
 
     // Body: loading, empty, or ticket groups
     let body: Element<'_, Message> = if !board_state.has_loaded {
