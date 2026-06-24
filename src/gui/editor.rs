@@ -2143,7 +2143,6 @@ impl EditorState {
                 if self.rename_target.is_some() {
                     self.rename_target = None;
                 }
-                self.file_tree.tree_focused = false;
                 self.pending_enter_dir = None;
                 // Remember the clicked file's position for Ctrl+B re-focus.
                 self.file_tree.focus_path(&path);
@@ -6598,11 +6597,11 @@ mod tests {
     }
 
     #[test]
-    fn test_select_file_clears_tree_focus() {
+    fn test_select_file_keeps_tree_focus() {
         let mut state = make_editor_with_tree();
         state.file_tree.tree_focused = true;
         let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
-        assert!(!state.file_tree.tree_focused);
+        assert!(state.file_tree.tree_focused);
     }
 
     #[test]
@@ -6611,7 +6610,7 @@ mod tests {
         state.file_tree.tree_focused = true;
         state.file_tree.tree_focus_index = 1; // Cargo.toml (not a directory)
         let _task = state.update(EditorMessage::TreeNavEnter);
-        // TreeNavEnter dispatches SelectFile which clears tree_focused.
+        // TreeNavEnter dispatches SelectFile which keeps tree_focused.
         // The task is async, so tree_focused is still true here.
         // We verify the state hasn't changed prematurely.
         assert!(state.file_tree.tree_focused);
@@ -7405,10 +7404,10 @@ mod tests {
         state.file_tree.nodes =
             build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
         state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = false;
+        state.file_tree.tree_focused = true;
         let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
-        // SelectFile clears tree_focused but remembers focus index.
-        assert!(!state.file_tree.tree_focused);
+        // SelectFile keeps tree_focused and remembers focus index.
+        assert!(state.file_tree.tree_focused);
         // tree_focus_index should point to "src/main.rs" for Ctrl+B re-focus.
         assert_eq!(
             state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,

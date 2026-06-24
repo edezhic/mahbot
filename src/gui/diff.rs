@@ -384,7 +384,6 @@ impl DiffState {
                 Task::none()
             }
             DiffMessage::SelectFile(path) => {
-                self.file_tree.tree_focused = false;
                 // Remember the clicked file's position for Ctrl+B re-focus.
                 self.file_tree.focus_path(&path);
                 if self.selected_file.as_deref() == Some(&path) {
@@ -1795,11 +1794,11 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_select_file_clears_tree_focus() {
+    fn test_diff_select_file_keeps_tree_focus() {
         let mut state = make_diff_with_tree();
         state.file_tree.tree_focused = true;
         let _ = state.update(DiffMessage::SelectFile("src/main.rs".to_owned()));
-        assert!(!state.file_tree.tree_focused);
+        assert!(state.file_tree.tree_focused);
     }
 
     #[test]
@@ -1918,10 +1917,10 @@ mod tests {
         state.file_tree.expanded_dirs.insert("src".to_string());
         state.file_tree.nodes = build_tree(&state.diff_files);
         state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = false;
+        state.file_tree.tree_focused = true;
         let _ = state.update(DiffMessage::SelectFile("src/main.rs".to_owned()));
-        // SelectFile clears tree_focused but remembers focus index.
-        assert!(!state.file_tree.tree_focused);
+        // SelectFile keeps tree_focused and remembers focus index.
+        assert!(state.file_tree.tree_focused);
         // tree_focus_index should point to "src/main.rs" for Ctrl+B re-focus.
         assert_eq!(
             state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
