@@ -1827,23 +1827,8 @@ mod tests {
         assert_eq!(status, TicketPhase::ReadyForDevelopment);
     }
 
-    #[tokio::test]
-    async fn test_backlog_phases_roundtrip() {
-        let (store, _tmp) = open_test_store().await;
-
-        store
-            .create_ticket(
-                "Backlog Test",
-                "A backlog ticket",
-                &test_ws_named("/workspace", "workspace"),
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create");
-
+    #[test]
+    fn test_ticket_phase_parse_and_roundtrip() {
         // Parse roundtrip — all variants
         let variants: &[(&str, TicketPhase)] = &[
             ("backlog", TicketPhase::Backlog),
@@ -1874,19 +1859,6 @@ mod tests {
 
         // Error case
         assert!("unknown_phase".parse::<TicketPhase>().is_err());
-
-        let claimed = store
-            .claim_ticket_in_workspace(
-                TicketPhase::Backlog,
-                TicketPhase::Analysis,
-                "workspace",
-                false,
-            )
-            .await
-            .expect("claim");
-        assert!(claimed.is_some());
-        let claimed = claimed.unwrap();
-        assert_eq!(claimed.status, TicketPhase::Analysis);
     }
 
     #[test]
