@@ -700,6 +700,15 @@ async fn poll_round() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run an Engineer agent to implement the ticket.
+///
+/// Guards with [`guard_phase_and_circuit_breaker`] (phase check + comment-count
+/// circuit breaker) before starting. Gathers feedback comments from all roles
+/// since the last engineer run and includes them in the agent prompt. After the
+/// agent finishes, performs a post-run phase check to catch race conditions,
+/// then transitions:
+/// - InDiagnostics (buffer) on successful completion
+/// - Failed (notify) if the agent failed or returned no output
 async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Engineer.as_str());
 
@@ -997,11 +1006,12 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
         return;
     };
 
+    // Check circuit breaker before running diagnostics.
     if trip_diagnostics_circuit_breaker_if_exceeded(board, &ticket).await {
         return;
     }
 
-    // 3. Run commands sequentially in the prescribed order.
+    // 2. Run commands sequentially in the prescribed order.
 
     let mut comment = String::from("🔍 Auto-diagnostics");
     let mut all_passed = true;
@@ -1298,6 +1308,9 @@ async fn record_verdict_comments(
 /// All verdicts are recorded as comments, then the ticket transitions to:
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYSIS_THRESHOLD`/10)
 /// - Paused (notify) when any analyst fails, with a comment listing the counts
+///
+/// Before spawning agents, [`guard_phase_and_circuit_breaker`] may also exit early
+/// with Failed (notify) if the comment-count circuit breaker trips.
 async fn dispatch_backlog_analysts(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
     if !guard_phase_and_circuit_breaker(board, &ticket, TicketPhase::Analysis, "Analysts").await {
         return;
