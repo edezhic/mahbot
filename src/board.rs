@@ -487,10 +487,6 @@ impl BoardStore {
         )
         .await?;
 
-        // The `pipeline_reservation` column was added to the `tickets` table
-        // in an earlier version (migration v2); it is now part of the
-        // `CREATE TABLE` schema and no migration is needed.
-
         Ok(Self { conn })
     }
 

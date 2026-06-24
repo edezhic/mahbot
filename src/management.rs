@@ -79,7 +79,7 @@ async fn is_ticket_in_phase(board: &BoardStore, ticket_id: &str, expected: Ticke
 }
 
 /// Shared pre-flight guard for dispatch functions that spawn agents.
-/// Verifies the ticket is still in `expected_phase` (avoids wasted DB writes
+/// Verifies the ticket is still in `expected` (avoids wasted DB writes
 /// and LLM API costs if the ticket was moved externally) and checks the
 /// circuit breaker (fails tickets with excessive comment accumulation and
 /// pauses the workspace to prevent dispatch thrashing).
@@ -97,13 +97,13 @@ async fn is_ticket_in_phase(board: &BoardStore, ticket_id: &str, expected: Ticke
 async fn guard_phase_and_circuit_breaker(
     board: &BoardStore,
     ticket: &Ticket,
-    expected_phase: TicketPhase,
+    expected: TicketPhase,
     label: &str,
 ) -> bool {
-    if !is_ticket_in_phase(board, &ticket.id, expected_phase).await {
+    if !is_ticket_in_phase(board, &ticket.id, expected).await {
         return false;
     }
-    if trip_circuit_breaker_if_exceeded(board, ticket, expected_phase, label).await {
+    if trip_circuit_breaker_if_exceeded(board, ticket, expected, label).await {
         return false;
     }
     true
@@ -1309,8 +1309,9 @@ async fn record_verdict_comments(
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYSIS_THRESHOLD`/10)
 /// - Paused (notify) when any analyst fails, with a comment listing the counts
 ///
-/// Before spawning agents, [`guard_phase_and_circuit_breaker`] may also exit early
-/// with Failed (notify) if the comment-count circuit breaker trips.
+/// Before spawning agents, [`guard_phase_and_circuit_breaker`] checks the phase and
+/// trips the comment-count circuit breaker (which may transition the ticket to
+/// Failed and pause the workspace). Returns `false` when the caller should abort.
 async fn dispatch_backlog_analysts(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
     if !guard_phase_and_circuit_breaker(board, &ticket, TicketPhase::Analysis, "Analysts").await {
         return;
