@@ -6,7 +6,7 @@
 
 use crate::global_store;
 use crate::turso::{self, Connection};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 global_store! {
@@ -91,41 +91,11 @@ pub struct ToolErrorQuery {
 impl StatsStore {
     /// Open (or create) the stats database at `root/db/stats.db`.
     ///
-    /// ## Migration v1
-    ///
-    /// Adds the `workspace` column to `tool_usage` for existing databases
-    /// created before the column was added to the schema constant.
+    /// The `workspace` column was added to the schema in an earlier version;
+    /// it is now part of the `CREATE TABLE` schema and no migration is needed.
     pub async fn open(root: &Path) -> Result<Self> {
         let db_path = root.join("db/stats.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
-
-        // ── Schema migration v1 ────────────────────────────────────────
-        //
-        // PRAGMA user_version returns 0 for unmigrated databases (SQLite
-        // default). We use this as a migration stamp to ensure the migration
-        // runs exactly once.
-        let user_version: i64 = conn
-            .query_row("PRAGMA user_version", turso::params![], |row| {
-                row.get::<Option<i64>>(0)
-            })
-            .await
-            .context("Failed to read PRAGMA user_version")?
-            .unwrap_or(0);
-
-        if user_version < 1 {
-            // Use a silent ALTER TABLE ADD COLUMN — if the column already exists
-            // (from a concurrent fresh CREATE TABLE IF NOT EXISTS on a new DB),
-            // the error is harmless.
-            let _ = conn
-                .execute(
-                    "ALTER TABLE tool_usage ADD COLUMN workspace TEXT NOT NULL DEFAULT ''",
-                    turso::params![],
-                )
-                .await;
-            conn.execute("PRAGMA user_version = 1", turso::params![])
-                .await
-                .context("Failed to set PRAGMA user_version = 1")?;
-        }
 
         Ok(Self { conn })
     }

@@ -414,41 +414,17 @@ fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
 
 impl WorkspaceStorage {
     /// Open (or create) the workspaces database at `root/db/workspaces.db`.
+    ///
+    /// The `dirty_content` column was added to the `editor_tabs` table in an
+    /// earlier version; it is now part of the `CREATE TABLE` schema and no
+    /// migration is needed.
     pub async fn open(root: &Path) -> Result<Self> {
         let db_path = root.join("db/workspaces.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
 
-        // Migration v1: add dirty_content column for persisting unsaved editor text.
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", turso::params![], |row| row.get(0))
-            .await
-            .unwrap_or(0);
-        if version < 1 {
-            let has_dirty_content = {
-                let rows = conn
-                    .query(
-                        "SELECT 1 FROM pragma_table_info('editor_tabs') \
-                         WHERE name = 'dirty_content'",
-                        turso::params![],
-                    )
-                    .await?;
-                !rows.is_empty()
-            };
-            if !has_dirty_content {
-                let _ = conn
-                    .execute(
-                        "ALTER TABLE editor_tabs ADD COLUMN dirty_content TEXT",
-                        turso::params![],
-                    )
-                    .await;
-            }
-            conn.execute("PRAGMA user_version = 1", turso::params![])
-                .await
-                .context("Failed to set PRAGMA user_version = 1")?;
-        }
-
         Ok(Self { conn })
     }
+
     /// Run a query that returns zero-or-one workspace row, mapping the result to
     /// `Ok(Some(ws))` / `Ok(None)` / `Err`.
     async fn query_one(

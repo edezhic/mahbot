@@ -484,27 +484,9 @@ impl BoardStore {
         )
         .await?;
 
-        // Migration: add pipeline_reservation column.
-        // Check current version first to avoid re-running migrations.
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", turso::params![], |row| row.get(0))
-            .await
-            .unwrap_or(0);
-        if version < 2 {
-            // Use a silent ALTER TABLE ADD COLUMN since `IF NOT EXISTS` requires
-            // SQLite 3.35+. If the ALTER fails (column already exists from a
-            // concurrent fresh CREATE TABLE IF NOT EXISTS), the error is harmless.
-            let _ = conn
-                .execute(
-                    "ALTER TABLE tickets ADD COLUMN pipeline_reservation \
-                     INTEGER NOT NULL DEFAULT 0",
-                    turso::params![],
-                )
-                .await;
-            conn.execute("PRAGMA user_version = 2", turso::params![])
-                .await
-                .context("Failed to set PRAGMA user_version = 2")?;
-        }
+        // The `pipeline_reservation` column was added to the `tickets` table
+        // in an earlier version (migration v2); it is now part of the
+        // `CREATE TABLE` schema and no migration is needed.
 
         Ok(Self { conn })
     }
