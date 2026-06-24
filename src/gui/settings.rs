@@ -789,6 +789,7 @@ impl SettingsState {
                             "Delete",
                             tooltip::Position::Top,
                         )
+                        .style(theme::tooltip_style)
                         .delay(Duration::from_millis(400)),
                     ]
                 };
@@ -1166,6 +1167,7 @@ impl SettingsState {
                             "Delete",
                             tooltip::Position::Top,
                         )
+                        .style(theme::tooltip_style)
                         .delay(Duration::from_millis(400)),
                     ]
                 };

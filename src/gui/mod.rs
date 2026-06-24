@@ -1217,7 +1217,8 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
             .style(theme::button_text),
         text("Clear chat").size(11),
         tooltip::Position::Bottom,
-    );
+    )
+    .style(theme::tooltip_style);
     let archive_icon = lucide::archive::<iced::Theme, iced::Renderer>()
         .size(12)
         .color(if has_completed {
@@ -1236,7 +1237,8 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
             .style(theme::button_text),
         text("Archive done & cancelled").size(11),
         tooltip::Position::Top,
-    );
+    )
+    .style(theme::tooltip_style);
     let header =
         row![clear_btn, Space::new().width(Length::Fill), archive_btn].align_y(Alignment::Center);
 
@@ -1496,7 +1498,8 @@ impl Dashboard {
             })
             .size(11),
             tooltip::Position::Top,
-        );
+        )
+        .style(theme::tooltip_style);
         nav_col = nav_col.push(maint_btn);
 
         // Per-workspace pipeline pause/unpause toggle.
@@ -1538,7 +1541,8 @@ impl Dashboard {
             })
             .size(11),
             tooltip::Position::Top,
-        );
+        )
+        .style(theme::tooltip_style);
         nav_col = nav_col.push(pause_btn);
 
         let inner = nav_col.spacing(2);

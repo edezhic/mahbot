@@ -688,11 +688,14 @@ impl BoardState {
             let indicator = row![pause_icon, count_text]
                 .spacing(2)
                 .align_y(Alignment::Center);
-            badge_row = badge_row.push(tooltip(
-                indicator,
-                text(tooltip_text).size(11),
-                tooltip::Position::Top,
-            ));
+            badge_row = badge_row.push(
+                tooltip(
+                    indicator,
+                    text(tooltip_text).size(11),
+                    tooltip::Position::Top,
+                )
+                .style(theme::tooltip_style),
+            );
         }
 
         // Inline commit stats: +added/−removed with color coding,

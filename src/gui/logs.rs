@@ -635,6 +635,7 @@ impl LogsState {
                 if self.paused { "Resume" } else { "Pause" },
                 tooltip::Position::Top,
             )
+            .style(theme::tooltip_style)
             .delay(Duration::from_millis(400))
         };
 

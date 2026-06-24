@@ -5,7 +5,7 @@
 use iced::Background;
 use iced::Color;
 use iced::border;
-use iced::widget::scrollable;
+use iced::widget::{container, scrollable};
 
 use crate::board::TicketPhase;
 
@@ -485,6 +485,28 @@ pub fn button_text(
             color: Color::TRANSPARENT,
         },
         ..iced::widget::button::Style::default()
+    }
+}
+
+// ── Tooltip container style ──────────────────────────────────────
+
+/// Style for tooltip containers: elevated background with subtle rounded
+/// corners and a hairline border, matching the `dialog_container_style`
+/// convention used for modal dialogs.
+///
+/// Applying this via `.style(theme::tooltip_style)` gives every tooltip a
+/// dark/neutral fill that stays readable regardless of what content is
+/// underneath it.
+#[must_use]
+pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(BG_ELEVATED)),
+        border: iced::Border {
+            radius: 6.0.into(),
+            width: 1.0,
+            color: BORDER_STRONG,
+        },
+        ..container::Style::default()
     }
 }
 
