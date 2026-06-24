@@ -4552,7 +4552,7 @@ impl EditorState {
             Self::build_close_dialog(
                 on_save,
                 on_discard,
-                &on_cancel,
+                on_cancel,
                 "This file has unsaved changes. What would you like to do?".to_string(),
             )
         });
@@ -4581,7 +4581,7 @@ impl EditorState {
                 keep_idx,
                 action: CloseAction::Cancel,
             };
-            Self::build_close_dialog(on_save, on_discard, &on_cancel, desc)
+            Self::build_close_dialog(on_save, on_discard, on_cancel, desc)
         });
 
         // ── Quick-open overlay ────────────────────────────────────────
@@ -5775,13 +5775,27 @@ impl EditorState {
 
     // ── Close dialog ──────────────────────────────────────────────
 
-    fn build_close_dialog(
-        on_save: EditorMessage,
-        on_discard: EditorMessage,
-        on_cancel: &EditorMessage,
-        description: String,
-    ) -> Element<'static, EditorMessage> {
-        // Dialog content.
+    /// Shared confirmation dialog builder.
+    ///
+    /// Constructs a standardised confirmation overlay with an icon row (warning icon +
+    /// title), a description, and a caller-provided button row. All confirmation
+    /// dialogs (e.g. unsaved-changes, delete-confirm) use this to avoid duplicating
+    /// the identical icon row, description styling, column wrapper, and wrap_dialog
+    /// call.
+    ///
+    /// Callers supply the button row as a pre-assembled [`Row`] (with its own
+    /// `.align_y` / `.width` styling) so each site can freely choose button
+    /// composition while reusing the structural boilerplate.
+    fn confirmation_dialog<'a>(
+        title: impl Into<String>,
+        description: impl Into<String>,
+        button_row: impl Into<Element<'a, EditorMessage>>,
+        width: u32,
+        cancel_msg: EditorMessage,
+        opacity: f32,
+    ) -> Element<'a, EditorMessage> {
+        let title: String = title.into();
+        let description: String = description.into();
         Self::wrap_dialog(
             column![
                 row![
@@ -5789,54 +5803,74 @@ impl EditorState {
                         .size(16)
                         .color(theme::STATUS_WARNING),
                     Space::new().width(8),
-                    text("Unsaved changes").size(16).color(theme::TEXT_PRIMARY),
+                    text(title).size(16).color(theme::TEXT_PRIMARY),
                 ]
                 .align_y(Alignment::Center),
                 text(description)
                     .size(14)
                     .color(theme::TEXT_SECONDARY)
                     .width(Length::Fill),
-                row![
-                    button(
-                        text("Cancel")
-                            .size(13)
-                            .color(theme::TEXT_SECONDARY)
-                            .align_x(Alignment::Center)
-                    )
-                    .style(theme::button_secondary)
-                    .on_press(on_cancel.clone()),
-                    Space::new().width(8),
-                    button(
-                        text("Discard")
-                            .size(13)
-                            .color(theme::STATUS_ERROR)
-                            .align_x(Alignment::Center)
-                    )
-                    .style(theme::button_danger)
-                    .on_press(on_discard),
-                    Space::new().width(8),
-                    button(
-                        text("Save")
-                            .size(13)
-                            .color(theme::ACCENT_LIGHT)
-                            .align_x(Alignment::Center)
-                    )
-                    .style(theme::button_primary)
-                    .on_press(on_save),
-                ]
-                .align_y(Alignment::End)
-                .width(Length::Fill),
+                button_row.into(),
             ]
             .spacing(16)
             .width(Length::Fill),
+            width,
+            cancel_msg,
+            opacity,
+        )
+    }
+
+    fn build_close_dialog(
+        on_save: EditorMessage,
+        on_discard: EditorMessage,
+        on_cancel: EditorMessage,
+        description: String,
+    ) -> Element<'static, EditorMessage> {
+        let button_row = row![
+            button(
+                text("Cancel")
+                    .size(13)
+                    .color(theme::TEXT_SECONDARY)
+                    .align_x(Alignment::Center)
+            )
+            .style(theme::button_secondary)
+            .on_press(on_cancel.clone()),
+            Space::new().width(8),
+            button(
+                text("Discard")
+                    .size(13)
+                    .color(theme::STATUS_ERROR)
+                    .align_x(Alignment::Center)
+            )
+            .style(theme::button_danger)
+            .on_press(on_discard),
+            Space::new().width(8),
+            button(
+                text("Save")
+                    .size(13)
+                    .color(theme::ACCENT_LIGHT)
+                    .align_x(Alignment::Center)
+            )
+            .style(theme::button_primary)
+            .on_press(on_save),
+        ]
+        .align_y(Alignment::End)
+        .width(Length::Fill);
+
+        Self::confirmation_dialog(
+            "Unsaved changes",
+            description,
+            button_row,
             380,
-            on_cancel.clone(),
+            on_cancel,
             0.5,
         )
     }
 
     /// Build the delete confirmation dialog overlay.
-    fn build_delete_confirm_dialog(target: &DeleteConfirmTarget) -> Element<'_, EditorMessage> {
+    fn build_delete_confirm_dialog(
+        target: &DeleteConfirmTarget,
+    ) -> Element<'static, EditorMessage> {
         let description = if target.is_dir {
             let dirty_msg = if target.dirty_tab_count > 0 {
                 format!(
@@ -5855,51 +5889,38 @@ impl EditorState {
             format!("Delete file \"{}\"?", target.path)
         };
 
-        // Dialog content.
-        Self::wrap_dialog(
-            column![
-                row![
-                    lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                        .size(16)
-                        .color(theme::STATUS_WARNING),
-                    Space::new().width(8),
-                    text(if target.is_dir {
-                        "Delete directory"
-                    } else {
-                        "Delete file"
-                    })
-                    .size(16)
-                    .color(theme::TEXT_PRIMARY),
-                ]
-                .align_y(Alignment::Center),
-                text(description)
-                    .size(14)
+        let title = if target.is_dir {
+            "Delete directory"
+        } else {
+            "Delete file"
+        };
+
+        let button_row = row![
+            button(
+                text("Cancel")
+                    .size(13)
                     .color(theme::TEXT_SECONDARY)
-                    .width(Length::Fill),
-                row![
-                    button(
-                        text("Cancel")
-                            .size(13)
-                            .color(theme::TEXT_SECONDARY)
-                            .align_x(Alignment::Center)
-                    )
-                    .style(theme::button_secondary)
-                    .on_press(EditorMessage::CancelDelete),
-                    Space::new().width(8),
-                    button(
-                        text("Delete")
-                            .size(13)
-                            .color(theme::STATUS_ERROR)
-                            .align_x(Alignment::Center)
-                    )
-                    .style(theme::button_danger)
-                    .on_press(EditorMessage::ConfirmDelete),
-                ]
-                .align_y(Alignment::End)
-                .width(Length::Fill),
-            ]
-            .spacing(16)
-            .width(Length::Fill),
+                    .align_x(Alignment::Center)
+            )
+            .style(theme::button_secondary)
+            .on_press(EditorMessage::CancelDelete),
+            Space::new().width(8),
+            button(
+                text("Delete")
+                    .size(13)
+                    .color(theme::STATUS_ERROR)
+                    .align_x(Alignment::Center)
+            )
+            .style(theme::button_danger)
+            .on_press(EditorMessage::ConfirmDelete),
+        ]
+        .align_y(Alignment::End)
+        .width(Length::Fill);
+
+        Self::confirmation_dialog(
+            title,
+            description,
+            button_row,
             400,
             EditorMessage::CancelDelete,
             0.5,
