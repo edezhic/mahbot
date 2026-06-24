@@ -3990,7 +3990,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("create");
 
-        let ticket = store.get_ticket(&id).await.expect("get").expect("exists");
+        let ticket = expect_ticket(&store, &id).await;
         let display = ticket.detailed_display();
 
         assert!(
@@ -4098,7 +4098,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("add_comment");
 
-        let ticket = store.get_ticket(&id).await.expect("get").expect("exists");
+        let ticket = expect_ticket(&store, &id).await;
         let display = ticket.detailed_display();
 
         assert!(
@@ -4172,11 +4172,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("create");
 
-        let ticket = store
-            .get_ticket(&multi_id)
-            .await
-            .expect("get")
-            .expect("exists");
+        let ticket = expect_ticket(&store, &multi_id).await;
         let display = ticket.detailed_display();
 
         assert!(
@@ -4214,11 +4210,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("supersede");
 
         // Check the new ticket shows Supersedes
-        let new_ticket = store
-            .get_ticket(&new_id)
-            .await
-            .expect("get")
-            .expect("exists");
+        let new_ticket = expect_ticket(&store, &new_id).await;
         let new_display = new_ticket.detailed_display();
         assert!(
             new_display.contains(&format!("Supersedes: {old_id}")),
@@ -4226,11 +4218,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
 
         // Check the old ticket shows Superseded by + Archived
-        let old_ticket = store
-            .get_ticket(&old_id)
-            .await
-            .expect("get")
-            .expect("exists");
+        let old_ticket = expect_ticket(&store, &old_id).await;
         let old_display = old_ticket.detailed_display();
         assert!(
             old_display.contains(&format!("Superseded by: {new_id}")),
