@@ -900,19 +900,14 @@ async fn spawn_new_instance_from(binary_path: &Path, admin_target: Option<&Strin
         )
         .context("Failed to open update.log for child stderr")?;
 
-    #[cfg(unix)]
-    {
-        cmd.stdin(Stdio::null()).stdout(Stdio::null());
-    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
 
     cmd.stderr(Stdio::from(update_log));
