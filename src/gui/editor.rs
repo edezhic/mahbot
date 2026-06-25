@@ -1544,11 +1544,10 @@ impl EditorState {
     }
 
     /// Resolve a relative tree path to an absolute filesystem path.
-    fn abs_path(&self, rel_path: &str) -> String {
+    fn abs_path(&self, rel_path: &str) -> Option<String> {
         self.selected_workspace_path
             .as_ref()
             .map(|ws| Path::new(ws).join(rel_path).to_string_lossy().to_string())
-            .unwrap_or_default()
     }
 
     /// Rebuild both the hierarchical tree and visible node list from `dir_entries`
@@ -2313,11 +2312,13 @@ impl EditorState {
                 // Resolve tree-relative path against workspace root so that
                 // file operations and tab paths are absolute (matching restored
                 // tabs) and work regardless of MahBot's CWD.
-                let Some(ws) = self.workspace_root() else {
+                let Some(_ws) = self.workspace_root() else {
                     tracing::error!("SelectFile without workspace selected");
                     return Task::none();
                 };
-                let abs_path = Path::new(ws).join(&path).to_string_lossy().to_string();
+                let abs_path = self
+                    .abs_path(&path)
+                    .expect("SelectFile: selected_workspace_path already guarded above");
 
                 if let Some(pos) = self.tabs.iter().position(|t| t.path == abs_path) {
                     return self.switch_to_tab(pos);
@@ -2648,10 +2649,12 @@ impl EditorState {
             EditorMessage::DeleteFileRequested(path) => {
                 // Cancel inline rename if open (mutual exclusion).
                 self.rename_target = None;
-                let Some(ref ws) = self.selected_workspace_path else {
+                let Some(ref _ws) = self.selected_workspace_path else {
                     return Task::none();
                 };
-                let abs_path = Path::new(ws).join(&path).to_string_lossy().to_string();
+                let abs_path = self
+                    .abs_path(&path)
+                    .expect("DeleteFileRequested: selected_workspace_path already guarded above");
                 self.delete_confirm = Some(DeleteConfirmTarget {
                     path,
                     is_dir: false,
@@ -2670,10 +2673,12 @@ impl EditorState {
                         "Cannot delete root directory".into(),
                     )));
                 }
-                let Some(ref ws) = self.selected_workspace_path else {
+                let Some(ref _ws) = self.selected_workspace_path else {
                     return Task::none();
                 };
-                let abs_path = Path::new(ws).join(&path).to_string_lossy().to_string();
+                let abs_path = self.abs_path(&path).expect(
+                    "DeleteDirectoryRequested: selected_workspace_path already guarded above",
+                );
                 let abs_prefix = format!("{abs_path}/");
 
                 // Count open tabs that are inside this directory.
@@ -2762,7 +2767,9 @@ impl EditorState {
                 // (mutual exclusion — only one modal state at a time).
                 self.new_item_input = None;
                 self.delete_confirm = None;
-                let abs_path = self.abs_path(&path);
+                let abs_path = self
+                    .abs_path(&path)
+                    .expect("RenameRequested: selected_workspace_path already guarded above");
                 let file_name = Path::new(&abs_path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -2917,6 +2924,11 @@ impl EditorState {
                 dir_entries,
                 rename_gen,
             } => {
+                // Guard: workspace could have been cleared mid-rename.
+                let Some(_ws) = self.workspace_root() else {
+                    return Task::none();
+                };
+
                 // Stale-result prevention via the standard dir_generations
                 // protocol (same as dir_expanded).  Compute the parent dir
                 // and check if we still own the generation slot.
@@ -2939,8 +2951,12 @@ impl EditorState {
                         }
 
                         // ── Update open tab paths ────────────────
-                        let old_abs = self.abs_path(&old_path);
-                        let new_abs = self.abs_path(&new_path);
+                        let old_abs = self
+                            .abs_path(&old_path)
+                            .expect("RenameCompleted: workspace_root() already guarded above");
+                        let new_abs = self
+                            .abs_path(&new_path)
+                            .expect("RenameCompleted: workspace_root() already guarded above");
 
                         // Build a prefix-based replacement for directory renames.
                         if is_dir {
@@ -4784,7 +4800,6 @@ impl EditorState {
 
         let btn = widgets::tree_node_button(row, highlight, Some(message));
 
-        let abs_path = self.abs_path(full_path);
         let rel_path = full_path.to_string();
 
         let mut menu_items: Vec<(String, EditorMessage)> = extra_context_items;
@@ -4792,14 +4807,17 @@ impl EditorState {
             "Copy Relative Path".into(),
             EditorMessage::CopyRelativePath(rel_path),
         ));
-        menu_items.push((
-            "Copy Absolute Path".into(),
-            EditorMessage::CopyAbsolutePath(abs_path.clone()),
-        ));
-        menu_items.push((
-            "Reveal in Finder".into(),
-            EditorMessage::RevealInFinder(abs_path),
-        ));
+
+        if let Some(abs_path) = self.abs_path(full_path) {
+            menu_items.push((
+                "Copy Absolute Path".into(),
+                EditorMessage::CopyAbsolutePath(abs_path.clone()),
+            ));
+            menu_items.push((
+                "Reveal in Finder".into(),
+                EditorMessage::RevealInFinder(abs_path),
+            ));
+        }
 
         ContextMenu::new(btn, menu_items).into()
     }
