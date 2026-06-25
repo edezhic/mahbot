@@ -1217,7 +1217,7 @@ mod tests {
         let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
         tree.viewport_h = Some(400.0);
 
-        let task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
+        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
 
         // The task type is opaque, but we can verify it's not panicking
         // and that scroll_y stays at its default.
