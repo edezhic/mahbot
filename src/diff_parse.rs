@@ -486,19 +486,42 @@ fn extract_b_path(b_part: &str) -> Option<String> {
     Some(path.strip_prefix("b/")?.to_string())
 }
 
-/// Parse hunk header: @@ -old_start,old_count +new_start,new_count @@ \[context]
+/// Parse a single range token like `-10,7` or `+10` from a hunk header.
+/// Returns the starting line number, or `None` if the token is malformed.
+/// `header` is the original hunk header string, used for diagnostic messages.
+fn parse_range_token(part: &str, prefix: char, header: &str) -> Option<usize> {
+    let remainder = part.strip_prefix(prefix)?;
+    if remainder.is_empty() || !remainder.chars().all(|c| c.is_ascii_digit() || c == ',') {
+        warn!("Skipping non-numeric '{prefix}' token {part:?} in hunk header {header:?}");
+        return None;
+    }
+    remainder
+        .split(',')
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+/// Parse a hunk header: `@@ -old_start,old_count +new_start,new_count @@ [context]`.
 ///
-/// Returns (old_start, new_start).
+/// Returns `(old_start, new_start)`, defaulting to `1` for malformed or missing ranges.
 ///
 /// # Correctness
 ///
-/// The parser extracts only the range tokens between the opening `@@` and
-/// closing `@@` delimiters, stopping at the first token that starts with `@`.
-/// This prevents context strings containing `-` or `+` (e.g. Rust function
-/// signatures with `->`, or expressions like `a + b`) from corrupting line
-/// numbers.  Additionally, only tokens whose remainder after stripping the
-/// `-`/`+` prefix contain exclusively ASCII digits and commas are treated as
-/// line-number ranges — everything else is logged and skipped.
+/// The parser must guard against two types of tokens that look like range
+/// prefixes but carry different meaning in trailing context:
+///
+/// - **`->`** (arrow in Rust function signatures): after the closing `@@`,
+///   a token like `->` starts with `-` but is not a range token. The parser
+///   stops at the first token starting with `@` (the closing delimiter), so
+///   trailing-context tokens are never inspected.
+/// - **`a + b`** (expressions in context): the `+b` token starts with `+`
+///   but appears after the closing `@@` delimiter — again stopped by the
+///   `@` break.
+///
+/// The character validation in [`parse_range_token`] provides a second
+/// line of defense: even if a spurious `-` or `+` token somehow appeared
+/// before the closing `@@`, non-digit/non-comma characters cause it to be
+/// skipped (e.g. `->` yields remainder `>` which fails validation).
 fn parse_hunk_header(header: &str) -> (usize, usize) {
     // Example inputs:
     //   @@ -10,7 +10,9 @@ fn main() {
@@ -508,73 +531,34 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
 
     // Strip the opening @@ delimiter.
     let after_open = header.trim_start_matches('@');
-    let parts: Vec<&str> = after_open.split_whitespace().collect();
 
     let mut old_start = 1;
     let mut new_start = 1;
 
-    for part in &parts {
+    for part in after_open.split_whitespace() {
         // Stop when we hit the closing @@ delimiter — any remaining
         // tokens are context and must not influence line numbers.
         if part.starts_with('@') {
             break;
         }
 
-        if part.starts_with('-') {
-            let remainder = part.strip_prefix('-').unwrap_or("");
-            // Validate: range remainder must be only digits and commas.
-            // Reject context tokens like `->`, `-this`, `-1` (from `if x < -1`).
-            if remainder.is_empty() || !remainder.chars().all(|c| c.is_ascii_digit() || c == ',') {
-                warn!(
-                    "Skipping non-numeric '-' token {:?} in hunk header {:?}",
-                    part, header
-                );
-                continue;
-            }
-            match remainder
-                .split(',')
-                .next()
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                Some(n) => old_start = n,
-                None => {
-                    warn!(
-                        "Failed to parse old line number from {:?} in hunk header {:?}",
-                        part, header
-                    );
-                }
-            }
-        } else if part.starts_with('+') {
-            let remainder = part.strip_prefix('+').unwrap_or("");
-            if remainder.is_empty() || !remainder.chars().all(|c| c.is_ascii_digit() || c == ',') {
-                warn!(
-                    "Skipping non-numeric '+' token {:?} in hunk header {:?}",
-                    part, header
-                );
-                continue;
-            }
-            match remainder
-                .split(',')
-                .next()
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                Some(n) => new_start = n,
-                None => {
-                    warn!(
-                        "Failed to parse new line number from {:?} in hunk header {:?}",
-                        part, header
-                    );
-                }
-            }
+        if part.starts_with('-')
+            && let Some(n) = parse_range_token(part, '-', header)
+        {
+            old_start = n;
+        } else if part.starts_with('+')
+            && let Some(n) = parse_range_token(part, '+', header)
+        {
+            new_start = n;
         }
     }
 
     (old_start, new_start)
 }
 
-/// Check if a directory is a git repository (handles worktrees where .git is a file).
+/// Check if a directory contains a `.git` entry (file for worktrees, directory otherwise).
 #[must_use]
-pub async fn is_git_repo(path: &Path) -> bool {
+pub fn is_git_repo(path: &Path) -> bool {
     path.join(".git").exists()
 }
 

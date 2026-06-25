@@ -1284,7 +1284,7 @@ async fn load_diff(
     if !git_is_installed().await {
         return Err("Git is not installed.".to_string());
     }
-    if !is_git_repo(&ws_path).await {
+    if !is_git_repo(&ws_path) {
         return Err("This workspace is not a git repository.".to_string());
     }
     if !git_has_commits(&ws_path)

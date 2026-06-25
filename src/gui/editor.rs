@@ -1162,7 +1162,7 @@ fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
 /// is not a git repo or if git is not installed.
 async fn load_git_status(workspace_path: String) -> Result<HashMap<String, GitFileStatus>, String> {
     let ws_path = Path::new(&workspace_path);
-    if !is_git_repo(ws_path).await {
+    if !is_git_repo(ws_path) {
         tracing::debug!("Workspace '{workspace_path}' is not a git repo — skipping git status");
         return Ok(HashMap::new());
     }

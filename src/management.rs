@@ -866,7 +866,7 @@ async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
         return;
     }
 
-    if !crate::diff_parse::is_git_repo(repo_path).await {
+    if !crate::diff_parse::is_git_repo(repo_path) {
         transition_qa_to_done(&ticket, "Not a git repo — moving to Done without commit").await;
         return;
     }
