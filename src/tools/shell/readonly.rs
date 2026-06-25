@@ -930,6 +930,38 @@ mod tests {
         assert_rejected("git rebase main");
     }
 
+    // ── Git --bare flag (regression: was skipped as a git global flag) ─
+
+    #[test]
+    fn git_bare_status_allowed() {
+        ok("git --bare status");
+    }
+
+    #[test]
+    fn git_bare_log_allowed() {
+        ok("git --bare log --oneline");
+    }
+
+    #[test]
+    fn git_bare_diff_allowed() {
+        ok("git --bare diff");
+    }
+
+    #[test]
+    fn git_bare_push_rejected() {
+        assert_rejected("git --bare push");
+    }
+
+    #[test]
+    fn git_bare_commit_rejected() {
+        assert_rejected("git --bare commit -m test");
+    }
+
+    #[test]
+    fn git_bare_reset_rejected() {
+        assert_rejected("git --bare reset --hard");
+    }
+
     // ── Cargo allowlist ────────────────────────────────────────────
 
     /// Tests that ALL entries in the production [`CARGO_SAFE_SUBCOMMANDS`] constant

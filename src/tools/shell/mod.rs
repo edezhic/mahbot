@@ -49,8 +49,12 @@ pub(super) const SHELL_PREFIXES: &[&str] = &[
 ];
 
 /// Git global flags that may appear between `git` and its subcommand.
-/// These flags take a value (the next word after the flag).
-pub(super) const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "--bare", "-c"];
+///
+/// **IMPORTANT**: Only include flags that take a space-separated value argument.
+/// Boolean flags like `--bare` MUST NOT be listed here — `find_first_non_flag_index`
+/// skips 2 words (flag + value) for each entry, causing boolean flags to consume
+/// the subcommand as their "value" and bypass read-only validation entirely.
+pub(super) const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
 
 /// Default maximum shell command execution time before kill.
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
