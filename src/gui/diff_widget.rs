@@ -21,8 +21,8 @@
 
 use std::sync::Arc;
 
+use iced::advanced::graphics::text::Raw as TextRaw;
 use iced::advanced::graphics::text::cosmic_text;
-use iced::advanced::graphics::text::{self as graphics_text, Raw as TextRaw};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text;
 use iced::advanced::widget::{self, Tree, Widget};
@@ -32,11 +32,10 @@ use iced::keyboard;
 use iced::{Color, Event, Length, Point, Rectangle, Size};
 
 use crate::diff_parse::{DiffFileStatus, DiffLineKind};
-use crate::util::UnwrapPoison;
 
 use super::text_rendering::{
     GUTTER_FONT_SIZE, compute_total_height, font_metrics, gutter_clip_rect, iced_color_to_cosmic,
-    push_or_merge, text_area_rect,
+    push_or_merge, text_area_rect, with_font_system,
 };
 use super::theme;
 
@@ -268,62 +267,63 @@ where
         }
 
         let metrics = font_metrics();
-        let mut guard = graphics_text::font_system().write().unwrap_poison();
-        let font_sys = guard.raw();
 
-        let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
+        let (buffer, total_height) = with_font_system(|font_sys| {
+            let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
 
-        // ── Build rich spans from pre-computed span data ────────────
-        let text = &self.data.text;
-        let base_attrs = cosmic_text::Attrs::new()
-            .family(cosmic_text::Family::Name("JetBrains Mono"))
-            .color(iced_color_to_cosmic(theme::TEXT_PRIMARY));
+            // ── Build rich spans from pre-computed span data ────────────
+            let text = &self.data.text;
+            let base_attrs = cosmic_text::Attrs::new()
+                .family(cosmic_text::Family::Name("JetBrains Mono"))
+                .color(iced_color_to_cosmic(theme::TEXT_PRIMARY));
 
-        let mut rich_spans: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
-        let mut byte_pos = 0usize;
-        for &(start, end, color) in &self.data.span_data {
-            if start > byte_pos {
-                push_or_merge(
-                    text,
-                    &mut rich_spans,
-                    &text[byte_pos..start],
-                    base_attrs.clone(),
-                );
+            let mut rich_spans: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
+            let mut byte_pos = 0usize;
+            for &(start, end, color) in &self.data.span_data {
+                if start > byte_pos {
+                    push_or_merge(
+                        text,
+                        &mut rich_spans,
+                        &text[byte_pos..start],
+                        base_attrs.clone(),
+                    );
+                }
+                if end > start {
+                    let attrs = base_attrs.clone().color(iced_color_to_cosmic(color));
+                    push_or_merge(text, &mut rich_spans, &text[start..end], attrs);
+                    byte_pos = end;
+                }
             }
-            if end > start {
-                let attrs = base_attrs.clone().color(iced_color_to_cosmic(color));
-                push_or_merge(text, &mut rich_spans, &text[start..end], attrs);
-                byte_pos = end;
+            // Cover any remaining text after the last span
+            if byte_pos < text.len() {
+                push_or_merge(text, &mut rich_spans, &text[byte_pos..], base_attrs.clone());
             }
-        }
-        // Cover any remaining text after the last span
-        if byte_pos < text.len() {
-            push_or_merge(text, &mut rich_spans, &text[byte_pos..], base_attrs.clone());
-        }
 
-        buffer.set_rich_text(
-            font_sys,
-            rich_spans,
-            &base_attrs,
-            cosmic_text::Shaping::Advanced,
-            None,
-        );
-        buffer.set_scroll(cosmic_text::Scroll {
-            line: 0,
-            vertical: 0.0,
-            horizontal: 0.0,
+            buffer.set_rich_text(
+                font_sys,
+                rich_spans,
+                &base_attrs,
+                cosmic_text::Shaping::Advanced,
+                None,
+            );
+            buffer.set_scroll(cosmic_text::Scroll {
+                line: 0,
+                vertical: 0.0,
+                horizontal: 0.0,
+            });
+            buffer.set_size(font_sys, Some(text_area_width), None);
+            buffer.shape_until_scroll(font_sys, false);
+
+            // ── Compute total height ────────────────────────────────────
+            // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines
+            let total_height: f32 = compute_total_height(&mut buffer, font_sys, metrics);
+
+            (buffer, total_height)
         });
-        buffer.set_size(font_sys, Some(text_area_width), None);
-        buffer.shape_until_scroll(font_sys, false);
-
-        // ── Compute total height ────────────────────────────────────
-        // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines
-        let total_height: f32 = compute_total_height(&mut buffer, font_sys, metrics);
 
         // Move the shaped buffer into an Arc and store for fill_raw
         let arc = Arc::new(buffer);
         state.buffer_for_render = Some(arc);
-        drop(guard);
 
         layout::Node::new(Size::new(bounds.width, total_height + self.padding * 2.0))
     }

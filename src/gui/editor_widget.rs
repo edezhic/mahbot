@@ -12,7 +12,7 @@ use iced::mouse::ScrollDelta;
 use super::highlight::{self, FileHighlights, HighlightLanguage};
 use super::text_rendering::{
     GUTTER_FONT_SIZE, MAX_HIGHLIGHT_SIZE, compute_total_height, font_metrics, gutter_clip_rect,
-    iced_color_to_cosmic, push_or_merge, text_area_rect,
+    iced_color_to_cosmic, push_or_merge, reshape_and_shape, text_area_rect, with_font_system,
 };
 use crate::util::UnwrapPoison;
 
@@ -182,19 +182,17 @@ pub struct EditorBuffer {
 impl EditorBuffer {
     /// Create an empty buffer with no language (no syntax highlighting).
     pub fn new() -> Self {
-        let mut guard = iced::advanced::graphics::text::font_system()
-            .write()
-            .unwrap_poison();
-        let font_sys = guard.raw();
-        let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
-        buffer.set_text(
-            font_sys,
-            "",
-            &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono")),
-            cosmic_text::Shaping::Advanced,
-            None,
-        );
-        drop(guard);
+        let buffer = with_font_system(|font_sys| {
+            let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
+            buffer.set_text(
+                font_sys,
+                "",
+                &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono")),
+                cosmic_text::Shaping::Advanced,
+                None,
+            );
+            buffer
+        });
         Self {
             buffer: RefCell::new(buffer),
             cursor_line: Cell::new(0),
@@ -213,13 +211,11 @@ impl EditorBuffer {
     /// `MAX_HIGHLIGHT_SIZE`, syntax highlighting is applied via tree-sitter.
     /// Otherwise text is rendered with default attributes.
     pub fn with_text(text: &str, language: Option<HighlightLanguage>) -> Self {
-        let mut guard = iced::advanced::graphics::text::font_system()
-            .write()
-            .unwrap_poison();
-        let font_sys = guard.raw();
-        let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
-        Self::set_buffer_text_highlighted(&mut buffer, font_sys, text, language);
-        drop(guard);
+        let buffer = with_font_system(|font_sys| {
+            let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
+            Self::set_buffer_text_highlighted(&mut buffer, font_sys, text, language);
+            buffer
+        });
         Self {
             buffer: RefCell::new(buffer),
             cursor_line: Cell::new(0),
@@ -458,14 +454,11 @@ impl EditorBuffer {
     /// selection to the start. Re-applies syntax highlighting if a language
     /// is configured.
     pub fn set_text(&self, new_text: &str) {
-        let mut guard = iced::advanced::graphics::text::font_system()
-            .write()
-            .unwrap_poison();
-        let font_sys = guard.raw();
-        let mut buffer = self.buffer.borrow_mut();
-        Self::set_buffer_text_highlighted(&mut buffer, font_sys, new_text, self.language);
-        drop(buffer);
-        drop(guard);
+        let language = self.language;
+        with_font_system(|font_sys| {
+            let mut buffer = self.buffer.borrow_mut();
+            Self::set_buffer_text_highlighted(&mut buffer, font_sys, new_text, language);
+        });
         self.cursor_line.set(0);
         self.cursor_col.set(0);
         self.has_selection.set(false);
@@ -589,14 +582,11 @@ impl EditorBuffer {
         let saved_sel_line = self.sel_line.get();
         let saved_sel_col = self.sel_col.get();
 
-        let mut guard = iced::advanced::graphics::text::font_system()
-            .write()
-            .unwrap_poison();
-        let font_sys = guard.raw();
-        let mut buffer = self.buffer.borrow_mut();
-        Self::set_buffer_text_highlighted(&mut buffer, font_sys, &new_text, self.language);
-        drop(buffer);
-        drop(guard);
+        let language = self.language;
+        with_font_system(|font_sys| {
+            let mut buffer = self.buffer.borrow_mut();
+            Self::set_buffer_text_highlighted(&mut buffer, font_sys, &new_text, language);
+        });
 
         // Restore cursor/selection after re-highlighting.
         self.cursor_line.set(saved_line);
@@ -2337,15 +2327,13 @@ where
         let font_sys = guard.raw();
         let mut buffer = self.buffer.borrow_buffer_mut();
 
-        // set_scroll MUST be called before shape_until_scroll / set_size
-        buffer.set_scroll(Scroll {
-            line: 0,
-            vertical: state.scroll_y,
-            horizontal: 0.0,
-        });
-        buffer.set_size(font_sys, Some(text_area_width), Some(text_area_height));
-        // Ensure shaping runs even if set_size was a no-op (size unchanged)
-        buffer.shape_until_scroll(font_sys, false);
+        reshape_and_shape(
+            &mut buffer,
+            font_sys,
+            Some(state.scroll_y),
+            text_area_width,
+            text_area_height,
+        );
 
         // ── Auto-scroll: keep cursor in viewport ───────────────────────
         let cursor = self.buffer.cursor();
@@ -2448,15 +2436,17 @@ where
         // Use the buffer Arc that was prepared in layout()
         let buffer_for_draw = state.buffer_for_render.clone().unwrap_or_else(|| {
             // Fallback: create a fresh buffer if layout wasn't called
-            let mut guard = graphics_text::font_system().write().unwrap_poison();
-            let font_sys = guard.raw();
-            let mut buffer = self.buffer.borrow_buffer_mut();
-            buffer.set_size(font_sys, Some(text_area_width), Some(text_area_height));
-            buffer.shape_until_scroll(font_sys, false);
-            let cloned = Arc::new(buffer.clone());
-            drop(buffer);
-            drop(guard);
-            cloned
+            with_font_system(|font_sys| {
+                let mut buffer = self.buffer.borrow_buffer_mut();
+                reshape_and_shape(
+                    &mut buffer,
+                    font_sys,
+                    None,
+                    text_area_width,
+                    text_area_height,
+                );
+                Arc::new(buffer.clone())
+            })
         });
 
         let text_clip = text_rect;
@@ -2754,16 +2744,17 @@ where
                     let text_area_width = (bounds.width - text_x - self.padding).max(0.0);
                     let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
 
-                    let mut guard = graphics_text::font_system().write().unwrap_poison();
-                    let font_sys = guard.raw();
-                    let mut buffer = self.buffer.borrow_buffer_mut();
-                    buffer.set_scroll(Scroll {
-                        line: 0,
-                        vertical: state.scroll_y,
-                        horizontal: 0.0,
+                    let scroll_y = state.scroll_y;
+                    with_font_system(|font_sys| {
+                        let mut buffer = self.buffer.borrow_buffer_mut();
+                        reshape_and_shape(
+                            &mut buffer,
+                            font_sys,
+                            Some(scroll_y),
+                            text_area_width,
+                            text_area_height,
+                        );
                     });
-                    buffer.set_size(font_sys, Some(text_area_width), Some(text_area_height));
-                    buffer.shape_until_scroll(font_sys, false);
                 }
 
                 if let Some((line, col)) = hit_test(
@@ -2891,12 +2882,7 @@ where
                 // ── Clipboard shortcuts (Cmd/Ctrl+C/X/V) ──────────────
                 // On macOS, only Cmd (not Ctrl) triggers clipboard shortcuts;
                 // Ctrl+C/X/V are terminal control characters.
-                #[cfg(target_os = "macos")]
-                let is_clipboard_mod = modifiers.command() && !modifiers.control();
-                #[cfg(not(target_os = "macos"))]
-                let is_clipboard_mod =
-                    (modifiers.command() || modifiers.control()) && !modifiers.alt();
-                if is_clipboard_mod {
+                if super::detect_keyboard_mods(modifiers).is_text_platform_mod() {
                     if let Some(latin) = key_press.to_latin(*physical_key) {
                         match latin {
                             'c' | 'x' => {
@@ -2928,11 +2914,7 @@ where
                 // Plain arrows (no cmd/ctrl, no alt) use visual navigation;
                 // Shift+Up/Down extends selection visually.
                 {
-                    // On macOS, platform shortcuts use Cmd only.
-                    #[cfg(target_os = "macos")]
-                    let platform_mod = modifiers.command();
-                    #[cfg(not(target_os = "macos"))]
-                    let platform_mod = modifiers.command() || modifiers.control();
+                    let platform_mod = super::detect_keyboard_mods(modifiers).is_nav_platform_mod();
                     let alt = modifiers.alt();
                     let shift = modifiers.shift();
                     let is_arrow_up = matches!(key_press, key::Key::Named(key::Named::ArrowUp));
@@ -2947,21 +2929,16 @@ where
                             (bounds.width - text_x_offset - self.padding).max(0.0);
                         let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
 
-                        let result = {
-                            let mut guard = graphics_text::font_system().write().unwrap_poison();
-                            let font_sys = guard.raw();
+                        let scroll_y = state.scroll_y;
+                        let result = with_font_system(|font_sys| {
                             let mut buffer = self.buffer.borrow_buffer_mut();
-                            buffer.set_scroll(Scroll {
-                                line: 0,
-                                vertical: state.scroll_y,
-                                horizontal: 0.0,
-                            });
-                            buffer.set_size(
+                            reshape_and_shape(
+                                &mut buffer,
                                 font_sys,
-                                Some(text_area_width),
-                                Some(text_area_height),
+                                Some(scroll_y),
+                                text_area_width,
+                                text_area_height,
                             );
-                            buffer.shape_until_scroll(font_sys, false);
 
                             let cursor = self.buffer.cursor();
                             let metrics = font_metrics();
@@ -3019,7 +2996,7 @@ where
                                     (hit.line, col)
                                 })
                             }
-                        }; // drop RefMut and font_system guard
+                        }); // with_font_system drops guard
 
                         if let Some((target_line, target_col)) = result {
                             if shift {
@@ -3051,10 +3028,7 @@ where
                 // behavior: first press goes to the visual row boundary,
                 // second press goes to the logical line start/end.
                 {
-                    #[cfg(target_os = "macos")]
-                    let platform_mod = modifiers.command();
-                    #[cfg(not(target_os = "macos"))]
-                    let platform_mod = modifiers.command() || modifiers.control();
+                    let platform_mod = super::detect_keyboard_mods(modifiers).is_nav_platform_mod();
                     let alt = modifiers.alt();
                     let shift = modifiers.shift();
                     let is_cmd_left = platform_mod
@@ -3072,21 +3046,16 @@ where
                             (bounds.width - text_x_offset - self.padding).max(0.0);
                         let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
 
-                        let result = {
-                            let mut guard = graphics_text::font_system().write().unwrap_poison();
-                            let font_sys = guard.raw();
+                        let scroll_y = state.scroll_y;
+                        let result = with_font_system(|font_sys| {
                             let mut buffer = self.buffer.borrow_buffer_mut();
-                            buffer.set_scroll(Scroll {
-                                line: 0,
-                                vertical: state.scroll_y,
-                                horizontal: 0.0,
-                            });
-                            buffer.set_size(
+                            reshape_and_shape(
+                                &mut buffer,
                                 font_sys,
-                                Some(text_area_width),
-                                Some(text_area_height),
+                                Some(scroll_y),
+                                text_area_width,
+                                text_area_height,
                             );
-                            buffer.shape_until_scroll(font_sys, false);
 
                             let cursor = self.buffer.cursor();
                             let cursor_run =
@@ -3130,7 +3099,7 @@ where
                                     }
                                 }
                             })
-                        }; // drop RefMut and font_system guard
+                        }); // with_font_system drops guard
 
                         if let Some((target_line, target_col)) = result {
                             if shift {
@@ -3176,13 +3145,7 @@ where
                 // On non-macOS, both Ctrl and Cmd are platform modifiers;
                 // Ctrl+Alt (AltGr) is excluded because it produces text
                 // characters for international layouts.
-                #[cfg(target_os = "macos")]
-                let is_platform_mod = modifiers.command() && !modifiers.control();
-                #[cfg(not(target_os = "macos"))]
-                let is_platform_mod =
-                    (modifiers.command() || modifiers.control()) && !modifiers.alt();
-
-                if !is_platform_mod {
+                if !super::detect_keyboard_mods(modifiers).is_text_platform_mod() {
                     if let Some(committed) = text {
                         if !committed.is_empty() {
                             if let Some(ref suppress) = state.ime_commit_suppress {
@@ -3380,10 +3343,7 @@ fn map_key_to_action(
     // Ctrl is reserved for emacs-style shortcuts (Ctrl+F/B/A/E/etc.)
     // and terminal conventions. On other platforms, Ctrl triggers
     // platform shortcuts alongside the Windows/Super key.
-    #[cfg(target_os = "macos")]
-    let platform_mod = modifiers.command();
-    #[cfg(not(target_os = "macos"))]
-    let platform_mod = modifiers.command() || modifiers.control();
+    let platform_mod = super::detect_keyboard_mods(&modifiers).is_nav_platform_mod();
     let shift = modifiers.shift();
     let alt = modifiers.alt();
 

@@ -239,6 +239,8 @@ pub(crate) struct KeyboardMods {
     /// True if the platform modifier is held — Command (⌘) on macOS,
     /// Control (Ctrl) on other platforms.
     pub is_platform_mod: bool,
+    /// True if the Control key is held (any platform).
+    pub ctrl_held: bool,
     /// On macOS: true if Ctrl is held without Cmd (triggers terminal
     /// control characters / emacs bindings).  Always false on other
     /// platforms.
@@ -248,6 +250,46 @@ pub(crate) struct KeyboardMods {
     pub altgr_active: bool,
 }
 
+impl KeyboardMods {
+    /// Platform modifier for shortcut-like navigation
+    /// (arrow-key movement, line start/end, etc.).
+    ///
+    /// On macOS: Cmd only — Ctrl is reserved for Emacs-style bindings
+    /// (Ctrl+F/B/A/E/P/N etc.) and terminal control characters.
+    ///
+    /// On other platforms: Cmd or Ctrl.
+    #[must_use]
+    pub fn is_nav_platform_mod(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.is_cmd
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.is_platform_mod
+        }
+    }
+
+    /// Platform modifier for text-affecting shortcuts
+    /// (clipboard C/X/V, IME guard).
+    ///
+    /// Stricter than [`is_nav_platform_mod`]: on macOS, Cmd+Ctrl combos
+    /// are excluded (Ctrl+C/X/V are terminal control characters); on
+    /// other platforms, AltGr (Ctrl+Alt) is excluded because it produces
+    /// text characters for international keyboard layouts.
+    #[must_use]
+    pub fn is_text_platform_mod(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.is_cmd && !self.ctrl_held
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.is_platform_mod && !self.altgr_active
+        }
+    }
+}
+
 /// Compute [`KeyboardMods`] from an Iced [`keyboard::Modifiers`] value.
 ///
 /// Encapsulates the `#[cfg(target_os = "macos")]` / `#[cfg(not(...))]`
@@ -255,6 +297,7 @@ pub(crate) struct KeyboardMods {
 pub(crate) fn detect_keyboard_mods(modifiers: &keyboard::Modifiers) -> KeyboardMods {
     let is_cmd = modifiers.command();
     let is_platform_mod = modifiers.command() || modifiers.control();
+    let ctrl_held = modifiers.control();
 
     #[cfg(target_os = "macos")]
     let is_emacs_ctrl = modifiers.control() && !modifiers.command();
@@ -269,6 +312,7 @@ pub(crate) fn detect_keyboard_mods(modifiers: &keyboard::Modifiers) -> KeyboardM
     KeyboardMods {
         is_cmd,
         is_platform_mod,
+        ctrl_held,
         is_emacs_ctrl,
         altgr_active,
     }

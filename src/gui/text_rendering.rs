@@ -9,6 +9,8 @@
 use iced::advanced::graphics::text::cosmic_text;
 use iced::{Color, Rectangle};
 
+use crate::util::UnwrapPoison;
+
 // ── Constants ───────────────────────────────────────────────────────
 
 /// Font metrics used for text rendering (editor buffer, diff viewer).
@@ -32,6 +34,64 @@ pub(crate) const GUTTER_FONT_SIZE: f32 = 11.0;
 /// Maximum visual lines per source line as a safety limit against
 /// pathological single lines (e.g. no-whitespace megabyte).
 pub(crate) const MAX_VISUAL_LINES_PER_SOURCE: usize = 10_000;
+
+// ── Font system access ───────────────────────────────────────────
+
+/// Acquire the global font system and invoke the closure with a mutable
+/// reference to it. The font system guard is released after the closure
+/// completes.
+///
+/// This is the canonical way to access the font system for shaping,
+/// highlighting, and other text operations, extracted to eliminate
+/// repeated `write().unwrap_poison()` boilerplate across editor and
+/// diff widgets.
+pub(crate) fn with_font_system<R>(f: impl FnOnce(&mut cosmic_text::FontSystem) -> R) -> R {
+    let mut guard = iced::advanced::graphics::text::font_system()
+        .write()
+        .unwrap_poison();
+    f(guard.raw())
+}
+
+/// Shape (or re-shape) a [`cosmic_text::Buffer`] for a given viewport.
+///
+/// When `scroll_y` is `Some`, [`set_scroll`] is called **before**
+/// [`set_size`] / [`shape_until_scroll`] — this ordering is required by
+/// cosmic_text and **must not** be inverted.
+///
+/// Pass `scroll_y: None` to skip the scroll reset (e.g. in draw fallbacks
+/// where [`layout`] already positioned the scroll).
+///
+/// # Scroll parameters
+///
+/// `line` is always 0 and `horizontal` is always 0.0 — every current
+/// caller places the cursor at the first logical line and left-aligns the
+/// viewport.  Accepting these as parameters would complicate every call
+/// site for no present benefit; if a future use-case needs different
+/// values, add them as optional parameters.
+///
+/// [`set_scroll`]: cosmic_text::Buffer::set_scroll
+/// [`set_size`]: cosmic_text::Buffer::set_size
+/// [`shape_until_scroll`]: cosmic_text::Buffer::shape_until_scroll
+/// [`layout`]: iced::advanced::widget::Widget::layout
+pub(crate) fn reshape_and_shape(
+    buffer: &mut cosmic_text::Buffer,
+    font_sys: &mut cosmic_text::FontSystem,
+    scroll_y: Option<f32>,
+    text_area_width: f32,
+    text_area_height: f32,
+) {
+    // set_scroll MUST be called before shape_until_scroll / set_size
+    if let Some(scroll_y) = scroll_y {
+        buffer.set_scroll(cosmic_text::Scroll {
+            line: 0,
+            vertical: scroll_y,
+            horizontal: 0.0,
+        });
+    }
+    buffer.set_size(font_sys, Some(text_area_width), Some(text_area_height));
+    // Ensure shaping runs even if set_size was a no-op (size unchanged)
+    buffer.shape_until_scroll(font_sys, false);
+}
 
 // ── Geometry helpers ────────────────────────────────────────────────
 
