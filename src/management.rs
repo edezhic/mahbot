@@ -135,13 +135,12 @@ enum NotifyPolicy {
 /// If `notify` is [`NotifyPolicy::Notify`], calls [`notify_ticket`] on success;
 /// errors from notification are logged and discarded (not propagated).
 ///
-/// # Note: workspace auto-pause on failure
+/// # Workspace auto-pause on failure
 ///
-/// Auto-pausing the workspace on ticket failure (`Failed` status) is handled
-/// inside [`notify_ticket`] — it only fires when
-/// `notify` is [`NotifyPolicy::Notify`]. If adding a `Failed` transition with
-/// [`NotifyPolicy::Buffer`], workspace pausing will NOT occur automatically;
-/// ensure appropriate handling at the call site.
+/// Auto-pauses the workspace when a ticket transitions to [`TicketPhase::Failed`],
+/// regardless of [`NotifyPolicy`]. This ensures the user can inspect the failure
+/// before any automated rework proceeds. The pause happens unconditionally so
+/// that future `Failed` transitions with `Buffer` still pause correctly.
 async fn transition_ticket(
     ticket: &Ticket,
     expected: TicketPhase,
@@ -153,6 +152,27 @@ async fn transition_ticket(
         .await
     {
         Ok(()) => {
+            // Auto-pause workspace on ticket failure regardless of NotifyPolicy,
+            // so the user can inspect before automated rework proceeds.
+            if target == TicketPhase::Failed
+                && let Some(ws) = resolve_ticket_workspace(ticket, "auto-pause after failure").await
+                    && !ws.paused {
+                        if let Err(e) = crate::workspace::store().set_paused(&ws.name, true).await {
+                            warn!(
+                                ticket = %ticket.id,
+                                workspace = %ws.name,
+                                error = %e,
+                                "Failed to pause workspace after ticket failure",
+                            );
+                        } else {
+                            info!(
+                                ticket = %ticket.id,
+                                workspace = %ws.name,
+                                "Workspace paused due to ticket failure",
+                            );
+                        }
+                    }
+
             if matches!(notify, NotifyPolicy::Notify) {
                 notify_ticket(ticket, target).await;
             } else if let Some(ws) =
@@ -165,11 +185,6 @@ async fn transition_ticket(
                     target.as_ref(),
                 );
             }
-
-            // Auto-pause on failure is handled inside `notify_ticket`.
-            // If a `Failed` transition with `NotifyPolicy::Buffer` is added here,
-            // auto-pause will NOT occur — ensure workspace pausing is
-            // handled explicitly if needed.
 
             Ok(())
         }
@@ -270,13 +285,9 @@ async fn bounce_back_to_development(ticket: &Ticket, source_phase: TicketPhase, 
 /// serialized [`crate::manager_queue::MANAGER_QUEUE`]. The consumer loop handles user lookup
 /// and delivery (broadcasts to all users with this workspace active).
 ///
-/// # Workspace auto-pause on failure
-///
-/// When `status` is [`TicketPhase::Failed`], this function also pauses
-/// the ticket's workspace so the user can inspect before any further
-/// automated work. This is a best-effort operation — if workspace
-/// resolution fails or the DB call errors, the pause is silently skipped
-/// and logged (errors never propagate to the caller).
+/// This is a pure notification function — it does NOT pause the workspace.
+/// Workspace auto-pause on [`TicketPhase::Failed`] transitions is handled
+/// unconditionally in [`transition_ticket`] regardless of [`NotifyPolicy`].
 ///
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
@@ -294,28 +305,6 @@ async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
         );
         return;
     };
-
-    // Auto-pause the workspace when a ticket fails, so the user
-    // can inspect before any further automated work.
-    // Note: if workspace resolution succeeded just above but this
-    // DB call fails, the pause is silently skipped — errors are
-    // handled internally and the impact is negligible on an exceptional path.
-    if status == TicketPhase::Failed && !ws.paused {
-        if let Err(e) = crate::workspace::store().set_paused(&ws.name, true).await {
-            warn!(
-                ticket = %ticket.id,
-                workspace = %ws.name,
-                error = %e,
-                "Failed to pause workspace after ticket failure",
-            );
-        } else {
-            info!(
-                ticket = %ticket.id,
-                workspace = %ws.name,
-                "Workspace paused due to ticket failure",
-            );
-        }
-    }
 
     // Build a single-line transition log for this ticket.
     let transition_log = format!(
@@ -1467,8 +1456,8 @@ fn build_analyst_summary(
 /// parameters and closures. This eliminates ~80% structural duplication while
 /// preserving exact behavioral semantics.
 ///
-/// The workspace is paused automatically via [`notify_ticket`], called from
-/// [`transition_ticket`] with [`NotifyPolicy::Notify`].
+/// The workspace is paused automatically inside [`transition_ticket`] when
+/// the ticket transitions to [`TicketPhase::Failed`].
 ///
 /// # Self-counting prevention
 ///
@@ -1545,8 +1534,8 @@ async fn run_circuit_breaker(
         return true;
     }
 
-    // Workspace auto-pause: `transition_ticket` (called with
-    // `NotifyPolicy::Notify`) pauses the workspace automatically.
+    // Workspace auto-pause is handled inside `transition_ticket`
+    // when the target is `Failed`, regardless of `NotifyPolicy`.
 
     // Move all other ReadyForDevelopment tickets in the same workspace to
     // Planning to prevent them from auto-starting after the workspace is
@@ -1620,7 +1609,7 @@ async fn run_circuit_breaker(
 /// that generates excessive churn of any kind gets failed.
 ///
 /// If the comment count exceeds [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`], fail the ticket
-/// (via [`TicketPhase::Failed`]) and pause the workspace (via [`notify_ticket`]).
+/// (via [`TicketPhase::Failed`]) and pause the workspace.
 /// Return `true` (caller should early-return). On transition failure, still returns
 /// `true` to abort dispatch.
 #[must_use]
@@ -2227,6 +2216,138 @@ mod tests {
         assert!(
             drained.is_empty(),
             "Buffer should be empty after last ticket's Notify drains it",
+        );
+    }
+
+    /// Verify that transitioning a ticket to [`TicketPhase::Failed`] unconditionally
+    /// pauses the workspace, even when using [`NotifyPolicy::Buffer`]. This proves
+    /// the auto-pause invariant is structural (not coincidental on NotifyPolicy).
+    #[tokio::test]
+    async fn transition_to_failed_pauses_workspace() {
+        init_test_stores().await;
+        if crate::workspace::WORKSPACES.get().is_none() {
+            let _ = crate::workspace::init_global().await;
+        }
+
+        let ws_name = "ws_pause_on_fail_test";
+        let ws_path = "/tmp/test_ws_pause_on_fail";
+        let now = crate::turso::now();
+        crate::workspace::store()
+            .conn
+            .execute(
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                turso::params![ws_name, ws_path, now.clone(), now, 0],
+            )
+            .await
+            .expect("insert test workspace");
+
+        let ws = test_ws_named(ws_path, ws_name);
+
+        let ticket_id = board()
+            .create_ticket(
+                "Test Ticket",
+                "desc",
+                &ws,
+                DEFAULT_TICKET_PHASE,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // Transition to Failed with Buffer policy — auto-pause must still fire
+        transition_ticket(
+            &ticket,
+            DEFAULT_TICKET_PHASE,
+            TicketPhase::Failed,
+            NotifyPolicy::Buffer,
+        )
+        .await
+        .expect("transition to Failed");
+
+        // Verify workspace is paused
+        let ws = crate::workspace::get_by_name(ws_name)
+            .await
+            .expect("get_by_name")
+            .expect("workspace exists");
+        assert!(
+            ws.paused,
+            "Workspace should be paused after ticket failure (even with Buffer policy)"
+        );
+    }
+
+    /// Verify that transitioning a ticket to a non-failure phase does NOT pause
+    /// the workspace. This proves the auto-pause is scoped exclusively to Failed.
+    #[tokio::test]
+    async fn transition_to_non_failed_does_not_pause() {
+        init_test_stores().await;
+        if crate::workspace::WORKSPACES.get().is_none() {
+            let _ = crate::workspace::init_global().await;
+        }
+        if crate::manager_queue::MANAGER_QUEUE.get().is_none() {
+            let _ = crate::manager_queue::init_global();
+        }
+
+        let ws_name = "ws_no_pause_test";
+        let ws_path = "/tmp/test_ws_no_pause";
+        let now = crate::turso::now();
+        crate::workspace::store()
+            .conn
+            .execute(
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                turso::params![ws_name, ws_path, now.clone(), now, 0],
+            )
+            .await
+            .expect("insert test workspace");
+
+        let ws = test_ws_named(ws_path, ws_name);
+
+        let ticket_id = board()
+            .create_ticket(
+                "Test Ticket",
+                "desc",
+                &ws,
+                DEFAULT_TICKET_PHASE,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // Transition from Backlog to Analysis (non-failure) with Notify policy
+        transition_ticket(
+            &ticket,
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+            NotifyPolicy::Notify,
+        )
+        .await
+        .expect("transition to Analysis");
+
+        // Verify workspace is NOT paused
+        let ws = crate::workspace::get_by_name(ws_name)
+            .await
+            .expect("get_by_name")
+            .expect("workspace exists");
+        assert!(
+            !ws.paused,
+            "Workspace should NOT be paused after non-failure transition"
         );
     }
 }
