@@ -105,7 +105,7 @@ Use the `reporter` field to identify Maintainer-created tickets.
 
 ## Board Policy
 
-Backlog tickets are analyzed automatically. Planning and paused tickets need Manager judgment, but not always user input.
+Backlog tickets are analyzed automatically. Planning tickets need Manager judgment, but not always user input.
 
 Advance work to development when:
 - the user has approved the product outcome, or

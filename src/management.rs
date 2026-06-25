@@ -1310,7 +1310,7 @@ async fn record_verdict_comments(
 /// Spawn 3 parallel analyst agents to research a backlog ticket.
 /// All verdicts are recorded as comments, then the ticket transitions to:
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYSIS_THRESHOLD`/10)
-/// - Paused (notify) when any analyst fails, with a comment listing the counts
+/// - Planning (notify) when any analyst fails, with a comment listing the counts
 ///
 /// Before spawning agents, [`guard_phase_and_circuit_breaker`] checks the phase and
 /// trips the comment-count circuit breaker (which may transition the ticket to
@@ -1339,7 +1339,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 /// Records per-analyst comments (if verdict exists), counts responses and
 /// extractions via post-loop iterators, then transitions:
 /// - to Planning (notify) if ALL analysts passed (≥ `ANALYSIS_THRESHOLD`/10)
-/// - to Paused (notify) if any analyst failed, with a comment listing the counts
+/// - to Planning (notify) if any analyst failed, with a comment listing the counts
 async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // Record per-analyst comments.
     // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
@@ -1384,11 +1384,7 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // analysts must produce passing verdicts for the ticket to proceed.
     let all_passed = passing_count == PARALLEL_AGENT_COUNT;
 
-    let target = if all_passed {
-        TicketPhase::Planning
-    } else {
-        TicketPhase::Paused
-    };
+    let target = TicketPhase::Planning;
 
     if let Err(e) =
         transition_ticket(ticket, TicketPhase::Analysis, target, NotifyPolicy::Notify).await
@@ -1414,7 +1410,7 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
             nonempty_count,
             extracted_count,
             passing_count,
-            "Backlog analysis incomplete — paused ({nonempty_count}/{PARALLEL_AGENT_COUNT} responded, \
+            "Backlog analysis incomplete — moved to planning ({nonempty_count}/{PARALLEL_AGENT_COUNT} responded, \
              {extracted_count} extracted, {passing_count} passed)",
         );
     }
@@ -1547,10 +1543,11 @@ async fn run_circuit_breaker(
     // Workspace auto-pause: `transition_ticket` (called with
     // `NotifyPolicy::Notify`) pauses the workspace automatically.
 
-    // Pause all other ReadyForDevelopment tickets in the same workspace to
-    // prevent them from auto-starting after the workspace is unpaused. The
-    // human must manually move them back to ReadyForDevelopment after
-    // investigating the root cause of the breaker trip.
+    // Move all other ReadyForDevelopment tickets in the same workspace to
+    // Planning to prevent them from auto-starting after the workspace is
+    // unpaused. The human must manually move them back to
+    // ReadyForDevelopment after investigating the root cause of the breaker
+    // trip.
     //
     // There is a small race window: between listing ReadyForDevelopment
     // tickets here and transitioning them individually, a concurrent poll
@@ -1567,15 +1564,15 @@ async fn run_circuit_breaker(
                 ticket = %ticket.id,
                 workspace = %ticket.workspace_name,
                 error = %e,
-                "Failed to list ReadyForDevelopment tickets for pausing \
-                 — breaker trip proceeds without pausing siblings",
+                "Failed to list ReadyForDevelopment tickets for moving to planning \
+                 — breaker trip proceeds without moving siblings",
             );
             return true;
         }
     };
 
     let pause_comment = format!(
-        "Paused due to circuit breaker trip on {}: {}. Unpause manually after investigation.",
+        "Moved to planning due to circuit breaker trip on {}: {}. Move back to ReadyForDevelopment manually after investigation.",
         ticket.id, ticket.title,
     );
 
@@ -1589,7 +1586,7 @@ async fn run_circuit_breaker(
         if let Err(e) = transition_ticket(
             other,
             TicketPhase::ReadyForDevelopment,
-            TicketPhase::Paused,
+            TicketPhase::Planning,
             NotifyPolicy::Buffer,
         )
         .await
@@ -1597,7 +1594,7 @@ async fn run_circuit_breaker(
             debug!(
                 other_ticket = %other.id,
                 error = %e,
-                "Failed to pause other ReadyForDevelopment ticket — likely raced by external move",
+                "Failed to move other ReadyForDevelopment ticket to planning — likely raced by external move",
             );
             continue;
         }
@@ -1822,11 +1819,11 @@ mod tests {
     }
 
     /// Verify that when the circuit breaker trips on a ticket, all other
-    /// ReadyForDevelopment tickets in the same workspace are paused with a
-    /// system comment referencing the tripped ticket. Tickets in other
+    /// ReadyForDevelopment tickets in the same workspace are moved to Planning
+    /// with a system comment referencing the tripped ticket. Tickets in other
     /// workspaces must not be affected.
     #[tokio::test]
-    async fn circuit_breaker_pauses_other_ready_for_development_tickets() {
+    async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning() {
         init_test_stores().await;
         // Initialize workspace store if not already done by a sibling test.
         // Required by transition_ticket for ticket buffer resolution.
@@ -1856,7 +1853,7 @@ mod tests {
             .await
             .expect("create_ticket A");
 
-        // Create ticket B in workspace A — this should be paused when A trips.
+        // Create ticket B in workspace A — this should be moved to Planning when A trips.
         let ticket_b_id = board()
             .create_ticket(
                 "Victim Ticket",
@@ -1870,7 +1867,7 @@ mod tests {
             .await
             .expect("create_ticket B");
 
-        // Create ticket C in workspace B — this must NOT be paused.
+        // Create ticket C in workspace B — this must NOT be moved.
         let ticket_c_id = board()
             .create_ticket(
                 "Other Workspace Ticket",
@@ -1923,7 +1920,7 @@ mod tests {
             );
         }
 
-        // ── Verify ticket B (same workspace) is Paused ──
+        // ── Verify ticket B (same workspace) is Planning ──
         {
             let ticket_b = board()
                 .get_ticket(&ticket_b_id)
@@ -1932,8 +1929,8 @@ mod tests {
                 .expect("ticket B exists");
             assert_eq!(
                 ticket_b.status,
-                TicketPhase::Paused,
-                "other ReadyForDevelopment ticket B in same workspace should be Paused"
+                TicketPhase::Planning,
+                "other ReadyForDevelopment ticket B in same workspace should be Planning"
             );
         }
 
@@ -1947,7 +1944,7 @@ mod tests {
             assert_eq!(
                 ticket_c.status,
                 TicketPhase::ReadyForDevelopment,
-                "ticket C in different workspace must not be paused"
+                "ticket C in different workspace must not be moved"
             );
         }
 
@@ -1957,26 +1954,26 @@ mod tests {
                 .get_comments(&ticket_b_id)
                 .await
                 .expect("get_comments for B");
-            let pause_comment = comments
+            let comment = comments
                 .iter()
                 .find(|c| c.role == "system")
                 .expect("ticket B should have a system comment");
 
             assert!(
-                pause_comment.content.contains(&ticket_a_id),
-                "pause comment should contain the tripped ticket's ID"
+                comment.content.contains(&ticket_a_id),
+                "comment should contain the tripped ticket's ID"
             );
             assert!(
-                pause_comment
+                comment
                     .content
-                    .contains("Paused due to circuit breaker trip on"),
-                "pause comment should start with expected format"
+                    .contains("Moved to planning due to circuit breaker trip on"),
+                "comment should start with expected format"
             );
             assert!(
-                pause_comment
+                comment
                     .content
-                    .contains("Unpause manually after investigation"),
-                "pause comment should end with expected format"
+                    .contains("Move back to ReadyForDevelopment manually after investigation"),
+                "comment should end with expected format"
             );
         }
     }

@@ -154,11 +154,6 @@ impl BoardState {
     /// Status transition actions (ported from Board.tsx `availableActions`)
     fn available_actions(status: &TicketPhase) -> Vec<(&'static str, TicketPhase)> {
         match status {
-            TicketPhase::Paused => vec![
-                ("▶️ Resume Dev", TicketPhase::ReadyForDevelopment),
-                ("↩️ Back to Backlog", TicketPhase::Backlog),
-                ("🛑 Cancel", TicketPhase::Cancelled),
-            ],
             TicketPhase::ReadyForDevelopment => vec![("🛑 Cancel", TicketPhase::Cancelled)],
             TicketPhase::InDevelopment | TicketPhase::InQa => {
                 vec![("🛑 Cancel", TicketPhase::Cancelled)]
@@ -626,7 +621,6 @@ impl BoardState {
                 TicketPhase::Backlog
                 | TicketPhase::Analysis
                 | TicketPhase::Planning
-                | TicketPhase::Paused
                 | TicketPhase::Failed => pending.push(ticket),
                 TicketPhase::ReadyForDevelopment
                 | TicketPhase::InDevelopment

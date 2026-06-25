@@ -420,7 +420,6 @@ pub enum TicketPhase {
     Done,
     Cancelled,
     Failed,
-    Paused,
 }
 
 impl TicketPhase {
@@ -484,6 +483,14 @@ impl BoardStore {
             TICKETS_FTS_INDEX_NAME,
             "ngram",
             TICKETS_FTS_INDEX_DDL,
+        )
+        .await?;
+
+        // Migration: `Paused` was removed from `TicketPhase` — all existing
+        // `paused` tickets are functionally identical to `Planning`. Idempotent.
+        conn.execute(
+            "UPDATE tickets SET status = 'planning' WHERE status = 'paused'",
+            turso::params![],
         )
         .await?;
 
@@ -969,7 +976,7 @@ impl BoardStore {
     ///   can set the reservation atomically by passing `Some(true)`.
     /// - Manual transitions (GUI/UpdateTicketTool) to terminal phases
     ///   leave stale reservations inert — the claim and blocker queries filter by
-    ///   status, so a cancelled/paused/failed ticket with reservation=1 is harmless.
+    ///   status, so a cancelled/planning/failed ticket with reservation=1 is harmless.
     ///
     /// When `reservation` is `Some(value)`, the column is set to the given boolean
     /// in the same UPDATE statement. This is needed for crash/restart recovery and
@@ -1240,7 +1247,7 @@ impl BoardStore {
     /// `ReadyForDevelopment` tickets with `pipeline_reservation = 1`.
     ///
     /// Non-active statuses (not matched by the query): `Done`, `Cancelled`,
-    /// `Failed`, `Paused`, `Backlog`, `Analysis`, `Planning`.
+    /// `Failed`, `Backlog`, `Analysis`, `Planning`.
     ///
     /// # Race condition note
     ///
@@ -1816,7 +1823,6 @@ mod tests {
             ("done", TicketPhase::Done),
             ("cancelled", TicketPhase::Cancelled),
             ("failed", TicketPhase::Failed),
-            ("paused", TicketPhase::Paused),
         ];
         for (s, expected) in variants {
             assert_eq!(&s.parse::<TicketPhase>().unwrap(), expected, "variant: {s}");
@@ -2368,18 +2374,18 @@ mod tests {
             )
             .await
             .expect("create Failed");
-        let paused_id = store
+        let planning_id = store
             .create_ticket(
-                "Paused",
+                "Planning",
                 "desc",
                 &ws,
-                TicketPhase::Paused,
+                TicketPhase::Planning,
                 &[],
                 "test",
                 None,
             )
             .await
-            .expect("create Paused");
+            .expect("create Planning");
         let backlog_id = store
             .create_ticket(
                 "Backlog",
@@ -2394,7 +2400,13 @@ mod tests {
             .expect("create Backlog");
 
         // All active-status tickets should return false
-        for exclude_id in [&done_id, &cancelled_id, &failed_id, &paused_id, &backlog_id] {
+        for exclude_id in [
+            &done_id,
+            &cancelled_id,
+            &failed_id,
+            &planning_id,
+            &backlog_id,
+        ] {
             assert!(
                 !store
                     .has_active_tickets_excluding("ws", exclude_id)

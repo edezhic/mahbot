@@ -2,7 +2,6 @@ Transition an existing ticket to a new status or phase. Requires the ticket `tic
 
 - **backlog** — return the ticket to the queue (analysts will re-evaluate it)
 - **ready_for_development** — send the ticket to an engineer for implementation
-- **paused** — temporarily hold the ticket (e.g., awaiting external input)
 - **cancelled** — abandon the ticket without completing it
 - **failed** — mark the ticket as unsuccessful
 - **done** — mark the ticket as complete and successful

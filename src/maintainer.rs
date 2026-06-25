@@ -85,7 +85,7 @@ pub async fn run_maintainer_loop() {
                 // If last_run_at is None, always run (first time).
             }
 
-            // Skip if there are already enough planning or paused tickets — pipeline pressure valve
+            // Skip if there are already enough planning tickets — pipeline pressure valve
             // Skip if this workspace has active pipeline tickets (dev/review/QA)
             if let Some(board) = crate::board::BOARD.get() {
                 let count_status = |status: TicketPhase| async move {
@@ -98,11 +98,10 @@ pub async fn run_maintainer_loop() {
                     }
                 };
 
-                let c1 = count_status(TicketPhase::Planning).await;
-                let c2 = count_status(TicketPhase::Paused).await;
+                let planning_count = count_status(TicketPhase::Planning).await;
 
-                if c1 + c2 >= 5 {
-                    info!(workspace = %ws.name, planning = c1, paused = c2, "Maintainer: skipping — tickets already in planning or paused");
+                if planning_count >= 5 {
+                    info!(workspace = %ws.name, planning = planning_count, "Maintainer: skipping — tickets already in planning");
                     continue;
                 }
 
