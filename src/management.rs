@@ -96,8 +96,12 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 ///
 /// Used by all agent-spawning dispatch functions
 /// ([`dispatch_backlog_analysts`], [`dispatch_engineer`], [`dispatch_verifiers`])
-/// for structural consistency. Diagnostics uses a separate circuit breaker
-/// (see [`trip_diagnostics_circuit_breaker_if_exceeded`]).
+/// for structural consistency. Previously, verifiers intentionally omitted this
+/// pre-agent check — churned tickets got one last review cycle before the
+/// circuit breaker could trip. Adding the pre-agent guard saves LLM credits
+/// by failing tickets with excessive churn before verifier agents run, at the
+/// cost of removing that last-chance review cycle. Diagnostics uses a separate
+/// circuit breaker (see [`trip_diagnostics_circuit_breaker_if_exceeded`]).
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
     ticket: &Ticket,
@@ -255,7 +259,13 @@ async fn bounce_back_to_development(ticket: &Ticket, source_phase: TicketPhase, 
                  failed — ticket stuck in {phase}, clearing assigned_to for retry",
                 phase = source_phase.as_ref(),
             );
-            let _ = board().set_assigned_to(&ticket.id, None).await;
+            if let Err(e) = board().set_assigned_to(&ticket.id, None).await {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to clear assigned_to on transition failure in bounce_back_to_development",
+                );
+            }
         }
     }
 }
@@ -421,13 +431,20 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                 );
                 // Best-effort transition: the ticket may have been moved
                 // externally while the dispatch was running.
-                let _ = board()
+                if let Err(e) = board()
                     .add_comment(
                         &ticket_for_failure.id,
                         "system",
                         &format!("❌ Dispatch panicked: {join_error}"),
                     )
-                    .await;
+                    .await
+                {
+                    warn!(
+                        ticket = %ticket_for_failure.id,
+                        error = %e,
+                        "Failed to record panic comment",
+                    );
+                }
                 if let Err(e) = transition_ticket(
                     &ticket_for_failure,
                     target_phase,
@@ -760,9 +777,16 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         ("Agent failed", TicketPhase::Failed, NotifyPolicy::Notify)
     };
 
-    let _ = board()
+    if let Err(e) = board()
         .add_comment(&ticket.id, Role::Engineer.as_str(), comment_text)
-        .await;
+        .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to record engineer comment",
+        );
+    }
     if let Err(e) =
         transition_ticket(&ticket, TicketPhase::InDevelopment, target_phase, notify).await
     {
@@ -777,7 +801,13 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             phase = target_phase.as_ref(),
             stuck = TicketPhase::InDevelopment.as_ref(),
         );
-        let _ = board().set_assigned_to(&ticket.id, None).await;
+        if let Err(e) = board().set_assigned_to(&ticket.id, None).await {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to clear assigned_to on transition error",
+            );
+        }
     }
 }
 
@@ -1035,9 +1065,16 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         let _ = write!(comment, "\n\n---\n❌ Diagnostics failed at {failed_at}");
         TicketPhase::ReadyForDevelopment
     };
-    let _ = board()
+    if let Err(e) = board()
         .add_comment(&ticket.id, "diagnostics", &comment)
-        .await;
+        .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to record diagnostics comment",
+        );
+    }
 
     if target == TicketPhase::ReadyForDevelopment {
         bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
@@ -1055,7 +1092,13 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             "Diagnostics completed but transition to DiagnosticsDone \
              failed — clearing assigned_to for retry",
         );
-        let _ = board().set_assigned_to(&ticket.id, None).await;
+        if let Err(e) = board().set_assigned_to(&ticket.id, None).await {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to clear assigned_to on transition error",
+            );
+        }
     }
 }
 
@@ -1252,23 +1295,50 @@ fn format_verdict_comment(
     }
 }
 
+/// Outcome of [`record_verdict_comments`]: counts how many comments were
+/// attempted (non-filtered) and how many actually succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerdictCommentResult {
+    /// Number of comments that passed the filter and were attempted.
+    attempted: usize,
+    /// Number of comments that were successfully written.
+    written: usize,
+}
+
 /// Record per-agent verdict comments on a ticket.
 ///
 /// Analysts record ALL verdicts (passing + failing) so that every
 /// verdict is visible in the ticket discussion — this differs from
 /// verifiers (reviewers / QA), which only record failing comments.
+///
+/// Returns a [`VerdictCommentResult`] with the number of comments attempted
+/// and successfully written. Write failures are logged as warnings but do
+/// not propagate — the caller can inspect the result to detect total failure.
 async fn record_verdict_comments(
     ticket_id: &str,
     results: &[ParallelVerdict],
     role_str: &str,
     filter: VerdictFilter,
-) {
+) -> VerdictCommentResult {
+    let mut attempted = 0usize;
+    let mut written = 0usize;
     for (i, r) in results.iter().enumerate() {
         let role_label = format!("{role_str}_{}", i + 1);
         if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-            let _ = board().add_comment(ticket_id, &role_label, &comment).await;
+            attempted += 1;
+            if let Err(e) = board().add_comment(ticket_id, &role_label, &comment).await {
+                warn!(
+                    ticket = ticket_id,
+                    role = %role_label,
+                    error = %e,
+                    "Failed to record verdict comment",
+                );
+            } else {
+                written += 1;
+            }
         }
     }
+    VerdictCommentResult { attempted, written }
 }
 
 // ── Backlog Analysis ──────────────────────────────────────────────────
@@ -1309,7 +1379,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // Record per-analyst comments.
     // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
-    record_verdict_comments(
+    let verdict_result = record_verdict_comments(
         &ticket.id,
         results,
         Role::Analyst.as_str(),
@@ -1317,7 +1387,6 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     )
     .await;
 
-    // Post-loop computation: categorize each analyst verdict
     let nonempty_count = results.iter().filter(|r| !r.response.is_empty()).count();
     let total = results.len();
     let mut lgtm = 0usize;
@@ -1341,7 +1410,13 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
         potential_blockers,
         missing_analysis,
     );
-    let _ = board().add_comment(&ticket.id, "system", &summary).await;
+    if let Err(e) = board().add_comment(&ticket.id, "system", &summary).await {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to record analyst summary comment",
+        );
+    }
 
     let extracted_count = total - missing_analysis;
     let passing_count = lgtm + minor_issues;
@@ -1356,6 +1431,17 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     } else {
         TicketPhase::Paused
     };
+
+    // Log if all verdict comments failed (DB issue), but don't pause —
+    // analysts are advisory, not gating, so pausing would be excessive.
+    if verdict_result.attempted > 0 && verdict_result.written == 0 {
+        warn!(
+            ticket = %ticket.id,
+            "Analyst verdict comments: {attempted} expected, 0 written — DB may be unavailable",
+            attempted = verdict_result.attempted,
+        );
+    }
+
     if let Err(e) =
         transition_ticket(ticket, TicketPhase::Analysis, target, NotifyPolicy::Notify).await
     {
@@ -1495,9 +1581,16 @@ async fn run_circuit_breaker(
         "Circuit breaker tripped at {count}/{threshold} ({log_label}) — failing ticket and pausing workspace"
     );
 
-    let _ = board()
+    if let Err(e) = board()
         .add_comment(&ticket.id, "system", &comment_text(count))
-        .await;
+        .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to record circuit breaker comment",
+        );
+    }
 
     if let Err(e) =
         transition_ticket(ticket, expected, TicketPhase::Failed, NotifyPolicy::Notify).await
@@ -1567,7 +1660,7 @@ async fn process_verdict_results(
     verifier: VerifierInfo,
 ) {
     // Record failing comments
-    record_verdict_comments(
+    let verdict_result = record_verdict_comments(
         &ticket.id,
         results,
         verifier.role.as_str(),
@@ -1577,6 +1670,61 @@ async fn process_verdict_results(
 
     // Determine outcome
     let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
+
+    // Total write failure takes precedence over bounce-back: if comments
+    // were expected (attempted > 0) but nothing was written, the DB may be
+    // unavailable. Pausing the ticket prevents silent LLM-credit loop where
+    // the engineer operates blind (no critique visible) and the circuit
+    // breaker can't detect the churn.
+    if verdict_result.attempted > 0 && verdict_result.written == 0 {
+        warn!(
+            ticket = %ticket.id,
+            "{label} verdict comments: {attempted} expected, 0 written — DB may be unavailable",
+            label = verifier.log_label,
+            attempted = verdict_result.attempted,
+        );
+
+        // Best-effort system comment — the pause transition does not depend on it.
+        if let Err(e) = board()
+            .add_comment(
+                &ticket.id,
+                "system",
+                &format!(
+                    "All {n} {label} verdict comment writes failed — DB may be unavailable. \
+                     Ticket paused.",
+                    n = verdict_result.attempted,
+                    label = verifier.log_label,
+                ),
+            )
+            .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to write system comment about DB failure for {label}",
+                label = verifier.log_label,
+            );
+        }
+
+        if let Err(e) = transition_ticket(
+            ticket,
+            verifier.active_phase,
+            TicketPhase::Paused,
+            NotifyPolicy::Notify,
+        )
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "{label} verdict DB failure: transition to Paused also failed — \
+                 ticket stays in {phase} (safe, no re-dispatch)",
+                label = verifier.log_label,
+                phase = verifier.active_phase.as_ref(),
+            );
+        }
+        return;
+    }
 
     if any_failed {
         bounce_back_to_development(ticket, verifier.active_phase, verifier.log_label).await;
@@ -1642,7 +1790,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     // would waste credits on a fundamentally broken dispatch.
     let all_failed = results.iter().all(|r| r.verdict.is_none());
     if all_failed {
-        let _ = board()
+        if let Err(e) = board()
             .add_comment(
                 &ticket.id,
                 "system",
@@ -1652,7 +1800,16 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
                     label = vi.log_label,
                 ),
             )
-            .await;
+            .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                role = %vi.log_label,
+                "Failed to record all-{label}-failed system comment",
+                label = vi.log_label,
+            );
+        }
         if let Err(e) = transition_ticket(
             &ticket,
             vi.active_phase,
@@ -1725,5 +1882,187 @@ mod tests {
                 .await,
             "guard_phase_and_circuit_breaker must pass when phase matches and comments are below threshold"
         );
+    }
+
+    /// Verify that `record_verdict_comments` correctly counts attempted and
+    /// written comments based on verdict filter and write success.
+    #[tokio::test]
+    async fn record_verdict_comments_counts() {
+        init_test_stores().await;
+
+        let ws = test_ws_named("/tmp/test", "test");
+        let ticket_id = board()
+            .create_ticket("Test", "desc", &ws, DEFAULT_TICKET_PHASE, &[], "test", None)
+            .await
+            .expect("create_ticket");
+
+        // ── FailingOnly with all-passing verdicts ──
+        // Should produce attempted=0, written=0 (no comments to write).
+        let passing_verdict = crate::Verdict {
+            score: REVIEW_QA_THRESHOLD, // 9/10 — passes
+            critique: None,
+            issues_detected: vec![],
+        };
+        let results = vec![ParallelVerdict {
+            response: "Looks good.".into(),
+            verdict: Some(passing_verdict),
+        }];
+        let result = record_verdict_comments(
+            &ticket_id,
+            &results,
+            Role::Reviewer.as_str(),
+            VerdictFilter::FailingOnly,
+        )
+        .await;
+        assert_eq!(
+            result.attempted, 0,
+            "passing verdicts with FailingOnly filter should produce 0 attempted"
+        );
+        assert_eq!(
+            result.written, 0,
+            "passing verdicts with FailingOnly filter should produce 0 written"
+        );
+
+        // ── FailingOnly with a failing verdict ──
+        // Should produce attempted=1, written=1.
+        let failing = crate::Verdict {
+            score: 3, // below threshold
+            critique: Some("Missing error handling.".into()),
+            issues_detected: vec!["No timeout check".into()],
+        };
+        let results = vec![ParallelVerdict {
+            response: "Has issues.".into(),
+            verdict: Some(failing),
+        }];
+        let result = record_verdict_comments(
+            &ticket_id,
+            &results,
+            Role::Reviewer.as_str(),
+            VerdictFilter::FailingOnly,
+        )
+        .await;
+        assert_eq!(result.attempted, 1, "failing verdict should be attempted");
+        assert_eq!(result.written, 1, "failing verdict should be written");
+
+        // Verify the comment was actually stored.
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert_eq!(comments.len(), 1, "one comment should exist");
+        assert_eq!(comments[0].role, "reviewer_1");
+
+        // ── All filter (analyst path) ──
+        // Should produce attempted=2, written=2 (both verdicts recorded).
+        let pass = crate::Verdict {
+            score: 10,
+            critique: Some("Excellent analysis.".into()),
+            issues_detected: vec![],
+        };
+        let fail = crate::Verdict {
+            score: 4,
+            critique: Some("Needs more research.".into()),
+            issues_detected: vec!["Missing citations".into()],
+        };
+        let results = vec![
+            ParallelVerdict {
+                response: "Agent 1 response.".into(),
+                verdict: Some(pass),
+            },
+            ParallelVerdict {
+                response: "Agent 2 response.".into(),
+                verdict: Some(fail),
+            },
+        ];
+        let result = record_verdict_comments(
+            &ticket_id,
+            &results,
+            Role::Analyst.as_str(),
+            VerdictFilter::All,
+        )
+        .await;
+        assert_eq!(
+            result.attempted, 2,
+            "All filter should attempt both verdicts"
+        );
+        assert_eq!(result.written, 2, "All filter should write both verdicts");
+
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert_eq!(comments.len(), 3, "now three comments total");
+    }
+
+    /// Regression: verify `process_verdict_results` does not panic when
+    /// total comment-write failure occurs (attempted > 0, written == 0).
+    ///
+    /// This exercises the pause-on-total-failure path that transitions the
+    /// ticket to `Paused` when `record_verdict_comments` reports no successful
+    /// writes despite non-zero attempts.
+    ///
+    /// The test uses a `Ticket` struct with a non-existent ID (ghost ticket).
+    /// Because [`open_with_schema`](crate::turso::open_with_schema) sets
+    /// `PRAGMA foreign_keys = ON`, `add_comment` fails with a FK violation
+    /// when inserting into `ticket_comments` — the referenced `ticket_id`
+    /// does not exist in `tickets`. This causes `record_verdict_comments`
+    /// to return `attempted = 1, written = 0`, entering the pause branch.
+    ///
+    /// The dangling transaction from the aborted `add_comment` is self-healed
+    /// by [`Connection::maybe_rollback_dangling_tx`] on the next write
+    /// operation, so no global state leaks to sibling tests.
+    #[tokio::test]
+    async fn pause_branch_does_not_panic_on_total_failure() {
+        init_test_stores().await;
+
+        // Build a Ticket with a non-existent ID (ghost ticket).
+        // FK enforcement is active (set by open_with_schema), so
+        // add_comment will fail with a FK violation.
+        let ticket = Ticket {
+            id: crate::generate_id(),
+            title: String::new(),
+            description: String::new(),
+            status: TicketPhase::InReview,
+            assigned_to: None,
+            workspace_name: "test".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            comments: vec![],
+            prerequisites: vec![],
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+        };
+
+        // Build a failing verdict — score below REVIEW_QA_THRESHOLD (9/10)
+        // ensures format_verdict_comment returns Some(...).
+        let failing = crate::Verdict {
+            score: 3,
+            critique: Some("Missing error handling.".into()),
+            issues_detected: vec!["No timeout check".into()],
+        };
+        let results = vec![ParallelVerdict {
+            response: "Has issues.".into(),
+            verdict: Some(failing),
+        }];
+
+        let vi = VerifierInfo {
+            role: Role::Reviewer,
+            log_label: "Reviewers",
+            source: TicketPhase::DiagnosticsDone,
+            success_phase: TicketPhase::Reviewed,
+            active_phase: TicketPhase::InReview,
+            prompt_template: "review.md",
+            extraction_prompt_path: "extraction/reviewer.md",
+        };
+
+        // This should not panic — all DB operation failures
+        // (add_comment, transition_to) are caught and logged internally.
+        process_verdict_results(&ticket, &results, vi).await;
     }
 }

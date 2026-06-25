@@ -300,10 +300,15 @@ impl Connection {
 
     /// Handle a dangling transaction from a dropped TxGuard.
     /// Called at the start of every write operation.
+    ///
+    /// The ROLLBACK is best-effort: if it fails (e.g., the database engine
+    /// already aborted the transaction on a constraint violation), the
+    /// error is silently ignored. The flag has already been cleared, so
+    /// sibling operations will not attempt another rollback.
     async fn maybe_rollback_dangling_tx(&self) -> turso::Result<()> {
         let conn = self.conn.lock().await;
         if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
-            conn.execute("ROLLBACK".to_string(), ()).await?;
+            let _ = conn.execute("ROLLBACK".to_string(), ()).await;
         }
         Ok(())
     }
