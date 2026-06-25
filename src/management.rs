@@ -1639,20 +1639,30 @@ async fn trip_circuit_breaker_if_exceeded(
 /// Process parallel verifier results: add failing comments, determine pass/fail,
 /// and update ticket status accordingly.
 ///
-/// Notification does NOT fire on pass — verifiers transition without notifying.
-/// Instead, notification fires when the ticket reaches Done (after the
-/// QaPassed commit succeeds in [`finalize_qa_passed`]).
+/// Handles three outcomes in priority order:
 ///
-/// If any verifier fails (score below `REVIEW_QA_THRESHOLD`) → `ReadyForDevelopment`
-/// (the circuit breaker check is handled *before* dispatch by
-/// [`guard_phase_and_circuit_breaker`], so only the bounce-back is needed here).
-/// If all pass → the verifier's `success_phase`.
+/// 1. **All agents failed to produce a verdict** (every result has `verdict: None`
+///    — crashed, timed out, or unparseable output) → transition to [`TicketPhase::Failed`]
+///    with [`NotifyPolicy::Notify`]. This is a terminal failure; retrying would waste
+///    credits on a fundamentally broken dispatch.
+///
+/// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → bounce back to
+///    [`TicketPhase::ReadyForDevelopment`] via [`bounce_back_to_development`]. The circuit
+///    breaker is checked *before* dispatch by [`guard_phase_and_circuit_breaker`], so only
+///    the bounce-back is needed here.
+///
+/// 3. **All passed** (all at or above threshold) → transition to the verifier's
+///    `success_phase` with [`NotifyPolicy::Buffer`]. No immediate notification fires —
+///    it waits until the ticket reaches Done (after the QaPassed commit succeeds in
+///    [`finalize_qa_passed`]).
 async fn process_verdict_results(
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
 ) {
-    // Record failing comments
+    // Record per-agent comments for ALL outcomes (including the all-failed case).
+    // Previously the all-failed case skipped this and only wrote a summary comment;
+    // the per-agent comments provide more diagnostic information.
     record_verdict_comments(
         &ticket.id,
         results,
@@ -1661,12 +1671,48 @@ async fn process_verdict_results(
     )
     .await;
 
-    // Determine outcome
-    let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
+    // Priority 1: all agents failed to produce verdicts — terminal failure.
+    let all_failed = results.iter().all(|r| r.verdict.is_none());
+    if all_failed {
+        let _ = board()
+            .add_comment(
+                &ticket.id,
+                "system",
+                &format!(
+                    "❌ All {label} agents failed to produce verdicts — \
+                     ticket marked as Failed.",
+                    label = verifier.log_label,
+                ),
+            )
+            .await;
+        if let Err(e) = transition_ticket(
+            ticket,
+            verifier.active_phase,
+            TicketPhase::Failed,
+            NotifyPolicy::Notify,
+        )
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                role = %verifier.log_label,
+                "All {label} agents failed but transition to Failed also failed",
+                label = verifier.log_label,
+            );
+        }
+        return;
+    }
 
+    // Priority 2: any verifier failed — bounce back to development.
+    let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
     if any_failed {
         bounce_back_to_development(ticket, verifier.active_phase, verifier.log_label).await;
-    } else if let Err(e) = transition_ticket(
+        return;
+    }
+
+    // Priority 3: all passed — transition to the success phase (buffered).
+    if let Err(e) = transition_ticket(
         ticket,
         verifier.active_phase,
         verifier.success_phase,
@@ -1720,41 +1766,6 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
 
     // Post-run check still needed for race conditions during agent execution.
     if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
-        return;
-    }
-
-    // If every verifier agent failed to produce a verdict (all crashed, timed
-    // out, or returned unparseable output), this is a terminal failure — retrying
-    // would waste credits on a fundamentally broken dispatch.
-    let all_failed = results.iter().all(|r| r.verdict.is_none());
-    if all_failed {
-        let _ = board()
-            .add_comment(
-                &ticket.id,
-                "system",
-                &format!(
-                    "❌ All {label} agents failed to produce verdicts — \
-                     ticket marked as Failed.",
-                    label = vi.log_label,
-                ),
-            )
-            .await;
-        if let Err(e) = transition_ticket(
-            &ticket,
-            vi.active_phase,
-            TicketPhase::Failed,
-            NotifyPolicy::Notify,
-        )
-        .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                role = %vi.log_label,
-                "All {label} agents failed but transition to Failed also failed",
-                label = vi.log_label,
-            );
-        }
         return;
     }
 
