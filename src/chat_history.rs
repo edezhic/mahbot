@@ -46,8 +46,6 @@ pub struct ChatHistoryEntry {
     pub content: String,
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
-    pub workspace: String,
-    pub created_at: String,
 }
 
 /// Maximum number of history entries to load at once.
@@ -56,7 +54,7 @@ const HISTORY_LIMIT: i64 = 100;
 /// Column list for chat history SELECT queries.
 ///
 /// The column order here must match the positional indices defined in
-/// [`COL_CH_ID`] through [`COL_CH_WORKSPACE`], which are used in
+/// [`COL_CH_ID`] through [`COL_CH_AGENT_ROLE`], which are used in
 /// [`entry_from_row`].
 ///
 /// Note: The column order differs from the schema declaration order
@@ -65,8 +63,7 @@ const HISTORY_LIMIT: i64 = 100;
 /// the source of truth for field mapping; the
 /// [`chat_history_columns_count_matches_column_constants`] test
 /// catches count drift.
-const CHAT_HISTORY_COLUMNS: &str = "id, message_id, user_name, content, direction, agent_role, \
-     created_at, workspace";
+const CHAT_HISTORY_COLUMNS: &str = "id, message_id, user_name, content, direction, agent_role";
 
 /// Column-index constants for [`CHAT_HISTORY_COLUMNS`].
 ///
@@ -81,8 +78,6 @@ const COL_CH_USER_NAME: usize = 2;
 const COL_CH_CONTENT: usize = 3;
 const COL_CH_DIRECTION: usize = 4;
 const COL_CH_AGENT_ROLE: usize = 5;
-const COL_CH_CREATED_AT: usize = 6;
-const COL_CH_WORKSPACE: usize = 7;
 
 /// Convert a database row to a [`ChatHistoryEntry`] using the column-index
 /// constants from [`CHAT_HISTORY_COLUMNS`].
@@ -97,8 +92,6 @@ fn entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
             _ => ChatDirection::User,
         },
         agent_role: row.get::<Option<String>>(COL_CH_AGENT_ROLE)?,
-        created_at: row.get::<String>(COL_CH_CREATED_AT)?,
-        workspace: row.get::<String>(COL_CH_WORKSPACE)?,
     })
 }
 
@@ -235,7 +228,7 @@ mod tests {
     /// or vice versa — a silent data corruption hazard.
     #[test]
     fn chat_history_columns_count_matches_column_constants() {
-        crate::assert_column_count!(CHAT_HISTORY_COLUMNS, COL_CH_WORKSPACE);
+        crate::assert_column_count!(CHAT_HISTORY_COLUMNS, COL_CH_AGENT_ROLE);
     }
 
     fn test_setup() -> (TempDir, std::path::PathBuf) {
