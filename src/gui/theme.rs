@@ -181,64 +181,64 @@ pub const fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
     match phase {
         // Early phases — cool/muted, neutral
         Backlog => (
-            Color::from_rgb(0.353, 0.353, 0.353),
+            Color::from_rgb(0.176, 0.176, 0.176),
             Color::from_rgb(0.808, 0.804, 0.765),
         ),
         Planning => (
-            Color::from_rgb(0.478, 0.447, 0.227),
+            Color::from_rgb(0.263, 0.243, 0.114),
             Color::from_rgb(0.902, 0.863, 0.784),
         ),
         Analysis => (
-            Color::from_rgb(0.227, 0.431, 0.620),
+            Color::from_rgb(0.114, 0.216, 0.310),
             Color::from_rgb(0.784, 0.863, 0.949),
         ),
         // Ready — olive gateway (Manager→Engineer)
         ReadyForDevelopment => (
-            Color::from_rgb(0.478, 0.431, 0.243),
+            Color::from_rgb(0.263, 0.224, 0.114),
             Color::from_rgb(0.902, 0.863, 0.784),
         ),
         // Active phases — warm
         InDevelopment => (
-            Color::from_rgb(0.659, 0.431, 0.204),
+            Color::from_rgb(0.380, 0.216, 0.078),
             Color::from_rgb(0.941, 0.878, 0.784),
         ),
         // Diagnostic phases — amber/teal
         InDiagnostics => (
-            Color::from_rgb(0.541, 0.447, 0.227),
+            Color::from_rgb(0.310, 0.224, 0.102),
             Color::from_rgb(0.902, 0.863, 0.784),
         ),
         DiagnosticsDone => (
-            Color::from_rgb(0.322, 0.471, 0.447),
+            Color::from_rgb(0.161, 0.235, 0.224),
             Color::from_rgb(0.784, 0.902, 0.871),
         ),
         // Review & QA
         InReview => (
-            Color::from_rgb(0.369, 0.431, 0.659),
+            Color::from_rgb(0.184, 0.216, 0.380),
             Color::from_rgb(0.816, 0.816, 0.933),
         ),
         Reviewed => (
-            Color::from_rgb(0.447, 0.416, 0.541),
+            Color::from_rgb(0.224, 0.208, 0.322),
             Color::from_rgb(0.878, 0.816, 0.933),
         ),
         InQa => (
-            Color::from_rgb(0.431, 0.369, 0.659),
+            Color::from_rgb(0.216, 0.184, 0.380),
             Color::from_rgb(0.816, 0.816, 0.933),
         ),
         QaPassed => (
-            Color::from_rgb(0.353, 0.541, 0.416),
+            Color::from_rgb(0.176, 0.310, 0.208),
             Color::from_rgb(0.784, 0.902, 0.816),
         ),
         // Unblocking phases — distinct
         Done => (
-            Color::from_rgb(0.227, 0.353, 0.227),
+            Color::from_rgb(0.114, 0.176, 0.114),
             Color::from_rgb(0.753, 0.816, 0.753),
         ),
         Cancelled => (
-            Color::from_rgb(0.290, 0.290, 0.290),
+            Color::from_rgb(0.145, 0.145, 0.145),
             Color::from_rgb(0.690, 0.690, 0.690),
         ),
         Failed => (
-            Color::from_rgb(0.541, 0.227, 0.227),
+            Color::from_rgb(0.310, 0.114, 0.114),
             Color::from_rgb(0.878, 0.753, 0.753),
         ),
     }
