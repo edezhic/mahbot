@@ -1833,8 +1833,8 @@ mod tests {
         assert_eq!(parse_recipient(""), ("", None));
     }
 
-    #[tokio::test]
-    async fn telegram_markdown_to_html() {
+    #[test]
+    fn markdown_to_telegram_html() {
         // escapes quotes in link href
         let r = TelegramChannel::markdown_to_telegram_html(
             "[click](https://example.com?q=\"x\"&a='b')",
