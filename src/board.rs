@@ -724,7 +724,6 @@ impl BoardStore {
         let status_str: String = row.get(1)?;
         let old_status: TicketPhase = status_str.parse()?;
 
-        // Cancel the old ticket and set the forward supersede link.
         let now = turso::now();
         let cancelled_rows = tx
             .execute(
@@ -740,7 +739,6 @@ impl BoardStore {
             .await?;
         Self::ensure_ticket_found(cancelled_rows, supersede_id, "cancel superseded ticket")?;
 
-        // Insert the new ticket.
         Self::insert_ticket_in_tx(
             &tx,
             &new_id,
@@ -755,12 +753,10 @@ impl BoardStore {
         )
         .await?;
 
-        // Rewire dependents that reference the old ID.
         Self::rewire_dependents(&tx, supersede_id, &new_id, &ws.name).await?;
 
         tx.commit().await?;
 
-        // Buffer the supersede transition after successful commit.
         crate::ticket_buffer::push(
             &ws.name,
             supersede_id,
@@ -768,7 +764,6 @@ impl BoardStore {
             TicketPhase::Cancelled.as_ref(),
         );
 
-        // Cancel any running agent on the superseded ticket (after commit).
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
 
         Ok(new_id)
@@ -904,7 +899,6 @@ impl BoardStore {
                 ],
             )
             .await?;
-        // Caller contract: query produces at most one row (subsequent rows silently ignored)
         match rows.into_iter().next() {
             Some(row) => Ok(Some(self.ticket_from_row(&row, true).await?)),
             None => Ok(None),
@@ -915,7 +909,6 @@ impl BoardStore {
     pub async fn get_ticket(&self, id: &str) -> Result<Option<Ticket>> {
         let sql = format!("SELECT {TICKET_COLUMNS} FROM tickets WHERE id = ?1");
         let rows = self.conn.query(&sql, turso::params![id]).await?;
-        // Caller contract: query produces at most one row (subsequent rows silently ignored)
         match rows.into_iter().next() {
             Some(row) => Ok(Some(self.ticket_from_row(&row, true).await?)),
             None => Ok(None),
