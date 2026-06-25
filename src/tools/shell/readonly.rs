@@ -1216,40 +1216,50 @@ mod tests {
     // ── Prefix stripping (P0) ──────────────────────────────────────
 
     /// Tests that ALL delegating shell prefixes (those that forward their
-    /// arguments as a command) correctly expose mutating commands for rejection.
-    /// Iterates the production [`SHELL_PREFIXES`] constant directly, excluding
-    /// non-delegating builtins (`cd`, `pushd`, `popd`, `export`, `source`, `.`).
+    /// arguments as a command) correctly dispatch commands for read-only
+    /// validation. Excludes non-delegating builtins (`cd`, `pushd`, `popd`,
+    /// `export`, `source`, `.`).
+    ///
+    /// Three command scenarios are tested for every prefix:
+    /// - `rm file` — a mutating command that must be rejected.
+    /// - `git push` — a mutating git subcommand that must be rejected
+    ///   (ensuring no prefix masks the git command word).
+    /// - `git status` — a safe git command that must be allowed.
     #[test]
-    fn shell_prefix_mutating_rejected() {
-        for prefix in SHELL_PREFIXES {
-            match *prefix {
-                "cd" | "pushd" | "popd" | "export" | "source" | "." => {}
-                _ => assert_rejected(&format!("{prefix} rm file")),
-            }
+    fn shell_prefixes_delegating() {
+        struct Case {
+            command: &'static str,
+            allowed: bool,
         }
-    }
 
-    /// Tests that ALL delegating shell prefixes correctly expose `git push`
-    /// (a mutating git subcommand) for rejection — ensuring that no prefix
-    /// masks the git command word from read-only validation.
-    #[test]
-    fn shell_prefix_git_push_rejected() {
+        let cases = [
+            Case {
+                command: "rm file",
+                allowed: false,
+            },
+            Case {
+                command: "git push",
+                allowed: false,
+            },
+            Case {
+                command: "git status",
+                allowed: true,
+            },
+        ];
+
         for prefix in SHELL_PREFIXES {
             match *prefix {
                 "cd" | "pushd" | "popd" | "export" | "source" | "." => {}
-                _ => assert_rejected(&format!("{prefix} git push")),
-            }
-        }
-    }
-
-    /// Tests that ALL delegating shell prefixes still allow safe git commands
-    /// like `git status` through.
-    #[test]
-    fn shell_prefix_git_status_allowed() {
-        for prefix in SHELL_PREFIXES {
-            match *prefix {
-                "cd" | "pushd" | "popd" | "export" | "source" | "." => {}
-                _ => ok(&format!("{prefix} git status")),
+                _ => {
+                    for case in &cases {
+                        let cmd = format!("{prefix} {}", case.command);
+                        if case.allowed {
+                            ok(&cmd);
+                        } else {
+                            assert_rejected(&cmd);
+                        }
+                    }
+                }
             }
         }
     }
