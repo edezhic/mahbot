@@ -334,7 +334,7 @@ impl SearchTool {
         Self::find_file_path_list(&handle, query, max_results, 0)
     }
 
-    fn search_grep(
+    fn search_greps(
         handle: &search_engine::EngineHandle,
         query: &str,
         max_results: usize,
@@ -617,7 +617,7 @@ impl Tool for SearchTool {
 
         let mut output = match mode.as_str() {
             "files" => Self::search_files(&handle, &query, max_results, offset, &query_constraints),
-            "grep" => Self::search_grep(
+            "grep" => Self::search_greps(
                 &handle,
                 &query,
                 max_results,
@@ -753,7 +753,7 @@ fn format_constraints(constraints: &[Constraint<'_>]) -> String {
 
 /// Build diagnostic output for a zero-result grep search.
 ///
-/// Extracted from `search_grep` to keep the main function under the
+/// Extracted from `search_greps` to keep the main function under the
 /// clippy `too_many_lines` threshold while providing rich diagnostics
 /// for agents to self-correct.
 fn build_grep_zero_diag(
