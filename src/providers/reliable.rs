@@ -261,10 +261,6 @@ impl ReliableProvider {
     /// ±25% of base to prevent thundering herd when multiple agents
     /// retry simultaneously on transient errors (5xx, timeouts, etc.).
     fn compute_backoff(base: u64, err: &anyhow::Error) -> u64 {
-        debug_assert!(
-            base >= 2,
-            "jitter range (base/2) would be zero for base < 2, causing modulo-by-zero"
-        );
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Retry-After is authoritative — follow it precisely,
             // clamped to [base, 30_000] ms.
