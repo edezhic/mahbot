@@ -1461,6 +1461,23 @@ pub struct EditorState {
     rename_target: Option<RenameTarget>,
 }
 
+/// Identifies which modal overlay is currently open, in Escape-dismissal
+/// priority order (GlobalSearch highest, CloseOthers lowest).
+///
+/// Used by [`EditorState::active_modal()`] to return the topmost open modal,
+/// and by [`EditorState::escape()`] to dispatch dismissal in the correct order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModalKind {
+    GlobalSearch,
+    GotoLine,
+    QuickOpen,
+    Rename,
+    NewItem,
+    DeleteConfirm,
+    CloseDialog,
+    CloseOthers,
+}
+
 /// State for the quick-open file picker.
 #[derive(Debug, Clone)]
 struct QuickOpenState {
@@ -1837,17 +1854,42 @@ impl EditorState {
             .is_some()
     }
 
+    /// Returns the highest-priority modal overlay that is currently open, or
+    /// [`None`] if no modal is active.  Priority order matches Escape's
+    /// dismissal cascade: GlobalSearch → GotoLine → QuickOpen → Rename →
+    /// NewItem → DeleteConfirm → CloseDialog → CloseOthers.
+    fn active_modal(&self) -> Option<ModalKind> {
+        if self.global_search.is_some() {
+            return Some(ModalKind::GlobalSearch);
+        }
+        if self.goto_line_input.is_some() {
+            return Some(ModalKind::GotoLine);
+        }
+        if self.quick_open.is_some() {
+            return Some(ModalKind::QuickOpen);
+        }
+        if self.rename_target.is_some() {
+            return Some(ModalKind::Rename);
+        }
+        if self.new_item_input.is_some() {
+            return Some(ModalKind::NewItem);
+        }
+        if self.delete_confirm.is_some() {
+            return Some(ModalKind::DeleteConfirm);
+        }
+        if self.close_dialog.is_some() {
+            return Some(ModalKind::CloseDialog);
+        }
+        if self.close_others_target.is_some() {
+            return Some(ModalKind::CloseOthers);
+        }
+        None
+    }
+
     /// Returns `true` when a modal overlay or text input owns keyboard focus
     /// and editor-wide shortcuts (undo, save, tab switch, etc.) must not run.
     fn modal_overlay_blocks_editor_shortcuts(&self) -> bool {
-        self.quick_open.is_some()
-            || self.global_search.is_some()
-            || self.goto_line_input.is_some()
-            || self.new_item_input.is_some()
-            || self.rename_target.is_some()
-            || self.close_dialog.is_some()
-            || self.close_others_target.is_some()
-            || self.delete_confirm.is_some()
+        self.active_modal().is_some()
     }
 
     /// Returns `true` when an inline rename is active.  Tree keyboard
@@ -2438,7 +2480,12 @@ impl EditorState {
 
             // ── Go-to-line ────────────────────────────────────────────
             EditorMessage::GoToLineToggle => {
-                if self.modal_overlay_blocks_editor_shortcuts() && self.goto_line_input.is_none() {
+                // Allow toggle-to-close when goto_line is already open, but
+                // block if any other modal is active.
+                if self
+                    .active_modal()
+                    .is_some_and(|m| m != ModalKind::GotoLine)
+                {
                     return Task::none();
                 }
                 if self.active_tab_idx().is_some() {
@@ -3038,7 +3085,7 @@ impl EditorState {
                     self.quick_open = None;
                     return Task::none();
                 }
-                if self.modal_overlay_blocks_editor_shortcuts() {
+                if self.active_modal().is_some() {
                     return Task::none();
                 }
 
@@ -4103,14 +4150,64 @@ impl EditorState {
         }
     }
 
-    /// Handle Escape key — dismisses find bar, go-to-line, quick open,
-    /// close dialog, tree focus, and global search in priority order.
+    /// Handle Escape key — dismisses modal overlays, find bar, tree focus,
+    /// and residual close-dialog state in priority order.
+    ///
+    /// Priority:
+    /// 1. Any modal overlay (via [`active_modal()`], which returns the
+    ///    highest-priority open modal in Escape-cascade order).
+    /// 2. Find/replace bar on the active tab.
+    /// 3. File-tree focus.
+    /// 4. Residual [`close_dialog`] / [`close_others_target`] state cleanup.
+    ///
+    /// Note: the original code checked only GlobalSearch before find_bar,
+    /// with GotoLine/QuickOpen/Rename/NewItem/DeleteConfirm after it.
+    /// The current rule (all modals before find_bar) is not observable in
+    /// practice because every modal toggle closes find_bar when opening.
+    /// If simultaneous modal+find_bar state ever becomes possible, the
+    /// priority order here (modal first) is the more intuitive choice.
     fn escape(&mut self) -> Task<EditorMessage> {
-        // Close global search first (before find bar).
-        if self.global_search.is_some() {
-            self.global_search = None;
-            return Task::none();
+        // Close modal overlays first (GlobalSearch has highest priority,
+        // followed by GotoLine, QuickOpen, etc.).
+        if let Some(modal) = self.active_modal() {
+            return match modal {
+                ModalKind::GlobalSearch => {
+                    self.global_search = None;
+                    Task::none()
+                }
+                ModalKind::GotoLine => {
+                    self.goto_line_input = None;
+                    Task::none()
+                }
+                ModalKind::QuickOpen => {
+                    self.quick_open = None;
+                    Task::none()
+                }
+                ModalKind::Rename => {
+                    self.rename_target = None;
+                    Task::none()
+                }
+                ModalKind::NewItem => {
+                    self.new_item_input = None;
+                    Task::none()
+                }
+                ModalKind::DeleteConfirm => {
+                    self.delete_confirm = None;
+                    Task::none()
+                }
+                ModalKind::CloseDialog => {
+                    self.close_dialog = None;
+                    self.pending_save_close = None;
+                    Task::none()
+                }
+                ModalKind::CloseOthers => {
+                    self.close_others_target = None;
+                    self.pending_close_others = None;
+                    Task::none()
+                }
+            };
         }
+
         // Close find bar on active tab next, if open.
         if let Some(idx) = self.active_tab_idx() {
             let path = self.tabs[idx].path.clone();
@@ -4121,31 +4218,8 @@ impl EditorState {
                 }
             }
         }
-        // Close go-to-line bar.
-        if self.goto_line_input.is_some() {
-            self.goto_line_input = None;
-            return Task::none();
-        }
-        // Close quick-open.
-        if self.quick_open.is_some() {
-            self.quick_open = None;
-            return Task::none();
-        }
-        // Close rename inline editor (before new-item, after quick-open).
-        if self.rename_target.is_some() {
-            self.rename_target = None;
-            return Task::none();
-        }
-        // Close new-item input (before tree focus, after quick-open/rename).
-        if self.new_item_input.is_some() {
-            self.new_item_input = None;
-            return Task::none();
-        }
-        // Close delete confirmation.
-        if self.delete_confirm.is_some() {
-            self.delete_confirm = None;
-            return Task::none();
-        }
+
+        // Unfocus the file tree, or clear residual close-dialog state.
         if self.file_tree.tree_focused {
             self.file_tree.tree_focused = false;
             self.pending_enter_dir = None;
@@ -4166,7 +4240,7 @@ impl EditorState {
             self.global_search = None;
             return Task::none();
         }
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal().is_some() {
             return Task::none();
         }
         // Close find bar and go-to-line when opening global search.
@@ -5551,13 +5625,7 @@ impl EditorState {
         let tree_focused = self.file_tree.tree_focused;
         let find_bar_open = tab_data.find_replace_state.is_some();
         // Modal overlays own keyboard input entirely — block all editor keys.
-        let modal_overlay_open = self.quick_open.is_some()
-            || self.global_search.is_some()
-            || self.goto_line_input.is_some()
-            || self.new_item_input.is_some()
-            || self.close_dialog.is_some()
-            || self.close_others_target.is_some()
-            || self.delete_confirm.is_some();
+        let modal_overlay_open = self.active_modal().is_some();
         // Find/replace allows cursor navigation while its text inputs are focused.
         let ignore_keyboard = tree_focused || modal_overlay_open || find_bar_open;
         let block_editing = find_bar_open;
@@ -7378,6 +7446,124 @@ mod tests {
             },
         );
         state
+    }
+
+    /// Each [`ModalKind`] variant must be returned by [`EditorState::active_modal()`]
+    /// when the corresponding field is set.  This catches the case where a new
+    /// variant is added to the enum but the if-else chain in `active_modal()`
+    /// is not updated (unlike `escape()`'s match, the if-else chain is not
+    /// compiler-enforced).
+    #[test]
+    fn test_active_modal_returns_correct_variant() {
+        let mut state = EditorState::new();
+
+        // None when no modal is open.
+        assert_eq!(state.active_modal(), None);
+
+        // Each variant in priority order — set only that field, verify it
+        // returns the expected variant, then clear and test the next.
+        state.global_search = Some(GlobalSearchState {
+            query: String::new(),
+            results: Vec::new(),
+            selected_index: 0,
+            status: GlobalSearchStatus::Idle,
+            search_gen: 0,
+        });
+        assert_eq!(state.active_modal(), Some(ModalKind::GlobalSearch));
+        state.global_search = None;
+
+        state.goto_line_input = Some(String::new());
+        assert_eq!(state.active_modal(), Some(ModalKind::GotoLine));
+        state.goto_line_input = None;
+
+        state.quick_open = Some(QuickOpenState {
+            filter: String::new(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+        assert_eq!(state.active_modal(), Some(ModalKind::QuickOpen));
+        state.quick_open = None;
+
+        state.rename_target = Some(RenameTarget {
+            path: "foo".into(),
+            abs_path: String::new(),
+            is_dir: false,
+            ws_root: String::new(),
+            input_text: "foo".into(),
+            error: None,
+        });
+        assert_eq!(state.active_modal(), Some(ModalKind::Rename));
+        state.rename_target = None;
+
+        state.new_item_input = Some(NewItemTarget {
+            parent_dir: String::new(),
+            is_dir: false,
+            abs_parent: String::new(),
+            ws_root: String::new(),
+            input_text: String::new(),
+        });
+        assert_eq!(state.active_modal(), Some(ModalKind::NewItem));
+        state.new_item_input = None;
+
+        state.delete_confirm = Some(DeleteConfirmTarget {
+            path: "foo".into(),
+            is_dir: false,
+            dirty_tab_count: 0,
+            abs_path: String::new(),
+        });
+        assert_eq!(state.active_modal(), Some(ModalKind::DeleteConfirm));
+        state.delete_confirm = None;
+
+        state.close_dialog = Some((0, CloseAction::Save));
+        assert_eq!(state.active_modal(), Some(ModalKind::CloseDialog));
+        state.close_dialog = None;
+
+        state.close_others_target = Some(0);
+        assert_eq!(state.active_modal(), Some(ModalKind::CloseOthers));
+    }
+
+    /// When multiple modals are open simultaneously, `active_modal()` must
+    /// return the highest-priority one according to the documented Escape
+    /// cascade order: GlobalSearch > GotoLine > QuickOpen > Rename > NewItem
+    /// > DeleteConfirm > CloseDialog > CloseOthers.
+    #[test]
+    fn test_active_modal_priority_when_multiple_open() {
+        let mut state = EditorState::new();
+
+        // Set multiple fields: higher-priority should win.
+        state.goto_line_input = Some(String::new());
+        state.quick_open = Some(QuickOpenState {
+            filter: String::new(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+        // GotoLine > QuickOpen → expects GotoLine.
+        assert_eq!(state.active_modal(), Some(ModalKind::GotoLine));
+
+        // Now add a GlobalSearch — should beat GotoLine.
+        state.global_search = Some(GlobalSearchState {
+            query: String::new(),
+            results: Vec::new(),
+            selected_index: 0,
+            status: GlobalSearchStatus::Idle,
+            search_gen: 0,
+        });
+        assert_eq!(state.active_modal(), Some(ModalKind::GlobalSearch));
+
+        // Clear GlobalSearch, keep GotoLine and QuickOpen; still GotoLine.
+        state.global_search = None;
+        assert_eq!(state.active_modal(), Some(ModalKind::GotoLine));
+
+        // Clear all, add low-priority pair: CloseOthers should lose to CloseDialog.
+        state.goto_line_input = None;
+        state.quick_open = None;
+        state.close_dialog = Some((0, CloseAction::Save));
+        state.close_others_target = Some(0);
+        assert_eq!(state.active_modal(), Some(ModalKind::CloseDialog));
+
+        // Clear CloseDialog, CloseOthers should win by default.
+        state.close_dialog = None;
+        assert_eq!(state.active_modal(), Some(ModalKind::CloseOthers));
     }
 
     #[test]
