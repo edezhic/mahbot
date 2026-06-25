@@ -132,10 +132,6 @@ fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
             return Ok(Some(file));
         }
 
-        // Drop the file descriptor before sleeping so the kernel can release
-        // our reference. The scope-based drop on each iteration's `file`
-        // variable handles this automatically.
-        drop(file);
         if attempt < 2 {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
