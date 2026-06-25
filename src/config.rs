@@ -792,20 +792,21 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
     // ── Persist to DB ─────────────────────────────────────────
     let store = crate::config_db::store();
 
-    // Write all KV pairs
+    // Write all KV pairs, per-role configs, AND per-model routings inside a
+    // single transaction so a crash between writes doesn't leave inconsistent
+    // partial state on restart.
+    let tx = store.begin_tx().await?;
     for (key, value) in config.string_fields() {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
-            store.set_kv(key, v).await?;
+            store.set_kv_tx(&tx, key, v).await?;
         } else {
-            store.delete_kv(key).await?;
+            store.delete_kv_tx(&tx, key).await?;
         }
     }
-
-    // Write per-role configs AND per-model routings inside a single
-    // transaction so a crash between writes doesn't leave inconsistent state.
     store
-        .save_role_and_routing_configs(&config.per_role_configs, &config.model_routings)
+        .save_role_and_routing_configs_tx(&tx, &config.per_role_configs, &config.model_routings)
         .await?;
+    tx.commit().await?;
 
     // ── Commit to runtime ─────────────────────────────────────
     // Warmup succeeded above — now persist runtime config and swap singletons.

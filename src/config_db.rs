@@ -197,6 +197,27 @@ impl ConfigStore {
         model_routings: &[ModelRouting],
     ) -> Result<()> {
         let tx = self.begin_tx().await?;
+        self.save_role_and_routing_configs_tx(&tx, role_configs, model_routings)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Same as [`save_role_and_routing_configs`] but operates on an existing
+    /// transaction provided by the caller.  The caller is responsible for
+    /// calling `commit()` or `rollback()` on the [`turso::TxGuard`].
+    ///
+    /// # Deadlock safety
+    ///
+    /// This method does NOT call `begin_tx()` or `commit()` internally —
+    /// it uses the supplied `tx` directly, making it safe to call from within
+    /// an outer transaction without deadlocking on the connection mutex.
+    pub(crate) async fn save_role_and_routing_configs_tx(
+        &self,
+        tx: &turso::TxGuard<'_>,
+        role_configs: &[RoleConfig],
+        model_routings: &[ModelRouting],
+    ) -> Result<()> {
         tx.execute("DELETE FROM config_role", turso::params![])
             .await?;
         for rc in role_configs {
@@ -221,7 +242,34 @@ impl ConfigStore {
             )
             .await?;
         }
-        tx.commit().await?;
+        Ok(())
+    }
+
+    // ── config_kv — tx-aware variants ─────────────────────────
+
+    /// Upsert a key-value pair within an existing transaction.
+    /// Like [`set_kv`] but executes on the supplied [`turso::TxGuard`].
+    pub(crate) async fn set_kv_tx(
+        &self,
+        tx: &turso::TxGuard<'_>,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            turso::params![key, value],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a key-value pair within an existing transaction.
+    /// Like [`delete_kv`] but executes on the supplied [`turso::TxGuard`].
+    /// Succeeds even if the key does not exist.
+    pub(crate) async fn delete_kv_tx(&self, tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
+        tx.execute("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
+            .await?;
         Ok(())
     }
 }
