@@ -1128,7 +1128,7 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(board: &BoardStore, ticket
     .await
 }
 
-// ── Parallel verifier helpers ──────────────────────────────────────────
+// ── Parallel agent helpers (shared) ─────────────────────────────────────
 
 /// Result from a single parallel verifier agent.
 struct ParallelVerdict {
@@ -1688,7 +1688,7 @@ async fn dispatch_verifiers(
     // preventing infinite re-dispatch loops.
     // dispatch_engineer and dispatch_backlog_analysts use
     // guard_phase_and_circuit_breaker as their pre-agent breaker
-    // because they lack an equivalent post-agent guard.
+    // instead, with a post-agent phase check but no circuit breaker.
 
     let engineer_response = ticket
         .comments
@@ -1706,6 +1706,11 @@ async fn dispatch_verifiers(
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
     let results =
         run_parallel_with_extraction(&ticket, &ws, vi.role, &prompt, &extraction_prompt).await;
+
+    // Post-run check still needed for race conditions during agent execution.
+    if !is_ticket_in_phase(board, &ticket.id, vi.active_phase).await {
+        return;
+    }
 
     // If every verifier agent failed to produce a verdict (all crashed, timed
     // out, or returned unparseable output), this is a terminal failure — retrying
@@ -1740,11 +1745,6 @@ async fn dispatch_verifiers(
                 label = vi.log_label,
             );
         }
-        return;
-    }
-
-    // If cancelled externally (e.g. via /stop), don't overwrite status.
-    if !is_ticket_in_phase(board, &ticket.id, vi.active_phase).await {
         return;
     }
 
