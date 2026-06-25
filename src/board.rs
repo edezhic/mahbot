@@ -1711,41 +1711,18 @@ mod tests {
             .expect("default_ticket")
     }
 
-    #[tokio::test]
-    async fn test_create_and_get_ticket() {
-        let (store, _tmp) = open_test_store().await;
-
-        let id = store
-            .create_ticket(
-                "Test",
-                "A test ticket",
-                &crate::workspace::test_ws_named("/workspace", "workspace"),
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+    /// Create a test ticket with a given title/phase in a workspace.
+    /// Arbitrary fields (description, prerequisites, reporter) use test defaults.
+    async fn ticket_with_phase(
+        store: &BoardStore,
+        title: &str,
+        phase: TicketPhase,
+        ws: &crate::Workspace,
+    ) -> String {
+        store
+            .create_ticket(title, "desc", ws, phase, &[], "test", None)
             .await
-            .expect("create");
-
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(ticket.title, "Test");
-        assert_eq!(ticket.description, "A test ticket");
-        assert_eq!(ticket.status, TicketPhase::Backlog);
-        assert!(ticket.assigned_to.is_none());
-        assert!(ticket.comments.is_empty());
-        assert!(
-            ticket.commit_hash.is_none(),
-            "new ticket should have no commit_hash"
-        );
-        assert!(
-            ticket.lines_added.is_none(),
-            "new ticket should have no lines_added"
-        );
-        assert!(
-            ticket.lines_removed.is_none(),
-            "new ticket should have no lines_removed"
-        );
+            .expect("ticket_with_phase")
     }
 
     #[tokio::test]
@@ -1831,14 +1808,6 @@ mod tests {
                 "display_name for {variant} still has underscore: {name}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_get_nonexistent_ticket() {
-        let (store, _tmp) = open_test_store().await;
-
-        let ticket = store.get_ticket("nonexistent").await.expect("get");
-        assert!(ticket.is_none());
     }
 
     #[tokio::test]
@@ -2317,91 +2286,39 @@ mod tests {
                 .expect("check"),
             "Should not find active tickets in unrelated workspace"
         );
-    }
 
-    /// Verify that a workspace with only non-active tickets (Done, Cancelled)
-    /// reports no active tickets.
-    #[tokio::test]
-    async fn test_has_active_tickets_excluding_only_non_active() {
-        let (store, _tmp) = open_test_store().await;
-        let ws = test_ws_named("/ws", "ws");
+        // Workspace with only non-active tickets — Done, Cancelled, Failed, Planning, Backlog
+        let ws_non = test_ws_named("/ws_non", "ws_non");
+        let non_active_done = ticket_with_phase(&store, "Done", TicketPhase::Done, &ws_non).await;
+        let non_active_cancelled =
+            ticket_with_phase(&store, "Cancelled", TicketPhase::Cancelled, &ws_non).await;
+        let non_active_failed =
+            ticket_with_phase(&store, "Failed", TicketPhase::Failed, &ws_non).await;
+        let non_active_planning =
+            ticket_with_phase(&store, "Planning", TicketPhase::Planning, &ws_non).await;
+        let non_active_backlog =
+            ticket_with_phase(&store, "Backlog", TicketPhase::Backlog, &ws_non).await;
 
-        // Create tickets only in non-active statuses
-        let done_id = store
-            .create_ticket("Done", "desc", &ws, TicketPhase::Done, &[], "test", None)
-            .await
-            .expect("create Done");
-        let cancelled_id = store
-            .create_ticket(
-                "Cancelled",
-                "desc",
-                &ws,
-                TicketPhase::Cancelled,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create Cancelled");
-        let failed_id = store
-            .create_ticket(
-                "Failed",
-                "desc",
-                &ws,
-                TicketPhase::Failed,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create Failed");
-        let planning_id = store
-            .create_ticket(
-                "Planning",
-                "desc",
-                &ws,
-                TicketPhase::Planning,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create Planning");
-        let backlog_id = store
-            .create_ticket(
-                "Backlog",
-                "desc",
-                &ws,
-                TicketPhase::Backlog,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create Backlog");
-
-        // All active-status tickets should return false
-        for exclude_id in [
-            &done_id,
-            &cancelled_id,
-            &failed_id,
-            &planning_id,
-            &backlog_id,
+        for exclude in [
+            &non_active_done,
+            &non_active_cancelled,
+            &non_active_failed,
+            &non_active_planning,
+            &non_active_backlog,
         ] {
             assert!(
                 !store
-                    .has_active_tickets_excluding("ws", exclude_id)
+                    .has_active_tickets_excluding("ws_non", exclude)
                     .await
                     .expect("check"),
                 "Workspace with only non-active tickets should have no active tickets (excluded {})",
-                exclude_id,
+                exclude,
             );
         }
-
-        // Excluding a nonexistent ID should also return false
+        // Excluding a nonexistent ID in a non-active-only workspace also returns false
         assert!(
             !store
-                .has_active_tickets_excluding("ws", "nonexistent")
+                .has_active_tickets_excluding("ws_non", "nonexistent")
                 .await
                 .expect("check"),
             "No active tickets for nonexistent exclude ID in non-active-only workspace",
@@ -3830,6 +3747,11 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_ticket_roundtrip_all_fields() {
         let (store, _tmp) = open_test_store().await;
+
+        // Non-existent ticket returns None.
+        let none = store.get_ticket("nonexistent").await.expect("get");
+        assert!(none.is_none(), "non-existent ticket should return None");
+
         let ws = crate::workspace::test_ws_named("/test_ws", "test_workspace");
 
         // Create ticket with known values for every TICKET_COLUMNS position.
@@ -3845,6 +3767,72 @@ with a comment explaining why no agent is mid-execution in that state.\
             )
             .await
             .expect("create_ticket");
+
+        // Read back BEFORE setting any mutable fields — verify fresh-ticket defaults
+        // (None for assigned_to, commit_hash, lines_added, lines_removed; empty comments).
+        let fresh = store
+            .get_ticket(&id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+        assert_eq!(fresh.title, "Roundtrip Title", "fresh title");
+        assert_eq!(
+            fresh.description, "Roundtrip description",
+            "fresh description"
+        );
+        assert_eq!(fresh.status, TicketPhase::Backlog, "fresh status");
+        assert!(
+            fresh.assigned_to.is_none(),
+            "fresh ticket should have no assigned_to"
+        );
+        assert!(
+            fresh.comments.is_empty(),
+            "fresh ticket should have no comments"
+        );
+        assert!(
+            fresh.commit_hash.is_none(),
+            "fresh ticket should have no commit_hash"
+        );
+        assert!(
+            fresh.lines_added.is_none(),
+            "fresh ticket should have no lines_added"
+        );
+        assert!(
+            fresh.lines_removed.is_none(),
+            "fresh ticket should have no lines_removed"
+        );
+        assert_eq!(
+            fresh.workspace_name, "test_workspace",
+            "fresh workspace_name"
+        );
+        assert!(
+            fresh.created_at.contains('T'),
+            "fresh created_at should be RFC 3339: {}",
+            fresh.created_at,
+        );
+        assert!(
+            fresh.updated_at.contains('T'),
+            "fresh updated_at should be RFC 3339: {}",
+            fresh.updated_at,
+        );
+        assert_eq!(fresh.reporter, "test_reporter", "fresh reporter");
+        assert!(
+            fresh.prerequisites.is_empty(),
+            "fresh prerequisites should be empty"
+        );
+        assert!(
+            fresh.supersedes.is_none(),
+            "fresh supersedes should be None"
+        );
+        assert!(
+            fresh.superseded_by.is_none(),
+            "fresh superseded_by should be None"
+        );
+        assert!(!fresh.is_archived, "fresh is_archived should be false");
+        assert!(
+            !fresh.pipeline_reservation,
+            "fresh pipeline_reservation should be false"
+        );
 
         // Set assigned_to (exercises COL_TICKET_ASSIGNED_TO with non-None value).
         store
