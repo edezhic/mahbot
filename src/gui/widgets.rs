@@ -1217,6 +1217,7 @@ mod tests {
         let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
         tree.viewport_h = Some(400.0);
 
+        // Must bind (not discard) because iced::Task is #[must_use].
         let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
 
         // The task type is opaque, but we can verify it's not panicking
