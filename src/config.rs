@@ -999,8 +999,8 @@ mod tests {
         // Empty string → None.
         let mut rc = RoleConfig {
             role: "engineer".into(),
-            model: Some("".into()),
-            reasoning_effort: Some("".into()),
+            model: Some(String::new()),
+            reasoning_effort: Some(String::new()),
         };
         rc.normalize();
         assert_eq!(rc.model, None);
@@ -1053,7 +1053,7 @@ mod tests {
         // Empty string → None.
         let mut mr = ModelRouting {
             model: "gpt-4".into(),
-            provider_order: Some("".into()),
+            provider_order: Some(String::new()),
             allow_fallbacks: None,
         };
         mr.normalize();
@@ -1095,7 +1095,7 @@ mod tests {
             per_role_configs: vec![
                 RoleConfig {
                     role: "engineer".into(),
-                    model: Some("".into()),
+                    model: Some(String::new()),
                     reasoning_effort: Some("  high  ".into()),
                 },
                 RoleConfig {

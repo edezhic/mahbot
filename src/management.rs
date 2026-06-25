@@ -1902,8 +1902,8 @@ mod tests {
         let tripped = run_circuit_breaker(
             &ticket_a,
             TicketPhase::ReadyForDevelopment,
-            0,                         // threshold = 0, so 1 comment > 0 trips
-            |comments| comments.len(), // count all comments
+            0,                      // threshold = 0, so 1 comment > 0 trips
+            <[TicketComment]>::len, // count all comments
             |count| format!("Breaker tripped at {count}"),
             "test",
         )
