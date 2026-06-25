@@ -97,25 +97,16 @@ fn wrap_chunk(chunk: &str, index: usize, total: usize) -> String {
     }
 }
 
-/// Find a natural split point (newline or space) within the first `hard_split`
-/// bytes of `text`. Returns a byte offset ≤ `hard_split`.
+/// Find the best split point within the first `hard_split` bytes of `text`.
+/// Returns a byte offset ≤ `hard_split`, preferring the natural break
+/// (newline or space) closest to `hard_split`, or a hard character-boundary
+/// split when neither exists.
 fn find_split_boundary(text: &str, hard_split: usize) -> usize {
     let search_area = &text[..hard_split];
-
-    // Prefer splitting at newline, but only if it's in the second half
-    if let Some(pos) = search_area.rfind('\n')
-        && pos >= hard_split.saturating_sub(hard_split / 2)
-    {
-        return pos + 1;
-    }
-
-    // Fall back to space
-    if let Some(pos) = search_area.rfind(' ') {
-        return pos + 1;
-    }
-
-    // Hard split at character boundary
-    hard_split
+    search_area
+        .rfind('\n')
+        .max(search_area.rfind(' '))
+        .map_or(hard_split, |p| p + 1)
 }
 
 /// If `pos` is inside an HTML tag (the last `<` before `pos` has no matching `>`),
@@ -2081,6 +2072,36 @@ mod tests {
         for p in &split_message_for_telegram(&msg) {
             assert!(p.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH);
         }
+    }
+
+    #[test]
+    fn newline_split_fallback_prevents_mid_word_break() {
+        // Regression: when the only newline is in the first half of the
+        // search window and no spaces exist, the old code would hard-split
+        // mid-word. The newline fallback (tier 3) prevents this.
+        let msg = format!("{}\n{}", "a".repeat(1000), "x".repeat(5000));
+        let chunks = split_message_for_telegram(&msg);
+
+        // All chunks must respect the length limit
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "chunk {} has {} chars (limit {})",
+                i,
+                chunk.chars().count(),
+                TELEGRAM_MAX_MESSAGE_LENGTH,
+            );
+        }
+
+        // Concatenation must reconstruct the original message
+        assert_eq!(chunks.join(""), msg);
+
+        // The first chunk must end with the newline (not split mid-word)
+        assert!(
+            chunks[0].ends_with('\n'),
+            "first chunk should end with newline, got: {:?}",
+            chunks[0].chars().rev().take(10).collect::<String>()
+        );
     }
 
     #[test]
