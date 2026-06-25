@@ -481,11 +481,15 @@ fn check_segment(segment: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Check unconditional rejection list
-    if MUTATING_COMMANDS.contains(&first_word) {
-        if SCRATCH_MUTATORS.contains(&first_word) && scratch_paths_under_temp(trimmed) {
+    // Check scratch mutators first (tee, touch, mkdir): allowed if all explicit
+    // path arguments are under an approved temp directory.
+    if SCRATCH_MUTATORS.contains(&first_word)
+        && scratch_paths_under_temp(trimmed) {
             return Ok(());
         }
+
+    // Check unconditional rejection list
+    if MUTATING_COMMANDS.contains(&first_word) {
         return reject(
             trimmed,
             &format!("`{first_word}` is not allowed — it modifies the workspace."),
