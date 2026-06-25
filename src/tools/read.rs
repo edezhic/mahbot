@@ -484,8 +484,8 @@ fn display_filename(path: &Path) -> &str {
 #[derive(Debug)]
 struct ParsedSource {
     source: String,
-    ext: String,
     language: Language,
+    symbol_query: &'static str,
     tree: Tree,
 }
 
@@ -500,13 +500,15 @@ async fn read_and_parse(resolved_path: &Path, mode_label: &str) -> anyhow::Resul
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_owned();
-    let Some(language) = language_support(&ext).map(|ls| ls.language) else {
+    let Some(ls) = language_support(&ext) else {
         anyhow::bail!(
             "Unsupported file extension '.{ext}' for {mode_label}. \
              Supported: .rs, .js, .jsx, .mjs, .cjs, .ts, .tsx, .py, .pyi, .pyx, .json, .toml, \
              .sh, .bash, .zsh, .css, .html, .htm, .go, .rb, .c, .h, .sql, .md, .markdown"
         );
     };
+    let language = ls.language;
+    let symbol_query = ls.symbol_query;
 
     let mut parser = Parser::new();
     parser
@@ -519,8 +521,8 @@ async fn read_and_parse(resolved_path: &Path, mode_label: &str) -> anyhow::Resul
 
     Ok(ParsedSource {
         source,
-        ext,
         language,
+        symbol_query,
         tree,
     })
 }
@@ -652,8 +654,7 @@ fn language_support(ext: &str) -> Option<LanguageSupport> {
 
 /// Compile the tree-sitter symbol query for the source file's language.
 fn build_symbol_query(ps: &ParsedSource) -> anyhow::Result<Query> {
-    let query_str = language_support(&ps.ext).map_or("", |ls| ls.symbol_query);
-    Query::new(&ps.language, query_str)
+    Query::new(&ps.language, ps.symbol_query)
         .map_err(|e| anyhow::anyhow!("Failed to build symbol query: {e}"))
 }
 
@@ -1467,7 +1468,10 @@ mod utils;
 
         let ctx = result.unwrap();
         // The query was built successfully
-        assert_eq!(ctx.ps.ext, "rs");
+        assert!(
+            !ctx.ps.symbol_query.is_empty(),
+            "expected non-empty symbol_query for .rs"
+        );
         // collect_symbols should find our symbols
         let symbols = collect_symbols(&ctx.ps, &ctx.query);
         assert_eq!(symbols.len(), 2, "expected 2 symbols, got {symbols:?}");
