@@ -275,6 +275,24 @@ pub struct Connection {
     has_dangling_tx: Arc<AtomicBool>,
 }
 
+/// Map each row in a slice through a fallible closure, collecting into a
+/// `Vec<turso::Result<T>>` with per-row error conversion.
+///
+/// Shared by `Connection::query_map` and `TxGuard::query_map` whose only
+/// difference is how they obtain the rows (mutex-guarded vs already-locked
+/// connection).
+fn map_rows<T, E>(
+    rows: &[Row],
+    mut map: impl FnMut(&Row) -> std::result::Result<T, E>,
+) -> Vec<turso::Result<T>>
+where
+    E: std::fmt::Display,
+{
+    rows.iter()
+        .map(|row| map(row).map_err(|e| turso::Error::Error(e.to_string())))
+        .collect()
+}
+
 impl Connection {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path_str = path
@@ -394,11 +412,7 @@ impl Connection {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         let rows = self.query(sql, params).await?;
-        let mut map = map;
-        Ok(rows
-            .iter()
-            .map(|row| map(row).map_err(|e| turso::Error::Error(e.to_string())))
-            .collect())
+        Ok(map_rows(&rows, map))
     }
 
     /// Execute a query that returns exactly one row.
@@ -516,11 +530,7 @@ impl TxGuard<'_> {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         let rows = Connection::query_impl(&self.conn, sql, params).await?;
-        let mut map = map;
-        Ok(rows
-            .iter()
-            .map(|row| map(row).map_err(|e| turso::Error::Error(e.to_string())))
-            .collect())
+        Ok(map_rows(&rows, map))
     }
 
     /// Commit the transaction and release the lock.
