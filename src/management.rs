@@ -94,11 +94,10 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 /// when the ticket has moved, been failed, or the workspace was paused — the
 /// caller should bail out immediately.
 ///
-/// This is **not** used by [`dispatch_verifiers`] — verifiers intentionally
-/// omit the pre-agent breaker and instead guard via
-/// [`trip_circuit_breaker_if_exceeded`] in [`process_verdict_results`] so
-/// the circuit breaker fires only after failed verifier runs, not before
-/// they start.
+/// Used by all agent-spawning dispatch functions
+/// ([`dispatch_backlog_analysts`], [`dispatch_engineer`], [`dispatch_verifiers`])
+/// for structural consistency. Diagnostics uses a separate circuit breaker
+/// (see [`trip_diagnostics_circuit_breaker_if_exceeded`]).
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
     ticket: &Ticket,
@@ -1559,8 +1558,8 @@ async fn trip_circuit_breaker_if_exceeded(
 /// QaPassed commit succeeds in [`finalize_qa_passed`]).
 ///
 /// If any verifier fails (score below `REVIEW_QA_THRESHOLD`) → `ReadyForDevelopment`
-/// (unless the circuit breaker trips, in which case the ticket is failed and the
-/// workspace paused).
+/// (the circuit breaker check is handled *before* dispatch by
+/// [`guard_phase_and_circuit_breaker`], so only the bounce-back is needed here).
 /// If all pass → the verifier's `success_phase`.
 async fn process_verdict_results(
     ticket: &Ticket,
@@ -1578,12 +1577,6 @@ async fn process_verdict_results(
 
     // Determine outcome
     let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
-
-    if any_failed
-        && trip_circuit_breaker_if_exceeded(ticket, verifier.active_phase, verifier.log_label).await
-    {
-        return;
-    }
 
     if any_failed {
         bounce_back_to_development(ticket, verifier.active_phase, verifier.log_label).await;
@@ -1616,20 +1609,11 @@ async fn process_verdict_results(
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs [`PARALLEL_AGENT_COUNT`] parallel verifiers of the given role, and processes the verdicts.
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
-    // Check phase BEFORE running agents — avoids wasting LLM API calls.
-    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
+    // Pre-agent guard: check phase and trip circuit breaker early to
+    // avoid wasting LLM API calls on tickets with excessive churn.
+    if !guard_phase_and_circuit_breaker(&ticket, vi.active_phase, vi.log_label).await {
         return;
     }
-
-    // No pre-agent circuit breaker — intentional.
-    // Verifiers are guarded by the post-agent circuit breaker in
-    // process_verdict_results instead: if verifiers fail and the total
-    // comment count exceeds the threshold, the ticket is failed (and the
-    // workspace paused) rather than returning to ReadyForDevelopment,
-    // preventing infinite re-dispatch loops.
-    // dispatch_engineer and dispatch_backlog_analysts use
-    // guard_phase_and_circuit_breaker as their pre-agent breaker
-    // instead, with a post-agent phase check but no circuit breaker.
 
     let engineer_response = ticket
         .comments
@@ -1689,4 +1673,57 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     }
 
     process_verdict_results(&ticket, &results, vi).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::DEFAULT_TICKET_PHASE;
+    use crate::util::test::init_test_stores;
+    use crate::workspace::test_ws_named;
+
+    /// Verify that `guard_phase_and_circuit_breaker` rejects a ticket
+    /// whose phase does not match `expected`. This validates that the
+    /// pre-agent guard works correctly for `dispatch_verifiers` (and all
+    /// other agent-spawning dispatch functions).
+    #[tokio::test]
+    async fn guard_phase_mismatch_rejected() {
+        init_test_stores().await;
+
+        let ws = test_ws_named("/tmp/test", "test");
+        let ticket_id = board()
+            .create_ticket("Test", "desc", &ws, DEFAULT_TICKET_PHASE, &[], "test", None)
+            .await
+            .expect("create_ticket");
+
+        // Transition to InDevelopment so we have a known phase
+        board()
+            .transition_to(
+                &ticket_id,
+                Some(TicketPhase::Backlog),
+                TicketPhase::InDevelopment,
+                None,
+            )
+            .await
+            .expect("transition_to");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // Call with wrong phase — guard should reject immediately
+        assert!(
+            !guard_phase_and_circuit_breaker(&ticket, TicketPhase::InReview, "test_label").await,
+            "guard_phase_and_circuit_breaker must reject a phase mismatch"
+        );
+
+        // Call with correct phase and 0 comments (below threshold) — guard should pass
+        assert!(
+            guard_phase_and_circuit_breaker(&ticket, TicketPhase::InDevelopment, "test_label")
+                .await,
+            "guard_phase_and_circuit_breaker must pass when phase matches and comments are below threshold"
+        );
+    }
 }
