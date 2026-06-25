@@ -435,6 +435,9 @@ pub enum EditorMessage {
     TreeNavLeft,
     /// Arrow Right in tree navigation — expand directory or go to first child.
     TreeNavRight,
+    /// Scroll position changed in the tree panel. First element is the
+    /// absolute vertical scroll offset, second is the visible viewport height.
+    TreeScrolled(f32, f32),
     /// Escape key — dismiss find bar, go-to-line, quick open, tree focus, or close dialog.
     Escape,
     /// A file's contents were loaded from disk.
@@ -3188,6 +3191,12 @@ impl EditorState {
                 Task::none()
             }
 
+            EditorMessage::TreeScrolled(scroll_y, viewport_h) => {
+                self.file_tree.scroll_y = scroll_y;
+                self.file_tree.viewport_h = Some(viewport_h);
+                Task::none()
+            }
+
             EditorMessage::TreeNavUp => self.navigate_tree_vertical(&TreeNavDirection::Up),
 
             EditorMessage::TreeNavDown => self.navigate_tree_vertical(&TreeNavDirection::Down),
@@ -3240,7 +3249,10 @@ impl EditorState {
                 // ArrowLeft on collapsed directory or file — navigate to parent.
                 match self.file_tree.focused_parent_path() {
                     Some(ref p) if self.file_tree.focus_path(p).is_some() => {
-                        return widgets::scroll_to_tree_focus(&self.file_tree);
+                        return widgets::scroll_to_tree_focus(
+                            &mut self.file_tree,
+                            widgets::ScrollMode::SnapToTop,
+                        );
                     }
                     _ => {} // Root-level item has no parent — no-op.
                 }
@@ -3269,7 +3281,10 @@ impl EditorState {
                 // Already expanded directory — move focus to first child (if any).
                 if idx + 1 < self.file_tree.visible_tree_nodes.len() {
                     self.file_tree.tree_focus_index = idx + 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                    return widgets::scroll_to_tree_focus(
+                        &mut self.file_tree,
+                        widgets::ScrollMode::SnapToTop,
+                    );
                 }
                 Task::none()
             }
@@ -4491,14 +4506,20 @@ impl EditorState {
             match *direction {
                 TreeNavDirection::Up if self.file_tree.tree_focus_index > 0 => {
                     self.file_tree.tree_focus_index -= 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                    return widgets::scroll_to_tree_focus(
+                        &mut self.file_tree,
+                        widgets::ScrollMode::ScrollIntoView,
+                    );
                 }
                 TreeNavDirection::Down
                     if self.file_tree.tree_focus_index + 1
                         < self.file_tree.visible_tree_nodes.len() =>
                 {
                     self.file_tree.tree_focus_index += 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                    return widgets::scroll_to_tree_focus(
+                        &mut self.file_tree,
+                        widgets::ScrollMode::ScrollIntoView,
+                    );
                 }
                 _ => {}
             }
@@ -4642,7 +4663,9 @@ impl EditorState {
             .enumerate()
             .map(|(i, n)| self.render_tree_node(n, 0, 0, i == self.file_tree.nodes.len() - 1))
             .collect();
-        let panel = widgets::build_tree_panel(&self.file_tree, elements);
+        let panel = widgets::build_tree_panel(&self.file_tree, elements, |viewport| {
+            EditorMessage::TreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
+        });
 
         // Wrap the tree panel with a context menu that fires on empty-space
         // right-clicks. When the user right-clicks on a tree node, the inner

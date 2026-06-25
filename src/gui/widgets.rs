@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use iced::widget::{self, button, column, container, pick_list, text, text_input};
+use iced::widget::{self, button, column, container, pick_list, scrollable, text, text_input};
 use iced::{Alignment, Color, Element, Length, Padding, Task};
 
 use iced_selection;
@@ -177,6 +177,14 @@ pub struct FileTree {
     pub visible_tree_nodes: Vec<(String, bool)>,
     /// Scrollable ID for the tree panel (for scroll-into-view).
     pub tree_scroll_id: iced::widget::Id,
+    /// Current vertical scroll offset of the tree panel viewport.
+    /// Updated via [`on_scroll`] on the scrollable widget.
+    pub scroll_y: f32,
+    /// Visible height of the tree panel viewport.
+    /// `None` until the first scroll event fires, at which point it becomes
+    /// `Some(viewport_h)`. When `None`, [`scroll_to_tree_focus`] with
+    /// [`ScrollMode::ScrollIntoView`] falls back to [`ScrollMode::SnapToTop`].
+    pub viewport_h: Option<f32>,
 }
 
 impl FileTree {
@@ -190,6 +198,8 @@ impl FileTree {
             tree_focus_index: 0,
             visible_tree_nodes: Vec::new(),
             tree_scroll_id: scroll_id,
+            scroll_y: 0.0,
+            viewport_h: None,
         }
     }
 
@@ -243,6 +253,8 @@ impl FileTree {
         self.tree_focused = false;
         self.tree_focus_index = 0;
         self.visible_tree_nodes.clear();
+        self.scroll_y = 0.0;
+        self.viewport_h = None;
     }
 
     /// Set the focus index to the visible-tree position of `path`, if found.
@@ -281,7 +293,7 @@ impl FileTree {
         if let Some(dir_idx) = self.focus_path(path) {
             if dir_idx + 1 < self.visible_tree_nodes.len() {
                 self.tree_focus_index = dir_idx + 1;
-                return scroll_to_tree_focus(self);
+                return scroll_to_tree_focus(self, ScrollMode::SnapToTop);
             }
         }
         Task::none()
@@ -304,7 +316,7 @@ impl FileTree {
         );
         self.rebuild_visible();
         if self.focus_path(path).is_some() {
-            return scroll_to_tree_focus(self);
+            return scroll_to_tree_focus(self, ScrollMode::SnapToTop);
         }
         Task::none()
     }
@@ -370,22 +382,98 @@ pub const TREE_FONT_SIZE: f32 = 14.0;
 /// at the same nominal point size).
 pub const TREE_ICON_SIZE: f32 = 15.0;
 
+/// Controls whether [`scroll_to_tree_focus`] snaps to the focused row or
+/// uses viewport-aware scroll-into-view logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMode {
+    /// Scroll so that the focused row is at the top of the viewport.
+    SnapToTop,
+    /// Only scroll when the focused row is outside the visible viewport.
+    /// Requires [`FileTree::viewport_h`] to be `Some`; falls back to
+    /// [`SnapToTop`](ScrollMode::SnapToTop) when unknown.
+    ScrollIntoView,
+}
+
 /// Estimated height per tree row for scroll-into-view on keyboard navigation.
 pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = 20.0;
 
 /// Scroll the tree panel to bring the focused row into view.
+///
+/// Behaviour depends on [`ScrollMode`]:
+///
+/// * [`SnapToTop`](ScrollMode::SnapToTop): absolute offset to
+///   `tree_focus_index * ESTIMATED_TREE_ROW_HEIGHT`.
+/// * [`ScrollIntoView`](ScrollMode::ScrollIntoView): only scrolls when the
+///   focused row is not fully visible — for rows above the viewport the
+///   row is brought to the top, for rows below the viewport the view
+///   advances by one row height. Falls back to [`SnapToTop`] when the
+///   viewport height is unknown ([`FileTree::viewport_h`] is `None`).
+///
+/// This method updates [`FileTree::scroll_y`] directly so that consecutive
+/// calls during the same frame see an accurate scroll offset even before the
+/// [`on_scroll`](widget::scrollable::on_scroll) callback fires.
 #[allow(clippy::cast_precision_loss)]
-pub fn scroll_to_tree_focus<Message: 'static>(file_tree: &FileTree) -> Task<Message> {
+pub fn scroll_to_tree_focus<Message: 'static>(
+    file_tree: &mut FileTree,
+    mode: ScrollMode,
+) -> Task<Message> {
     if file_tree.visible_tree_nodes.is_empty() {
         return Task::none();
     }
-    let offset_y = file_tree.tree_focus_index as f32 * ESTIMATED_TREE_ROW_HEIGHT;
+
+    let focus_y = file_tree.tree_focus_index as f32 * ESTIMATED_TREE_ROW_HEIGHT;
+
+    match mode {
+        ScrollMode::SnapToTop => absolute_scroll_to(file_tree, focus_y),
+        ScrollMode::ScrollIntoView => match file_tree.viewport_h {
+            None => {
+                // Viewport size unknown — fall back to snap-to-top.
+                absolute_scroll_to(file_tree, focus_y)
+            }
+            Some(viewport_h) => {
+                // A row is considered "above viewport" when the bottom edge
+                // of the row is above the viewport top. This avoids redundant
+                // scrolling when a row is partially visible at the top edge
+                // after non-row-aligned mouse-wheel scrolling.
+                let row_bottom = focus_y + ESTIMATED_TREE_ROW_HEIGHT;
+                let viewport_bottom = file_tree.scroll_y + viewport_h;
+
+                if row_bottom <= file_tree.scroll_y {
+                    // Focus is above the visible area — bring it to the top.
+                    absolute_scroll_to(file_tree, focus_y)
+                } else if focus_y >= viewport_bottom {
+                    // Focus is below the visible area — advance by one row
+                    // and update scroll_y directly so the next key event
+                    // sees accurate state even before on_scroll fires.
+                    file_tree.scroll_y = (file_tree.scroll_y + ESTIMATED_TREE_ROW_HEIGHT).max(0.0);
+                    iced::widget::operation::scroll_by(
+                        file_tree.tree_scroll_id.clone(),
+                        iced::widget::operation::AbsoluteOffset {
+                            x: 0.0,
+                            y: ESTIMATED_TREE_ROW_HEIGHT,
+                        },
+                    )
+                } else {
+                    // Row is within the viewport (fully or partially visible).
+                    // Partially-visible rows at the bottom edge
+                    // (focus_y < viewport_bottom but row_bottom > viewport_bottom)
+                    // are intentionally not scrolled — only rows whose top edge
+                    // is entirely outside the viewport trigger a scroll.
+                    Task::none()
+                }
+            }
+        },
+    }
+}
+
+/// Helper: absolute scroll to `y` offset and update [`FileTree::scroll_y`].
+fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Task<Message> {
+    // Best-guess update of the tracked scroll offset so that subsequent
+    // ScrollIntoView checks within the same frame use a plausible value.
+    file_tree.scroll_y = y.max(0.0);
     iced::widget::operation::scroll_to(
         file_tree.tree_scroll_id.clone(),
-        iced::widget::operation::AbsoluteOffset {
-            x: 0.0,
-            y: offset_y,
-        },
+        iced::widget::operation::AbsoluteOffset { x: 0.0, y },
     )
 }
 
@@ -394,12 +482,20 @@ pub fn scroll_to_tree_focus<Message: 'static>(file_tree: &FileTree) -> Task<Mess
 /// Renders a scrollable, fixed-width column wrapping the pre-built
 /// `tree_element` rows. A focus border is applied when `file_tree.tree_focused`
 /// is true.
+///
+/// `on_scroll` is attached to the inner [`widget::scrollable`] via
+/// [`widget::scrollable::on_scroll`] and fires whenever the viewport changes
+/// (scrollbar drag, mouse wheel, programmatic scroll). The caller should
+/// produce a message that updates [`FileTree::scroll_y`] and
+/// [`FileTree::viewport_h`] from the [`Viewport`] data.
 pub fn build_tree_panel<'a, Message: 'a>(
     file_tree: &'a FileTree,
     tree_rows: Vec<Element<'a, Message>>,
+    on_scroll: impl Fn(scrollable::Viewport) -> Message + 'a,
 ) -> Element<'a, Message> {
     let tree_body = widget::scrollable(column(tree_rows).spacing(0))
         .id(file_tree.tree_scroll_id.clone())
+        .on_scroll(on_scroll)
         .width(Length::Fill)
         .height(Length::Fill)
         .direction(theme::vertical_scrollbar())
@@ -989,5 +1085,134 @@ mod tests {
         );
         #[cfg(not(debug_assertions))]
         assert!(result.is_ok(), "no panic expected in release builds");
+    }
+
+    // ── scroll_to_tree_focus / ScrollIntoView tests ──────────────────
+
+    /// Helper: build a FileTree with `n` flat file entries, a known viewport
+    /// height, and `scroll_y` set to a given offset.
+    fn tree_with_viewport(n: usize, scroll_y: f32, viewport_h: f32) -> FileTree {
+        let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
+        tree.visible_tree_nodes = (0..n).map(|i| (format!("file_{i}.rs"), false)).collect();
+        tree.scroll_y = scroll_y;
+        tree.viewport_h = Some(viewport_h);
+        tree
+    }
+
+    #[test]
+    fn scroll_into_view_row_fully_visible_no_scroll() {
+        // Viewport: y=40..440 (400px tall, starting at row index 2)
+        // Focus on index 3 (y=60). The row at y=60 spans y=60..80.
+        // Viewport bottom is 440. Row is fully within 40..440.
+        let mut tree = tree_with_viewport(30, 40.0, 400.0);
+        tree.tree_focus_index = 3; // 3 * 20 = 60
+
+        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
+
+        // scroll_y unchanged — no scroll needed.
+        assert!(
+            (tree.scroll_y - 40.0).abs() < f32::EPSILON,
+            "scroll_y should remain 40"
+        );
+    }
+
+    #[test]
+    fn scroll_into_view_row_below_viewport_advances_one_row() {
+        // Viewport: y=0..200 (200px tall)
+        // Focus on index 15 (y=300). Row bottom is 320.
+        // Row is below viewport bottom (200).
+        let mut tree = tree_with_viewport(30, 0.0, 200.0);
+        tree.tree_focus_index = 15; // 15 * 20 = 300
+
+        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
+
+        // scroll_y advanced by one row height.
+        assert!(
+            (tree.scroll_y - 20.0).abs() < f32::EPSILON,
+            "scroll_y should advance by 20, got {}",
+            tree.scroll_y
+        );
+    }
+
+    #[test]
+    fn scroll_into_view_row_above_viewport_brings_to_top() {
+        // Viewport: y=100..500 (400px tall)
+        // Focus on index 3 (y=60). Row bottom is 80.
+        // Row bottom (80) is above viewport top (100).
+        let mut tree = tree_with_viewport(30, 100.0, 400.0);
+        tree.tree_focus_index = 3; // 3 * 20 = 60
+
+        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
+
+        // scroll_y set to focus_y (60) — bring row to top.
+        assert!(
+            (tree.scroll_y - 60.0).abs() < f32::EPSILON,
+            "scroll_y should be 60, got {}",
+            tree.scroll_y
+        );
+    }
+
+    #[test]
+    fn scroll_into_view_partially_visible_at_top_edge_no_scroll() {
+        // Viewport: y=50..450 (400px tall)
+        // Focus on index 2 (y=40). Row bottom is 60.
+        // Row bottom (60) is below viewport top (50) → partially visible.
+        let mut tree = tree_with_viewport(30, 50.0, 400.0);
+        tree.tree_focus_index = 2; // 2 * 20 = 40
+
+        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
+
+        // scroll_y unchanged — row is partially visible at top edge.
+        assert!(
+            (tree.scroll_y - 50.0).abs() < f32::EPSILON,
+            "scroll_y should remain 50, got {}",
+            tree.scroll_y
+        );
+    }
+
+    #[test]
+    fn scroll_into_view_unknown_viewport_falls_back_to_snap() {
+        // viewport_h is None — should fall back to SnapToTop.
+        let mut tree = tree_with_viewport(30, 10.0, 0.0);
+        tree.viewport_h = None;
+        tree.tree_focus_index = 10; // 10 * 20 = 200
+
+        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
+
+        // Falls back to absolute scroll: scroll_y = focus_y = 200.
+        assert!(
+            (tree.scroll_y - 200.0).abs() < f32::EPSILON,
+            "scroll_y should snap to 200, got {}",
+            tree.scroll_y
+        );
+    }
+
+    #[test]
+    fn scroll_snap_to_top_sets_scroll_y() {
+        let mut tree = tree_with_viewport(30, 0.0, 400.0);
+        tree.tree_focus_index = 8; // 8 * 20 = 160
+
+        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::SnapToTop);
+
+        // SnapToTop sets scroll_y to focus_y.
+        assert!(
+            (tree.scroll_y - 160.0).abs() < f32::EPSILON,
+            "scroll_y should be 160, got {}",
+            tree.scroll_y
+        );
+    }
+
+    #[test]
+    fn scroll_into_view_empty_tree_noop() {
+        let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
+        tree.viewport_h = Some(400.0);
+
+        let task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
+
+        // The task type is opaque, but we can verify it's not panicking
+        // and that scroll_y stays at its default.
+        assert!((tree.scroll_y - 0.0).abs() < f32::EPSILON);
+        // The function returns Task::none() for empty trees.
+        // We can't easily inspect Task contents, so we just check no crash.
     }
 }

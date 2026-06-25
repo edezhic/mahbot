@@ -76,6 +76,9 @@ pub enum DiffMessage {
     TreeNavLeft,
     /// Arrow Right in tree navigation — expand directory or go to first child.
     TreeNavRight,
+    /// Scroll position changed in the tree panel. First element is the
+    /// absolute vertical scroll offset, second is the visible viewport height.
+    TreeScrolled(f32, f32),
     /// Navigate to a specific commit diff view.
     /// (workspace_name, commit_hash)
     NavigateToCommit(String, String),
@@ -586,10 +589,19 @@ impl DiffState {
                 Task::none()
             }
 
+            DiffMessage::TreeScrolled(scroll_y, viewport_h) => {
+                self.file_tree.scroll_y = scroll_y;
+                self.file_tree.viewport_h = Some(viewport_h);
+                Task::none()
+            }
+
             DiffMessage::TreeNavUp => {
                 if self.file_tree.tree_focused && self.file_tree.tree_focus_index > 0 {
                     self.file_tree.tree_focus_index -= 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                    return widgets::scroll_to_tree_focus(
+                        &mut self.file_tree,
+                        widgets::ScrollMode::ScrollIntoView,
+                    );
                 }
                 Task::none()
             }
@@ -599,7 +611,10 @@ impl DiffState {
                     && self.file_tree.tree_focus_index + 1 < self.file_tree.visible_tree_nodes.len()
                 {
                     self.file_tree.tree_focus_index += 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                    return widgets::scroll_to_tree_focus(
+                        &mut self.file_tree,
+                        widgets::ScrollMode::ScrollIntoView,
+                    );
                 }
                 Task::none()
             }
@@ -645,7 +660,10 @@ impl DiffState {
                 // ArrowLeft on collapsed directory or file — navigate to parent.
                 match self.file_tree.focused_parent_path() {
                     Some(ref p) if self.file_tree.focus_path(p).is_some() => {
-                        return widgets::scroll_to_tree_focus(&self.file_tree);
+                        return widgets::scroll_to_tree_focus(
+                            &mut self.file_tree,
+                            widgets::ScrollMode::SnapToTop,
+                        );
                     }
                     _ => {} // Root-level item has no parent — no-op.
                 }
@@ -674,7 +692,10 @@ impl DiffState {
                 // Already expanded directory — move focus to first child (if any).
                 if idx + 1 < self.file_tree.visible_tree_nodes.len() {
                     self.file_tree.tree_focus_index = idx + 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                    return widgets::scroll_to_tree_focus(
+                        &mut self.file_tree,
+                        widgets::ScrollMode::SnapToTop,
+                    );
                 }
                 Task::none()
             }
@@ -832,7 +853,9 @@ impl DiffState {
             .enumerate()
             .map(|(i, n)| self.render_tree_node(n, 0, 0, i == count - 1))
             .collect();
-        widgets::build_tree_panel(&self.file_tree, elements)
+        widgets::build_tree_panel(&self.file_tree, elements, |viewport| {
+            DiffMessage::TreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
+        })
     }
 
     /// Recursively render a tree node and its children.
