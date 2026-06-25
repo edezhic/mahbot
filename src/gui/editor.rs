@@ -1725,55 +1725,41 @@ impl EditorState {
             else {
                 return None;
             };
-            let is_platform_mod = modifiers.command() || modifiers.control();
-            // On macOS, Ctrl alone (without Cmd) triggers emacs shortcuts
-            // (Ctrl+B → MoveLeft, Ctrl+F → MoveRight) — don't also fire
-            // TreeFocusToggled / FindToggle on the same keypress.
-            #[cfg(target_os = "macos")]
-            let is_emacs_ctrl = modifiers.control() && !modifiers.command();
-            #[cfg(not(target_os = "macos"))]
-            let is_emacs_ctrl = false;
-
-            // On non-macOS, AltGr (Ctrl+Alt) is character input — block
-            // shortcuts from firing.
-            #[cfg(not(target_os = "macos"))]
-            let altgr_active = modifiers.alt() && modifiers.control();
-            #[cfg(target_os = "macos")]
-            let altgr_active = false;
+            let km = super::detect_keyboard_mods(&modifiers);
 
             // Helper: match a Character key by its Latin equivalent.
             let latin = |target: char| -> bool { key.to_latin(physical_key) == Some(target) };
 
             // Ctrl+B / Cmd+B → toggle tree focus.
-            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('b') {
+            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('b') {
                 return Some(EditorMessage::TreeFocusToggled);
             }
             // Cmd+Shift+F / Ctrl+Shift+F → global search (find-in-files).
             // Must appear BEFORE the Cmd+F / Ctrl+F check so Cmd+Shift+F
             // doesn't also trigger FindToggle.
-            if is_platform_mod && !altgr_active && modifiers.shift() && latin('f') {
+            if km.is_platform_mod && !km.altgr_active && modifiers.shift() && latin('f') {
                 return Some(EditorMessage::GlobalSearchToggle);
             }
             // Cmd+F / Ctrl+F → toggle find/replace bar.
             // Guard: Cmd+Shift+F handled above, so !modifiers.shift() prevents
             // Cmd+Shift+F from also triggering FindToggle.
-            if is_platform_mod
-                && !is_emacs_ctrl
-                && !altgr_active
+            if km.is_platform_mod
+                && !km.is_emacs_ctrl
+                && !km.altgr_active
                 && !modifiers.shift()
                 && latin('f')
             {
                 return Some(EditorMessage::FindToggle);
             }
             // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z / Ctrl+Shift+Z → redo.
-            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('z') {
+            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('z') {
                 if modifiers.shift() {
                     return Some(EditorMessage::Redo);
                 }
                 return Some(EditorMessage::Undo);
             }
             // Cmd+S / Ctrl+S → save.
-            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('s') {
+            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('s') {
                 return Some(EditorMessage::SaveActiveTab);
             }
             // Ctrl+Tab / Ctrl+Shift+Tab → switch tabs.
@@ -1789,7 +1775,7 @@ impl EditorState {
             // Ctrl+W → close tab (all platforms). Cmd+W on macOS is typically
             // captured by the window manager to close the window, so we use
             // Ctrl+W consistently.
-            if !altgr_active && modifiers.control() && latin('w') {
+            if !km.altgr_active && modifiers.control() && latin('w') {
                 return Some(EditorMessage::CloseActiveTab);
             }
             // Go-to-line: Cmd+L on macOS, Ctrl+G on other platforms.
@@ -1801,16 +1787,16 @@ impl EditorState {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                if !altgr_active && modifiers.control() && latin('g') {
+                if !km.altgr_active && modifiers.control() && latin('g') {
                     return Some(EditorMessage::GoToLineToggle);
                 }
             }
             // Quick open: Cmd+P / Ctrl+P
-            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('p') {
+            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('p') {
                 return Some(EditorMessage::QuickOpenToggle);
             }
             // Refresh file tree: Cmd+R / Ctrl+R
-            if is_platform_mod && !is_emacs_ctrl && !altgr_active && latin('r') {
+            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('r') {
                 return Some(EditorMessage::RefreshFileTree);
             }
             // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev

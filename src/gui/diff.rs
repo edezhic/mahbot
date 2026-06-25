@@ -199,14 +199,8 @@ impl DiffState {
             else {
                 return None;
             };
-            let is_cmd = modifiers.command();
-            // On non-macOS, AltGr (Ctrl+Alt) is character input — block
-            // shortcuts from firing.
-            #[cfg(not(target_os = "macos"))]
-            let altgr_active = modifiers.alt() && modifiers.control();
-            #[cfg(target_os = "macos")]
-            let altgr_active = false;
-            if !altgr_active && is_cmd && key.to_latin(physical_key) == Some('b') {
+            let km = super::detect_keyboard_mods(&modifiers);
+            if !km.altgr_active && km.is_cmd && key.to_latin(physical_key) == Some('b') {
                 return Some(DiffMessage::TreeFocusToggled);
             }
             match &key {

@@ -772,23 +772,11 @@ impl HomeState {
             else {
                 return None;
             };
-            let is_platform_mod = modifiers.command() || modifiers.control();
-            // On macOS, Ctrl alone (without Cmd) triggers terminal control
-            // characters — don't interpret Ctrl+Z as undo.
-            #[cfg(target_os = "macos")]
-            let is_emacs_ctrl = modifiers.control() && !modifiers.command();
-            #[cfg(not(target_os = "macos"))]
-            let is_emacs_ctrl = false;
-            // On non-macOS, AltGr (Ctrl+Alt) is character input — block
-            // shortcuts from firing.
-            #[cfg(not(target_os = "macos"))]
-            let altgr_active = modifiers.alt() && modifiers.control();
-            #[cfg(target_os = "macos")]
-            let altgr_active = false;
+            let km = super::detect_keyboard_mods(&modifiers);
             // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
-            if is_platform_mod
-                && !is_emacs_ctrl
-                && !altgr_active
+            if km.is_platform_mod
+                && !km.is_emacs_ctrl
+                && !km.altgr_active
                 && key.to_latin(physical_key) == Some('z')
             {
                 if modifiers.shift() {

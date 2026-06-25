@@ -226,6 +226,54 @@ pub enum Message {
     Settings(settings::SettingsMessage),
 }
 
+// ── Keyboard modifier helper ─────────────────────────────────────
+
+/// Platform-aware keyboard modifier state computed from a
+/// [`keyboard::Modifiers`] value.  Centralises the duplicated
+/// `#[cfg]`-gated setup that was repeated across four GUI keyboard
+/// subscription handlers.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct KeyboardMods {
+    /// True if the Command key (macOS) is held (⌘).
+    pub is_cmd: bool,
+    /// True if the platform modifier is held — Command (⌘) on macOS,
+    /// Control (Ctrl) on other platforms.
+    pub is_platform_mod: bool,
+    /// On macOS: true if Ctrl is held without Cmd (triggers terminal
+    /// control characters / emacs bindings).  Always false on other
+    /// platforms.
+    pub is_emacs_ctrl: bool,
+    /// On non-macOS: true if Ctrl+Alt is held (AltGr character input).
+    /// Always false on macOS.
+    pub altgr_active: bool,
+}
+
+/// Compute [`KeyboardMods`] from an Iced [`keyboard::Modifiers`] value.
+///
+/// Encapsulates the `#[cfg(target_os = "macos")]` / `#[cfg(not(...))]`
+/// blocks that every keyboard subscription handler previously inlined.
+pub(crate) fn detect_keyboard_mods(modifiers: &keyboard::Modifiers) -> KeyboardMods {
+    let is_cmd = modifiers.command();
+    let is_platform_mod = modifiers.command() || modifiers.control();
+
+    #[cfg(target_os = "macos")]
+    let is_emacs_ctrl = modifiers.control() && !modifiers.command();
+    #[cfg(not(target_os = "macos"))]
+    let is_emacs_ctrl = false;
+
+    #[cfg(not(target_os = "macos"))]
+    let altgr_active = modifiers.alt() && modifiers.control();
+    #[cfg(target_os = "macos")]
+    let altgr_active = false;
+
+    KeyboardMods {
+        is_cmd,
+        is_platform_mod,
+        is_emacs_ctrl,
+        altgr_active,
+    }
+}
+
 // ── Dashboard state ──────────────────────────────────────────────
 
 /// Log store created during boot; read when handling [`Message::Boot`].
@@ -1325,22 +1373,16 @@ impl Dashboard {
                 else {
                     return None;
                 };
-                let is_cmd = modifiers.command();
-                // On non-macOS, AltGr (Ctrl+Alt) is character input — block
-                // shortcuts from firing.
-                #[cfg(not(target_os = "macos"))]
-                let altgr_active = modifiers.alt() && modifiers.control();
-                #[cfg(target_os = "macos")]
-                let altgr_active = false;
+                let km = detect_keyboard_mods(&modifiers);
 
                 let latin = key.to_latin(physical_key);
                 // Cmd+F (macOS) / Ctrl+F (other) → focus search.
-                if !altgr_active && is_cmd && !modifiers.shift() && latin == Some('f') {
+                if !km.altgr_active && km.is_cmd && !modifiers.shift() && latin == Some('f') {
                     return Some(Message::FocusSearch);
                 }
                 if let Key::Named(iced::keyboard::key::Named::Escape) = key {
                     Some(Message::EscapePressed)
-                } else if is_cmd && !altgr_active {
+                } else if km.is_cmd && !km.altgr_active {
                     // Cmd+number → navigate to page.
                     if let Some(digit) = latin.and_then(|c| c.to_digit(10)) {
                         let idx = digit as usize;
