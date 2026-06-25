@@ -721,6 +721,20 @@ fn validate_item_name(name: &str) -> Option<&'static str> {
 
 // ── Helpers — prefix-based collection re-keying ───────────────────
 
+/// Given a key starting with `old_prefix`, compute the new key with
+/// `new_prefix` substituted for the prefix portion.  The caller must
+/// already have verified that the key starts with `old_prefix` (via
+/// `starts_with` or equivalent) — this function uses `unwrap_or("")`
+/// as a safe fallback but assumes the prefix match.
+fn rekey_compute_new_key(key: &str, old_prefix: &str, new_prefix: &str) -> String {
+    let rest = key.strip_prefix(old_prefix).unwrap_or("");
+    if rest.is_empty() {
+        new_prefix.to_string()
+    } else {
+        format!("{new_prefix}/{rest}")
+    }
+}
+
 /// Re-key entries in a `HashMap<String, V>` whose keys start with
 /// `old_prefix` to use `new_prefix` instead.  Each value passes through
 /// `modify` before re-insertion (use `|_| {}` when no modification is
@@ -742,12 +756,7 @@ fn rekey_map_prefix<V>(
     for k in keys {
         if let Some(mut v) = map.remove(&k) {
             modify(&mut v);
-            let rest = k.strip_prefix(old_prefix).unwrap_or("");
-            let new_key = if rest.is_empty() {
-                new_prefix.to_string()
-            } else {
-                format!("{new_prefix}/{rest}")
-            };
+            let new_key = rekey_compute_new_key(&k, old_prefix, new_prefix);
             map.insert(new_key, v);
         }
     }
@@ -764,12 +773,7 @@ fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &st
         .collect();
     for k in keys {
         set.remove(&k);
-        let rest = k.strip_prefix(old_prefix).unwrap_or("");
-        let new_key = if rest.is_empty() {
-            new_prefix.to_string()
-        } else {
-            format!("{new_prefix}/{rest}")
-        };
+        let new_key = rekey_compute_new_key(&k, old_prefix, new_prefix);
         set.insert(new_key);
     }
 }
@@ -779,8 +783,8 @@ fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &st
 /// directory-rename migrations to keep `FsEntry` paths in sync with their
 /// new directory key.
 fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
-    if let Some(tail) = entry.full_path.strip_prefix(old_prefix) {
-        entry.full_path = format!("{new_prefix}/{tail}");
+    if entry.full_path.starts_with(old_prefix) {
+        entry.full_path = rekey_compute_new_key(&entry.full_path, old_prefix, new_prefix);
     }
 }
 
