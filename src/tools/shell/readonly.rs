@@ -1438,110 +1438,109 @@ mod tests {
     // ── extract_git_subcommand unit tests ──────────────────────────
 
     #[test]
-    fn extract_git_subcommand_basic() {
-        assert_eq!(extract_git_subcommand("git status"), "status");
-    }
+    fn test_extract_git_subcommand() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: &'static str,
+        }
 
-    #[test]
-    fn extract_git_subcommand_with_global_flag() {
-        assert_eq!(extract_git_subcommand("git -C /repo diff"), "diff");
-    }
+        let cases = [
+            Case {
+                name: "basic",
+                input: "git status",
+                expected: "status",
+            },
+            Case {
+                name: "with global flag",
+                input: "git -C /repo diff",
+                expected: "diff",
+            },
+            Case {
+                name: "with config",
+                input: "git -c user.name=me log",
+                expected: "log",
+            },
+            Case {
+                name: "with git dir",
+                input: "git --git-dir /repo status",
+                expected: "status",
+            },
+            Case {
+                name: "env assignment",
+                input: "GIT_DIR=/tmp git status",
+                expected: "status",
+            },
+            Case {
+                name: "no git",
+                input: "cargo build",
+                expected: "",
+            },
+            Case {
+                name: "git only",
+                input: "git",
+                expected: "",
+            },
+            Case {
+                name: "full subcommand",
+                input: "git branch -d feature",
+                expected: "branch -d feature",
+            },
+            Case {
+                name: "with double dash",
+                input: "git -- diff",
+                expected: "diff",
+            },
+            Case {
+                name: "stash list",
+                input: "git stash list",
+                expected: "stash list",
+            },
+            Case {
+                name: "multiple env",
+                input: "CC=gcc CXX=g++ git status",
+                expected: "status",
+            },
+            Case {
+                name: "multiple flags",
+                input: "git -C /repo --git-dir /other status",
+                expected: "status",
+            },
+            Case {
+                name: "with sudo skipped — Shell prefixes like `sudo` are skipped by `find_first_command_word_index`, so \"git\" is correctly located",
+                input: "sudo git status",
+                expected: "status",
+            },
+            Case {
+                name: "with env skipped",
+                input: "env git status",
+                expected: "status",
+            },
+            Case {
+                name: "env and sudo — Combined env assignment + shell prefix",
+                input: "GIT_DIR=/tmp sudo git status",
+                expected: "status",
+            },
+            Case {
+                name: "sudo push — Mutating subcommand with shell prefix",
+                input: "sudo git push",
+                expected: "push",
+            },
+            Case {
+                name: "flag with multiple args",
+                input: "git branch --merged master",
+                expected: "branch --merged master",
+            },
+        ];
 
-    #[test]
-    fn extract_git_subcommand_with_config() {
-        assert_eq!(extract_git_subcommand("git -c user.name=me log"), "log");
-    }
-
-    #[test]
-    fn extract_git_subcommand_with_git_dir() {
-        assert_eq!(
-            extract_git_subcommand("git --git-dir /repo status"),
-            "status"
-        );
-    }
-
-    #[test]
-    fn extract_git_subcommand_env_assignment() {
-        assert_eq!(extract_git_subcommand("GIT_DIR=/tmp git status"), "status");
-    }
-
-    #[test]
-    fn extract_git_subcommand_no_git() {
-        assert_eq!(extract_git_subcommand("cargo build"), "");
-    }
-
-    #[test]
-    fn extract_git_subcommand_git_only() {
-        assert_eq!(extract_git_subcommand("git"), "");
-    }
-
-    #[test]
-    fn extract_git_subcommand_full_subcommand() {
-        assert_eq!(
-            extract_git_subcommand("git branch -d feature"),
-            "branch -d feature"
-        );
-    }
-
-    #[test]
-    fn extract_git_subcommand_with_double_dash() {
-        assert_eq!(extract_git_subcommand("git -- diff"), "diff");
-    }
-
-    #[test]
-    fn extract_git_subcommand_stash_list() {
-        assert_eq!(extract_git_subcommand("git stash list"), "stash list");
-    }
-
-    #[test]
-    fn extract_git_subcommand_multiple_env() {
-        assert_eq!(
-            extract_git_subcommand("CC=gcc CXX=g++ git status"),
-            "status"
-        );
-    }
-
-    #[test]
-    fn extract_git_subcommand_multiple_flags() {
-        assert_eq!(
-            extract_git_subcommand("git -C /repo --git-dir /other status"),
-            "status"
-        );
-    }
-
-    #[test]
-    fn extract_git_subcommand_with_sudo_skipped() {
-        // Shell prefixes like `sudo` ARE skipped by `find_first_command_word_index`,
-        // so "git" is correctly located and its subcommand extracted.
-        assert_eq!(extract_git_subcommand("sudo git status"), "status");
-    }
-
-    #[test]
-    fn extract_git_subcommand_with_env_skipped() {
-        assert_eq!(extract_git_subcommand("env git status"), "status");
-    }
-
-    #[test]
-    fn extract_git_subcommand_env_and_sudo() {
-        // Combined env assignment + shell prefix
-        assert_eq!(
-            extract_git_subcommand("GIT_DIR=/tmp sudo git status"),
-            "status"
-        );
-    }
-
-    #[test]
-    fn extract_git_subcommand_sudo_push() {
-        // Mutating subcommand with shell prefix — should extract "push"
-        assert_eq!(extract_git_subcommand("sudo git push"), "push");
-    }
-
-    #[test]
-    fn extract_git_subcommand_flag_with_multiple_args() {
-        assert_eq!(
-            extract_git_subcommand("git branch --merged master"),
-            "branch --merged master"
-        );
+        for case in &cases {
+            assert_eq!(
+                extract_git_subcommand(case.input),
+                case.expected,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     #[test]
