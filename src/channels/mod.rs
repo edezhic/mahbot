@@ -545,7 +545,7 @@ fn extract_urls(text: &str) -> Vec<String> {
 ///
 /// If no URLs are found, the original message is returned unchanged.
 /// Links are fetched concurrently using the shared `BrowserTool` — each URL
-/// gets its own isolated session tab that is closed after snapshot extraction.
+/// gets its own isolated session tab that is closed after text extraction.
 pub async fn enrich_links(content: &str) -> String {
     let urls = extract_urls(content);
     if urls.is_empty() {
@@ -566,7 +566,7 @@ pub async fn enrich_links(content: &str) -> String {
         let tab = format!("link-enricher-{i}");
         let browser = std::sync::Arc::clone(&browser);
         tasks.push(tokio::spawn(async move {
-            let result = browser.fetch_snapshot(&url, &tab).await;
+            let result = browser.fetch_page_text(&url, &tab).await;
             // Close the tab (best-effort) regardless of fetch outcome.
             browser.close_session(&tab).await;
             (url, result)
@@ -576,19 +576,19 @@ pub async fn enrich_links(content: &str) -> String {
     let mut enrichments: Vec<String> = Vec::new();
     for task in tasks {
         match task.await {
-            Ok((url, Ok(snapshot))) => {
-                // Truncate very long snapshots to keep messages manageable.
-                const MAX_SNAPSHOT_LEN: usize = 5000;
-                let snippet = if snapshot.len() > MAX_SNAPSHOT_LEN {
-                    let end = snapshot.floor_char_boundary(MAX_SNAPSHOT_LEN);
-                    format!("{}…", &snapshot[..end])
+            Ok((url, Ok(body_text))) => {
+                // Truncate very long text to keep messages manageable.
+                const MAX_TEXT_LEN: usize = 5000;
+                let snippet = if body_text.len() > MAX_TEXT_LEN {
+                    let end = body_text.floor_char_boundary(MAX_TEXT_LEN);
+                    format!("{}…", &body_text[..end])
                 } else {
-                    snapshot
+                    body_text
                 };
                 enrichments.push(format!("📄 [{url}]\n{snippet}"));
             }
             Ok((url, Err(e))) => {
-                tracing::debug!(url, error = %e, "Link enricher: failed to fetch page snapshot");
+                tracing::debug!(url, error = %e, "Link enricher: failed to fetch page text");
             }
             Err(e) => {
                 tracing::debug!("Link enricher task panicked: {e}");

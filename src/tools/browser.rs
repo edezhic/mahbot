@@ -116,37 +116,38 @@ impl BrowserTool {
         lock.lock_owned().await
     }
 
-    /// Open a URL, wait for network idle, take a compact snapshot, and return
-    /// the page content as text. Handles all agent-browser response shapes:
-    /// string data, `content` field, `snapshot` field, or fallback JSON.
+    /// Open a URL, wait for network idle, and extract clean visible text via
+    /// `document.body.innerText` (JavaScript eval). Unlike the accessibility
+    /// tree returned by the `Open` browser action (which contains element refs,
+    /// ARIA roles, and indentation), this returns plain rendered text — no
+    /// markup, no hidden content, no `<script>`/`<style>` noise.
+    ///
+    /// Falls back to `textContent` if the JavaScript eval fails.
     ///
     /// The tab is left open — caller should close it with `close_session` when
-    /// done. Each call acquires a per-tab lock so concurrent calls to the same
-    /// tab are serialized.
-    pub async fn fetch_snapshot(&self, url: &str, tab: &str) -> anyhow::Result<String> {
+    /// done.  The per-tab lock is held for the full duration (navigate +
+    /// extract) so concurrent callers targeting the same tab are serialized
+    /// consistently.
+    pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
         Self::validate_url(url)?;
 
         if !Self::is_available().await {
             anyhow::bail!("agent-browser CLI is not available");
         }
 
+        // Lock is held for the entire navigate + extract sequence so
+        // concurrent same-tab access doesn't race between navigation
+        // and text extraction.
         let _guard = self.acquire_tab_lock(tab).await;
-
-        // 1. Open the URL
         self.run_command(&["open", url], Some(tab)).await?;
 
-        // 2. Wait for network idle (best-effort)
+        // Wait for network idle (best-effort — no hard error on timeout).
         let _ = self
             .run_command(&["wait", "--load", "networkidle"], Some(tab))
             .await;
 
-        // 3. Take a compact snapshot and extract the text content
-        let snap_resp = self.run_command(&["snapshot", "-c"], Some(tab)).await?;
-        let text = snap_resp
-            .data
-            .as_ref()
-            .and_then(extract_snapshot_text)
-            .unwrap_or_default();
+        // Extract clean visible text via innerText JS eval (not snapshot).
+        let text = self.get_inner_text("body", tab).await?;
 
         Ok(text)
     }
@@ -1185,5 +1186,39 @@ mod tests {
         } else {
             assert_eq!(name, "agent-browser");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_page_text validation — error propagation through public method
+    // (exercises the early-return preamble without agent-browser)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fetch_page_text_propagates_url_validation_errors() {
+        let tool = BrowserTool::default();
+
+        let err = tool.fetch_page_text("", "test-tab").await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be empty"),
+            "expected empty-url error, got: {err}",
+        );
+
+        let err = tool
+            .fetch_page_text("file:///etc/passwd", "test-tab")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not allowed"),
+            "expected file:// rejection, got: {err}",
+        );
+
+        let err = tool
+            .fetch_page_text("ftp://example.com", "test-tab")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Only http:// and https://"),
+            "expected scheme rejection, got: {err}",
+        );
     }
 }
