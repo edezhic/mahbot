@@ -25,12 +25,27 @@ pub struct RoleConfig {
     pub reasoning_effort: Option<String>,
 }
 
+impl RoleConfig {
+    /// Normalise optional string fields: trim whitespace, collapse empty → `None`.
+    pub(crate) fn normalize(&mut self) {
+        self.model = non_empty(self.model.take());
+        self.reasoning_effort = non_empty(self.reasoning_effort.take());
+    }
+}
+
 /// A per-model provider routing rule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRouting {
     pub model: String,
     pub provider_order: Option<String>,
     pub allow_fallbacks: Option<bool>,
+}
+
+impl ModelRouting {
+    /// Normalise optional string fields: trim whitespace, collapse empty → `None`.
+    pub(crate) fn normalize(&mut self) {
+        self.provider_order = non_empty(self.provider_order.take());
+    }
 }
 
 // ── ConfigData — the reloadable inner config ─────────────────────
@@ -110,8 +125,9 @@ pub struct ConfigData {
 
 // ── String config field mapping ──────────────────────────────────
 //
-// The three runtime sync items (`STRUCT_FIELDS_DEFAULT`, `string_fields()`,
-// `set_string_field()`) plus the typed accessors on [`ConfigReload`]
+// The four runtime sync items (`STRUCT_FIELDS_DEFAULT`, `string_fields()`,
+// `set_string_field()`, `normalize_string_fields()`) plus the typed accessors
+// on [`ConfigReload`]
 // are all generated from a single annotated field-name declaration by the
 // `string_config_fields!` macro — adding or removing a field in the
 // macro invocation updates all items automatically, eliminating the
@@ -300,6 +316,23 @@ string_config_fields! {
     video_gen_models [list_or(fallback = video_gen_model, default = DEFAULT_VIDEO_GEN_MODEL)],
     exa_key [non_empty],
     telegram_bot_token [non_empty],
+}
+
+impl ConfigData {
+    /// Normalise all Vec entry inner `Option<String>` fields in place:
+    /// trim whitespace and collapse empty/whitespace-only values to `None`.
+    ///
+    /// This is the Vec-entry counterpart of [`normalize_string_fields()`] —
+    /// the macro-generated method only touches top-level `Option<String>` fields,
+    /// not the inner fields of [`RoleConfig`] and [`ModelRouting`] entries.
+    pub(crate) fn normalize_entries(&mut self) {
+        for rc in &mut self.per_role_configs {
+            rc.normalize();
+        }
+        for mr in &mut self.model_routings {
+            mr.normalize();
+        }
+    }
 }
 
 // ── Config value helpers ────────────────────────────────────────────
@@ -609,6 +642,14 @@ pub async fn reload_from_db() -> Result<()> {
     let routings = store.get_all_model_routings().await?;
     config.model_routings = routings;
 
+    // Normalise top-level KV-string fields: trim whitespace, collapse empty → None.
+    // This ensures consistency with save_and_reload's persistence path.
+    config.normalize_string_fields();
+
+    // Normalise Vec entry inner Option<String> fields so the in-memory
+    // representation matches save_and_reload's output.
+    config.normalize_entries();
+
     // Atomically swap
     CONFIG.swap(config);
     tracing::info!("Config reloaded from DB");
@@ -679,8 +720,12 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
     let mut config = config.clone();
 
     // Normalise string fields: trim whitespace, collapse empty → None.
-    // This matches reload_from_db's set_string_field → non_empty pipeline.
+    // For top-level KV fields this matches reload_from_db's
+    // set_string_field → non_empty pipeline.
     config.normalize_string_fields();
+    // Normalise Vec entry inner fields so both persistence paths apply
+    // the same non_empty treatment to per_role_configs and model_routings.
+    config.normalize_entries();
     // Sort to match DB ORDER BY clauses (get_all_role_configs / get_all_model_routings).
     config.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
     config.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
@@ -925,5 +970,152 @@ mod tests {
     #[test]
     fn struct_fields_default_matches_derive_default() {
         assert_eq!(ConfigData::default(), ConfigData::STRUCT_FIELDS_DEFAULT);
+    }
+
+    /// Verify that [`RoleConfig::normalize`] collapses empty and whitespace-only
+    /// optional string fields to `None`, and preserves non-empty values.
+    #[test]
+    fn role_config_normalize() {
+        // Non-empty values are preserved.
+        let mut rc = RoleConfig {
+            role: "engineer".into(),
+            model: Some("gpt-4".into()),
+            reasoning_effort: Some("high".into()),
+        };
+        rc.normalize();
+        assert_eq!(rc.model, Some("gpt-4".into()));
+        assert_eq!(rc.reasoning_effort, Some("high".into()));
+
+        // Empty string → None.
+        let mut rc = RoleConfig {
+            role: "engineer".into(),
+            model: Some("".into()),
+            reasoning_effort: Some("".into()),
+        };
+        rc.normalize();
+        assert_eq!(rc.model, None);
+        assert_eq!(rc.reasoning_effort, None);
+
+        // Whitespace-only → None.
+        let mut rc = RoleConfig {
+            role: "engineer".into(),
+            model: Some("   ".into()),
+            reasoning_effort: Some("  ".into()),
+        };
+        rc.normalize();
+        assert_eq!(rc.model, None);
+        assert_eq!(rc.reasoning_effort, None);
+
+        // Trimming preserves non-empty with whitespace.
+        let mut rc = RoleConfig {
+            role: "engineer".into(),
+            model: Some("  gpt-4  ".into()),
+            reasoning_effort: Some("  high  ".into()),
+        };
+        rc.normalize();
+        assert_eq!(rc.model, Some("gpt-4".into()));
+        assert_eq!(rc.reasoning_effort, Some("high".into()));
+
+        // Already None stays None.
+        let mut rc = RoleConfig {
+            role: "engineer".into(),
+            model: None,
+            reasoning_effort: None,
+        };
+        rc.normalize();
+        assert_eq!(rc.model, None);
+        assert_eq!(rc.reasoning_effort, None);
+    }
+
+    /// Verify that [`ModelRouting::normalize`] collapses empty and whitespace-only
+    /// `provider_order` to `None`.
+    #[test]
+    fn model_routing_normalize() {
+        // Non-empty value is preserved.
+        let mut mr = ModelRouting {
+            model: "gpt-4".into(),
+            provider_order: Some("OpenAi".into()),
+            allow_fallbacks: None,
+        };
+        mr.normalize();
+        assert_eq!(mr.provider_order, Some("OpenAi".into()));
+
+        // Empty string → None.
+        let mut mr = ModelRouting {
+            model: "gpt-4".into(),
+            provider_order: Some("".into()),
+            allow_fallbacks: None,
+        };
+        mr.normalize();
+        assert_eq!(mr.provider_order, None);
+
+        // Whitespace-only → None.
+        let mut mr = ModelRouting {
+            model: "gpt-4".into(),
+            provider_order: Some("   ".into()),
+            allow_fallbacks: None,
+        };
+        mr.normalize();
+        assert_eq!(mr.provider_order, None);
+
+        // Trimming preserves non-empty with whitespace.
+        let mut mr = ModelRouting {
+            model: "gpt-4".into(),
+            provider_order: Some("  OpenAi  ".into()),
+            allow_fallbacks: None,
+        };
+        mr.normalize();
+        assert_eq!(mr.provider_order, Some("OpenAi".into()));
+
+        // Already None stays None.
+        let mut mr = ModelRouting {
+            model: "gpt-4".into(),
+            provider_order: None,
+            allow_fallbacks: None,
+        };
+        mr.normalize();
+        assert_eq!(mr.provider_order, None);
+    }
+
+    /// Verify that [`ConfigData::normalize_entries`] applies `normalize()` to
+    /// every entry in `per_role_configs` and `model_routings`.
+    #[test]
+    fn normalize_entries_works() {
+        let mut config = ConfigData {
+            per_role_configs: vec![
+                RoleConfig {
+                    role: "engineer".into(),
+                    model: Some("".into()),
+                    reasoning_effort: Some("  high  ".into()),
+                },
+                RoleConfig {
+                    role: "manager".into(),
+                    model: Some("  gpt-4  ".into()),
+                    reasoning_effort: None,
+                },
+            ],
+            model_routings: vec![ModelRouting {
+                model: "gpt-4".into(),
+                provider_order: Some("   ".into()),
+                allow_fallbacks: None,
+            }],
+            ..ConfigData::default()
+        };
+
+        config.normalize_entries();
+
+        // First role: empty model → None, whitespace reasoning_effort → trimmed
+        assert_eq!(config.per_role_configs[0].model, None);
+        assert_eq!(
+            config.per_role_configs[0].reasoning_effort,
+            Some("high".into())
+        );
+
+        // Second role: trimmed model preserved, None stays None
+        assert_eq!(config.per_role_configs[1].model, Some("gpt-4".into()));
+        assert_eq!(config.per_role_configs[1].reasoning_effort, None);
+
+        // Routing: whitespace-only provider_order → None
+        assert_eq!(config.model_routings[0].provider_order, None);
     }
 }
