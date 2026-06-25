@@ -340,7 +340,7 @@ impl ConfigData {
 /// Trim a string and return `None` if empty or whitespace-only.
 /// This is the canonical primitive for string trimming helpers.
 #[must_use]
-pub(crate) fn trim_non_empty(s: &str) -> Option<String> {
+pub(crate) fn trimmed_or_none(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None
@@ -360,10 +360,10 @@ pub(crate) fn parse_newline_list(s: &str) -> Vec<String> {
 
 /// Treat an empty or whitespace-only string as `None`.
 /// The value is trimmed before being returned.
-/// Delegates to [`trim_non_empty`].
+/// Delegates to [`trimmed_or_none`].
 #[must_use]
 fn non_empty(val: Option<String>) -> Option<String> {
-    val.and_then(|s| trim_non_empty(&s))
+    val.and_then(|s| trimmed_or_none(&s))
 }
 
 /// Resolve a value with a fallback: use `val` if non-empty (after trimming), else `fallback`.
@@ -924,14 +924,14 @@ mod tests {
     }
 
     #[test]
-    fn trim_non_empty_trims_whitespace() {
-        // trim_non_empty is the canonical primitive — trims and returns None
+    fn trimmed_or_none_trims_whitespace() {
+        // trimmed_or_none is the canonical primitive — trims and returns None
         // for empty or whitespace-only strings.
-        assert_eq!(trim_non_empty("  value  "), Some("value".to_string()));
-        assert_eq!(trim_non_empty(" "), None);
-        assert_eq!(trim_non_empty(""), None);
+        assert_eq!(trimmed_or_none("  value  "), Some("value".to_string()));
+        assert_eq!(trimmed_or_none(" "), None);
+        assert_eq!(trimmed_or_none(""), None);
 
-        // non_empty delegates to trim_non_empty — the only unique behaviour is
+        // non_empty delegates to trimmed_or_none — the only unique behaviour is
         // the Option→&str unwrap via and_then.
         assert_eq!(non_empty(None), None);
 

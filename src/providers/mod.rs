@@ -11,7 +11,7 @@ pub mod reasoning_roundtrip;
 pub mod reliable;
 pub mod transcribe;
 
-use crate::config::{CONFIG, trim_non_empty};
+use crate::config::{CONFIG, trimmed_or_none};
 pub use crate::{ChatMessage, ChatRequest, ChatResponse, Provider};
 use crate::{StreamEvent, StreamResult};
 
@@ -182,7 +182,10 @@ pub async fn init_global() -> anyhow::Result<()> {
 /// Used by [`save_and_reload`](crate::config::save_and_reload) as a
 /// pre-commit validation step.
 pub async fn warmup_provider_from_config(config: &crate::config::ConfigData) -> anyhow::Result<()> {
-    let endpoint = config.provider_endpoint.as_deref().and_then(trim_non_empty);
+    let endpoint = config
+        .provider_endpoint
+        .as_deref()
+        .and_then(trimmed_or_none);
     let endpoint_opt = endpoint.filter(|e| e.as_str() != crate::config::DEFAULT_PROVIDER_ENDPOINT);
     let provider = create_provider(config.provider_key.as_deref(), endpoint_opt.as_deref())?;
     provider.warmup().await?;
@@ -253,10 +256,10 @@ pub fn create_provider(
     api_key: Option<&str>,
     endpoint: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let key_owned = api_key.and_then(trim_non_empty);
+    let key_owned = api_key.and_then(trimmed_or_none);
     let resolved_key = key_owned.as_deref();
     let base_url = endpoint
-        .and_then(trim_non_empty)
+        .and_then(trimmed_or_none)
         .unwrap_or_else(|| crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string());
 
     let mut extra_headers = std::collections::HashMap::new();
@@ -289,9 +292,9 @@ fn create_transcriber<T>(
     provider: Option<&str>,
     wrapper: impl FnOnce(transcribe::MediaTranscriber) -> T,
 ) -> Option<T> {
-    let _key = api_key.and_then(trim_non_empty)?;
-    let model = model.and_then(trim_non_empty)?;
-    let route = provider.and_then(trim_non_empty);
+    let _key = api_key.and_then(trimmed_or_none)?;
+    let model = model.and_then(trimmed_or_none)?;
+    let route = provider.and_then(trimmed_or_none);
     let base_url = api_url
         .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT)
         .to_string();
