@@ -79,8 +79,6 @@ pub struct DiffLine {
     pub new_line_number: Option<usize>,
     /// The code content (without the leading +/-/space prefix).
     pub content: String,
-    /// The leading character: '+', '-', or ' '
-    pub prefix: char,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +86,18 @@ pub enum DiffLineKind {
     Added,
     Removed,
     Context,
+}
+
+impl DiffLineKind {
+    /// The leading character used in unified diff format: '+', '-', or ' '.
+    #[must_use]
+    pub const fn prefix(self) -> char {
+        match self {
+            Self::Added => '+',
+            Self::Removed => '-',
+            Self::Context => ' ',
+        }
+    }
 }
 
 /// Parse `git diff HEAD --no-color --find-renames` output.
@@ -189,12 +199,12 @@ pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
                 lines: Vec::new(),
             });
         } else if let Some(hunk) = &mut current_hunk {
-            let (line_kind, prefix) = if line.starts_with('+') {
-                (DiffLineKind::Added, '+')
+            let line_kind = if line.starts_with('+') {
+                DiffLineKind::Added
             } else if line.starts_with('-') {
-                (DiffLineKind::Removed, '-')
+                DiffLineKind::Removed
             } else if line.starts_with(' ') {
-                (DiffLineKind::Context, ' ')
+                DiffLineKind::Context
             } else if line == r"\ No newline at end of file" {
                 // Skip this annotation — handled implicitly
                 continue;
@@ -229,7 +239,6 @@ pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
                 old_line_number: old_num,
                 new_line_number: new_num,
                 content: content.to_string(),
-                prefix,
             });
         }
     }
@@ -251,7 +260,6 @@ pub fn make_untracked_diff_file(path: &str, content: &str) -> DiffFile {
             old_line_number: None,
             new_line_number: Some(idx + 1),
             content: line.trim_end_matches('\r').to_string(),
-            prefix: '+',
         })
         .collect();
 

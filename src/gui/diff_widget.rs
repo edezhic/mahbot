@@ -696,7 +696,7 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
             let line_start = start;
 
             // Prefix
-            text.push(line.prefix);
+            text.push(line.kind.prefix());
             text.push(' ');
             let content_start = text.len();
 
@@ -813,17 +813,11 @@ mod tests {
         old: Option<usize>,
         new: Option<usize>,
     ) -> DiffLine {
-        let prefix = match kind {
-            DiffLineKind::Added => '+',
-            DiffLineKind::Removed => '-',
-            DiffLineKind::Context => ' ',
-        };
         DiffLine {
             kind,
             old_line_number: old,
             new_line_number: new,
             content: content.to_string(),
-            prefix,
         }
     }
 
