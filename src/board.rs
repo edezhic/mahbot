@@ -408,6 +408,8 @@ impl Ticket {
 pub enum TicketPhase {
     Backlog,
     Analysis,
+    /// Ticket is waiting for Manager review. Not picked up automatically by any agent —
+    /// the Manager or user must manually advance it to ReadyForDevelopment or cancel it.
     Planning,
     ReadyForDevelopment,
     InDevelopment,

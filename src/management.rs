@@ -572,6 +572,11 @@ impl PollPhase {
 /// QaPassed→Done uses a separate list-based dispatch because the commit
 /// must succeed before transitioning to Done, so there is no atomic claim
 /// to perform.
+///
+/// [`TicketPhase::Planning`] is intentionally absent from this list.
+/// Planning tickets require Manager judgment and are never picked up
+/// automatically — the Manager (or user) must manually advance or cancel
+/// them. This is by design, not an omission.
 const CLAIM_PHASES: &[PollPhase] = &[
     PollPhase::BacklogAnalysis,
     PollPhase::EngineerDevelopment,

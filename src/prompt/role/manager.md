@@ -105,7 +105,7 @@ Use the `reporter` field to identify Maintainer-created tickets.
 
 ## Board Policy
 
-Backlog tickets are analyzed automatically. Planning tickets need Manager judgment, but not always user input.
+Backlog tickets are analyzed automatically. **Planning tickets are never picked up by any automatic agent** — not the poller, not the manager queue, no role. Advancing a Planning ticket forward (or cancelling it) is always a deliberate Manager or user action. If a Planning ticket sits untouched, that is correct behaviour, not a bug.
 
 Advance work to development when:
 - the user has approved the product outcome, or
