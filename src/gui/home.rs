@@ -97,6 +97,53 @@ fn parse_inline_keyboard(reply_markup: Option<&serde_json::Value>) -> Vec<Inline
     buttons
 }
 
+/// Construct a non-optimistic `ChatMessage` with parsed markdown and keyboard.
+///
+/// Takes `message_id` by value so the caller can clone when they need to
+/// retain ownership (e.g. for dedup tracking on the optimistic-replacement
+/// path in `update()`).
+fn build_chat_message(
+    message_id: String,
+    user_name: String,
+    content: String,
+    direction: ChatDirection,
+    agent_role: Option<String>,
+    reply_markup: Option<&serde_json::Value>,
+) -> ChatMessage {
+    use iced::widget::markdown;
+    let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
+    ChatMessage {
+        id: None,
+        message_id,
+        user_name,
+        content,
+        direction,
+        agent_role,
+        md_items,
+        is_optimistic: false,
+        reply_buttons: parse_inline_keyboard(reply_markup),
+    }
+}
+
+/// Wrap a chat bubble in a 3:1 FillPortion row so it occupies 75% width,
+/// aligned to the right for user messages or to the left for agent/typing.
+///
+/// The caller must set `.width(Length::FillPortion(3))` on the bubble before
+/// passing it — this function only creates the spacer row.
+fn align_bubble<'a>(
+    bubble: impl Into<Element<'a, HomeMessage>>,
+    is_user: bool,
+) -> Element<'a, HomeMessage> {
+    let bubble = bubble.into();
+    if is_user {
+        // User: bubble left, spacer right
+        row![bubble, Space::new().width(Length::FillPortion(1)),].into()
+    } else {
+        // Agent: spacer left, bubble right
+        row![Space::new().width(Length::FillPortion(1)), bubble,].into()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum HomeMessage {
     /// User selected (from picker, Users page icon, or auto-selected at boot).
@@ -509,41 +556,17 @@ impl HomeState {
 
                     let bubble = container(bubble_content)
                         .padding(10)
-                        .style(move |_theme: &iced::Theme| {
-                            use iced::widget::container;
-                            container::Style {
-                                background: Some(iced::Background::Color(if is_user {
-                                    theme::BG_ELEVATED
-                                } else {
-                                    theme::BG_SURFACE
-                                })),
-                                text_color: Some(theme::TEXT_PRIMARY),
-                                border: iced::Border {
-                                    radius: 8.0.into(),
-                                    width: 0.0,
-                                    color: iced::Color::TRANSPARENT,
-                                },
-                                ..container::Style::default()
-                            }
-                        })
-                        .width(Length::Fill);
+                        .style(theme::bubble_style(
+                            if is_user {
+                                theme::BG_ELEVATED
+                            } else {
+                                theme::BG_SURFACE
+                            },
+                            Some(theme::TEXT_PRIMARY),
+                        ))
+                        .width(Length::FillPortion(3));
 
-                    // 75% width, side-aligned via FillPortion row (3:1 ratio).
-                    if is_user {
-                        // User: bubble left, spacer right
-                        row![
-                            bubble.width(Length::FillPortion(3)),
-                            Space::new().width(Length::FillPortion(1)),
-                        ]
-                        .into()
-                    } else {
-                        // Agent: spacer left, bubble right
-                        row![
-                            Space::new().width(Length::FillPortion(1)),
-                            bubble.width(Length::FillPortion(3)),
-                        ]
-                        .into()
-                    }
+                    align_bubble(bubble, is_user)
                 })
                 .collect();
 
@@ -556,27 +579,10 @@ impl HomeState {
                 let typing_dots = text(dots).size(20).color(theme::TEXT_MUTED);
                 let typing_bubble = container(typing_dots)
                     .padding(10)
-                    .style(|_theme: &iced::Theme| {
-                        use iced::widget::container;
-                        container::Style {
-                            background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                            border: iced::Border {
-                                radius: 8.0.into(),
-                                width: 0.0,
-                                color: iced::Color::TRANSPARENT,
-                            },
-                            ..container::Style::default()
-                        }
-                    })
-                    .width(Length::Fill);
+                    .style(theme::bubble_style(theme::BG_SURFACE, None))
+                    .width(Length::FillPortion(3));
 
-                children.push(
-                    row![
-                        Space::new().width(Length::FillPortion(1)),
-                        typing_bubble.width(Length::FillPortion(3)),
-                    ]
-                    .into(),
-                );
+                children.push(align_bubble(typing_bubble, false));
             }
 
             // Prepend "Load older messages" button when applicable.
@@ -1070,19 +1076,14 @@ impl HomeState {
                             .iter()
                             .position(|m| m.is_optimistic && m.message_id == *opt_id)
                         {
-                            use iced::widget::markdown;
-                            let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
-                            self.messages[pos] = ChatMessage {
-                                id: None,
-                                message_id: message_id.clone(),
+                            self.messages[pos] = build_chat_message(
+                                message_id.clone(),
                                 user_name,
                                 content,
                                 direction,
                                 agent_role,
-                                md_items,
-                                is_optimistic: false,
-                                reply_buttons: parse_inline_keyboard(reply_markup.as_ref()),
-                            };
+                                reply_markup.as_ref(),
+                            );
                             // Track the canonical ID for dedup — the
                             // optimistic ID was never added to seen_ids.
                             self.seen_ids.insert(message_id);
@@ -1152,19 +1153,14 @@ impl HomeState {
                     if Some(&user_name) == self.selected_user.as_ref()
                         && Some(&workspace) == self.resolve_workspace_name().as_ref()
                     {
-                        use iced::widget::markdown;
-                        let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
-                        self.messages.push(ChatMessage {
-                            id: None,
+                        self.messages.push(build_chat_message(
                             message_id,
                             user_name,
                             content,
                             direction,
                             agent_role,
-                            md_items,
-                            is_optimistic: false,
-                            reply_buttons: parse_inline_keyboard(reply_markup.as_ref()),
-                        });
+                            reply_markup.as_ref(),
+                        ));
                     }
 
                     self.maybe_snap()

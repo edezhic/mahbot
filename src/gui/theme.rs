@@ -543,6 +543,28 @@ pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
     }
 }
 
+/// Style for chat message bubbles and the typing indicator.
+///
+/// Shared padding/radius/border across all bubbles.  Background is
+/// parameterized (user vs agent messages); `text_color` is optional —
+/// message bubbles set it to `TEXT_PRIMARY`, while the typing indicator
+/// leaves it inherited (the inner `text()` widget sets its own color).
+pub fn bubble_style(
+    bg: Color,
+    text_color: Option<Color>,
+) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_theme: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(bg)),
+        text_color,
+        border: iced::Border {
+            radius: 8.0.into(),
+            width: 0.0,
+            color: iced::Color::TRANSPARENT,
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Style for bar containers (find/replace bar, go-to-line bar).
 /// Flat elevated background with zero-radius border.
 #[must_use]
