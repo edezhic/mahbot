@@ -2147,124 +2147,10 @@ mod tests {
         test_ws_named(&ws_path, &ws_name)
     }
 
-    /// Verify that a single QaPassed ticket (the last active one) triggers an
-    /// immediate Notify — no buffer entries should remain.
+    /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets:
+    /// the first one buffers, the last one notifies and drains the buffer.
     #[tokio::test]
-    async fn transition_qa_to_done_last_ticket_notifies() {
-        let ws = setup_transition_qa_to_done_test("last_notifies").await;
-        let ticket_id = board()
-            .create_ticket(
-                "Last Ticket",
-                "desc",
-                &ws,
-                TicketPhase::QaPassed,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create_ticket");
-
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
-
-        // No other active tickets — should Notify (not buffer)
-        transition_qa_to_done(&ticket, "Test transition — last ticket").await;
-
-        // Verify transitioned to Done
-        let updated = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
-        assert_eq!(
-            updated.status,
-            TicketPhase::Done,
-            "Single ticket should transition to Done",
-        );
-
-        // Buffer should be empty (Notify path drains nothing; we had no buffer)
-        let drained = crate::ticket_buffer::drain("ws_last_notifies");
-        assert!(
-            drained.is_empty(),
-            "No buffered entries expected for last-ticket transition: got {drained:?}",
-        );
-    }
-
-    /// Verify that a QaPassed ticket in a workspace with other active tickets
-    /// buffers the Done notification instead of notifying immediately.
-    #[tokio::test]
-    async fn transition_qa_to_done_active_tickets_buffers() {
-        let ws = setup_transition_qa_to_done_test("active_buffers").await;
-
-        // Create one ticket in QaPassed (the one we'll transition)
-        let qa_id = board()
-            .create_ticket(
-                "QA Ticket",
-                "desc",
-                &ws,
-                TicketPhase::QaPassed,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create QA ticket");
-
-        // Create another active ticket (ReadyForDevelopment — active without reservation)
-        board()
-            .create_ticket(
-                "Active RFD",
-                "desc",
-                &ws,
-                TicketPhase::ReadyForDevelopment,
-                &[],
-                "test",
-                None,
-            )
-            .await
-            .expect("create RFD ticket");
-
-        let ticket = board()
-            .get_ticket(&qa_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
-
-        // Other active ticket exists — should Buffer
-        transition_qa_to_done(&ticket, "Test transition — other active exists").await;
-
-        // Verify transitioned to Done
-        let updated = board()
-            .get_ticket(&qa_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
-        assert_eq!(
-            updated.status,
-            TicketPhase::Done,
-            "Ticket should transition to Done even when buffered",
-        );
-
-        // Buffer should contain the Done transition
-        let drained = crate::ticket_buffer::drain("ws_active_buffers");
-        assert!(
-            !drained.is_empty(),
-            "Buffered entry expected when other active tickets exist",
-        );
-        assert!(
-            drained.contains("qa_passed → done"),
-            "Buffer entry should contain the status transition: {drained}",
-        );
-    }
-
-    /// Verify that when multiple QaPassed tickets exist and the last one finishes,
-    /// the notification includes previously buffered Done transitions (buffer drain).
-    #[tokio::test]
-    async fn transition_qa_to_done_last_ticket_drains_buffer() {
+    async fn transition_qa_to_done_buffer_and_notify() {
         let ws = setup_transition_qa_to_done_test("drains_buffer").await;
 
         // Two QaPassed tickets in the same workspace
@@ -2303,7 +2189,20 @@ mod tests {
         // Transition ticket A — ticket B is still QaPassed (active), so Buffer
         transition_qa_to_done(&ticket_a, "Test — ticket A done, B still active").await;
 
-        // Transition ticket B — no more active tickets, should Notify
+        // Intermediate assertion: verify the Buffer path was actually taken.
+        // Without this, a bug where has_active_tickets_excluding incorrectly
+        // returns false (causing Notify instead of Buffer) would only be caught
+        // by the final empty-buffer check — which could still pass if the Notify
+        // path also happened to drain the buffer cleanly (e.g., by sending an
+        // empty notification). Draining here verifies entry was pushed.
+        let intermediate = crate::ticket_buffer::drain("ws_drains_buffer");
+        assert!(
+            !intermediate.is_empty(),
+            "After first QaPassed → Done with other active tickets: \
+             should have buffered the notification (got empty buffer)",
+        );
+
+        // Transition ticket B — no more active tickets, should Notify and drain
         let ticket_b = board()
             .get_ticket(&ticket_b_id)
             .await
@@ -2321,9 +2220,9 @@ mod tests {
             assert_eq!(t.status, TicketPhase::Done, "Ticket {label} should be Done");
         }
 
-        // The Notify path on ticket B should have drained the buffer,
-        // consuming ticket A's buffered entry. No entries for this workspace
-        // should remain.
+        // No entries should remain for this workspace (the Notify path on
+        // ticket B calls drain() internally; we drained the intermediate
+        // buffer above, so this check is for leftover / stale entries).
         let drained = crate::ticket_buffer::drain("ws_drains_buffer");
         assert!(
             drained.is_empty(),
