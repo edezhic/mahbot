@@ -5014,10 +5014,7 @@ impl EditorState {
                 },
             ))
             .on_press(EditorMessage::TabClosed(i))
-            .style(|_t: &iced::Theme, _s: button::Status| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding(0);
 
             let mut tab_row = row![].spacing(2).align_y(Alignment::Center);
@@ -5134,34 +5131,22 @@ impl EditorState {
 
         let prev_btn = button(text("‹").size(14).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::FindPrev)
-            .style(|_t: &iced::Theme, _s| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding([2, 8]);
 
         let next_btn = button(text("›").size(14).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::FindNext)
-            .style(|_t: &iced::Theme, _s| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding([2, 8]);
 
         let replace_btn = button(text("Replace").size(11).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::FindReplace)
-            .style(|_t: &iced::Theme, _s| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding([2, 6]);
 
         let replace_all_btn = button(text("All").size(11).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::FindReplaceAll)
-            .style(|_t: &iced::Theme, _s| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding([2, 6]);
 
         // Case sensitivity toggle: "Aa" label, highlighted when active.
@@ -5172,10 +5157,7 @@ impl EditorState {
         };
         let case_btn = button(text("Aa").size(11).color(case_label_color))
             .on_press(EditorMessage::FindToggleCaseSensitivity)
-            .style(|_t: &iced::Theme, _s| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding([2, 6]);
 
         let bar = row![
@@ -5195,15 +5177,7 @@ impl EditorState {
 
         Some(
             container(bar)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                    border: iced::Border {
-                        radius: 0.0.into(),
-                        width: 0.0,
-                        color: iced::Color::TRANSPARENT,
-                    },
-                    ..Default::default()
-                })
+                .style(theme::container_bar)
                 .width(Length::Fill)
                 .into(),
         )
@@ -5224,10 +5198,7 @@ impl EditorState {
 
         let go_btn = button(text("Go").size(12).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::GoToLineGo)
-            .style(|_t: &iced::Theme, _s: button::Status| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding([2, 8]);
 
         let bar = row![
@@ -5242,15 +5213,7 @@ impl EditorState {
 
         Some(
             container(bar)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                    border: iced::Border {
-                        radius: 0.0.into(),
-                        width: 0.0,
-                        color: iced::Color::TRANSPARENT,
-                    },
-                    ..Default::default()
-                })
+                .style(theme::container_bar)
                 .width(Length::Fill)
                 .into(),
         )
@@ -5366,11 +5329,7 @@ impl EditorState {
                 );
                 button(entry)
                     .on_press(EditorMessage::QuickOpenSelect(i))
-                    .style(|_t: &iced::Theme, _s: button::Status| button::Style {
-                        background: None,
-                        border: iced::Border::default(),
-                        ..Default::default()
-                    })
+                    .style(theme::button_transparent)
                     .width(Length::Fill)
                     .padding(0)
                     .into()
@@ -5567,11 +5526,7 @@ impl EditorState {
 
                 button(entry)
                     .on_press(EditorMessage::GlobalSearchSelect(i))
-                    .style(|_t: &iced::Theme, _s: button::Status| button::Style {
-                        background: None,
-                        border: iced::Border::default(),
-                        ..Default::default()
-                    })
+                    .style(theme::button_transparent)
                     .width(Length::Fill)
                     .padding(0)
                     .into()

@@ -374,6 +374,19 @@ pub fn scrollbar_style(theme: &iced::Theme, status: scrollable::Status) -> scrol
 
 // ── Button theme helpers ──────────────────────────────────────────
 
+/// Transparent button with no background. Useful for icon-only buttons
+/// embedded in bars, toolbars, and tab close buttons.
+#[must_use]
+pub fn button_transparent(
+    _: &iced::Theme,
+    _status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    iced::widget::button::Style {
+        background: None,
+        ..Default::default()
+    }
+}
+
 /// Primary action button (Save, Submit, Confirm). Uses Flexoki accent green.
 pub fn button_primary(
     _: &iced::Theme,
@@ -525,6 +538,21 @@ pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
             radius: 6.0.into(),
             width: 1.0,
             color: BORDER_STRONG,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Style for bar containers (find/replace bar, go-to-line bar).
+/// Flat elevated background with zero-radius border.
+#[must_use]
+pub fn container_bar(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(BG_ELEVATED)),
+        border: iced::Border {
+            radius: 0.0.into(),
+            width: 0.0,
+            color: iced::Color::TRANSPARENT,
         },
         ..container::Style::default()
     }

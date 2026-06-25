@@ -340,10 +340,7 @@ impl ShellState {
                 },
             ))
             .on_press(ShellMessage::TabClosed(i))
-            .style(|_t: &iced::Theme, _s: button::Status| button::Style {
-                background: None,
-                ..Default::default()
-            })
+            .style(theme::button_transparent)
             .padding(0);
 
             let tab_row = row![name_text, close_btn]
@@ -382,10 +379,7 @@ impl ShellState {
                 .color(theme::TEXT_SECONDARY),
         )
         .on_press(ShellMessage::NewTab)
-        .style(|_t: &iced::Theme, _s: button::Status| button::Style {
-            background: None,
-            ..Default::default()
-        })
+        .style(theme::button_transparent)
         .padding([8, 8]);
 
         tab_buttons.push(new_tab_btn.into());
