@@ -1606,6 +1606,73 @@ async fn run_circuit_breaker(
     // Workspace auto-pause: `transition_ticket` (called with
     // `NotifyPolicy::Notify`) pauses the workspace automatically.
 
+    // Pause all other ReadyForDevelopment tickets in the same workspace to
+    // prevent them from auto-starting after the workspace is unpaused. The
+    // human must manually move them back to ReadyForDevelopment after
+    // investigating the root cause of the breaker trip.
+    //
+    // There is a small race window: between listing ReadyForDevelopment
+    // tickets here and transitioning them individually, a concurrent poll
+    // cycle could claim one. This is rare in practice (dispatch tasks spawn
+    // after the claim loop completes) and the CAS guard in transition_to
+    // handles the transition gracefully.
+    let other_tickets = match board()
+        .list_tickets_in_phase(TicketPhase::ReadyForDevelopment, &ticket.workspace_name)
+        .await
+    {
+        Ok(tickets) => tickets,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                workspace = %ticket.workspace_name,
+                error = %e,
+                "Failed to list ReadyForDevelopment tickets for pausing \
+                 — breaker trip proceeds without pausing siblings",
+            );
+            return true;
+        }
+    };
+
+    let pause_comment = format!(
+        "Paused due to circuit breaker trip on {}: {}. Unpause manually after investigation.",
+        ticket.id, ticket.title,
+    );
+
+    // Filter out the tripped ticket: defense-in-depth. The tripped ticket
+    // was already transitioned to Failed above and shouldn't appear in the
+    // ReadyForDevelopment results, but the filter keeps us safe if a
+    // concurrent race or future refactor changes the timing.
+    for other in other_tickets.iter().filter(|t| t.id != ticket.id) {
+        // If the transition fails (e.g., ticket was already claimed or moved
+        // externally), skip it and continue with the remaining tickets.
+        if let Err(e) = transition_ticket(
+            other,
+            TicketPhase::ReadyForDevelopment,
+            TicketPhase::Paused,
+            NotifyPolicy::Buffer,
+        )
+        .await
+        {
+            debug!(
+                other_ticket = %other.id,
+                error = %e,
+                "Failed to pause other ReadyForDevelopment ticket — likely raced by external move",
+            );
+            continue;
+        }
+
+        if let Err(e) = board()
+            .add_comment(&other.id, "system", &pause_comment)
+            .await
+        {
+            warn!(
+                other_ticket = %other.id,
+                error = %e,
+                "Failed to add system comment to paused ticket",
+            );
+        }
+    }
+
     true
 }
 
@@ -1882,6 +1949,166 @@ mod tests {
                 .await,
             "guard_phase_and_circuit_breaker must pass when phase matches and comments are below threshold"
         );
+    }
+
+    /// Verify that when the circuit breaker trips on a ticket, all other
+    /// ReadyForDevelopment tickets in the same workspace are paused with a
+    /// system comment referencing the tripped ticket. Tickets in other
+    /// workspaces must not be affected.
+    #[tokio::test]
+    async fn circuit_breaker_pauses_other_ready_for_development_tickets() {
+        init_test_stores().await;
+        // Initialize workspace store if not already done by a sibling test.
+        // Required by transition_ticket for ticket buffer resolution.
+        // The workspace does not need to exist in the store
+        // (resolve_ticket_workspace returns None gracefully for
+        // non-existent workspaces, merely skipping the buffer push).
+        if crate::workspace::WORKSPACES.get().is_none() {
+            crate::workspace::init_global()
+                .await
+                .expect("workspace store init");
+        }
+
+        let ws_a = test_ws_named("/ws_a", "ws_a");
+        let ws_b = test_ws_named("/ws_b", "ws_b");
+
+        // Create ticket A in workspace A — this will trip the circuit breaker.
+        let ticket_a_id = board()
+            .create_ticket(
+                "Trip Ticket",
+                "desc",
+                &ws_a,
+                TicketPhase::ReadyForDevelopment,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket A");
+
+        // Create ticket B in workspace A — this should be paused when A trips.
+        let ticket_b_id = board()
+            .create_ticket(
+                "Victim Ticket",
+                "desc",
+                &ws_a,
+                TicketPhase::ReadyForDevelopment,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket B");
+
+        // Create ticket C in workspace B — this must NOT be paused.
+        let ticket_c_id = board()
+            .create_ticket(
+                "Other Workspace Ticket",
+                "desc",
+                &ws_b,
+                TicketPhase::ReadyForDevelopment,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket C");
+
+        // Add a comment to ticket A so the circuit breaker has something to count.
+        board()
+            .add_comment(&ticket_a_id, "system", "Some comment")
+            .await
+            .expect("add_comment to A");
+
+        // Fetch ticket A and trip the circuit breaker with threshold 0.
+        let ticket_a = board()
+            .get_ticket(&ticket_a_id)
+            .await
+            .expect("get_ticket A")
+            .expect("ticket A exists");
+
+        let tripped = run_circuit_breaker(
+            &ticket_a,
+            TicketPhase::ReadyForDevelopment,
+            0,                         // threshold = 0, so 1 comment > 0 trips
+            |comments| comments.len(), // count all comments
+            |count| format!("Breaker tripped at {count}"),
+            "test",
+        )
+        .await;
+
+        assert!(tripped, "circuit breaker should have tripped");
+
+        // ── Verify ticket A is Failed ──
+        {
+            let ticket_a = board()
+                .get_ticket(&ticket_a_id)
+                .await
+                .expect("get_ticket A")
+                .expect("ticket A exists");
+            assert_eq!(
+                ticket_a.status,
+                TicketPhase::Failed,
+                "tripped ticket A should be Failed"
+            );
+        }
+
+        // ── Verify ticket B (same workspace) is Paused ──
+        {
+            let ticket_b = board()
+                .get_ticket(&ticket_b_id)
+                .await
+                .expect("get_ticket B")
+                .expect("ticket B exists");
+            assert_eq!(
+                ticket_b.status,
+                TicketPhase::Paused,
+                "other ReadyForDevelopment ticket B in same workspace should be Paused"
+            );
+        }
+
+        // ── Verify ticket C (different workspace) is still ReadyForDevelopment ──
+        {
+            let ticket_c = board()
+                .get_ticket(&ticket_c_id)
+                .await
+                .expect("get_ticket C")
+                .expect("ticket C exists");
+            assert_eq!(
+                ticket_c.status,
+                TicketPhase::ReadyForDevelopment,
+                "ticket C in different workspace must not be paused"
+            );
+        }
+
+        // ── Verify ticket B has a system comment referencing ticket A ──
+        {
+            let comments = board()
+                .get_comments(&ticket_b_id)
+                .await
+                .expect("get_comments for B");
+            let pause_comment = comments
+                .iter()
+                .find(|c| c.role == "system")
+                .expect("ticket B should have a system comment");
+
+            assert!(
+                pause_comment.content.contains(&ticket_a_id),
+                "pause comment should contain the tripped ticket's ID"
+            );
+            assert!(
+                pause_comment
+                    .content
+                    .contains("Paused due to circuit breaker trip on"),
+                "pause comment should start with expected format"
+            );
+            assert!(
+                pause_comment
+                    .content
+                    .contains("Unpause manually after investigation"),
+                "pause comment should end with expected format"
+            );
+        }
     }
 
     /// Verify that `record_verdict_comments` correctly counts attempted and
