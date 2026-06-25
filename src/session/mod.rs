@@ -35,9 +35,6 @@ CREATE TABLE IF NOT EXISTS session_metadata (
 );";
 
 // ── Column index constants ──────────────────────────────────
-//
-// These prevent silent data corruption when SELECT column order
-// changes.  See the assertions in test module below.
 
 // Session messages (2-column SELECT: role, content)
 const SESSION_MESSAGE_COLUMNS: &str = "role, content";

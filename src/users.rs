@@ -53,9 +53,6 @@ CREATE TABLE IF NOT EXISTS user_channels (
 );";
 
 // ── Column index constants ──────────────────────────────────
-//
-// These prevent silent data corruption when SELECT column order
-// changes.  See the assertions in test module below.
 
 // users table (4-column SELECT: name, permissions, selected_workspace, selected_role)
 const USERS_COLUMNS: &str = "name, permissions, selected_workspace, selected_role";

@@ -83,12 +83,6 @@ const WORKSPACE_COLUMNS: &str = "name, path, status, created_at, updated_at, \
      diagnostics, diagnostics_updated_at";
 
 /// Column-index constants for [`WORKSPACE_COLUMNS`].
-///
-/// These replace hardcoded positional indices in [`workspace_from_row`].
-/// With named constants, the compiler catches references to undefined column
-/// constants — for instance, removing a constant but forgetting to update a
-/// `row.get()` call produces a compile error rather than a silent field
-/// mapping bug.
 const COL_WS_NAME: usize = 0;
 const COL_WS_PATH: usize = 1;
 const COL_WS_STATUS: usize = 2;

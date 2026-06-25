@@ -96,12 +96,6 @@ const TICKET_COLUMNS: &str = "id, title, description, status, assigned_to, \
      pipeline_reservation";
 
 /// Column-index constants for [`TICKET_COLUMNS`].
-///
-/// These replace hardcoded positional indices in [`BoardStore::ticket_from_row`].
-/// With named constants, the compiler catches references to undefined
-/// column constants — for instance, removing a constant but forgetting to
-/// update a `row.get()` call produces a compile error rather than a silent
-/// field mapping bug.
 const COL_TICKET_ID: usize = 0;
 const COL_TICKET_TITLE: usize = 1;
 const COL_TICKET_DESCRIPTION: usize = 2;
@@ -132,12 +126,6 @@ const COMMENT_COLUMNS: &str = "role, content, created_at";
 /// Note: `id` and `ticket_id` were removed from the SELECT (these fields
 /// are dead — never consumed by any production code). The remaining columns
 /// are renumbered from 0.
-///
-/// These replace hardcoded positional indices in [`BoardStore::get_comments`].
-/// With named constants, the compiler catches references to undefined
-/// column constants — for instance, removing a constant but forgetting to
-/// update a `row.get()` call produces a compile error rather than a silent
-/// field mapping bug.
 const COL_COMMENT_ROLE: usize = 0;
 const COL_COMMENT_CONTENT: usize = 1;
 const COL_COMMENT_CREATED_AT: usize = 2;

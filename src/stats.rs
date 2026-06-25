@@ -45,12 +45,6 @@ const TOOL_ERROR_COLUMNS: &str =
     "tool_name, role, json_each.value AS error, workspace, recorded_at";
 
 /// Column-index constants for [`TOOL_ERROR_COLUMNS`].
-///
-/// These replace hardcoded positional indices in [`StatsStore::query_tool_errors`].
-/// With named constants, the compiler catches references to undefined column
-/// constants — for instance, removing a constant but forgetting to update a
-/// `row_text()` call produces a compile error rather than a silent field
-/// mapping bug.
 const COL_TE_TOOL_NAME: usize = 0;
 const COL_TE_ROLE: usize = 1;
 const COL_TE_ERROR: usize = 2;

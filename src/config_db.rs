@@ -43,9 +43,6 @@ CREATE TABLE IF NOT EXISTS config_model_routing (
 );";
 
 // ── Column index constants ──────────────────────────────────
-//
-// These prevent silent data corruption when SELECT column order
-// changes.  See the assertions in test module below.
 
 // config_kv table (2-column SELECT: key, value)
 const KV_COLUMNS: &str = "key, value";

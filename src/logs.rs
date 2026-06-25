@@ -42,12 +42,6 @@ const LOGS_COLUMNS: &str =
     "timestamp, level, target, message, fields, agent_id, agent_role, workspace";
 
 /// Column-index constants for [`LOGS_COLUMNS`].
-///
-/// These replace hardcoded positional indices in [`row_to_entry`].
-/// With named constants, the compiler catches references to undefined
-/// column constants — for instance, removing a constant but forgetting to
-/// update a `row_text()` call produces a compile error rather than a silent
-/// field mapping bug.
 const COL_LOGS_TIMESTAMP: usize = 0;
 const COL_LOGS_LEVEL: usize = 1;
 const COL_LOGS_TARGET: usize = 2;

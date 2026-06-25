@@ -66,12 +66,6 @@ const HISTORY_LIMIT: i64 = 100;
 const CHAT_HISTORY_COLUMNS: &str = "id, message_id, user_name, content, direction, agent_role";
 
 /// Column-index constants for [`CHAT_HISTORY_COLUMNS`].
-///
-/// These replace hardcoded positional indices in [`chat_history_entry_from_row`].
-/// With named constants, the compiler catches references to undefined
-/// column constants — for instance, removing a constant but forgetting to
-/// update a `row.get()` call produces a compile error rather than a silent
-/// field mapping bug.
 const COL_CH_ID: usize = 0;
 const COL_CH_MESSAGE_ID: usize = 1;
 const COL_CH_USER_NAME: usize = 2;
