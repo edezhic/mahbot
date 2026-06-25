@@ -805,8 +805,8 @@ impl BoardStore {
             lines_added: row.get(COL_TICKET_LINES_ADDED)?,
             lines_removed: row.get(COL_TICKET_LINES_REMOVED)?,
             reporter: row.get::<String>(COL_TICKET_REPORTER)?,
-            is_archived: row.get::<i64>(COL_TICKET_IS_ARCHIVED)? != 0,
-            pipeline_reservation: row.get::<i64>(COL_TICKET_PIPELINE_RESERVATION)? != 0,
+            is_archived: row.get::<bool>(COL_TICKET_IS_ARCHIVED)?,
+            pipeline_reservation: row.get::<bool>(COL_TICKET_PIPELINE_RESERVATION)?,
         })
     }
 
@@ -3747,9 +3747,9 @@ with a comment explaining why no agent is mid-execution in that state.\
             "pipeline_reservation should be false for fresh ticket",
         );
 
-        // ── Exercise is_archived i64→bool conversion ──────────────────
+        // ── Exercise is_archived bool deserialization ──────────────────
         // set_archived flips is_archived to 1 in SQL, which exercises the
-        // conversion: row.get::<i64>()? != 0.
+        // conversion: row.get::<bool>()?.
         store.set_archived(&id).await.expect("set_archived");
 
         let archived = store

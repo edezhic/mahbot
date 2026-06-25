@@ -819,8 +819,8 @@ impl WorkspaceStorage {
                     Ok(EditorTabRecord {
                         file_path: row.get::<String>(COL_ET_FILE_PATH).unwrap_or_default(),
                         tab_order: usize::try_from(row.get::<i64>(COL_ET_TAB_ORDER).unwrap_or(0)).unwrap_or(0),
-                        is_active: row.get::<i64>(COL_ET_IS_ACTIVE).unwrap_or(0) != 0,
-                        is_dirty: row.get::<i64>(COL_ET_IS_DIRTY).unwrap_or(0) != 0,
+                        is_active: row.get::<bool>(COL_ET_IS_ACTIVE).unwrap_or(false),
+                        is_dirty: row.get::<bool>(COL_ET_IS_DIRTY).unwrap_or(false),
                         dirty_content: row.get::<Option<String>>(COL_ET_DIRTY_CONTENT).unwrap_or(None),
                     })
                 },
@@ -1301,6 +1301,7 @@ mod tests {
 
         let loaded = store.load_editor_tabs("ws1").await.expect("load tabs");
         assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].is_active);
         assert!(loaded[0].is_dirty);
         assert_eq!(loaded[0].dirty_content.as_deref(), Some("draft text"));
     }
