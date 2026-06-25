@@ -532,9 +532,7 @@ async fn handle_dispatch_command(msg: &mut ChannelMessage) -> bool {
 /// Handle `/start` command for Telegram — sends an inline keyboard with
 /// context-appropriate action buttons.
 async fn handle_start_command(msg: &ChannelMessage) {
-    let Some(reply_markup) = build_start_keyboard(msg).await else {
-        return;
-    };
+    let reply_markup = build_start_keyboard(msg).await;
     let reply = mahbot::SendMessage {
         content: "Choose an action:".to_string(),
         recipient: msg.reply_target.clone(),
@@ -554,16 +552,11 @@ async fn handle_start_command(msg: &ChannelMessage) {
 ///
 /// Returns the full Telegram `inline_keyboard` JSON array, where each element
 /// is a row (list of buttons in that row). Currently each button gets its own
-/// row. Returns `None` if the caller is not on a Telegram channel.
+/// row.
 ///
 /// For Artist: shows image model selection, video model selection, and clear session.
 /// For other roles: shows only clear session.
-async fn build_start_keyboard(msg: &ChannelMessage) -> Option<serde_json::Value> {
-    // Only Telegram gets inline keyboards — other channels get None
-    if msg.source_channel != "telegram" {
-        return None;
-    }
-
+async fn build_start_keyboard(msg: &ChannelMessage) -> serde_json::Value {
     let role = mahbot::users::resolve_active_role(&msg.user_name).await;
 
     let rows = if role == Role::Artist {
@@ -600,7 +593,7 @@ async fn build_start_keyboard(msg: &ChannelMessage) -> Option<serde_json::Value>
         }])]
     };
 
-    Some(serde_json::json!({ "inline_keyboard": rows }))
+    serde_json::json!({ "inline_keyboard": rows })
 }
 
 /// Push one row per model to `rows`, marking the active model with ✓.
