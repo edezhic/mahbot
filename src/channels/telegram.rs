@@ -44,9 +44,11 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
     let chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
 
     while !remaining.is_empty() {
-        // If the remainder fits within chunk_limit (leaving room for the
-        // "(continued)\n\n" prefix that send_text_chunks adds to the last chunk
-        // in multi-chunk messages — 13 chars overhead, so 4066+13=4079 ≤ 4096).
+        // If the remainder fits within chunk_limit, push the last chunk.
+        // chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD = 4066.
+        // The 30-char overhead covers the worst case (middle chunk: prefix + suffix).
+        // For the last chunk, send_text_chunks only adds the "(continued)\n\n" prefix
+        // (13 chars), so 4066+13=4079 ≤ 4096 — we have margin even for the last chunk.
         if remaining.chars().count() <= chunk_limit {
             chunks.push(remaining.to_string());
             break;
