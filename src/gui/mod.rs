@@ -362,20 +362,18 @@ impl Dashboard {
             Message::BootWorkspaces(options, paths, paused_map, maintenance_map, restored_name) => {
                 self.workspace_options.clone_from(&options);
                 self.workspace_paths = paths;
-                // Clone the maps before moving them into self so the closure
-                // below can reference them without borrowing from self.
-                let paused_map_for_closure = paused_map.clone();
-                let maintenance_map_for_closure = maintenance_map.clone();
                 self.workspace_paused = paused_map;
                 self.workspace_maintenance = maintenance_map;
                 // Derive paused & maintenance states from the selected workspace.
+                // Reads from dash.workspace_paused / dash.workspace_maintenance
+                // while writing dash.paused / dash.maintenance (disjoint fields).
                 let update_states = |dash: &mut Self, ws_name: Option<&str>| {
                     dash.paused = ws_name
-                        .and_then(|n| paused_map_for_closure.get(n))
+                        .and_then(|n| dash.workspace_paused.get(n))
                         .copied()
                         .unwrap_or(false);
                     dash.maintenance = ws_name
-                        .and_then(|n| maintenance_map_for_closure.get(n))
+                        .and_then(|n| dash.workspace_maintenance.get(n))
                         .copied()
                         .unwrap_or(false);
                 };
@@ -390,49 +388,33 @@ impl Dashboard {
                     Task::done(home::HomeMessage::WorkspaceOptions(options.clone()))
                         .map(Message::Home);
                 let load_users = self.home_state.load_users().map(Message::Home);
-                if let Some(ref name) = restored_name {
-                    if name.is_empty() {
-                        // "Personal" workspace — no shared workspace selected.
+
+                // restored_name is always Some — load_workspace_options sets it.
+                // Empty string => "Personal" workspace (no shared workspace).
+                let ws_name = match restored_name {
+                    Some(ref name) if name.is_empty() => {
                         self.selected_workspace_name = None;
                         update_states(self, None);
-                        return Task::batch([
-                            self.propagate_workspace_selection(""),
-                            home_opts,
-                            load_users,
-                        ]);
+                        String::new()
                     }
-                    self.selected_workspace_name = Some(name.clone());
-                    update_states(self, Some(name));
-                    return Task::batch([
-                        self.propagate_workspace_selection(name),
-                        home_opts,
-                        load_users,
-                    ]);
-                }
-                // Auto-select first workspace when nothing was restored
-                // (belt-and-suspenders: load_workspace_options already does this,
-                // but guard against any future call site that doesn't).
-                if let Some(first) = options.first() {
-                    if first.value.is_empty() {
+                    Some(ref name) => {
+                        self.selected_workspace_name = Some(name.clone());
+                        update_states(self, Some(name));
+                        name.clone()
+                    }
+                    None => {
+                        // Unreachable: load_workspace_options always produces Some.
+                        // Defensive fallback — treat as Personal workspace.
                         self.selected_workspace_name = None;
                         update_states(self, None);
-                        return Task::batch([
-                            self.propagate_workspace_selection(""),
-                            home_opts,
-                            load_users,
-                        ]);
+                        String::new()
                     }
-                    self.selected_workspace_name = Some(first.value.clone());
-                    update_states(self, Some(&first.value));
-                    return Task::batch([
-                        self.propagate_workspace_selection(&first.value),
-                        home_opts,
-                        load_users,
-                    ]);
-                }
-                self.selected_workspace_name = None;
-                update_states(self, None);
-                Task::batch([home_opts, load_users])
+                };
+                Task::batch([
+                    self.propagate_workspace_selection(&ws_name),
+                    home_opts,
+                    load_users,
+                ])
             }
             Message::Navigation(_) if !self.ready => Task::none(),
             Message::Navigation(page) => {
