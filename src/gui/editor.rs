@@ -2344,6 +2344,12 @@ impl EditorState {
             EditorMessage::TabClosed(idx) => self.close_tab_at(idx),
 
             EditorMessage::EditorAction(action) => {
+                // Clicking in the editor content transfers focus from the file
+                // tree to the editor, matching Escape handler behavior.
+                self.file_tree.tree_focused = false;
+                self.pending_enter_dir = None;
+                self.rename_target = None;
+
                 let Some(idx) = self.active_tab_idx() else {
                     return Task::none();
                 };
@@ -6541,6 +6547,41 @@ mod tests {
         state.file_tree.tree_focused = true;
         let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
         assert!(state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_editor_action_clears_tree_focus() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.tree_focused = true;
+        state.pending_enter_dir = Some("src".to_string());
+        state.rename_target = Some(RenameTarget {
+            path: "src/main.rs".to_string(),
+            abs_path: String::new(),
+            is_dir: false,
+            ws_root: String::new(),
+            input_text: "main.rs".to_string(),
+            error: None,
+        });
+
+        // A mouse-originated EditorAction (like MoveTo from a click) should
+        // transfer focus from the file tree to the editor.
+        let _ = state.update(EditorMessage::EditorAction(EditorAction::MoveTo {
+            line: 0,
+            col: 0,
+        }));
+
+        assert!(
+            !state.file_tree.tree_focused,
+            "click in editor should clear tree focus"
+        );
+        assert_eq!(
+            state.pending_enter_dir, None,
+            "click in editor should clear pending_enter_dir"
+        );
+        assert!(
+            state.rename_target.is_none(),
+            "click in editor should dismiss rename"
+        );
     }
 
     #[test]
