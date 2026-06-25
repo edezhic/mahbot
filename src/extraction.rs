@@ -189,112 +189,209 @@ mod callback_tests {
     // ── is_callback ───────────────────────────────────────────────────────
 
     #[test]
-    fn is_callback_matches_prefix() {
-        assert!(is_callback("__opt__ticket123|Label"));
-        assert!(is_callback("__opt__|Label"));
-        assert!(is_callback("__opt__bare"));
-    }
+    fn test_is_callback() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: bool,
+        }
 
-    #[test]
-    fn is_callback_rejects_non_prefix() {
-        assert!(!is_callback("not_opt_something"));
-        assert!(!is_callback(""));
-        assert!(!is_callback("__op__ticket|Label"));
+        let cases = [
+            Case {
+                name: "matches prefix",
+                input: "__opt__ticket123|Label",
+                expected: true,
+            },
+            Case {
+                name: "matches prefix only pipe",
+                input: "__opt__|Label",
+                expected: true,
+            },
+            Case {
+                name: "bare label no pipe",
+                input: "__opt__bare",
+                expected: true,
+            },
+            Case {
+                name: "rejects wrong prefix",
+                input: "not_opt_something",
+                expected: false,
+            },
+            Case {
+                name: "rejects empty",
+                input: "",
+                expected: false,
+            },
+            Case {
+                name: "rejects similar prefix",
+                input: "__op__ticket|Label",
+                expected: false,
+            },
+        ];
+
+        for case in &cases {
+            assert_eq!(
+                is_callback(case.input),
+                case.expected,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     // ── decode_callback ───────────────────────────────────────────────────
 
     #[test]
-    fn decode_callback_with_ticket_id() {
-        let (ticket_id, label) = decode_callback("__opt__mahbot-123|Option A").unwrap();
-        assert_eq!(ticket_id.as_deref(), Some("mahbot-123"));
-        assert_eq!(label, "Option A");
+    fn test_decode_callback() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: Option<(Option<&'static str>, &'static str)>,
+        }
+
+        let cases = [
+            Case {
+                name: "with ticket id",
+                input: "__opt__mahbot-123|Option A",
+                expected: Some((Some("mahbot-123"), "Option A")),
+            },
+            Case {
+                name: "empty ticket id",
+                input: "__opt__|Label",
+                expected: Some((None, "Label")),
+            },
+            Case {
+                name: "no delimiter",
+                input: "__opt__BareLabel",
+                expected: Some((None, "BareLabel")),
+            },
+            Case {
+                name: "rejects non prefix",
+                input: "random_text",
+                expected: None,
+            },
+            Case {
+                name: "rejects empty",
+                input: "",
+                expected: None,
+            },
+            Case {
+                name: "label with extra pipes",
+                input: "__opt__ticket|A|B|C",
+                expected: Some((Some("ticket"), "A|B|C")),
+            },
+            // Labels containing '|' test a deliberate `split_once` behavior:
+            // `split_once('|')` splits on the *first* pipe only, so the label
+            // captures everything after it.  Neither ticket_id nor label should
+            // contain `|` in practice (per the format contract in the doc comment).
+            Case {
+                name: "only prefix and pipe",
+                input: "__opt__|",
+                expected: Some((None, "")),
+            },
+        ];
+
+        for case in &cases {
+            let result = decode_callback(case.input);
+            let expected = case
+                .expected
+                .map(|(tid, lbl)| (tid.map(String::from), lbl.to_string()));
+            assert_eq!(result, expected, "case: {}", case.name);
+        }
     }
 
+    // ── is_action ─────────────────────────────────────────────────────────
+
     #[test]
-    fn decode_callback_empty_ticket_id() {
-        // "__opt__|Label" — empty ticket_id before the delimiter
-        let (ticket_id, label) = decode_callback("__opt__|Label").unwrap();
-        assert_eq!(ticket_id.as_deref(), None);
-        assert_eq!(label, "Label");
+    fn test_is_action() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "matches prefix with payload",
+                input: "__act__set_image_model|model-name",
+                expected: true,
+            },
+            Case {
+                name: "matches prefix empty with pipe",
+                input: "__act__clear_session|",
+                expected: true,
+            },
+            Case {
+                name: "matches prefix bare",
+                input: "__act__clear_session",
+                expected: true,
+            },
+            Case {
+                name: "rejects wrong prefix",
+                input: "not_act_something",
+                expected: false,
+            },
+            Case {
+                name: "rejects empty",
+                input: "",
+                expected: false,
+            },
+            Case {
+                name: "rejects similar prefix",
+                input: "__ac__something",
+                expected: false,
+            },
+        ];
+
+        for case in &cases {
+            assert_eq!(is_action(case.input), case.expected, "case: {}", case.name);
+        }
     }
 
-    #[test]
-    fn decode_callback_no_delimiter() {
-        // No '|' at all — everything after prefix is the label
-        let (ticket_id, label) = decode_callback("__opt__BareLabel").unwrap();
-        assert_eq!(ticket_id.as_deref(), None);
-        assert_eq!(label, "BareLabel");
-    }
+    // ── decode_action ─────────────────────────────────────────────────────
 
     #[test]
-    fn decode_callback_rejects_non_prefix() {
-        assert!(decode_callback("random_text").is_none());
-        assert!(decode_callback("").is_none());
-    }
+    fn test_decode_action() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: Option<(&'static str, &'static str)>,
+        }
 
-    #[test]
-    fn decode_callback_label_with_extra_pipes() {
-        // Labels containing '|' are a known fragility — the format contract
-        // assumes neither ticket_id nor label may contain '|'.
-        // split_once('|') splits on the *first* pipe, so the label captures
-        // everything after it.
-        let (ticket_id, label) = decode_callback("__opt__ticket|A|B|C").unwrap();
-        assert_eq!(ticket_id.as_deref(), Some("ticket"));
-        assert_eq!(label, "A|B|C");
-    }
+        let cases = [
+            Case {
+                name: "with payload",
+                input: "__act__set_image_model|google/gemini-3.1-flash-image-preview",
+                expected: Some(("set_image_model", "google/gemini-3.1-flash-image-preview")),
+            },
+            Case {
+                name: "empty payload pipe",
+                input: "__act__clear_session|",
+                expected: Some(("clear_session", "")),
+            },
+            Case {
+                name: "no pipe",
+                input: "__act__clear_session",
+                expected: Some(("clear_session", "")),
+            },
+            Case {
+                name: "rejects non prefix",
+                input: "random_text",
+                expected: None,
+            },
+            Case {
+                name: "rejects empty",
+                input: "",
+                expected: None,
+            },
+        ];
 
-    #[test]
-    fn decode_callback_only_prefix_and_pipe() {
-        // "__opt__|" — empty ticket_id, empty label
-        let (ticket_id, label) = decode_callback("__opt__|").unwrap();
-        assert_eq!(ticket_id.as_deref(), None);
-        assert_eq!(label, "");
-    }
-
-    // ── is_action ───────────────────────────────────────────────────────
-
-    #[test]
-    fn is_action_matches_prefix() {
-        assert!(is_action("__act__set_image_model|model-name"));
-        assert!(is_action("__act__clear_session|"));
-        assert!(is_action("__act__clear_session"));
-    }
-
-    #[test]
-    fn is_action_rejects_non_prefix() {
-        assert!(!is_action("not_act_something"));
-        assert!(!is_action(""));
-        assert!(!is_action("__ac__something"));
-    }
-
-    // ── decode_action ───────────────────────────────────────────────────
-
-    #[test]
-    fn decode_action_with_payload() {
-        let (action, payload) =
-            decode_action("__act__set_image_model|google/gemini-3.1-flash-image-preview").unwrap();
-        assert_eq!(action, "set_image_model");
-        assert_eq!(payload, "google/gemini-3.1-flash-image-preview");
-    }
-
-    #[test]
-    fn decode_action_empty_payload_with_pipe() {
-        let (action, payload) = decode_action("__act__clear_session|").unwrap();
-        assert_eq!(action, "clear_session");
-        assert_eq!(payload, "");
-    }
-
-    #[test]
-    fn decode_action_no_pipe() {
-        let (action, payload) = decode_action("__act__clear_session").unwrap();
-        assert_eq!(action, "clear_session");
-        assert_eq!(payload, "");
-    }
-
-    #[test]
-    fn decode_action_rejects_non_prefix() {
-        assert!(decode_action("random_text").is_none());
-        assert!(decode_action("").is_none());
+        for case in &cases {
+            let result = decode_action(case.input);
+            let expected = case
+                .expected
+                .map(|(action, payload)| (action.to_string(), payload.to_string()));
+            assert_eq!(result, expected, "case: {}", case.name);
+        }
     }
 }
