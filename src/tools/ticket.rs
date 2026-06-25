@@ -379,6 +379,7 @@ async fn guard_not_pipeline_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::TicketBuilder;
     use crate::workspace::test_ws;
     use serde_json::json;
 
@@ -429,16 +430,9 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = store
-            .create_ticket(
-                "Test",
-                "desc",
-                &test_ws("/ws"),
-                crate::board::DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let id = TicketBuilder::new(store, test_ws("/ws"))
+            .title("Test")
+            .create()
             .await
             .expect("create");
 
@@ -464,40 +458,19 @@ mod tests {
         let store = crate::board::store();
         let ws = test_ws("/tmp_ws");
 
-        let _id_a = store
-            .create_ticket(
-                "A",
-                "desc",
-                &ws,
-                crate::board::DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let _id_a = TicketBuilder::new(store, ws.clone())
+            .title("A")
+            .create()
             .await
             .expect("create");
-        let id_b = store
-            .create_ticket(
-                "B",
-                "desc",
-                &ws,
-                crate::board::DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let id_b = TicketBuilder::new(store, ws.clone())
+            .title("B")
+            .create()
             .await
             .expect("create");
-        let id_c = store
-            .create_ticket(
-                "C",
-                "desc",
-                &ws,
-                crate::board::DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let id_c = TicketBuilder::new(store, ws.clone())
+            .title("C")
+            .create()
             .await
             .expect("create");
         // Transition C to 'done' and B to 'cancelled'
@@ -578,16 +551,10 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = store
-            .create_ticket(
-                "GetTest",
-                "get me",
-                &test_ws("/ws"),
-                crate::board::DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let id = TicketBuilder::new(store, test_ws("/ws"))
+            .title("GetTest")
+            .desc("get me")
+            .create()
             .await
             .expect("create");
 
@@ -610,16 +577,10 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = store
-            .create_ticket(
-                "CommentTest",
-                "add a comment",
-                &test_ws("/ws"),
-                crate::board::DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let id = TicketBuilder::new(store, test_ws("/ws"))
+            .title("CommentTest")
+            .desc("add a comment")
+            .create()
             .await
             .expect("create");
 
@@ -644,16 +605,9 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = store
-            .create_ticket(
-                "Test",
-                "desc",
-                &test_ws("/ws"),
-                crate::board::DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let id = TicketBuilder::new(store, test_ws("/ws"))
+            .title("Test")
+            .create()
             .await
             .expect("create");
 
@@ -676,29 +630,19 @@ mod tests {
         let store = crate::board::store();
         let ws = test_ws("/ws");
 
-        let blocking_id = store
-            .create_ticket(
-                "BlockingGuard",
-                "in development",
-                &ws,
-                TicketPhase::InDevelopment,
-                &[],
-                "test",
-                None,
-            )
+        let blocking_id = TicketBuilder::new(store, ws.clone())
+            .title("BlockingGuard")
+            .desc("in development")
+            .phase(TicketPhase::InDevelopment)
+            .create()
             .await
             .expect("create");
 
-        let nonblocking_id = store
-            .create_ticket(
-                "NonBlockingGuard",
-                "backlog",
-                &ws,
-                TicketPhase::Backlog,
-                &[],
-                "test",
-                None,
-            )
+        let nonblocking_id = TicketBuilder::new(store, ws)
+            .title("NonBlockingGuard")
+            .desc("backlog")
+            .phase(TicketPhase::Backlog)
+            .create()
             .await
             .expect("create");
 
@@ -726,16 +670,11 @@ mod tests {
     async fn create_blocking_ticket() -> String {
         crate::util::test::init_test_stores().await;
         let store = crate::board::store();
-        store
-            .create_ticket(
-                "BlockMe",
-                "in flight",
-                &test_ws("/ws"),
-                TicketPhase::InDevelopment,
-                &[],
-                "test",
-                None,
-            )
+        TicketBuilder::new(store, test_ws("/ws"))
+            .title("BlockMe")
+            .desc("in flight")
+            .phase(TicketPhase::InDevelopment)
+            .create()
             .await
             .expect("create")
     }
@@ -790,16 +729,11 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = store
-            .create_ticket(
-                "NotBlocked",
-                "backlog ticket",
-                &test_ws("/ws"),
-                TicketPhase::Backlog,
-                &[],
-                "test",
-                None,
-            )
+        let id = TicketBuilder::new(store, test_ws("/ws"))
+            .title("NotBlocked")
+            .desc("backlog ticket")
+            .phase(TicketPhase::Backlog)
+            .create()
             .await
             .expect("create");
 

@@ -135,6 +135,7 @@ impl SearchArchivedTicketsTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::board::TicketBuilder;
     use crate::board::open_test_store;
 
     /// Test that the tool-layer fts_search wrapper correctly converts
@@ -144,16 +145,10 @@ mod tests {
         let (store, _tmp) = open_test_store().await;
         // Create and archive a ticket so FTS has something to find
         let ws = crate::workspace::test_ws("ws");
-        let id = store
-            .create_ticket(
-                "UniqueSearchableTitleXYZ",
-                "desc",
-                &ws,
-                crate::board::TicketPhase::Done,
-                &[],
-                "test",
-                None,
-            )
+        let id = crate::board::TicketBuilder::new(&store, ws)
+            .title("UniqueSearchableTitleXYZ")
+            .phase(crate::board::TicketPhase::Done)
+            .create()
             .await
             .expect("create");
         store.set_archived(&id).await.expect("archive");
@@ -172,29 +167,17 @@ mod tests {
     async fn test_format_results_formats_correctly() {
         let (store, _tmp) = open_test_store().await;
         let ws = crate::workspace::test_ws("ws");
-        let id_a = store
-            .create_ticket(
-                "Alpha ticket",
-                "desc",
-                &ws,
-                crate::board::TicketPhase::Done,
-                &[],
-                "test",
-                None,
-            )
+        let id_a = crate::board::TicketBuilder::new(&store, ws.clone())
+            .title("Alpha ticket")
+            .phase(crate::board::TicketPhase::Done)
+            .create()
             .await
             .expect("create");
         store.set_archived(&id_a).await.expect("archive");
-        let id_b = store
-            .create_ticket(
-                "Beta ticket",
-                "desc",
-                &ws,
-                crate::board::TicketPhase::Cancelled,
-                &[],
-                "test",
-                None,
-            )
+        let id_b = crate::board::TicketBuilder::new(&store, ws)
+            .title("Beta ticket")
+            .phase(crate::board::TicketPhase::Cancelled)
+            .create()
             .await
             .expect("create");
         store.set_archived(&id_b).await.expect("archive");

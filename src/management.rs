@@ -1765,6 +1765,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
 mod tests {
     use super::*;
     use crate::board::DEFAULT_TICKET_PHASE;
+    use crate::board::TicketBuilder;
     use crate::util::test::init_test_stores;
     use crate::workspace::test_ws_named;
 
@@ -1777,8 +1778,9 @@ mod tests {
         init_test_stores().await;
 
         let ws = test_ws_named("/tmp/test", "test");
-        let ticket_id = board()
-            .create_ticket("Test", "desc", &ws, DEFAULT_TICKET_PHASE, &[], "test", None)
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Test")
+            .create()
             .await
             .expect("create_ticket");
 
@@ -1835,44 +1837,26 @@ mod tests {
         let ws_b = test_ws_named("/ws_b", "ws_b");
 
         // Create ticket A in workspace A — this will trip the circuit breaker.
-        let ticket_a_id = board()
-            .create_ticket(
-                "Trip Ticket",
-                "desc",
-                &ws_a,
-                TicketPhase::ReadyForDevelopment,
-                &[],
-                "test",
-                None,
-            )
+        let ticket_a_id = TicketBuilder::new(board(), ws_a.clone())
+            .title("Trip Ticket")
+            .phase(TicketPhase::ReadyForDevelopment)
+            .create()
             .await
             .expect("create_ticket A");
 
         // Create ticket B in workspace A — this should be moved to Planning when A trips.
-        let ticket_b_id = board()
-            .create_ticket(
-                "Victim Ticket",
-                "desc",
-                &ws_a,
-                TicketPhase::ReadyForDevelopment,
-                &[],
-                "test",
-                None,
-            )
+        let ticket_b_id = TicketBuilder::new(board(), ws_a)
+            .title("Victim Ticket")
+            .phase(TicketPhase::ReadyForDevelopment)
+            .create()
             .await
             .expect("create_ticket B");
 
         // Create ticket C in workspace B — this must NOT be moved.
-        let ticket_c_id = board()
-            .create_ticket(
-                "Other Workspace Ticket",
-                "desc",
-                &ws_b,
-                TicketPhase::ReadyForDevelopment,
-                &[],
-                "test",
-                None,
-            )
+        let ticket_c_id = TicketBuilder::new(board(), ws_b)
+            .title("Other Workspace Ticket")
+            .phase(TicketPhase::ReadyForDevelopment)
+            .create()
             .await
             .expect("create_ticket C");
 
@@ -1980,8 +1964,9 @@ mod tests {
         init_test_stores().await;
 
         let ws = test_ws_named("/tmp/test", "test");
-        let ticket_id = board()
-            .create_ticket("Test", "desc", &ws, DEFAULT_TICKET_PHASE, &[], "test", None)
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Test")
+            .create()
             .await
             .expect("create_ticket");
 
@@ -2144,29 +2129,17 @@ mod tests {
         let ws = setup_transition_qa_to_done_test("drains_buffer").await;
 
         // Two QaPassed tickets in the same workspace
-        let ticket_a_id = board()
-            .create_ticket(
-                "Ticket A",
-                "desc",
-                &ws,
-                TicketPhase::QaPassed,
-                &[],
-                "test",
-                None,
-            )
+        let ticket_a_id = TicketBuilder::new(board(), ws.clone())
+            .title("Ticket A")
+            .phase(TicketPhase::QaPassed)
+            .create()
             .await
             .expect("create ticket A");
 
-        let ticket_b_id = board()
-            .create_ticket(
-                "Ticket B",
-                "desc",
-                &ws,
-                TicketPhase::QaPassed,
-                &[],
-                "test",
-                None,
-            )
+        let ticket_b_id = TicketBuilder::new(board(), ws)
+            .title("Ticket B")
+            .phase(TicketPhase::QaPassed)
+            .create()
             .await
             .expect("create ticket B");
 
@@ -2245,16 +2218,9 @@ mod tests {
 
         let ws = test_ws_named(ws_path, ws_name);
 
-        let ticket_id = board()
-            .create_ticket(
-                "Test Ticket",
-                "desc",
-                &ws,
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Test Ticket")
+            .create()
             .await
             .expect("create_ticket");
 
@@ -2312,16 +2278,9 @@ mod tests {
 
         let ws = test_ws_named(ws_path, ws_name);
 
-        let ticket_id = board()
-            .create_ticket(
-                "Test Ticket",
-                "desc",
-                &ws,
-                DEFAULT_TICKET_PHASE,
-                &[],
-                "test",
-                None,
-            )
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Test Ticket")
+            .create()
             .await
             .expect("create_ticket");
 
