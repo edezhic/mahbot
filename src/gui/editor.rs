@@ -52,6 +52,8 @@ macro_rules! apply_git_result {
 use super::context_menu::ContextMenu;
 
 use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unquote_c_style};
+
+use super::editor_widget::{LineEnding, detect_line_ending, has_trailing_newline};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
 use super::editor_widget::EditorBuffer;
@@ -126,13 +128,6 @@ pub enum GitFileStatus {
     Modified,
     /// File is untracked (?? in porcelain output) or newly added (A).
     Added,
-}
-
-/// Line ending convention detected for a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineEnding {
-    Lf,
-    Crlf,
 }
 
 /// A single editor tab (metadata, no content).
@@ -788,24 +783,6 @@ fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
 
 // ── Helpers — detection ──────────────────────────────────────────
 
-/// Check whether a byte slice has a trailing newline.
-#[must_use]
-fn has_trailing_newline(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && bytes.last() == Some(&b'\n')
-}
-
-/// Detect the line ending convention (LF vs CRLF) by scanning the first 64 KiB.
-#[must_use]
-fn detect_line_ending(bytes: &[u8]) -> LineEnding {
-    let limit = bytes.len().min(65536);
-    let has_crlf = bytes[..limit].windows(2).any(|w| w == b"\r\n");
-    if has_crlf {
-        LineEnding::Crlf
-    } else {
-        LineEnding::Lf
-    }
-}
-
 // ── Helpers — async I/O ──────────────────────────────────────────
 
 /// Read a flat list of directory entries for a given path relative to the
@@ -927,8 +904,8 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
 
     let data = FileLoadData {
         path: full_path,
-        has_trailing_newline: has_trailing_newline(&bytes),
-        line_ending: detect_line_ending(&bytes),
+        has_trailing_newline: has_trailing_newline(&text),
+        line_ending: detect_line_ending(&text),
         text,
     };
     FileLoadMsg {
@@ -3665,8 +3642,8 @@ impl EditorState {
 
                 match result {
                     Ok(text) => {
-                        let has_trailing = text.ends_with('\n');
-                        let line_ending = detect_line_ending(text.as_bytes());
+                        let has_trailing = has_trailing_newline(&text);
+                        let line_ending = detect_line_ending(&text);
 
                         // Update tab metadata.
                         if let Some(tab) = self.tabs.get_mut(idx) {
@@ -3796,9 +3773,8 @@ impl EditorState {
                     };
 
                     if let Some(text) = loaded_text {
-                        let bytes = text.as_bytes();
-                        let has_trailing = has_trailing_newline(bytes);
-                        let line_ending = detect_line_ending(bytes);
+                        let has_trailing = has_trailing_newline(&text);
+                        let line_ending = detect_line_ending(&text);
                         loaded.push(SavedTabData {
                             file_path,
                             text,
@@ -4061,7 +4037,7 @@ impl EditorState {
                     tab.is_dirty = false;
                     if let Some(tab_data) = self.tab_contents.get(path) {
                         let text = tab_data.content.text();
-                        tab.has_trailing_newline = has_trailing_newline(text.as_bytes());
+                        tab.has_trailing_newline = has_trailing_newline(&text);
                     }
                 }
                 if let Some(tab_data) = self.tab_contents.get_mut(path) {
@@ -6121,23 +6097,6 @@ fn auto_jump_to_first_match(
 mod tests {
     use super::*;
     use crate::gui::editor_widget::{EditorAction, EditorBuffer};
-
-    #[test]
-    fn test_has_trailing_newline() {
-        assert!(has_trailing_newline(b"hello\n"));
-        assert!(!has_trailing_newline(b"hello"));
-        assert!(!has_trailing_newline(b""));
-    }
-
-    #[test]
-    fn test_detect_line_ending_lf() {
-        assert_eq!(detect_line_ending(b"hello\nworld\n"), LineEnding::Lf);
-    }
-
-    #[test]
-    fn test_detect_line_ending_crlf() {
-        assert_eq!(detect_line_ending(b"hello\r\nworld\r\n"), LineEnding::Crlf);
-    }
 
     // ── compute_text_matches ────────────────────────────────────
 

@@ -1367,7 +1367,7 @@ impl EditorBuffer {
 
         self.edit_text(|text| {
             let mut new_text = text.to_string();
-            let line_ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+            let line_ending = detect_line_ending(text).as_str();
 
             // Get the text of the lines to duplicate.
             let duplicated: String = if end_line + 1 < line_count {
@@ -1426,8 +1426,8 @@ impl EditorBuffer {
         let swap_line = start_line.saturating_sub(1);
 
         self.edit_text(|text| {
-            let default_ending = detect_default_line_ending(text);
-            let had_trailing = had_trailing_newline_text(text);
+            let default_ending = detect_line_ending(text);
+            let had_trailing = has_trailing_newline(text);
             let mut lines = logical_lines(text);
             if swap_line >= lines.len() || end_line >= lines.len() {
                 return (text.to_string(), None);
@@ -1467,8 +1467,8 @@ impl EditorBuffer {
         let swap_line = end_line + 1;
 
         self.edit_text(|text| {
-            let default_ending = detect_default_line_ending(text);
-            let had_trailing = had_trailing_newline_text(text);
+            let default_ending = detect_line_ending(text);
+            let had_trailing = has_trailing_newline(text);
             let mut lines = logical_lines(text);
             if swap_line >= lines.len() || end_line >= lines.len() {
                 return (text.to_string(), None);
@@ -1774,12 +1774,41 @@ fn reassemble_lines(lines: &[(String, String)]) -> String {
     out
 }
 
-fn detect_default_line_ending(text: &str) -> &'static str {
-    if text.contains("\r\n") { "\r\n" } else { "\n" }
+/// Line ending convention detected for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineEnding {
+    Lf,
+    Crlf,
 }
 
-fn had_trailing_newline_text(text: &str) -> bool {
+impl LineEnding {
+    /// Return the string representation of this line ending.
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "\n",
+            LineEnding::Crlf => "\r\n",
+        }
+    }
+}
+
+/// Check whether a string has a trailing newline.
+#[must_use]
+pub(crate) fn has_trailing_newline(text: &str) -> bool {
     text.ends_with('\n')
+}
+
+/// Detect the line ending convention (LF vs CRLF) by scanning the first 64 KiB.
+#[must_use]
+pub(crate) fn detect_line_ending(text: &str) -> LineEnding {
+    let bytes = text.as_bytes();
+    let limit = bytes.len().min(65536);
+    let has_crlf = bytes[..limit].windows(2).any(|w| w == b"\r\n");
+    if has_crlf {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    }
 }
 
 fn swap_lines_with_endings(lines: &mut [(String, String)], i: usize, j: usize) {
@@ -1790,19 +1819,24 @@ fn swap_lines_with_endings(lines: &mut [(String, String)], i: usize, j: usize) {
     lines[j].1 = end_j;
 }
 
-fn fix_line_endings(lines: &mut [(String, String)], had_trailing: bool, default_ending: &str) {
+fn fix_line_endings(
+    lines: &mut [(String, String)],
+    had_trailing: bool,
+    default_ending: LineEnding,
+) {
     if lines.is_empty() {
         return;
     }
+    let default_str = default_ending.as_str();
     let last_idx = lines.len() - 1;
     for line in &mut lines[..last_idx] {
         if line.1.is_empty() {
-            line.1 = default_ending.to_string();
+            line.1 = default_str.to_string();
         }
     }
     if had_trailing {
         if lines[last_idx].1.is_empty() {
-            lines[last_idx].1 = default_ending.to_string();
+            lines[last_idx].1 = default_str.to_string();
         }
     } else {
         lines[last_idx].1.clear();
@@ -4114,14 +4148,31 @@ mod tests {
     }
 
     #[test]
+    fn test_has_trailing_newline() {
+        assert!(has_trailing_newline("hello\n"));
+        assert!(!has_trailing_newline("hello"));
+        assert!(!has_trailing_newline(""));
+    }
+
+    #[test]
+    fn test_detect_line_ending_lf() {
+        assert_eq!(detect_line_ending("hello\nworld\n"), LineEnding::Lf);
+    }
+
+    #[test]
+    fn test_detect_line_ending_crlf() {
+        assert_eq!(detect_line_ending("hello\r\nworld\r\n"), LineEnding::Crlf);
+    }
+
+    #[test]
     fn test_line_helpers_preserve_crlf_on_move_down() {
         let text = "a\r\nb\r\nc";
         let mut lines = logical_lines(text);
         swap_lines_with_endings(&mut lines, 1, 2);
         fix_line_endings(
             &mut lines,
-            had_trailing_newline_text(text),
-            detect_default_line_ending(text),
+            has_trailing_newline(text),
+            detect_line_ending(text),
         );
         assert_eq!(reassemble_lines(&lines), "a\r\nc\r\nb");
     }
