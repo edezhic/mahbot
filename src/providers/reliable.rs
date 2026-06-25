@@ -278,13 +278,7 @@ impl ReliableProvider {
 #[async_trait]
 impl Provider for ReliableProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Err(e) = self.provider.warmup().await {
-            tracing::warn!(
-                provider = self.name,
-                "Connection warmup failed (non-fatal): {e}"
-            );
-        }
-        Ok(())
+        self.provider.warmup().await
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
@@ -395,6 +389,7 @@ mod tests {
         context_overflow: bool,
         tool_schema_error: bool,
         tool_calls: Vec<crate::ToolCall>,
+        warmup_fails: bool,
     }
 
     impl TestProvider {
@@ -407,6 +402,7 @@ mod tests {
                 context_overflow: false,
                 tool_schema_error: false,
                 tool_calls: Vec::new(),
+                warmup_fails: false,
             }
         }
 
@@ -435,6 +431,11 @@ mod tests {
 
         fn with_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
             self.calls = calls;
+            self
+        }
+
+        fn with_warmup_fail(mut self) -> Self {
+            self.warmup_fails = true;
             self
         }
 
@@ -482,6 +483,13 @@ mod tests {
                 Ok(StreamEvent::Final),
             ])
             .boxed()
+        }
+
+        async fn warmup(&self) -> anyhow::Result<()> {
+            if self.warmup_fails {
+                anyhow::bail!("warmup failed");
+            }
+            Ok(())
         }
     }
 
@@ -753,6 +761,29 @@ mod tests {
         assert!(msg.contains("provider=p1"));
         assert!(msg.contains("error=p1 chat error"));
         assert!(msg.contains("retryable"));
+    }
+
+    #[tokio::test]
+    async fn warmup_propagates_inner_error() {
+        let inner = TestProvider::new("unused").with_warmup_fail();
+        let provider =
+            ReliableProvider::new("test".into(), Box::new(inner) as Box<dyn Provider>, 0, 1);
+        let err = provider
+            .warmup()
+            .await
+            .expect_err("warmup should propagate error");
+        assert!(
+            err.to_string().contains("warmup failed"),
+            "expected 'warmup failed', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_ok_when_inner_succeeds() {
+        let inner = TestProvider::new("ok");
+        let provider =
+            ReliableProvider::new("test".into(), Box::new(inner) as Box<dyn Provider>, 0, 1);
+        provider.warmup().await.expect("warmup should succeed");
     }
 
     // ── Context window error handling ─────────────────────────

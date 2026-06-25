@@ -137,7 +137,7 @@ async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Res
         }
         WarmupMode::NonFatal => {
             if let Err(e) = provider.warmup().await {
-                tracing::warn!("Provider warmup failed (non-fatal): {e}");
+                tracing::warn!(endpoint = %endpoint, "Provider warmup failed (non-fatal): {e}");
             }
         }
     }
