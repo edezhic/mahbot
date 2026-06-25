@@ -3,7 +3,7 @@
 //! Each log entry is inserted asynchronously via a background channel task.
 //! A broadcast channel feeds live log entries to the Iced native GUI dashboard.
 
-use crate::turso::{self, row_text};
+use crate::turso;
 use crate::util::json;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -297,21 +297,17 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
 }
 
 fn row_to_entry(row: &Row) -> anyhow::Result<LogEntry> {
-    let timestamp = row_text(row, COL_LOGS_TIMESTAMP)?;
-    let level = row_text(row, COL_LOGS_LEVEL)?;
-    let target = row_text(row, COL_LOGS_TARGET)?;
-    let message = row_text(row, COL_LOGS_MESSAGE)?;
-    let fields_str = match row.get_value(COL_LOGS_FIELDS)? {
-        Value::Text(s) => s,
-        Value::Null => "{}".to_string(),
-        _ => anyhow::bail!("expected text for fields"),
-    };
+    let timestamp = row.get::<String>(COL_LOGS_TIMESTAMP)?;
+    let level = row.get::<String>(COL_LOGS_LEVEL)?;
+    let target = row.get::<String>(COL_LOGS_TARGET)?;
+    let message = row.get::<String>(COL_LOGS_MESSAGE)?;
+    let fields_str = row.get::<String>(COL_LOGS_FIELDS)?;
     let fields: serde_json::Value =
         serde_json::from_str(&fields_str).unwrap_or(serde_json::Value::Null);
 
-    let agent_id = row_text(row, COL_LOGS_AGENT_ID)?;
-    let agent_role = row_text(row, COL_LOGS_AGENT_ROLE)?;
-    let workspace = row_text(row, COL_LOGS_WORKSPACE)?;
+    let agent_id = row.get::<String>(COL_LOGS_AGENT_ID)?;
+    let agent_role = row.get::<String>(COL_LOGS_AGENT_ROLE)?;
+    let workspace = row.get::<String>(COL_LOGS_WORKSPACE)?;
 
     Ok(LogEntry {
         timestamp,

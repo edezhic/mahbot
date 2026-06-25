@@ -214,11 +214,11 @@ impl StatsStore {
         let mut entries = Vec::new();
         for row in rows {
             entries.push(ToolErrorEntry {
-                tool_name: turso::row_text(&row, COL_TE_TOOL_NAME)?,
-                role: turso::row_text(&row, COL_TE_ROLE)?,
-                error: turso::row_text(&row, COL_TE_ERROR)?,
-                workspace: turso::row_text(&row, COL_TE_WORKSPACE)?,
-                recorded_at: turso::row_text(&row, COL_TE_RECORDED_AT)?,
+                tool_name: row.get::<String>(COL_TE_TOOL_NAME)?,
+                role: row.get::<String>(COL_TE_ROLE)?,
+                error: row.get::<String>(COL_TE_ERROR)?,
+                workspace: row.get::<String>(COL_TE_WORKSPACE)?,
+                recorded_at: row.get::<String>(COL_TE_RECORDED_AT)?,
             });
         }
 

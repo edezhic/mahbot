@@ -124,8 +124,8 @@ impl ConfigStore {
         rows.into_iter()
             .map(|row| {
                 Ok((
-                    turso::row_text(&row, COL_KV_KEY)?,
-                    turso::row_text(&row, COL_KV_VALUE)?,
+                    row.get::<String>(COL_KV_KEY)?,
+                    row.get::<String>(COL_KV_VALUE)?,
                 ))
             })
             .collect()
@@ -144,9 +144,9 @@ impl ConfigStore {
             .await?;
         rows.into_iter()
             .map(|row| {
-                let role = turso::row_text(&row, COL_RC_ROLE)?;
-                let model = turso::row_text_opt(&row, COL_RC_MODEL)?;
-                let reasoning_effort = turso::row_text_opt(&row, COL_RC_REASONING_EFFORT)?;
+                let role = row.get::<String>(COL_RC_ROLE)?;
+                let model = row.get::<Option<String>>(COL_RC_MODEL)?;
+                let reasoning_effort = row.get::<Option<String>>(COL_RC_REASONING_EFFORT)?;
                 Ok(RoleConfig {
                     role,
                     model,
@@ -169,9 +169,9 @@ impl ConfigStore {
             .await?;
         rows.into_iter()
             .map(|row| {
-                let model = turso::row_text(&row, COL_MR_MODEL)?;
-                let provider_order = turso::row_text_opt(&row, COL_MR_PROVIDER_ORDER)?;
-                let allow_fallbacks = turso::row_bool_opt(&row, COL_MR_ALLOW_FALLBACKS)?;
+                let model = row.get::<String>(COL_MR_MODEL)?;
+                let provider_order = row.get::<Option<String>>(COL_MR_PROVIDER_ORDER)?;
+                let allow_fallbacks = row.get::<Option<bool>>(COL_MR_ALLOW_FALLBACKS)?;
                 Ok(ModelRouting {
                     model,
                     provider_order,
@@ -256,10 +256,9 @@ impl ConfigStore {
                 "SELECT model, reasoning_effort FROM config_role WHERE role = ?1",
                 turso::params![role],
                 |row| {
-                    let model = turso::row_text_opt(row, COL_RC_TEST_MODEL)
-                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
-                    let reasoning_effort = turso::row_text_opt(row, COL_RC_TEST_REASONING_EFFORT)
-                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
+                    let model = row.get::<Option<String>>(COL_RC_TEST_MODEL)?;
+                    let reasoning_effort =
+                        row.get::<Option<String>>(COL_RC_TEST_REASONING_EFFORT)?;
                     Ok::<RoleConfig, ::turso::Error>(RoleConfig {
                         role: role_owned,
                         model,
@@ -316,10 +315,8 @@ impl ConfigStore {
                 "SELECT provider_order, allow_fallbacks FROM config_model_routing WHERE model = ?1",
                 turso::params![model],
                 |row| {
-                    let provider_order = turso::row_text_opt(row, COL_MR_TEST_PROVIDER_ORDER)
-                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
-                    let allow_fallbacks = turso::row_bool_opt(row, COL_MR_TEST_ALLOW_FALLBACKS)
-                        .map_err(|e| ::turso::Error::Error(e.to_string()))?;
+                    let provider_order = row.get::<Option<String>>(COL_MR_TEST_PROVIDER_ORDER)?;
+                    let allow_fallbacks = row.get::<Option<bool>>(COL_MR_TEST_ALLOW_FALLBACKS)?;
                     Ok::<ModelRouting, ::turso::Error>(ModelRouting {
                         model: model_owned,
                         provider_order,

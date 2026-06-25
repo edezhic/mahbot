@@ -531,40 +531,8 @@ impl Drop for TxGuard<'_> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Row extraction helper
-// ─────────────────────────────────────────────────────────────────────
-
-/// Extract a `TEXT` column from a row, returning `""` for `NULL`.
-pub fn row_text(row: &Row, idx: usize) -> anyhow::Result<String> {
-    match row.get_value(idx)? {
-        Value::Text(s) => Ok(s),
-        Value::Null => Ok(String::new()),
-        other => anyhow::bail!("expected text column {idx}, got {other:?}"),
-    }
-}
-
-/// Extract an optional `TEXT` column from a row, returning `None` for `NULL`.
-pub fn row_text_opt(row: &Row, idx: usize) -> anyhow::Result<Option<String>> {
-    match row.get_value(idx)? {
-        Value::Text(s) => Ok(Some(s)),
-        Value::Null => Ok(None),
-        other => anyhow::bail!("expected text or null in column {idx}, got {other:?}"),
-    }
-}
-
-/// Extract an optional `INTEGER` column as `Option<bool>` (1 = true, 0 = false,
-/// `NULL` = `None`).
-pub fn row_bool_opt(row: &Row, idx: usize) -> anyhow::Result<Option<bool>> {
-    match row.get_value(idx)? {
-        Value::Integer(i) => Ok(Some(i != 0)),
-        Value::Null => Ok(None),
-        other => anyhow::bail!("expected integer or null in column {idx}, got {other:?}"),
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────
 // Schema / index management
-// ──────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
 
 /// Ensure a full-text search index exists with the correct tokenizer.
 /// Drops and recreates if the existing index has a different tokenizer.
