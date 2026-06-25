@@ -650,6 +650,12 @@ pub async fn reload_from_db() -> Result<()> {
     // representation matches save_and_reload's output.
     config.normalize_entries();
 
+    // Explicit sort — DB also returns sorted (ORDER BY role/model), but we
+    // re-sort here for safety so reload_from_db matches save_and_reload's
+    // ordering regardless of SQL ORDER BY future changes.
+    config.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
+    config.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
+
     // Atomically swap
     CONFIG.swap(config);
     tracing::info!("Config reloaded from DB");
@@ -726,7 +732,7 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
     // Normalise Vec entry inner fields so both persistence paths apply
     // the same non_empty treatment to per_role_configs and model_routings.
     config.normalize_entries();
-    // Sort to match DB ORDER BY clauses (get_all_role_configs / get_all_model_routings).
+    // Explicit sort — DB also returns sorted, but we re-sort here for safety.
     config.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
     config.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
 
