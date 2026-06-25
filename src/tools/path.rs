@@ -5,7 +5,6 @@
 //! access for reading, spill-file detection, and symlink/symlink-escape protection.
 
 use anyhow::Context;
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -167,26 +166,13 @@ pub(crate) async fn resolve_read_target(
     Ok(resolved_path)
 }
 
-/// If the path starts with `~`, expand it to the user's home directory.
-/// Otherwise returns the original path as-is.
-///
-/// This is used by path-check helpers that compare user-provided (pre-canonicalization)
-/// paths against init-time expanded allowlist entries.
-fn expand_tilde_for_path_check(path: &Path) -> Cow<'_, Path> {
-    if path.to_str().is_some_and(|s| s.starts_with('~')) {
-        Cow::Owned(crate::config::expand_tilde(&path.to_string_lossy()))
-    } else {
-        Cow::Borrowed(path)
-    }
-}
-
 /// Check whether a path is under any of the given roots, after tilde expansion.
 ///
 /// The path may contain a leading `~` (user-provided input before
 /// canonicalization). In that case the `~` is expanded to the user's
 /// home directory before comparing against the (already-expanded) roots.
 fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    let check_path = expand_tilde_for_path_check(path);
+    let check_path = crate::config::expand_tilde(&path.to_string_lossy());
     roots.iter().any(|root| check_path.starts_with(root))
 }
 
@@ -208,7 +194,7 @@ fn paths_same_or_canonical(a: &Path, b: &Path) -> bool {
 
 /// Whether `path` is an OS temp directory root (not merely nested under temp).
 fn is_os_temp_root(path: &Path) -> bool {
-    let check_path = expand_tilde_for_path_check(path);
+    let check_path = crate::config::expand_tilde(&path.to_string_lossy());
 
     if paths_same_or_canonical(&check_path, &std::env::temp_dir()) {
         return true;
