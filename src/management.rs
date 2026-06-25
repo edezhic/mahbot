@@ -50,11 +50,17 @@ const ANALYSIS_THRESHOLD: u8 = 7;
 /// Minimum acceptable verification score (0-10) for review and QA phases.
 const REVIEW_QA_THRESHOLD: u8 = 9;
 
+/// Returns the global [`BoardStore`] singleton.
+#[inline]
+fn board() -> &'static BoardStore {
+    crate::board::store()
+}
+
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
 /// Returns `false` if the ticket was moved externally or an error occurred.
 #[must_use]
-async fn is_ticket_in_phase(board: &BoardStore, ticket_id: &str, expected: TicketPhase) -> bool {
-    match board.get_ticket_status(ticket_id).await {
+async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
+    match board().get_ticket_status(ticket_id).await {
         Ok(Some(status)) => {
             let ok = status == expected;
             if !ok {
@@ -95,15 +101,14 @@ async fn is_ticket_in_phase(board: &BoardStore, ticket_id: &str, expected: Ticke
 /// they start.
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
-    board: &BoardStore,
     ticket: &Ticket,
     expected: TicketPhase,
     label: &str,
 ) -> bool {
-    if !is_ticket_in_phase(board, &ticket.id, expected).await {
+    if !is_ticket_in_phase(&ticket.id, expected).await {
         return false;
     }
-    if trip_circuit_breaker_if_exceeded(board, ticket, expected, label).await {
+    if trip_circuit_breaker_if_exceeded(ticket, expected, label).await {
         return false;
     }
     true
@@ -135,13 +140,12 @@ enum NotifyPolicy {
 /// [`NotifyPolicy::Buffer`], workspace pausing will NOT occur automatically;
 /// ensure appropriate handling at the call site.
 async fn transition_ticket(
-    board: &BoardStore,
     ticket: &Ticket,
     expected: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
 ) -> Result<(), String> {
-    match board
+    match board()
         .transition_to(&ticket.id, Some(expected), target, None)
         .await
     {
@@ -222,13 +226,8 @@ async fn resolve_ticket_workspace(
 /// processing — both paths had nearly identical duplicated bounce-back logic
 /// that differed only in the source phase and log label, and the verifier
 /// path was missing the defensive `assigned_to` cleanup on transition failure.
-async fn bounce_back_to_development(
-    board: &BoardStore,
-    ticket: &Ticket,
-    source_phase: TicketPhase,
-    log_label: &str,
-) {
-    match board
+async fn bounce_back_to_development(ticket: &Ticket, source_phase: TicketPhase, log_label: &str) {
+    match board()
         .transition_to(
             &ticket.id,
             Some(source_phase),
@@ -257,7 +256,7 @@ async fn bounce_back_to_development(
                  failed — ticket stuck in {phase}, clearing assigned_to for retry",
                 phase = source_phase.as_ref(),
             );
-            let _ = board.set_assigned_to(&ticket.id, None).await;
+            let _ = board().set_assigned_to(&ticket.id, None).await;
         }
     }
 }
@@ -383,7 +382,7 @@ pub async fn run_management() {
 /// The dispatch runs inside an inner [`tokio::spawn`] so panics are caught via
 /// the [`JoinHandle`](tokio::task::JoinHandle).  On panic the ticket transitions
 /// to [`TicketPhase::Failed`] with notification so the manager can investigate.
-fn spawn_dispatch(board: &'static BoardStore, phase: PollPhase, ticket: Ticket, ws: Workspace) {
+fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let phase_info = phase.info();
     let target_phase = phase_info.claim_target;
 
@@ -404,7 +403,7 @@ fn spawn_dispatch(board: &'static BoardStore, phase: PollPhase, ticket: Ticket, 
         // Spawn an inner task so panics inside dispatch() are caught via
         // the JoinHandle rather than silently swallowed by the outer spawn.
         let handle = tokio::spawn(async move {
-            phase.dispatch(board, ticket, ws).await;
+            phase.dispatch(ticket, ws).await;
         });
 
         match handle.await {
@@ -423,7 +422,7 @@ fn spawn_dispatch(board: &'static BoardStore, phase: PollPhase, ticket: Ticket, 
                 );
                 // Best-effort transition: the ticket may have been moved
                 // externally while the dispatch was running.
-                let _ = board
+                let _ = board()
                     .add_comment(
                         &ticket_for_failure.id,
                         "system",
@@ -431,7 +430,6 @@ fn spawn_dispatch(board: &'static BoardStore, phase: PollPhase, ticket: Ticket, 
                     )
                     .await;
                 if let Err(e) = transition_ticket(
-                    board,
                     &ticket_for_failure,
                     target_phase,
                     TicketPhase::Failed,
@@ -552,13 +550,13 @@ impl PollPhase {
     }
 
     /// Dispatch the appropriate agent(s) for a claimed ticket.
-    async fn dispatch(self, board: &'static BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
+    async fn dispatch(self, ticket: Arc<Ticket>, ws: Workspace) {
         match self {
-            Self::BacklogAnalysis => dispatch_backlog_analysts(board, ticket, ws).await,
-            Self::EngineerDevelopment => dispatch_engineer(board, ticket, ws).await,
-            Self::DiagnosticsCheck => dispatch_diagnostics(board, ticket, ws).await,
+            Self::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
+            Self::EngineerDevelopment => dispatch_engineer(ticket, ws).await,
+            Self::DiagnosticsCheck => dispatch_diagnostics(ticket, ws).await,
             Self::VerifierCheck(vi) => {
-                dispatch_verifiers(board, ticket, ws, vi).await;
+                dispatch_verifiers(ticket, ws, vi).await;
             }
         }
     }
@@ -583,13 +581,8 @@ const CLAIM_PHASES: &[PollPhase] = &[
 /// Lists tickets via [`BoardStore::list_tickets_in_phase`], iterates, and logs
 /// a structured error on failure. Replaces the identical 14-line match blocks
 /// that previously appeared for Diagnostics and QaPassed dispatch.
-async fn for_tickets_in_phase(
-    board: &BoardStore,
-    phase: TicketPhase,
-    ws_name: &str,
-    mut action: impl FnMut(Ticket),
-) {
-    match board.list_tickets_in_phase(phase, ws_name).await {
+async fn for_tickets_in_phase(phase: TicketPhase, ws_name: &str, mut action: impl FnMut(Ticket)) {
+    match board().list_tickets_in_phase(phase, ws_name).await {
         Ok(tickets) => {
             for ticket in tickets {
                 action(ticket);
@@ -661,7 +654,7 @@ async fn poll_round() -> anyhow::Result<()> {
                         break;
                     }
                 };
-                spawn_dispatch(board, phase, ticket, ws.clone());
+                spawn_dispatch(phase, ticket, ws.clone());
             }
         }
 
@@ -673,11 +666,11 @@ async fn poll_round() -> anyhow::Result<()> {
         // completion). Instead, we list InDiagnostics tickets for this
         // workspace directly and guard against re-dispatch via
         // `assigned_to IS NULL`.
-        for_tickets_in_phase(board, TicketPhase::InDiagnostics, &ws.name, |ticket| {
+        for_tickets_in_phase(TicketPhase::InDiagnostics, &ws.name, |ticket| {
             if ticket.assigned_to.is_some() {
                 return; // already dispatched, still running
             }
-            spawn_dispatch(board, PollPhase::DiagnosticsCheck, ticket, ws.clone());
+            spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws.clone());
         })
         .await;
 
@@ -688,10 +681,10 @@ async fn poll_round() -> anyhow::Result<()> {
         // claim-based phases, there is no atomic source→target transition
         // — the ticket stays in QaPassed until the commit succeeds, so
         // re-dispatch is harmless (git status short-circuits a no-op).
-        for_tickets_in_phase(board, TicketPhase::QaPassed, &ws.name, |ticket| {
+        for_tickets_in_phase(TicketPhase::QaPassed, &ws.name, |ticket| {
             let ws = ws.clone();
             tokio::spawn(async move {
-                finalize_qa_passed(board, ticket, ws).await;
+                finalize_qa_passed(ticket, ws).await;
             });
         })
         .await;
@@ -709,12 +702,10 @@ async fn poll_round() -> anyhow::Result<()> {
 /// then transitions:
 /// - InDiagnostics (buffer) on successful completion
 /// - Failed (notify) if the agent failed or returned no output
-async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
+async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Engineer.as_str());
 
-    if !guard_phase_and_circuit_breaker(board, &ticket, TicketPhase::InDevelopment, "Engineer")
-        .await
-    {
+    if !guard_phase_and_circuit_breaker(&ticket, TicketPhase::InDevelopment, "Engineer").await {
         return;
     }
 
@@ -739,7 +730,10 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
         );
     }
 
-    if let Err(e) = board.set_assigned_to(&ticket.id, Some(&session_key)).await {
+    if let Err(e) = board()
+        .set_assigned_to(&ticket.id, Some(&session_key))
+        .await
+    {
         warn!(
             ticket = %ticket.id,
             error = %e,
@@ -751,7 +745,7 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
         run_agent(session_key, Role::Engineer, &ws, Some(&ticket), &message).await;
 
     // Post-run check still needed for race conditions during agent execution.
-    if !is_ticket_in_phase(board, &ticket.id, TicketPhase::InDevelopment).await {
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
         return;
     }
 
@@ -767,17 +761,11 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
         ("Agent failed", TicketPhase::Failed, NotifyPolicy::Notify)
     };
 
-    let _ = board
+    let _ = board()
         .add_comment(&ticket.id, Role::Engineer.as_str(), comment_text)
         .await;
-    if let Err(e) = transition_ticket(
-        board,
-        &ticket,
-        TicketPhase::InDevelopment,
-        target_phase,
-        notify,
-    )
-    .await
+    if let Err(e) =
+        transition_ticket(&ticket, TicketPhase::InDevelopment, target_phase, notify).await
     {
         let verb = match target_phase {
             TicketPhase::InDiagnostics => "completed",
@@ -806,10 +794,9 @@ async fn dispatch_engineer(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspac
 //   the spawned task.
 
 /// Transition a QaPassed ticket to Done with a descriptive reason.
-async fn transition_qa_to_done(board: &BoardStore, ticket: &Ticket, reason: &str) {
+async fn transition_qa_to_done(ticket: &Ticket, reason: &str) {
     info!(ticket = %ticket.id, "{reason}");
     if let Err(e) = transition_ticket(
-        board,
         ticket,
         TicketPhase::QaPassed,
         TicketPhase::Done,
@@ -832,26 +819,16 @@ async fn transition_qa_to_done(board: &BoardStore, ticket: &Ticket, reason: &str
 /// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::diff_parse::run_git_commit`].
 /// - **Commit failure:** ticket stays in QaPassed, poller retries next cycle.
 /// - **Not a git repo / no git installed:** transitions to Done without commit.
-async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
+async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
     if !crate::diff_parse::git_is_installed().await {
-        transition_qa_to_done(
-            board,
-            &ticket,
-            "Git not installed — moving to Done without commit",
-        )
-        .await;
+        transition_qa_to_done(&ticket, "Git not installed — moving to Done without commit").await;
         return;
     }
 
     if !crate::diff_parse::is_git_repo(repo_path).await {
-        transition_qa_to_done(
-            board,
-            &ticket,
-            "Not a git repo — moving to Done without commit",
-        )
-        .await;
+        transition_qa_to_done(&ticket, "Not a git repo — moving to Done without commit").await;
         return;
     }
 
@@ -870,7 +847,6 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
 
     if !has_changes {
         transition_qa_to_done(
-            board,
             &ticket,
             "Clean working tree — moving to Done without commit",
         )
@@ -881,7 +857,7 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
     match crate::diff_parse::run_git_commit(repo_path, &ticket.title).await {
         Ok(commit_info) => {
             // Persist commit info (hash + line stats) before transitioning.
-            if let Err(e) = board
+            if let Err(e) = board()
                 .set_commit_info(
                     &ticket.id,
                     &commit_info.hash,
@@ -900,17 +876,13 @@ async fn finalize_qa_passed(board: &BoardStore, ticket: Ticket, ws: Workspace) {
                 commit_info.lines_added,
                 commit_info.lines_removed,
             );
-            if let Err(e) = board.add_comment(&ticket.id, "system", &comment).await {
+            if let Err(e) = board().add_comment(&ticket.id, "system", &comment).await {
                 warn!(ticket = %ticket.id, "Failed to add commit comment: {e}");
             }
 
             // Transition to Done.
-            transition_qa_to_done(
-                board,
-                &ticket,
-                &format!("Committed {short_hash}, moving to Done"),
-            )
-            .await;
+            transition_qa_to_done(&ticket, &format!("Committed {short_hash}, moving to Done"))
+                .await;
         }
         Err(e) => {
             error!(
@@ -953,8 +925,8 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 /// (any failure), unless the circuit breaker trips (see
 /// [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
 #[allow(clippy::too_many_lines)]
-async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
-    match board.claim_diagnostics(&ticket.id).await {
+async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
+    match board().claim_diagnostics(&ticket.id).await {
         Ok(true) => {} // Claim succeeded — proceed.
         Ok(false) => {
             warn!(
@@ -989,7 +961,6 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
 
     let Some(diag) = diag else {
         if let Err(e) = transition_ticket(
-            board,
             &ticket,
             TicketPhase::InDiagnostics,
             TicketPhase::DiagnosticsDone,
@@ -1007,7 +978,7 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
     };
 
     // Check circuit breaker before running diagnostics.
-    if trip_diagnostics_circuit_breaker_if_exceeded(board, &ticket).await {
+    if trip_diagnostics_circuit_breaker_if_exceeded(&ticket).await {
         return;
     }
 
@@ -1064,12 +1035,13 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
         let _ = write!(comment, "\n\n---\n❌ Diagnostics failed at {failed_at}");
         TicketPhase::ReadyForDevelopment
     };
-    let _ = board.add_comment(&ticket.id, "diagnostics", &comment).await;
+    let _ = board()
+        .add_comment(&ticket.id, "diagnostics", &comment)
+        .await;
 
     if target == TicketPhase::ReadyForDevelopment {
-        bounce_back_to_development(board, &ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
+        bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
     } else if let Err(e) = transition_ticket(
-        board,
         &ticket,
         TicketPhase::InDiagnostics,
         target,
@@ -1083,7 +1055,7 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
             "Diagnostics completed but transition to DiagnosticsDone \
              failed — clearing assigned_to for retry",
         );
-        let _ = board.set_assigned_to(&ticket.id, None).await;
+        let _ = board().set_assigned_to(&ticket.id, None).await;
     }
 }
 
@@ -1100,9 +1072,8 @@ async fn dispatch_diagnostics(board: &'static BoardStore, ticket: Arc<Ticket>, w
 /// `false` otherwise, including on comment fetch errors (fail-open).
 /// On transition failure, still returns `true` to abort dispatch.
 #[must_use]
-async fn trip_diagnostics_circuit_breaker_if_exceeded(board: &BoardStore, ticket: &Ticket) -> bool {
+async fn trip_diagnostics_circuit_breaker_if_exceeded(ticket: &Ticket) -> bool {
     run_circuit_breaker(
-        board,
         ticket,
         TicketPhase::InDiagnostics,
         DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
@@ -1287,7 +1258,6 @@ fn format_verdict_comment(
 /// verdict is visible in the ticket discussion — this differs from
 /// verifiers (reviewers / QA), which only record failing comments.
 async fn record_verdict_comments(
-    board: &BoardStore,
     ticket_id: &str,
     results: &[ParallelVerdict],
     role_str: &str,
@@ -1296,7 +1266,7 @@ async fn record_verdict_comments(
     for (i, r) in results.iter().enumerate() {
         let role_label = format!("{role_str}_{}", i + 1);
         if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-            let _ = board.add_comment(ticket_id, &role_label, &comment).await;
+            let _ = board().add_comment(ticket_id, &role_label, &comment).await;
         }
     }
 }
@@ -1311,8 +1281,8 @@ async fn record_verdict_comments(
 /// Before spawning agents, [`guard_phase_and_circuit_breaker`] checks the phase and
 /// trips the comment-count circuit breaker (which may transition the ticket to
 /// Failed and pause the workspace). Returns `false` when the caller should abort.
-async fn dispatch_backlog_analysts(board: &BoardStore, ticket: Arc<Ticket>, ws: Workspace) {
-    if !guard_phase_and_circuit_breaker(board, &ticket, TicketPhase::Analysis, "Analysts").await {
+async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
+    if !guard_phase_and_circuit_breaker(&ticket, TicketPhase::Analysis, "Analysts").await {
         return;
     }
 
@@ -1323,11 +1293,11 @@ async fn dispatch_backlog_analysts(board: &BoardStore, ticket: Arc<Ticket>, ws: 
             .await;
 
     // Post-run check still needed for race conditions during agent execution.
-    if !is_ticket_in_phase(board, &ticket.id, TicketPhase::Analysis).await {
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
         return;
     }
 
-    handle_analyst_verdicts(board, &ticket, &parallel_results).await;
+    handle_analyst_verdicts(&ticket, &parallel_results).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -1336,11 +1306,10 @@ async fn dispatch_backlog_analysts(board: &BoardStore, ticket: Arc<Ticket>, ws: 
 /// extractions via post-loop iterators, then transitions:
 /// - to Planning (notify) if ALL analysts passed (≥ `ANALYSIS_THRESHOLD`/10)
 /// - to Paused (notify) if any analyst failed, with a comment listing the counts
-async fn handle_analyst_verdicts(board: &BoardStore, ticket: &Ticket, results: &[ParallelVerdict]) {
+async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // Record per-analyst comments.
     // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
     record_verdict_comments(
-        board,
         &ticket.id,
         results,
         Role::Analyst.as_str(),
@@ -1372,7 +1341,7 @@ async fn handle_analyst_verdicts(board: &BoardStore, ticket: &Ticket, results: &
         potential_blockers,
         missing_analysis,
     );
-    let _ = board.add_comment(&ticket.id, "system", &summary).await;
+    let _ = board().add_comment(&ticket.id, "system", &summary).await;
 
     let extracted_count = total - missing_analysis;
     let passing_count = lgtm + minor_issues;
@@ -1387,14 +1356,8 @@ async fn handle_analyst_verdicts(board: &BoardStore, ticket: &Ticket, results: &
     } else {
         TicketPhase::Paused
     };
-    if let Err(e) = transition_ticket(
-        board,
-        ticket,
-        TicketPhase::Analysis,
-        target,
-        NotifyPolicy::Notify,
-    )
-    .await
+    if let Err(e) =
+        transition_ticket(ticket, TicketPhase::Analysis, target, NotifyPolicy::Notify).await
     {
         warn!(
             ticket = %ticket.id,
@@ -1499,7 +1462,6 @@ fn build_analyst_summary(
 /// * `comment_text` — formats the system comment body given the count.
 #[must_use]
 async fn run_circuit_breaker(
-    board: &BoardStore,
     ticket: &Ticket,
     expected: TicketPhase,
     threshold: usize,
@@ -1507,7 +1469,7 @@ async fn run_circuit_breaker(
     comment_text: impl Fn(usize) -> String,
     log_label: &str,
 ) -> bool {
-    let comments = match board.get_comments(&ticket.id).await {
+    let comments = match board().get_comments(&ticket.id).await {
         Ok(c) => c,
         Err(e) => {
             warn!(
@@ -1533,18 +1495,12 @@ async fn run_circuit_breaker(
         "Circuit breaker tripped at {count}/{threshold} ({log_label}) — failing ticket and pausing workspace"
     );
 
-    let _ = board
+    let _ = board()
         .add_comment(&ticket.id, "system", &comment_text(count))
         .await;
 
-    if let Err(e) = transition_ticket(
-        board,
-        ticket,
-        expected,
-        TicketPhase::Failed,
-        NotifyPolicy::Notify,
-    )
-    .await
+    if let Err(e) =
+        transition_ticket(ticket, expected, TicketPhase::Failed, NotifyPolicy::Notify).await
     {
         warn!(
             ticket = %ticket.id,
@@ -1573,13 +1529,11 @@ async fn run_circuit_breaker(
 /// `true` to abort dispatch.
 #[must_use]
 async fn trip_circuit_breaker_if_exceeded(
-    board: &BoardStore,
     ticket: &Ticket,
     expected: TicketPhase,
     log_label: &str,
 ) -> bool {
     run_circuit_breaker(
-        board,
         ticket,
         expected,
         CIRCUIT_BREAKER_COMMENT_THRESHOLD,
@@ -1608,14 +1562,12 @@ async fn trip_circuit_breaker_if_exceeded(
 /// workspace paused).
 /// If all pass → the verifier's `success_phase`.
 async fn process_verdict_results(
-    board: &BoardStore,
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
 ) {
     // Record failing comments
     record_verdict_comments(
-        board,
         &ticket.id,
         results,
         verifier.role.as_str(),
@@ -1627,21 +1579,14 @@ async fn process_verdict_results(
     let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
 
     if any_failed
-        && trip_circuit_breaker_if_exceeded(
-            board,
-            ticket,
-            verifier.active_phase,
-            verifier.log_label,
-        )
-        .await
+        && trip_circuit_breaker_if_exceeded(ticket, verifier.active_phase, verifier.log_label).await
     {
         return;
     }
 
     if any_failed {
-        bounce_back_to_development(board, ticket, verifier.active_phase, verifier.log_label).await;
+        bounce_back_to_development(ticket, verifier.active_phase, verifier.log_label).await;
     } else if let Err(e) = transition_ticket(
-        board,
         ticket,
         verifier.active_phase,
         verifier.success_phase,
@@ -1669,14 +1614,9 @@ async fn process_verdict_results(
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs [`PARALLEL_AGENT_COUNT`] parallel verifiers of the given role, and processes the verdicts.
-async fn dispatch_verifiers(
-    board: &BoardStore,
-    ticket: Arc<Ticket>,
-    ws: Workspace,
-    vi: VerifierInfo,
-) {
+async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
     // Check phase BEFORE running agents — avoids wasting LLM API calls.
-    if !is_ticket_in_phase(board, &ticket.id, vi.active_phase).await {
+    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
         return;
     }
 
@@ -1708,7 +1648,7 @@ async fn dispatch_verifiers(
         run_parallel_with_extraction(&ticket, &ws, vi.role, &prompt, &extraction_prompt).await;
 
     // Post-run check still needed for race conditions during agent execution.
-    if !is_ticket_in_phase(board, &ticket.id, vi.active_phase).await {
+    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
         return;
     }
 
@@ -1717,7 +1657,7 @@ async fn dispatch_verifiers(
     // would waste credits on a fundamentally broken dispatch.
     let all_failed = results.iter().all(|r| r.verdict.is_none());
     if all_failed {
-        let _ = board
+        let _ = board()
             .add_comment(
                 &ticket.id,
                 "system",
@@ -1729,7 +1669,6 @@ async fn dispatch_verifiers(
             )
             .await;
         if let Err(e) = transition_ticket(
-            board,
             &ticket,
             vi.active_phase,
             TicketPhase::Failed,
@@ -1748,5 +1687,5 @@ async fn dispatch_verifiers(
         return;
     }
 
-    process_verdict_results(board, &ticket, &results, vi).await;
+    process_verdict_results(&ticket, &results, vi).await;
 }
