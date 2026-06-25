@@ -971,17 +971,6 @@ mod tests {
     }
 
     #[test]
-    fn test_path_construction_with_exe_suffix() {
-        let suffix = std::env::consts::EXE_SUFFIX;
-        let exe_name = if suffix.is_empty() {
-            "mahbot".to_string()
-        } else {
-            format!("mahbot{suffix}")
-        };
-        assert!(exe_name.starts_with("mahbot"));
-    }
-
-    #[test]
     fn test_lock_acquire_and_release_with_temp_dir() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("mahbot.lock");
