@@ -46,7 +46,7 @@ pub struct ModelRouting {
 /// Follow all three steps in order:
 ///
 /// 1. **Field declaration** — add the field here on [`ConfigData`].
-/// 2. **Macro** — add the field name to the `string_config_fields!` invocation (~line 200).
+/// 2. **Macro** — add the field name to the `string_config_fields!` invocation in this file.
 ///    The macro generates `ConfigData::STRUCT_FIELDS_DEFAULT` (used by [`ConfigReload::const_new`]),
 ///    [`ConfigData::string_fields()`], and [`ConfigData::set_string_field()`] from this list.  The compiler
 ///    enforces that every field on [`ConfigData`] is present in `STRUCT_FIELDS_DEFAULT`,
@@ -681,7 +681,7 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
     // Capture the new token before swapping so we can detect changes below.
     let new_token = config.telegram_bot_token.clone();
     CONFIG.swap(config);
-    tracing::info!("Config reloaded from DB");
+    tracing::info!("Config saved and swapped into runtime");
     crate::providers::recreate_all().await?;
 
     // ── Hot-reload Telegram listener if token changed ─────────
