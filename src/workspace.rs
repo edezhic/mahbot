@@ -101,6 +101,36 @@ const COL_WS_MAINTAINER_LAST_RUN_AT: usize = 8;
 const COL_WS_DIAGNOSTICS: usize = 9;
 const COL_WS_DIAGNOSTICS_UPDATED_AT: usize = 10;
 
+// ── Editor tab column constants ───────────────────────────────────────
+
+/// Column list for editor_tab SELECT queries.
+///
+/// The column order here must match the positional indices defined in
+/// [`COL_ET_FILE_PATH`] through [`COL_ET_DIRTY_CONTENT`], which are used
+/// in [`WorkspaceStorage::load_editor_tabs`].
+const EDITOR_TAB_COLUMNS: &str = "file_path, tab_order, is_active, is_dirty, dirty_content";
+
+/// Column-index constants for [`EDITOR_TAB_COLUMNS`].
+const COL_ET_FILE_PATH: usize = 0;
+const COL_ET_TAB_ORDER: usize = 1;
+const COL_ET_IS_ACTIVE: usize = 2;
+const COL_ET_IS_DIRTY: usize = 3;
+const COL_ET_DIRTY_CONTENT: usize = 4;
+
+// ── Workspace state list column constants ────────────────────────────
+
+/// Column list for lightweight workspace state queries (name + toggles).
+///
+/// The column order here must match the positional indices defined in
+/// [`COL_WSST_NAME`] through [`COL_WSST_MAINTENANCE`], which are used
+/// in [`WorkspaceStorage::list_states`].
+const WS_STATE_COLUMNS: &str = "name, paused, maintenance";
+
+/// Column-index constants for [`WS_STATE_COLUMNS`].
+const COL_WSST_NAME: usize = 0;
+const COL_WSST_PAUSED: usize = 1;
+const COL_WSST_MAINTENANCE: usize = 2;
+
 /// Check the discovery generation counter: return `true` if the calling task
 /// is still the latest (OK to proceed), `false` if a newer [`WorkspaceStorage::rediscover`] has
 /// been triggered (stale — do not proceed).
@@ -505,15 +535,15 @@ impl WorkspaceStorage {
         let rows = self
             .conn
             .query(
-                "SELECT name, paused, maintenance FROM workspaces ORDER BY name",
+                &format!("SELECT {WS_STATE_COLUMNS} FROM workspaces ORDER BY name"),
                 turso::params![],
             )
             .await?;
         let mut states = Vec::with_capacity(rows.len());
         for row in &rows {
-            let name: String = row.get(0)?;
-            let paused: bool = row.get(1)?;
-            let maintenance: bool = row.get(2)?;
+            let name: String = row.get(COL_WSST_NAME)?;
+            let paused: bool = row.get(COL_WSST_PAUSED)?;
+            let maintenance: bool = row.get(COL_WSST_MAINTENANCE)?;
             states.push((name, paused, maintenance));
         }
         Ok(states)
@@ -783,15 +813,15 @@ impl WorkspaceStorage {
     pub async fn load_editor_tabs(&self, name: &str) -> Result<Vec<EditorTabRecord>> {
         let rows = self.conn
             .query_map(
-                "SELECT file_path, tab_order, is_active, is_dirty, dirty_content FROM editor_tabs WHERE workspace_name = ?1 ORDER BY tab_order",
+                &format!("SELECT {EDITOR_TAB_COLUMNS} FROM editor_tabs WHERE workspace_name = ?1 ORDER BY tab_order"),
                 turso::params![name],
                 |row| -> std::result::Result<EditorTabRecord, String> {
                     Ok(EditorTabRecord {
-                        file_path: row.get::<String>(0).unwrap_or_default(),
-                        tab_order: usize::try_from(row.get::<i64>(1).unwrap_or(0)).unwrap_or(0),
-                        is_active: row.get::<i64>(2).unwrap_or(0) != 0,
-                        is_dirty: row.get::<i64>(3).unwrap_or(0) != 0,
-                        dirty_content: row.get::<Option<String>>(4).unwrap_or(None),
+                        file_path: row.get::<String>(COL_ET_FILE_PATH).unwrap_or_default(),
+                        tab_order: usize::try_from(row.get::<i64>(COL_ET_TAB_ORDER).unwrap_or(0)).unwrap_or(0),
+                        is_active: row.get::<i64>(COL_ET_IS_ACTIVE).unwrap_or(0) != 0,
+                        is_dirty: row.get::<i64>(COL_ET_IS_DIRTY).unwrap_or(0) != 0,
+                        dirty_content: row.get::<Option<String>>(COL_ET_DIRTY_CONTENT).unwrap_or(None),
                     })
                 },
             )
@@ -872,6 +902,20 @@ mod tests {
     #[test]
     fn workspace_columns_count_matches_column_constants() {
         crate::assert_column_count!(WORKSPACE_COLUMNS, COL_WS_DIAGNOSTICS_UPDATED_AT);
+    }
+
+    /// Verify that the number of columns in [`EDITOR_TAB_COLUMNS`] matches the highest
+    /// column-index constant + 1.
+    #[test]
+    fn editor_tab_columns_count_matches_column_constants() {
+        crate::assert_column_count!(EDITOR_TAB_COLUMNS, COL_ET_DIRTY_CONTENT);
+    }
+
+    /// Verify that the number of columns in [`WS_STATE_COLUMNS`] matches the highest
+    /// column-index constant + 1.
+    #[test]
+    fn ws_state_columns_count_matches_column_constants() {
+        crate::assert_column_count!(WS_STATE_COLUMNS, COL_WSST_MAINTENANCE);
     }
 
     /// Open a temporary workspace store for testing.
