@@ -480,7 +480,7 @@ pub async fn execute_update() -> Result<()> {
 
     // 12. Spawn the new instance from the determined spawn path.
     //     On macOS, posix_spawn triggers asynchronous Gatekeeper code signature
-    //     validation. The cleanup guard below guarantees the spawn target is
+    //     validation. Spawning before deletion guarantees the spawn target is
     //     never deleted during or before the child's startup window.
     if let Err(e) = spawn_new_instance_from(&spawn_path, admin_target.as_ref()).await {
         // Spawn failed — re-acquire the lock since the process stays alive.
@@ -491,7 +491,7 @@ pub async fn execute_update() -> Result<()> {
     }
 
     // 13. Clean up the build output binary after successful spawn.
-    //     Guarded: never delete:
+    //     Safety: never delete:
     //     - The spawn target (prevents macOS Gatekeeper race — see step 12).
     //     - The current_exe path (same Gatekeeper concern).
     //     - The cargo bin path (same Gatekeeper concern, also the spawn target).
@@ -780,7 +780,7 @@ fn should_delete_build_artifact(
 
 /// Canonicalize a path, falling back to the lexical path on failure.
 ///
-/// Used for cleanup-guard comparisons where the file may not exist yet
+/// Used for canonicalized-path comparisons where the file may not exist yet
 /// (e.g., the cargo bin install path before installation) or where
 /// canonicalization may fail for other reasons (e.g., broken symlinks,
 /// permission denied).
@@ -879,7 +879,7 @@ async fn resolve_spawn_path(
 /// ## macOS Gatekeeper safety
 ///
 /// The caller guarantees that `binary_path` is never deleted before or during
-/// the child's startup window (see cleanup guard in [`execute_update`]).
+/// the child's startup window (see deletion safety in [`execute_update`]).
 /// Deleting the spawn target while Gatekeeper is validating its code signature
 /// causes `syspolicyd` to SIGKILL the child.
 async fn spawn_new_instance_from(binary_path: &Path, admin_target: Option<&String>) -> Result<()> {
