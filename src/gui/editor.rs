@@ -29,6 +29,26 @@ use iced_fonts::lucide;
 use fff_search::grep::{GrepMode, GrepSearchOptions};
 use fff_search::parse_grep_query;
 
+/// Apply a loaded git result (status or ignore) to the editor state.
+/// Both git variants follow the same pattern — only the cache field,
+/// loading flag, and log label differ — so this macro avoids duplicating
+/// the match arm body.
+macro_rules! apply_git_result {
+    ($result:expr, $cache:expr, $loading:expr, $label:expr) => {{
+        $loading = false;
+        match $result {
+            Ok(cache) => {
+                $cache = cache;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load {}: {e}", $label);
+                $cache.clear();
+            }
+        }
+        Task::none()
+    }};
+}
+
 use super::context_menu::ContextMenu;
 
 use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unquote_c_style};
@@ -2132,6 +2152,21 @@ impl EditorState {
         Task::none()
     }
 
+    /// Handle Undo or Redo after checking that the find bar or modal overlay
+    /// won't intercept the keyboard shortcut.
+    ///
+    /// When the find bar is open, Cmd+Z / Cmd+Shift+Z should undo/redo within
+    /// the find bar's text input (handled natively by Iced's text widget), not
+    /// undo the editor content. Bail out early so the text input handles the
+    /// shortcut internally.
+    fn handle_undo_or_redo(&mut self, is_redo: bool) -> Task<EditorMessage> {
+        if self.is_find_bar_open() || self.modal_overlay_blocks_editor_shortcuts() {
+            Task::none()
+        } else {
+            self.apply_undo_or_redo(is_redo)
+        }
+    }
+
     /// Clear all workspace-scoped editor state when switching workspaces.
     /// Does not touch `selected_workspace_name`, `selected_workspace_path`, or `generation`
     /// — those are managed at the call site.
@@ -3221,23 +3256,9 @@ impl EditorState {
                 Task::none()
             }
 
-            EditorMessage::Undo => {
-                if self.is_find_bar_open() || self.modal_overlay_blocks_editor_shortcuts() {
-                    // Cmd+Z in the find bar's text input should undo within
-                    // the text field, not undo the editor. Bail when find bar
-                    // is open so the text_input handles Cmd+Z internally.
-                    Task::none()
-                } else {
-                    self.apply_undo_or_redo(false)
-                }
-            }
-            EditorMessage::Redo => {
-                if self.is_find_bar_open() || self.modal_overlay_blocks_editor_shortcuts() {
-                    Task::none()
-                } else {
-                    self.apply_undo_or_redo(true)
-                }
-            }
+            EditorMessage::Undo => self.handle_undo_or_redo(false),
+
+            EditorMessage::Redo => self.handle_undo_or_redo(true),
 
             EditorMessage::FindToggle => {
                 if self.modal_overlay_blocks_editor_shortcuts() {
@@ -3523,31 +3544,21 @@ impl EditorState {
             }
 
             EditorMessage::GitStatusLoaded(result) => {
-                self.git_status_loading = false;
-                match result {
-                    Ok(cache) => {
-                        self.git_status_cache = cache;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to load git status: {e}");
-                        self.git_status_cache.clear();
-                    }
-                }
-                Task::none()
+                apply_git_result!(
+                    result,
+                    self.git_status_cache,
+                    self.git_status_loading,
+                    "git status"
+                )
             }
 
             EditorMessage::GitIgnoredLoaded(result) => {
-                self.git_ignore_loading = false;
-                match result {
-                    Ok(cache) => {
-                        self.git_ignore_cache = cache;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to load git ignore status: {e}");
-                        self.git_ignore_cache.clear();
-                    }
-                }
-                Task::none()
+                apply_git_result!(
+                    result,
+                    self.git_ignore_cache,
+                    self.git_ignore_loading,
+                    "git ignore status"
+                )
             }
 
             EditorMessage::TabsSaved(saved_gen) => {
