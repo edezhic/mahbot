@@ -395,7 +395,14 @@ pub enum ScrollMode {
 }
 
 /// Estimated height per tree row for scroll-into-view on keyboard navigation.
-pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = 20.0;
+/// Derived from [`TREE_FONT_SIZE`] × Iced's default relative line height (1.3)
+/// for a close approximation of actual rendered row height. File entries are
+/// ~18.2 px; directory entries (with [`TREE_ICON_SIZE`] 15 pt icons) are
+/// ~19.5 px.
+///
+/// This constant is used directly by [`scroll_to_tree_focus`] to compute
+/// row positions for keyboard-navigation scroll-into-view logic.
+pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_FONT_SIZE * 1.3;
 
 /// Scroll the tree panel to bring the focused row into view.
 ///
@@ -408,6 +415,9 @@ pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = 20.0;
 ///   row is brought to the top, for rows below the viewport the view
 ///   advances by one row height. Falls back to [`SnapToTop`] when the
 ///   viewport height is unknown ([`FileTree::viewport_h`] is `None`).
+///
+/// Row height is approximated by [`ESTIMATED_TREE_ROW_HEIGHT`], derived
+/// from [`TREE_FONT_SIZE`] × Iced's default relative line height (1.3).
 ///
 /// This method updates [`FileTree::scroll_y`] directly so that consecutive
 /// calls during the same frame see an accurate scroll offset even before the
@@ -1101,17 +1111,17 @@ mod tests {
 
     #[test]
     fn scroll_into_view_row_fully_visible_no_scroll() {
-        // Viewport: y=40..440 (400px tall, starting at row index 2)
-        // Focus on index 3 (y=60). The row at y=60 spans y=60..80.
+        // Viewport: y=40..440 (400px tall, starting at row index ~2)
+        // Focus on index 3. Row spans y=54..72 (3 * 18 = 54).
         // Viewport bottom is 440. Row is fully within 40..440.
         let mut tree = tree_with_viewport(30, 40.0, 400.0);
-        tree.tree_focus_index = 3; // 3 * 20 = 60
+        tree.tree_focus_index = 3; // 3 * ~18.2 = ~54.6
 
         let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
 
         // scroll_y unchanged — no scroll needed.
         assert!(
-            (tree.scroll_y - 40.0).abs() < f32::EPSILON,
+            (tree.scroll_y - 40.0).abs() < 0.01,
             "scroll_y should remain 40"
         );
     }
@@ -1119,17 +1129,17 @@ mod tests {
     #[test]
     fn scroll_into_view_row_below_viewport_advances_one_row() {
         // Viewport: y=0..200 (200px tall)
-        // Focus on index 15 (y=300). Row bottom is 320.
+        // Focus on index 15 (y~273). Row bottom ~291.2.
         // Row is below viewport bottom (200).
         let mut tree = tree_with_viewport(30, 0.0, 200.0);
-        tree.tree_focus_index = 15; // 15 * 20 = 300
+        tree.tree_focus_index = 15; // 15 * ~18.2 = ~273
 
         let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
 
-        // scroll_y advanced by one row height.
+        // scroll_y advanced by one row height (~18.2px).
         assert!(
-            (tree.scroll_y - 20.0).abs() < f32::EPSILON,
-            "scroll_y should advance by 20, got {}",
+            (tree.scroll_y - 18.2_f32).abs() < 0.01,
+            "scroll_y should advance by ~18.2, got {}",
             tree.scroll_y
         );
     }
@@ -1137,17 +1147,17 @@ mod tests {
     #[test]
     fn scroll_into_view_row_above_viewport_brings_to_top() {
         // Viewport: y=100..500 (400px tall)
-        // Focus on index 3 (y=60). Row bottom is 80.
-        // Row bottom (80) is above viewport top (100).
+        // Focus on index 3 (y~54.6). Row bottom ~72.8.
+        // Row bottom (~72.8) is above viewport top (100).
         let mut tree = tree_with_viewport(30, 100.0, 400.0);
-        tree.tree_focus_index = 3; // 3 * 20 = 60
+        tree.tree_focus_index = 3; // 3 * ~18.2 = ~54.6
 
         let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
 
-        // scroll_y set to focus_y (60) — bring row to top.
+        // scroll_y set to focus_y (~54.6) — bring row to top.
         assert!(
-            (tree.scroll_y - 60.0).abs() < f32::EPSILON,
-            "scroll_y should be 60, got {}",
+            (tree.scroll_y - 54.6).abs() < 0.01,
+            "scroll_y should be ~54.6, got {}",
             tree.scroll_y
         );
     }
@@ -1155,16 +1165,16 @@ mod tests {
     #[test]
     fn scroll_into_view_partially_visible_at_top_edge_no_scroll() {
         // Viewport: y=50..450 (400px tall)
-        // Focus on index 2 (y=40). Row bottom is 60.
-        // Row bottom (60) is below viewport top (50) → partially visible.
+        // Focus on index 2 (y~36.4). Row bottom ~54.6.
+        // Row bottom (~54.6) is below viewport top (50) → partially visible.
         let mut tree = tree_with_viewport(30, 50.0, 400.0);
-        tree.tree_focus_index = 2; // 2 * 20 = 40
+        tree.tree_focus_index = 2; // 2 * ~18.2 = ~36.4
 
         let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
 
         // scroll_y unchanged — row is partially visible at top edge.
         assert!(
-            (tree.scroll_y - 50.0).abs() < f32::EPSILON,
+            (tree.scroll_y - 50.0).abs() < 0.01,
             "scroll_y should remain 50, got {}",
             tree.scroll_y
         );
@@ -1175,14 +1185,14 @@ mod tests {
         // viewport_h is None — should fall back to SnapToTop.
         let mut tree = tree_with_viewport(30, 10.0, 0.0);
         tree.viewport_h = None;
-        tree.tree_focus_index = 10; // 10 * 20 = 200
+        tree.tree_focus_index = 10; // 10 * ~18.2 = ~182
 
         let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
 
-        // Falls back to absolute scroll: scroll_y = focus_y = 200.
+        // Falls back to absolute scroll: scroll_y = focus_y ≈ 182.
         assert!(
-            (tree.scroll_y - 200.0).abs() < f32::EPSILON,
-            "scroll_y should snap to 200, got {}",
+            (tree.scroll_y - 182.0).abs() < 0.01,
+            "scroll_y should snap to ~182, got {}",
             tree.scroll_y
         );
     }
@@ -1190,14 +1200,14 @@ mod tests {
     #[test]
     fn scroll_snap_to_top_sets_scroll_y() {
         let mut tree = tree_with_viewport(30, 0.0, 400.0);
-        tree.tree_focus_index = 8; // 8 * 20 = 160
+        tree.tree_focus_index = 8; // 8 * ~18.2 = ~145.6
 
         let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::SnapToTop);
 
         // SnapToTop sets scroll_y to focus_y.
         assert!(
-            (tree.scroll_y - 160.0).abs() < f32::EPSILON,
-            "scroll_y should be 160, got {}",
+            (tree.scroll_y - 145.6).abs() < 0.01,
+            "scroll_y should be ~145.6, got {}",
             tree.scroll_y
         );
     }
@@ -1211,7 +1221,7 @@ mod tests {
 
         // The task type is opaque, but we can verify it's not panicking
         // and that scroll_y stays at its default.
-        assert!((tree.scroll_y - 0.0).abs() < f32::EPSILON);
+        assert!((tree.scroll_y - 0.0).abs() < 0.01);
         // The function returns Task::none() for empty trees.
         // We can't easily inspect Task contents, so we just check no crash.
     }
