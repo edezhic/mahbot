@@ -1609,6 +1609,7 @@ impl EditorState {
     /// Returns `Task::none()` if no workspace is selected (caller should
     /// propagate this return).
     fn expand_dir_and_focus(&mut self, path: &str, label: &str) -> Task<EditorMessage> {
+        self.selected_file = None;
         self.file_tree.expanded_dirs.insert(path.to_string());
 
         let needs_async_load = !self.dir_entries.contains_key(path);
@@ -2266,6 +2267,10 @@ impl EditorState {
                 if self.rename_target.is_some() {
                     self.rename_target = None;
                 }
+                // Clear any previously-selected file highlight — navigating
+                // to a directory should visually show the directory as focused,
+                // not the previously-selected file.
+                self.selected_file = None;
                 if self.file_tree.expanded_dirs.contains(&dir_path) {
                     self.file_tree.tree_focused = true;
                     return self.collapse_dir(&dir_path);
@@ -6536,9 +6541,15 @@ mod tests {
     #[test]
     fn test_toggle_dir_sets_tree_focus() {
         let mut state = make_editor_with_tree();
-        // ToggleDir on collapsed directory → should set tree_focused
+        // Select a file first so we can verify it gets cleared.
+        state.selected_file = Some("Cargo.toml".to_string());
+        // ToggleDir on collapsed directory → should set tree_focused and clear selected_file
         let _ = state.update(EditorMessage::ToggleDir("src".to_string()));
         assert!(state.file_tree.tree_focused);
+        assert!(
+            state.selected_file.is_none(),
+            "ToggleDir should clear selected_file"
+        );
     }
 
     #[test]
@@ -6611,10 +6622,15 @@ mod tests {
         let mut state = make_editor_with_tree();
         state.file_tree.tree_focused = true;
         state.file_tree.tree_focus_index = 0; // "src" directory
+        state.selected_file = Some("Cargo.toml".to_string());
         let _task = state.update(EditorMessage::TreeNavEnter);
         // After expanding "src", focus should move to first child
         assert!(state.file_tree.expanded_dirs.contains("src"));
         assert_eq!(state.file_tree.tree_focus_index, 1); // "src/main.rs"
+        assert!(
+            state.selected_file.is_none(),
+            "TreeNavEnter on dir should clear selected_file"
+        );
     }
 
     #[test]
@@ -7399,12 +7415,17 @@ mod tests {
         let mut state = make_editor_with_tree();
         state.file_tree.tree_focused = true;
         state.file_tree.tree_focus_index = 0; // "src" (collapsed, has children in dir_entries)
+        state.selected_file = Some("Cargo.toml".to_string());
 
         let _ = state.update(EditorMessage::TreeNavRight);
         // Should expand "src" and advance to first child "src/main.rs"
         assert!(state.file_tree.expanded_dirs.contains("src"));
         assert_eq!(state.file_tree.tree_focus_index, 1);
         assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
+        assert!(
+            state.selected_file.is_none(),
+            "TreeNavRight on dir should clear selected_file"
+        );
     }
 
     #[test]
@@ -7439,11 +7460,17 @@ mod tests {
     #[test]
     fn test_toggle_dir_sets_tree_focus_index() {
         let mut state = make_editor_with_tree();
+        // Select a file first so we can verify it gets cleared.
+        state.selected_file = Some("Cargo.toml".to_string());
         let _ = state.update(EditorMessage::ToggleDir("src".to_string()));
         // ToggleDir should set tree_focus_index to "src"'s position
         assert!(state.file_tree.tree_focused);
         assert_eq!(state.file_tree.tree_focus_index, 0);
         assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
+        assert!(
+            state.selected_file.is_none(),
+            "ToggleDir should clear selected_file"
+        );
     }
 
     #[test]
