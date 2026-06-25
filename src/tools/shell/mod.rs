@@ -2804,7 +2804,7 @@ mod tests {
         let result = process_shell_output("df -h", &input, "", 0, Duration::ZERO);
         let lines = result.lines().count();
         // 20 lines + 1 truncated note line = 21 max
-        assert!(lines <= 50, "df should cap at ~21 lines, got {lines}");
+        assert!(lines <= 21, "df should cap at ~21 lines, got {lines}");
         assert!(lines >= 19, "df should have around 20 lines, got {lines}");
     }
 
