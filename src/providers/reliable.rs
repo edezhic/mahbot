@@ -269,8 +269,8 @@ impl ReliableProvider {
             // Jitter: randomize within [75%, 125%) of base so parallel agents
             // retrying on the same transient error don't synchronize.
             let half_range = base / 2;
-            let jittered_backoff = base - base / 4 + (rand::random::<u64>() % half_range);
-            jittered_backoff.max(50) // floor at 50ms; matters when base < 67
+            
+            base - base / 4 + (rand::random::<u64>() % half_range)
         }
     }
 }
