@@ -454,10 +454,10 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "~/.local/pipx/",
 ];
 
-/// Approved filesystem roots for scratch/temp files (single source of truth).
+/// Allowed filesystem roots for scratch/temp files (single source of truth).
 ///
 /// Used by read-path allowlists and read-only shell redirect / scratch-write policy.
-static APPROVED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let mut dirs = Vec::new();
     add_path_with_canonical(&mut dirs, std::env::temp_dir());
     add_path_with_canonical(&mut dirs, PathBuf::from("/tmp"));
@@ -468,10 +468,10 @@ static APPROVED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     dirs
 });
 
-/// Check whether `path` is under an approved temp/scratch root.
+/// Check whether `path` is under an allowed temp/scratch root.
 #[must_use]
 pub(crate) fn is_path_under_allowed_temp(path: &Path) -> bool {
-    is_path_under_roots(path, &APPROVED_TEMP_ROOTS)
+    is_path_under_roots(path, &ALLOWED_TEMP_ROOTS)
 }
 
 /// Paths under any of these directories are allowed for reading (temp dir,
@@ -490,7 +490,7 @@ pub(crate) fn is_path_under_allowed_temp(path: &Path) -> bool {
 /// `~/.config/`) also generate variants using the corresponding `$XDG_*`
 /// environment variable when set.
 static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
-    let mut dirs = APPROVED_TEMP_ROOTS.clone();
+    let mut dirs = ALLOWED_TEMP_ROOTS.clone();
 
     // Dependency source directories (cross-platform)
     for raw_path in EXTRA_ALLOWED_RAW_PATHS {

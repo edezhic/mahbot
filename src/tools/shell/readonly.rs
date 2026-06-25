@@ -448,7 +448,7 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
     paths
 }
 
-/// True when every explicit path argument is an absolute path under approved temp.
+/// True when every explicit path argument is an absolute path under allowed temp.
 fn scratch_paths_under_temp(segment: &str) -> bool {
     let paths = non_flag_path_args(segment);
     !paths.is_empty()
@@ -482,7 +482,7 @@ fn check_segment(segment: &str) -> Result<(), String> {
     }
 
     // Check scratch mutators first (tee, touch, mkdir): allowed if all explicit
-    // path arguments are under an approved temp directory.
+    // path arguments are under an allowed temp directory.
     if SCRATCH_MUTATORS.contains(&first_word) && scratch_paths_under_temp(trimmed) {
         return Ok(());
     }
