@@ -2297,6 +2297,9 @@ impl EditorState {
             }
 
             EditorMessage::SelectFile(path) => {
+                // Clicking a file tree row transfers keyboard focus to the tree
+                // so that arrow keys navigate the tree instead of the editor.
+                self.file_tree.tree_focused = true;
                 // Cancel inline rename (clicking a tree row while renaming
                 // means the user is dismissing the rename).
                 if self.rename_target.is_some() {
@@ -7512,6 +7515,22 @@ mod tests {
         assert_eq!(
             state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
             "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_select_file_sets_tree_focused_when_not_focused() {
+        // When tree_focused starts false, clicking a file should set it true.
+        let mut state = make_editor_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = false;
+        let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
+        assert!(
+            state.file_tree.tree_focused,
+            "SelectFile should set tree_focused to true"
         );
     }
 

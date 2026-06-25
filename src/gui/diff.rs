@@ -382,6 +382,9 @@ impl DiffState {
                 Task::none()
             }
             DiffMessage::SelectFile(path) => {
+                // Clicking a file tree row transfers keyboard focus to the tree
+                // so that arrow keys navigate the tree instead of the editor.
+                self.file_tree.tree_focused = true;
                 // Remember the clicked file's position for Ctrl+B re-focus.
                 self.file_tree.focus_path(&path);
                 if self.selected_file.as_deref() == Some(&path) {
@@ -1786,6 +1789,18 @@ mod tests {
         state.file_tree.tree_focused = true;
         let _ = state.update(DiffMessage::SelectFile("src/main.rs".to_owned()));
         assert!(state.file_tree.tree_focused);
+    }
+
+    #[test]
+    fn test_diff_select_file_sets_tree_focused_when_not_focused() {
+        // When tree_focused starts false, clicking a file should set it true.
+        let mut state = make_diff_with_tree();
+        state.file_tree.tree_focused = false;
+        let _ = state.update(DiffMessage::SelectFile("src/main.rs".to_owned()));
+        assert!(
+            state.file_tree.tree_focused,
+            "SelectFile should set tree_focused to true",
+        );
     }
 
     #[test]
