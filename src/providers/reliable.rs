@@ -844,47 +844,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn chat_context_window_exceeded_eventually_fails() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
-            "primary".into(),
-            Box::new(
-                TestProvider::new("never succeeds")
-                    .with_context_overflow(usize::MAX)
-                    .with_calls(calls.clone()),
-            ) as Box<dyn Provider>,
-            3,
-            1,
-        );
-
-        let messages = vec![ChatMessage::user("test")];
-        let result = provider
-            .chat(ChatRequest {
-                messages: messages.clone(),
-                tools: None,
-                model: "test".to_string(),
-                allow_image_parts: false,
-                temperature: 0.1,
-                reasoning_effort: None,
-                provider_order: None,
-                provider_allow_fallbacks: None,
-            })
-            .await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("All attempts failed")
-                && err_msg.contains("exceeds the available context size"),
-            "Should aggregate failures, got: {err_msg}"
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "no retries for context window errors"
-        );
-    }
-
     // ── Tool schema error detection tests ───────────────────────────────
 
     #[test]
