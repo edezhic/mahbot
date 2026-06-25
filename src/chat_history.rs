@@ -55,7 +55,7 @@ const HISTORY_LIMIT: i64 = 100;
 ///
 /// The column order here must match the positional indices defined in
 /// [`COL_CH_ID`] through [`COL_CH_AGENT_ROLE`], which are used in
-/// [`entry_from_row`].
+/// [`chat_history_entry_from_row`].
 ///
 /// Note: The column order differs from the schema declaration order
 /// (id, message_id, user_name, channel, role, direction, content,
@@ -67,7 +67,7 @@ const CHAT_HISTORY_COLUMNS: &str = "id, message_id, user_name, content, directio
 
 /// Column-index constants for [`CHAT_HISTORY_COLUMNS`].
 ///
-/// These replace hardcoded positional indices in [`entry_from_row`].
+/// These replace hardcoded positional indices in [`chat_history_entry_from_row`].
 /// With named constants, the compiler catches references to undefined
 /// column constants — for instance, removing a constant but forgetting to
 /// update a `row.get()` call produces a compile error rather than a silent
@@ -81,7 +81,7 @@ const COL_CH_AGENT_ROLE: usize = 5;
 
 /// Convert a database row to a [`ChatHistoryEntry`] using the column-index
 /// constants from [`CHAT_HISTORY_COLUMNS`].
-fn entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
+fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
     Ok(ChatHistoryEntry {
         id: row.get::<i64>(COL_CH_ID)?,
         message_id: row.get::<String>(COL_CH_MESSAGE_ID)?,
@@ -162,7 +162,7 @@ impl ChatHistoryStore {
             .await?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(entry_from_row(&row)?);
+            entries.push(chat_history_entry_from_row(&row)?);
         }
         entries.reverse();
         Ok(entries)
@@ -193,7 +193,7 @@ impl ChatHistoryStore {
             .await?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(entry_from_row(&row)?);
+            entries.push(chat_history_entry_from_row(&row)?);
         }
         // Reverse for chronological display order.
         entries.reverse();
