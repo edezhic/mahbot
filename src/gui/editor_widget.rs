@@ -2124,6 +2124,10 @@ struct EditorWidgetState {
     /// Last active buffer key (typically file path) — used to reset scroll
     /// and interaction state when switching tabs.
     last_buffer_key: Option<String>,
+    /// Tracks the current keyboard modifiers (shift, ctrl, alt, etc.).
+    /// Updated from `ModifiersChanged` events. Used to detect shift+click
+    /// for extending the selection.
+    modifiers: keyboard::Modifiers,
 }
 
 impl Default for EditorWidgetState {
@@ -2140,6 +2144,7 @@ impl Default for EditorWidgetState {
             last_click_pos: None,
             ime_commit_suppress: None,
             last_buffer_key: None,
+            modifiers: keyboard::Modifiers::empty(),
         }
     }
 }
@@ -2779,15 +2784,78 @@ where
                         _ => false,
                     };
 
-                    // Always update tracking (enables triple-click to also select).
+                    // Always update tracking for double-click detection.
                     state.last_click_time = Some(now);
                     state.last_click_pos = Some((line, col));
 
                     if is_double_click {
-                        shell.publish(EditorAction::SelectWordAt { line, col });
+                        if state.modifiers.shift() {
+                            // Shift+double-click: extend existing selection to include the
+                            // word at the click position (word-boundary selection).
+                            let text_buf = self.buffer.text();
+                            let byte_offset = line_col_to_byte_offset(&text_buf, line, col);
+                            let (word_start, word_end) = word_bounds_at(&text_buf, byte_offset);
+                            if word_start != word_end {
+                                let (start_line, start_col) =
+                                    byte_offset_to_line_col(&text_buf, word_start);
+                                let (end_line, end_col) =
+                                    byte_offset_to_line_col(&text_buf, word_end);
+
+                                // Determine which word boundary to extend to based on
+                                // the anchor position relative to the word.
+                                let cur = self.buffer.cursor();
+                                let anchor_byte = cur.selection.as_ref().map_or_else(
+                                    || line_col_to_byte_offset(&text_buf, cur.line, cur.column),
+                                    |a| line_col_to_byte_offset(&text_buf, a.line, a.column),
+                                );
+
+                                if anchor_byte < word_start {
+                                    // Anchor is before the word — extend to word
+                                    // end to include the full word.
+                                    shell.publish(EditorAction::SelectTo {
+                                        line: end_line,
+                                        col: end_col,
+                                    });
+                                } else if anchor_byte >= word_end {
+                                    // Anchor is after the word — extend to word
+                                    // start to include the full word.
+                                    shell.publish(EditorAction::SelectTo {
+                                        line: start_line,
+                                        col: start_col,
+                                    });
+                                } else {
+                                    // Anchor is inside the word — select the full
+                                    // word by first resetting the cursor to the
+                                    // word start, then extending to word end.
+                                    //
+                                    // NOTE: This relies on Iced draining queued
+                                    // shell.publish() messages in order between
+                                    // platform event dispatches (same assumption
+                                    // documented in ButtonReleased below at the
+                                    // zero-width-selection fix).
+                                    shell.publish(EditorAction::MoveTo {
+                                        line: start_line,
+                                        col: start_col,
+                                    });
+                                    shell.publish(EditorAction::SelectTo {
+                                        line: end_line,
+                                        col: end_col,
+                                    });
+                                }
+                            } else {
+                                // Zero-width word (whitespace) — fall back to regular
+                                // shift+click behaviour.
+                                shell.publish(EditorAction::SelectTo { line, col });
+                            }
+                        } else {
+                            shell.publish(EditorAction::SelectWordAt { line, col });
+                        }
                         // Clear mouse_held so intermediate CursorMoved events
-                        // don't trigger SelectTo and truncate the word selection.
+                        // don't trigger SelectTo and truncate the word/word-boundary
+                        // selection.
                         state.mouse_held = false;
+                    } else if state.modifiers.shift() {
+                        shell.publish(EditorAction::SelectTo { line, col });
                     } else {
                         shell.publish(EditorAction::MoveTo { line, col });
                     }
@@ -2853,6 +2921,11 @@ where
                     // Keep the redraw cycle alive while dragging to select.
                     shell.request_redraw();
                 }
+            }
+
+            // ── Keyboard modifiers changed ─────────────────────────
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
             }
 
             // ── Keyboard handling ───────────────────────────────────
