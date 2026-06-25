@@ -1837,7 +1837,7 @@ mod tests {
         let ws_b = test_ws_named("/ws_b", "ws_b");
 
         // Create ticket A in workspace A — this will trip the circuit breaker.
-        let ticket_a_id = TicketBuilder::new(board(), ws_a.clone())
+        let trip_id = TicketBuilder::new(board(), ws_a.clone())
             .title("Trip Ticket")
             .phase(TicketPhase::ReadyForDevelopment)
             .create()
@@ -1845,7 +1845,7 @@ mod tests {
             .expect("create_ticket A");
 
         // Create ticket B in workspace A — this should be moved to Planning when A trips.
-        let ticket_b_id = TicketBuilder::new(board(), ws_a)
+        let victim_id = TicketBuilder::new(board(), ws_a)
             .title("Victim Ticket")
             .phase(TicketPhase::ReadyForDevelopment)
             .create()
@@ -1853,7 +1853,7 @@ mod tests {
             .expect("create_ticket B");
 
         // Create ticket C in workspace B — this must NOT be moved.
-        let ticket_c_id = TicketBuilder::new(board(), ws_b)
+        let other_ws_id = TicketBuilder::new(board(), ws_b)
             .title("Other Workspace Ticket")
             .phase(TicketPhase::ReadyForDevelopment)
             .create()
@@ -1862,13 +1862,13 @@ mod tests {
 
         // Add a comment to ticket A so the circuit breaker has something to count.
         board()
-            .add_comment(&ticket_a_id, "system", "Some comment")
+            .add_comment(&trip_id, "system", "Some comment")
             .await
             .expect("add_comment to A");
 
         // Fetch ticket A and trip the circuit breaker with threshold 0.
         let ticket_a = board()
-            .get_ticket(&ticket_a_id)
+            .get_ticket(&trip_id)
             .await
             .expect("get_ticket A")
             .expect("ticket A exists");
@@ -1888,7 +1888,7 @@ mod tests {
         // ── Verify ticket A is Failed ──
         {
             let ticket_a = board()
-                .get_ticket(&ticket_a_id)
+                .get_ticket(&trip_id)
                 .await
                 .expect("get_ticket A")
                 .expect("ticket A exists");
@@ -1902,7 +1902,7 @@ mod tests {
         // ── Verify ticket B (same workspace) is Planning ──
         {
             let ticket_b = board()
-                .get_ticket(&ticket_b_id)
+                .get_ticket(&victim_id)
                 .await
                 .expect("get_ticket B")
                 .expect("ticket B exists");
@@ -1916,7 +1916,7 @@ mod tests {
         // ── Verify ticket C (different workspace) is still ReadyForDevelopment ──
         {
             let ticket_c = board()
-                .get_ticket(&ticket_c_id)
+                .get_ticket(&other_ws_id)
                 .await
                 .expect("get_ticket C")
                 .expect("ticket C exists");
@@ -1930,7 +1930,7 @@ mod tests {
         // ── Verify ticket B has a system comment referencing ticket A ──
         {
             let comments = board()
-                .get_comments(&ticket_b_id)
+                .get_comments(&victim_id)
                 .await
                 .expect("get_comments for B");
             let comment = comments
@@ -1939,7 +1939,7 @@ mod tests {
                 .expect("ticket B should have a system comment");
 
             assert!(
-                comment.content.contains(&ticket_a_id),
+                comment.content.contains(&trip_id),
                 "comment should contain the tripped ticket's ID"
             );
             assert!(
@@ -2129,14 +2129,14 @@ mod tests {
         let ws = setup_transition_qa_to_done_test("drains_buffer").await;
 
         // Two QaPassed tickets in the same workspace
-        let ticket_a_id = TicketBuilder::new(board(), ws.clone())
+        let first_id = TicketBuilder::new(board(), ws.clone())
             .title("Ticket A")
             .phase(TicketPhase::QaPassed)
             .create()
             .await
             .expect("create ticket A");
 
-        let ticket_b_id = TicketBuilder::new(board(), ws)
+        let second_id = TicketBuilder::new(board(), ws)
             .title("Ticket B")
             .phase(TicketPhase::QaPassed)
             .create()
@@ -2144,7 +2144,7 @@ mod tests {
             .expect("create ticket B");
 
         let ticket_a = board()
-            .get_ticket(&ticket_a_id)
+            .get_ticket(&first_id)
             .await
             .expect("get_ticket")
             .expect("ticket A exists");
@@ -2167,14 +2167,14 @@ mod tests {
 
         // Transition ticket B — no more active tickets, should Notify and drain
         let ticket_b = board()
-            .get_ticket(&ticket_b_id)
+            .get_ticket(&second_id)
             .await
             .expect("get_ticket")
             .expect("ticket B exists");
         transition_qa_to_done(&ticket_b, "Test — ticket B done, last ticket").await;
 
         // Verify both tickets are Done
-        for (id, label) in [(&ticket_a_id, "A"), (&ticket_b_id, "B")] {
+        for (id, label) in [(&first_id, "A"), (&second_id, "B")] {
             let t = board()
                 .get_ticket(id)
                 .await

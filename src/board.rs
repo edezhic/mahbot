@@ -2352,8 +2352,7 @@ mod tests {
                     .has_active_tickets_excluding("ws_non", exclude)
                     .await
                     .expect("check"),
-                "Workspace with only non-active tickets should have no active tickets (excluded {})",
-                exclude,
+                "Workspace with only non-active tickets should have no active tickets (excluded {exclude})",
             );
         }
         // Excluding a nonexistent ID in a non-active-only workspace also returns false

@@ -135,7 +135,6 @@ impl SearchArchivedTicketsTool {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::TicketBuilder;
     use crate::board::open_test_store;
 
     /// Test that the tool-layer fts_search wrapper correctly converts
