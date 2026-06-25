@@ -374,7 +374,7 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 /// Global reloadable config singleton.
 ///
 /// Replaces the old `OnceCell<Config>` (write-once). The `storage_root` is
-/// immutable after startup; all other fields live in an `Arc<RwLock<ConfigData>>`
+/// immutable after startup; all other fields live in an `RwLock<ConfigData>`
 /// that can be atomically swapped at runtime.
 pub static CONFIG: ConfigReload = ConfigReload::const_new();
 
