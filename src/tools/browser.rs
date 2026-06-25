@@ -5,7 +5,7 @@ use crate::{Tool, ToolOutputPhase, Workspace};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::future::join_all;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -23,7 +23,7 @@ struct AgentBrowserResponse {
 }
 
 /// Actions for navigating and extracting content from web pages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserAction {
     /// Navigate to a URL (returns page content automatically).
