@@ -826,11 +826,51 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 /// Transition a QaPassed ticket to Done with a descriptive reason.
 async fn transition_qa_to_done(ticket: &Ticket, reason: &str) {
     info!(ticket = %ticket.id, "{reason}");
+
+    // Determine whether to notify immediately or buffer: if other active
+    // tickets still exist in this workspace, buffer the Done transition so
+    // the Manager only gets one notification when the last ticket finishes.
+    // Active tickets = PIPELINE_BLOCKING_STATUSES + ReadyForDevelopment.
+    //
+    // Race condition: multiple QaPassed tickets in the same workspace are
+    // finalized concurrently (tokio::spawn in poll_round). Both may see each
+    // other as active and both buffer. In this scenario all tickets are already
+    // Done in the database — the only consequence is delayed notifications
+    // until the next UserMessage drains the buffer.
+    let notify_policy = match board()
+        .has_active_tickets_excluding(&ticket.workspace_name, &ticket.id)
+        .await
+    {
+        Ok(true) => {
+            debug!(
+                ticket = %ticket.id,
+                workspace = %ticket.workspace_name,
+                "Other active tickets remain — buffering Done notification",
+            );
+            NotifyPolicy::Buffer
+        }
+        Ok(false) => {
+            // This is the last active ticket in the workspace — notify
+            // immediately. Draining the buffer also delivers any previously
+            // buffered Done transitions from this workspace.
+            NotifyPolicy::Notify
+        }
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                workspace = %ticket.workspace_name,
+                error = %e,
+                "Failed to check active tickets — notifying to be safe",
+            );
+            NotifyPolicy::Notify
+        }
+    };
+
     if let Err(e) = transition_ticket(
         ticket,
         TicketPhase::QaPassed,
         TicketPhase::Done,
-        NotifyPolicy::Notify,
+        notify_policy,
     )
     .await
     {
@@ -1963,10 +2003,10 @@ mod tests {
         // The workspace does not need to exist in the store
         // (resolve_ticket_workspace returns None gracefully for
         // non-existent workspaces, merely skipping the buffer push).
+        // Initialize workspace store — race-safe: if another test already
+        // initialized it, init_global returns an error which we ignore.
         if crate::workspace::WORKSPACES.get().is_none() {
-            crate::workspace::init_global()
-                .await
-                .expect("workspace store init");
+            let _ = crate::workspace::init_global().await;
         }
 
         let ws_a = test_ws_named("/ws_a", "ws_a");
@@ -2291,5 +2331,241 @@ mod tests {
         // This should not panic — all DB operation failures
         // (add_comment, transition_to) are caught and logged internally.
         process_verdict_results(&ticket, &results, vi).await;
+    }
+
+    // ── transition_qa_to_done — conditional notification ─────────────
+
+    /// Ensures the ticket buffer is initialized exactly once across all tests.
+    /// Unlike `ticket_buffer::reset()`, this does not clear existing entries
+    /// from other workspaces, avoiding flake when tests run concurrently.
+    static TICKET_BUF_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    fn ensure_ticket_buffer_initialized() {
+        TICKET_BUF_INIT.get_or_init(|| {
+            // `init_global` panics if already set, but OnceLock ensures
+            // this code runs exactly once.
+            crate::ticket_buffer::init_global();
+        });
+    }
+
+    /// Prepare a workspace for `transition_qa_to_done` tests.
+    ///
+    /// Ensures all global stores (board, workspace, manager_queue) are
+    /// initialized (race-safe with concurrent tests), creates a unique
+    /// workspace in the store, and returns a [`Workspace`] struct referencing
+    /// it. Each test must pass a unique `suffix` to avoid UNIQUE constraint
+    /// and cross-test pollution on the shared ticket buffer.
+    async fn setup_transition_qa_to_done_test(suffix: &str) -> crate::Workspace {
+        init_test_stores().await;
+        ensure_ticket_buffer_initialized();
+        // Workspace store — race-safe: if another test already initialized it,
+        // init_global returns an error which we ignore.
+        if crate::workspace::WORKSPACES.get().is_none() {
+            let _ = crate::workspace::init_global().await;
+        }
+        // Manager queue — needed by the Notify path inside notify_ticket.
+        // Race-safe: if another test already initialized it, init_global
+        // returns an error which we ignore.
+        if crate::manager_queue::MANAGER_QUEUE.get().is_none() {
+            let _ = crate::manager_queue::init_global();
+        }
+
+        let ws_name = format!("ws_{suffix}");
+        let ws_path = format!("/tmp/test_{suffix}");
+        let now = crate::turso::now();
+        crate::workspace::store()
+            .conn
+            .execute(
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                turso::params![ws_name.clone(), ws_path.clone(), now.clone(), now, 0],
+            )
+            .await
+            .expect("insert test workspace");
+
+        test_ws_named(&ws_path, &ws_name)
+    }
+
+    /// Verify that a single QaPassed ticket (the last active one) triggers an
+    /// immediate Notify — no buffer entries should remain.
+    #[tokio::test]
+    async fn transition_qa_to_done_last_ticket_notifies() {
+        let ws = setup_transition_qa_to_done_test("last_notifies").await;
+        let ticket_id = board()
+            .create_ticket(
+                "Last Ticket",
+                "desc",
+                &ws,
+                TicketPhase::QaPassed,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // No other active tickets — should Notify (not buffer)
+        transition_qa_to_done(&ticket, "Test transition — last ticket").await;
+
+        // Verify transitioned to Done
+        let updated = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+        assert_eq!(
+            updated.status,
+            TicketPhase::Done,
+            "Single ticket should transition to Done",
+        );
+
+        // Buffer should be empty (Notify path drains nothing; we had no buffer)
+        let drained = crate::ticket_buffer::drain("ws_last_notifies");
+        assert!(
+            drained.is_empty(),
+            "No buffered entries expected for last-ticket transition: got {drained:?}",
+        );
+    }
+
+    /// Verify that a QaPassed ticket in a workspace with other active tickets
+    /// buffers the Done notification instead of notifying immediately.
+    #[tokio::test]
+    async fn transition_qa_to_done_active_tickets_buffers() {
+        let ws = setup_transition_qa_to_done_test("active_buffers").await;
+
+        // Create one ticket in QaPassed (the one we'll transition)
+        let qa_id = board()
+            .create_ticket(
+                "QA Ticket",
+                "desc",
+                &ws,
+                TicketPhase::QaPassed,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create QA ticket");
+
+        // Create another active ticket (ReadyForDevelopment — active without reservation)
+        board()
+            .create_ticket(
+                "Active RFD",
+                "desc",
+                &ws,
+                TicketPhase::ReadyForDevelopment,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create RFD ticket");
+
+        let ticket = board()
+            .get_ticket(&qa_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // Other active ticket exists — should Buffer
+        transition_qa_to_done(&ticket, "Test transition — other active exists").await;
+
+        // Verify transitioned to Done
+        let updated = board()
+            .get_ticket(&qa_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+        assert_eq!(
+            updated.status,
+            TicketPhase::Done,
+            "Ticket should transition to Done even when buffered",
+        );
+
+        // Buffer should contain the Done transition
+        let drained = crate::ticket_buffer::drain("ws_active_buffers");
+        assert!(
+            !drained.is_empty(),
+            "Buffered entry expected when other active tickets exist",
+        );
+        assert!(
+            drained.contains("qa_passed → done"),
+            "Buffer entry should contain the status transition: {drained}",
+        );
+    }
+
+    /// Verify that when multiple QaPassed tickets exist and the last one finishes,
+    /// the notification includes previously buffered Done transitions (buffer drain).
+    #[tokio::test]
+    async fn transition_qa_to_done_last_ticket_drains_buffer() {
+        let ws = setup_transition_qa_to_done_test("drains_buffer").await;
+
+        // Two QaPassed tickets in the same workspace
+        let ticket_a_id = board()
+            .create_ticket(
+                "Ticket A",
+                "desc",
+                &ws,
+                TicketPhase::QaPassed,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create ticket A");
+
+        let ticket_b_id = board()
+            .create_ticket(
+                "Ticket B",
+                "desc",
+                &ws,
+                TicketPhase::QaPassed,
+                &[],
+                "test",
+                None,
+            )
+            .await
+            .expect("create ticket B");
+
+        let ticket_a = board()
+            .get_ticket(&ticket_a_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket A exists");
+
+        // Transition ticket A — ticket B is still QaPassed (active), so Buffer
+        transition_qa_to_done(&ticket_a, "Test — ticket A done, B still active").await;
+
+        // Transition ticket B — no more active tickets, should Notify
+        let ticket_b = board()
+            .get_ticket(&ticket_b_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket B exists");
+        transition_qa_to_done(&ticket_b, "Test — ticket B done, last ticket").await;
+
+        // Verify both tickets are Done
+        for (id, label) in [(&ticket_a_id, "A"), (&ticket_b_id, "B")] {
+            let t = board()
+                .get_ticket(id)
+                .await
+                .expect("get_ticket")
+                .unwrap_or_else(|| panic!("ticket {label} exists"));
+            assert_eq!(t.status, TicketPhase::Done, "Ticket {label} should be Done");
+        }
+
+        // The Notify path on ticket B should have drained the buffer,
+        // consuming ticket A's buffered entry. No entries for this workspace
+        // should remain.
+        let drained = crate::ticket_buffer::drain("ws_drains_buffer");
+        assert!(
+            drained.is_empty(),
+            "Buffer should be empty after last ticket's Notify drains it",
+        );
     }
 }
