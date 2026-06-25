@@ -54,12 +54,19 @@ pub struct ModelRouting {
 /// 3. **Typed accessor** — write a typed accessor on [`ConfigReload`] (see
 ///    "String config accessors" below) so that the public API stays uniform.
 ///
-/// ## Transient `Option<String>` fields (non-persisted)
+/// ## All `Option<String>` fields must be in the macro
 ///
-/// If a new `Option<String>` field is a runtime-only cache or otherwise NOT
-/// meant to be persisted as a config KV pair, do NOT add it to
-/// `string_config_fields!` and do NOT add it to `ConfigData::STRUCT_FIELDS_DEFAULT`.
-/// It will not be persisted through `save_and_reload` — this is intentional.
+/// EVERY `Option<String>` field on [`ConfigData`] **must** appear in the
+/// `string_config_fields!` invocation — the compiler enforces this through
+/// `STRUCT_FIELDS_DEFAULT` (a `const Self { … }` that initialises every
+/// field).  There is no such thing as a "transient" `Option<String>` field
+/// that lives outside the macro.
+///
+/// Fields that should NOT be persisted as config KV pairs (runtime-only
+/// caches, reconstructed state) will still appear in `string_fields()`
+/// and thus be written/read by `save_and_reload` / `reload_from_db`.
+/// If you truly need an unpersisted value, use a different type or a
+/// separate data structure — not an `Option<String>` on [`ConfigData`].
 ///
 /// ## UX asymmetry warning
 ///
@@ -68,7 +75,7 @@ pub struct ModelRouting {
 /// [`ConfigData::string_fields`], which is macro-generated.  A field missing from
 /// the macro would appear editable in the GUI but silently discard its value on
 /// every save.  The compiler guard on `ConfigData::STRUCT_FIELDS_DEFAULT` prevents this.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConfigData {
     /// API key for the LLM provider.
     pub provider_key: Option<String>,
@@ -570,7 +577,7 @@ pub async fn load_or_init() -> Result<()> {
 
     // Start with hardcoded defaults — reload_from_db() will overlay
     // any persisted values from config.db (called later in bootstrap).
-    CONFIG.swap(ConfigData::default());
+    CONFIG.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
 
     tracing::info!(
         "Config system initialised (storage root: {}).",
@@ -584,7 +591,7 @@ pub async fn load_or_init() -> Result<()> {
 /// a GUI-driven save.
 pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
-    let mut config = ConfigData::default();
+    let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
 
     // Load key-value pairs
     let kvs = store.get_all_kv().await?;
@@ -905,5 +912,18 @@ mod tests {
             reload.image_gen_model(),
             "google/gemini-3.1-flash-image-preview"
         );
+    }
+
+    /// Verify that `STRUCT_FIELDS_DEFAULT` and `Default::default()` produce
+    /// semantically identical values.  Both initialise all `Option<String>`
+    /// fields to `None` and all `Vec` fields to empty vectors.
+    ///
+    /// This is a compile-time sanity check: if someone accidentally adds a
+    /// non-`None` / non-empty initialiser to one but not the other, this test
+    /// will catch the divergence.  (Currently both are structurally identical
+    /// by construction — this test is belt-and-suspenders against drift.)
+    #[test]
+    fn struct_fields_default_matches_derive_default() {
+        assert_eq!(ConfigData::default(), ConfigData::STRUCT_FIELDS_DEFAULT);
     }
 }
