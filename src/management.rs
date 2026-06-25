@@ -778,6 +778,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             phase = target_phase.as_ref(),
             stuck = TicketPhase::InDevelopment.as_ref(),
         );
+        let _ = board().set_assigned_to(&ticket.id, None).await;
     }
 }
 
