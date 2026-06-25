@@ -377,20 +377,7 @@ impl SettingsState {
             }
             SettingsMessage::RoleModel { role, model } => {
                 let model_opt = Some(model).filter(|s| !s.is_empty());
-                if let Some(existing) = self
-                    .config
-                    .per_role_configs
-                    .iter_mut()
-                    .find(|rc| rc.role == role)
-                {
-                    existing.model = model_opt;
-                } else {
-                    self.config.per_role_configs.push(RoleConfig {
-                        role,
-                        model: model_opt,
-                        reasoning_effort: None,
-                    });
-                }
+                RoleConfig::upsert_model(&mut self.config.per_role_configs, role, model_opt);
                 Task::none()
             }
             SettingsMessage::RoleReasoning { role, effort } => {
@@ -399,55 +386,28 @@ impl SettingsState {
                 } else {
                     Some(effort).filter(|s| !s.is_empty())
                 };
-                if let Some(existing) = self
-                    .config
-                    .per_role_configs
-                    .iter_mut()
-                    .find(|rc| rc.role == role)
-                {
-                    existing.reasoning_effort = effort_opt;
-                } else {
-                    self.config.per_role_configs.push(RoleConfig {
-                        role,
-                        model: None,
-                        reasoning_effort: effort_opt,
-                    });
-                }
+                RoleConfig::upsert_reasoning_effort(
+                    &mut self.config.per_role_configs,
+                    role,
+                    effort_opt,
+                );
                 Task::none()
             }
             SettingsMessage::ModelRoutingOrder { model, order } => {
                 let order_opt = Some(order).filter(|s| !s.is_empty());
-                if let Some(existing) = self
-                    .config
-                    .model_routings
-                    .iter_mut()
-                    .find(|mr| mr.model == model)
-                {
-                    existing.provider_order = order_opt;
-                } else {
-                    self.config.model_routings.push(ModelRouting {
-                        model,
-                        provider_order: order_opt,
-                        allow_fallbacks: None,
-                    });
-                }
+                ModelRouting::upsert_provider_order(
+                    &mut self.config.model_routings,
+                    model,
+                    order_opt,
+                );
                 Task::none()
             }
             SettingsMessage::ModelRoutingAllowFallbacks { model, allow } => {
-                if let Some(existing) = self
-                    .config
-                    .model_routings
-                    .iter_mut()
-                    .find(|mr| mr.model == model)
-                {
-                    existing.allow_fallbacks = Some(allow);
-                } else {
-                    self.config.model_routings.push(ModelRouting {
-                        model,
-                        provider_order: None,
-                        allow_fallbacks: Some(allow),
-                    });
-                }
+                ModelRouting::upsert_allow_fallbacks(
+                    &mut self.config.model_routings,
+                    model,
+                    Some(allow),
+                );
                 Task::none()
             }
             SettingsMessage::TogglePasswordVisibility(target) => {
