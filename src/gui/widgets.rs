@@ -2,6 +2,7 @@
 //! and build_tree_panel for shared file-tree panel rendering.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
 
 use iced::widget::{self, button, column, container, pick_list, text, text_input};
@@ -326,6 +327,39 @@ impl FileTree {
         let is_dir = self.visible_tree_nodes[idx].1;
         Some((idx, path, is_dir))
     }
+
+    /// Returns `true` when the focused node is a directory and is currently expanded.
+    ///
+    /// This is a read-only inspection helper that centralises the common
+    /// `is_dir && expanded_dirs.contains(path)` check that appears in tree-navigation
+    /// keyboard handlers.  Returns `false` when the tree is not focused, empty, or
+    /// the focused node is a file or a collapsed directory.
+    #[must_use]
+    pub fn focused_is_expanded_dir(&self) -> bool {
+        self.focused_tree_node()
+            .is_some_and(|(_, ref path, is_dir)| is_dir && self.expanded_dirs.contains(path))
+    }
+
+    /// Returns the parent path of the focused node, or [`None`] for root-level items.
+    ///
+    /// Computes the parent by calling [`std::path::Path::parent`] on the focused
+    /// node's full path.  Returns [`None`] when the tree is not focused, empty, or
+    /// the focused node is already at the root (no parent).
+    ///
+    /// This is a read-only helper that replaces the repeated
+    /// `Path::new(&path).parent().map(|p| p.to_string_lossy().to_string())`
+    /// pattern in tree-navigation keyboard handlers.
+    #[must_use]
+    pub fn focused_parent_path(&self) -> Option<String> {
+        let (_idx, path, _is_dir) = self.focused_tree_node()?;
+        let parent = Path::new(&path).parent()?;
+        let parent_str = parent.to_string_lossy().to_string();
+        if parent_str.is_empty() {
+            None
+        } else {
+            Some(parent_str)
+        }
+    }
 }
 
 /// Font size for file tree item labels and connector guides.
@@ -640,7 +674,81 @@ mod tests {
         assert!(is_dir);
     }
 
-    // ── tree_guide_prefix tests ─────────────────────────────────────
+    // ── focused_is_expanded_dir tests ────────────────────────────────
+
+    #[test]
+    fn focused_is_expanded_dir_not_focused() {
+        let tree = make_tree(vec![("src", true)]);
+        // Tree is not focused.
+        assert!(!tree.focused_is_expanded_dir());
+    }
+
+    #[test]
+    fn focused_is_expanded_dir_empty_tree() {
+        let mut tree = make_tree(vec![]);
+        tree.tree_focused = true;
+        assert!(!tree.focused_is_expanded_dir());
+    }
+
+    #[test]
+    fn focused_is_expanded_dir_file() {
+        let mut tree = make_tree(vec![("main.rs", false)]);
+        tree.tree_focused = true;
+        assert!(!tree.focused_is_expanded_dir());
+    }
+
+    #[test]
+    fn focused_is_expanded_dir_collapsed_directory() {
+        let mut tree = make_tree(vec![("src", true)]);
+        tree.tree_focused = true;
+        // "src" is a directory but not in expanded_dirs.
+        assert!(!tree.focused_is_expanded_dir());
+    }
+
+    #[test]
+    fn focused_is_expanded_dir_expanded_directory() {
+        let mut tree = make_tree(vec![("src", true)]);
+        tree.tree_focused = true;
+        tree.expanded_dirs.insert("src".into());
+        assert!(tree.focused_is_expanded_dir());
+    }
+
+    // ── focused_parent_path tests ────────────────────────────────────
+
+    #[test]
+    fn focused_parent_path_not_focused() {
+        let tree = make_tree(vec![("src/main.rs", false)]);
+        assert!(tree.focused_parent_path().is_none());
+    }
+
+    #[test]
+    fn focused_parent_path_empty_tree() {
+        let mut tree = make_tree(vec![]);
+        tree.tree_focused = true;
+        assert!(tree.focused_parent_path().is_none());
+    }
+
+    #[test]
+    fn focused_parent_path_root_item() {
+        let mut tree = make_tree(vec![("src", true)]);
+        tree.tree_focused = true;
+        // Root-level item — no parent.
+        assert!(tree.focused_parent_path().is_none());
+    }
+
+    #[test]
+    fn focused_parent_path_nested() {
+        let mut tree = make_tree(vec![("src/main.rs", false)]);
+        tree.tree_focused = true;
+        assert_eq!(tree.focused_parent_path(), Some("src".into()));
+    }
+
+    #[test]
+    fn focused_parent_path_deep_nested() {
+        let mut tree = make_tree(vec![("a/b/c/file.rs", false)]);
+        tree.tree_focused = true;
+        assert_eq!(tree.focused_parent_path(), Some("a/b/c".into()));
+    }
 
     /// Build the expected guide string from a literal. Makes it easier to
     /// see the box-drawing characters in test output.

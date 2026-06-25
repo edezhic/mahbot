@@ -3190,11 +3190,11 @@ impl EditorState {
                 let Some((_idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
                     return Task::none();
                 };
+                if self.file_tree.focused_is_expanded_dir() {
+                    // Collapse: rebuild and keep focus on the collapsed directory.
+                    return self.collapse_dir(&path);
+                }
                 if is_dir {
-                    if self.file_tree.expanded_dirs.contains(&path) {
-                        // Collapse: rebuild and keep focus on the collapsed directory.
-                        return self.collapse_dir(&path);
-                    }
                     // Expand: insert, rebuild, jump to first child.
                     return self.expand_dir_and_focus(&path, "TreeNavEnter");
                 }
@@ -3207,21 +3207,18 @@ impl EditorState {
                 if self.is_renaming() {
                     return Task::none();
                 }
-                let Some((_idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
+                let Some((_idx, path, _)) = self.file_tree.focused_tree_node() else {
                     return Task::none();
                 };
 
-                if is_dir && self.file_tree.expanded_dirs.contains(&path) {
+                if self.file_tree.focused_is_expanded_dir() {
                     // Collapse expanded directory and keep focus on it.
                     return self.collapse_dir(&path);
                 }
 
                 // ArrowLeft on collapsed directory or file — navigate to parent.
-                let parent = Path::new(&path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string());
-                match parent {
-                    Some(ref p) if !p.is_empty() && self.file_tree.focus_path(p).is_some() => {
+                match self.file_tree.focused_parent_path() {
+                    Some(ref p) if self.file_tree.focus_path(p).is_some() => {
                         return widgets::scroll_to_tree_focus(&self.file_tree);
                     }
                     _ => {} // Root-level item has no parent — no-op.
