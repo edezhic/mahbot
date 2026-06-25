@@ -169,11 +169,7 @@ pub fn skills_to_prompt(skills: &[Skill], ws: &crate::Workspace) -> String {
 
 fn write_xml_text_element(w: &mut String, indent: usize, name: &str, value: &str) {
     let padding = " ".repeat(indent);
-    let escaped = value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;");
+    let escaped = crate::util::html::escape_html(value);
     let _ = writeln!(w, "{padding}<{name}>{escaped}</{name}>");
 }
 
@@ -393,5 +389,17 @@ mod tests {
 
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 3);
+    }
+
+    #[test]
+    fn write_xml_text_element_escapes_special_chars() {
+        // Verify that `<`, `>`, `&`, `"`, and `'` are all properly escaped
+        // using the shared `escape_html` from `util::html`.
+        let mut out = String::new();
+        write_xml_text_element(&mut out, 0, "test", "<hello> & \"world\" 'test'");
+        assert_eq!(
+            out,
+            "<test>&lt;hello&gt; &amp; &quot;world&quot; &#39;test&#39;</test>\n"
+        );
     }
 }

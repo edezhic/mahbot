@@ -475,6 +475,199 @@ async fn resolve_authorized_sender(
     Some((canonical_user, chat_id, reply_target))
 }
 
+/// Decode common HTML entities that might appear in LLM output.
+/// Must be called *before* `markdown_to_telegram_html` so that entities like
+/// `&#39;` → `'` → then re-encoded correctly by `escape_html` → `&#39;`.
+/// Without this, the `&` in `&#39;` gets double-escaped to `&amp;#39;`.
+/// Order matters: decode `&amp;` before `&#39;` so that double-encoded
+/// `&amp;#39;` → `&#39;` → `'`, and before `&lt;`/`&gt;`/`&quot;`
+/// to handle double-encoded named entities like `&amp;lt;`.
+///
+/// Fast path: returns `s.to_string()` immediately when no `&` is present,
+/// avoiding 5 chained `replace` allocations in the common case where LLM
+/// output contains no HTML entities.
+fn decode_html_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&amp;", "&")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+}
+
+/// Convert Markdown to Telegram HTML format.
+/// Telegram HTML supports: &lt;b&gt;, &lt;i&gt;, &lt;u&gt;, &lt;s&gt;, &lt;code&gt;, &lt;pre&gt;, &lt;a href="..."&gt;
+/// Convert a subset of Markdown to Telegram's HTML parse_mode format.
+///
+/// Supported: headers (`# …`, `## …`), bold (`**…**`, `__…__`), italic (`*…*`),
+/// inline code (`` `…` ``), links (`[…](url)`), strikethrough (`~~…~~`),
+/// fenced code blocks (` ``` … ``` `), and `<blockquote>` pass-through.
+///
+/// Code block fences are detected first so inline formatting inside them is
+/// never interpreted (single-pass with code-block tracking).
+#[allow(clippy::too_many_lines)]
+fn markdown_to_telegram_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code_block = false;
+    let mut code_buf = String::new();
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+
+        // ── Fenced code blocks ────────────────────────────────
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                in_code_block = false;
+                let escaped = crate::util::html::escape_html(code_buf.trim_end_matches('\n'));
+                let _ = writeln!(out, "<pre><code>{escaped}</code></pre>");
+                code_buf.clear();
+            } else {
+                in_code_block = true;
+                code_buf.clear();
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_buf.push_str(line);
+            code_buf.push('\n');
+            continue;
+        }
+
+        // ── Blockquotes — pass through as-is ──────────────────
+        if trimmed.starts_with("<blockquote") || trimmed == "</blockquote>" {
+            out.push_str(trimmed);
+            out.push('\n');
+            continue;
+        }
+
+        // ── Headers: ## Title → <b>Title</b> ───────────────────
+        let stripped = line.trim_start_matches('#');
+        let header_level = line.len() - stripped.len();
+        if header_level > 0 && line.starts_with('#') && stripped.starts_with(' ') {
+            let title = crate::util::html::escape_html(stripped.trim());
+            let _ = writeln!(out, "<b>{title}</b>");
+            continue;
+        }
+
+        // ── Inline formatting per line ────────────────────────
+        let mut line_out = String::new();
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            // Bold: **text** or __text__
+            let bold_delim: Option<&str> = (i + 1 < len)
+                .then(|| {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'*' {
+                        Some("**")
+                    } else if bytes[i] == b'_' && bytes[i + 1] == b'_' {
+                        Some("__")
+                    } else {
+                        None
+                    }
+                })
+                .flatten();
+            if let Some(delim) = bold_delim
+                && let Some(end) = line[i + 2..].find(delim)
+            {
+                let inner = crate::util::html::escape_html(&line[i + 2..i + 2 + end]);
+                let _ = write!(line_out, "<b>{inner}</b>");
+                i += 4 + end;
+                continue;
+            }
+            // Italic: *text*
+            if bytes[i] == b'*'
+                && (i == 0 || bytes[i - 1] != b'*')
+                && let Some(end) = line[i + 1..].find('*')
+                && end > 0
+            {
+                let inner = crate::util::html::escape_html(&line[i + 1..i + 1 + end]);
+                let _ = write!(line_out, "<i>{inner}</i>");
+                i += 2 + end;
+                continue;
+            }
+            // Inline code: `code`
+            if bytes[i] == b'`'
+                && (i == 0 || bytes[i - 1] != b'`')
+                && let Some(end) = line[i + 1..].find('`')
+            {
+                let inner = crate::util::html::escape_html(&line[i + 1..i + 1 + end]);
+                let _ = write!(line_out, "<code>{inner}</code>");
+                i += 2 + end;
+                continue;
+            }
+            // Markdown link: [text](url)
+            if bytes[i] == b'['
+                && let Some(bracket_end) = line[i + 1..].find(']')
+            {
+                let text_part = &line[i + 1..i + 1 + bracket_end];
+                let after_bracket = i + 1 + bracket_end + 1;
+                if after_bracket < len
+                    && bytes[after_bracket] == b'('
+                    && let Some(paren_end) = line[after_bracket + 1..].find(')')
+                {
+                    let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        let text_html = crate::util::html::escape_html(text_part);
+                        let url_html = crate::util::html::escape_html(url);
+                        let _ = write!(line_out, "<a href=\"{url_html}\">{text_html}</a>");
+                        i = after_bracket + 1 + paren_end + 1;
+                        continue;
+                    }
+                }
+            }
+            // Strikethrough: ~~text~~
+            if i + 1 < len
+                && bytes[i] == b'~'
+                && bytes[i + 1] == b'~'
+                && let Some(end) = line[i + 2..].find("~~")
+            {
+                let inner = crate::util::html::escape_html(&line[i + 2..i + 2 + end]);
+                let _ = write!(line_out, "<s>{inner}</s>");
+                i += 4 + end;
+                continue;
+            }
+            // Default: escape HTML entities
+            let ch = line[i..].chars().next().unwrap();
+            crate::util::html::push_escaped(ch, &mut line_out);
+            i += ch.len_utf8();
+        }
+        line_out.push('\n');
+        out.push_str(&line_out);
+    }
+
+    // Unclosed code block at EOF — emit what we have.
+    if in_code_block && !code_buf.is_empty() {
+        let _ = writeln!(
+            out,
+            "<pre><code>{}</code></pre>",
+            crate::util::html::escape_html(code_buf.trim_end())
+        );
+    }
+
+    out.trim_end_matches('\n').to_string()
+}
+
+/// Strip all HTML tags from a string, leaving only the text content.
+/// Used when falling back from HTML `parse_mode` to plain text so users
+/// don't see raw tags like `<b>`, `<code>`, `<pre>` etc.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 impl TelegramChannel {
     /// Internal constructor shared by [`new`](Self::new) and
     /// [`with_offset`](Self::with_offset).
@@ -955,222 +1148,6 @@ impl TelegramChannel {
         Some(ctx.into_channel_message(content))
     }
 
-    /// Decode common HTML entities that might appear in LLM output.
-    /// Must be called *before* `markdown_to_telegram_html` so that entities like
-    /// `&#39;` → `'` → then re-encoded correctly by `escape_html` → `&#39;`.
-    /// Without this, the `&` in `&#39;` gets double-escaped to `&amp;#39;`.
-    /// Order matters: decode `&amp;` before `&#39;` so that double-encoded
-    /// `&amp;#39;` → `&#39;` → `'`, and before `&lt;`/`&gt;`/`&quot;`
-    /// to handle double-encoded named entities like `&amp;lt;`.
-    ///
-    /// Fast path: returns `s.to_string()` immediately when no `&` is present,
-    /// avoiding 5 chained `replace` allocations in the common case where LLM
-    /// output contains no HTML entities.
-    fn decode_html_entities(s: &str) -> String {
-        if !s.contains('&') {
-            return s.to_string();
-        }
-        s.replace("&amp;", "&")
-            .replace("&#39;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-    }
-
-    /// Convert Markdown to Telegram HTML format.
-    /// Telegram HTML supports: &lt;b&gt;, &lt;i&gt;, &lt;u&gt;, &lt;s&gt;, &lt;code&gt;, &lt;pre&gt;, &lt;a href="..."&gt;
-    /// Convert a subset of Markdown to Telegram's HTML parse_mode format.
-    ///
-    /// Supported: headers (`# …`, `## …`), bold (`**…**`, `__…__`), italic (`*…*`),
-    /// inline code (`` `…` ``), links (`[…](url)`), strikethrough (`~~…~~`),
-    /// fenced code blocks (` ``` … ``` `), and `<blockquote>` pass-through.
-    ///
-    /// Code block fences are detected first so inline formatting inside them is
-    /// never interpreted (single-pass with code-block tracking).
-    #[allow(clippy::too_many_lines)]
-    fn markdown_to_telegram_html(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut in_code_block = false;
-        let mut code_buf = String::new();
-
-        for line in text.split('\n') {
-            let trimmed = line.trim_start();
-
-            // ── Fenced code blocks ────────────────────────────────
-            if trimmed.starts_with("```") {
-                if in_code_block {
-                    in_code_block = false;
-                    let escaped = Self::escape_html(code_buf.trim_end_matches('\n'));
-                    let _ = writeln!(out, "<pre><code>{escaped}</code></pre>");
-                    code_buf.clear();
-                } else {
-                    in_code_block = true;
-                    code_buf.clear();
-                }
-                continue;
-            }
-
-            if in_code_block {
-                code_buf.push_str(line);
-                code_buf.push('\n');
-                continue;
-            }
-
-            // ── Blockquotes — pass through as-is ──────────────────
-            if trimmed.starts_with("<blockquote") || trimmed == "</blockquote>" {
-                out.push_str(trimmed);
-                out.push('\n');
-                continue;
-            }
-
-            // ── Headers: ## Title → <b>Title</b> ───────────────────
-            let stripped = line.trim_start_matches('#');
-            let header_level = line.len() - stripped.len();
-            if header_level > 0 && line.starts_with('#') && stripped.starts_with(' ') {
-                let title = Self::escape_html(stripped.trim());
-                let _ = writeln!(out, "<b>{title}</b>");
-                continue;
-            }
-
-            // ── Inline formatting per line ────────────────────────
-            let mut line_out = String::new();
-            let bytes = line.as_bytes();
-            let len = bytes.len();
-            let mut i = 0;
-            while i < len {
-                // Bold: **text** or __text__
-                let bold_delim: Option<&str> = (i + 1 < len)
-                    .then(|| {
-                        if bytes[i] == b'*' && bytes[i + 1] == b'*' {
-                            Some("**")
-                        } else if bytes[i] == b'_' && bytes[i + 1] == b'_' {
-                            Some("__")
-                        } else {
-                            None
-                        }
-                    })
-                    .flatten();
-                if let Some(delim) = bold_delim
-                    && let Some(end) = line[i + 2..].find(delim)
-                {
-                    let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                    let _ = write!(line_out, "<b>{inner}</b>");
-                    i += 4 + end;
-                    continue;
-                }
-                // Italic: *text*
-                if bytes[i] == b'*'
-                    && (i == 0 || bytes[i - 1] != b'*')
-                    && let Some(end) = line[i + 1..].find('*')
-                    && end > 0
-                {
-                    let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                    let _ = write!(line_out, "<i>{inner}</i>");
-                    i += 2 + end;
-                    continue;
-                }
-                // Inline code: `code`
-                if bytes[i] == b'`'
-                    && (i == 0 || bytes[i - 1] != b'`')
-                    && let Some(end) = line[i + 1..].find('`')
-                {
-                    let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                    let _ = write!(line_out, "<code>{inner}</code>");
-                    i += 2 + end;
-                    continue;
-                }
-                // Markdown link: [text](url)
-                if bytes[i] == b'['
-                    && let Some(bracket_end) = line[i + 1..].find(']')
-                {
-                    let text_part = &line[i + 1..i + 1 + bracket_end];
-                    let after_bracket = i + 1 + bracket_end + 1;
-                    if after_bracket < len
-                        && bytes[after_bracket] == b'('
-                        && let Some(paren_end) = line[after_bracket + 1..].find(')')
-                    {
-                        let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
-                        if url.starts_with("http://") || url.starts_with("https://") {
-                            let text_html = Self::escape_html(text_part);
-                            let url_html = Self::escape_html(url);
-                            let _ = write!(line_out, "<a href=\"{url_html}\">{text_html}</a>");
-                            i = after_bracket + 1 + paren_end + 1;
-                            continue;
-                        }
-                    }
-                }
-                // Strikethrough: ~~text~~
-                if i + 1 < len
-                    && bytes[i] == b'~'
-                    && bytes[i + 1] == b'~'
-                    && let Some(end) = line[i + 2..].find("~~")
-                {
-                    let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                    let _ = write!(line_out, "<s>{inner}</s>");
-                    i += 4 + end;
-                    continue;
-                }
-                // Default: escape HTML entities
-                let ch = line[i..].chars().next().unwrap();
-                Self::push_escaped(ch, &mut line_out);
-                i += ch.len_utf8();
-            }
-            line_out.push('\n');
-            out.push_str(&line_out);
-        }
-
-        // Unclosed code block at EOF — emit what we have.
-        if in_code_block && !code_buf.is_empty() {
-            let _ = writeln!(
-                out,
-                "<pre><code>{}</code></pre>",
-                Self::escape_html(code_buf.trim_end())
-            );
-        }
-
-        out.trim_end_matches('\n').to_string()
-    }
-
-    /// Push a character to the output buffer, escaping HTML-special characters
-    /// as their corresponding entities. Used in the hot loop of
-    /// `markdown_to_telegram_html` where we process characters one-by-one.
-    #[inline]
-    fn push_escaped(ch: char, out: &mut String) {
-        match ch {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-
-    fn escape_html(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for ch in s.chars() {
-            Self::push_escaped(ch, &mut out);
-        }
-        out
-    }
-
-    /// Strip all HTML tags from a string, leaving only the text content.
-    /// Used when falling back from HTML `parse_mode` to plain text so users
-    /// don't see raw tags like `<b>`, `<code>`, `<pre>` etc.
-    fn strip_html_tags(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut in_tag = false;
-        for c in s.chars() {
-            match c {
-                '<' => in_tag = true,
-                '>' => in_tag = false,
-                _ if !in_tag => out.push(c),
-                _ => {}
-            }
-        }
-        out
-    }
-
     /// Send one Telegram text message, with optional `parse_mode`.
     /// Returns the HTTP status and response body on failure, or Ok(()) on success.
     async fn send_single_message(
@@ -1222,9 +1199,9 @@ impl TelegramChannel {
     ) -> anyhow::Result<()> {
         // Decode HTML entities (e.g. &#39;) that LLM may emit, before
         // markdown-to-HTML conversion so they don't get double-escaped.
-        let message = Self::decode_html_entities(message);
+        let message = decode_html_entities(message);
         // Convert Markdown to Telegram HTML once, then split.
-        let html = Self::markdown_to_telegram_html(&message);
+        let html = markdown_to_telegram_html(&message);
         let chunks = split_message_for_telegram(&html);
 
         for (index, chunk) in chunks.iter().enumerate() {
@@ -1253,7 +1230,7 @@ impl TelegramChannel {
                     "Telegram sendMessage with HTML parse_mode failed; retrying without parse_mode"
                 );
                 // Strip HTML tags so users don't see raw `<b>`, `<code>` etc.
-                let clean_text = Self::strip_html_tags(&text);
+                let clean_text = strip_html_tags(&text);
                 self.send_single_message(chat_id, thread_id, &clean_text, None, chunk_reply_markup)
                     .await
                     .map_err(|(plain_status, plain_err)| {
@@ -1834,100 +1811,64 @@ mod tests {
     }
 
     #[test]
-    fn markdown_to_telegram_html() {
+    fn test_markdown_to_telegram_html() {
         // escapes quotes in link href
-        let r = TelegramChannel::markdown_to_telegram_html(
-            "[click](https://example.com?q=\"x\"&a='b')",
-        );
+        let r = markdown_to_telegram_html("[click](https://example.com?q=\"x\"&a='b')");
         assert_eq!(
             r,
             "<a href=\"https://example.com?q=&quot;x&quot;&amp;a=&#39;b&#39;\">click</a>"
         );
         // escapes quotes/ampersand in plain text
-        let r = TelegramChannel::markdown_to_telegram_html("say \"hi\" & <tag> 'ok'");
+        let r = markdown_to_telegram_html("say \"hi\" & <tag> 'ok'");
         assert_eq!(r, "say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;");
         // drops language attribute from code blocks
-        let r = TelegramChannel::markdown_to_telegram_html(
-            "```rust\" onclick=\"alert(1)\nlet x = 1;\n```",
-        );
+        let r = markdown_to_telegram_html("```rust\" onclick=\"alert(1)\nlet x = 1;\n```");
         assert_eq!(r, "<pre><code>let x = 1;</code></pre>");
         assert!(!r.contains("language-"));
         assert!(!r.contains("onclick"));
 
         // Inline formatting inside code blocks is preserved literally
-        let r = TelegramChannel::markdown_to_telegram_html("```\nsome **bold** and `code`\n```");
+        let r = markdown_to_telegram_html("```\nsome **bold** and `code`\n```");
         assert_eq!(r, "<pre><code>some **bold** and `code`</code></pre>");
 
         // HTML special characters in code blocks are escaped
-        let r = TelegramChannel::markdown_to_telegram_html("```\n<div> & \"it\" 'works'\n```");
+        let r = markdown_to_telegram_html("```\n<div> & \"it\" 'works'\n```");
         assert_eq!(
             r,
             "<pre><code>&lt;div&gt; &amp; &quot;it&quot; &#39;works&#39;</code></pre>"
         );
 
         // Literal </code> in code block must not break the HTML
-        let r = TelegramChannel::markdown_to_telegram_html("```\nuse &lt;/code&gt;\n```");
+        let r = markdown_to_telegram_html("```\nuse &lt;/code&gt;\n```");
         assert_eq!(r, "<pre><code>use &amp;lt;/code&amp;gt;</code></pre>");
-    }
-
-    #[test]
-    fn escape_html_all_special_chars() {
-        // All five special characters in one string
-        let r = TelegramChannel::escape_html("<div class=\"test\">AT&T 'hello'</div>");
-        assert_eq!(
-            r,
-            "&lt;div class=&quot;test&quot;&gt;AT&amp;T &#39;hello&#39;&lt;/div&gt;"
-        );
-    }
-
-    #[test]
-    fn escape_html_no_special_chars() {
-        // Plain text with no special characters passes through unchanged
-        let r = TelegramChannel::escape_html("hello world 123");
-        assert_eq!(r, "hello world 123");
-    }
-
-    #[test]
-    fn escape_html_empty_string() {
-        let r = TelegramChannel::escape_html("");
-        assert_eq!(r, "");
-    }
-
-    #[test]
-    fn escape_html_only_ampersand() {
-        // The order-dependency test: & must not be double-escaped
-        let r = TelegramChannel::escape_html("&amp; &lt; &gt; &quot; &#39;");
-        assert_eq!(r, "&amp;amp; &amp;lt; &amp;gt; &amp;quot; &amp;#39;");
     }
 
     #[test]
     fn decode_html_entities_no_change() {
         // Fast path: no ampersand → returned unchanged (also covers empty string)
-        let r = TelegramChannel::decode_html_entities("hello world 123");
+        let r = decode_html_entities("hello world 123");
         assert_eq!(r, "hello world 123");
-        assert_eq!(TelegramChannel::decode_html_entities(""), "");
+        assert_eq!(decode_html_entities(""), "");
     }
 
     #[test]
     fn decode_html_entities_lone_ampersand() {
         // Ampersand with no valid entity passes through unchanged
-        let r = TelegramChannel::decode_html_entities("a & b");
+        let r = decode_html_entities("a & b");
         assert_eq!(r, "a & b");
     }
 
     #[test]
     fn decode_html_entities_all() {
         // All five entities decoded in realistic text
-        let r = TelegramChannel::decode_html_entities(
-            "say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;",
-        );
+        let r = decode_html_entities("say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;");
         assert_eq!(r, "say \"hi\" & <tag> 'ok'");
     }
 
     #[test]
     fn decode_html_entities_double_encoded() {
         // Order dependency: &amp; before &#39; so &amp;#39; → &#39; → '
-        let r = TelegramChannel::decode_html_entities("&amp;#39;");
+        let r = decode_html_entities("&amp;#39;");
         assert_eq!(r, "'");
     }
 
