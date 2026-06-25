@@ -78,8 +78,6 @@ pub struct DiffFileBuffer {
     pub line_numbers: Vec<(Option<usize>, Option<usize>)>,
     /// Digit count for the widest old/new line number (minimum 1).
     pub gutter_digits: usize,
-    /// Whether this buffer has content to render (not binary / too-large).
-    pub has_content: bool,
 }
 
 // ── Widget state ─────────────────────────────────────────────────────
@@ -265,7 +263,7 @@ where
         let text_area_width = (bounds.width - text_x - self.padding).max(0.0);
 
         // No content — collapse to zero height
-        if !self.data.has_content || self.data.text.is_empty() {
+        if self.data.text.is_empty() {
             return layout::Node::new(Size::new(bounds.width, 0.0));
         }
 
@@ -778,7 +776,6 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
         line_kinds,
         line_numbers,
         gutter_digits,
-        has_content: true,
     }
 }
 
