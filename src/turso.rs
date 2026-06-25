@@ -500,6 +500,29 @@ impl TxGuard<'_> {
         Connection::query_impl(&self.conn, sql, params).await
     }
 
+    /// Execute a read-only query within the transaction, mapping each row
+    /// through a closure. Returns a Vec of results so callers can handle
+    /// per-row errors individually.
+    /// Uses the upstream connection directly so the query participates in the
+    /// transaction.
+    pub async fn query_map<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> turso::Result<Vec<turso::Result<T>>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let rows = Connection::query_impl(&self.conn, sql, params).await?;
+        let mut map = map;
+        Ok(rows
+            .iter()
+            .map(|row| map(row).map_err(|e| turso::Error::Error(e.to_string())))
+            .collect())
+    }
+
     /// Commit the transaction and release the lock.
     pub async fn commit(mut self) -> turso::Result<()> {
         self.conn.execute("COMMIT".to_string(), ()).await?;

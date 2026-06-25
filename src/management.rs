@@ -156,22 +156,23 @@ async fn transition_ticket(
             // so the user can inspect before automated rework proceeds.
             if target == TicketPhase::Failed
                 && let Some(ws) = resolve_ticket_workspace(ticket, "auto-pause after failure").await
-                    && !ws.paused {
-                        if let Err(e) = crate::workspace::store().set_paused(&ws.name, true).await {
-                            warn!(
-                                ticket = %ticket.id,
-                                workspace = %ws.name,
-                                error = %e,
-                                "Failed to pause workspace after ticket failure",
-                            );
-                        } else {
-                            info!(
-                                ticket = %ticket.id,
-                                workspace = %ws.name,
-                                "Workspace paused due to ticket failure",
-                            );
-                        }
-                    }
+                && !ws.paused
+            {
+                if let Err(e) = crate::workspace::store().set_paused(&ws.name, true).await {
+                    warn!(
+                        ticket = %ticket.id,
+                        workspace = %ws.name,
+                        error = %e,
+                        "Failed to pause workspace after ticket failure",
+                    );
+                } else {
+                    info!(
+                        ticket = %ticket.id,
+                        workspace = %ws.name,
+                        "Workspace paused due to ticket failure",
+                    );
+                }
+            }
 
             if matches!(notify, NotifyPolicy::Notify) {
                 notify_ticket(ticket, target).await;
