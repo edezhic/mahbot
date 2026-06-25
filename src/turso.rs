@@ -320,6 +320,17 @@ impl Connection {
     ) -> turso::Result<u64> {
         self.maybe_rollback_dangling_tx().await?;
         let conn = self.conn.lock().await;
+        Self::execute_impl(&conn, sql, params).await
+    }
+
+    /// Core execution logic shared by [`Connection::execute`] and
+    /// [`TxGuard::execute`].  Operates on a raw connection that is already
+    /// locked (no lock acquisition).
+    async fn execute_impl(
+        conn: &turso::Connection,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<u64> {
         conn.execute(sql.to_string(), params).await
     }
 
@@ -351,6 +362,16 @@ impl Connection {
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
         let conn = self.conn.lock().await;
+        Self::query_impl(&conn, sql, params).await
+    }
+
+    /// Core query logic shared by [`Connection::query`] and [`TxGuard::query`].
+    /// Operates on an already-locked connection. Collects all rows into a `Vec`.
+    async fn query_impl(
+        conn: &turso::Connection,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
         let mut rows = conn.query(sql, params).await?;
         let mut result = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -392,6 +413,21 @@ impl Connection {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         let conn = self.conn.lock().await;
+        Self::query_row_impl(&conn, sql, params, map).await
+    }
+
+    /// Core query_row logic shared by [`Connection::query_row`] and
+    /// [`TxGuard::query_row`].  Operates on an already-locked connection.
+    /// Returns [`turso::Error::QueryReturnedNoRows`] when no row matches.
+    async fn query_row_impl<T, E>(
+        conn: &turso::Connection,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> turso::Result<T>
+    where
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
         let mut rows = conn.query(sql, params).await?;
         let row = rows
             .next()
@@ -435,7 +471,7 @@ impl TxGuard<'_> {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<u64> {
-        self.conn.execute(sql.to_string(), params).await
+        Connection::execute_impl(&self.conn, sql, params).await
     }
 
     /// Execute a query that returns exactly one row within the transaction.
@@ -450,12 +486,7 @@ impl TxGuard<'_> {
     where
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let mut rows = self.conn.query(sql, params).await?;
-        let row = rows
-            .next()
-            .await?
-            .ok_or(turso::Error::QueryReturnedNoRows)?;
-        map(&row).map_err(|e| turso::Error::Error(e.to_string()))
+        Connection::query_row_impl(&self.conn, sql, params, map).await
     }
 
     /// Execute a query returning zero or more rows within the transaction.
@@ -466,12 +497,7 @@ impl TxGuard<'_> {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let mut rows = self.conn.query(sql, params).await?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            result.push(row);
-        }
-        Ok(result)
+        Connection::query_impl(&self.conn, sql, params).await
     }
 
     /// Commit the transaction and release the lock.
