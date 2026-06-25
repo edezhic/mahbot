@@ -416,7 +416,8 @@ pub fn unescape_c_style(input: &str) -> Option<String> {
 ///   `rename to` does not need separate extraction.
 ///
 /// - Combined diff format (`diff --combined` / `diff --cc`): these produce
-///   different header formats and are not handled by this parser.
+///   different header formats. Our `git show -m` invocation never produces
+///   these, and they are not handled by this parser.
 fn parse_diff_git_line(line: &str) -> Option<String> {
     let rest = line.strip_prefix("diff --git ")?;
     // Locate the b-part of the two space-separated tokens.
@@ -478,17 +479,16 @@ fn extract_b_path(b_part: &str) -> Option<String> {
 }
 
 /// Parse hunk header: @@ -old_start,old_count +new_start,new_count @@ \[context]
-/// Also handles combined diff format: @@@ -old1,c1 -old2,c2 +new,c @@@ \[context]
 ///
 /// Returns (old_start, new_start).
 ///
 /// # Correctness
 ///
-/// The parser extracts only the range tokens between the opening `@@`/`@@@`
-/// and closing `@@`/`@@@` delimiters, stopping at the first token that starts
-/// with `@`. This prevents context strings containing `-` or `+` (e.g. Rust
-/// function signatures with `->`, or expressions like `a + b`) from corrupting
-/// line numbers.  Additionally, only tokens whose remainder after stripping the
+/// The parser extracts only the range tokens between the opening `@@` and
+/// closing `@@` delimiters, stopping at the first token that starts with `@`.
+/// This prevents context strings containing `-` or `+` (e.g. Rust function
+/// signatures with `->`, or expressions like `a + b`) from corrupting line
+/// numbers.  Additionally, only tokens whose remainder after stripping the
 /// `-`/`+` prefix contain exclusively ASCII digits and commas are treated as
 /// line-number ranges — everything else is logged and skipped.
 fn parse_hunk_header(header: &str) -> (usize, usize) {
@@ -496,10 +496,9 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
     //   @@ -10,7 +10,9 @@ fn main() {
     //   @@ -1 +2 @@ fn main()
     //   @@ -0,0 +1,3 @@
-    //   @@@ -10,7 -12,7 +10,9 @@@ fn main()
     //   @@ -10,7 +10,9 @@ fn process() -> Result<()>
 
-    // Strip the opening @@ / @@@ delimiter.
+    // Strip the opening @@ delimiter.
     let after_open = header.trim_start_matches('@');
     let parts: Vec<&str> = after_open.split_whitespace().collect();
 
@@ -507,7 +506,7 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
     let mut new_start = 1;
 
     for part in &parts {
-        // Stop when we hit the closing @@ / @@@ delimiter — any remaining
+        // Stop when we hit the closing @@ delimiter — any remaining
         // tokens are context and must not influence line numbers.
         if part.starts_with('@') {
             break;
@@ -1175,22 +1174,6 @@ index abc123..def456 100644
             ("hunk_no_count_first", "@@ -1 +1 @@ fn single_line()", 1, 1),
             // Single-line hunk without comma-count — different values.
             ("hunk_no_count_second", "@@ -5 +3 @@ fn another()", 5, 3),
-            // Combined diff format from `git show -m`. Two old ranges;
-            // the parser takes the last `-` token. The new_start is the
-            // primary value of interest for display purposes.
-            (
-                "hunk_combined_diff",
-                "@@@ -10,7 -10,12 +10,9 @@@ fn main()",
-                10,
-                10,
-            ),
-            // Combined diff format without context string.
-            (
-                "hunk_combined_diff_no_context",
-                "@@@ -1,5 -1,7 +1,8 @@@",
-                1,
-                1,
-            ),
             // Context like `if x < -1` produces a `-1` token — must be skipped.
             // The remainder after stripping `-` is `"1"`, which is all digits,
             // so digit validation alone would not reject it. Only the @-break
