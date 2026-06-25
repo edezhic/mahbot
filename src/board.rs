@@ -210,6 +210,21 @@ fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
 /// The default phase assigned to newly created tickets.
 pub const DEFAULT_TICKET_PHASE: TicketPhase = TicketPhase::Backlog;
 
+/// Bundled parameters for ticket creation.
+///
+/// Reduces parameter explosion across [`BoardStore::insert_ticket_in_tx`],
+/// [`BoardStore::create_ticket`], and [`BoardStore::supersede_and_create`].
+#[derive(Debug, Clone)]
+pub(crate) struct TicketParams {
+    pub title: String,
+    pub description: String,
+    pub workspace_name: String,
+    pub phase: TicketPhase,
+    pub prerequisites: Vec<String>,
+    pub reporter: String,
+    pub embedding: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TicketComment {
     pub role: String,
@@ -483,37 +498,30 @@ impl BoardStore {
     /// Computes the timestamp and serializes prerequisites internally. Does NOT
     /// commit the transaction — the caller is responsible for calling
     /// `tx.commit()` after any additional writes.
-    #[allow(clippy::too_many_arguments)]
     async fn insert_ticket_in_tx(
         tx: &TxGuard<'_>,
         id: &str,
-        title: &str,
-        description: &str,
-        workspace_name: &str,
-        phase: TicketPhase,
-        prerequisites: &[String],
+        params: &TicketParams,
         supersedes: Option<&str>,
-        reporter: &str,
-        embedding: Option<&[u8]>,
     ) -> Result<()> {
         let now = turso::now();
-        let prereqs_json = serde_json::to_string(prerequisites)?;
+        let prereqs_json = serde_json::to_string(&params.prerequisites)?;
         tx.execute(
             "INSERT INTO tickets (id, title, description, status, workspace_name, \
              created_at, updated_at, prerequisites, supersedes, reporter, embedding) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             turso::params![
                 id,
-                title,
-                description,
-                phase.as_ref(),
-                workspace_name,
+                params.title.as_str(),
+                params.description.as_str(),
+                params.phase.as_ref(),
+                params.workspace_name.as_str(),
                 now.as_str(),
                 now.as_str(),
                 prereqs_json.as_str(),
                 supersedes,
-                reporter,
-                embedding,
+                params.reporter.as_str(),
+                params.embedding.as_deref(),
             ],
         )
         .await?;
@@ -615,34 +623,12 @@ impl BoardStore {
     }
 
     /// Create a new ticket at the requested phase. Returns the ticket id.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_ticket(
-        &self,
-        title: &str,
-        description: &str,
-        ws: &crate::Workspace,
-        phase: TicketPhase,
-        prerequisites: &[String],
-        reporter: &str,
-        embedding: Option<&[u8]>,
-    ) -> Result<String> {
+    pub(crate) async fn create_ticket(&self, params: &TicketParams) -> Result<String> {
         let (tx, id) = self
-            .begin_tx_and_validate_prerequisites(&ws.name, prerequisites)
+            .begin_tx_and_validate_prerequisites(&params.workspace_name, &params.prerequisites)
             .await?;
 
-        Self::insert_ticket_in_tx(
-            &tx,
-            &id,
-            title,
-            description,
-            &ws.name,
-            phase,
-            prerequisites,
-            None,
-            reporter,
-            embedding,
-        )
-        .await?;
+        Self::insert_ticket_in_tx(&tx, &id, params, None).await?;
 
         tx.commit().await?;
         Ok(id)
@@ -664,27 +650,21 @@ impl BoardStore {
     /// - The superseded ticket is in a different workspace
     /// - A self-reference is detected (supersede ID in the new ticket's prerequisites)
     /// - Any prerequisite is invalid (doesn't exist or cross-workspace)
-    #[allow(clippy::too_many_arguments)]
-    pub async fn supersede_and_create(
+    pub(crate) async fn supersede_and_create(
         &self,
         supersede_id: &str,
-        title: &str,
-        description: &str,
-        ws: &crate::Workspace,
-        prerequisites: &[String],
-        reporter: &str,
-        embedding: Option<&[u8]>,
+        params: &TicketParams,
     ) -> Result<String> {
         // Self-reference: a ticket cannot supersede and depend on the same ticket.
         anyhow::ensure!(
-            !prerequisites.iter().any(|p| p == supersede_id),
+            !params.prerequisites.iter().any(|p| p == supersede_id),
             "Ticket cannot supersede and depend on the same ticket: {supersede_id}"
         );
 
         // Begin transaction and validate prerequisites — counter upsert, old
         // cancel, new create, and dependent rewiring all happen atomically.
         let (tx, new_id) = self
-            .begin_tx_and_validate_prerequisites(&ws.name, prerequisites)
+            .begin_tx_and_validate_prerequisites(&params.workspace_name, &params.prerequisites)
             .await?;
 
         // Verify the superseded ticket exists and belongs to the same workspace.
@@ -703,11 +683,11 @@ impl BoardStore {
             .ok_or_else(|| anyhow::anyhow!("Superseded ticket not found: {supersede_id}"))?;
         let old_ws: String = row.get(0)?;
         anyhow::ensure!(
-            old_ws == ws.name,
+            old_ws == params.workspace_name,
             "Superseded ticket {supersede_id} belongs to workspace '{old_ws}', \
              not the current workspace '{}'. \
              Cross-workspace supersede is not allowed.",
-            ws.name,
+            params.workspace_name,
         );
         let status_str: String = row.get(1)?;
         let old_status: TicketPhase = status_str.parse()?;
@@ -727,26 +707,14 @@ impl BoardStore {
             .await?;
         Self::ensure_ticket_found(cancelled_rows, supersede_id, "cancel superseded ticket")?;
 
-        Self::insert_ticket_in_tx(
-            &tx,
-            &new_id,
-            title,
-            description,
-            &ws.name,
-            TicketPhase::Backlog,
-            prerequisites,
-            Some(supersede_id),
-            reporter,
-            embedding,
-        )
-        .await?;
+        Self::insert_ticket_in_tx(&tx, &new_id, params, Some(supersede_id)).await?;
 
-        Self::rewire_dependents(&tx, supersede_id, &new_id, &ws.name).await?;
+        Self::rewire_dependents(&tx, supersede_id, &new_id, &params.workspace_name).await?;
 
         tx.commit().await?;
 
         crate::ticket_buffer::push(
-            &ws.name,
+            &params.workspace_name,
             supersede_id,
             old_status.as_ref(),
             TicketPhase::Cancelled.as_ref(),
@@ -1748,32 +1716,30 @@ impl<'a> TicketBuilder<'a> {
 
     /// Create the ticket with the accumulated parameters.
     pub(crate) async fn create(self) -> anyhow::Result<String> {
-        self.store
-            .create_ticket(
-                &self.title,
-                &self.desc,
-                &self.ws,
-                self.phase,
-                &self.prereqs,
-                &self.reporter,
-                self.embedding.as_deref(),
-            )
-            .await
+        let params = crate::board::TicketParams {
+            title: self.title,
+            description: self.desc,
+            workspace_name: self.ws.name,
+            phase: self.phase,
+            prerequisites: self.prereqs,
+            reporter: self.reporter,
+            embedding: self.embedding,
+        };
+        self.store.create_ticket(&params).await
     }
 
     /// Supersede `supersede_id` with this ticket (calls `supersede_and_create`).
     pub(crate) async fn supersede(self, supersede_id: &str) -> anyhow::Result<String> {
-        self.store
-            .supersede_and_create(
-                supersede_id,
-                &self.title,
-                &self.desc,
-                &self.ws,
-                &self.prereqs,
-                &self.reporter,
-                self.embedding.as_deref(),
-            )
-            .await
+        let params = crate::board::TicketParams {
+            title: self.title,
+            description: self.desc,
+            workspace_name: self.ws.name,
+            phase: self.phase,
+            prerequisites: self.prereqs,
+            reporter: self.reporter,
+            embedding: self.embedding,
+        };
+        self.store.supersede_and_create(supersede_id, &params).await
     }
 }
 

@@ -5,7 +5,7 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::board::TicketPhase;
+use crate::board::{TicketParams, TicketPhase};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -99,12 +99,15 @@ impl Tool for CreateTicketTool {
             let id = store
                 .supersede_and_create(
                     &supersede_id,
-                    title,
-                    description,
-                    ws,
-                    &prerequisites,
-                    &self.reporter,
-                    embedding_bytes.as_deref(),
+                    &TicketParams {
+                        title: title.to_string(),
+                        description: description.to_string(),
+                        workspace_name: ws.name.clone(),
+                        phase: TicketPhase::Backlog,
+                        prerequisites: prerequisites.clone(),
+                        reporter: self.reporter.clone(),
+                        embedding: embedding_bytes.clone(),
+                    },
                 )
                 .await?;
             Ok(format!(
@@ -112,15 +115,15 @@ impl Tool for CreateTicketTool {
             ))
         } else {
             let id = store
-                .create_ticket(
-                    title,
-                    description,
-                    ws,
-                    TicketPhase::Backlog,
-                    &prerequisites,
-                    &self.reporter,
-                    embedding_bytes.as_deref(),
-                )
+                .create_ticket(&TicketParams {
+                    title: title.to_string(),
+                    description: description.to_string(),
+                    workspace_name: ws.name.clone(),
+                    phase: TicketPhase::Backlog,
+                    prerequisites: prerequisites.clone(),
+                    reporter: self.reporter.clone(),
+                    embedding: embedding_bytes.clone(),
+                })
                 .await?;
             Ok(format!("Created ticket {id}: {title}{prereq_note}"))
         }
