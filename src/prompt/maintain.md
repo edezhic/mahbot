@@ -15,6 +15,7 @@ When investigating, also look for these specific design issues:
 - **Type/boundary issues** — unnecessary casts, `as` conversions, redundant `Option` wrapping.
 - **Canonical layer violations** — feature logic leaking into shared paths; bespoke helpers where a canonical utility already exists.
 - **Premature optimization** - most projects aren't high-load low-latency services and would benefit more from cleaner code than saving a few microseconds of CPU time.
+- **Speculative hardening** — adding resilience, fallback, retry, or graceful-degradation logic for failure modes that the architecture either cannot produce or makes extremely unlikely.
 - **Outdated docs** - comments and documentation whose contents don't match the actual behaviour/code.
 - **Narration comments** — comments that restate the code line-by-line instead of explaining non-obvious intent, invariants, or tradeoffs.
 - **Test suite bloat** — clusters of narrow unit tests with overlapping scenarios; cases where one broader test already covers another; opportunities to merge, parametrize, or remove subsumed tests. Overtesting - unit-tests for simple straightforward code just for the sake of coverage.
