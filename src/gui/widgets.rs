@@ -307,6 +307,25 @@ impl FileTree {
         }
         Task::none()
     }
+
+    /// Return the focused visible tree node, if the tree has focus and is non-empty.
+    ///
+    /// Returns `None` when the tree is not focused or there are no visible nodes.
+    /// Otherwise returns `(clamped_index, path, is_dir)` where `clamped_index` is
+    /// `tree_focus_index` clamped to `visible_tree_nodes.len() - 1`. The clamped
+    /// index is returned (rather than the raw `tree_focus_index`) so callers can
+    /// safely use it for subsequent adjacency checks (e.g. `idx + 1` bounds check
+    /// in `TreeNavRight`).
+    #[must_use]
+    pub fn focused_tree_node(&self) -> Option<(usize, String, bool)> {
+        if !self.tree_focused || self.visible_tree_nodes.is_empty() {
+            return None;
+        }
+        let idx = self.tree_focus_index.min(self.visible_tree_nodes.len() - 1);
+        let path = self.visible_tree_nodes[idx].0.clone();
+        let is_dir = self.visible_tree_nodes[idx].1;
+        Some((idx, path, is_dir))
+    }
 }
 
 /// Font size for file tree item labels and connector guides.
@@ -567,6 +586,58 @@ mod tests {
         assert_eq!(tree.tree_focus_index, 2);
         tree.focus_path("a");
         assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn focused_tree_node_not_focused() {
+        let tree = make_tree(vec![("src", true), ("src/main.rs", false)]);
+        // Tree is not focused (default).
+        assert!(tree.focused_tree_node().is_none());
+    }
+
+    #[test]
+    fn focused_tree_node_empty_visible_nodes() {
+        let mut tree = make_tree(vec![]);
+        tree.tree_focused = true;
+        assert!(tree.focused_tree_node().is_none());
+    }
+
+    #[test]
+    fn focused_tree_node_clamps_index() {
+        let mut tree = make_tree(vec![("a", false), ("b", false)]);
+        tree.tree_focused = true;
+        // Set index beyond bounds — method should clamp.
+        tree.tree_focus_index = 10;
+        let (idx, path, is_dir) = tree.focused_tree_node().unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(path, "b");
+        assert!(!is_dir);
+    }
+
+    #[test]
+    fn focused_tree_node_returns_correct_node() {
+        let mut tree = make_tree(vec![
+            ("src", true),
+            ("src/main.rs", false),
+            ("Cargo.toml", false),
+        ]);
+        tree.tree_focused = true;
+        tree.tree_focus_index = 1;
+        let (idx, path, is_dir) = tree.focused_tree_node().unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(path, "src/main.rs");
+        assert!(!is_dir);
+    }
+
+    #[test]
+    fn focused_tree_node_returns_directory() {
+        let mut tree = make_tree(vec![("src", true), ("src/main.rs", false)]);
+        tree.tree_focused = true;
+        tree.tree_focus_index = 0;
+        let (idx, path, is_dir) = tree.focused_tree_node().unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(path, "src");
+        assert!(is_dir);
     }
 
     // ── tree_guide_prefix tests ─────────────────────────────────────

@@ -611,15 +611,9 @@ impl DiffState {
             }
 
             DiffMessage::TreeNavEnter => {
-                if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
+                let Some((_idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
                     return Task::none();
-                }
-                let idx = self
-                    .file_tree
-                    .tree_focus_index
-                    .min(self.file_tree.visible_tree_nodes.len() - 1);
-                let path = self.file_tree.visible_tree_nodes[idx].0.clone();
-                let is_dir = self.file_tree.visible_tree_nodes[idx].1;
+                };
                 if is_dir {
                     if self.file_tree.expanded_dirs.contains(&path) {
                         // Collapse: rebuild and keep focus on the collapsed directory.
@@ -641,15 +635,9 @@ impl DiffState {
             }
 
             DiffMessage::TreeNavLeft => {
-                if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
+                let Some((_idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
                     return Task::none();
-                }
-                let idx = self
-                    .file_tree
-                    .tree_focus_index
-                    .min(self.file_tree.visible_tree_nodes.len() - 1);
-                let path = self.file_tree.visible_tree_nodes[idx].0.clone();
-                let is_dir = self.file_tree.visible_tree_nodes[idx].1;
+                };
 
                 if is_dir && self.file_tree.expanded_dirs.contains(&path) {
                     // Collapse expanded directory and keep focus on it.
@@ -674,15 +662,9 @@ impl DiffState {
             }
 
             DiffMessage::TreeNavRight => {
-                if !self.file_tree.tree_focused || self.file_tree.visible_tree_nodes.is_empty() {
+                let Some((idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
                     return Task::none();
-                }
-                let idx = self
-                    .file_tree
-                    .tree_focus_index
-                    .min(self.file_tree.visible_tree_nodes.len() - 1);
-                let path = self.file_tree.visible_tree_nodes[idx].0.clone();
-                let is_dir = self.file_tree.visible_tree_nodes[idx].1;
+                };
 
                 if !is_dir {
                     // ArrowRight on a file does nothing.
