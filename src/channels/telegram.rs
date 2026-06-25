@@ -1,3 +1,4 @@
+use crate::util::html::decode_html_entities;
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -473,28 +474,6 @@ async fn resolve_authorized_sender(
     // Update reply_target for future message delivery
     let _ = crate::users::update_channel_contact("telegram", &username, &reply_target).await;
     Some((canonical_user, chat_id, reply_target))
-}
-
-/// Decode common HTML entities that might appear in LLM output.
-/// Must be called *before* `markdown_to_telegram_html` so that entities like
-/// `&#39;` → `'` → then re-encoded correctly by `escape_html` → `&#39;`.
-/// Without this, the `&` in `&#39;` gets double-escaped to `&amp;#39;`.
-/// Order matters: decode `&amp;` before `&#39;` so that double-encoded
-/// `&amp;#39;` → `&#39;` → `'`, and before `&lt;`/`&gt;`/`&quot;`
-/// to handle double-encoded named entities like `&amp;lt;`.
-///
-/// Fast path: returns `s.to_string()` immediately when no `&` is present,
-/// avoiding 5 chained `replace` allocations in the common case where LLM
-/// output contains no HTML entities.
-fn decode_html_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    s.replace("&amp;", "&")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
 }
 
 /// Convert Markdown to Telegram HTML format.
@@ -1841,35 +1820,6 @@ mod tests {
         // Literal </code> in code block must not break the HTML
         let r = markdown_to_telegram_html("```\nuse &lt;/code&gt;\n```");
         assert_eq!(r, "<pre><code>use &amp;lt;/code&amp;gt;</code></pre>");
-    }
-
-    #[test]
-    fn decode_html_entities_no_change() {
-        // Fast path: no ampersand → returned unchanged (also covers empty string)
-        let r = decode_html_entities("hello world 123");
-        assert_eq!(r, "hello world 123");
-        assert_eq!(decode_html_entities(""), "");
-    }
-
-    #[test]
-    fn decode_html_entities_lone_ampersand() {
-        // Ampersand with no valid entity passes through unchanged
-        let r = decode_html_entities("a & b");
-        assert_eq!(r, "a & b");
-    }
-
-    #[test]
-    fn decode_html_entities_all() {
-        // All five entities decoded in realistic text
-        let r = decode_html_entities("say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;");
-        assert_eq!(r, "say \"hi\" & <tag> 'ok'");
-    }
-
-    #[test]
-    fn decode_html_entities_double_encoded() {
-        // Order dependency: &amp; before &#39; so &amp;#39; → &#39; → '
-        let r = decode_html_entities("&amp;#39;");
-        assert_eq!(r, "'");
     }
 
     #[tokio::test]
