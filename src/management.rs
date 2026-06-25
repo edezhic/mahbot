@@ -724,11 +724,13 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         .map(|c| c.content.as_str())
         .collect();
 
-    let mut message = "Implement the ticket described in the system prompt.".to_string();
-    if !feedback.is_empty() {
+    let mut message = String::new();
+    if feedback.is_empty() {
+        message = "Implement the ticket described in the system prompt.".to_string();
+    } else {
         let _ = write!(
             message,
-            "\n\n---\nNew feedback to address:\n{}",
+            "New feedback to address:\n{}",
             feedback.join("\n---\n")
         );
     }
