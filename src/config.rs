@@ -333,6 +333,26 @@ impl ConfigData {
             mr.normalize();
         }
     }
+
+    /// Apply canonical normalisation + sorting to the in-memory
+    /// representation so it is consistent across all persistence paths.
+    ///
+    /// The sequence is:
+    /// 1. Trim top-level `Option<String>` fields and collapse empty → `None`.
+    /// 2. Trim inner fields on `Vec` entries (`[RoleConfig]`, `[ModelRouting]`)
+    ///    and collapse empty → `None`.
+    /// 3. Sort `per_role_configs` by role name.
+    /// 4. Sort `model_routings` by model name.
+    ///
+    /// Every caller that produces a newly-built [`ConfigData`] must call
+    /// this before swapping into the global [`CONFIG`] so that the in-memory
+    /// representation is the same regardless of which code path produced it.
+    pub(crate) fn finalize(&mut self) {
+        self.normalize_string_fields();
+        self.normalize_entries();
+        self.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
+        self.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
+    }
 }
 
 // ── Config value helpers ────────────────────────────────────────────
@@ -642,19 +662,9 @@ pub async fn reload_from_db() -> Result<()> {
     let routings = store.get_all_model_routings().await?;
     config.model_routings = routings;
 
-    // Normalise top-level KV-string fields: trim whitespace, collapse empty → None.
-    // This ensures consistency with save_and_reload's persistence path.
-    config.normalize_string_fields();
-
-    // Normalise Vec entry inner Option<String> fields so the in-memory
-    // representation matches save_and_reload's output.
-    config.normalize_entries();
-
-    // Explicit sort — DB also returns sorted (ORDER BY role/model), but we
-    // re-sort here for safety so reload_from_db matches save_and_reload's
-    // ordering regardless of SQL ORDER BY future changes.
-    config.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
-    config.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
+    // Normalise and sort so the in-memory representation matches
+    // save_and_reload's persistence path.
+    config.finalize();
 
     // Atomically swap
     CONFIG.swap(config);
@@ -725,16 +735,10 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
     // reload_from_db's read path would perform so the behaviour is identical.
     let mut config = config.clone();
 
-    // Normalise string fields: trim whitespace, collapse empty → None.
-    // For top-level KV fields this matches reload_from_db's
-    // set_string_field → non_empty pipeline.
-    config.normalize_string_fields();
-    // Normalise Vec entry inner fields so both persistence paths apply
-    // the same non_empty treatment to per_role_configs and model_routings.
-    config.normalize_entries();
-    // Explicit sort — DB also returns sorted, but we re-sort here for safety.
-    config.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
-    config.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
+    // Apply the same normalisation + sorting that reload_from_db's read path
+    // performs so the behaviour is identical regardless of which persistence
+    // path produced the data.
+    config.finalize();
 
     // Capture the new token before swapping so we can detect changes below.
     let new_token = config.telegram_bot_token.clone();
