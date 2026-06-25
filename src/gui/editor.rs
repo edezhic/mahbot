@@ -354,6 +354,12 @@ enum FindDirection {
     Prev,
 }
 
+/// Direction for navigating the file tree, global search results, or quick-open list.
+enum TreeNavDirection {
+    Up,
+    Down,
+}
+
 /// Data returned from the async file load operation.
 #[derive(Debug, Clone)]
 pub struct FileLoadData {
@@ -3126,59 +3132,9 @@ impl EditorState {
                 Task::none()
             }
 
-            EditorMessage::TreeNavUp => {
-                // Suppress during inline rename.
-                if self.is_renaming() {
-                    return Task::none();
-                }
-                // When global search is active, navigate the results list.
-                if let Some(ref mut gs) = self.global_search {
-                    if gs.selected_index > 0 {
-                        gs.selected_index -= 1;
-                    }
-                    return Task::none();
-                }
-                // When quick-open is active, navigate the results list.
-                if let Some(ref mut qo) = self.quick_open {
-                    if qo.selected_index > 0 {
-                        qo.selected_index -= 1;
-                    }
-                    return Task::none();
-                }
-                if self.file_tree.tree_focused && self.file_tree.tree_focus_index > 0 {
-                    self.file_tree.tree_focus_index -= 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
-                }
-                Task::none()
-            }
+            EditorMessage::TreeNavUp => self.navigate_tree_vertical(&TreeNavDirection::Up),
 
-            EditorMessage::TreeNavDown => {
-                // Suppress during inline rename.
-                if self.is_renaming() {
-                    return Task::none();
-                }
-                // When global search is active, navigate the results list.
-                if let Some(ref mut gs) = self.global_search {
-                    if gs.selected_index + 1 < gs.results.len() {
-                        gs.selected_index += 1;
-                    }
-                    return Task::none();
-                }
-                // When quick-open is active, navigate the results list.
-                if let Some(ref mut qo) = self.quick_open {
-                    if qo.selected_index + 1 < qo.results.len() {
-                        qo.selected_index += 1;
-                    }
-                    return Task::none();
-                }
-                if self.file_tree.tree_focused
-                    && self.file_tree.tree_focus_index + 1 < self.file_tree.visible_tree_nodes.len()
-                {
-                    self.file_tree.tree_focus_index += 1;
-                    return widgets::scroll_to_tree_focus(&self.file_tree);
-                }
-                Task::none()
-            }
+            EditorMessage::TreeNavDown => self.navigate_tree_vertical(&TreeNavDirection::Down),
 
             EditorMessage::TreeNavEnter => {
                 // Suppress during inline rename.
@@ -4455,6 +4411,62 @@ impl EditorState {
                 }
             }
         }
+    }
+
+    /// Navigate vertically in the active overlay or file tree.
+    ///
+    /// Handles global-search results, quick-open results, and file-tree focus
+    /// in priority order. Only the file-tree path returns a scroll-to-focus
+    /// task; the overlay paths return `Task::none()`.
+    fn navigate_tree_vertical(&mut self, direction: &TreeNavDirection) -> Task<EditorMessage> {
+        // Suppress during inline rename.
+        if self.is_renaming() {
+            return Task::none();
+        }
+        // When global search is active, navigate the results list.
+        if let Some(ref mut gs) = self.global_search {
+            match *direction {
+                TreeNavDirection::Up if gs.selected_index > 0 => {
+                    gs.selected_index -= 1;
+                }
+                TreeNavDirection::Down if gs.selected_index + 1 < gs.results.len() => {
+                    gs.selected_index += 1;
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+        // When quick-open is active, navigate the results list.
+        if let Some(ref mut qo) = self.quick_open {
+            match *direction {
+                TreeNavDirection::Up if qo.selected_index > 0 => {
+                    qo.selected_index -= 1;
+                }
+                TreeNavDirection::Down if qo.selected_index + 1 < qo.results.len() => {
+                    qo.selected_index += 1;
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+        // Navigate the file tree focus index.
+        if self.file_tree.tree_focused {
+            match *direction {
+                TreeNavDirection::Up if self.file_tree.tree_focus_index > 0 => {
+                    self.file_tree.tree_focus_index -= 1;
+                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                }
+                TreeNavDirection::Down
+                    if self.file_tree.tree_focus_index + 1
+                        < self.file_tree.visible_tree_nodes.len() =>
+                {
+                    self.file_tree.tree_focus_index += 1;
+                    return widgets::scroll_to_tree_focus(&self.file_tree);
+                }
+                _ => {}
+            }
+        }
+        Task::none()
     }
 
     pub fn view(&self) -> Element<'_, EditorMessage> {
