@@ -22,23 +22,24 @@ static MEDIA_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// Return a Bearer Authorization header value built from the configured
 /// provider API key.
 ///
+/// Returns `None` when no provider key is configured (the key is missing or
+/// empty).  Callers should propagate this as a clear error message rather than
+/// sending a request with a blank `"Bearer "` header that would produce an
+/// opaque 401 response.
+///
 /// Used by [`crate::tools::image_gen::ImageGenTool`],
 /// [`crate::tools::video_gen::VideoGenTool`], and the
 /// [`ImageTranscriber`](crate::providers::transcribe::ImageTranscriber) /
 /// [`AudioTranscriber`](crate::providers::transcribe::AudioTranscriber) — all
 /// OpenRouter-based tools that require this header.  Any future
 /// OpenRouter-based media tools should reuse this helper as well.
-///
-/// The header name is always `"Authorization"` and the value is
-/// `"Bearer {key}"` where `{key}` is the configured provider key
-/// (falling back to an empty string if none is set, preserving the existing
-/// behaviour).
 #[must_use]
-pub fn bearer_auth_header() -> String {
-    format!(
-        "Bearer {}",
-        crate::config::CONFIG.provider_key().unwrap_or_default()
-    )
+pub fn bearer_auth_header() -> Option<String> {
+    let key = crate::config::CONFIG.provider_key()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(format!("Bearer {key}"))
 }
 
 /// Extract the first 4xx HTTP status code from a formatted error message.
@@ -97,7 +98,10 @@ async fn check_response(
 ) -> anyhow::Result<reqwest::Response> {
     let status = response.status();
     if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_default();
+        let error_text = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(?e, "Failed to read response body");
+            "failed to read response body".to_string()
+        });
         let preview = crate::util::truncate(&error_text, 500);
         anyhow::bail!("{error_context} API error ({status}): {preview}");
     }
@@ -145,7 +149,8 @@ pub async fn post_json_to_provider(
     body: &serde_json::Value,
     error_context: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let auth = bearer_auth_header();
+    let auth = bearer_auth_header()
+        .ok_or_else(|| anyhow::anyhow!("{error_context}: provider API key is not configured"))?;
     let client = media_http_client();
 
     let response = client
@@ -184,7 +189,8 @@ pub async fn get_json_from_provider(
     url: &str,
     error_context: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let auth = bearer_auth_header();
+    let auth = bearer_auth_header()
+        .ok_or_else(|| anyhow::anyhow!("{error_context}: provider API key is not configured"))?;
     let client = media_http_client();
 
     let response = client
@@ -217,7 +223,8 @@ pub async fn get_json_from_provider(
 /// - Non-2xx status: `"{error_context} API error ({status}): {preview}"` (first 500 chars)
 /// - Body read failure: `"{error_context} failed to read response body: {err}"`
 pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::Result<Vec<u8>> {
-    let auth = bearer_auth_header();
+    let auth = bearer_auth_header()
+        .ok_or_else(|| anyhow::anyhow!("{error_context}: provider API key is not configured"))?;
     let client = media_http_client();
 
     let response = client

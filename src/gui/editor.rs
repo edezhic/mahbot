@@ -1016,10 +1016,23 @@ fn build_save_task(
     );
     let path = tabs[idx].path.clone();
     let line_ending = tabs[idx].line_ending;
-    let content = tab_contents
-        .get(&path)
-        .map(|d| d.content.text())
-        .unwrap_or_default();
+    let Some(content) = tab_contents.get(&path).map(|d| d.content.text()) else {
+        tracing::error!(
+            ?path,
+            idx,
+            "build_save_task: path not found in tab_contents — invariant violation"
+        );
+        return Task::perform(
+            async move {
+                EditorMessage::SaveResult {
+                    path,
+                    result: Err("Internal error: file content not found for save".into()),
+                    saved_hash: 0,
+                }
+            },
+            |msg| msg,
+        );
+    };
     let saved_hash = hash_text(&content);
     Task::perform(
         async move {
@@ -3832,7 +3845,10 @@ impl EditorState {
         let load_tabs_task = Task::perform(
             async move {
                 let store = crate::workspace::store();
-                let records = store.load_editor_tabs(&tab_ws).await.unwrap_or_default();
+                let records = store.load_editor_tabs(&tab_ws).await.unwrap_or_else(|e| {
+                    tracing::warn!(?e, workspace = %tab_ws, "Failed to load editor tabs");
+                    Vec::new()
+                });
                 let ws_path = tab_path;
 
                 let mut loaded: Vec<SavedTabData> = Vec::new();

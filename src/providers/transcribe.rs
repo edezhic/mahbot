@@ -129,11 +129,15 @@ impl AudioTranscriber {
 
         let base = crate::providers::ensure_base_url(&self.inner.api_url);
         let url = format!("{base}/audio/transcriptions");
+
+        let auth = crate::util::http::bearer_auth_header()
+            .ok_or_else(|| anyhow::anyhow!("provider API key is not configured"))?;
+
         let response = self
             .inner
             .client
             .post(&url)
-            .header("Authorization", crate::util::http::bearer_auth_header())
+            .header("Authorization", auth)
             .multipart(form)
             .send()
             .await

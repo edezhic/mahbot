@@ -87,7 +87,10 @@ impl WebSearchTool {
 
         if !res.status().is_success() {
             let status = res.status();
-            let body = res.text().await.unwrap_or_default();
+            let body = res.text().await.unwrap_or_else(|e| {
+                tracing::warn!(?e, "Failed to read response body");
+                String::new()
+            });
 
             // Exa returns HTML block pages (Cloudflare, etc.) for 403 and
             // potentially other non-2xx statuses — replace the HTML dump
