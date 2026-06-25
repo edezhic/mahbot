@@ -475,15 +475,6 @@ impl BoardStore {
             TICKETS_FTS_INDEX_DDL,
         )
         .await?;
-
-        // Migration: `Paused` was removed from `TicketPhase` — all existing
-        // `paused` tickets are functionally identical to `Planning`. Idempotent.
-        conn.execute(
-            "UPDATE tickets SET status = 'planning' WHERE status = 'paused'",
-            turso::params![],
-        )
-        .await?;
-
         Ok(Self { conn })
     }
 
