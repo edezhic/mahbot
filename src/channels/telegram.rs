@@ -852,7 +852,10 @@ impl TelegramChannel {
             .await
             .context("Failed to reach Telegram API")?;
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => anyhow::bail!("Failed to parse Telegram API response: {e}"),
+        };
         if !status.is_success() || body.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
         {
             let desc = body
