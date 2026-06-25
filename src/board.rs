@@ -2629,60 +2629,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     #[tokio::test]
-    async fn test_blocked_ticket_not_claimable() {
-        let (store, _tmp) = open_test_store().await;
-        let ws = test_ws_named("/ws", "ws");
-
-        // P is a prerequisite
-        let p = store
-            .create_ticket("P", "prereq", &ws, DEFAULT_TICKET_PHASE, &[], "test", None)
-            .await
-            .expect("create p");
-
-        // D depends on P
-        let d_id = store
-            .create_ticket(
-                "D",
-                "dependent",
-                &ws,
-                DEFAULT_TICKET_PHASE,
-                std::slice::from_ref(&p),
-                "test",
-                None,
-            )
-            .await
-            .expect("create d");
-
-        // Verify D has a prerequisite
-        let d_ticket = crate::util::test::expect_ticket(&store, &d_id).await;
-        assert_eq!(d_ticket.prerequisites, vec![p.clone()]);
-
-        // D should not be claimable because P is still in 'backlog'
-        let claimed = store
-            .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
-            .await
-            .expect("claim");
-        assert!(claimed.is_some(), "should claim P (no unmet prereqs)");
-        // claimed should NOT be D — it should be P (the only unblocked one)
-        let claimed = claimed.unwrap();
-        assert_eq!(
-            claimed.id, p,
-            "should have claimed the unblocked ticket P, not D"
-        );
-
-        // Now P is in Analysis — D should still be blocked
-        let second = store
-            .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
-            .await
-            .expect("claim");
-        assert!(
-            second.is_none(),
-            "D should be blocked because P is in analysis, not done"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_unblocked_after_prereq_done() {
+    async fn test_prerequisite_lifecycle() {
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/ws", "ws");
 
@@ -2706,27 +2653,40 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("create d");
 
-        // D is blocked while P is in backlog
-        let blocked = store
+        // D is blocked while P is in backlog — claiming returns P, not D
+        let claimed = store
+            .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
+            .await
+            .expect("claim")
+            .expect("should claim P");
+        assert_eq!(
+            claimed.id, p,
+            "should claim the unblocked prerequisite P, not D"
+        );
+
+        // Now P is in Analysis — D should still be blocked (P not done yet)
+        let second = store
             .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
             .await
             .expect("claim");
-        // Should have claimed P, not D
-        assert_eq!(blocked.unwrap().id, p);
+        assert!(
+            second.is_none(),
+            "D should be blocked because P is in Analysis, not Done"
+        );
 
-        // Move P to done
+        // Move P to Done
         store
             .transition_to(&p, None, TicketPhase::Done, None)
             .await
-            .expect("set done");
+            .expect("transition P to Done");
 
-        // Now D should be claimable
+        // Now D should be unblocked and claimable
         let unblocked = store
             .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
             .await
             .expect("claim");
-        assert!(unblocked.is_some(), "D should be claimable after P is done");
-        assert_eq!(unblocked.unwrap().id, d);
+        assert!(unblocked.is_some(), "D should be claimable after P is Done");
+        assert_eq!(unblocked.unwrap().id, d, "should claim D after P is Done");
     }
 
     #[tokio::test]
