@@ -130,7 +130,6 @@ pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
         if line.starts_with("diff --git ") {
             // Flush previous file
             flush_file(&mut current_file, &mut current_hunk, &mut files);
-            current_hunk = None;
             old_counter = 0;
             new_counter = 0;
 
