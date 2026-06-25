@@ -261,6 +261,10 @@ impl ReliableProvider {
     /// ±25% of base to prevent thundering herd when multiple agents
     /// retry simultaneously on transient errors (5xx, timeouts, etc.).
     fn compute_backoff(base: u64, err: &anyhow::Error) -> u64 {
+        debug_assert!(
+            base >= 2,
+            "jitter range (base/2) would be zero for base < 2, causing modulo-by-zero"
+        );
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Retry-After is authoritative — follow it precisely,
             // clamped to [base, 30_000] ms.
@@ -268,7 +272,7 @@ impl ReliableProvider {
         } else {
             // Jitter: randomize within [75%, 125%) of base so parallel agents
             // retrying on the same transient error don't synchronize.
-            let half_range = (base / 2).max(1); // guard against base < 2
+            let half_range = base / 2;
             let jittered_backoff = base - base / 4 + (rand::random::<u64>() % half_range);
             jittered_backoff.max(50) // floor at 50ms; matters when base < 67
         }
@@ -528,7 +532,7 @@ mod tests {
                     .with_calls(calls.clone()),
             ) as Box<dyn Provider>,
             2,
-            1,
+            50,
         );
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
@@ -708,7 +712,7 @@ mod tests {
                     .with_calls(calls.clone()),
             ) as Box<dyn Provider>,
             3,
-            1,
+            50,
         );
 
         let messages = vec![ChatMessage::user("test")];
