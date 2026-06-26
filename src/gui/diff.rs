@@ -84,6 +84,11 @@ pub enum DiffMessage {
     NavigateToCommit(String, String),
     /// Return from historical commit view to working tree diff.
     BackToWorkingTree,
+    /// Commit message fetched for a historical commit (commit_hash, message).
+    CommitMessageFetched(String, Option<String>),
+    /// Clear commit state (ref + message) without triggering any diff load.
+    /// Used when the modal is closed to prevent stale accessor returns.
+    ClearCommitState,
     /// Discard changes for a file or directory (path, target).
     DiscardPath(String, DiscardTarget),
     /// Result of a discard operation.
@@ -154,6 +159,8 @@ pub struct DiffState {
     /// Current commit being viewed, if any.
     /// `None` means we're viewing the working-tree diff (`git diff HEAD`).
     current_commit_ref: Option<String>,
+    /// Commit message of the commit being viewed (fetched during NavigateToCommit).
+    current_commit_message: Option<String>,
     /// When true, the next successful [`DiffMessage::DiffLoaded`] recursively
     /// expands all directory nodes in the file tree (nested folders included).
     /// Cleared after expansion. Not set on periodic auto-refresh ticks.
@@ -179,8 +186,29 @@ impl DiffState {
             commit_message: String::new(),
             committing: false,
             current_commit_ref: None,
+            current_commit_message: None,
             tree_auto_expand_pending: false,
         }
+    }
+
+    /// Whether this state is viewing a historical commit (vs working tree).
+    #[must_use]
+    pub fn is_viewing_commit(&self) -> bool {
+        self.current_commit_ref.is_some()
+    }
+
+    /// The commit message of the commit currently being viewed, if any.
+    #[must_use]
+    pub fn commit_message(&self) -> Option<&str> {
+        self.current_commit_message.as_deref()
+    }
+
+    /// The short hash (8 chars) of the commit currently being viewed, if any.
+    #[must_use]
+    pub fn commit_short_hash(&self) -> Option<&str> {
+        self.current_commit_ref
+            .as_deref()
+            .map(|h| if h.len() > 8 { &h[..8] } else { h })
     }
 
     pub fn subscription(&self) -> iced::Subscription<DiffMessage> {
@@ -237,6 +265,7 @@ impl DiffState {
                     self.status_message = None;
                     self.commit_message.clear();
                     self.committing = false;
+                    self.current_commit_message = None;
                     return Task::none();
                 }
                 self.file_tree.expanded_dirs.clear();
@@ -246,6 +275,7 @@ impl DiffState {
                 self.selected_workspace_name = Some(name.clone());
                 self.personal_workspace_path.clone_from(&path_override);
                 self.current_commit_ref = None;
+                self.current_commit_message = None;
                 self.generation = self.generation.wrapping_add(1);
                 let generation_num = self.generation;
                 let workspace_name = name.clone();
@@ -337,6 +367,7 @@ impl DiffState {
                 self.committing = false;
                 self.selected_file = None;
                 self.file_buffers.clear();
+                self.current_commit_message = None;
                 // Set commit ref and loading BEFORE spawning task
                 // (prevents Tick race: subscription checks .is_some() to skip).
                 self.current_commit_ref = Some(hash.clone());
@@ -344,9 +375,28 @@ impl DiffState {
                 self.diff_has_loaded = false;
                 self.generation = self.generation.wrapping_add(1);
                 let generation_num = self.generation;
-                Task::perform(load_diff(ws_name, None, Some(hash)), move |result| {
-                    DiffMessage::DiffLoaded(generation_num, result)
-                })
+
+                // Load the diff and fetch the commit message in parallel.
+                let hash_for_diff = hash.clone();
+                let diff_task = Task::perform(
+                    load_diff(ws_name.clone(), None, Some(hash_for_diff)),
+                    move |r| DiffMessage::DiffLoaded(generation_num, r),
+                );
+
+                let msg_ws = ws_name.clone();
+                let msg_hash = hash.clone();
+                let msg_task = Task::perform(
+                    async move {
+                        let ws_path = resolve_workspace_path(&msg_ws, None).await;
+                        match ws_path {
+                            Ok(path) => crate::diff_parse::run_git_commit_message(&path).await.ok(),
+                            Err(_) => None,
+                        }
+                    },
+                    move |msg| DiffMessage::CommitMessageFetched(msg_hash, msg),
+                );
+
+                Task::batch([diff_task, msg_task])
             }
             DiffMessage::BackToWorkingTree => {
                 let ws_name = match &self.selected_workspace_name {
@@ -356,6 +406,7 @@ impl DiffState {
                 // Set loading BEFORE clearing ref (prevents Tick race).
                 self.diff_loading = true;
                 self.current_commit_ref = None;
+                self.current_commit_message = None;
                 self.file_tree.expanded_dirs.clear();
                 self.tree_auto_expand_pending = true;
                 self.generation = self.generation.wrapping_add(1);
@@ -364,6 +415,18 @@ impl DiffState {
                 Task::perform(load_diff(ws_name, ws_path, None), move |result| {
                     DiffMessage::DiffLoaded(generation_num, result)
                 })
+            }
+            DiffMessage::CommitMessageFetched(hash, msg) => {
+                // Only accept if we're still viewing the same commit.
+                if self.current_commit_ref.as_deref() == Some(&hash) {
+                    self.current_commit_message = msg;
+                }
+                Task::none()
+            }
+            DiffMessage::ClearCommitState => {
+                self.current_commit_ref = None;
+                self.current_commit_message = None;
+                Task::none()
             }
             DiffMessage::ToggleDir(path) => {
                 self.file_tree.tree_focused = true;

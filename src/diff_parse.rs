@@ -771,7 +771,7 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> Result<CommitInf
     };
 
     // Capture line stats via --numstat. Try HEAD~1..HEAD first.
-    if let Some((lines_added, lines_removed)) =
+    if let Ok((lines_added, lines_removed)) =
         parse_numstat(repo_path, &["diff", "--numstat", "HEAD~1..HEAD"]).await
     {
         Ok(CommitInfo {
@@ -802,17 +802,10 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> Result<CommitInf
 
 /// Run `git diff --numstat <args...>` and sum the line stats across all files.
 ///
-/// Returns `Some((lines_added, lines_removed))` on success (even if the diff
-/// is empty). Returns `None` on any error — command failure, non-zero exit,
-/// or spawn failure — after logging a warning. Stats are non-critical.
-async fn parse_numstat(repo_path: &Path, args: &[&str]) -> Option<(i64, i64)> {
-    let stdout = match run_git_command(repo_path, args).await {
-        Ok(out) => out,
-        Err(e) => {
-            warn!(args = ?args, error = %e, "git diff --numstat failed");
-            return None;
-        }
-    };
+/// Returns `Ok((lines_added, lines_removed))` on success (even if the diff
+/// is empty). Returns the git error message on failure.
+async fn parse_numstat(repo_path: &Path, args: &[&str]) -> Result<(i64, i64), String> {
+    let stdout = run_git_command(repo_path, args).await?;
 
     let mut lines_added: i64 = 0;
     let mut lines_removed: i64 = 0;
@@ -825,7 +818,7 @@ async fn parse_numstat(repo_path: &Path, args: &[&str]) -> Option<(i64, i64)> {
         }
     }
 
-    Some((lines_added, lines_removed))
+    Ok((lines_added, lines_removed))
 }
 
 /// Check if git is installed.
@@ -853,6 +846,86 @@ pub async fn git_has_commits(repo_path: &Path) -> Result<bool, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(!stdout.trim().is_empty())
+}
+
+/// Get the current branch name (e.g. `main`, `feature/xyz`).
+pub async fn run_git_current_branch(repo_path: &Path) -> Result<String, String> {
+    run_git_command(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .map(|s| s.trim().to_string())
+}
+
+/// Get behind/ahead counts against the upstream branch.
+///
+/// Returns `(behind, ahead)`. If there is no upstream configured, returns
+/// `(0, 0)` without error.
+pub async fn run_git_behind_ahead(repo_path: &Path) -> Result<(usize, usize), String> {
+    match run_git_command(
+        repo_path,
+        &["rev-list", "--count", "--left-right", "HEAD...@{upstream}"],
+    )
+    .await
+    {
+        Ok(out) => {
+            let parts: Vec<&str> = out.trim().split('\t').collect();
+            if parts.len() == 2 {
+                let behind = parts[0].parse::<usize>().unwrap_or(0);
+                let ahead = parts[1].parse::<usize>().unwrap_or(0);
+                Ok((behind, ahead))
+            } else {
+                Ok((0, 0))
+            }
+        }
+        Err(e) if e.contains("no upstream") || e.contains("upstream") => Ok((0, 0)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Run `git diff --numstat HEAD` and return the total added/removed lines.
+///
+/// Delegates to [`parse_numstat`].
+pub async fn run_git_diff_stats(repo_path: &Path) -> Result<(i64, i64), String> {
+    parse_numstat(repo_path, &["diff", "--numstat", "HEAD"]).await
+}
+
+/// List all local branches (short ref names).
+pub async fn run_git_list_branches(repo_path: &Path) -> Result<Vec<String>, String> {
+    let out = run_git_command(repo_path, &["branch", "--format=%(refname:short)"]).await?;
+    Ok(out.lines().map(ToString::to_string).collect())
+}
+
+/// Switch to an existing branch via `git switch {branch}`.
+pub async fn run_git_switch_branch(repo_path: &Path, branch: &str) -> Result<(), String> {
+    run_git_command(repo_path, &["switch", branch]).await?;
+    Ok(())
+}
+
+/// Create and switch to a new branch via `git switch -c {branch}`.
+pub async fn run_git_create_branch(repo_path: &Path, branch: &str) -> Result<(), String> {
+    run_git_command(repo_path, &["switch", "-c", branch]).await?;
+    Ok(())
+}
+
+/// Sync with remote: `git pull --ff-only` then `git push`.
+///
+/// Returns the combined output of both commands.
+pub async fn run_git_sync(repo_path: &Path) -> Result<String, String> {
+    let pull_out = run_git_command(repo_path, &["pull", "--ff-only"]).await?;
+    let push_out = run_git_command(repo_path, &["push"]).await?;
+    let combined = if pull_out.trim().is_empty() {
+        push_out
+    } else if push_out.trim().is_empty() {
+        pull_out
+    } else {
+        format!("{pull_out}\n{push_out}")
+    };
+    Ok(combined)
+}
+
+/// Get the last commit's message via `git log -1 --format=%s`.
+pub async fn run_git_commit_message(repo_path: &Path) -> Result<String, String> {
+    let out = run_git_command(repo_path, &["log", "-1", "--format=%s"]).await?;
+    Ok(out.trim().to_string())
 }
 
 #[cfg(test)]
@@ -1241,5 +1314,152 @@ index abc123..def456 100644
                 "case {i} ({name}): new_start mismatch. Input: {input:?}"
             );
         }
+    }
+
+    // ── Integration tests for run_git_* functions ────────────────
+
+    /// Helper: create a temp directory, init git, add a file, and commit.
+    fn init_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo_path = dir.path().to_path_buf();
+
+        // git init
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        // Set user config (required for commit)
+        for (key, value) in [("user.name", "Test"), ("user.email", "test@test.com")] {
+            let status = std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(&repo_path)
+                .status()
+                .expect("git config");
+            assert!(status.success());
+        }
+
+        // Create a file and make initial commit
+        std::fs::write(repo_path.join("test.txt"), b"line1\nline2\nline3\n")
+            .expect("write test file");
+        let status = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git commit");
+        assert!(status.success());
+
+        (dir, repo_path)
+    }
+
+    #[tokio::test]
+    async fn test_run_git_current_branch_default() {
+        let (_dir, repo_path) = init_temp_repo();
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        assert!(!branch.is_empty(), "branch name should not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_behind_ahead_no_upstream() {
+        let (_dir, repo_path) = init_temp_repo();
+        let (behind, ahead) = run_git_behind_ahead(&repo_path)
+            .await
+            .expect("behind/ahead");
+        assert_eq!(behind, 0);
+        assert_eq!(ahead, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_git_diff_stats_clean_tree() {
+        let (_dir, repo_path) = init_temp_repo();
+        let (added, removed) = run_git_diff_stats(&repo_path).await.expect("diff stats");
+        assert_eq!(added, 0);
+        assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_git_diff_stats_with_changes() {
+        let (_dir, repo_path) = init_temp_repo();
+        // Modify: change "line2" to "line2 modified", add "line4"
+        std::fs::write(
+            repo_path.join("test.txt"),
+            b"line1\nline2 modified\nline3\nline4\n",
+        )
+        .expect("write modified file");
+        let (added, removed) = run_git_diff_stats(&repo_path).await.expect("diff stats");
+        assert_eq!(added, 2, "two lines added (modified + new line)");
+        assert_eq!(removed, 1, "one line removed (line2)");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_list_branches_single() {
+        let (_dir, repo_path) = init_temp_repo();
+        let branches = run_git_list_branches(&repo_path)
+            .await
+            .expect("list branches");
+        assert_eq!(branches.len(), 1, "single branch in new repo");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_switch_and_create_branch() {
+        let (_dir, repo_path) = init_temp_repo();
+        // Note the default branch name before creating a new one
+        let default_branch = run_git_current_branch(&repo_path)
+            .await
+            .expect("current branch");
+
+        // Create and switch to a new branch
+        run_git_create_branch(&repo_path, "feature/test")
+            .await
+            .expect("create branch");
+        // Verify we're on the new branch
+        let current = run_git_current_branch(&repo_path)
+            .await
+            .expect("current branch");
+        assert_eq!(current, "feature/test");
+        // Verify it appears in the branch list
+        let branches = run_git_list_branches(&repo_path)
+            .await
+            .expect("list branches");
+        assert!(branches.contains(&"feature/test".to_string()));
+        // Switch back to the default branch
+        run_git_switch_branch(&repo_path, &default_branch)
+            .await
+            .expect("switch back");
+        let switched = run_git_current_branch(&repo_path)
+            .await
+            .expect("current branch");
+        assert_eq!(switched, default_branch, "should be back on default branch");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_commit_message() {
+        let (_dir, repo_path) = init_temp_repo();
+        let msg = run_git_commit_message(&repo_path)
+            .await
+            .expect("commit message");
+        assert_eq!(msg, "Initial commit");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_sync_no_remote() {
+        let (_dir, repo_path) = init_temp_repo();
+        // No remote configured — run_git_sync should return an error
+        // from git pull --ff-only (no remote) rather than panicking.
+        let result = run_git_sync(&repo_path).await;
+        assert!(result.is_err(), "sync without remote should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("remote") || err.contains("push") || err.contains("pull"),
+            "error should mention remote/push/pull: {err}"
+        );
     }
 }

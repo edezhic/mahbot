@@ -77,16 +77,15 @@ pub enum Page {
     Home,
     Sessions,
     Logs,
-    Diff,
     Shell,
     Editor,
     Settings,
 }
 
 impl Page {
-    /// Pages shown in the sidebar (Home, Editor, Diff, Shell).
+    /// Pages shown in the sidebar (Home, Editor, Shell).
     const fn sidebar_pages() -> &'static [Page] {
-        &[Page::Home, Page::Editor, Page::Diff, Page::Shell]
+        &[Page::Home, Page::Editor, Page::Shell]
     }
 
     /// Pages shown in the footer nav (Sessions, Logs, Settings).
@@ -99,7 +98,6 @@ impl Page {
             Page::Home => "Home",
             Page::Sessions => "Sessions",
             Page::Logs => "Logs",
-            Page::Diff => "Diff",
             Page::Shell => "Shell",
             Page::Editor => "Editor",
             Page::Settings => "Settings",
@@ -220,10 +218,49 @@ pub enum Message {
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
     Sessions(sessions::SessionsMessage),
-    Diff(diff::DiffMessage),
+    /// Diff modal overlay (not a page) — wraps [`diff::DiffMessage`].
+    /// Named `DiffModal` rather than `Diff` to avoid ambiguity with the
+    /// removed `Page::Diff` variant and the existing page-message convention.
+    DiffModal(diff::DiffMessage),
     Shell(shell::ShellMessage),
     Editor(editor::EditorMessage),
     Settings(settings::SettingsMessage),
+
+    // ── Diff modal ──────────────────────────────────────────────
+    /// Open the diff modal. Optional commit hash — `None` = working tree diff.
+    OpenDiffModal(Option<String>),
+    /// Close the diff modal.
+    CloseDiffModal,
+
+    // ── Git sidebar ────────────────────────────────────────────
+    /// Result of `run_git_diff_stats`. `None` when not a git repo.
+    GitDiffStats(Option<(i64, i64)>),
+    /// Result of `run_git_current_branch`. `None` when not a git repo.
+    GitCurrentBranch(Option<String>),
+    /// Result of `run_git_behind_ahead`. `None` when not a git repo / no upstream.
+    GitBehindAhead(Option<(usize, usize)>),
+    /// Open the branch management modal.
+    OpenBranchModal,
+    /// Close the branch management modal.
+    CloseBranchModal,
+    /// Branch search query changed.
+    BranchQueryChanged(String),
+    /// Result of `run_git_list_branches`.
+    GitListBranches(Result<Vec<String>, String>),
+    /// Result of `run_git_sync`.
+    GitSyncResult(Result<String, String>),
+    /// Trigger a git sync (pull --ff-only + push).
+    GitSync,
+    /// Switch to a branch.
+    GitSwitch(String),
+    /// Result of `run_git_switch_branch`.
+    GitSwitchResult(Result<(), String>),
+    /// Create a new branch from the value in `new_branch_name`.
+    GitCreate,
+    /// Result of `run_git_create_branch`.
+    GitCreateBranchResult(Result<(), String>),
+    /// The new-branch name input changed.
+    NewBranchNameChanged(String),
 }
 
 // ── Keyboard modifier helper ─────────────────────────────────────
@@ -364,6 +401,34 @@ pub struct Dashboard {
     shell_state: shell::ShellState,
     editor_state: editor::EditorState,
     settings_state: settings::SettingsState,
+
+    // ── Diff modal ──────────────────────────────────────────────
+    show_diff_modal: bool,
+
+    // ── Git sidebar ─────────────────────────────────────────────
+    /// Cached filesystem path for the currently selected workspace.
+    workspace_filesystem_path: Option<String>,
+    /// Cached diff stats (+N / -M) from periodic refresh.
+    git_diff_stats: Option<(i64, i64)>,
+    /// Cached current branch name from periodic refresh.
+    git_current_branch: Option<String>,
+    /// Cached behind/ahead counts from periodic refresh.
+    git_behind_ahead: Option<(usize, usize)>,
+    /// Whether the branch management modal is open.
+    show_branch_modal: bool,
+    /// Branch search query text.
+    branch_search_query: String,
+    /// Cached list of local branches.
+    local_branches: Vec<String>,
+    /// Whether a git sync operation is in-flight.
+    git_syncing: bool,
+    /// Error message from branch switch/create failure.
+    git_branch_error: Option<String>,
+    /// Current value of the "new branch name" text input.
+    new_branch_name: String,
+    /// Whether a git sidebar eagerly refreshed recently — skip the next
+    /// Tick-based refresh to avoid double-firing after workspace switch.
+    git_refresh_eagerly: bool,
 }
 
 impl Dashboard {
@@ -394,6 +459,18 @@ impl Dashboard {
             shell_state: shell::ShellState::new(),
             editor_state: editor::EditorState::new(),
             settings_state: settings::SettingsState::new(),
+            show_diff_modal: false,
+            workspace_filesystem_path: None,
+            git_diff_stats: None,
+            git_current_branch: None,
+            git_behind_ahead: None,
+            show_branch_modal: false,
+            branch_search_query: String::new(),
+            local_branches: Vec::new(),
+            git_syncing: false,
+            git_branch_error: None,
+            new_branch_name: String::new(),
+            git_refresh_eagerly: false,
         }
     }
 
@@ -529,9 +606,8 @@ impl Dashboard {
                     }
                     Page::Shell => Task::none(),
                     Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
-                    // Editor and Diff receive workspace state via WorkspaceSelected
+                    // Editor receives workspace state via WorkspaceSelected
                     // from the Home page picker, not via refresh().
-                    Page::Diff => Task::none(),
                     Page::Editor => Task::none(),
                     Page::Settings => {
                         self.settings_state.refresh();
@@ -598,11 +674,20 @@ impl Dashboard {
                         };
                         Task::batch([ws, us])
                     }
-                    Page::Diff => Task::none(),
                     _ => Task::none(),
                 };
 
-                Task::batch([ws_refresh, page_task])
+                // ── Git sidebar refresh (every second) ─────────────
+                // Skip if an eager refresh was just triggered (e.g. after
+                // workspace switch) to avoid 6 subprocess calls in <1 second.
+                let git_tasks = if self.git_refresh_eagerly {
+                    self.git_refresh_eagerly = false;
+                    Task::none()
+                } else {
+                    self.refresh_git_sidebar()
+                };
+
+                Task::batch([ws_refresh, page_task, git_tasks])
             }
             Message::Home(msg) if self.ready => {
                 // Intercept RequestWorkspaceChange: the Home page detected
@@ -658,12 +743,23 @@ impl Dashboard {
                     ref workspace_name,
                 } = msg
                 {
-                    self.page = Page::Diff;
-                    return Task::done(diff::DiffMessage::NavigateToCommit(
-                        workspace_name.clone(),
-                        commit_hash.clone(),
-                    ))
-                    .map(Message::Diff);
+                    // Close any board modal
+                    let close_board = self
+                        .board_state
+                        .update(board::BoardMessage::CloseModal)
+                        .map(Message::Board);
+                    // Open diff modal — the diff_state will receive
+                    // NavigateToCommit which loads the commit data.
+                    self.show_diff_modal = true;
+                    self.show_branch_modal = false;
+                    let hash = commit_hash.clone();
+                    let ws = workspace_name.clone();
+                    return Task::batch([
+                        close_board,
+                        Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
+                            ws, hash,
+                        ))),
+                    ]);
                 }
                 if let board::BoardMessage::LinkClicked(ref url) = msg {
                     open_url(url);
@@ -682,11 +778,11 @@ impl Dashboard {
                 }
                 self.sessions_state.update(msg).map(Message::Sessions)
             }
-            Message::Diff(msg) if self.ready => {
+            Message::DiffModal(msg) if self.ready => {
                 if let diff::DiffMessage::Toast(ref tm) = msg {
                     self.toasts.push(Toast::from_toast_msg(tm));
                 }
-                self.diff_state.update(msg).map(Message::Diff)
+                self.diff_state.update(msg).map(Message::DiffModal)
             }
             Message::Editor(msg) if self.ready => {
                 if let editor::EditorMessage::Toast(ref tm) = msg {
@@ -802,6 +898,191 @@ impl Dashboard {
                 self.toasts.retain(|t| t.id != id);
                 Task::none()
             }
+            // ── Diff modal ────────────────────────────────────────
+            Message::OpenDiffModal(commit_hash) if self.ready => {
+                // Close any board modal and branch modal
+                let close_board = self
+                    .board_state
+                    .update(board::BoardMessage::CloseModal)
+                    .map(Message::Board);
+                self.show_diff_modal = true;
+                self.show_branch_modal = false;
+                if let Some(hash) = commit_hash {
+                    let ws = self.selected_workspace_name.clone().unwrap_or_default();
+                    let hash_clone = hash;
+                    Task::batch([
+                        close_board,
+                        Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
+                            ws, hash_clone,
+                        ))),
+                    ])
+                } else {
+                    // Working tree — send BackToWorkingTree to clear any
+                    // stale commit ref and load the working-tree diff.
+                    Task::batch([
+                        close_board,
+                        Task::done(Message::DiffModal(diff::DiffMessage::BackToWorkingTree)),
+                    ])
+                }
+            }
+            Message::CloseDiffModal => {
+                self.show_diff_modal = false;
+                Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
+            }
+            // ── Git sidebar ───────────────────────────────────────
+            Message::GitDiffStats(stats) => {
+                self.git_diff_stats = stats;
+                Task::none()
+            }
+            Message::GitCurrentBranch(branch) => {
+                self.git_current_branch = branch;
+                Task::none()
+            }
+            Message::GitBehindAhead(ba) => {
+                self.git_behind_ahead = ba;
+                Task::none()
+            }
+            Message::OpenBranchModal if self.ready => {
+                self.show_branch_modal = true;
+                self.show_diff_modal = false;
+                self.branch_search_query.clear();
+                self.git_branch_error = None;
+                let ws_path = self.workspace_filesystem_path.clone();
+                Task::perform(
+                    async move {
+                        match ws_path {
+                            Some(path) => {
+                                let path = std::path::PathBuf::from(path);
+                                crate::diff_parse::run_git_list_branches(&path).await
+                            }
+                            None => Ok(Vec::new()),
+                        }
+                    },
+                    Message::GitListBranches,
+                )
+            }
+            Message::CloseBranchModal => {
+                self.show_branch_modal = false;
+                Task::none()
+            }
+            Message::BranchQueryChanged(query) => {
+                self.branch_search_query = query;
+                Task::none()
+            }
+            Message::GitListBranches(result) => {
+                match result {
+                    Ok(branches) => self.local_branches = branches,
+                    Err(e) => self.git_branch_error = Some(e),
+                }
+                Task::none()
+            }
+            Message::GitSync if self.ready => {
+                self.git_syncing = true;
+                let ws_path = self.workspace_filesystem_path.clone();
+                Task::perform(
+                    async move {
+                        match ws_path {
+                            Some(path) => {
+                                let path = std::path::PathBuf::from(path);
+                                crate::diff_parse::run_git_sync(&path).await
+                            }
+                            None => Err("No workspace path".to_string()),
+                        }
+                    },
+                    Message::GitSyncResult,
+                )
+            }
+            Message::GitSyncResult(result) => {
+                self.git_syncing = false;
+                match result {
+                    Ok(output) => {
+                        self.toasts.push(Toast::new(
+                            if output.trim().is_empty() {
+                                "Already up-to-date".to_string()
+                            } else {
+                                format!("Sync completed:\n{output}")
+                            },
+                            ToastKind::Success,
+                        ));
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(Toast::new(format!("Sync failed: {e}"), ToastKind::Error));
+                    }
+                }
+                Task::none()
+            }
+            Message::GitSwitch(branch) if !self.git_syncing && self.ready => {
+                let ws_path = self.workspace_filesystem_path.clone();
+                let branch_clone = branch.clone();
+                self.git_syncing = true;
+                let task = async move {
+                    match ws_path {
+                        Some(path) => {
+                            let path = std::path::PathBuf::from(path);
+                            crate::diff_parse::run_git_switch_branch(&path, &branch_clone).await
+                        }
+                        None => Err("No workspace path".to_string()),
+                    }
+                };
+                Task::perform(task, Message::GitSwitchResult)
+            }
+            Message::GitSwitchResult(result) => {
+                self.git_syncing = false;
+                match result {
+                    Ok(()) => {
+                        self.toasts.push(Toast::new(
+                            "Switched branch".to_string(),
+                            ToastKind::Success,
+                        ));
+                        self.show_branch_modal = false;
+                    }
+                    Err(e) => {
+                        self.git_branch_error = Some(e);
+                    }
+                }
+                Task::none()
+            }
+            Message::GitCreate if !self.git_syncing && self.ready => {
+                let branch = self.new_branch_name.clone();
+                if branch.trim().is_empty() {
+                    self.git_branch_error = Some("Branch name cannot be empty".to_string());
+                    return Task::none();
+                }
+                let ws_path = self.workspace_filesystem_path.clone();
+                let branch_clone = branch.trim().to_string();
+                self.git_syncing = true;
+                let task = async move {
+                    match ws_path {
+                        Some(path) => {
+                            let path = std::path::PathBuf::from(path);
+                            crate::diff_parse::run_git_create_branch(&path, &branch_clone).await
+                        }
+                        None => Err("No workspace path".to_string()),
+                    }
+                };
+                Task::perform(task, Message::GitCreateBranchResult)
+            }
+            Message::NewBranchNameChanged(name) => {
+                self.new_branch_name = name;
+                Task::none()
+            }
+            Message::GitCreateBranchResult(result) => {
+                self.git_syncing = false;
+                match result {
+                    Ok(()) => {
+                        self.toasts.push(Toast::new(
+                            "Created and switched to new branch".to_string(),
+                            ToastKind::Success,
+                        ));
+                        self.show_branch_modal = false;
+                    }
+                    Err(e) => {
+                        self.git_branch_error = Some(e);
+                    }
+                }
+                Task::none()
+            }
             Message::FocusSearch => match self.page {
                 Page::Logs => self
                     .logs_state
@@ -812,46 +1093,54 @@ impl Dashboard {
                     .map(Message::Logs),
                 _ => Task::none(),
             },
-            Message::EscapePressed => match self.page {
-                Page::Home => {
-                    if self.board_state.is_modal_open() {
-                        self.board_state
-                            .update(board::BoardMessage::Escape)
-                            .map(Message::Board)
-                    } else {
-                        Task::none()
+            Message::EscapePressed => {
+                // Modal close priority: diff modal first, then branch modal,
+                // then page-level escapes.
+                if self.show_diff_modal {
+                    self.show_diff_modal = false;
+                    Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
+                } else if self.show_branch_modal {
+                    self.show_branch_modal = false;
+                    Task::none()
+                } else {
+                    match self.page {
+                        Page::Home => {
+                            if self.board_state.is_modal_open() {
+                                self.board_state
+                                    .update(board::BoardMessage::Escape)
+                                    .map(Message::Board)
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        Page::Shell => Task::none(),
+                        Page::Logs => self
+                            .logs_state
+                            .update(
+                                logs::LogMessage::Escape,
+                                self.log_store.as_ref().expect("ready"),
+                            )
+                            .map(Message::Logs),
+                        Page::Sessions => self
+                            .sessions_state
+                            .update(sessions::SessionsMessage::Escape)
+                            .map(Message::Sessions),
+                        Page::Editor => self
+                            .editor_state
+                            .update(editor::EditorMessage::Escape)
+                            .map(Message::Editor),
+                        Page::Settings => {
+                            if self.settings_state.is_modal_open() {
+                                self.settings_state
+                                    .update(settings::SettingsMessage::Escape)
+                                    .map(Message::Settings)
+                            } else {
+                                Task::none()
+                            }
+                        }
                     }
                 }
-                Page::Shell => Task::none(),
-                Page::Logs => self
-                    .logs_state
-                    .update(
-                        logs::LogMessage::Escape,
-                        self.log_store.as_ref().expect("ready"),
-                    )
-                    .map(Message::Logs),
-                Page::Sessions => self
-                    .sessions_state
-                    .update(sessions::SessionsMessage::Escape)
-                    .map(Message::Sessions),
-                Page::Diff => self
-                    .diff_state
-                    .update(diff::DiffMessage::Escape)
-                    .map(Message::Diff),
-                Page::Editor => self
-                    .editor_state
-                    .update(editor::EditorMessage::Escape)
-                    .map(Message::Editor),
-                Page::Settings => {
-                    if self.settings_state.is_modal_open() {
-                        self.settings_state
-                            .update(settings::SettingsMessage::Escape)
-                            .map(Message::Settings)
-                    } else {
-                        Task::none()
-                    }
-                }
-            },
+            }
             Message::UpdateBot if self.ready => {
                 self.updating = true;
                 // Save window state before update (synchronous).
@@ -1000,7 +1289,7 @@ impl Dashboard {
             | Message::Logs(_)
             | Message::Board(_)
             | Message::Sessions(_)
-            | Message::Diff(_)
+            | Message::DiffModal(_)
             | Message::Editor(_)
             | Message::Settings(_)
             | Message::UpdateBot
@@ -1010,7 +1299,12 @@ impl Dashboard {
             | Message::ToggleMaintenance
             | Message::ToggleMaintenanceResult(..)
             | Message::WorkspaceStatesRefreshed(..)
-            | Message::Nop => Task::none(),
+            | Message::Nop
+            | Message::OpenDiffModal(_)
+            | Message::GitSwitch(_)
+            | Message::GitCreate
+            | Message::GitSync
+            | Message::OpenBranchModal => Task::none(),
         }
     }
 
@@ -1020,6 +1314,15 @@ impl Dashboard {
     ///
     /// An empty name selects the "Personal" workspace (no shared workspace).
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
+        // Clear git sidebar state — eagerly refreshed below; Tick skips once.
+        self.git_diff_stats = None;
+        self.git_current_branch = None;
+        self.git_behind_ahead = None;
+        self.local_branches.clear();
+        self.branch_search_query.clear();
+        self.git_branch_error = None;
+        self.git_refresh_eagerly = true;
+
         if name.is_empty() {
             self.selected_workspace_name = None;
             self.paused = false;
@@ -1086,9 +1389,14 @@ impl Dashboard {
 
         let diff_name = name.to_string();
         let diff_path = personal_path.clone();
+
+        // Cache workspace filesystem path on Dashboard for git sidebar + modal use.
+        let resolved_path = ws_path.clone().or_else(|| personal_path.clone());
+        self.workspace_filesystem_path = resolved_path;
+
         let diff_task: Task<Message> =
             Task::done(diff::DiffMessage::WorkspaceSelected(diff_name, diff_path))
-                .map(Message::Diff);
+                .map(Message::DiffModal);
 
         let (shell_name, shell_path) =
             resolve_workspace_path(name, ws_path.as_ref(), personal_path.as_ref());
@@ -1102,7 +1410,14 @@ impl Dashboard {
         let home_task: Task<Message> =
             Task::done(home::HomeMessage::WorkspaceChanged(Some(home_name))).map(Message::Home);
 
-        Task::batch([board_refresh, editor_task, diff_task, shell_task, home_task])
+        Task::batch([
+            board_refresh,
+            editor_task,
+            diff_task,
+            shell_task,
+            home_task,
+            self.refresh_git_sidebar(),
+        ])
     }
 
     /// Reload workspace options from storage (e.g. after add/delete on the
@@ -1114,6 +1429,58 @@ impl Dashboard {
             load_workspace_options(prev_selection),
             std::convert::identity,
         )
+    }
+
+    /// Refresh git sidebar information (diff stats, current branch, behind/ahead).
+    /// Called every tick when a workspace with a git repo is selected.
+    fn refresh_git_sidebar(&self) -> Task<Message> {
+        let ws_path = match &self.workspace_filesystem_path {
+            Some(p) => p.clone(),
+            None => return Task::none(),
+        };
+
+        let ws_path = std::path::PathBuf::from(ws_path);
+        if !crate::diff_parse::is_git_repo(&ws_path) {
+            return Task::none();
+        }
+
+        // Diff stats
+        let stats_path = ws_path.clone();
+        let stats_task = Task::perform(
+            async move {
+                match crate::diff_parse::run_git_diff_stats(&stats_path).await {
+                    Ok(stats) => Message::GitDiffStats(Some(stats)),
+                    Err(_) => Message::GitDiffStats(None),
+                }
+            },
+            std::convert::identity,
+        );
+
+        // Current branch
+        let branch_path = ws_path.clone();
+        let branch_task = Task::perform(
+            async move {
+                match crate::diff_parse::run_git_current_branch(&branch_path).await {
+                    Ok(b) => Message::GitCurrentBranch(Some(b)),
+                    Err(_) => Message::GitCurrentBranch(None),
+                }
+            },
+            std::convert::identity,
+        );
+
+        // Behind/ahead
+        let ahead_path = ws_path;
+        let ahead_task = Task::perform(
+            async move {
+                match crate::diff_parse::run_git_behind_ahead(&ahead_path).await {
+                    Ok(ba) if ba.0 > 0 || ba.1 > 0 => Message::GitBehindAhead(Some(ba)),
+                    _ => Message::GitBehindAhead(None),
+                }
+            },
+            std::convert::identity,
+        );
+
+        Task::batch([stats_task, branch_task, ahead_task])
     }
 
     /// Return the selected workspace name, or `None` if no shared workspace
@@ -1184,7 +1551,6 @@ impl Dashboard {
             }
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
-            Page::Diff => self.diff_state.view().map(Message::Diff),
             Page::Shell => self.shell_state.view().map(Message::Shell),
             Page::Editor => self.editor_state.view().map(Message::Editor),
             Page::Settings => self
@@ -1243,8 +1609,243 @@ impl Dashboard {
                 .into()
         };
 
-        iced::widget::stack![body, overlay].into()
+        // ── Diff modal overlay ─────────────────────────────────────
+        let diff_overlay: Element<'_, Message> = if self.show_diff_modal {
+            render_diff_modal(&self.diff_state)
+        } else {
+            container(text(""))
+                .width(Length::Shrink)
+                .height(Length::Shrink)
+                .into()
+        };
+
+        // ── Branch management modal overlay ─────────────────────────
+        let branch_overlay: Element<'_, Message> = if self.show_branch_modal {
+            render_branch_modal(
+                &self.local_branches,
+                &self.branch_search_query,
+                self.git_branch_error.as_ref(),
+                self.git_syncing,
+                &self.new_branch_name,
+            )
+        } else {
+            container(text(""))
+                .width(Length::Shrink)
+                .height(Length::Shrink)
+                .into()
+        };
+
+        iced::widget::stack![body, diff_overlay, branch_overlay, overlay].into()
     }
+}
+
+/// Render the diff modal (80% width, 100% height, centered).
+fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
+    let backdrop = iced::widget::mouse_area(
+        container(text(""))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.0, 0.0, 0.0, 0.5,
+                ))),
+                ..container::Style::default()
+            }),
+    )
+    .on_press(Message::CloseDiffModal);
+
+    let viewing_commit = diff_state.is_viewing_commit();
+
+    // Outer header: commit message (large, bold) + short hash (muted) for
+    // historical commits, or "Uncommitted changes" for working-tree diff.
+    let header: Element<'_, Message> = if viewing_commit {
+        let msg = diff_state
+            .commit_message()
+            .unwrap_or("(no commit message)")
+            .to_string();
+        let hash = diff_state.commit_short_hash().unwrap_or("????????");
+        column![
+            text(msg).size(18).color(theme::TEXT_PRIMARY),
+            text(hash).size(12).color(theme::TEXT_MUTED),
+        ]
+        .spacing(2)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 12.0,
+            left: 0.0,
+        })
+        .into()
+    } else {
+        column![
+            text("Uncommitted changes")
+                .size(18)
+                .color(theme::TEXT_PRIMARY),
+            text("Working tree diff \u{2014} press Escape to close")
+                .size(11)
+                .color(theme::TEXT_MUTED),
+        ]
+        .spacing(4)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 12.0,
+            left: 0.0,
+        })
+        .into()
+    };
+
+    let diff_content: Element<'_, diff::DiffMessage> = diff_state.view();
+    let inner = column![header, diff_content.map(Message::DiffModal)].spacing(0);
+
+    // 80% width with 10% margin each side via a row with FillPortion spacers
+    let dialog = container(inner)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(16)
+        .style(|_theme: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: theme::BORDER_STRONG,
+            },
+            ..container::Style::default()
+        });
+
+    let centered = row![
+        Space::new().width(Length::FillPortion(1)), // 10% margin
+        dialog.width(Length::FillPortion(8)),       // 80% content
+        Space::new().width(Length::FillPortion(1)), // 10% margin
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    iced::widget::stack([backdrop.into(), centered.into()]).into()
+}
+
+/// Render the branch management modal (80% width, 100% height).
+fn render_branch_modal<'a>(
+    branches: &'a [String],
+    search_query: &'a str,
+    error: Option<&'a String>,
+    syncing: bool,
+    new_branch_name: &'a str,
+) -> Element<'a, Message> {
+    use iced::widget::text_input;
+    let backdrop = iced::widget::mouse_area(
+        container(text(""))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.0, 0.0, 0.0, 0.5,
+                ))),
+                ..container::Style::default()
+            }),
+    )
+    .on_press(Message::CloseBranchModal);
+
+    let search_input = text_input("Search branches…", search_query)
+        .on_input(Message::BranchQueryChanged)
+        .on_submit(Message::Nop)
+        .padding(8)
+        .size(14);
+
+    // Filter branches by search query
+    let filtered: Vec<&String> = if search_query.is_empty() {
+        branches.iter().collect()
+    } else {
+        let q = search_query.to_lowercase();
+        branches
+            .iter()
+            .filter(|b| b.to_lowercase().contains(&q))
+            .collect()
+    };
+
+    let branch_items: Vec<Element<'a, Message>> = filtered
+        .iter()
+        .map(|branch| {
+            let b = (*branch).clone();
+            button(text(b.clone()).size(14).color(theme::TEXT_PRIMARY))
+                .padding([6, 12])
+                .width(Length::Fill)
+                .style(theme::button_text)
+                .on_press_maybe(if syncing {
+                    None
+                } else {
+                    Some(Message::GitSwitch(b.clone()))
+                })
+                .into()
+        })
+        .collect();
+
+    let list = scrollable(Column::with_children(branch_items).spacing(2))
+        .height(Length::Fill)
+        .style(theme::scrollbar_style);
+
+    // Error display
+    let error_elem: Element<'a, Message> = if let Some(err) = error {
+        text(err).size(12).color(theme::STATUS_ERROR).into()
+    } else {
+        container(text("")).into()
+    };
+
+    // Create new branch input + button
+    let create_input = text_input("New branch name…", new_branch_name)
+        .on_input(Message::NewBranchNameChanged)
+        .on_submit(Message::GitCreate)
+        .padding(8)
+        .size(14);
+
+    let create_btn = button(text("Create & Switch").size(14).color(theme::TEXT_PRIMARY))
+        .padding([6, 12])
+        .style(theme::button_primary)
+        .on_press_maybe(if syncing {
+            None
+        } else {
+            Some(Message::GitCreate)
+        });
+
+    let inner = column![
+        text("Branches").size(18).color(theme::TEXT_PRIMARY),
+        Space::new().height(8),
+        search_input,
+        Space::new().height(8),
+        list,
+        error_elem,
+        Space::new().height(8),
+        row![create_input, create_btn]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    ]
+    .spacing(0)
+    .height(Length::Fill);
+
+    // 80% width with 10% margin each side via a row with FillPortion spacers
+    let dialog = container(inner)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(16)
+        .style(|_theme: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: theme::BORDER_STRONG,
+            },
+            ..container::Style::default()
+        });
+
+    let centered = row![
+        Space::new().width(Length::FillPortion(1)), // 10% margin
+        dialog.width(Length::FillPortion(8)),       // 80% content
+        Space::new().width(Length::FillPortion(1)), // 10% margin
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    iced::widget::stack([backdrop.into(), centered.into()]).into()
 }
 
 // ── Ticket sidebar (Home page, right side) ────────────────────────
@@ -1446,10 +2047,17 @@ impl Dashboard {
             self.logs_state.subscription().map(Message::Logs),
             self.board_state.subscription().map(Message::Board),
             self.sessions_state.subscription().map(Message::Sessions),
-            self.diff_state.subscription().map(Message::Diff),
             self.editor_state.subscription().map(Message::Editor),
             self.home_state.subscription().map(Message::Home),
             iced::Subscription::run(shutdown_subscription),
+            // Diff modal subscription (keyboard shortcuts, auto-refresh).
+            // Only active when the modal is open to avoid intercepting
+            // global keyboard shortcuts unnecessarily.
+            if self.show_diff_modal {
+                self.diff_state.subscription().map(Message::DiffModal)
+            } else {
+                iced::Subscription::none()
+            },
         ])
     }
 }
@@ -1468,14 +2076,14 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
 
 impl Dashboard {
     fn sidebar_view(&self) -> Element<'_, Message> {
-        // Sidebar navigation: Home, Editor, Diff, Shell (icon-only, 28px)
+        // Sidebar navigation: Home, Editor, Shell (icon-only, 28px)
         let mut nav_col = Column::new().spacing(4);
         for page in Page::sidebar_pages() {
             let is_active = self.page == *page;
-            // Editor, Diff, Shell require any workspace (shared or personal with a user selected).
+            // Editor, Shell require any workspace (shared or personal with a user selected).
             let has_any_workspace =
                 self.selected_workspace_name.is_some() || self.selected_user_name.is_some();
-            let requires_workspace = matches!(*page, Page::Editor | Page::Shell | Page::Diff);
+            let requires_workspace = matches!(*page, Page::Editor | Page::Shell);
             let disabled = requires_workspace && !has_any_workspace;
 
             let color = if is_active {
@@ -1487,10 +2095,6 @@ impl Dashboard {
             };
             let icon: iced::Element<'_, Message> = match page {
                 Page::Home => lucide::layout_dashboard::<iced::Theme, iced::Renderer>()
-                    .size(28)
-                    .color(color)
-                    .into(),
-                Page::Diff => lucide::git_pull_request::<iced::Theme, iced::Renderer>()
                     .size(28)
                     .color(color)
                     .into(),
@@ -1519,6 +2123,98 @@ impl Dashboard {
                 Some(Message::Navigation(*page))
             });
             nav_col = nav_col.push(btn);
+        }
+
+        // ── Git section (diff stats, branch, behind/ahead) ────────
+        let has_git = self.workspace_filesystem_path.is_some() && self.git_current_branch.is_some();
+
+        if has_git {
+            nav_col = nav_col.push(Space::new().height(8));
+
+            // a) Uncommitted diff stats — clickable -> open diff modal (working tree)
+            let stats_text: Element<'_, Message> = match self.git_diff_stats {
+                Some((added, removed)) if added > 0 || removed > 0 => row![
+                    text::<iced::Theme, iced::Renderer>(format!("+{added}"))
+                        .size(11)
+                        .color(theme::STATUS_SUCCESS),
+                    text::<iced::Theme, iced::Renderer>(format!(" \u{2212}{removed}"))
+                        .size(11)
+                        .color(theme::STATUS_ERROR),
+                ]
+                .spacing(2)
+                .align_y(Alignment::Center)
+                .into(),
+                _ => text("clean").size(10).color(theme::TEXT_MUTED).into(),
+            };
+            let stats_btn = button(
+                container(stats_text)
+                    .width(Length::Fill)
+                    .center_x(Length::Fill)
+                    .padding([2, 0]),
+            )
+            .width(Length::Fill)
+            .padding(0)
+            .style(theme::button_text)
+            .on_press(Message::OpenDiffModal(None));
+            nav_col = nav_col.push(stats_btn);
+
+            // b) Current branch name — clickable -> branch modal
+            let branch_text: Element<'_, Message> = match &self.git_current_branch {
+                Some(b) => {
+                    let truncated = if b.len() > 20 {
+                        format!("{}…", &b[..19])
+                    } else {
+                        b.clone()
+                    };
+                    text(truncated).size(11).color(theme::ACCENT).into()
+                }
+                None => text("").into(),
+            };
+            let branch_btn = button(
+                container(branch_text)
+                    .width(Length::Fill)
+                    .center_x(Length::Fill)
+                    .padding([2, 0]),
+            )
+            .width(Length::Fill)
+            .padding(0)
+            .style(theme::button_text)
+            .on_press(Message::OpenBranchModal);
+            nav_col = nav_col.push(branch_btn);
+
+            // c) Behind/ahead counts — clickable -> sync
+            if let Some((behind, ahead)) = self.git_behind_ahead {
+                if behind > 0 || ahead > 0 {
+                    let sync_text = if behind > 0 && ahead > 0 {
+                        format!("\u{2193}{behind} \u{2191}{ahead}")
+                    } else if behind > 0 {
+                        format!("\u{2193}{behind}")
+                    } else {
+                        format!("\u{2191}{ahead}")
+                    };
+                    let sync_btn = button(
+                        row![
+                            text("\u{21bb}").size(14).color(if self.git_syncing {
+                                theme::TEXT_MUTED
+                            } else {
+                                theme::ACCENT
+                            }),
+                            text(sync_text.clone()).size(11).color(theme::TEXT_MUTED),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([2, 0])
+                    .width(Length::Fill)
+                    .style(theme::button_text)
+                    .on_press_maybe(if self.git_syncing {
+                        None
+                    } else {
+                        Some(Message::GitSync)
+                    });
+                    nav_col = nav_col.push(sync_btn);
+                }
+            }
         }
 
         // Spacer to push buttons to the bottom of the sidebar
@@ -1616,7 +2312,7 @@ impl Dashboard {
         let inner = nav_col.spacing(2);
 
         container(inner)
-            .width(Length::Fixed(56.0))
+            .width(Length::Fixed(130.0))
             .height(Length::Fill)
             .style(move |_theme| container::Style {
                 background: Some(iced::Background::Color(theme::BG_SURFACE)),

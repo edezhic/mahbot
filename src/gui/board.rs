@@ -988,6 +988,51 @@ impl BoardState {
                         .color(theme::TEXT_MUTED),
                 );
             } else if let Some(ref stats) = self.commit_stats {
+                // Summary header: commit hash + aggregate change stats
+                let total_additions: i64 = stats.files.iter().map(|f| f.additions).sum();
+                let total_deletions: i64 = stats.files.iter().map(|f| f.deletions).sum();
+                let file_count = stats.files.len();
+                let mut summary_parts: Vec<Element<'_, BoardMessage>> = Vec::new();
+                if let Some(ref hash) = ticket.commit_hash {
+                    summary_parts.push(
+                        text(format!("{hash:.8}"))
+                            .size(11)
+                            .color(theme::TEXT_MUTED)
+                            .into(),
+                    );
+                    summary_parts.push(Space::new().width(6).into());
+                }
+                summary_parts.push(
+                    text(format!(
+                        "{file_count} file{} changed",
+                        if file_count == 1 { "" } else { "s" }
+                    ))
+                    .size(11)
+                    .color(theme::TEXT_SECONDARY)
+                    .into(),
+                );
+                if total_additions > 0 {
+                    summary_parts.push(
+                        text(format!("+{total_additions}"))
+                            .size(11)
+                            .color(theme::STATUS_SUCCESS)
+                            .into(),
+                    );
+                }
+                if total_deletions > 0 {
+                    summary_parts.push(
+                        text(format!("\u{2212}{total_deletions}"))
+                            .size(11)
+                            .color(theme::STATUS_ERROR)
+                            .into(),
+                    );
+                }
+                let summary_header =
+                    container(row(summary_parts).spacing(4).align_y(Alignment::Center))
+                        .padding([4, 8])
+                        .width(Length::Fill);
+                detail = detail.push(summary_header);
+
                 // File stat rows — hide zero-valued sides
                 let mut file_col = Column::new().spacing(2);
                 for f in &stats.files {
