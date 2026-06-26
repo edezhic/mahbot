@@ -131,9 +131,16 @@ enum NotifyPolicy {
 }
 
 /// Transition a ticket to `target` phase if it's still in `expected` phase.
+///
 /// Returns `Ok(())` if the transition was applied (ticket was still in expected
 /// phase). Returns `Err(String)` with a descriptive message if the ticket was
-/// moved externally or an error occurred.
+/// moved externally or an error occurred. On failure, clears `assigned_to` so
+/// the poll loop can re-dispatch if needed.
+///
+/// The `pipeline_reservation` parameter is forwarded to
+/// [`BoardStore::transition_to`]: pass `Some(true)` for bounce-back transitions
+/// (back to [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets
+/// priority re-dispatch over fresh tickets, or `None` for all other transitions.
 ///
 /// If `notify` is [`NotifyPolicy::Notify`], calls [`notify_ticket`] on success;
 /// errors from notification are logged and discarded (not propagated).
@@ -142,9 +149,10 @@ async fn transition_ticket(
     expected: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
+    pipeline_reservation: Option<bool>,
 ) -> Result<(), String> {
     match board()
-        .transition_to(&ticket.id, Some(expected), target, None)
+        .transition_to(&ticket.id, Some(expected), target, pipeline_reservation)
         .await
     {
         Ok(()) => {
@@ -171,6 +179,7 @@ async fn transition_ticket(
                 error = %e,
                 "Failed to update ticket status",
             );
+            let _ = board().set_assigned_to(&ticket.id, None).await;
             Err(e.to_string())
         }
     }
@@ -207,49 +216,6 @@ async fn resolve_ticket_workspace(
                 "Failed to look up workspace for ticket — {context}",
             );
             None
-        }
-    }
-}
-
-/// Bounce a failed ticket back to [`TicketPhase::ReadyForDevelopment`] with a
-/// pipeline reservation, ensuring it gets priority re-dispatch over fresh
-/// tickets.
-///
-/// Used by both the diagnostics runner and the verifier (reviewer/QA)
-/// processing — both paths had nearly identical duplicated bounce-back logic
-/// that differed only in the source phase and log label, and the verifier
-/// path was missing the defensive `assigned_to` cleanup on transition failure.
-async fn bounce_back_to_development(ticket: &Ticket, source_phase: TicketPhase, log_label: &str) {
-    match board()
-        .transition_to(
-            &ticket.id,
-            Some(source_phase),
-            TicketPhase::ReadyForDevelopment,
-            Some(true),
-        )
-        .await
-    {
-        Ok(()) => {
-            ticket_buffer::push(
-                &ticket.workspace_name,
-                &ticket.id,
-                source_phase.as_ref(),
-                TicketPhase::ReadyForDevelopment.as_ref(),
-            );
-            info!(
-                ticket = %ticket.id,
-                "{log_label} failed — pipeline reservation set for rework priority",
-            );
-        }
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "{log_label} failed but transition to ReadyForDevelopment \
-                 failed — ticket stuck in {phase}, clearing assigned_to for retry",
-                phase = source_phase.as_ref(),
-            );
-            let _ = board().set_assigned_to(&ticket.id, None).await;
         }
     }
 }
@@ -406,6 +372,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                     target_phase,
                     TicketPhase::Failed,
                     NotifyPolicy::Notify,
+                    None,
                 )
                 .await
                 {
@@ -767,8 +734,14 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let _ = board()
         .add_comment(&ticket.id, Role::Engineer.as_str(), comment_text)
         .await;
-    if let Err(e) =
-        transition_ticket(&ticket, TicketPhase::InDevelopment, target_phase, notify).await
+    if let Err(e) = transition_ticket(
+        &ticket,
+        TicketPhase::InDevelopment,
+        target_phase,
+        notify,
+        None,
+    )
+    .await
     {
         let verb = match target_phase {
             TicketPhase::InDiagnostics => "completed",
@@ -781,7 +754,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             phase = target_phase.as_ref(),
             stuck = TicketPhase::InDevelopment.as_ref(),
         );
-        let _ = board().set_assigned_to(&ticket.id, None).await;
     }
 }
 
@@ -842,7 +814,8 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, reason:
 
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
 
-    if let Err(e) = transition_ticket(ticket, source, TicketPhase::Done, notify_policy).await {
+    if let Err(e) = transition_ticket(ticket, source, TicketPhase::Done, notify_policy, None).await
+    {
         let phase_label = source.as_ref();
         warn!(
             ticket = %ticket.id,
@@ -1243,9 +1216,9 @@ async fn trip_sanitation_circuit_breaker_if_exceeded(
 /// - If **clean** (pass = true): transitions to [`TicketPhase::SanitationPassed`]
 ///   (transitory handoff before auto-commit).
 /// - If **garbage detected** (pass = false): adds a comment listing the offending
-///   files and bounces the ticket to [`TicketPhase::ReadyForDevelopment`] via
-///   [`bounce_back_to_development`], matching the existing review/QA failure
-///   pattern.
+///   files and transitions the ticket to [`TicketPhase::ReadyForDevelopment`] with a
+///   pipeline reservation (via [`transition_ticket`]), matching the existing review/QA
+///   failure pattern.
 #[allow(clippy::too_many_lines)]
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
@@ -1385,6 +1358,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             TicketPhase::InSanitation,
             TicketPhase::SanitationPassed,
             NotifyPolicy::Buffer,
+            None,
         )
         .await
         {
@@ -1418,7 +1392,26 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             )
             .await;
 
-        bounce_back_to_development(&ticket, TicketPhase::InSanitation, "Sanitation").await;
+        if let Err(e) = transition_ticket(
+            &ticket,
+            TicketPhase::InSanitation,
+            TicketPhase::ReadyForDevelopment,
+            NotifyPolicy::Buffer,
+            Some(true),
+        )
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Sanitation failed but transition to ReadyForDevelopment also failed",
+            );
+        } else {
+            info!(
+                ticket = %ticket.id,
+                "Sanitation failed — pipeline reservation set for rework priority",
+            );
+        }
     }
 }
 
@@ -1539,6 +1532,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             TicketPhase::InDiagnostics,
             TicketPhase::DiagnosticsDone,
             NotifyPolicy::Buffer,
+            None,
         )
         .await
         {
@@ -1614,12 +1608,32 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         .await;
 
     if target == TicketPhase::ReadyForDevelopment {
-        bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
+        if let Err(e) = transition_ticket(
+            &ticket,
+            TicketPhase::InDiagnostics,
+            TicketPhase::ReadyForDevelopment,
+            NotifyPolicy::Buffer,
+            Some(true),
+        )
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Diagnostics failed but transition to ReadyForDevelopment also failed",
+            );
+        } else {
+            info!(
+                ticket = %ticket.id,
+                "Diagnostics failed — pipeline reservation set for rework priority",
+            );
+        }
     } else if let Err(e) = transition_ticket(
         &ticket,
         TicketPhase::InDiagnostics,
         target,
         NotifyPolicy::Buffer,
+        None,
     )
     .await
     {
@@ -1627,9 +1641,8 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             ticket = %ticket.id,
             error = %e,
             "Diagnostics completed but transition to DiagnosticsDone \
-             failed — clearing assigned_to for retry",
+             failed — ticket stuck in DiagnosticsDone",
         );
-        let _ = board().set_assigned_to(&ticket.id, None).await;
     }
 }
 
@@ -1925,8 +1938,14 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
 
     let target = TicketPhase::Planning;
 
-    if let Err(e) =
-        transition_ticket(ticket, TicketPhase::Analysis, target, NotifyPolicy::Notify).await
+    if let Err(e) = transition_ticket(
+        ticket,
+        TicketPhase::Analysis,
+        target,
+        NotifyPolicy::Notify,
+        None,
+    )
+    .await
     {
         warn!(
             ticket = %ticket.id,
@@ -2068,8 +2087,14 @@ async fn run_circuit_breaker(
         .add_comment(&ticket.id, "system", &comment_text(count))
         .await;
 
-    if let Err(e) =
-        transition_ticket(ticket, expected, TicketPhase::Failed, NotifyPolicy::Notify).await
+    if let Err(e) = transition_ticket(
+        ticket,
+        expected,
+        TicketPhase::Failed,
+        NotifyPolicy::Notify,
+        None,
+    )
+    .await
     {
         warn!(
             ticket = %ticket.id,
@@ -2122,6 +2147,7 @@ async fn run_circuit_breaker(
             TicketPhase::ReadyForDevelopment,
             TicketPhase::Planning,
             NotifyPolicy::Buffer,
+            None,
         )
         .await
         {
@@ -2185,8 +2211,9 @@ async fn trip_circuit_breaker_if_exceeded(
 ///    with [`NotifyPolicy::Notify`]. This is a terminal failure; retrying would waste
 ///    credits on a fundamentally broken dispatch.
 ///
-/// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → bounce back to
-///    [`TicketPhase::ReadyForDevelopment`] via [`bounce_back_to_development`]. The circuit
+/// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
+///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (via
+///    [`transition_ticket`]). The circuit
 ///    breaker is checked *before* dispatch by [`guard_phase_and_circuit_breaker`], so only
 ///    the bounce-back is needed here.
 ///
@@ -2229,6 +2256,7 @@ async fn process_verdict_results(
             verifier.active_phase,
             TicketPhase::Failed,
             NotifyPolicy::Notify,
+            None,
         )
         .await
         {
@@ -2246,7 +2274,28 @@ async fn process_verdict_results(
     // Priority 2: any verifier failed — bounce back to development.
     let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
     if any_failed {
-        bounce_back_to_development(ticket, verifier.active_phase, verifier.log_label).await;
+        if let Err(e) = transition_ticket(
+            ticket,
+            verifier.active_phase,
+            TicketPhase::ReadyForDevelopment,
+            NotifyPolicy::Buffer,
+            Some(true),
+        )
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "{log_label} failed but transition to ReadyForDevelopment also failed",
+                log_label = verifier.log_label,
+            );
+        } else {
+            info!(
+                ticket = %ticket.id,
+                "{log_label} failed — pipeline reservation set for rework priority",
+                log_label = verifier.log_label,
+            );
+        }
         return;
     }
 
@@ -2256,6 +2305,7 @@ async fn process_verdict_results(
         verifier.active_phase,
         verifier.success_phase,
         NotifyPolicy::Buffer,
+        None,
     )
     .await
     {
@@ -2797,6 +2847,7 @@ mod tests {
             DEFAULT_TICKET_PHASE,
             TicketPhase::Failed,
             NotifyPolicy::Buffer,
+            None,
         )
         .await
         .expect("transition to Failed");
@@ -2857,6 +2908,7 @@ mod tests {
             TicketPhase::Backlog,
             TicketPhase::Analysis,
             NotifyPolicy::Notify,
+            None,
         )
         .await
         .expect("transition to Analysis");
