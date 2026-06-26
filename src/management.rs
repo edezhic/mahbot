@@ -393,10 +393,15 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let ticket_for_failure = Arc::clone(&ticket);
 
     tokio::spawn(async move {
-        // Spawn an inner task so panics inside dispatch() are caught via
+        // Spawn an inner task so panics inside the dispatch are caught via
         // the JoinHandle rather than silently swallowed by the outer spawn.
         let handle = tokio::spawn(async move {
-            phase.dispatch(ticket, ws).await;
+            match phase {
+                PollPhase::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
+                PollPhase::EngineerDevelopment => dispatch_engineer(ticket, ws).await,
+                PollPhase::DiagnosticsCheck => dispatch_diagnostics(ticket, ws).await,
+                PollPhase::VerifierCheck(vi) => dispatch_verifiers(ticket, ws, vi).await,
+            }
         });
 
         match handle.await {
@@ -539,18 +544,6 @@ impl PollPhase {
                 require_clear_pipeline: false,
                 role_label: vi.role.as_str(),
             },
-        }
-    }
-
-    /// Dispatch the appropriate agent(s) for a claimed ticket.
-    async fn dispatch(self, ticket: Arc<Ticket>, ws: Workspace) {
-        match self {
-            Self::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
-            Self::EngineerDevelopment => dispatch_engineer(ticket, ws).await,
-            Self::DiagnosticsCheck => dispatch_diagnostics(ticket, ws).await,
-            Self::VerifierCheck(vi) => {
-                dispatch_verifiers(ticket, ws, vi).await;
-            }
         }
     }
 }
