@@ -434,7 +434,9 @@ impl Agent {
                             &tool_arguments,
                             &format!("Error executing {tool_name}: {e}"),
                         );
-                        let reason = error_reason.as_deref().unwrap_or_default();
+                        let reason = error_reason
+                            .as_deref()
+                            .expect("failure_outcome always returns Some");
                         tracing::debug!(
                             tool = %tool_name,
                             duration_ms = duration.as_millis(),
@@ -454,7 +456,8 @@ impl Agent {
             let entry = guard.entry(tool_name.clone()).or_default();
             entry.call_count += 1;
             if let Some(ref reason) = error_reason {
-                let args_str = serde_json::to_string(&tool_arguments).unwrap_or_default();
+                let args_str =
+                    serde_json::to_string(&tool_arguments).expect("Value is always serializable");
                 let args_scrubbed = scrub_credentials(&args_str);
                 let args_truncated = &args_scrubbed[..args_scrubbed.floor_char_boundary(500)];
                 entry
