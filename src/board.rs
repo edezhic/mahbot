@@ -903,6 +903,38 @@ impl BoardStore {
             .await
     }
 
+    /// Build the SQL, params, and action description for a ticket status
+    /// transition. Shared by [`transition_to`](Self::transition_to) and
+    /// [`transition_to_tx`](Self::transition_to_tx).
+    fn build_transition_sql(
+        id: &str,
+        expected_phase: Option<&TicketPhase>,
+        target_phase: &TicketPhase,
+        reservation: Option<bool>,
+    ) -> (String, Vec<turso::Value>, String) {
+        let now = turso::now();
+        let guard: Option<&str> = expected_phase.map(TicketPhase::as_ref);
+        let action = match reservation {
+            Some(v) => format!(
+                "set status to {} (reservation={})",
+                target_phase.as_ref(),
+                v,
+            ),
+            None => format!("set status to {}", target_phase.as_ref()),
+        };
+        let sql = "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
+                    pipeline_reservation = COALESCE(?5, pipeline_reservation) \
+                    WHERE id = ?3 AND (?4 IS NULL OR status = ?4)";
+        let params: Vec<turso::Value> = vec![
+            Value::from(target_phase.as_ref()),
+            Value::from(now),
+            Value::from(id),
+            Value::from(guard),
+            Value::from(reservation),
+        ];
+        (sql.to_string(), params, action)
+    }
+
     /// Update the status of a ticket, optionally guarded by an expected phase.
     ///
     /// When `expected_phase` is [`Some`], the UPDATE includes `AND status = ?` in
@@ -947,25 +979,9 @@ impl BoardStore {
         target_phase: TicketPhase,
         reservation: Option<bool>,
     ) -> Result<()> {
-        let now = turso::now();
-        let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
-        let action = match reservation {
-            Some(v) => format!(
-                "set status to {} (reservation={})",
-                target_phase.as_ref(),
-                v,
-            ),
-            None => format!("set status to {}", target_phase.as_ref()),
-        };
-        self.execute_and_cancel(
-            "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
-             pipeline_reservation = COALESCE(?5, pipeline_reservation) \
-             WHERE id = ?3 AND (?4 IS NULL OR status = ?4)",
-            turso::params![target_phase.as_ref(), now, id, guard, reservation],
-            id,
-            &action,
-        )
-        .await
+        let (sql, params, action) =
+            Self::build_transition_sql(id, expected_phase.as_ref(), &target_phase, reservation);
+        self.execute_and_cancel(&sql, params, id, &action).await
     }
 
     /// Transactional variant of [`transition_to`](Self::transition_to) —
@@ -978,24 +994,9 @@ impl BoardStore {
         target_phase: TicketPhase,
         reservation: Option<bool>,
     ) -> Result<()> {
-        let now = turso::now();
-        let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
-        let action = match reservation {
-            Some(v) => format!(
-                "set status to {} (reservation={})",
-                target_phase.as_ref(),
-                v,
-            ),
-            None => format!("set status to {}", target_phase.as_ref()),
-        };
-        let rows = tx
-            .execute(
-                "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
-                 pipeline_reservation = COALESCE(?5, pipeline_reservation) \
-                 WHERE id = ?3 AND (?4 IS NULL OR status = ?4)",
-                turso::params![target_phase.as_ref(), now, id, guard, reservation],
-            )
-            .await?;
+        let (sql, params, action) =
+            Self::build_transition_sql(id, expected_phase.as_ref(), &target_phase, reservation);
+        let rows = tx.execute(&sql, params).await?;
         Self::ensure_ticket_found(rows, id, &action)?;
         Ok(())
     }
