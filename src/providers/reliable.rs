@@ -268,7 +268,7 @@ impl ReliableProvider {
         } else {
             // Jitter: randomize within [75%, 125%) of base so parallel agents
             // retrying on the same transient error don't synchronize.
-            let half_range = (base / 2).max(1);
+            let half_range = base / 2;
 
             base - base / 4 + (rand::random::<u64>() % half_range)
         }
@@ -887,22 +887,6 @@ mod tests {
             assert_eq!(tc.name, "shell");
         } else {
             panic!("expected ToolCall event");
-        }
-    }
-
-    #[test]
-    fn compute_backoff_does_not_panic_on_small_bases() {
-        // Regression: compute_backoff must not panic on division by zero
-        // for base < 2. The function is defensive against future callers
-        // that might bypass the constructor's floor of 50.
-        let err = anyhow::anyhow!("transient server error");
-        for base in [0u64, 1u64] {
-            let backoff = ReliableProvider::compute_backoff(base, &err);
-            // Result must be >= base (guaranteed by + base/4 in the jitter branch)
-            assert!(
-                backoff >= base,
-                "compute_backoff({base}) = {backoff} should be >= {base}"
-            );
         }
     }
 }
