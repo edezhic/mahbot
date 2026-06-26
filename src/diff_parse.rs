@@ -192,7 +192,7 @@ fn handle_diff_content_line(
     hunk: &mut DiffHunk,
     old_counter: &mut usize,
     new_counter: &mut usize,
-) -> bool {
+) {
     let line_kind = if line.starts_with('+') {
         DiffLineKind::Added
     } else if line.starts_with('-') {
@@ -201,10 +201,10 @@ fn handle_diff_content_line(
         DiffLineKind::Context
     } else if line == r"\ No newline at end of file" {
         // Skip this annotation — handled implicitly
-        return true;
+        return;
     } else {
         // Unknown line — skip
-        return true;
+        return;
     };
 
     let content = line[1..].trim_end_matches('\r');
@@ -234,7 +234,6 @@ fn handle_diff_content_line(
         new_line_number: new_num,
         content: content.to_string(),
     });
-    false
 }
 
 /// Parse `git diff HEAD --no-color --find-renames` output.
