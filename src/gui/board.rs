@@ -27,11 +27,7 @@ pub struct FileStat {
 /// Parsed commit stats for a ticket's associated commit.
 #[derive(Debug, Clone)]
 pub struct CommitStats {
-    /// Short hash (7 chars).
-    hash: String,
     files: Vec<FileStat>,
-    /// Conditional summary like "3 files changed, +5" or "3 files changed, -3" or "3 files changed, +5/-2".
-    summary: String,
 }
 
 #[derive(Debug, Clone)]
@@ -541,8 +537,6 @@ impl BoardState {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut files: Vec<FileStat> = Vec::new();
-        let mut total_additions: i64 = 0;
-        let mut total_deletions: i64 = 0;
 
         for line in stdout.lines() {
             let line = line.trim();
@@ -572,8 +566,6 @@ impl BoardState {
                 continue;
             }
 
-            total_additions += additions;
-            total_deletions += deletions;
             files.push(FileStat {
                 path,
                 additions,
@@ -581,33 +573,7 @@ impl BoardState {
             });
         }
 
-        let file_count = files.len();
-        let summary = match (total_additions, total_deletions) {
-            (0, 0) => format!(
-                "{file_count} file{} changed, no changes",
-                if file_count == 1 { "" } else { "s" }
-            ),
-            (a, 0) => format!(
-                "{file_count} file{} changed, +{a}",
-                if file_count == 1 { "" } else { "s" }
-            ),
-            (0, d) => format!(
-                "{file_count} file{} changed, -{d}",
-                if file_count == 1 { "" } else { "s" }
-            ),
-            (a, d) => format!(
-                "{file_count} file{} changed, +{a}/-{d}",
-                if file_count == 1 { "" } else { "s" }
-            ),
-        };
-
-        let hash = commit_hash.chars().take(7).collect();
-
-        Ok(CommitStats {
-            hash,
-            files,
-            summary,
-        })
+        Ok(CommitStats { files })
     }
 
     /// Partition tickets into the three kanban columns.
@@ -1022,13 +988,6 @@ impl BoardState {
                         .color(theme::TEXT_MUTED),
                 );
             } else if let Some(ref stats) = self.commit_stats {
-                detail = detail.push(Space::new().height(10));
-                detail = detail.push(
-                    text(format!("Commit `{}`", stats.hash))
-                        .size(12)
-                        .color(theme::TEXT_PRIMARY),
-                );
-
                 // File stat rows — hide zero-valued sides
                 let mut file_col = Column::new().spacing(2);
                 for f in &stats.files {
@@ -1075,10 +1034,6 @@ impl BoardState {
                         ..container::Style::default()
                     },
                 ));
-
-                // Summary line
-                detail = detail.push(Space::new().height(4));
-                detail = detail.push(text(&stats.summary).size(10).color(theme::TEXT_MUTED));
             }
             // If loading is done but stats is None (error) → render nothing
         }
