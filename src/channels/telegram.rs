@@ -1,4 +1,4 @@
-use crate::util::html::decode_html_entities;
+use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -499,7 +499,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
         if trimmed.starts_with("```") {
             if in_code_block {
                 in_code_block = false;
-                let escaped = crate::util::html::escape_html(code_buf.trim_end_matches('\n'));
+                let escaped = escape_html(code_buf.trim_end_matches('\n'));
                 let _ = writeln!(out, "<pre><code>{escaped}</code></pre>");
                 code_buf.clear();
             } else {
@@ -526,7 +526,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
         let stripped = line.trim_start_matches('#');
         let header_level = line.len() - stripped.len();
         if header_level > 0 && line.starts_with('#') && stripped.starts_with(' ') {
-            let title = crate::util::html::escape_html(stripped.trim());
+            let title = escape_html(stripped.trim());
             let _ = writeln!(out, "<b>{title}</b>");
             continue;
         }
@@ -552,7 +552,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
             if let Some(delim) = bold_delim
                 && let Some(end) = line[i + 2..].find(delim)
             {
-                let inner = crate::util::html::escape_html(&line[i + 2..i + 2 + end]);
+                let inner = escape_html(&line[i + 2..i + 2 + end]);
                 let _ = write!(line_out, "<b>{inner}</b>");
                 i += 4 + end;
                 continue;
@@ -563,7 +563,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 && let Some(end) = line[i + 1..].find('*')
                 && end > 0
             {
-                let inner = crate::util::html::escape_html(&line[i + 1..i + 1 + end]);
+                let inner = escape_html(&line[i + 1..i + 1 + end]);
                 let _ = write!(line_out, "<i>{inner}</i>");
                 i += 2 + end;
                 continue;
@@ -573,7 +573,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 && (i == 0 || bytes[i - 1] != b'`')
                 && let Some(end) = line[i + 1..].find('`')
             {
-                let inner = crate::util::html::escape_html(&line[i + 1..i + 1 + end]);
+                let inner = escape_html(&line[i + 1..i + 1 + end]);
                 let _ = write!(line_out, "<code>{inner}</code>");
                 i += 2 + end;
                 continue;
@@ -590,8 +590,8 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 {
                     let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
                     if url.starts_with("http://") || url.starts_with("https://") {
-                        let text_html = crate::util::html::escape_html(text_part);
-                        let url_html = crate::util::html::escape_html(url);
+                        let text_html = escape_html(text_part);
+                        let url_html = escape_html(url);
                         let _ = write!(line_out, "<a href=\"{url_html}\">{text_html}</a>");
                         i = after_bracket + 1 + paren_end + 1;
                         continue;
@@ -604,14 +604,14 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 && bytes[i + 1] == b'~'
                 && let Some(end) = line[i + 2..].find("~~")
             {
-                let inner = crate::util::html::escape_html(&line[i + 2..i + 2 + end]);
+                let inner = escape_html(&line[i + 2..i + 2 + end]);
                 let _ = write!(line_out, "<s>{inner}</s>");
                 i += 4 + end;
                 continue;
             }
             // Default: escape HTML entities
             let ch = line[i..].chars().next().unwrap();
-            crate::util::html::push_escaped(ch, &mut line_out);
+            push_escaped(ch, &mut line_out);
             i += ch.len_utf8();
         }
         line_out.push('\n');
@@ -623,7 +623,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
         let _ = writeln!(
             out,
             "<pre><code>{}</code></pre>",
-            crate::util::html::escape_html(code_buf.trim_end())
+            escape_html(code_buf.trim_end())
         );
     }
 
