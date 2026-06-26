@@ -476,6 +476,35 @@ async fn resolve_authorized_sender(
     Some((canonical_user, chat_id, reply_target))
 }
 
+/// If the text at position `i` starts with `delim`, finds the matching closing
+/// `delim`, HTML-escapes the content, and wraps it in `<tag>...</tag>`.
+///
+/// On success, advances `i` past the closing delimiter and returns `true`.
+/// Returns `false` if `delim` is not found or when the content between
+/// delimiters is empty (the `end > 0` guard prevents zero-length formatting
+/// spans like `****` or `*` with no content between delimiters).
+///
+/// This is a helper to deduplicate the 5 structurally identical inline
+/// formatting branches (bold, italic, code, strikethrough). Callers that
+/// need to guard against matching a single character when the previous
+/// character is the same (e.g. the second `*` of `**` for italic, or the
+/// second `` ` `` of ` `` ` for inline code) must apply that guard before
+/// calling this helper.
+fn try_format_inline(text: &str, i: &mut usize, out: &mut String, delim: &str, tag: &str) -> bool {
+    if text[*i..].starts_with(delim) {
+        let content_start = *i + delim.len();
+        if let Some(end) = text[content_start..].find(delim)
+            && end > 0
+        {
+            let inner = escape_html(&text[content_start..content_start + end]);
+            let _ = write!(out, "<{tag}>{inner}</{tag}>");
+            *i += delim.len() * 2 + end;
+            return true;
+        }
+    }
+    false
+}
+
 /// Convert Markdown to Telegram HTML format.
 /// Telegram HTML supports: &lt;b&gt;, &lt;i&gt;, &lt;u&gt;, &lt;s&gt;, &lt;code&gt;, &lt;pre&gt;, &lt;a href="..."&gt;
 /// Convert a subset of Markdown to Telegram's HTML parse_mode format.
@@ -486,7 +515,6 @@ async fn resolve_authorized_sender(
 ///
 /// Code block fences are detected first so inline formatting inside them is
 /// never interpreted (single-pass with code-block tracking).
-#[allow(clippy::too_many_lines)]
 fn markdown_to_telegram_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_code_block = false;
@@ -537,45 +565,24 @@ fn markdown_to_telegram_html(text: &str) -> String {
         let len = bytes.len();
         let mut i = 0;
         while i < len {
-            // Bold: **text** or __text__
-            let bold_delim: Option<&str> = (i + 1 < len)
-                .then(|| {
-                    if bytes[i] == b'*' && bytes[i + 1] == b'*' {
-                        Some("**")
-                    } else if bytes[i] == b'_' && bytes[i + 1] == b'_' {
-                        Some("__")
-                    } else {
-                        None
-                    }
-                })
-                .flatten();
-            if let Some(delim) = bold_delim
-                && let Some(end) = line[i + 2..].find(delim)
-            {
-                let inner = escape_html(&line[i + 2..i + 2 + end]);
-                let _ = write!(line_out, "<b>{inner}</b>");
-                i += 4 + end;
+            // Bold: **text**
+            if try_format_inline(line, &mut i, &mut line_out, "**", "b") {
                 continue;
             }
-            // Italic: *text*
-            if bytes[i] == b'*'
-                && (i == 0 || bytes[i - 1] != b'*')
-                && let Some(end) = line[i + 1..].find('*')
-                && end > 0
-            {
-                let inner = escape_html(&line[i + 1..i + 1 + end]);
-                let _ = write!(line_out, "<i>{inner}</i>");
-                i += 2 + end;
+            // Bold: __text__
+            if try_format_inline(line, &mut i, &mut line_out, "__", "b") {
                 continue;
             }
-            // Inline code: `code`
-            if bytes[i] == b'`'
-                && (i == 0 || bytes[i - 1] != b'`')
-                && let Some(end) = line[i + 1..].find('`')
+            // Italic: *text* — guard against matching second `*` of `**`
+            if (i == 0 || bytes[i - 1] != b'*')
+                && try_format_inline(line, &mut i, &mut line_out, "*", "i")
             {
-                let inner = escape_html(&line[i + 1..i + 1 + end]);
-                let _ = write!(line_out, "<code>{inner}</code>");
-                i += 2 + end;
+                continue;
+            }
+            // Inline code: `code` — guard against matching second `` ` `` of ` `` `
+            if (i == 0 || bytes[i - 1] != b'`')
+                && try_format_inline(line, &mut i, &mut line_out, "`", "code")
+            {
                 continue;
             }
             // Markdown link: [text](url)
@@ -599,14 +606,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 }
             }
             // Strikethrough: ~~text~~
-            if i + 1 < len
-                && bytes[i] == b'~'
-                && bytes[i + 1] == b'~'
-                && let Some(end) = line[i + 2..].find("~~")
-            {
-                let inner = escape_html(&line[i + 2..i + 2 + end]);
-                let _ = write!(line_out, "<s>{inner}</s>");
-                i += 4 + end;
+            if try_format_inline(line, &mut i, &mut line_out, "~~", "s") {
                 continue;
             }
             // Default: escape HTML entities
@@ -1829,6 +1829,109 @@ mod tests {
         // Literal </code> in code block must not break the HTML
         let r = markdown_to_telegram_html("```\nuse &lt;/code&gt;\n```");
         assert_eq!(r, "<pre><code>use &amp;lt;/code&amp;gt;</code></pre>");
+    }
+
+    // ── Inline formatting tests ──────────────────────────────────────
+
+    #[test]
+    fn inline_bold_double_asterisk() {
+        let r = markdown_to_telegram_html("**hello** world");
+        assert_eq!(r, "<b>hello</b> world");
+    }
+
+    #[test]
+    fn inline_bold_double_underscore() {
+        let r = markdown_to_telegram_html("__hello__ world");
+        assert_eq!(r, "<b>hello</b> world");
+    }
+
+    #[test]
+    fn inline_italic() {
+        let r = markdown_to_telegram_html("*hello* world");
+        assert_eq!(r, "<i>hello</i> world");
+    }
+
+    #[test]
+    fn inline_code() {
+        let r = markdown_to_telegram_html("use `hello()` in your code");
+        assert_eq!(r, "use <code>hello()</code> in your code");
+    }
+
+    #[test]
+    fn inline_strikethrough() {
+        let r = markdown_to_telegram_html("this is ~~wrong~~ fixed");
+        assert_eq!(r, "this is <s>wrong</s> fixed");
+    }
+
+    #[test]
+    fn inline_combined() {
+        let r = markdown_to_telegram_html("**bold** and *italic* and `code` and ~~strike~~");
+        assert_eq!(
+            r,
+            "<b>bold</b> and <i>italic</i> and <code>code</code> and <s>strike</s>"
+        );
+    }
+
+    #[test]
+    fn inline_bold_inside_text() {
+        let r = markdown_to_telegram_html("before **middle** after");
+        assert_eq!(r, "before <b>middle</b> after");
+    }
+
+    #[test]
+    fn inline_escaping_inner_html() {
+        let r = markdown_to_telegram_html("**a < b & c > d**");
+        assert_eq!(r, "<b>a &lt; b &amp; c &gt; d</b>");
+    }
+
+    #[test]
+    fn inline_unmatched_double_asterisk() {
+        // `**` without closing should be rendered literally
+        let r = markdown_to_telegram_html("hello ** world");
+        assert_eq!(r, "hello ** world");
+    }
+
+    #[test]
+    fn inline_unmatched_single_asterisk() {
+        // `*` without closing should be rendered literally
+        let r = markdown_to_telegram_html("hello * world");
+        assert_eq!(r, "hello * world");
+    }
+
+    #[test]
+    fn inline_triple_asterisk() {
+        // `***` is not a valid bold or italic construct; rendered literally
+        let r = markdown_to_telegram_html("***");
+        assert_eq!(r, "***");
+    }
+
+    #[test]
+    fn inline_unmatched_backtick() {
+        // `` ` `` without closing should be rendered literally (the opening ` is pushed as text)
+        let r = markdown_to_telegram_html("hello ` world");
+        assert_eq!(r, "hello ` world");
+    }
+
+    #[test]
+    fn inline_double_backtick() {
+        // ` `` ` (two backticks) — the first opens, the second closes (empty content), and since
+        // the `end > 0` guard rejects empty matches, both are rendered literally.
+        let r = markdown_to_telegram_html("hello `` world");
+        assert_eq!(r, "hello `` world");
+    }
+
+    #[test]
+    fn inline_unmatched_tilde() {
+        // `~` without matching pair should be rendered literally
+        let r = markdown_to_telegram_html("hello ~ world");
+        assert_eq!(r, "hello ~ world");
+    }
+
+    #[test]
+    fn inline_bold_and_italic_overlap() {
+        // Bold takes priority over italic for `**`
+        let r = markdown_to_telegram_html("***bold**");
+        assert_eq!(r, "<b>*bold</b>");
     }
 
     #[tokio::test]
