@@ -479,7 +479,6 @@ pub struct TxGuard<'a> {
 }
 
 impl TxGuard<'_> {
-    /// Execute a statement within the transaction.
     pub async fn execute(
         &self,
         sql: &str,
@@ -488,9 +487,7 @@ impl TxGuard<'_> {
         Connection::execute_impl(&self.conn, sql, params).await
     }
 
-    /// Execute a query that returns exactly one row within the transaction.
-    /// Uses the upstream connection directly so the query participates in the
-    /// transaction.
+    /// Execute a query that returns exactly one row.
     pub async fn query_row<T, E>(
         &self,
         sql: &str,
@@ -503,9 +500,8 @@ impl TxGuard<'_> {
         Connection::query_row_impl(&self.conn, sql, params, map).await
     }
 
-    /// Execute a query returning zero or more rows within the transaction.
-    /// Uses the upstream connection directly so the query participates in the
-    /// transaction. Returns an empty Vec when no rows match.
+    /// Execute a query returning zero or more rows.
+    /// Returns an empty Vec when no rows match.
     pub async fn query(
         &self,
         sql: &str,
@@ -514,11 +510,8 @@ impl TxGuard<'_> {
         Connection::query_impl(&self.conn, sql, params).await
     }
 
-    /// Execute a read-only query within the transaction, mapping each row
-    /// through a closure. Returns a Vec of results so callers can handle
-    /// per-row errors individually.
-    /// Uses the upstream connection directly so the query participates in the
-    /// transaction.
+    /// Execute a read-only query, mapping each row through a closure.
+    /// Returns per-row results so callers can handle errors individually.
     pub async fn query_map<T, E>(
         &self,
         sql: &str,
