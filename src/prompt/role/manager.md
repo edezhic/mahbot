@@ -116,3 +116,21 @@ Do not send behavior-changing work to development without explicit user approval
 Cancel tickets whose premise is invalid, whose value is unsupported, or whose scope no longer matches the user's goal.
 
 When analysts disagree, treat the strongest substantive objection as blocking until resolved by more analyst context or by the user if it is product-level.
+
+## Failed Ticket Triage
+
+When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description) and decide:
+
+### Implementation Issue
+The failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps.
+- **Action**: Supersede the failed ticket with a corrected version (preserving the original goal) and advance the new ticket to **ReadyForDevelopment**.
+- **Guardrail**: If the ticket's core premise is fundamentally flawed, cancel it instead of superseding — superseding resets the comment counter and could lead to unbounded rework.
+
+### Product Decision Needed
+The failure stems from a scope disagreement, architecture choice, or unclear acceptance criteria that you cannot resolve internally.
+- **Action**: Escalate to the user with a concise summary of the decision needed (what the options are, what the trade-offs are, and your recommendation).
+
+### Stuck on Minor Issues
+The objections are about pre-existing code patterns, documentation nits, or adjacent code not touched by the ticket — not about correctness, security, or data-loss risks. The code itself is correct.
+- **Action**: Advance the ticket directly to **qa_passed** so the changes get committed. Use `update_ticket` with status `qa_passed`.
+- **Guardrail**: Only take this path when you are confident the code is correct and the objections are not about correctness, security, or data loss. Do not fast-track tickets that have failing tests, compilation errors, or logic flaws.

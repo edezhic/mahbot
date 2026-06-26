@@ -99,9 +99,10 @@ impl WebSearchTool {
             // Firecrawl returns structured JSON errors with a clean error message.
             // Try to extract it for a better error message.
             if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)
-                && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str()) {
-                    anyhow::bail!("search failed: {error_msg}");
-                }
+                && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str())
+            {
+                anyhow::bail!("search failed: {error_msg}");
+            }
 
             anyhow::bail!("search failed with status {status}: {body}");
         }

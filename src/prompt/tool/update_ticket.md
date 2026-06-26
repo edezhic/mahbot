@@ -5,5 +5,6 @@ Transition an existing ticket to a new status or phase. Requires the ticket `tic
 - **cancelled** — abandon the ticket without completing it
 - **failed** — mark the ticket as unsuccessful
 - **done** — mark the ticket as complete and successful
+- **qa_passed** — advance a failed ticket past the failed phase (only valid from `failed`; for Manager triage of minor issues where the code is correct)
 
-Do NOT set pipeline-managed phases (analysis, planning, in_development, in_diagnostics, diagnostics_done, in_review, reviewed, in_qa, qa_passed) — the board poller manages these automatically, and manual transitions will race with running agents.
+Do NOT set other pipeline-managed phases (analysis, planning, in_development, in_diagnostics, diagnostics_done, in_review, reviewed, in_qa) — the board poller manages these automatically, and manual transitions will race with running agents.

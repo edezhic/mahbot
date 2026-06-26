@@ -40,13 +40,12 @@ const PARALLEL_AGENT_COUNT: usize = 3;
 
 /// Comments threshold — tickets accumulating more than this number of comments
 /// are tripped by the circuit breaker (i.e., the trip point is > threshold),
-/// transitioning to Failed and pausing the workspace.
-const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 100;
+/// transitioning to Failed for Manager triage.
+const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 50;
 
 /// Maximum number of cumulative diagnostics failures allowed before the circuit
 /// breaker trips. The breaker trips when `count > DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`
-/// (i.e., at ≥5 failures), failing the ticket and pausing the workspace to
-/// prevent thrashing.
+/// (i.e., at ≥5 failures), failing the ticket to prevent thrashing.
 const DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD: usize = 4;
 
 /// Minimum acceptable verification score (0-10) for analysis phase.
@@ -92,12 +91,11 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 /// Shared pre-flight guard for dispatch functions that spawn agents.
 /// Verifies the ticket is still in `expected` (avoids wasted DB writes
 /// and LLM API costs if the ticket was moved externally) and checks the
-/// circuit breaker (fails tickets with excessive comment accumulation and
-/// pauses the workspace to prevent dispatch thrashing).
+/// circuit breaker (fails tickets with excessive comment accumulation
+/// to prevent dispatch thrashing).
 ///
 /// Returns `true` when it's safe for the caller to proceed. Returns `false`
-/// when the ticket has moved, been failed, or the workspace was paused — the
-/// caller should bail out immediately.
+/// when the ticket has moved, been failed — the caller should bail out immediately.
 ///
 /// Used by all agent-spawning dispatch functions
 /// ([`dispatch_backlog_analysts`], [`dispatch_engineer`], [`dispatch_verifiers`])
@@ -139,13 +137,6 @@ enum NotifyPolicy {
 ///
 /// If `notify` is [`NotifyPolicy::Notify`], calls [`notify_ticket`] on success;
 /// errors from notification are logged and discarded (not propagated).
-///
-/// # Workspace auto-pause on failure
-///
-/// Auto-pauses the workspace when a ticket transitions to [`TicketPhase::Failed`],
-/// regardless of [`NotifyPolicy`]. This ensures the user can inspect the failure
-/// before any automated rework proceeds. The pause happens unconditionally so
-/// that future `Failed` transitions with `Buffer` still pause correctly.
 async fn transition_ticket(
     ticket: &Ticket,
     expected: TicketPhase,
@@ -157,28 +148,6 @@ async fn transition_ticket(
         .await
     {
         Ok(()) => {
-            // Auto-pause workspace on ticket failure regardless of NotifyPolicy,
-            // so the user can inspect before automated rework proceeds.
-            if target == TicketPhase::Failed
-                && let Some(ws) = resolve_ticket_workspace(ticket, "auto-pause after failure").await
-                && !ws.paused
-            {
-                if let Err(e) = crate::workspace::store().set_paused(&ws.name, true).await {
-                    warn!(
-                        ticket = %ticket.id,
-                        workspace = %ws.name,
-                        error = %e,
-                        "Failed to pause workspace after ticket failure",
-                    );
-                } else {
-                    info!(
-                        ticket = %ticket.id,
-                        workspace = %ws.name,
-                        "Workspace paused due to ticket failure",
-                    );
-                }
-            }
-
             if matches!(notify, NotifyPolicy::Notify) {
                 notify_ticket(ticket, target).await;
             } else if let Some(ws) =
@@ -292,8 +261,7 @@ async fn bounce_back_to_development(ticket: &Ticket, source_phase: TicketPhase, 
 /// and delivery (broadcasts to all users with this workspace active).
 ///
 /// This is a pure notification function — it does NOT pause the workspace.
-/// Workspace auto-pause on [`TicketPhase::Failed`] transitions is handled
-/// unconditionally in [`transition_ticket`] regardless of [`NotifyPolicy`].
+/// The Manager handles failed tickets autonomously via the triage prompt.
 ///
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
@@ -1074,12 +1042,11 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 
 /// Maximum number of consecutive sanitation failures allowed before the
 /// sanitation circuit breaker trips. The breaker trips when a ticket's
-/// sanitation failure count exceeds this threshold, failing the ticket and
-/// pausing the workspace.
+/// sanitation failure count exceeds this threshold, failing the ticket.
 ///
 /// This is a separate, lower threshold than the general comment-count
 /// circuit breaker — sanitation failures are cheap to detect and should
-/// not consume 100 comments before tripping.
+/// not consume 50 comments before tripping.
 const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
 
 /// Handle a QaPassed ticket: check for untracked/new files and either
@@ -1235,7 +1202,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 ///
 /// Separate from the general comment-count circuit breaker so that
 /// garbage-thrashing tickets are caught early without consuming the full
-/// 100-comment budget.
+/// 50-comment budget.
 #[must_use]
 async fn trip_sanitation_circuit_breaker_if_exceeded(
     ticket: &Ticket,
@@ -1285,7 +1252,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Phase check only (no general circuit breaker): verify the ticket is still
     // in InSanitation before starting the agent. The dedicated sanitation circuit
-    // breaker below (threshold: 3) will always trip before the general 100-comment
+    // breaker below (threshold: 3) will always trip before the general comment-count
     // breaker, so running both would waste a DB round-trip fetching comments twice.
     if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
         return;
@@ -1667,9 +1634,8 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 }
 
 /// Diagnostics-specific circuit breaker: counts prior diagnostics system
-/// comments that indicate failures, and fails the ticket (plus pauses the
-/// workspace) if the count exceeds [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]
-/// (i.e., trip at ≥5 failures).
+/// comments that indicate failures, and fails the ticket if the count
+/// exceeds [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`] (i.e., trip at ≥5 failures).
 ///
 /// Re-fetches comments because the ticket snapshot may be stale.
 /// Excludes comments already containing "Circuit breaker" to prevent
@@ -1698,7 +1664,7 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(ticket: &Ticket) -> bool {
         |count| {
             format!(
                 "🔍 Auto-diagnostics\n\n❌ Circuit breaker: {count} prior diagnostic \
-                 failures. Failing ticket and pausing workspace."
+                 failures. Failing ticket."
             )
         },
         "Diagnostics",
@@ -1887,7 +1853,7 @@ async fn record_verdict_comments(
 ///
 /// Before spawning agents, [`guard_phase_and_circuit_breaker`] checks the phase and
 /// trips the comment-count circuit breaker (which may transition the ticket to
-/// Failed and pause the workspace). Returns `false` when the caller should abort.
+/// Failed for Manager triage). Returns `false` when the caller should abort.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     if !guard_phase_and_circuit_breaker(&ticket, TicketPhase::Analysis, "Analysts").await {
         return;
@@ -2035,8 +2001,8 @@ fn build_analyst_summary(
 /// parameters and closures. This eliminates ~80% structural duplication while
 /// preserving exact behavioral semantics.
 ///
-/// The workspace is paused automatically inside [`transition_ticket`] when
-/// the ticket transitions to [`TicketPhase::Failed`].
+/// The Manager is notified via [`transition_ticket`] when the ticket
+/// transitions to [`TicketPhase::Failed`].
 ///
 /// # Self-counting prevention
 ///
@@ -2095,7 +2061,7 @@ async fn run_circuit_breaker(
         count,
         threshold,
         log_label,
-        "Circuit breaker tripped at {count}/{threshold} ({log_label}) — failing ticket and pausing workspace"
+        "Circuit breaker tripped at {count}/{threshold} ({log_label}) — failing ticket"
     );
 
     let _ = board()
@@ -2113,14 +2079,9 @@ async fn run_circuit_breaker(
         return true;
     }
 
-    // Workspace auto-pause is handled inside `transition_ticket`
-    // when the target is `Failed`, regardless of `NotifyPolicy`.
-
     // Move all other ReadyForDevelopment tickets in the same workspace to
-    // Planning to prevent them from auto-starting after the workspace is
-    // unpaused. The human must manually move them back to
-    // ReadyForDevelopment after investigating the root cause of the breaker
-    // trip.
+    // Planning to prevent them from auto-starting while the Manager triages
+    // the failure.
     //
     // There is a small race window: between listing ReadyForDevelopment
     // tickets here and transitioning them individually, a concurrent poll
@@ -2144,8 +2105,8 @@ async fn run_circuit_breaker(
         }
     };
 
-    let pause_comment = format!(
-        "Moved to planning due to circuit breaker trip on {}: {}. Move back to ReadyForDevelopment manually after investigation.",
+    let planning_move_comment = format!(
+        "Moved to planning due to circuit breaker trip on {}: {}. Re-advance to ReadyForDevelopment after Manager resolves the failure.",
         ticket.id, ticket.title,
     );
 
@@ -2173,7 +2134,7 @@ async fn run_circuit_breaker(
         }
 
         let _ = board()
-            .add_comment(&other.id, "system", &pause_comment)
+            .add_comment(&other.id, "system", &planning_move_comment)
             .await;
     }
 
@@ -2188,7 +2149,7 @@ async fn run_circuit_breaker(
 /// that generates excessive churn of any kind gets failed.
 ///
 /// If the comment count exceeds [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`], fail the ticket
-/// (via [`TicketPhase::Failed`]) and pause the workspace.
+/// (via [`TicketPhase::Failed`]).
 /// Return `true` (caller should early-return). On transition failure, still returns
 /// `true` to abort dispatch.
 #[must_use]
@@ -2206,7 +2167,7 @@ async fn trip_circuit_breaker_if_exceeded(
             format!(
                 "Failed after {count} comments — ticket has accumulated too many comments \
                  (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
-                 Workspace paused for human investigation."
+                 Ticket failed — Manager will triage."
             )
         },
         log_label,
@@ -2538,9 +2499,9 @@ mod tests {
                 "comment should start with expected format"
             );
             assert!(
-                comment
-                    .content
-                    .contains("Move back to ReadyForDevelopment manually after investigation"),
+                comment.content.contains(
+                    "Re-advance to ReadyForDevelopment after Manager resolves the failure"
+                ),
                 "comment should end with expected format"
             );
         }
@@ -2793,18 +2754,18 @@ mod tests {
         );
     }
 
-    /// Verify that transitioning a ticket to [`TicketPhase::Failed`] unconditionally
-    /// pauses the workspace, even when using [`NotifyPolicy::Buffer`]. This proves
-    /// the auto-pause invariant is structural (not coincidental on NotifyPolicy).
+    /// Verify that transitioning a ticket to [`TicketPhase::Failed`] does NOT
+    /// pause the workspace. The old auto-pause behavior was removed — workspace
+    /// pausing is no longer part of the Failed transition.
     #[tokio::test]
-    async fn transition_to_failed_pauses_workspace() {
+    async fn transition_to_failed_does_not_pause_workspace() {
         init_test_stores().await;
         if crate::workspace::WORKSPACES.get().is_none() {
             let _ = crate::workspace::init_global().await;
         }
 
-        let ws_name = "ws_pause_on_fail_test";
-        let ws_path = "/tmp/test_ws_pause_on_fail";
+        let ws_name = "ws_no_pause_on_fail_test";
+        let ws_path = "/tmp/test_ws_no_pause_on_fail";
         let now = crate::turso::now();
         crate::workspace::store()
             .conn
@@ -2830,7 +2791,7 @@ mod tests {
             .expect("get_ticket")
             .expect("ticket exists");
 
-        // Transition to Failed with Buffer policy — auto-pause must still fire
+        // Transition to Failed with Buffer policy — workspace should NOT pause
         transition_ticket(
             &ticket,
             DEFAULT_TICKET_PHASE,
@@ -2840,19 +2801,19 @@ mod tests {
         .await
         .expect("transition to Failed");
 
-        // Verify workspace is paused
+        // Verify workspace is NOT paused
         let ws = crate::workspace::get_by_name(ws_name)
             .await
             .expect("get_by_name")
             .expect("workspace exists");
         assert!(
-            ws.paused,
-            "Workspace should be paused after ticket failure (even with Buffer policy)"
+            !ws.paused,
+            "Workspace should NOT be paused after ticket failure (auto-pause was removed)"
         );
     }
 
     /// Verify that transitioning a ticket to a non-failure phase does NOT pause
-    /// the workspace. This proves the auto-pause is scoped exclusively to Failed.
+    /// the workspace. Transitions should never pause the workspace.
     #[tokio::test]
     async fn transition_to_non_failed_does_not_pause() {
         init_test_stores().await;
