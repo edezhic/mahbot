@@ -1714,30 +1714,29 @@ impl<'a> TicketBuilder<'a> {
 
     /// Create the ticket with the accumulated parameters.
     pub(crate) async fn create(self) -> anyhow::Result<String> {
-        let params = crate::board::TicketParams {
-            title: self.title,
-            description: self.desc,
-            workspace_name: self.ws.name,
-            phase: self.phase,
-            prerequisites: self.prereqs,
-            reporter: self.reporter,
-            embedding: self.embedding,
-        };
-        self.store.create_ticket(&params).await
+        let (store, params) = self.into_params();
+        store.create_ticket(&params).await
     }
 
     /// Supersede `supersede_id` with this ticket (calls `supersede_and_create`).
     pub(crate) async fn supersede(self, supersede_id: &str) -> anyhow::Result<String> {
-        let params = crate::board::TicketParams {
-            title: self.title,
-            description: self.desc,
-            workspace_name: self.ws.name,
-            phase: self.phase,
-            prerequisites: self.prereqs,
-            reporter: self.reporter,
-            embedding: self.embedding,
-        };
-        self.store.supersede_and_create(supersede_id, &params).await
+        let (store, params) = self.into_params();
+        store.supersede_and_create(supersede_id, &params).await
+    }
+
+    fn into_params(self) -> (&'a BoardStore, TicketParams) {
+        (
+            self.store,
+            TicketParams {
+                title: self.title,
+                description: self.desc,
+                workspace_name: self.ws.name,
+                phase: self.phase,
+                prerequisites: self.prereqs,
+                reporter: self.reporter,
+                embedding: self.embedding,
+            },
+        )
     }
 }
 
