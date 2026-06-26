@@ -196,14 +196,12 @@ fn status_list_sql_fragment(statuses: &[TicketPhase]) -> String {
 
 fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
     serde_json::from_str(raw).with_context(|| {
-        if raw.len() > 200 {
-            format!(
-                "Corrupt prerequisites JSON in database: {}…",
-                &raw[..raw.floor_char_boundary(200)]
-            )
+        let preview = if raw.len() > 200 {
+            format!("{}…", &raw[..raw.floor_char_boundary(200)])
         } else {
-            format!("Corrupt prerequisites JSON in database: {raw}")
-        }
+            raw.to_string()
+        };
+        format!("Corrupt prerequisites JSON in database: {preview}")
     })
 }
 
