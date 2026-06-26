@@ -6633,144 +6633,199 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_nav_up_at_top_clamped() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0;
-        let _ = state.update(EditorMessage::TreeNavUp);
-        assert_eq!(state.file_tree.tree_focus_index, 0); // Clamped at top
+    fn test_tree_nav_up_down() {
+        struct Case {
+            name: &'static str,
+            focused: bool,
+            start_idx: usize,
+            msg: EditorMessage,
+            expected_idx: usize,
+        }
+        let last_idx = make_editor_with_tree().file_tree.visible_tree_nodes.len() - 1;
+        let cases: &[Case] = &[
+            Case {
+                name: "up_at_top_clamped",
+                focused: true,
+                start_idx: 0,
+                msg: EditorMessage::TreeNavUp,
+                expected_idx: 0,
+            },
+            Case {
+                name: "down_at_bottom_clamped",
+                focused: true,
+                start_idx: last_idx,
+                msg: EditorMessage::TreeNavDown,
+                expected_idx: last_idx,
+            },
+            Case {
+                name: "up_moves_focus",
+                focused: true,
+                start_idx: 1,
+                msg: EditorMessage::TreeNavUp,
+                expected_idx: 0,
+            },
+            Case {
+                name: "down_moves_focus",
+                focused: true,
+                start_idx: 0,
+                msg: EditorMessage::TreeNavDown,
+                expected_idx: 1,
+            },
+            Case {
+                name: "ignored_when_not_focused",
+                focused: false,
+                start_idx: 0,
+                msg: EditorMessage::TreeNavDown,
+                expected_idx: 0,
+            },
+        ];
+        for case in cases {
+            let mut state = make_editor_with_tree();
+            state.file_tree.tree_focused = case.focused;
+            state.file_tree.tree_focus_index = case.start_idx;
+            let _ = state.update(case.msg.clone());
+            assert_eq!(
+                state.file_tree.tree_focus_index, case.expected_idx,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     #[test]
-    fn test_tree_nav_down_at_bottom_clamped() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        let last = state.file_tree.visible_tree_nodes.len() - 1;
-        state.file_tree.tree_focus_index = last;
-        let _ = state.update(EditorMessage::TreeNavDown);
-        assert_eq!(state.file_tree.tree_focus_index, last); // Clamped at bottom
+    fn test_misc_focus_actions() {
+        struct Case {
+            name: &'static str,
+            msg: EditorMessage,
+            setup: fn(&mut EditorState),
+            check: fn(&EditorState, name: &str),
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "escape_clears_tree_focus",
+                msg: EditorMessage::Escape,
+                setup: |s| s.file_tree.tree_focused = true,
+                check: |s, name| assert!(!s.file_tree.tree_focused, "case: {name}"),
+            },
+            Case {
+                name: "toggle_dir_sets_tree_focus",
+                msg: EditorMessage::ToggleDir("src".to_string()),
+                setup: |s| {
+                    s.selected_file = Some("Cargo.toml".to_string());
+                },
+                check: |s, name| {
+                    assert!(s.file_tree.tree_focused, "case: {name}");
+                    assert!(s.selected_file.is_none(), "case: {name}");
+                },
+            },
+            Case {
+                name: "select_file_keeps_tree_focus",
+                msg: EditorMessage::SelectFile("src/main.rs".to_string()),
+                setup: |s| s.file_tree.tree_focused = true,
+                check: |s, name| assert!(s.file_tree.tree_focused, "case: {name}"),
+            },
+            // A mouse-originated EditorAction (like MoveTo from a click)
+            // should transfer focus from the file tree to the editor.
+            Case {
+                name: "editor_action_clears_tree_focus",
+                msg: EditorMessage::EditorAction(EditorAction::MoveTo { line: 0, col: 0 }),
+                setup: |s| {
+                    s.file_tree.tree_focused = true;
+                    s.pending_enter_dir = Some("src".to_string());
+                    s.rename_target = Some(RenameTarget {
+                        path: "src/main.rs".to_string(),
+                        abs_path: String::new(),
+                        is_dir: false,
+                        ws_root: String::new(),
+                        input_text: "main.rs".to_string(),
+                        error: None,
+                    });
+                },
+                check: |s, name| {
+                    assert!(!s.file_tree.tree_focused, "case: {name}");
+                    assert_eq!(s.pending_enter_dir, None, "case: {name}");
+                    assert!(s.rename_target.is_none(), "case: {name}");
+                },
+            },
+        ];
+        for case in cases {
+            let mut state = make_editor_with_tree();
+            (case.setup)(&mut state);
+            let _ = state.update(case.msg.clone());
+            (case.check)(&state, case.name);
+        }
     }
 
     #[test]
-    fn test_tree_nav_up_down_moves_focus() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1;
-        let _ = state.update(EditorMessage::TreeNavUp);
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-        let _ = state.update(EditorMessage::TreeNavDown);
-        assert_eq!(state.file_tree.tree_focus_index, 1);
-    }
-
-    #[test]
-    fn test_tree_nav_ignored_when_not_focused() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focus_index = 0;
-        let _ = state.update(EditorMessage::TreeNavDown);
-        assert_eq!(state.file_tree.tree_focus_index, 0); // No movement
-    }
-
-    #[test]
-    fn test_escape_clears_tree_focus() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        let _ = state.update(EditorMessage::Escape);
-        assert!(!state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_toggle_dir_sets_tree_focus() {
-        let mut state = make_editor_with_tree();
-        // Select a file first so we can verify it gets cleared.
-        state.selected_file = Some("Cargo.toml".to_string());
-        // ToggleDir on collapsed directory → should set tree_focused and clear selected_file
-        let _ = state.update(EditorMessage::ToggleDir("src".to_string()));
-        assert!(state.file_tree.tree_focused);
-        assert!(
-            state.selected_file.is_none(),
-            "ToggleDir should clear selected_file"
-        );
-    }
-
-    #[test]
-    fn test_select_file_keeps_tree_focus() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        let _ = state.update(EditorMessage::SelectFile("src/main.rs".to_string()));
-        assert!(state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_editor_action_clears_tree_focus() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.pending_enter_dir = Some("src".to_string());
-        state.rename_target = Some(RenameTarget {
-            path: "src/main.rs".to_string(),
-            abs_path: String::new(),
-            is_dir: false,
-            ws_root: String::new(),
-            input_text: "main.rs".to_string(),
-            error: None,
-        });
-
-        // A mouse-originated EditorAction (like MoveTo from a click) should
-        // transfer focus from the file tree to the editor.
-        let _ = state.update(EditorMessage::EditorAction(EditorAction::MoveTo {
-            line: 0,
-            col: 0,
-        }));
-
-        assert!(
-            !state.file_tree.tree_focused,
-            "click in editor should clear tree focus"
-        );
-        assert_eq!(
-            state.pending_enter_dir, None,
-            "click in editor should clear pending_enter_dir"
-        );
-        assert!(
-            state.rename_target.is_none(),
-            "click in editor should dismiss rename"
-        );
-    }
-
-    #[test]
-    fn test_tree_nav_enter_on_file_dispatches_task() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1; // Cargo.toml (not a directory)
-        let _task = state.update(EditorMessage::TreeNavEnter);
-        // TreeNavEnter dispatches SelectFile which keeps tree_focused.
-        // The task is async, so tree_focused is still true here.
-        // We verify the state hasn't changed prematurely.
-        assert!(state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_tree_nav_enter_not_focused_ignored() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focus_index = 1; // Cargo.toml
-        let _task = state.update(EditorMessage::TreeNavEnter);
-        // Tree not focused — Enter is a no-op. State unchanged.
-        assert_eq!(state.file_tree.tree_focus_index, 1);
-        assert!(!state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_tree_nav_enter_on_dir_expands_and_advances() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" directory
-        state.selected_file = Some("Cargo.toml".to_string());
-        let _task = state.update(EditorMessage::TreeNavEnter);
-        // After expanding "src", focus should move to first child
-        assert!(state.file_tree.expanded_dirs.contains("src"));
-        assert_eq!(state.file_tree.tree_focus_index, 1); // "src/main.rs"
-        assert!(
-            state.selected_file.is_none(),
-            "TreeNavEnter on dir should clear selected_file"
-        );
+    fn test_tree_nav_enter() {
+        struct Case {
+            name: &'static str,
+            focused: bool,
+            start_idx: usize,
+            /// Set selected_file before the message
+            pre_select_file: bool,
+            /// Expected tree_focused after
+            expect_focused: bool,
+            /// Expected focus index after (None = skip check)
+            expected_idx: Option<usize>,
+            /// Additional per-case assertions
+            check: Option<fn(&EditorState, name: &str)>,
+        }
+        let cases: &[Case] = &[
+            // TreeNavEnter on a file dispatches an async load task, but
+            // tree_focused stays true in the same-turn state update.
+            Case {
+                name: "on_file_dispatches_task",
+                focused: true,
+                start_idx: 1,
+                pre_select_file: false,
+                expect_focused: true,
+                expected_idx: None,
+                check: None,
+            },
+            Case {
+                name: "not_focused_ignored",
+                focused: false,
+                start_idx: 1,
+                pre_select_file: false,
+                expect_focused: false,
+                expected_idx: Some(1),
+                check: None,
+            },
+            Case {
+                name: "on_dir_expands_and_advances",
+                focused: true,
+                start_idx: 0,
+                pre_select_file: true,
+                expect_focused: true,
+                expected_idx: Some(1),
+                check: Some(|s, name| {
+                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                    assert!(s.selected_file.is_none(), "case: {name}");
+                    assert_eq!(s.file_tree.visible_tree_nodes[1].0, "src/main.rs");
+                }),
+            },
+        ];
+        for case in cases {
+            let mut state = make_editor_with_tree();
+            state.file_tree.tree_focused = case.focused;
+            state.file_tree.tree_focus_index = case.start_idx;
+            if case.pre_select_file {
+                state.selected_file = Some("Cargo.toml".to_string());
+            }
+            let _ = state.update(EditorMessage::TreeNavEnter);
+            assert_eq!(
+                state.file_tree.tree_focused, case.expect_focused,
+                "case: {}",
+                case.name
+            );
+            if let Some(idx) = case.expected_idx {
+                assert_eq!(state.file_tree.tree_focus_index, idx, "case: {}", case.name);
+            }
+            if let Some(check) = case.check {
+                check(&state, case.name);
+            }
+        }
     }
 
     #[test]
@@ -7469,104 +7524,121 @@ mod tests {
     // ── Tree arrow-key navigation tests ─────────────────────────────
 
     #[test]
-    fn test_tree_nav_left_on_expanded_dir_collapses() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes =
-            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focus_index = 0; // "src"
-        assert!(state.file_tree.expanded_dirs.contains("src"));
-
-        let _ = state.update(EditorMessage::TreeNavLeft);
-        assert!(!state.file_tree.expanded_dirs.contains("src"));
-        // Focus stays on "src" after collapse
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn test_tree_nav_left_on_file_navigates_to_parent() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes =
-            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1; // "src/main.rs"
-
-        let _ = state.update(EditorMessage::TreeNavLeft);
-        // Should navigate to parent "src"
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    }
-
-    #[test]
-    fn test_tree_nav_left_on_root_collapsed_dir_noop() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (collapsed, root-level)
-        assert!(!state.file_tree.expanded_dirs.contains("src"));
-
-        let _ = state.update(EditorMessage::TreeNavLeft);
-        // Root-level collapsed dir has no parent — no-op.
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn test_tree_nav_left_on_root_file_noop() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1; // "Cargo.toml" (root-level file)
-
-        let _ = state.update(EditorMessage::TreeNavLeft);
-        // Root-level file has no parent — no-op.
-        assert_eq!(state.file_tree.tree_focus_index, 1);
-    }
-
-    #[test]
-    fn test_tree_nav_right_on_collapsed_dir_expands_and_advances() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (collapsed, has children in dir_entries)
-        state.selected_file = Some("Cargo.toml".to_string());
-
-        let _ = state.update(EditorMessage::TreeNavRight);
-        // Should expand "src" and advance to first child "src/main.rs"
-        assert!(state.file_tree.expanded_dirs.contains("src"));
-        assert_eq!(state.file_tree.tree_focus_index, 1);
-        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
-        assert!(
-            state.selected_file.is_none(),
-            "TreeNavRight on dir should clear selected_file"
-        );
-    }
-
-    #[test]
-    fn test_tree_nav_right_on_expanded_dir_moves_to_first_child() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes =
-            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (already expanded)
-
-        let _ = state.update(EditorMessage::TreeNavRight);
-        // Should move focus to first child "src/main.rs"
-        assert_eq!(state.file_tree.tree_focus_index, 1);
-        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/main.rs");
-    }
-
-    #[test]
-    fn test_tree_nav_right_on_file_noop() {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1; // "Cargo.toml" (file)
-
-        let _ = state.update(EditorMessage::TreeNavRight);
-        // ArrowRight on file does nothing
-        assert_eq!(state.file_tree.tree_focus_index, 1);
+    fn test_tree_nav_left_right() {
+        struct Case {
+            name: &'static str,
+            msg: EditorMessage,
+            start_idx: usize,
+            /// Pre-expand "src" before sending the message
+            pre_expand_src: bool,
+            /// Set selected_file to Some("Cargo.toml") before sending the message
+            pre_select_file: bool,
+            /// Expected focus index after the message
+            expected_idx: usize,
+            /// Additional per-case assertions beyond focus index
+            check: Option<fn(&EditorState, name: &str)>,
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "left_on_expanded_dir_collapses",
+                msg: EditorMessage::TreeNavLeft,
+                start_idx: 0,
+                pre_expand_src: true,
+                pre_select_file: false,
+                expected_idx: 0,
+                check: Some(|s, name| {
+                    assert!(!s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                }),
+            },
+            Case {
+                name: "left_on_file_navigates_to_parent",
+                msg: EditorMessage::TreeNavLeft,
+                start_idx: 1,
+                pre_expand_src: true,
+                pre_select_file: false,
+                expected_idx: 0,
+                check: Some(|s, name| {
+                    assert_eq!(s.file_tree.visible_tree_nodes[0].0, "src", "case: {name}");
+                }),
+            },
+            Case {
+                name: "left_on_root_collapsed_dir_noop",
+                msg: EditorMessage::TreeNavLeft,
+                start_idx: 0,
+                pre_expand_src: false,
+                pre_select_file: false,
+                expected_idx: 0,
+                check: None,
+            },
+            Case {
+                name: "left_on_root_file_noop",
+                msg: EditorMessage::TreeNavLeft,
+                start_idx: 1,
+                pre_expand_src: false,
+                pre_select_file: false,
+                expected_idx: 1,
+                check: None,
+            },
+            Case {
+                name: "right_on_collapsed_dir_expands_and_advances",
+                msg: EditorMessage::TreeNavRight,
+                start_idx: 0,
+                pre_expand_src: false,
+                pre_select_file: true,
+                expected_idx: 1,
+                check: Some(|s, name| {
+                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                    assert!(s.selected_file.is_none(), "case: {name}");
+                    assert_eq!(s.file_tree.visible_tree_nodes[1].0, "src/main.rs");
+                }),
+            },
+            Case {
+                name: "right_on_expanded_dir_moves_to_first_child",
+                msg: EditorMessage::TreeNavRight,
+                start_idx: 0,
+                pre_expand_src: true,
+                pre_select_file: false,
+                expected_idx: 1,
+                check: Some(|s, name| {
+                    assert_eq!(
+                        s.file_tree.visible_tree_nodes[1].0, "src/main.rs",
+                        "case: {name}"
+                    );
+                }),
+            },
+            Case {
+                name: "right_on_file_noop",
+                msg: EditorMessage::TreeNavRight,
+                start_idx: 1,
+                pre_expand_src: false,
+                pre_select_file: false,
+                expected_idx: 1,
+                check: None,
+            },
+        ];
+        for case in cases {
+            let mut state = make_editor_with_tree();
+            if case.pre_expand_src {
+                state.file_tree.expanded_dirs.insert("src".to_string());
+                state.file_tree.nodes =
+                    build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+                state.file_tree.rebuild_visible();
+            }
+            state.file_tree.tree_focused = true;
+            state.file_tree.tree_focus_index = case.start_idx;
+            if case.pre_select_file {
+                state.selected_file = Some("Cargo.toml".to_string());
+            }
+            let _ = state.update(case.msg.clone());
+            assert_eq!(
+                state.file_tree.tree_focus_index, case.expected_idx,
+                "case: {}",
+                case.name
+            );
+            if let Some(check) = case.check {
+                check(&state, case.name);
+            }
+        }
     }
 
     // ── Click-to-select focus index tests ────────────────────────────
