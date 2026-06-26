@@ -567,50 +567,50 @@ async fn poll_round() -> anyhow::Result<()> {
     };
 
     for ws in &workspaces {
-        // 1. Claim for each pipeline phase (skip when the workspace is
-        //    individually paused).
-        //    On claim error we `break` out of the phase loop — this skips all
-        //    remaining CLAIM_PHASES for this workspace and falls through to
-        //    Diagnostics/QaPassed (which handle their own errors independently).
-        //    A DB-down workspace won't block other workspaces; a transient claim
-        //    failure won't generate log noise for every remaining phase.
-        if !ws.paused {
-            for &phase in CLAIM_PHASES {
-                let info = phase.info();
-                let ticket = match board
-                    .claim_ticket_in_workspace(
-                        info.source,
-                        info.claim_target,
-                        &ws.name,
-                        info.require_clear_pipeline,
-                    )
-                    .await
-                {
-                    Ok(Some(t)) => {
-                        // Buffer the claim transition. The returned ticket already
-                        // has status = info.claim_target (from SQL RETURNING), so record
-                        // the transition from info.source.
-                        ticket_buffer::push(
-                            &ws.name,
-                            &t.id,
-                            info.source.as_ref(),
-                            t.status.as_ref(),
-                        );
-                        t
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        error!(
-                            workspace = %ws.name,
-                            phase = %info.role_label,
-                            error = %e,
-                            "Claim failed, skipping remaining phases for workspace",
-                        );
-                        break;
-                    }
-                };
-                spawn_dispatch(phase, ticket, ws.clone());
+        // 1. Claim for each pipeline phase.
+        //
+        // When the workspace is paused, only block EngineerDevelopment
+        // (ready_for_development → in_development). All other phases
+        // (analysis, review, QA, …) proceed normally.
+        //
+        // On claim error we `break` out of the phase loop — this skips all
+        // remaining CLAIM_PHASES for this workspace and falls through to
+        // Diagnostics/QaPassed (which handle their own errors independently).
+        // A DB-down workspace won't block other workspaces; a transient claim
+        // failure won't generate log noise for every remaining phase.
+        for &phase in CLAIM_PHASES {
+            if ws.paused && matches!(phase, PollPhase::EngineerDevelopment) {
+                continue;
             }
+            let info = phase.info();
+            let ticket = match board
+                .claim_ticket_in_workspace(
+                    info.source,
+                    info.claim_target,
+                    &ws.name,
+                    info.require_clear_pipeline,
+                )
+                .await
+            {
+                Ok(Some(t)) => {
+                    // Buffer the claim transition. The returned ticket already
+                    // has status = info.claim_target (from SQL RETURNING), so record
+                    // the transition from info.source.
+                    ticket_buffer::push(&ws.name, &t.id, info.source.as_ref(), t.status.as_ref());
+                    t
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    error!(
+                        workspace = %ws.name,
+                        phase = %info.role_label,
+                        error = %e,
+                        "Claim failed, skipping remaining phases for workspace",
+                    );
+                    break;
+                }
+            };
+            spawn_dispatch(phase, ticket, ws.clone());
         }
 
         // 2. Dispatch unassigned InDiagnostics tickets.

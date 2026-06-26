@@ -115,7 +115,9 @@ pub struct Workspace {
     pub created_at: String,
     pub updated_at: String,
     pub maintenance: bool,
-    /// Whether the pipeline is paused for this workspace (no new tickets claimed).
+    /// Whether development dispatch is paused for this workspace (blocks
+    /// ready_for_development → in_development). All other pipeline phases
+    /// (analysis, review, QA, diagnostics, sanitation, maintainer) run normally.
     pub paused: bool,
     /// Minutes until the next maintainer run.
     /// Reset to 1 when a run creates tickets; doubled on empty runs

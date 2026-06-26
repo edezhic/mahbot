@@ -47,11 +47,6 @@ pub async fn run_maintainer_loop() {
                 break;
             }
 
-            // Per-workspace pause — skip maintainer for this workspace.
-            if ws.paused {
-                continue;
-            }
-
             // Skip workspace if maintainer is not explicitly enabled
             if !ws.maintenance {
                 continue;
