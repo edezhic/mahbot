@@ -133,8 +133,9 @@ const COL_COMMENT_CREATED_AT: usize = 2;
 /// Statuses where a ticket occupies the dev/review/QA pipeline.
 ///
 /// Only one ticket at a time per workspace may be in this pipeline. Any ticket in one of these
-/// statuses blocks new Engineer dispatches and suppresses maintainer investigation
-/// for that workspace.
+/// statuses blocks new Engineer dispatches for that workspace. The Maintainer uses a separate
+/// pre-development threshold (Analysis + Planning + ReadyForDevelopment) and is no longer
+/// directly suppressed by this constant.
 ///
 /// Note: [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
 /// of these (InDevelopment, InDiagnostics, InReview, InQa) plus Analysis — see its docs for

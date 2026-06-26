@@ -85,8 +85,10 @@ pub async fn run_maintainer_loop() {
                 // If last_run_at is None, always run (first time).
             }
 
-            // Skip if there are already enough planning tickets — pipeline pressure valve
-            // Skip if this workspace has active pipeline tickets (dev/review/QA)
+            // Skip if the pre-development pipeline has >= 5 tickets (Analysis + Planning + ReadyForDevelopment).
+            // This replaces the previous "pause if any pipeline-blocker exists" guard with a threshold
+            // so the maintainer resumes creating tickets as soon as the pre-dev pipeline drops below 5,
+            // even if other tickets are in development/review/QA.
             if let Some(board) = crate::board::BOARD.get() {
                 let count_status = |status: TicketPhase| async move {
                     match board.count_by_status(status, Some(&ws.name)).await {
@@ -98,23 +100,16 @@ pub async fn run_maintainer_loop() {
                     }
                 };
 
-                let planning_count = count_status(TicketPhase::Planning).await;
+                let pre_dev_count = {
+                    let analysis = count_status(TicketPhase::Analysis).await;
+                    let planning = count_status(TicketPhase::Planning).await;
+                    let ready = count_status(TicketPhase::ReadyForDevelopment).await;
+                    analysis + planning + ready
+                };
 
-                if planning_count >= 5 {
-                    info!(workspace = %ws.name, planning = planning_count, "Maintainer: skipping — tickets already in planning");
+                if pre_dev_count >= 5 {
+                    info!(workspace = %ws.name, pre_dev = pre_dev_count, "Maintainer: skipping — pre-development pipeline has >= 5 tickets");
                     continue;
-                }
-
-                match board.has_pipeline_blocker_for_workspace(&ws.name).await {
-                    Ok(true) => {
-                        info!(workspace = %ws.name, "Maintainer: skipping — workspace has active pipeline tickets");
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(workspace = %ws.name, error = %e, "Maintainer: failed to check pipeline blocker");
-                        continue;
-                    }
                 }
             }
 
