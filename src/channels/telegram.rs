@@ -1863,104 +1863,101 @@ mod tests {
     // ── Inline formatting tests ──────────────────────────────────────
 
     #[test]
-    fn inline_bold_double_asterisk() {
-        let r = markdown_to_telegram_html("**hello** world");
-        assert_eq!(r, "<b>hello</b> world");
-    }
-
-    #[test]
-    fn inline_bold_double_underscore() {
-        let r = markdown_to_telegram_html("__hello__ world");
-        assert_eq!(r, "<b>hello</b> world");
-    }
-
-    #[test]
-    fn inline_italic() {
-        let r = markdown_to_telegram_html("*hello* world");
-        assert_eq!(r, "<i>hello</i> world");
-    }
-
-    #[test]
-    fn inline_code() {
-        let r = markdown_to_telegram_html("use `hello()` in your code");
-        assert_eq!(r, "use <code>hello()</code> in your code");
-    }
-
-    #[test]
-    fn inline_strikethrough() {
-        let r = markdown_to_telegram_html("this is ~~wrong~~ fixed");
-        assert_eq!(r, "this is <s>wrong</s> fixed");
-    }
-
-    #[test]
-    fn inline_combined() {
-        let r = markdown_to_telegram_html("**bold** and *italic* and `code` and ~~strike~~");
-        assert_eq!(
-            r,
-            "<b>bold</b> and <i>italic</i> and <code>code</code> and <s>strike</s>"
-        );
-    }
-
-    #[test]
-    fn inline_bold_inside_text() {
-        let r = markdown_to_telegram_html("before **middle** after");
-        assert_eq!(r, "before <b>middle</b> after");
-    }
-
-    #[test]
-    fn inline_escaping_inner_html() {
-        let r = markdown_to_telegram_html("**a < b & c > d**");
-        assert_eq!(r, "<b>a &lt; b &amp; c &gt; d</b>");
-    }
-
-    #[test]
-    fn inline_unmatched_double_asterisk() {
-        // `**` without closing should be rendered literally
-        let r = markdown_to_telegram_html("hello ** world");
-        assert_eq!(r, "hello ** world");
-    }
-
-    #[test]
-    fn inline_unmatched_single_asterisk() {
-        // `*` without closing should be rendered literally
-        let r = markdown_to_telegram_html("hello * world");
-        assert_eq!(r, "hello * world");
-    }
-
-    #[test]
-    fn inline_triple_asterisk() {
-        // `***` is not a valid bold or italic construct; rendered literally
-        let r = markdown_to_telegram_html("***");
-        assert_eq!(r, "***");
-    }
-
-    #[test]
-    fn inline_unmatched_backtick() {
-        // `` ` `` without closing should be rendered literally (the opening ` is pushed as text)
-        let r = markdown_to_telegram_html("hello ` world");
-        assert_eq!(r, "hello ` world");
-    }
-
-    #[test]
-    fn inline_double_backtick() {
-        // ` `` ` (two backticks) — the first opens, the second closes (empty content), and since
-        // the `end > 0` guard rejects empty matches, both are rendered literally.
-        let r = markdown_to_telegram_html("hello `` world");
-        assert_eq!(r, "hello `` world");
-    }
-
-    #[test]
-    fn inline_unmatched_tilde() {
-        // `~` without matching pair should be rendered literally
-        let r = markdown_to_telegram_html("hello ~ world");
-        assert_eq!(r, "hello ~ world");
-    }
-
-    #[test]
-    fn inline_bold_and_italic_overlap() {
-        // Bold takes priority over italic for `**`
-        let r = markdown_to_telegram_html("***bold**");
-        assert_eq!(r, "<b>*bold</b>");
+    fn test_inline_formatting() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: &'static str,
+        }
+        let cases = vec![
+            Case {
+                name: "bold double asterisk",
+                input: "**hello** world",
+                expected: "<b>hello</b> world",
+            },
+            Case {
+                name: "bold double underscore",
+                input: "__hello__ world",
+                expected: "<b>hello</b> world",
+            },
+            Case {
+                name: "italic",
+                input: "*hello* world",
+                expected: "<i>hello</i> world",
+            },
+            Case {
+                name: "inline code",
+                input: "use `hello()` in your code",
+                expected: "use <code>hello()</code> in your code",
+            },
+            Case {
+                name: "strikethrough",
+                input: "this is ~~wrong~~ fixed",
+                expected: "this is <s>wrong</s> fixed",
+            },
+            Case {
+                name: "combined",
+                input: "**bold** and *italic* and `code` and ~~strike~~",
+                expected: "<b>bold</b> and <i>italic</i> and <code>code</code> and <s>strike</s>",
+            },
+            Case {
+                name: "bold inside text",
+                input: "before **middle** after",
+                expected: "before <b>middle</b> after",
+            },
+            Case {
+                name: "escaping inner HTML",
+                input: "**a < b & c > d**",
+                expected: "<b>a &lt; b &amp; c &gt; d</b>",
+            },
+            // `**` without closing should be rendered literally
+            Case {
+                name: "unmatched double asterisk",
+                input: "hello ** world",
+                expected: "hello ** world",
+            },
+            // `*` without closing should be rendered literally
+            Case {
+                name: "unmatched single asterisk",
+                input: "hello * world",
+                expected: "hello * world",
+            },
+            // `***` is not a valid bold or italic construct; rendered literally
+            Case {
+                name: "triple asterisk",
+                input: "***",
+                expected: "***",
+            },
+            // `` ` `` without closing should be rendered literally (the opening ` is pushed as text)
+            Case {
+                name: "unmatched backtick",
+                input: "hello ` world",
+                expected: "hello ` world",
+            },
+            // ` `` ` (two backticks) — the first opens, the second closes (empty content), and since
+            // the `end > 0` guard rejects empty matches, both are rendered literally.
+            Case {
+                name: "double backtick",
+                input: "hello `` world",
+                expected: "hello `` world",
+            },
+            // `~` without matching pair should be rendered literally
+            Case {
+                name: "unmatched tilde",
+                input: "hello ~ world",
+                expected: "hello ~ world",
+            },
+            // Bold takes priority over italic for `**`
+            Case {
+                name: "bold and italic overlap",
+                input: "***bold**",
+                expected: "<b>*bold</b>",
+            },
+        ];
+        for case in cases {
+            let result = markdown_to_telegram_html(case.input);
+            assert_eq!(result, case.expected, "case: {}", case.name);
+        }
     }
 
     #[tokio::test]
@@ -2557,191 +2554,249 @@ mod tests {
     // ── strip_html_tags tests ──────────────────────────────────
 
     #[test]
-    fn strip_html_tags_empty_string() {
-        assert_eq!(strip_html_tags(""), "");
-    }
-
-    #[test]
-    fn strip_html_tags_plain_text() {
-        assert_eq!(strip_html_tags("hello world"), "hello world");
-    }
-
-    #[test]
-    fn strip_html_tags_simple_tag() {
-        assert_eq!(strip_html_tags("<b>bold</b>"), "bold");
-    }
-
-    #[test]
-    fn strip_html_tags_nested_tags() {
-        assert_eq!(strip_html_tags("<div><span>text</span></div>"), "text");
-    }
-
-    #[test]
-    fn strip_html_tags_self_closing() {
-        assert_eq!(strip_html_tags("before<br/>after"), "beforeafter");
-    }
-
-    #[test]
-    fn strip_html_tags_gt_in_double_quoted_attribute() {
-        // Regression: '<' in tag starts in_tag, then '>' inside attribute
-        // value must NOT close the tag.
-        assert_eq!(strip_html_tags("<a title=\"a > b\">link</a>"), "link");
-    }
-
-    #[test]
-    fn strip_html_tags_gt_in_single_quoted_attribute() {
-        assert_eq!(strip_html_tags("<a title='a > b'>link</a>"), "link");
-    }
-
-    #[test]
-    fn strip_html_tags_mixed_quotes() {
-        // Double-quoted attribute containing single quotes
-        assert_eq!(
-            strip_html_tags("<a title=\"he said 'hello'\">text</a>"),
-            "text"
-        );
-        // Single-quoted attribute containing double quotes
-        assert_eq!(
-            strip_html_tags("<a title='he said \"hello\"'>text</a>"),
-            "text"
-        );
-    }
-
-    #[test]
-    fn strip_html_tags_multiple_attrs_with_gt() {
-        // Multiple attributes, some with '>' inside quoted values
-        assert_eq!(
-            strip_html_tags("<input type=\"text\" value=\"a > b\" placeholder=\"x > y\">"),
-            ""
-        );
-    }
-
-    #[test]
-    fn strip_html_tags_gt_outside_tag() {
-        // '>' that is not inside a tag should be preserved as text
-        assert_eq!(strip_html_tags("a > b"), "a > b");
-    }
-
-    #[test]
-    fn strip_html_tags_lt_outside_tag() {
-        // '<' that is not part of a tag should start tag mode
-        // (pre-existing behavior: bare '<' starts tag stripping)
-        assert_eq!(strip_html_tags("a < b"), "a ");
-    }
-
-    #[test]
-    fn strip_html_tags_html_comment() {
-        assert_eq!(strip_html_tags("<!-- comment -->visible"), "visible");
-    }
-
-    #[test]
-    fn strip_html_tags_mixed_content() {
-        // Realistic mixed content with tags and text
-        let input =
-            "Hello <b>world</b>, check <a href=\"https://example.com?q=a > b\">this</a> out!";
-        assert_eq!(strip_html_tags(input), "Hello world, check this out!");
+    fn test_strip_html_tags() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: &'static str,
+        }
+        let cases = vec![
+            Case {
+                name: "empty string",
+                input: "",
+                expected: "",
+            },
+            Case {
+                name: "plain text",
+                input: "hello world",
+                expected: "hello world",
+            },
+            Case {
+                name: "simple tag",
+                input: "<b>bold</b>",
+                expected: "bold",
+            },
+            Case {
+                name: "nested tags",
+                input: "<div><span>text</span></div>",
+                expected: "text",
+            },
+            Case {
+                name: "self-closing tag",
+                input: "before<br/>after",
+                expected: "beforeafter",
+            },
+            // Regression: '<' in tag starts in_tag, then '>' inside attribute
+            // value must NOT close the tag.
+            Case {
+                name: "gt in double-quoted attribute",
+                input: "<a title=\"a > b\">link</a>",
+                expected: "link",
+            },
+            Case {
+                name: "gt in single-quoted attribute",
+                input: "<a title='a > b'>link</a>",
+                expected: "link",
+            },
+            // Double-quoted attribute containing single quotes
+            Case {
+                name: "mixed quotes - double with single inside",
+                input: "<a title=\"he said 'hello'\">text</a>",
+                expected: "text",
+            },
+            // Single-quoted attribute containing double quotes
+            Case {
+                name: "mixed quotes - single with double inside",
+                input: "<a title='he said \"hello\"'>text</a>",
+                expected: "text",
+            },
+            // Multiple attributes, some with '>' inside quoted values
+            Case {
+                name: "multiple attrs with gt",
+                input: "<input type=\"text\" value=\"a > b\" placeholder=\"x > y\">",
+                expected: "",
+            },
+            // '>' that is not inside a tag should be preserved as text
+            Case {
+                name: "gt outside tag",
+                input: "a > b",
+                expected: "a > b",
+            },
+            // '<' that is not part of a tag should start tag mode
+            // (pre-existing behavior: bare '<' starts tag stripping)
+            Case {
+                name: "lt outside tag",
+                input: "a < b",
+                expected: "a ",
+            },
+            Case {
+                name: "html comment",
+                input: "<!-- comment -->visible",
+                expected: "visible",
+            },
+            // Realistic mixed content with tags and text
+            Case {
+                name: "mixed content",
+                input: "Hello <b>world</b>, check <a href=\"https://example.com?q=a > b\">this</a> out!",
+                expected: "Hello world, check this out!",
+            },
+        ];
+        for case in cases {
+            let result = strip_html_tags(case.input);
+            assert_eq!(result, case.expected, "case: {}", case.name);
+        }
     }
 
     // ── extend_past_open_tag tests ─────────────────────────────
 
     #[test]
-    fn extend_tag_no_tag_near_pos() {
-        // No '<' before pos → None
-        assert_eq!(extend_past_open_tag("hello world", 5), None);
-    }
-
-    #[test]
-    fn extend_tag_inside_simple_tag() {
-        // <b>hello
-        // 01234567
-        // pos=1 (inside <b>, before '>') → extend past '>' at 2
-        assert_eq!(extend_past_open_tag("<b>hello", 1), Some(3));
-        // pos=2 (at the '>' itself) → extend past it
-        assert_eq!(extend_past_open_tag("<b>hello", 2), Some(3));
-    }
-
-    #[test]
-    fn extend_tag_after_simple_tag() {
-        // <b>hello
-        // 01234567
-        // pos=3 (at 'h', past the '>') → None
-        assert_eq!(extend_past_open_tag("<b>hello", 3), None);
-        // pos further into text → None
-        assert_eq!(extend_past_open_tag("<b>hello", 5), None);
-    }
-
-    #[test]
-    fn extend_tag_no_closing_gt() {
-        // No '>' exists after the '<' → None (can't extend)
-        assert_eq!(extend_past_open_tag("<div", 3), None);
-    }
-
-    #[test]
-    fn extend_tag_gt_in_double_quoted_attribute() {
-        // Regression: '>' inside double-quoted attribute must not be
-        // treated as tag closer. The real '>' is at index 16.
-        let input = "<a title=\"a > b\">text";
-        // 012345678901234567890   (indices)
-        //           111111111122
-        //      '>' at 12 is inside attribute, real '>' at 16
-        // pos=13 (inside tag, past the quoted '>', before real '>') → extend to 17
-        assert_eq!(extend_past_open_tag(input, 13), Some(17));
-        // pos=16 (at the real '>') → extend past it
-        assert_eq!(extend_past_open_tag(input, 16), Some(17));
-    }
-
-    #[test]
-    fn extend_tag_after_closed_tag_with_gt_in_attribute() {
-        // pos after the real closing '>' → None
-        let input = "<a title=\"a > b\">text";
-        // 012345678901234567890
-        //           111111111122
-        // real '>' at 16, 't' at 17
-        assert_eq!(extend_past_open_tag(input, 17), None);
-        assert_eq!(extend_past_open_tag(input, 20), None);
-    }
-
-    #[test]
-    fn extend_tag_gt_in_single_quoted_attribute() {
-        // Same scenario with single quotes
-        let input = "<a title='a > b'>text";
-        // real '>' at 16
-        assert_eq!(extend_past_open_tag(input, 13), Some(17));
-    }
-
-    #[test]
-    fn extend_tag_mixed_quotes() {
-        // Double-quoted attr containing single quotes: '>' inside should still be
-        // treated as quoted because we're inside double quotes, not single.
-        let input = "<a title=\"he said 'stop'\">text";
-        // real '>' at 25
-        // pos=17 (inside the attribute, past the single quotes) → extend past real '>'
-        assert_eq!(extend_past_open_tag(input, 17), Some(26));
-    }
-
-    #[test]
-    fn extend_tag_nested_tags() {
-        // <div><span>text
-        // 012345678901234
-        // last '<' at 5 (<span>), its '>' at 10.
-        // pos=11 (after both tags are closed) → None
-        let input = "<div><span>text";
-        assert_eq!(extend_past_open_tag(input, 11), None);
-        // pos=15 (end of string, still after both tags) → None
-        assert_eq!(extend_past_open_tag(input, 15), None);
-    }
-
-    #[test]
-    fn extend_tag_inside_nested_tag() {
-        // <div><span>text
-        // pos=6 (inside <span>, before its '>') → extend past '>' at 10
-        let input = "<div><span>text";
-        assert_eq!(extend_past_open_tag(input, 6), Some(11));
-    }
-
-    #[test]
-    fn extend_tag_pos_at_start() {
-        // |<b>text → pos=0 is before any '<'
-        assert_eq!(extend_past_open_tag("<b>text", 0), None);
+    fn test_extend_past_open_tag() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            pos: usize,
+            expected: Option<usize>,
+        }
+        let cases = vec![
+            // No '<' before pos → None
+            Case {
+                name: "no tag near pos",
+                input: "hello world",
+                pos: 5,
+                expected: None,
+            },
+            // <b>hello
+            // 01234567
+            // pos=1 (inside <b>, before '>') → extend past '>' at 2
+            Case {
+                name: "inside simple tag before gt",
+                input: "<b>hello",
+                pos: 1,
+                expected: Some(3),
+            },
+            // pos=2 (at the '>' itself) → extend past it
+            Case {
+                name: "inside simple tag at gt",
+                input: "<b>hello",
+                pos: 2,
+                expected: Some(3),
+            },
+            // <b>hello
+            // 01234567
+            // pos=3 (at 'h', past the '>') → None
+            Case {
+                name: "after simple tag at h",
+                input: "<b>hello",
+                pos: 3,
+                expected: None,
+            },
+            // pos further into text → None
+            Case {
+                name: "after simple tag further",
+                input: "<b>hello",
+                pos: 5,
+                expected: None,
+            },
+            // No '>' exists after the '<' → None (can't extend)
+            Case {
+                name: "no closing gt",
+                input: "<div",
+                pos: 3,
+                expected: None,
+            },
+            // Regression: '>' inside double-quoted attribute must not be
+            // treated as tag closer. The real '>' is at index 16.
+            // <a title="a > b">text
+            // 012345678901234567890   (indices)
+            //           111111111122
+            //      '>' at 12 is inside attribute, real '>' at 16
+            // pos=13 (inside tag, past the quoted '>', before real '>') → extend to 17
+            Case {
+                name: "gt in double-quoted attr before real gt",
+                input: "<a title=\"a > b\">text",
+                pos: 13,
+                expected: Some(17),
+            },
+            // pos=16 (at the real '>') → extend past it
+            Case {
+                name: "gt in double-quoted attr at real gt",
+                input: "<a title=\"a > b\">text",
+                pos: 16,
+                expected: Some(17),
+            },
+            // pos after the real closing '>' → None
+            // <a title="a > b">text
+            // 012345678901234567890
+            //           111111111122
+            // real '>' at 16, 't' at 17
+            Case {
+                name: "after closed tag with gt in attr at 17",
+                input: "<a title=\"a > b\">text",
+                pos: 17,
+                expected: None,
+            },
+            Case {
+                name: "after closed tag with gt in attr at 20",
+                input: "<a title=\"a > b\">text",
+                pos: 20,
+                expected: None,
+            },
+            // Same scenario with single quotes
+            // <a title='a > b'>text
+            // real '>' at 16
+            Case {
+                name: "gt in single-quoted attr",
+                input: "<a title='a > b'>text",
+                pos: 13,
+                expected: Some(17),
+            },
+            // Double-quoted attr containing single quotes: '>' inside should still be
+            // treated as quoted because we're inside double quotes, not single.
+            // <a title="he said 'stop'">text
+            // real '>' at 25
+            // pos=17 (inside the attribute, past the single quotes) → extend past real '>'
+            Case {
+                name: "mixed quotes",
+                input: "<a title=\"he said 'stop'\">text",
+                pos: 17,
+                expected: Some(26),
+            },
+            // <div><span>text
+            // 012345678901234
+            // last '<' at 5 (<span>), its '>' at 10.
+            // pos=11 (after both tags are closed) → None
+            Case {
+                name: "after nested tags at 11",
+                input: "<div><span>text",
+                pos: 11,
+                expected: None,
+            },
+            // pos=15 (end of string, still after both tags) → None
+            Case {
+                name: "after nested tags at 15",
+                input: "<div><span>text",
+                pos: 15,
+                expected: None,
+            },
+            // <div><span>text
+            // pos=6 (inside <span>, before its '>') → extend past '>' at 10
+            Case {
+                name: "inside nested tag",
+                input: "<div><span>text",
+                pos: 6,
+                expected: Some(11),
+            },
+            // |<b>text → pos=0 is before any '<'
+            Case {
+                name: "pos at start",
+                input: "<b>text",
+                pos: 0,
+                expected: None,
+            },
+        ];
+        for case in cases {
+            let result = extend_past_open_tag(case.input, case.pos);
+            assert_eq!(result, case.expected, "case: {}", case.name);
+        }
     }
 }
