@@ -1297,19 +1297,17 @@ impl BoardStore {
             .collect();
         let rows = tx.query(&sql, params_from_iter(params)).await?;
 
-        // Build a simple lookup Vec in a single pass over the result rows.
-        let mut found: Vec<(String, String)> = Vec::new();
+        // Build a lookup map for O(1) prerequisite resolution.
+        let mut found: HashMap<String, String> = HashMap::new();
         for row in rows {
             let id: String = row.get(0)?;
             let ws_name: String = row.get(1)?;
-            found.push((id, ws_name));
+            found.insert(id, ws_name);
         }
 
         for pid in prerequisite_ids {
             let ws_name = found
-                .iter()
-                .find(|(i, _)| i == pid)
-                .map(|(_, ws)| ws)
+                .get(pid)
                 .ok_or_else(|| anyhow::anyhow!("Prerequisite ticket not found: {pid}"))?;
             anyhow::ensure!(
                 ws_name == workspace_name,
