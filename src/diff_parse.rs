@@ -185,8 +185,8 @@ fn handle_hunk_header(
 /// Handle a content line within a hunk: classify as Added/Removed/Context, track
 /// line numbers, and push to the hunk.
 ///
-/// Returns `true` if the line is an annotation (`\ No newline at end of file` or
-/// an unknown line) that should be skipped — the caller should `continue`.
+/// Annotation lines (`\ No newline at end of file` or unknown lines) are silently
+/// skipped — the caller continues normally.
 fn handle_diff_content_line(
     line: &str,
     hunk: &mut DiffHunk,
