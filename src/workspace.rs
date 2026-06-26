@@ -811,11 +811,23 @@ impl WorkspaceStorage {
                 turso::params![name],
                 |row| -> std::result::Result<EditorTabRecord, String> {
                     Ok(EditorTabRecord {
-                        file_path: row.get::<String>(COL_ET_FILE_PATH).unwrap_or_default(),
-                        tab_order: usize::try_from(row.get::<i64>(COL_ET_TAB_ORDER).unwrap_or(0)).unwrap_or(0),
-                        is_active: row.get::<bool>(COL_ET_IS_ACTIVE).unwrap_or(false),
-                        is_dirty: row.get::<bool>(COL_ET_IS_DIRTY).unwrap_or(false),
-                        dirty_content: row.get::<Option<String>>(COL_ET_DIRTY_CONTENT).unwrap_or(None),
+                        file_path: row
+                            .get::<String>(COL_ET_FILE_PATH)
+                            .map_err(|e| format!("failed to read file_path: {e}"))?,
+                        tab_order: usize::try_from(
+                            row.get::<i64>(COL_ET_TAB_ORDER)
+                                .map_err(|e| format!("failed to read tab_order: {e}"))?,
+                        )
+                        .unwrap_or(0),
+                        is_active: row
+                            .get::<bool>(COL_ET_IS_ACTIVE)
+                            .map_err(|e| format!("failed to read is_active: {e}"))?,
+                        is_dirty: row
+                            .get::<bool>(COL_ET_IS_DIRTY)
+                            .map_err(|e| format!("failed to read is_dirty: {e}"))?,
+                        dirty_content: row
+                            .get::<Option<String>>(COL_ET_DIRTY_CONTENT)
+                            .map_err(|e| format!("failed to read dirty_content: {e}"))?,
                     })
                 },
             )
@@ -824,6 +836,11 @@ impl WorkspaceStorage {
         for row in rows {
             let tab = row.map_err(|e| anyhow::anyhow!("Failed to parse editor tab row: {e}"))?;
             if tab.file_path.is_empty() || tab.file_path.trim().is_empty() {
+                // Defense-in-depth: the file_path column is NOT NULL in the
+                // schema and DB errors now propagate before reaching this check,
+                // but an empty string could still appear via corruption or other
+                // code paths constructing EditorTabRecord. Skip rather than
+                // resolve to workspace root.
                 warn!(
                     workspace = %name,
                     tab_order = tab.tab_order,
