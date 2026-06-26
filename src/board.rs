@@ -963,6 +963,38 @@ impl BoardStore {
         .await
     }
 
+    /// Transactional variant of [`transition_to`](Self::transition_to) —
+    /// uses an existing transaction instead of `self.conn.execute()`.
+    /// Does NOT cancel registered agents (caller does that after `tx.commit()`).
+    pub(crate) async fn transition_to_tx(
+        tx: &TxGuard<'_>,
+        id: &str,
+        expected_phase: Option<TicketPhase>,
+        target_phase: TicketPhase,
+        reservation: Option<bool>,
+    ) -> Result<()> {
+        let now = turso::now();
+        let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
+        let action = match reservation {
+            Some(v) => format!(
+                "set status to {} (reservation={})",
+                target_phase.as_ref(),
+                v,
+            ),
+            None => format!("set status to {}", target_phase.as_ref()),
+        };
+        let rows = tx
+            .execute(
+                "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
+                 pipeline_reservation = COALESCE(?5, pipeline_reservation) \
+                 WHERE id = ?3 AND (?4 IS NULL OR status = ?4)",
+                turso::params![target_phase.as_ref(), now, id, guard, reservation],
+            )
+            .await?;
+        Self::ensure_ticket_found(rows, id, &action)?;
+        Ok(())
+    }
+
     /// Verify that a mutation query affected at least one row, returning an
     /// error with a descriptive message if the ticket was not found.
     fn ensure_ticket_found(rows: u64, id: &str, action: &str) -> Result<()> {
@@ -1087,6 +1119,39 @@ impl BoardStore {
         let now = turso::now();
         let rows = self
             .conn
+            .execute(
+                "UPDATE tickets SET commit_hash = ?1, lines_added = ?2, lines_removed = ?3, \
+                 updated_at = ?4 WHERE id = ?5",
+                turso::params![hash, lines_added, lines_removed, now, id],
+            )
+            .await?;
+
+        Self::ensure_ticket_found(rows, id, "set commit info")?;
+
+        Ok(())
+    }
+
+    /// Transactional variant of [`set_commit_info`](Self::set_commit_info) —
+    /// uses an existing transaction instead of its own connection write.
+    /// Does NOT commit or rollback the transaction; the caller controls that.
+    pub(crate) async fn set_commit_info_tx(
+        tx: &TxGuard<'_>,
+        id: &str,
+        hash: &str,
+        lines_added: i64,
+        lines_removed: i64,
+    ) -> Result<()> {
+        debug_assert!(
+            lines_added >= 0,
+            "lines_added must be non-negative: {lines_added}"
+        );
+        debug_assert!(
+            lines_removed >= 0,
+            "lines_removed must be non-negative: {lines_removed}"
+        );
+
+        let now = turso::now();
+        let rows = tx
             .execute(
                 "UPDATE tickets SET commit_hash = ?1, lines_added = ?2, lines_removed = ?3, \
                  updated_at = ?4 WHERE id = ?5",
@@ -1240,6 +1305,30 @@ impl BoardStore {
         )
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Transactional variant of [`add_comment`](Self::add_comment) —
+    /// uses an existing transaction instead of opening its own.
+    /// Does NOT commit or rollback; the caller controls outer transaction lifecycle.
+    pub(crate) async fn add_comment_tx(
+        tx: &TxGuard<'_>,
+        id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        let comment_id = crate::generate_id();
+        let now = turso::now();
+        tx.execute(
+            "INSERT INTO ticket_comments (id, ticket_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            turso::params![comment_id, id, role, content, now.clone()],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE tickets SET updated_at = ?1 WHERE id = ?2",
+            turso::params![now, id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -3455,6 +3544,207 @@ with a comment explaining why no agent is mid-execution in that state.\
             msg.contains("nonexistent"),
             "error should mention ticket id: {msg}"
         );
+    }
+
+    // ── Transactional variant tests ──
+    //
+    // These tests verify that the `_tx` variants work correctly within an
+    // outer transaction (commit → visible, rollback → invisible).
+
+    #[tokio::test]
+    async fn test_set_commit_info_tx_commit() {
+        let (store, _tmp, id) = setup().await;
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
+            .await
+            .expect("set_commit_info_tx");
+        tx.commit().await.unwrap();
+
+        let ticket = crate::util::test::expect_ticket(&store, &id).await;
+        assert_eq!(
+            ticket.commit_hash.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcd0123")
+        );
+        assert_eq!(ticket.lines_added, Some(10));
+        assert_eq!(ticket.lines_removed, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_set_commit_info_tx_rollback() {
+        let (store, _tmp, id) = setup().await;
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::set_commit_info_tx(&tx, &id, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 3, 7)
+            .await
+            .expect("set_commit_info_tx");
+        tx.rollback().await.unwrap();
+
+        // After rollback, commit info should not be visible.
+        let ticket = crate::util::test::expect_ticket(&store, &id).await;
+        assert_eq!(ticket.commit_hash, None);
+        assert_eq!(ticket.lines_added, None);
+        assert_eq!(ticket.lines_removed, None);
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_tx_commit() {
+        let (store, _tmp, id) = setup().await;
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::add_comment_tx(&tx, &id, "system", "transactional comment")
+            .await
+            .expect("add_comment_tx");
+        tx.commit().await.unwrap();
+
+        let comments = store.get_comments(&id).await.expect("get comments");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].role, "system");
+        assert_eq!(comments[0].content, "transactional comment");
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_tx_rollback() {
+        let (store, _tmp, id) = setup().await;
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::add_comment_tx(&tx, &id, "system", "rolled back comment")
+            .await
+            .expect("add_comment_tx");
+        tx.rollback().await.unwrap();
+
+        let comments = store.get_comments(&id).await.expect("get comments");
+        assert_eq!(comments.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_transition_to_tx_commit() {
+        let (store, _tmp, id) = setup().await;
+
+        // Start in QaPassed.
+        store
+            .transition_to(&id, None, TicketPhase::QaPassed, None)
+            .await
+            .unwrap();
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::transition_to_tx(
+            &tx,
+            &id,
+            Some(TicketPhase::QaPassed),
+            TicketPhase::Done,
+            None,
+        )
+        .await
+        .expect("transition_to_tx");
+        tx.commit().await.unwrap();
+
+        let status = crate::util::test::expect_ticket_status(&store, &id).await;
+        assert_eq!(status, TicketPhase::Done);
+    }
+
+    #[tokio::test]
+    async fn test_transition_to_tx_rollback() {
+        let (store, _tmp, id) = setup().await;
+
+        // Start in QaPassed.
+        store
+            .transition_to(&id, None, TicketPhase::QaPassed, None)
+            .await
+            .unwrap();
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::transition_to_tx(
+            &tx,
+            &id,
+            Some(TicketPhase::QaPassed),
+            TicketPhase::Done,
+            None,
+        )
+        .await
+        .expect("transition_to_tx");
+        tx.rollback().await.unwrap();
+
+        // After rollback, ticket should still be in QaPassed.
+        let status = crate::util::test::expect_ticket_status(&store, &id).await;
+        assert_eq!(status, TicketPhase::QaPassed);
+    }
+
+    #[tokio::test]
+    async fn test_transactional_triple_write_commit() {
+        // Exercise the full pattern used by commit_and_transition_ticket:
+        // all three _tx writes in one transaction → commit → all visible.
+        let (store, _tmp, id) = setup().await;
+        store
+            .transition_to(&id, None, TicketPhase::QaPassed, None)
+            .await
+            .unwrap();
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
+            .await
+            .unwrap();
+        BoardStore::add_comment_tx(&tx, &id, "system", "triple write comment")
+            .await
+            .unwrap();
+        BoardStore::transition_to_tx(
+            &tx,
+            &id,
+            Some(TicketPhase::QaPassed),
+            TicketPhase::Done,
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // All three changes should be visible.
+        let ticket = crate::util::test::expect_ticket(&store, &id).await;
+        assert_eq!(
+            ticket.commit_hash.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcd0123")
+        );
+        assert_eq!(ticket.status, TicketPhase::Done);
+
+        let comments = store.get_comments(&id).await.expect("get comments");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].content, "triple write comment");
+    }
+
+    #[tokio::test]
+    async fn test_transactional_triple_write_rollback() {
+        // Same pattern but rollback → none of the three changes persist.
+        let (store, _tmp, id) = setup().await;
+        store
+            .transition_to(&id, None, TicketPhase::QaPassed, None)
+            .await
+            .unwrap();
+
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::set_commit_info_tx(&tx, &id, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 3, 7)
+            .await
+            .unwrap();
+        BoardStore::add_comment_tx(&tx, &id, "system", "rolled back triple write")
+            .await
+            .unwrap();
+        BoardStore::transition_to_tx(
+            &tx,
+            &id,
+            Some(TicketPhase::QaPassed),
+            TicketPhase::Done,
+            None,
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+
+        // None of the three changes should be visible.
+        let ticket = crate::util::test::expect_ticket(&store, &id).await;
+        assert_eq!(ticket.commit_hash, None);
+        assert_eq!(ticket.status, TicketPhase::QaPassed);
+
+        let comments = store.get_comments(&id).await.expect("get comments");
+        assert_eq!(comments.len(), 0);
     }
 
     // ── parse_prereqs unit tests ──

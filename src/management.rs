@@ -787,48 +787,50 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 // - No Arc wrapping is needed because `Ticket` is moved by value into
 //   the spawned task.
 
-/// Transition a QaPassed ticket to Done with a descriptive reason.
-async fn transition_qa_to_done(ticket: &Ticket, reason: &str) {
-    info!(ticket = %ticket.id, "{reason}");
-
-    // Determine whether to notify immediately or buffer: if other active
-    // tickets still exist in this workspace, buffer the Done transition so
-    // the Manager only gets one notification when the last ticket finishes.
-    // Active tickets = PIPELINE_BLOCKING_STATUSES + ReadyForDevelopment.
-    //
-    // Race condition: multiple QaPassed tickets in the same workspace are
-    // finalized concurrently (tokio::spawn in poll_round). Both may see each
-    // other as active and both buffer. In this scenario all tickets are already
-    // Done in the database — the only consequence is delayed notifications
-    // until the next UserMessage drains the buffer.
-    let notify_policy = match board()
-        .has_active_tickets_excluding(&ticket.workspace_name, &ticket.id)
+/// Determine whether to notify immediately or buffer the Done transition.
+///
+/// If other active tickets remain in the workspace, the notification is
+/// buffered so the Manager only gets one notification when the last ticket
+/// finishes. Active tickets = `PIPELINE_BLOCKING_STATUSES` + `ReadyForDevelopment`.
+///
+/// # Race condition
+///
+/// Multiple QaPassed tickets in the same workspace are finalized concurrently
+/// (`tokio::spawn` in `poll_round`). Both may see each other as active and
+/// both buffer. In this scenario all tickets are already Done in the database
+/// — the only consequence is delayed notifications until the next
+/// `UserMessage` drains the buffer.
+async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> NotifyPolicy {
+    match board()
+        .has_active_tickets_excluding(workspace_name, ticket_id)
         .await
     {
         Ok(true) => {
             debug!(
-                ticket = %ticket.id,
-                workspace = %ticket.workspace_name,
+                ticket = %ticket_id,
+                workspace = %workspace_name,
                 "Other active tickets remain — buffering Done notification",
             );
             NotifyPolicy::Buffer
         }
-        Ok(false) => {
-            // This is the last active ticket in the workspace — notify
-            // immediately. Draining the buffer also delivers any previously
-            // buffered Done transitions from this workspace.
-            NotifyPolicy::Notify
-        }
+        Ok(false) => NotifyPolicy::Notify,
         Err(e) => {
             warn!(
-                ticket = %ticket.id,
-                workspace = %ticket.workspace_name,
+                ticket = %ticket_id,
+                workspace = %workspace_name,
                 error = %e,
                 "Failed to check active tickets — notifying to be safe",
             );
             NotifyPolicy::Notify
         }
-    };
+    }
+}
+
+/// Transition a QaPassed ticket to Done with a descriptive reason.
+async fn transition_qa_to_done(ticket: &Ticket, reason: &str) {
+    info!(ticket = %ticket.id, "{reason}");
+
+    let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
 
     if let Err(e) = transition_ticket(
         ticket,
@@ -889,35 +891,111 @@ async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
     }
 
     match crate::diff_parse::run_git_commit(repo_path, &ticket.title).await {
-        Ok(commit_info) => {
-            // Persist commit info (hash + line stats) before transitioning.
-            let _ = board()
-                .set_commit_info(
-                    &ticket.id,
-                    &commit_info.hash,
-                    commit_info.lines_added,
-                    commit_info.lines_removed,
-                )
-                .await;
-
-            // Add system comment with human-readable commit summary.
-            let short_hash = commit_info.hash.get(..7).unwrap_or(&commit_info.hash);
-            let comment = format_commit_summary(
-                short_hash,
-                commit_info.lines_added,
-                commit_info.lines_removed,
-            );
-            let _ = board().add_comment(&ticket.id, "system", &comment).await;
-
-            // Transition to Done.
-            transition_qa_to_done(&ticket, &format!("Committed {short_hash}, moving to Done"))
-                .await;
-        }
+        Ok(commit_info) => commit_and_transition_ticket(&ticket, commit_info).await,
         Err(e) => {
             error!(
                 ticket = %ticket.id,
                 error = %e,
                 "Commit failed — staying in QaPassed for retry"
+            );
+        }
+    }
+}
+
+/// After a successful `git commit`, persist the metadata and transition the
+/// ticket to Done atomically within a single DB transaction.
+///
+/// All three writes (commit_info, comment, status transition) happen atomically
+/// so a crash mid-sequence doesn't leave partial state. The git commit itself
+/// happens *before* the transaction, so an orphan commit is still possible if
+/// the process crashes between the filesystem commit and the DB commit — the
+/// self-healing mechanism handles this on the next poll cycle by detecting a
+/// clean working tree.
+async fn commit_and_transition_ticket(ticket: &Ticket, commit_info: crate::diff_parse::CommitInfo) {
+    let short_hash = commit_info.hash.get(..7).unwrap_or(&commit_info.hash);
+    let comment = format_commit_summary(
+        short_hash,
+        commit_info.lines_added,
+        commit_info.lines_removed,
+    );
+
+    let tx = match board().conn.begin_tx().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to begin transaction — staying in QaPassed for retry",
+            );
+            return;
+        }
+    };
+
+    let outcome: anyhow::Result<()> = async {
+        BoardStore::set_commit_info_tx(
+            &tx,
+            &ticket.id,
+            &commit_info.hash,
+            commit_info.lines_added,
+            commit_info.lines_removed,
+        )
+        .await?;
+        BoardStore::add_comment_tx(&tx, &ticket.id, "system", &comment).await?;
+        BoardStore::transition_to_tx(
+            &tx,
+            &ticket.id,
+            Some(TicketPhase::QaPassed),
+            TicketPhase::Done,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            if let Err(e) = tx.commit().await {
+                error!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Commit succeeded ({short_hash}) but DB transaction commit failed — \
+                     ticket stays in QaPassed for retry, orphan commit in repo",
+                );
+                return;
+            }
+
+            // In-memory side-effects happen after the transaction commits.
+            crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
+
+            info!(ticket = %ticket.id, "Committed {short_hash}, moving to Done");
+
+            let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
+
+            match notify_policy {
+                NotifyPolicy::Notify => notify_ticket(ticket, TicketPhase::Done).await,
+                NotifyPolicy::Buffer => {
+                    if let Some(ws) =
+                        resolve_ticket_workspace(ticket, "cannot buffer Done transition").await
+                    {
+                        ticket_buffer::push(
+                            &ws.name,
+                            &ticket.id,
+                            TicketPhase::QaPassed.as_ref(),
+                            TicketPhase::Done.as_ref(),
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // tx is dropped → TxGuard::drop sets the dangling_tx flag,
+            // triggering a rollback on the next write attempt.
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to finalize Done transition — transaction rolled back, \
+                 ticket stays in QaPassed for retry",
             );
         }
     }
