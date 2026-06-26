@@ -482,7 +482,6 @@ impl PollPhase {
                 // metadata-only since SanitationCheck is excluded from CLAIM_PHASES
                 // and the actual QaPassed→InSanitation transition happens via
                 // raw SQL in handle_qa_passed.
-                // handle_qa_passed.
                 require_clear_pipeline: false,
                 role_label: Role::Sanitation.as_str(),
             },
