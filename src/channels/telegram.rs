@@ -114,24 +114,40 @@ fn find_split_boundary(text: &str, hard_split: usize) -> usize {
 
 /// If `pos` is inside an HTML tag (the last `<` before `pos` has no matching `>`),
 /// return the byte offset just past the closing `>`. Otherwise return `None`.
+///
+/// Handles `>` inside quoted attribute values correctly — a `>` inside a
+/// single- or double-quoted string is not treated as a tag closer.
 fn extend_past_open_tag(text: &str, pos: usize) -> Option<usize> {
     let prefix = &text[..pos];
     let last_open = prefix.rfind('<')?;
-    let last_close = prefix.rfind('>');
 
-    let inside_tag = match last_close {
-        Some(close) => last_open > close,
-        None => true,
-    };
+    // Scan forward from last_open in one pass, tracking quote state,
+    // to find the first unquoted '>' (the real tag closer).
+    let mut in_quote = false;
+    let mut quote_char = '"';
 
-    if inside_tag {
-        // Find the closing '>' after pos
-        let after = &text[pos..];
-        let tag_end = after.find('>')?;
-        Some(pos + tag_end + 1)
-    } else {
-        None
+    for (i, c) in text[last_open..].char_indices() {
+        match c {
+            '"' | '\'' if !in_quote => {
+                in_quote = true;
+                quote_char = c;
+            }
+            '"' | '\'' if in_quote && c == quote_char => {
+                in_quote = false;
+            }
+            '>' if !in_quote => {
+                let gt_absolute = last_open + i;
+                if gt_absolute < pos {
+                    return None; // tag properly closed before pos
+                }
+                return Some(gt_absolute + 1); // past the closing '>'
+            }
+            _ => {}
+        }
     }
+
+    // No unquoted '>' found at all.
+    None
 }
 
 fn extract_sender_username(message: &serde_json::Value) -> String {
@@ -633,13 +649,26 @@ fn markdown_to_telegram_html(text: &str) -> String {
 /// Strip all HTML tags from a string, leaving only the text content.
 /// Used when falling back from HTML `parse_mode` to plain text so users
 /// don't see raw tags like `<b>`, `<code>`, `<pre>` etc.
+///
+/// Correctly handles `>` inside quoted attribute values — a `>` inside a
+/// single- or double-quoted string is not treated as a tag closer.
 fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
+    let mut in_quote = false;
+    let mut quote_char = '"';
     for c in s.chars() {
         match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
+            '<' if !in_tag => in_tag = true,
+            '>' if in_tag && !in_quote => in_tag = false,
+            '"' | '\'' if in_tag => {
+                if in_quote && c == quote_char {
+                    in_quote = false;
+                } else if !in_quote {
+                    in_quote = true;
+                    quote_char = c;
+                }
+            }
             _ if !in_tag => out.push(c),
             _ => {}
         }
@@ -2523,5 +2552,196 @@ mod tests {
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
         let content = format!("{attr}{photo_content}");
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+    }
+
+    // ── strip_html_tags tests ──────────────────────────────────
+
+    #[test]
+    fn strip_html_tags_empty_string() {
+        assert_eq!(strip_html_tags(""), "");
+    }
+
+    #[test]
+    fn strip_html_tags_plain_text() {
+        assert_eq!(strip_html_tags("hello world"), "hello world");
+    }
+
+    #[test]
+    fn strip_html_tags_simple_tag() {
+        assert_eq!(strip_html_tags("<b>bold</b>"), "bold");
+    }
+
+    #[test]
+    fn strip_html_tags_nested_tags() {
+        assert_eq!(strip_html_tags("<div><span>text</span></div>"), "text");
+    }
+
+    #[test]
+    fn strip_html_tags_self_closing() {
+        assert_eq!(strip_html_tags("before<br/>after"), "beforeafter");
+    }
+
+    #[test]
+    fn strip_html_tags_gt_in_double_quoted_attribute() {
+        // Regression: '<' in tag starts in_tag, then '>' inside attribute
+        // value must NOT close the tag.
+        assert_eq!(strip_html_tags("<a title=\"a > b\">link</a>"), "link");
+    }
+
+    #[test]
+    fn strip_html_tags_gt_in_single_quoted_attribute() {
+        assert_eq!(strip_html_tags("<a title='a > b'>link</a>"), "link");
+    }
+
+    #[test]
+    fn strip_html_tags_mixed_quotes() {
+        // Double-quoted attribute containing single quotes
+        assert_eq!(
+            strip_html_tags("<a title=\"he said 'hello'\">text</a>"),
+            "text"
+        );
+        // Single-quoted attribute containing double quotes
+        assert_eq!(
+            strip_html_tags("<a title='he said \"hello\"'>text</a>"),
+            "text"
+        );
+    }
+
+    #[test]
+    fn strip_html_tags_multiple_attrs_with_gt() {
+        // Multiple attributes, some with '>' inside quoted values
+        assert_eq!(
+            strip_html_tags("<input type=\"text\" value=\"a > b\" placeholder=\"x > y\">"),
+            ""
+        );
+    }
+
+    #[test]
+    fn strip_html_tags_gt_outside_tag() {
+        // '>' that is not inside a tag should be preserved as text
+        assert_eq!(strip_html_tags("a > b"), "a > b");
+    }
+
+    #[test]
+    fn strip_html_tags_lt_outside_tag() {
+        // '<' that is not part of a tag should start tag mode
+        // (pre-existing behavior: bare '<' starts tag stripping)
+        assert_eq!(strip_html_tags("a < b"), "a ");
+    }
+
+    #[test]
+    fn strip_html_tags_html_comment() {
+        assert_eq!(strip_html_tags("<!-- comment -->visible"), "visible");
+    }
+
+    #[test]
+    fn strip_html_tags_mixed_content() {
+        // Realistic mixed content with tags and text
+        let input =
+            "Hello <b>world</b>, check <a href=\"https://example.com?q=a > b\">this</a> out!";
+        assert_eq!(strip_html_tags(input), "Hello world, check this out!");
+    }
+
+    // ── extend_past_open_tag tests ─────────────────────────────
+
+    #[test]
+    fn extend_tag_no_tag_near_pos() {
+        // No '<' before pos → None
+        assert_eq!(extend_past_open_tag("hello world", 5), None);
+    }
+
+    #[test]
+    fn extend_tag_inside_simple_tag() {
+        // <b>hello
+        // 01234567
+        // pos=1 (inside <b>, before '>') → extend past '>' at 2
+        assert_eq!(extend_past_open_tag("<b>hello", 1), Some(3));
+        // pos=2 (at the '>' itself) → extend past it
+        assert_eq!(extend_past_open_tag("<b>hello", 2), Some(3));
+    }
+
+    #[test]
+    fn extend_tag_after_simple_tag() {
+        // <b>hello
+        // 01234567
+        // pos=3 (at 'h', past the '>') → None
+        assert_eq!(extend_past_open_tag("<b>hello", 3), None);
+        // pos further into text → None
+        assert_eq!(extend_past_open_tag("<b>hello", 5), None);
+    }
+
+    #[test]
+    fn extend_tag_no_closing_gt() {
+        // No '>' exists after the '<' → None (can't extend)
+        assert_eq!(extend_past_open_tag("<div", 3), None);
+    }
+
+    #[test]
+    fn extend_tag_gt_in_double_quoted_attribute() {
+        // Regression: '>' inside double-quoted attribute must not be
+        // treated as tag closer. The real '>' is at index 16.
+        let input = "<a title=\"a > b\">text";
+        // 012345678901234567890   (indices)
+        //           111111111122
+        //      '>' at 12 is inside attribute, real '>' at 16
+        // pos=13 (inside tag, past the quoted '>', before real '>') → extend to 17
+        assert_eq!(extend_past_open_tag(input, 13), Some(17));
+        // pos=16 (at the real '>') → extend past it
+        assert_eq!(extend_past_open_tag(input, 16), Some(17));
+    }
+
+    #[test]
+    fn extend_tag_after_closed_tag_with_gt_in_attribute() {
+        // pos after the real closing '>' → None
+        let input = "<a title=\"a > b\">text";
+        // 012345678901234567890
+        //           111111111122
+        // real '>' at 16, 't' at 17
+        assert_eq!(extend_past_open_tag(input, 17), None);
+        assert_eq!(extend_past_open_tag(input, 20), None);
+    }
+
+    #[test]
+    fn extend_tag_gt_in_single_quoted_attribute() {
+        // Same scenario with single quotes
+        let input = "<a title='a > b'>text";
+        // real '>' at 16
+        assert_eq!(extend_past_open_tag(input, 13), Some(17));
+    }
+
+    #[test]
+    fn extend_tag_mixed_quotes() {
+        // Double-quoted attr containing single quotes: '>' inside should still be
+        // treated as quoted because we're inside double quotes, not single.
+        let input = "<a title=\"he said 'stop'\">text";
+        // real '>' at 25
+        // pos=17 (inside the attribute, past the single quotes) → extend past real '>'
+        assert_eq!(extend_past_open_tag(input, 17), Some(26));
+    }
+
+    #[test]
+    fn extend_tag_nested_tags() {
+        // <div><span>text
+        // 012345678901234
+        // last '<' at 5 (<span>), its '>' at 10.
+        // pos=11 (after both tags are closed) → None
+        let input = "<div><span>text";
+        assert_eq!(extend_past_open_tag(input, 11), None);
+        // pos=15 (end of string, still after both tags) → None
+        assert_eq!(extend_past_open_tag(input, 15), None);
+    }
+
+    #[test]
+    fn extend_tag_inside_nested_tag() {
+        // <div><span>text
+        // pos=6 (inside <span>, before its '>') → extend past '>' at 10
+        let input = "<div><span>text";
+        assert_eq!(extend_past_open_tag(input, 6), Some(11));
+    }
+
+    #[test]
+    fn extend_tag_pos_at_start() {
+        // |<b>text → pos=0 is before any '<'
+        assert_eq!(extend_past_open_tag("<b>text", 0), None);
     }
 }
