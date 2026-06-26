@@ -3577,130 +3577,128 @@ with a comment explaining why no agent is mid-execution in that state.\
     //
     // These tests verify that the `_tx` variants work correctly within an
     // outer transaction (commit → visible, rollback → invisible).
+    //
+    // Each pair (commit/rollback) shares an `_{name}_inner(should_commit: bool)`
+    // helper that uses a single set of test data values.  Rollback assertions
+    // verify *absence* of the written data rather than checking for different
+    // (wrong) values.
 
-    #[tokio::test]
-    async fn test_set_commit_info_tx_commit() {
+    /// Shared helper: commit or rollback the given transaction.
+    async fn commit_or_rollback(tx: TxGuard<'_>, should_commit: bool) {
+        if should_commit {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+    }
+
+    async fn set_commit_info_tx_inner(should_commit: bool) {
         let (store, _tmp, id) = setup().await;
 
         let tx = store.conn.begin_tx().await.unwrap();
         BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
             .await
             .expect("set_commit_info_tx");
-        tx.commit().await.unwrap();
+        commit_or_rollback(tx, should_commit).await;
 
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(
-            ticket.commit_hash.as_deref(),
-            Some("abcdef0123456789abcdef0123456789abcd0123")
-        );
-        assert_eq!(ticket.lines_added, Some(10));
-        assert_eq!(ticket.lines_removed, Some(5));
+        if should_commit {
+            assert_eq!(
+                ticket.commit_hash.as_deref(),
+                Some("abcdef0123456789abcdef0123456789abcd0123")
+            );
+            assert_eq!(ticket.lines_added, Some(10));
+            assert_eq!(ticket.lines_removed, Some(5));
+        } else {
+            // After rollback, commit info should not be visible.
+            assert_eq!(ticket.commit_hash, None);
+            assert_eq!(ticket.lines_added, None);
+            assert_eq!(ticket.lines_removed, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_commit_info_tx_commit() {
+        set_commit_info_tx_inner(true).await;
     }
 
     #[tokio::test]
     async fn test_set_commit_info_tx_rollback() {
-        let (store, _tmp, id) = setup().await;
-
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::set_commit_info_tx(&tx, &id, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 3, 7)
-            .await
-            .expect("set_commit_info_tx");
-        tx.rollback().await.unwrap();
-
-        // After rollback, commit info should not be visible.
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(ticket.commit_hash, None);
-        assert_eq!(ticket.lines_added, None);
-        assert_eq!(ticket.lines_removed, None);
+        set_commit_info_tx_inner(false).await;
     }
 
-    #[tokio::test]
-    async fn test_add_comment_tx_commit() {
+    async fn add_comment_tx_inner(should_commit: bool) {
         let (store, _tmp, id) = setup().await;
 
         let tx = store.conn.begin_tx().await.unwrap();
         BoardStore::add_comment_tx(&tx, &id, "system", "transactional comment")
             .await
             .expect("add_comment_tx");
-        tx.commit().await.unwrap();
+        commit_or_rollback(tx, should_commit).await;
 
         let comments = store.get_comments(&id).await.expect("get comments");
-        assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0].role, "system");
-        assert_eq!(comments[0].content, "transactional comment");
+        if should_commit {
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].role, "system");
+            assert_eq!(comments[0].content, "transactional comment");
+        } else {
+            assert_eq!(comments.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_comment_tx_commit() {
+        add_comment_tx_inner(true).await;
     }
 
     #[tokio::test]
     async fn test_add_comment_tx_rollback() {
+        add_comment_tx_inner(false).await;
+    }
+
+    async fn transition_to_tx_inner(should_commit: bool) {
         let (store, _tmp, id) = setup().await;
 
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::add_comment_tx(&tx, &id, "system", "rolled back comment")
+        // Start in QaPassed.
+        store
+            .transition_to(&id, None, TicketPhase::QaPassed, None)
             .await
-            .expect("add_comment_tx");
-        tx.rollback().await.unwrap();
+            .unwrap();
 
-        let comments = store.get_comments(&id).await.expect("get comments");
-        assert_eq!(comments.len(), 0);
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::transition_to_tx(
+            &tx,
+            &id,
+            Some(TicketPhase::QaPassed),
+            TicketPhase::Done,
+            None,
+        )
+        .await
+        .expect("transition_to_tx");
+        commit_or_rollback(tx, should_commit).await;
+
+        let status = crate::util::test::expect_ticket_status(&store, &id).await;
+        if should_commit {
+            assert_eq!(status, TicketPhase::Done);
+        } else {
+            assert_eq!(status, TicketPhase::QaPassed);
+        }
     }
 
     #[tokio::test]
     async fn test_transition_to_tx_commit() {
-        let (store, _tmp, id) = setup().await;
-
-        // Start in QaPassed.
-        store
-            .transition_to(&id, None, TicketPhase::QaPassed, None)
-            .await
-            .unwrap();
-
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::transition_to_tx(
-            &tx,
-            &id,
-            Some(TicketPhase::QaPassed),
-            TicketPhase::Done,
-            None,
-        )
-        .await
-        .expect("transition_to_tx");
-        tx.commit().await.unwrap();
-
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
-        assert_eq!(status, TicketPhase::Done);
+        transition_to_tx_inner(true).await;
     }
 
     #[tokio::test]
     async fn test_transition_to_tx_rollback() {
-        let (store, _tmp, id) = setup().await;
-
-        // Start in QaPassed.
-        store
-            .transition_to(&id, None, TicketPhase::QaPassed, None)
-            .await
-            .unwrap();
-
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::transition_to_tx(
-            &tx,
-            &id,
-            Some(TicketPhase::QaPassed),
-            TicketPhase::Done,
-            None,
-        )
-        .await
-        .expect("transition_to_tx");
-        tx.rollback().await.unwrap();
-
-        // After rollback, ticket should still be in QaPassed.
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
-        assert_eq!(status, TicketPhase::QaPassed);
+        transition_to_tx_inner(false).await;
     }
 
-    #[tokio::test]
-    async fn test_transactional_triple_write_commit() {
+    async fn transactional_triple_write_inner(should_commit: bool) {
         // Exercise the full pattern used by commit_and_transition_ticket:
-        // all three _tx writes in one transaction → commit → all visible.
+        // all three _tx writes in one transaction → commit → all visible
+        // (or rollback → none persist).
         let (store, _tmp, id) = setup().await;
         store
             .transition_to(&id, None, TicketPhase::QaPassed, None)
@@ -3723,55 +3721,35 @@ with a comment explaining why no agent is mid-execution in that state.\
         )
         .await
         .unwrap();
-        tx.commit().await.unwrap();
+        commit_or_rollback(tx, should_commit).await;
 
-        // All three changes should be visible.
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(
-            ticket.commit_hash.as_deref(),
-            Some("abcdef0123456789abcdef0123456789abcd0123")
-        );
-        assert_eq!(ticket.status, TicketPhase::Done);
-
         let comments = store.get_comments(&id).await.expect("get comments");
-        assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0].content, "triple write comment");
+        if should_commit {
+            // All three changes should be visible.
+            assert_eq!(
+                ticket.commit_hash.as_deref(),
+                Some("abcdef0123456789abcdef0123456789abcd0123")
+            );
+            assert_eq!(ticket.status, TicketPhase::Done);
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].content, "triple write comment");
+        } else {
+            // None of the three changes should be visible.
+            assert_eq!(ticket.commit_hash, None);
+            assert_eq!(ticket.status, TicketPhase::QaPassed);
+            assert_eq!(comments.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transactional_triple_write_commit() {
+        transactional_triple_write_inner(true).await;
     }
 
     #[tokio::test]
     async fn test_transactional_triple_write_rollback() {
-        // Same pattern but rollback → none of the three changes persist.
-        let (store, _tmp, id) = setup().await;
-        store
-            .transition_to(&id, None, TicketPhase::QaPassed, None)
-            .await
-            .unwrap();
-
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::set_commit_info_tx(&tx, &id, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 3, 7)
-            .await
-            .unwrap();
-        BoardStore::add_comment_tx(&tx, &id, "system", "rolled back triple write")
-            .await
-            .unwrap();
-        BoardStore::transition_to_tx(
-            &tx,
-            &id,
-            Some(TicketPhase::QaPassed),
-            TicketPhase::Done,
-            None,
-        )
-        .await
-        .unwrap();
-        tx.rollback().await.unwrap();
-
-        // None of the three changes should be visible.
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(ticket.commit_hash, None);
-        assert_eq!(ticket.status, TicketPhase::QaPassed);
-
-        let comments = store.get_comments(&id).await.expect("get comments");
-        assert_eq!(comments.len(), 0);
+        transactional_triple_write_inner(false).await;
     }
 
     // ── parse_prereqs unit tests ──
