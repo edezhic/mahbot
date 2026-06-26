@@ -6,13 +6,18 @@
 //! - InDiagnostics → dispatch diagnostics runner (shell commands)
 //! - DiagnosticsDone → spawn Reviewer agents (`PARALLEL_AGENT_COUNT` parallel)
 //! - Reviewed → spawn QA agents (`PARALLEL_AGENT_COUNT` parallel)
+//! - QaPassed → check for untracked files; if found, claim to InSanitation and
+//!   dispatch Sanitation agent, otherwise commit and transition to Done
+//! - InSanitation → dispatch Sanitation agent (via `assigned_to` re-dispatch guard)
+//! - SanitationPassed → auto-commit and transition to Done
 //!
 //! Reviewer and QA phases share a single `PollPhase::VerifierCheck` variant
 //! with per-phase configuration carried in `VerifierInfo` constants
 //! (`REVIEWER_VI`, `QA_VI`).
 //!
-//! Additionally, QaPassed tickets are auto-committed and moved to Done outside
-//! the claim loop (no agent required).
+//! The Sanitation phase (sanitation.md agent prompt, Role::Sanitation) inspects
+//! new/untracked files before the auto-commit step. Garbage artifacts cause a
+//! bounce back to ReadyForDevelopment; clean files proceed to Done via commit.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -399,6 +404,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             match phase {
                 PollPhase::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
                 PollPhase::EngineerDevelopment => dispatch_engineer(ticket, ws).await,
+                PollPhase::SanitationCheck => dispatch_sanitation(ticket, ws).await,
                 PollPhase::DiagnosticsCheck => dispatch_diagnostics(ticket, ws).await,
                 PollPhase::VerifierCheck(vi) => dispatch_verifiers(ticket, ws, vi).await,
             }
@@ -512,6 +518,7 @@ struct PollPhaseInfo {
 enum PollPhase {
     BacklogAnalysis,
     EngineerDevelopment,
+    SanitationCheck,
     DiagnosticsCheck,
     VerifierCheck(VerifierInfo),
 }
@@ -532,6 +539,18 @@ impl PollPhase {
                 require_clear_pipeline: true,
                 role_label: Role::Engineer.as_str(),
             },
+            Self::SanitationCheck => PollPhaseInfo {
+                source: TicketPhase::QaPassed,
+                claim_target: TicketPhase::InSanitation,
+                // Note: claim_target is consumed by spawn_dispatch's
+                // panic-recovery transition (target_phase → Failed); source is
+                // metadata-only since SanitationCheck is excluded from CLAIM_PHASES
+                // and the actual QaPassed→InSanitation transition happens via
+                // raw SQL in handle_qa_passed.
+                // handle_qa_passed.
+                require_clear_pipeline: false,
+                role_label: Role::Sanitation.as_str(),
+            },
             Self::DiagnosticsCheck => PollPhaseInfo {
                 source: TicketPhase::InDiagnostics,
                 claim_target: TicketPhase::InDiagnostics,
@@ -550,8 +569,9 @@ impl PollPhase {
 
 /// Pipeline phases that use atomic source→claim_target claim transitions.
 ///
-/// DiagnosticsCheck is intentionally excluded — it keeps the ticket in
-/// InDiagnostics while running and guards re-dispatch via `assigned_to`.
+/// DiagnosticsCheck and SanitationCheck are intentionally excluded — they
+/// keep the ticket in InDiagnostics/InSanitation while running and guard
+/// re-dispatch via `assigned_to` and pre-condition checks respectively.
 /// QaPassed→Done uses a separate list-based dispatch because the commit
 /// must succeed before transitioning to Done, so there is no atomic claim
 /// to perform.
@@ -665,18 +685,47 @@ async fn poll_round() -> anyhow::Result<()> {
         })
         .await;
 
-        // 3. Auto-commit QaPassed tickets.
+        // 3. SanitationPassed → Done (auto-commit).
         //
-        // Spawned via tokio::spawn (not synchronous .await) to prevent
-        // git operations from blocking the entire poll loop. Unlike the
-        // claim-based phases, there is no atomic source→target transition
-        // — the ticket stays in QaPassed until the commit succeeds, so
-        // re-dispatch is harmless (git status short-circuits a no-op).
+        // After the sanitation agent approves, the ticket reaches SanitationPassed.
+        // We commit the changes and transition to Done, following the same pattern
+        // as the QaPassed→Done commit flow.
+        for_tickets_in_phase(TicketPhase::SanitationPassed, &ws.name, |ticket| {
+            let ws = ws.clone();
+            tokio::spawn(async move {
+                finalize_sanitation_passed(ticket, ws).await;
+            });
+        })
+        .await;
+
+        // 4. Handle QaPassed tickets.
+        //
+        // For each QaPassed ticket, check whether the working tree has new/untracked
+        // files. If it does, claim the ticket to InSanitation and dispatch a sanitation
+        // agent. Otherwise, commit directly and transition to Done (existing behavior).
+        //
+        // Spawned via tokio::spawn to prevent git operations from blocking the poll loop.
+        // The ticket stays in QaPassed until either the claim or the commit succeeds,
+        // so re-dispatch is harmless.
         for_tickets_in_phase(TicketPhase::QaPassed, &ws.name, |ticket| {
             let ws = ws.clone();
             tokio::spawn(async move {
-                finalize_qa_passed(ticket, ws).await;
+                handle_qa_passed(ticket, ws).await;
             });
+        })
+        .await;
+
+        // 5. Dispatch unassigned InSanitation tickets.
+        //
+        // SanitationCheck does NOT use the claim loop — the claim (QaPassed→InSanitation)
+        // happens inside handle_qa_passed, which also pushes the ticket_buffer entry.
+        // We guard against re-dispatch via assigned_to IS NULL, matching the
+        // DiagnosticsCheck pattern.
+        for_tickets_in_phase(TicketPhase::InSanitation, &ws.name, |ticket| {
+            if ticket.assigned_to.is_some() {
+                return; // already dispatched, still running
+            }
+            spawn_dispatch(PollPhase::SanitationCheck, ticket, ws.clone());
         })
         .await;
     }
@@ -819,45 +868,53 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
     }
 }
 
-/// Transition a QaPassed ticket to Done with a descriptive reason.
-async fn transition_qa_to_done(ticket: &Ticket, reason: &str) {
+/// Transition a ticket to Done with a descriptive reason from the given source phase.
+async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, reason: &str) {
     info!(ticket = %ticket.id, "{reason}");
 
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
 
-    if let Err(e) = transition_ticket(
-        ticket,
-        TicketPhase::QaPassed,
-        TicketPhase::Done,
-        notify_policy,
-    )
-    .await
-    {
+    if let Err(e) = transition_ticket(ticket, source, TicketPhase::Done, notify_policy).await {
+        let phase_label = source.as_ref();
         warn!(
             ticket = %ticket.id,
             error = %e,
-            "QA passed but transition to Done failed",
+            "{phase_label} passed but transition to Done failed",
         );
     }
 }
 
-/// Auto-commit changes after QA passes and move the ticket to Done.
+/// Auto-commit changes and move the ticket to Done.
+///
+/// Parameterized by source phase so both [`finalize_qa_passed`] and
+/// [`finalize_sanitation_passed`] share the same implementation.
 ///
 /// Checks for a dirty working tree via `git status --porcelain`:
 /// - **Clean tree:** skips commit, transitions directly to Done with notification.
 /// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::diff_parse::run_git_commit`].
-/// - **Commit failure:** ticket stays in QaPassed, poller retries next cycle.
+/// - **Commit failure:** ticket stays in `source`, poller retries next cycle.
 /// - **Not a git repo / no git installed:** transitions to Done without commit.
-async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
+async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
     let repo_path = ws.as_path();
+    let phase_label = source.as_ref();
 
     if !crate::diff_parse::git_is_installed().await {
-        transition_qa_to_done(&ticket, "Git not installed — moving to Done without commit").await;
+        transition_ticket_to_done(
+            &ticket,
+            source,
+            "Git not installed — moving to Done without commit",
+        )
+        .await;
         return;
     }
 
     if !crate::diff_parse::is_git_repo(repo_path) {
-        transition_qa_to_done(&ticket, "Not a git repo — moving to Done without commit").await;
+        transition_ticket_to_done(
+            &ticket,
+            source,
+            "Not a git repo — moving to Done without commit",
+        )
+        .await;
         return;
     }
 
@@ -868,15 +925,16 @@ async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Failed to check git status — staying in QaPassed for retry"
+                "Failed to check git status — staying in {phase_label} for retry"
             );
             return;
         }
     };
 
     if !has_changes {
-        transition_qa_to_done(
+        transition_ticket_to_done(
             &ticket,
+            source,
             "Clean working tree — moving to Done without commit",
         )
         .await;
@@ -884,27 +942,34 @@ async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
     }
 
     match crate::diff_parse::run_git_commit(repo_path, &ticket.title).await {
-        Ok(commit_info) => commit_and_transition_ticket(&ticket, commit_info).await,
+        Ok(commit_info) => {
+            commit_and_transition_ticket_from(&ticket, commit_info, source).await;
+        }
         Err(e) => {
             error!(
                 ticket = %ticket.id,
                 error = %e,
-                "Commit failed — staying in QaPassed for retry"
+                "Commit failed — staying in {phase_label} for retry"
             );
         }
     }
 }
 
+/// Auto-commit changes after QA passes and move the ticket to Done.
+async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
+    finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
+}
+
 /// After a successful `git commit`, persist the metadata and transition the
 /// ticket to Done atomically within a single DB transaction.
 ///
-/// All three writes (commit_info, comment, status transition) happen atomically
-/// so a crash mid-sequence doesn't leave partial state. The git commit itself
-/// happens *before* the transaction, so an orphan commit is still possible if
-/// the process crashes between the filesystem commit and the DB commit — the
-/// self-healing mechanism handles this on the next poll cycle by detecting a
-/// clean working tree.
-async fn commit_and_transition_ticket(ticket: &Ticket, commit_info: crate::diff_parse::CommitInfo) {
+/// Parameterized by source phase so both the QaPassed→Done and
+/// SanitationPassed→Done flows share the same implementation.
+async fn commit_and_transition_ticket_from(
+    ticket: &Ticket,
+    commit_info: crate::diff_parse::CommitInfo,
+    source: TicketPhase,
+) {
     let short_hash = commit_info.hash.get(..7).unwrap_or(&commit_info.hash);
     let comment = format_commit_summary(
         short_hash,
@@ -912,13 +977,15 @@ async fn commit_and_transition_ticket(ticket: &Ticket, commit_info: crate::diff_
         commit_info.lines_removed,
     );
 
+    let phase_label = source.as_ref();
+
     let tx = match board().conn.begin_tx().await {
         Ok(tx) => tx,
         Err(e) => {
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Failed to begin transaction — staying in QaPassed for retry",
+                "Failed to begin transaction — staying in {phase_label} for retry",
             );
             return;
         }
@@ -934,14 +1001,8 @@ async fn commit_and_transition_ticket(ticket: &Ticket, commit_info: crate::diff_
         )
         .await?;
         BoardStore::add_comment_tx(&tx, &ticket.id, "system", &comment).await?;
-        BoardStore::transition_to_tx(
-            &tx,
-            &ticket.id,
-            Some(TicketPhase::QaPassed),
-            TicketPhase::Done,
-            None,
-        )
-        .await?;
+        BoardStore::transition_to_tx(&tx, &ticket.id, Some(source), TicketPhase::Done, None)
+            .await?;
         Ok(())
     }
     .await;
@@ -953,7 +1014,7 @@ async fn commit_and_transition_ticket(ticket: &Ticket, commit_info: crate::diff_
                     ticket = %ticket.id,
                     error = %e,
                     "Commit succeeded ({short_hash}) but DB transaction commit failed — \
-                     ticket stays in QaPassed for retry, orphan commit in repo",
+                     ticket stays in {phase_label} for retry, orphan commit in repo",
                 );
                 return;
             }
@@ -974,7 +1035,7 @@ async fn commit_and_transition_ticket(ticket: &Ticket, commit_info: crate::diff_
                         ticket_buffer::push(
                             &ws.name,
                             &ticket.id,
-                            TicketPhase::QaPassed.as_ref(),
+                            source.as_ref(),
                             TicketPhase::Done.as_ref(),
                         );
                     }
@@ -988,7 +1049,7 @@ async fn commit_and_transition_ticket(ticket: &Ticket, commit_info: crate::diff_
                 ticket = %ticket.id,
                 error = %e,
                 "Failed to finalize Done transition — transaction rolled back, \
-                 ticket stays in QaPassed for retry",
+                 ticket stays in {phase_label} for retry",
             );
         }
     }
@@ -1007,6 +1068,452 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
         (0, r) => format!("Committed as `{short_hash}` (-{r})"),
         (a, r) => format!("Committed as `{short_hash}` (+{a}/-{r})"),
     }
+}
+
+// ── Sanitation ─────────────────────────────────────────────────────────
+
+/// Maximum number of consecutive sanitation failures allowed before the
+/// sanitation circuit breaker trips. The breaker trips when a ticket's
+/// sanitation failure count exceeds this threshold, failing the ticket and
+/// pausing the workspace.
+///
+/// This is a separate, lower threshold than the general comment-count
+/// circuit breaker — sanitation failures are cheap to detect and should
+/// not consume 100 comments before tripping.
+const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
+
+/// Handle a QaPassed ticket: check for untracked/new files and either
+/// transition to InSanitation for sanitation agent dispatch or commit
+/// directly to Done.
+///
+/// Checks the working tree for untracked files (`git status --porcelain`
+/// showing `??` or `A `). If untracked files exist, atomically transitions
+/// the ticket to InSanitation with `assigned_to` set (no TOCTOU window
+/// between transition and assignment), and dispatches the sanitation agent.
+/// Otherwise, commits and transitions to Done (existing behavior).
+async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
+    let repo_path = ws.as_path();
+
+    // Only check git if it's available and the repo exists.
+    if !crate::diff_parse::git_is_installed().await || !crate::diff_parse::is_git_repo(repo_path) {
+        finalize_qa_passed(ticket, ws).await;
+        return;
+    }
+
+    // Check for untracked files — use list_untracked_files which returns the
+    // actual file list, then check if non-empty (avoids a separate git call).
+    let untracked = match list_untracked_files(repo_path).await {
+        Ok(files) => files,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to check git status for untracked files — staying in QaPassed for retry"
+            );
+            return;
+        }
+    };
+
+    if untracked.is_empty() {
+        // No new/untracked files — commit directly (current behavior).
+        finalize_qa_passed(ticket, ws).await;
+        return;
+    }
+
+    // Untracked files exist — claim this specific ticket to InSanitation.
+    //
+    // We use a raw SQL UPDATE instead of `transition_to()` because we need to
+    // atomically set both `status` AND `assigned_to` in a single statement.
+    // `transition_to` always clears `assigned_to = NULL`, but we need to set
+    // it to the session key to prevent the poll loop's InSanitation re-dispatch
+    // guard (assigned_to IS NULL) from firing a second agent during the yield
+    // between two separate calls.
+    //
+    // This is safe because `ticket` is owned (handle_qa_passed takes Ticket by
+    // value) and we already checked `untracked.is_empty()` — no other handler
+    // can race on this specific ticket id because the CAS on `status = 'qa_passed'`
+    // ensures at most one handler wins the transition. There is no running agent
+    // to cancel (the ticket is in QaPassed, a transitory handoff phase with no
+    // agent mid-execution), so the execute_and_cancel wrapper that `transition_to`
+    // uses is not needed here.
+    //
+    // WARNING: Do NOT copy this raw-SQL pattern for phases that DO have running
+    // agents. The execute_and_cancel wrapper in `transition_to` cancels agents
+    // for the claimed ticket before transitioning — without it, a stale agent
+    // would continue running with a now-stale phase reference. QaPassed is safe
+    // because it is a transitory handoff phase with no running agent.
+    let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
+    // Check the sanitation pipeline: reject the claim if another ticket is
+    // already in InSanitation or SanitationPassed in this workspace. This
+    // enforces the manager's requirement that sanitation is serialized per
+    // workspace — only one ticket at a time through the sanitation pipeline.
+    // We check only InSanitation/SanitationPassed (not the full
+    // PIPELINE_BLOCKING_STATUSES) because earlier pipeline phases like QaPassed
+    // should not block a new ticket from entering sanitation.
+    let rows = board()
+        .conn
+        .execute(
+            "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = ?5 \
+             AND NOT EXISTS (SELECT 1 FROM tickets t2 \
+               WHERE t2.workspace_name = (SELECT workspace_name FROM tickets WHERE id = ?4) \
+               AND t2.id != ?4 \
+               AND t2.status IN ('in_sanitation','sanitation_passed'))",
+            turso::params![
+                TicketPhase::InSanitation.as_ref(),
+                session_key.as_str(),
+                crate::turso::now(),
+                ticket.id.as_str(),
+                TicketPhase::QaPassed.as_ref(),
+            ],
+        )
+        .await;
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to transition QaPassed ticket to InSanitation"
+            );
+            return;
+        }
+    };
+
+    if rows == 0 {
+        debug!(
+            ticket = %ticket.id,
+            "QaPassed ticket moved externally — skipping sanitation dispatch",
+        );
+        return;
+    }
+
+    ticket_buffer::push(
+        &ticket.workspace_name,
+        &ticket.id,
+        TicketPhase::QaPassed.as_ref(),
+        TicketPhase::InSanitation.as_ref(),
+    );
+
+    // Re-fetch ticket with updated status/comments before dispatch.
+    // By this point assigned_to is already set atomically in the same
+    // UPDATE that changed the status, so the poll loop's InSanitation
+    // re-dispatch guard (assigned_to IS NULL) will not fire for this ticket.
+    let updated = match board().get_ticket(&ticket.id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn!(ticket = %ticket.id, "Ticket disappeared after transition — skipping");
+            // Ticket was deleted between CAS and re-fetch. Clear assigned_to so
+            // the poll loop doesn't think a running agent exists for a phantom ticket.
+            let _ = board().set_assigned_to(&ticket.id, None).await;
+            return;
+        }
+        Err(e) => {
+            warn!(ticket = %ticket.id, error = %e, "Failed to re-fetch ticket after transition");
+            // Re-fetch failed (DB error). The ticket is stuck in InSanitation with
+            // assigned_to set but no agent dispatched. Clear assigned_to to allow the
+            // poll loop to retry dispatching a sanitation agent on the next cycle.
+            let _ = board().set_assigned_to(&ticket.id, None).await;
+            return;
+        }
+    };
+
+    spawn_dispatch(PollPhase::SanitationCheck, updated, ws);
+}
+
+/// Sanitation circuit breaker — trip if the ticket has accumulated too
+/// many consecutive sanitation failures.
+///
+/// Delegates to [`run_circuit_breaker`] to ensure fresh comment fetching,
+/// proper sibling ticket drainage (moving other ReadyForDevelopment tickets
+/// to Planning), and consistent failure handling with the general breaker.
+///
+/// Counts system comments where role == "system" and content contains
+/// "Sanitation failed" but NOT "Circuit breaker" (to prevent self-counting
+/// cascade on re-dispatch after the breaker trips).
+///
+/// Separate from the general comment-count circuit breaker so that
+/// garbage-thrashing tickets are caught early without consuming the full
+/// 100-comment budget.
+#[must_use]
+async fn trip_sanitation_circuit_breaker_if_exceeded(
+    ticket: &Ticket,
+    expected: TicketPhase,
+) -> bool {
+    run_circuit_breaker(
+        ticket,
+        expected,
+        SANITATION_CIRCUIT_BREAKER_THRESHOLD,
+        |comments| {
+            comments
+                .iter()
+                .filter(|c| {
+                    c.role == "system"
+                        && c.content.contains("Sanitation failed")
+                        && !c.content.contains("Circuit breaker")
+                })
+                .count()
+        },
+        |count| {
+            format!(
+                "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+                 (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
+            )
+        },
+        "Sanitation",
+    )
+    .await
+}
+
+/// Run the sanitation agent to inspect new/untracked files in the workspace.
+///
+/// Called by [`PollPhase::SanitationCheck`] via [`spawn_dispatch`]. Runs a
+/// single sanitation agent with tools to inspect files and determine whether
+/// they are legitimate project files or intermediate garbage.
+///
+/// After the agent completes, extracts a structured [`SanitationVerdict`]:
+/// - If **clean** (pass = true): transitions to [`TicketPhase::SanitationPassed`]
+///   (transitory handoff before auto-commit).
+/// - If **garbage detected** (pass = false): adds a comment listing the offending
+///   files and bounces the ticket to [`TicketPhase::ReadyForDevelopment`] via
+///   [`bounce_back_to_development`], matching the existing review/QA failure
+///   pattern.
+#[allow(clippy::too_many_lines)]
+async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
+    let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
+
+    // Phase check only (no general circuit breaker): verify the ticket is still
+    // in InSanitation before starting the agent. The dedicated sanitation circuit
+    // breaker below (threshold: 3) will always trip before the general 100-comment
+    // breaker, so running both would waste a DB round-trip fetching comments twice.
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
+        return;
+    }
+
+    // Check the sanitation-specific circuit breaker before running the agent.
+    if trip_sanitation_circuit_breaker_if_exceeded(&ticket, TicketPhase::InSanitation).await {
+        return;
+    }
+
+    //
+    // Unlike handle_qa_passed (which fails closed on git errors — returning early
+    // to stay in QaPassed for retry), dispatch_sanitation takes a fail-open approach:
+    // if we can't list untracked files, we pass an empty list rather than failing the
+    // ticket. The sanitation agent will see "(could not list untracked files)" and
+    // proceed. This is intentional: by the time dispatch_sanitation runs, the ticket
+    // has already been claimed to InSanitation with assigned_to set. Failing-closed
+    // (returning early) would leave the ticket stuck in InSanitation with no agent
+    // running, requiring the next poll cycle's re-dispatch guard to recover. Passing
+    // an empty list is at-worst a no-op (the agent passes, ticket proceeds to commit);
+    // at-best the agent may still detect garbage from known patterns.
+    //
+    // Note: this re-runs `git status --porcelain` even though `handle_qa_passed`
+    // already collected the untracked file list. The re-run is unavoidable because
+    // `dispatch_sanitation` runs in a separate async task (spawned via `spawn_dispatch`)
+    // and the data from `handle_qa_passed` cannot be shared across that boundary.
+    // The shell overhead of one `git status` call per sanitation cycle is negligible
+    // relative to the LLM agent cost that follows.
+    let untracked_files = match list_untracked_files(ws.as_path()).await {
+        Ok(files) => files.join("\n"),
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to list untracked files — proceeding with empty list",
+            );
+            String::from("(could not list untracked files)")
+        }
+    };
+
+    let prompt = substitute(
+        &crate::prompt::load_prompt("sanitation.md"),
+        &[
+            ("{{ticket_title}}", &ticket.title),
+            ("{{ticket_description}}", &ticket.description),
+            ("{{untracked_files}}", &untracked_files),
+        ],
+    );
+
+    let (agent, response) =
+        run_agent(session_key, Role::Sanitation, &ws, Some(&ticket), &prompt).await;
+
+    // Post-run phase check — bail if ticket was moved externally.
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
+        return;
+    }
+
+    let Some(ref _text) = response else {
+        // Agent failed or was cancelled — record failure and clear assigned_to
+        // for re-dispatch retry. The system comment lets the sanitation circuit
+        // breaker detect repeated failures.
+        warn!(
+            ticket = %ticket.id,
+            "Sanitation agent returned no output — clearing assigned_to for retry"
+        );
+        let _ = board()
+            .add_comment(
+                &ticket.id,
+                "system",
+                "Sanitation failed — agent returned no output",
+            )
+            .await;
+        let _ = board().set_assigned_to(&ticket.id, None).await;
+        return;
+    };
+
+    let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
+    let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
+
+    let verdict: crate::SanitationVerdict = match agent
+        .extract_structured(&extraction_prompt, &retry_prompt, 5)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to extract sanitation verdict — clearing assigned_to for retry"
+            );
+            // Record the failure as a system comment so the circuit breaker
+            // can detect repeated extraction failures.
+            let _ = board()
+                .add_comment(
+                    &ticket.id,
+                    "system",
+                    &format!("Sanitation failed — verdict extraction error: {e}"),
+                )
+                .await;
+            let _ = board().set_assigned_to(&ticket.id, None).await;
+            return;
+        }
+    };
+
+    if verdict.pass {
+        // Clean — transition to SanitationPassed for auto-commit.
+        info!(
+            ticket = %ticket.id,
+            "Sanitation passed — transitioning to SanitationPassed",
+        );
+
+        // Add a comment summarizing the sanitation check.
+        let comment = if verdict.garbage_files.is_empty() {
+            format!(
+                "🧹 Sanitation passed: {rationale}",
+                rationale = verdict.rationale
+            )
+        } else {
+            format!(
+                "🧹 Sanitation passed (files reviewed): {rationale}",
+                rationale = verdict.rationale
+            )
+        };
+        let _ = board()
+            .add_comment(&ticket.id, Role::Sanitation.as_str(), &comment)
+            .await;
+
+        if let Err(e) = transition_ticket(
+            &ticket,
+            TicketPhase::InSanitation,
+            TicketPhase::SanitationPassed,
+            NotifyPolicy::Buffer,
+        )
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Sanitation passed but transition to SanitationPassed failed — \
+                 ticket stuck in InSanitation"
+            );
+        }
+    } else {
+        // Garbage detected — bounce back to development with details.
+        let garbage_list = verdict.garbage_files.join("\n- ");
+        let comment = format!(
+            "🗑️ Sanitation failed — garbage files detected:\n- {garbage_list}\n\nRationale: {rationale}",
+            rationale = verdict.rationale,
+        );
+        let _ = board()
+            .add_comment(&ticket.id, Role::Sanitation.as_str(), &comment)
+            .await;
+
+        // Also add a system comment so the sanitation circuit breaker can detect it.
+        let _ = board()
+            .add_comment(
+                &ticket.id,
+                "system",
+                &format!(
+                    "Sanitation failed — garbage files: {count}",
+                    count = verdict.garbage_files.len(),
+                ),
+            )
+            .await;
+
+        bounce_back_to_development(&ticket, TicketPhase::InSanitation, "Sanitation").await;
+    }
+}
+
+/// List untracked/new files in the working tree by running `git status --porcelain`.
+///
+/// Delegates to [`parse_untracked_from_porcelain`] for the actual parsing logic.
+/// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
+/// including `A ` clean staged and `AM` staged+modified).
+async fn list_untracked_files(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    use tokio::process::Command;
+
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_path)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git status --porcelain failed: {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_untracked_from_porcelain(&stdout))
+}
+
+/// Parse untracked/new file paths from `git status --porcelain` output.
+///
+/// Returns file paths for entries where the index status indicates a new file:
+/// - `??` — untracked file
+/// - `A ` at position 0 — staged as new (first char is `A`)
+///
+/// This correctly catches `A ` (staged, clean) and `AM` (staged as new, then
+/// modified in working tree) because both start with `A`. The porcelain format
+/// is `<XY><space><path>` where X = index status, Y = working tree status.
+/// Path always starts at index 3.
+///
+/// Excludes ` A` (not tracked, added only to working tree — this is a file
+/// that exists but is not tracked by git; it falls under `??` instead).
+#[must_use]
+fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter(|line| line.starts_with("?? ") || line.starts_with('A'))
+        // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
+        // we guard with `get()` to prevent panics on malformed input.
+        .filter_map(|line| {
+            let path = line.get(3..)?;
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Finalize a SanitationPassed ticket: commit changes and transition to Done.
+///
+/// Delegates to the parameterized [`finalize_ticket_from_phase`].
+async fn finalize_sanitation_passed(ticket: Ticket, ws: Workspace) {
+    finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed).await;
 }
 
 // ── Post-development diagnostics ───────────────────────────────────────
@@ -2152,7 +2659,7 @@ mod tests {
         );
     }
 
-    // ── transition_qa_to_done — conditional notification ─────────────
+    // ── transition_ticket_to_done — conditional notification ─────────
 
     /// Ensures the ticket buffer is initialized exactly once across all tests.
     /// Unlike `ticket_buffer::reset()`, this does not clear existing entries
@@ -2166,14 +2673,14 @@ mod tests {
         });
     }
 
-    /// Prepare a workspace for `transition_qa_to_done` tests.
+    /// Prepare a workspace for `transition_ticket_to_done` tests (QaPassed→Done path).
     ///
     /// Ensures all global stores (board, workspace, manager_queue) are
     /// initialized (race-safe with concurrent tests), creates a unique
     /// workspace in the store, and returns a [`Workspace`] struct referencing
     /// it. Each test must pass a unique `suffix` to avoid UNIQUE constraint
     /// and cross-test pollution on the shared ticket buffer.
-    async fn setup_transition_qa_to_done_test(suffix: &str) -> crate::Workspace {
+    async fn setup_ticket_to_done_test(suffix: &str) -> crate::Workspace {
         init_test_stores().await;
         ensure_ticket_buffer_initialized();
         // Workspace store — race-safe: if another test already initialized it,
@@ -2204,11 +2711,12 @@ mod tests {
         test_ws_named(&ws_path, &ws_name)
     }
 
-    /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets:
-    /// the first one buffers, the last one notifies and drains the buffer.
+    /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
+    /// via `transition_ticket_to_done`: the first one buffers, the last one
+    /// notifies and drains the buffer.
     #[tokio::test]
-    async fn transition_qa_to_done_buffer_and_notify() {
-        let ws = setup_transition_qa_to_done_test("drains_buffer").await;
+    async fn transition_ticket_to_done_buffer_and_notify() {
+        let ws = setup_ticket_to_done_test("drains_buffer").await;
 
         // Two QaPassed tickets in the same workspace
         let first_id = TicketBuilder::new(board(), ws.clone())
@@ -2232,7 +2740,12 @@ mod tests {
             .expect("ticket A exists");
 
         // Transition ticket A — ticket B is still QaPassed (active), so Buffer
-        transition_qa_to_done(&ticket_a, "Test — ticket A done, B still active").await;
+        transition_ticket_to_done(
+            &ticket_a,
+            TicketPhase::QaPassed,
+            "Test — ticket A done, B still active",
+        )
+        .await;
 
         // Intermediate assertion: verify the Buffer path was actually taken.
         // Without this, a bug where has_active_tickets_excluding incorrectly
@@ -2253,7 +2766,12 @@ mod tests {
             .await
             .expect("get_ticket")
             .expect("ticket B exists");
-        transition_qa_to_done(&ticket_b, "Test — ticket B done, last ticket").await;
+        transition_ticket_to_done(
+            &ticket_b,
+            TicketPhase::QaPassed,
+            "Test — ticket B done, last ticket",
+        )
+        .await;
 
         // Verify both tickets are Done
         for (id, label) in [(&first_id, "A"), (&second_id, "B")] {
@@ -2390,6 +2908,174 @@ mod tests {
         assert!(
             !ws.paused,
             "Workspace should NOT be paused after non-failure transition"
+        );
+    }
+
+    // ── parse_untracked_from_porcelain — git porcelain parsing ──
+
+    /// Verify that `parse_untracked_from_porcelain` correctly extracts untracked
+    /// and staged-as-new file paths from git porcelain output.
+    #[test]
+    fn parse_untracked_from_porcelain_extracts_new_files() {
+        let porcelain = "\
+?? new_file.rs
+M  modified.rs
+?? another_new.py
+A  staged_new.js
+?? dir/untracked.txt
+ M working_tree_only.txt
+?? temp.log
+AM staged_then_modified.js
+ A working_tree_new.txt
+";
+
+        let files = parse_untracked_from_porcelain(porcelain);
+
+        assert_eq!(files.len(), 6);
+        assert!(files.contains(&"new_file.rs".to_string()));
+        assert!(files.contains(&"another_new.py".to_string()));
+        assert!(files.contains(&"staged_new.js".to_string()));
+        assert!(files.contains(&"dir/untracked.txt".to_string()));
+        assert!(files.contains(&"temp.log".to_string()));
+        assert!(files.contains(&"staged_then_modified.js".to_string()));
+        // These should be excluded:
+        assert!(!files.contains(&"modified.rs".to_string()));
+        assert!(!files.contains(&"working_tree_only.txt".to_string()));
+        assert!(!files.contains(&"working_tree_new.txt".to_string()));
+    }
+
+    /// Verify that empty or no-new-files porcelain produces an empty list.
+    #[test]
+    fn parse_untracked_from_porcelain_empty_when_no_new_files() {
+        let porcelain = "\
+M  modified.rs
+ M working_tree_only.txt
+D  deleted.rs
+ A working_tree_new.txt
+";
+
+        let files = parse_untracked_from_porcelain(porcelain);
+        assert!(
+            files.is_empty(),
+            "Should be empty when no new/untracked files"
+        );
+    }
+
+    /// Verify that the porcelain slicing at &line[3..] is correct for various
+    /// git status --porcelain line formats involving new files.
+    ///
+    /// Tests via the actual `parse_untracked_from_porcelain` function rather than
+    /// reimplementing the slicing logic inline, so a refactor of the parsing
+    /// algorithm would break this test.
+    #[test]
+    fn parse_untracked_from_porcelain_slicing() {
+        // fmt: <XY><space><path>
+        let test_cases = [
+            ("?? foo.rs", "foo.rs"),
+            ("?? dir/bar.py", "dir/bar.py"),
+            ("A  staged.txt", "staged.txt"),
+            ("AM both.txt", "both.txt"), // A in index, M in working tree
+        ];
+
+        for &(line, expected_path) in &test_cases {
+            // Build a multi-line porcelain string containing just this line.
+            let input = format!("{line}\n");
+            let files = parse_untracked_from_porcelain(&input);
+            assert_eq!(
+                files,
+                vec![expected_path.to_string()],
+                "Failed for line: {line:?}"
+            );
+        }
+    }
+
+    /// Verify that malformed/truncated porcelain lines don't cause panics.
+    #[test]
+    fn parse_untracked_from_porcelain_handles_malformed_input() {
+        // Lines shorter than 4 chars that match the filter should not panic.
+        let short_lines = ["A", "A ", "?? ", "??"];
+
+        for &bad_line in &short_lines {
+            let files = parse_untracked_from_porcelain(bad_line);
+            // The line matches the filter but is too short for slicing.
+            // get(3..) returns None, so the line is silently skipped.
+            assert!(
+                files.is_empty(),
+                "Malformed line {bad_line:?} should produce empty result, got {files:?}"
+            );
+        }
+    }
+
+    // ── trip_sanitation_circuit_breaker_if_exceeded — counting ──
+
+    /// Verify that the sanitation circuit breaker counting logic works correctly.
+    #[tokio::test]
+    async fn sanitation_breaker_counts_failures() {
+        init_test_stores().await;
+        let ws = test_ws_named("/tmp/test", "san_breaker_test");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Sanitation Breaker Test")
+            .phase(TicketPhase::InSanitation)
+            .create()
+            .await
+            .expect("create ticket");
+
+        // Add 2 sanitation failure comments (below threshold of 3).
+        for _ in 0..2 {
+            let _ = board()
+                .add_comment(&ticket_id, "system", "Sanitation failed — garbage files: 1")
+                .await;
+        }
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // Should NOT trip (2 <= 3)
+        assert!(
+            !trip_sanitation_circuit_breaker_if_exceeded(&ticket, TicketPhase::InSanitation).await,
+            "Should NOT trip with 2 failures (threshold: 3)"
+        );
+
+        // Add a 3rd failure comment (should still not trip — runs the count_fn
+        // which counts by the "Sanitation failed" substring, using fresh comments
+        // from DB, not the stale in-memory ticket.comments).
+        let _ = board()
+            .add_comment(&ticket_id, "system", "Sanitation failed — garbage files: 1")
+            .await;
+
+        // ... actually 3 <= 3 means the breaker does NOT trip yet.
+        // The breaker trips when count > threshold, i.e., at 4 failures.
+        // Add a 4th failure.
+        let _ = board()
+            .add_comment(&ticket_id, "system", "Sanitation failed — garbage files: 1")
+            .await;
+
+        // Now with 4 failures, should trip (4 > 3).
+        // Re-fetch ticket with fresh comments (run_circuit_breaker fetches comments
+        // from DB internally, so we just need the ticket id).
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        let tripped =
+            trip_sanitation_circuit_breaker_if_exceeded(&ticket, TicketPhase::InSanitation).await;
+        assert!(tripped, "Should trip with 4 failures (threshold: 3, 4 > 3)");
+
+        // Verify the ticket is now Failed
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Failed,
+            "Circuit breaker should transition to Failed"
         );
     }
 }

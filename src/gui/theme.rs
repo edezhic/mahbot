@@ -136,6 +136,7 @@ pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme,
         crate::Role::Discovery => lucide::search(),
         crate::Role::Artist => lucide::palette(),
         crate::Role::Reviewer => lucide::file_check(),
+        crate::Role::Sanitation => lucide::spray_can(),
     }
 }
 
@@ -176,7 +177,8 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
 pub const fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
         Analysis, Backlog, Cancelled, DiagnosticsDone, Done, Failed, InDevelopment, InDiagnostics,
-        InQa, InReview, Planning, QaPassed, ReadyForDevelopment, Reviewed,
+        InQa, InReview, InSanitation, Planning, QaPassed, ReadyForDevelopment, Reviewed,
+        SanitationPassed,
     };
     match phase {
         // Early phases — cool/muted, neutral
@@ -210,6 +212,15 @@ pub const fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
         DiagnosticsDone => (
             Color::from_rgb(0.161, 0.235, 0.224),
             Color::from_rgb(0.784, 0.902, 0.871),
+        ),
+        // Sanitation phases — neutral gray
+        InSanitation => (
+            Color::from_rgb(0.310, 0.310, 0.310),
+            Color::from_rgb(0.788, 0.788, 0.788),
+        ),
+        SanitationPassed => (
+            Color::from_rgb(0.247, 0.247, 0.247),
+            Color::from_rgb(0.863, 0.863, 0.863),
         ),
         // Review & QA
         InReview => (

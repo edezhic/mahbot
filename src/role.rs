@@ -154,6 +154,12 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             display_label: "Maintainer",
             ..BASE_ROLE_INFO
         },
+        Role::Sanitation => &RoleInfo {
+            temperature: 0.1,
+            badge_fg: (0.482, 0.482, 0.482),
+            display_label: "Sanitation",
+            ..BASE_ROLE_INFO
+        },
     }
 }
 
@@ -296,7 +302,7 @@ impl Role {
                     Box::new(SearchTool),
                 ]
             }
-            Role::Qa | Role::Reviewer | Role::Discovery => {
+            Role::Qa | Role::Reviewer | Role::Discovery | Role::Sanitation => {
                 vec![
                     Box::new(ReadTool),
                     Box::new(SearchTool),

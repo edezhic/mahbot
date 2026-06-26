@@ -455,6 +455,7 @@ pub enum Role {
     Discovery,
     Artist,
     Maintainer,
+    Sanitation,
 }
 
 // ── Agent ───────────────────────────────────────────────────────
@@ -499,7 +500,7 @@ pub struct Agent {
 // ── Verdict type ─────────────────────────────────────────────────
 
 /// Result of a single review or QA verification pass.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 pub struct Verdict {
     /// Quality score from 0 (worst) to 10 (best).
     pub score: u8,
@@ -508,6 +509,18 @@ pub struct Verdict {
     /// List of specific issues detected in the response.
     #[serde(rename = "issues")]
     pub issues_detected: Vec<String>,
+}
+
+/// Result of a sanitation agent's file inspection.
+#[derive(Deserialize)]
+pub struct SanitationVerdict {
+    /// Whether the ticket passes sanitation (`true` = clean, `false` = garbage detected).
+    pub pass: bool,
+    /// List of garbage/unwanted files found (empty when `pass` is `true`).
+    #[serde(default)]
+    pub garbage_files: Vec<String>,
+    /// Rationale for the decision.
+    pub rationale: String,
 }
 
 // ── Tool trait + types ──────────────────────────────────────────

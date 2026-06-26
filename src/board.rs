@@ -138,10 +138,10 @@ const COL_COMMENT_CREATED_AT: usize = 2;
 /// directly suppressed by this constant.
 ///
 /// Note: [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
-/// of these (InDevelopment, InDiagnostics, InReview, InQa) plus Analysis — see its docs for
-/// rationale. The remaining three phases ([`TRANSITORY_HANDOFF_PHASES`]) are transitory handoff
-/// states intentionally excluded from reset. The `tests::test_pipeline_blockers_coverage` test
-/// enforces that every non-transitory pipeline blocker has a corresponding reset transition.
+/// of these (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) plus Analysis — see its
+/// docs for rationale. The remaining four phases ([`TRANSITORY_HANDOFF_PHASES`]) are transitory
+/// handoff states intentionally excluded from reset. The `tests::test_pipeline_blockers_coverage`
+/// test enforces that every non-transitory pipeline blocker has a corresponding reset transition.
 const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
@@ -150,6 +150,8 @@ const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
     TicketPhase::Reviewed,
     TicketPhase::InQa,
     TicketPhase::QaPassed,
+    TicketPhase::InSanitation,
+    TicketPhase::SanitationPassed,
 ];
 
 /// Pipeline-blocking phases that are transitory handoff states — no agent is
@@ -160,6 +162,7 @@ const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
 /// mechanically verified by `tests::test_pipeline_blockers_coverage`.
 const TRANSITORY_HANDOFF_PHASES: &[TicketPhase] = &[
     TicketPhase::DiagnosticsDone,
+    TicketPhase::SanitationPassed,
     TicketPhase::Reviewed,
     TicketPhase::QaPassed,
 ];
@@ -417,6 +420,8 @@ pub enum TicketPhase {
     InDevelopment,
     InDiagnostics,
     DiagnosticsDone,
+    InSanitation,
+    SanitationPassed,
     InReview,
     Reviewed,
     InQa,
@@ -777,13 +782,12 @@ impl BoardStore {
     ///
     /// Note that a reserved ReadyForDevelopment ticket (one with
     /// `pipeline_reservation = 1`) is **not** treated as a pipeline blocker for
-    /// the purpose of this claim. This
-    /// asymmetry with [`has_pipeline_blocker_for_workspace`](Self::has_pipeline_blocker_for_workspace)
-    /// (which does treat reserved ReadyForDevelopment as a blocker for the
-    /// maintainer) is intentional: the claim subquery orders by
-    /// `pipeline_reservation DESC` and clears reservation on claim, so a
-    /// reserved ticket at ReadyForDevelopment will be claimed before any
-    /// other ticket at the same phase — no pipeline blocking needed.
+    /// the purpose of this claim. This asymmetry with
+    /// `has_pipeline_blocker_for_workspace` (a test-only query that treats
+    /// reserved ReadyForDevelopment as a blocker) is intentional: the claim
+    /// subquery orders by `pipeline_reservation DESC` and clears reservation
+    /// on claim, so a reserved ticket at ReadyForDevelopment will be claimed
+    /// before any other ticket at the same phase — no pipeline blocking needed.
     ///
     /// When `require_clear_pipeline` is `false`, the claim uses a simple LIMIT 1
     /// subquery with no pipeline gating. This is used for phases that should
@@ -1190,6 +1194,12 @@ impl BoardStore {
             TicketPhase::ReadyForDevelopment,
             true,
         ),
+        (TicketPhase::InSanitation, TicketPhase::QaPassed, true),
+        // Note: pipeline_reservation = true on InSanitation → QaPassed is inert —
+        // QaPassed uses list-based dispatch (for_tickets_in_phase), not the claim
+        // loop where pipeline_reservation provides ordering. Set for consistency
+        // with the crash-recovery pattern; the flag is harmless for list-based
+        // dispatch.
         (TicketPhase::InQa, TicketPhase::Reviewed, false),
         (TicketPhase::InReview, TicketPhase::DiagnosticsDone, false),
         (TicketPhase::Analysis, TicketPhase::Backlog, false),
@@ -1197,8 +1207,9 @@ impl BoardStore {
     /// Reset all in-flight tickets to their ready state (for crash/restart recovery).
     ///
     /// Resets:
-    /// - 4 of the 7 `PIPELINE_BLOCKING_STATUSES` where agents may have been mid-work
-    ///   (InDevelopment, InDiagnostics, InReview, InQa) — roll back to their pre-pipeline state
+    /// - 5 of the 9 `PIPELINE_BLOCKING_STATUSES` where agents may have been mid-work
+    ///   (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) — roll back to
+    ///   their pre-pipeline state
     /// - `Analysis` (not a pipeline blocker, but backlog analysts may crash mid-work)
     ///
     /// Tickets that are bounced to `ReadyForDevelopment` (InDevelopment and InDiagnostics)
@@ -1228,10 +1239,20 @@ impl BoardStore {
     /// status (dev/review/QA), OR any reserved ReadyForDevelopment ticket that
     /// was bounced back and is awaiting rework. Used by the maintainer to avoid
     /// scanning codebases that are actively being changed or about to be changed by rework.
+    /// Check if the workspace has any active tickets (pipeline-blocking or
+    /// reserved ReadyForDevelopment).
+    ///
+    /// Only used in tests — retained for coverage of the pipeline-blocker query.
+    ///
+    /// # Maintenance warning
+    /// If a future feature needs this in production, remove the `#[cfg(test)]`
+    /// gate and add a real caller. The doc comment and tests will validate the
+    /// query is correct before any production use.
     ///
     /// Excludes archived tickets — the only statuses that ever get archived are
     /// `Done` and `Cancelled`, neither of which appears in
     /// `PIPELINE_BLOCKING_STATUSES`, so this is a defensive consistency measure.
+    #[cfg(test)]
     pub async fn has_pipeline_blocker_for_workspace(&self, workspace_name: &str) -> Result<bool> {
         let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_STATUSES);
         let sql = format!(
@@ -1256,8 +1277,9 @@ impl BoardStore {
     /// considered active to suppress Done notifications until the pipeline is
     /// fully drained).
     ///
-    /// This differs from [`has_pipeline_blocker_for_workspace`] which only counts
-    /// `ReadyForDevelopment` tickets with `pipeline_reservation = 1`.
+    /// This differs from `has_pipeline_blocker_for_workspace` (a test-only query)
+    /// which only counts `ReadyForDevelopment` tickets with
+    /// `pipeline_reservation = 1`.
     ///
     /// Non-active statuses (not matched by the query): `Done`, `Cancelled`,
     /// `Failed`, `Backlog`, `Analysis`, `Planning`.
@@ -1910,6 +1932,8 @@ mod tests {
             ("in_development", TicketPhase::InDevelopment),
             ("in_diagnostics", TicketPhase::InDiagnostics),
             ("diagnostics_done", TicketPhase::DiagnosticsDone),
+            ("in_sanitation", TicketPhase::InSanitation),
+            ("sanitation_passed", TicketPhase::SanitationPassed),
             ("in_review", TicketPhase::InReview),
             ("reviewed", TicketPhase::Reviewed),
             ("in_qa", TicketPhase::InQa),
@@ -2448,9 +2472,10 @@ mod tests {
 
     /// Verify that every non-transitory pipeline-blocking phase has a reset transition.
     ///
-    /// [`PIPELINE_BLOCKING_STATUSES`] defines 7 phases; 4 of them (InDevelopment,
-    /// InDiagnostics, InReview, InQa) have entries in [`RESET_TRANSITIONS`]. The remaining
-    /// 3 phases ([`TRANSITORY_HANDOFF_PHASES`]) are transitory handoff states that the
+    /// [`PIPELINE_BLOCKING_STATUSES`] defines 9 phases; 5 of them (InDevelopment,
+    /// InDiagnostics, InSanitation, InReview, InQa) have entries in
+    /// [`RESET_TRANSITIONS`]. The remaining 4 phases
+    /// ([`TRANSITORY_HANDOFF_PHASES`]) are transitory handoff states that the
     /// poller picks up within seconds — no agent is mid-execution in those states,
     /// so they don't need reset entries.
     ///

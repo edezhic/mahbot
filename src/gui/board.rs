@@ -626,6 +626,8 @@ impl BoardState {
                 | TicketPhase::InDevelopment
                 | TicketPhase::InDiagnostics
                 | TicketPhase::DiagnosticsDone
+                | TicketPhase::InSanitation
+                | TicketPhase::SanitationPassed
                 | TicketPhase::InReview
                 | TicketPhase::Reviewed
                 | TicketPhase::InQa

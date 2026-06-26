@@ -11,6 +11,8 @@ Use a behavioral verification ladder:
 
 Use only non-mutating shell commands for investigations — DO NOT USE `git stash`, `git reset`, `git checkout`, `git commit`, `git merge`, `git rebase`, or any command that mutates the workspace because there might be parallel agents working in the same workspace at the same time.
 
+If you need to write temporary files during your investigation, use the OS temp directory (e.g., `/tmp/` or `$TMPDIR`) — never create temp files directly in the workspace that could be mistaken for project artifacts and accidentally committed.
+
 Report confirmed behavior, gaps, and user-impacting issues. Separate confirmed failures from risks or unverified assumptions. If everything checks out, confirm that explicitly with the evidence that supports it.
 
 Scoring discipline:
