@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Row, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{
-    Alignment, Element, Length, Subscription, Task,
+    Alignment, Color, Element, Length, Subscription, Task,
     keyboard::{self},
     widget::Id,
 };
@@ -5831,42 +5831,55 @@ impl EditorState {
         )
     }
 
+    /// Create a styled dialog button with consistent size (13) and center-aligned text.
+    fn dialog_button(
+        label: &str,
+        color: Color,
+        style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
+        on_press: EditorMessage,
+    ) -> Element<'_, EditorMessage> {
+        button(text(label).size(13).color(color).align_x(Alignment::Center))
+            .style(style)
+            .on_press(on_press)
+            .into()
+    }
+
+    /// Create a row of dialog buttons with 8px spacing between them,
+    /// right-aligned within the row and filling the available width.
+    fn dialog_button_row<'a>(
+        buttons: impl IntoIterator<Item = Element<'a, EditorMessage>>,
+    ) -> Element<'a, EditorMessage> {
+        let mut row = Row::new().align_y(Alignment::End).width(Length::Fill);
+        for (i, btn) in buttons.into_iter().enumerate() {
+            if i > 0 {
+                row = row.push(Space::new().width(8));
+            }
+            row = row.push(btn);
+        }
+        row.into()
+    }
+
     fn build_close_dialog(
         on_save: EditorMessage,
         on_discard: EditorMessage,
         on_cancel: EditorMessage,
         description: String,
     ) -> Element<'static, EditorMessage> {
-        let button_row = row![
-            button(
-                text("Cancel")
-                    .size(13)
-                    .color(theme::TEXT_SECONDARY)
-                    .align_x(Alignment::Center)
-            )
-            .style(theme::button_secondary)
-            .on_press(on_cancel.clone()),
-            Space::new().width(8),
-            button(
-                text("Discard")
-                    .size(13)
-                    .color(theme::STATUS_ERROR)
-                    .align_x(Alignment::Center)
-            )
-            .style(theme::button_danger)
-            .on_press(on_discard),
-            Space::new().width(8),
-            button(
-                text("Save")
-                    .size(13)
-                    .color(theme::ACCENT_LIGHT)
-                    .align_x(Alignment::Center)
-            )
-            .style(theme::button_primary)
-            .on_press(on_save),
-        ]
-        .align_y(Alignment::End)
-        .width(Length::Fill);
+        let button_row = Self::dialog_button_row([
+            Self::dialog_button(
+                "Cancel",
+                theme::TEXT_SECONDARY,
+                theme::button_secondary,
+                on_cancel.clone(),
+            ),
+            Self::dialog_button(
+                "Discard",
+                theme::STATUS_ERROR,
+                theme::button_danger,
+                on_discard,
+            ),
+            Self::dialog_button("Save", theme::ACCENT_LIGHT, theme::button_primary, on_save),
+        ]);
 
         Self::confirmation_dialog(
             "Unsaved changes",
@@ -5906,27 +5919,20 @@ impl EditorState {
             "Delete file"
         };
 
-        let button_row = row![
-            button(
-                text("Cancel")
-                    .size(13)
-                    .color(theme::TEXT_SECONDARY)
-                    .align_x(Alignment::Center)
-            )
-            .style(theme::button_secondary)
-            .on_press(EditorMessage::CancelDelete),
-            Space::new().width(8),
-            button(
-                text("Delete")
-                    .size(13)
-                    .color(theme::STATUS_ERROR)
-                    .align_x(Alignment::Center)
-            )
-            .style(theme::button_danger)
-            .on_press(EditorMessage::ConfirmDelete),
-        ]
-        .align_y(Alignment::End)
-        .width(Length::Fill);
+        let button_row = Self::dialog_button_row([
+            Self::dialog_button(
+                "Cancel",
+                theme::TEXT_SECONDARY,
+                theme::button_secondary,
+                EditorMessage::CancelDelete,
+            ),
+            Self::dialog_button(
+                "Delete",
+                theme::STATUS_ERROR,
+                theme::button_danger,
+                EditorMessage::ConfirmDelete,
+            ),
+        ]);
 
         Self::confirmation_dialog(
             title,
@@ -5958,27 +5964,20 @@ impl EditorState {
             column![
                 text(label).size(14).color(theme::TEXT_PRIMARY),
                 input,
-                row![
-                    button(
-                        text("Cancel")
-                            .size(13)
-                            .color(theme::TEXT_SECONDARY)
-                            .align_x(Alignment::Center)
-                    )
-                    .style(theme::button_secondary)
-                    .on_press(EditorMessage::Escape),
-                    Space::new().width(8),
-                    button(
-                        text("Create")
-                            .size(13)
-                            .color(theme::ACCENT_LIGHT)
-                            .align_x(Alignment::Center)
-                    )
-                    .style(theme::button_primary)
-                    .on_press(EditorMessage::NewItemSubmit(target.input_text.clone())),
-                ]
-                .align_y(Alignment::End)
-                .width(Length::Fill),
+                Self::dialog_button_row([
+                    Self::dialog_button(
+                        "Cancel",
+                        theme::TEXT_SECONDARY,
+                        theme::button_secondary,
+                        EditorMessage::Escape,
+                    ),
+                    Self::dialog_button(
+                        "Create",
+                        theme::ACCENT_LIGHT,
+                        theme::button_primary,
+                        EditorMessage::NewItemSubmit(target.input_text.clone()),
+                    ),
+                ]),
             ]
             .spacing(12)
             .width(Length::Fill),
