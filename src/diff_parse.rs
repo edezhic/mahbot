@@ -140,11 +140,10 @@ fn handle_diff_git_header(
 }
 
 /// Handle a `rename from` line: set rename status and parse the old path.
-/// Returns `true` if the rename info was malformed and the caller should `continue`
-/// (status falls back to `Modified`).
-fn handle_rename_from(line: &str, current_file: &mut Option<DiffFile>) -> bool {
+/// Falls back to `Modified` status when the rename path is malformed.
+fn handle_rename_from(line: &str, current_file: &mut Option<DiffFile>) {
     let Some(f) = current_file.as_mut() else {
-        return false;
+        return;
     };
 
     f.status = DiffFileStatus::Renamed;
@@ -155,10 +154,9 @@ fn handle_rename_from(line: &str, current_file: &mut Option<DiffFile>) -> bool {
             "rename from: malformed C-style escape, dropping rename info"
         );
         f.status = DiffFileStatus::Modified;
-        return true;
+        return;
     };
     f.old_path = Some(old_path);
-    false
 }
 
 /// Handle a hunk header line (`@@ -old,count +new,count @@`): flush previous hunk,
