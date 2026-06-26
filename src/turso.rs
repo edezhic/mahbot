@@ -326,7 +326,7 @@ impl Connection {
     async fn maybe_rollback_dangling_tx(&self) -> turso::Result<()> {
         let conn = self.conn.lock().await;
         if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
-            let _ = conn.execute("ROLLBACK".to_string(), ()).await;
+            let _ = conn.execute("ROLLBACK", ()).await;
         }
         Ok(())
     }
@@ -349,13 +349,13 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<u64> {
-        conn.execute(sql.to_string(), params).await
+        conn.execute(sql, params).await
     }
 
     pub(crate) async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
         self.maybe_rollback_dangling_tx().await?;
         let conn = self.conn.lock().await;
-        conn.execute_batch(sql.to_string()).await
+        conn.execute_batch(sql).await
     }
 
     /// Begin a transaction and return a guard that keeps the connection locked
@@ -363,7 +363,7 @@ impl Connection {
     pub async fn begin_tx(&self) -> turso::Result<TxGuard<'_>> {
         self.maybe_rollback_dangling_tx().await?;
         let conn = self.conn.lock().await;
-        conn.execute("BEGIN".to_string(), ()).await?;
+        conn.execute("BEGIN", ()).await?;
         Ok(TxGuard {
             conn,
             has_dangling_tx: Some(self.has_dangling_tx.clone()),
@@ -528,7 +528,7 @@ impl TxGuard<'_> {
 
     /// Commit the transaction and release the lock.
     pub async fn commit(mut self) -> turso::Result<()> {
-        self.conn.execute("COMMIT".to_string(), ()).await?;
+        self.conn.execute("COMMIT", ()).await?;
         // Clear flag so Drop doesn't try to roll back an already-committed tx
         self.has_dangling_tx = None;
         Ok(())
@@ -536,7 +536,7 @@ impl TxGuard<'_> {
 
     /// Rollback the transaction and release the lock.
     pub async fn rollback(mut self) -> turso::Result<()> {
-        self.conn.execute("ROLLBACK".to_string(), ()).await?;
+        self.conn.execute("ROLLBACK", ()).await?;
         // Clear flag so Drop doesn't try to roll back again
         self.has_dangling_tx = None;
         Ok(())
