@@ -2639,79 +2639,116 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert!(ticket.prerequisites.contains(&p2));
     }
 
+    /// Table-driven tests for `create_ticket` with invalid prerequisite inputs.
     #[tokio::test]
-    async fn test_create_ticket_nonexistent_prereq_error() {
+    async fn test_create_ticket_invalid_inputs() {
+        enum Scenario {
+            /// Prerequisite references a nonexistent ticket.
+            NonExistent,
+            /// Prerequisite references the ticket about to be created (self-reference).
+            SelfReference,
+            /// Prerequisite references a ticket in a different workspace.
+            CrossWorkspace,
+        }
+
+        struct Case {
+            name: &'static str,
+            scenario: Scenario,
+        }
+
+        let cases = [
+            Case {
+                name: "nonexistent prerequisite",
+                scenario: Scenario::NonExistent,
+            },
+            Case {
+                name: "self-referencing prerequisite",
+                scenario: Scenario::SelfReference,
+            },
+            Case {
+                name: "cross-workspace prerequisite",
+                scenario: Scenario::CrossWorkspace,
+            },
+        ];
+
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/ws", "ws");
+        let ws_b = test_ws_named("/ws_b", "ws_b");
+        // Isolated workspace for SelfReference — its own counter avoids
+        // ordering dependencies with CrossWorkspace which also creates
+        // seeds in `ws`.
+        let ws_sr = test_ws_named("/ws_sr", "ws_sr");
 
-        let result = TicketBuilder::new(&store, ws)
-            .title("Bad")
-            .prereqs(&[String::from("nonexistent-1")])
-            .create()
-            .await;
+        for case in &cases {
+            let expected_error = match case.scenario {
+                Scenario::NonExistent => "not found",
+                Scenario::SelfReference => "cannot depend on itself",
+                Scenario::CrossWorkspace => "Cross-workspace",
+            };
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("not found"),
-            "expected 'not found' in error, got: {err}"
-        );
-    }
+            // Create a seed ticket for scenarios that need one.
+            // NonExistent: no seed needed — uses a nonexistent ID directly.
+            // CrossWorkspace: create a ticket in `ws` to use as a
+            //   cross-workspace prerequisite for a ticket in `ws_b`.
+            // SelfReference: create exactly one ticket in its own workspace
+            //   `ws_sr` to advance the counter so the next ticket will
+            //   have ID `ws_sr-1`.
+            let seed: Option<String> = match &case.scenario {
+                Scenario::NonExistent => None,
+                Scenario::CrossWorkspace => Some(
+                    TicketBuilder::new(&store, ws.clone())
+                        .title("Existing")
+                        .desc("in ws")
+                        .create()
+                        .await
+                        .expect("create seed for cross-workspace"),
+                ),
+                Scenario::SelfReference => Some(
+                    TicketBuilder::new(&store, ws_sr.clone())
+                        .title("First")
+                        .desc("any")
+                        .create()
+                        .await
+                        .expect("create seed for self-reference"),
+                ),
+            };
 
-    #[tokio::test]
-    async fn test_create_ticket_self_reference_error() {
-        let (store, _tmp) = open_test_store().await;
-        let ws = test_ws_named("/ws", "ws");
+            let target_ws = match case.scenario {
+                Scenario::CrossWorkspace => &ws_b,
+                Scenario::SelfReference => &ws_sr,
+                Scenario::NonExistent => &ws,
+            };
 
-        // Create a ticket so we have a counter row
-        let _first = TicketBuilder::new(&store, ws.clone())
-            .title("First")
-            .desc("any")
-            .create()
-            .await
-            .expect("create first");
+            // Build prerequisites for each scenario.
+            // NonExistent: a nonexistent ticket ID.
+            // CrossWorkspace: the ticket created in `ws` (different workspace).
+            // SelfReference: hardcoded `{ws_sr}-1` — the ID the next ticket
+            //   receives in the isolated workspace, creating a self-reference.
+            let prereqs: Vec<String> = match &case.scenario {
+                Scenario::NonExistent => vec!["nonexistent-1".to_string()],
+                Scenario::CrossWorkspace => {
+                    vec![seed.clone().expect("seed must exist for CrossWorkspace")]
+                }
+                Scenario::SelfReference => {
+                    // After creating exactly one seed ticket above, the next
+                    // ticket in this isolated workspace receives ID `ws_sr-1`.
+                    vec![format!("{}-1", ws_sr.name)]
+                }
+            };
 
-        // The next id would be ws-1, so pass that as a self-reference
-        let result = TicketBuilder::new(&store, ws)
-            .title("SelfReferencing")
-            .prereqs(&[String::from("ws-1")])
-            .create()
-            .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("cannot depend on itself"),
-            "expected 'cannot depend on itself' in error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_ticket_cross_workspace_error() {
-        let (store, _tmp) = open_test_store().await;
-        let ws_a = test_ws_named("/ws_a", "workspace_a");
-        let ws_b = test_ws_named("/ws_b", "workspace_b");
-
-        let pa = TicketBuilder::new(&store, ws_a)
-            .title("PA")
-            .desc("in A")
-            .create()
-            .await
-            .expect("create pa");
-
-        let result = TicketBuilder::new(&store, ws_b)
-            .title("InB")
-            .desc("depends on A")
-            .prereqs(std::slice::from_ref(&pa))
-            .create()
-            .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Cross-workspace"),
-            "expected 'Cross-workspace' in error, got: {err}"
-        );
+            let err = TicketBuilder::new(&store, target_ws.clone())
+                .title("New")
+                .prereqs(&prereqs)
+                .create()
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(expected_error),
+                "Case '{}': expected error containing '{}', got: {err}",
+                case.name,
+                expected_error
+            );
+        }
     }
 
     #[tokio::test]
