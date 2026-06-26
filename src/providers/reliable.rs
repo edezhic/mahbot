@@ -424,11 +424,6 @@ mod tests {
             self
         }
 
-        fn with_tool_calls(mut self, tool_calls: Vec<crate::ToolCall>) -> Self {
-            self.tool_calls = tool_calls;
-            self
-        }
-
         fn with_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
             self.calls = calls;
             self
