@@ -272,10 +272,7 @@ impl StatsStore {
 mod tests {
     use super::*;
 
-    /// Verify that the number of columns in [`TOOL_ERROR_COLUMNS`] matches the highest
-    /// column-index constant + 1. If this test fails, a column was added or removed
-    /// from the string list without updating the corresponding `COL_TE_*` constants,
-    /// or vice versa — a silent data corruption hazard.
+    /// Column count matches highest index constant.
     ///
     /// Note: [`COL_TU_CALL_COUNT`] and [`COL_TE_COUNT`] are single-column query
     /// constants and are intentionally excluded from this assertion.

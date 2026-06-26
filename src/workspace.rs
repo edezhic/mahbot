@@ -889,24 +889,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Verify that the number of columns in [`WORKSPACE_COLUMNS`] matches the highest
-    /// column-index constant + 1. If this test fails, a column was added or removed
-    /// from the string list without updating the corresponding `COL_WS_*` constants,
-    /// or vice versa — a silent data corruption hazard.
+    /// Column count matches highest index constant.
     #[test]
     fn workspace_columns_count_matches_column_constants() {
         crate::assert_column_count!(WORKSPACE_COLUMNS, COL_WS_DIAGNOSTICS_UPDATED_AT);
     }
 
-    /// Verify that the number of columns in [`EDITOR_TAB_COLUMNS`] matches the highest
-    /// column-index constant + 1.
+    /// Column count matches highest index constant.
     #[test]
     fn editor_tab_columns_count_matches_column_constants() {
         crate::assert_column_count!(EDITOR_TAB_COLUMNS, COL_ET_DIRTY_CONTENT);
     }
 
-    /// Verify that the number of columns in [`WS_STATE_COLUMNS`] matches the highest
-    /// column-index constant + 1.
+    /// Column count matches highest index constant.
     #[test]
     fn ws_state_columns_count_matches_column_constants() {
         crate::assert_column_count!(WS_STATE_COLUMNS, COL_WSST_MAINTENANCE);

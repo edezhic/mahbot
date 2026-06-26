@@ -1749,17 +1749,13 @@ mod tests {
     use strum::IntoEnumIterator;
     use tempfile::TempDir;
 
-    /// Verify that the number of columns in [`TICKET_COLUMNS`] matches the highest
-    /// column-index constant + 1. If this test fails, a column was added or removed
-    /// from the string list without updating the corresponding `COL_TICKET_*` constants,
-    /// or vice versa — a silent data corruption hazard.
+    /// Column count matches highest index constant.
     #[test]
     fn ticket_columns_count_matches_column_constants() {
         crate::assert_column_count!(TICKET_COLUMNS, COL_TICKET_PIPELINE_RESERVATION);
     }
 
-    /// Verify that the number of columns in [`COMMENT_COLUMNS`] matches the highest
-    /// column-index constant + 1.
+    /// Column count matches highest index constant.
     #[test]
     fn comment_columns_count_matches_column_constants() {
         crate::assert_column_count!(COMMENT_COLUMNS, COL_COMMENT_CREATED_AT);

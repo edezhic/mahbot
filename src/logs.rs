@@ -505,10 +505,7 @@ fn extract_agent_from_span(val: &serde_json::Value) -> (String, String, String) 
 mod tests {
     use super::*;
 
-    /// Verify that the number of columns in [`LOGS_COLUMNS`] matches the highest
-    /// column-index constant + 1. If this test fails, a column was added or removed
-    /// from the string list without updating the corresponding `COL_LOGS_*` constants,
-    /// or vice versa — a silent data corruption hazard.
+    /// Column count matches highest index constant.
     #[test]
     fn logs_columns_count_matches_column_constants() {
         crate::assert_column_count!(LOGS_COLUMNS, COL_LOGS_WORKSPACE);

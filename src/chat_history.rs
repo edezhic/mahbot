@@ -216,10 +216,7 @@ mod tests {
     use crate::turso;
     use tempfile::TempDir;
 
-    /// Verify that the number of columns in [`CHAT_HISTORY_COLUMNS`] matches the highest
-    /// column-index constant + 1. If this test fails, a column was added or removed
-    /// from the string list without updating the corresponding `COL_CH_*` constants,
-    /// or vice versa — a silent data corruption hazard.
+    /// Column count matches highest index constant.
     #[test]
     fn chat_history_columns_count_matches_column_constants() {
         crate::assert_column_count!(CHAT_HISTORY_COLUMNS, COL_CH_AGENT_ROLE);
