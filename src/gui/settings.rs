@@ -21,7 +21,7 @@ use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 use super::theme;
@@ -1860,7 +1860,7 @@ impl SettingsState {
         // Collect all unique models that should appear in the routing section:
         // 1. Every role's effective model (override from per_role_configs → hardcoded default)
         // 2. Every model with a saved routing entry (preserves orphaned entries)
-        let mut model_names: Vec<String> = Vec::new();
+        let mut model_names: BTreeSet<String> = BTreeSet::new();
         for role in Role::all_roles() {
             let role_key: &str = role.into();
             let model = self
@@ -1870,16 +1870,11 @@ impl SettingsState {
                 .find(|rc| rc.role == role_key)
                 .and_then(|rc| rc.model.clone().filter(|m| !m.is_empty()))
                 .unwrap_or_else(|| crate::role::role_info(&role).default_model.to_string());
-            if !model_names.contains(&model) {
-                model_names.push(model);
-            }
+            model_names.insert(model);
         }
         for mr in &self.config.model_routings {
-            if !model_names.contains(&mr.model) {
-                model_names.push(mr.model.clone());
-            }
+            model_names.insert(mr.model.clone());
         }
-        model_names.sort();
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
         for model_name in &model_names {
