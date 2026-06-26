@@ -48,6 +48,16 @@ const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 50;
 /// (i.e., at ≥5 failures), failing the ticket to prevent thrashing.
 const DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD: usize = 4;
 
+/// Prefix for all auto-diagnostics comments on tickets.
+const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
+/// Marker appended when all diagnostics pass.
+const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
+/// Marker appended when diagnostics fail (includes the failed-at label after it).
+const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
+/// Substring used both by the breaker trip comment and the self-counting guard
+/// — must stay in sync between `comment_text` and `count_fn`.
+const CIRCUIT_BREAKER_TRIP_MARKER: &str = "Circuit breaker";
+
 /// Minimum acceptable verification score (0-10) for analysis phase.
 const ANALYSIS_THRESHOLD: u8 = 7;
 
@@ -1551,7 +1561,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
     // 2. Run commands sequentially in the prescribed order.
 
-    let mut comment = String::from("🔍 Auto-diagnostics");
+    let mut comment = String::from(DIAGNOSTICS_COMMENT_PREFIX);
     let mut all_passed = true;
     let mut failed_at: &str = "";
 
@@ -1596,10 +1606,11 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
     // 3. Final outcome.
     let target = if all_passed {
-        comment.push_str("\n\n---\n✅ All diagnostics passed");
+        comment.push_str("\n\n---\n");
+        comment.push_str(DIAGNOSTICS_PASSED_MARKER);
         TicketPhase::DiagnosticsDone
     } else {
-        let _ = write!(comment, "\n\n---\n❌ Diagnostics failed at {failed_at}");
+        let _ = write!(comment, "\n\n---\n{DIAGNOSTICS_FAILED_MARKER} {failed_at}");
         TicketPhase::ReadyForDevelopment
     };
     let _ = board()
@@ -1667,15 +1678,15 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(ticket: &Ticket) -> bool {
                 .iter()
                 .filter(|c| {
                     c.role == "diagnostics"
-                        && c.content.starts_with("🔍 Auto-diagnostics")
-                        && c.content.contains('❌')
-                        && !c.content.contains("Circuit breaker")
+                        && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
+                        && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
+                        && !c.content.contains(CIRCUIT_BREAKER_TRIP_MARKER)
                 })
                 .count()
         },
         |count| {
             format!(
-                "🔍 Auto-diagnostics\n\n❌ Circuit breaker: {count} prior diagnostic \
+                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ {CIRCUIT_BREAKER_TRIP_MARKER}: {count} prior diagnostic \
                  failures. Failing ticket."
             )
         },
