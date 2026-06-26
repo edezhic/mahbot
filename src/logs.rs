@@ -567,6 +567,15 @@ mod tests {
         assert_eq!(entry.workspace, "/ws");
     }
 
+    /// Create a temporary LogStore for tests.
+    /// Returns the store and a TempDir that must be held to prevent premature cleanup.
+    async fn test_store() -> (Arc<LogStore>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("db/logs.db");
+        let store = Arc::new(LogStore::open(&db_path).await.unwrap());
+        (store, dir)
+    }
+
     // Helper to seed log entries in tests
     async fn seed_entries(store: &LogStore, entries: &[LogEntry]) {
         for e in entries {
@@ -574,249 +583,229 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_spawn_log_writer_writes_to_store() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("db/logs.db");
-            let store = Arc::new(LogStore::open(&db_path).await.unwrap());
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
+    #[tokio::test]
+    async fn test_spawn_log_writer_writes_to_store() {
+        let (store, _dir) = test_store().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
 
-            spawn_log_writer(store.clone(), rx, broadcast_tx);
+        spawn_log_writer(store.clone(), rx, broadcast_tx);
 
-            tx.send(
-                r#"{"timestamp":"2025-01-01T00:00:00Z","level":"INFO","target":"test","fields":{"message":"hi"}}"#
-                    .to_string(),
-            )
+        tx.send(
+            r#"{"timestamp":"2025-01-01T00:00:00Z","level":"INFO","target":"test","fields":{"message":"hi"}}"#
+                .to_string(),
+        )
+        .unwrap();
+        tx.send(
+            r#"{"timestamp":"2025-01-01T00:00:01Z","level":"ERROR","target":"test","fields":{"message":"oh no","err":"boom"}}"#
+                .to_string(),
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(tx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message, "oh no");
+        assert_eq!(entries[1].message, "hi");
+    }
+
+    #[tokio::test]
+    async fn test_like_search_substring() {
+        let (store, _dir) = test_store().await;
+
+        let entries = vec![
+            LogEntry {
+                timestamp: "2025-01-01T00:00:00Z".into(),
+                level: "INFO".into(),
+                target: "module_a".into(),
+                message: "processing request".into(),
+                fields: serde_json::Value::Null,
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+            LogEntry {
+                timestamp: "2025-01-01T00:00:01Z".into(),
+                level: "ERROR".into(),
+                target: "module_b".into(),
+                message: "failed to process".into(),
+                fields: serde_json::Value::Null,
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+            LogEntry {
+                timestamp: "2025-01-01T00:00:02Z".into(),
+                level: "INFO".into(),
+                target: "module_c".into(),
+                message: "started".into(),
+                fields: serde_json::Value::Null,
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+        ];
+
+        seed_entries(&store, &entries).await;
+
+        // LIKE %...% matches substrings: "proc" matches "processing" and "process"
+        let (results, total) = store
+            .query(&LogQuery {
+                search: Some("proc".into()),
+                ..Default::default()
+            })
+            .await
             .unwrap();
-            tx.send(
-                r#"{"timestamp":"2025-01-01T00:00:01Z","level":"ERROR","target":"test","fields":{"message":"oh no","err":"boom"}}"#
-                    .to_string(),
-            )
+        assert_eq!(total, 2, "substring 'proc' should match both entries");
+        assert_eq!(results.len(), 2);
+        let (results, total) = store
+            .query(&LogQuery {
+                search: Some("request".into()),
+                ..Default::default()
+            })
+            .await
             .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(results[0].message, "processing request");
 
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            drop(tx);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
-            assert_eq!(total, 2);
-            assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0].message, "oh no");
-            assert_eq!(entries[1].message, "hi");
-        });
+        // LIKE matches the target column too
+        let (_results, total) = store
+            .query(&LogQuery {
+                search: Some("module".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 3, "all targets contain 'module'");
     }
 
-    #[test]
-    fn test_like_search_substring() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("db/logs.db");
-            let store = Arc::new(LogStore::open(&db_path).await.unwrap());
+    #[tokio::test]
+    async fn test_like_search_combined_filters() {
+        let (store, _dir) = test_store().await;
 
-            let entries = vec![
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:00Z".into(),
-                    level: "INFO".into(),
-                    target: "module_a".into(),
-                    message: "processing request".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:01Z".into(),
-                    level: "ERROR".into(),
-                    target: "module_b".into(),
-                    message: "failed to process".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:02Z".into(),
-                    level: "INFO".into(),
-                    target: "module_c".into(),
-                    message: "started".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-            ];
+        let entries = vec![
+            LogEntry {
+                timestamp: "2025-01-01T00:00:00Z".into(),
+                level: "INFO".into(),
+                target: "mahbot::orchestrator".into(),
+                message: "processing request".into(),
+                fields: serde_json::Value::Null,
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+            LogEntry {
+                timestamp: "2025-01-01T00:00:01Z".into(),
+                level: "ERROR".into(),
+                target: "mahbot::tools".into(),
+                message: "failed to process".into(),
+                fields: serde_json::json!({"code": 1}),
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+            LogEntry {
+                timestamp: "2025-01-01T00:00:02Z".into(),
+                level: "INFO".into(),
+                target: "mahbot::api".into(),
+                message: "started".into(),
+                fields: serde_json::Value::Null,
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+        ];
 
-            seed_entries(&store, &entries).await;
+        seed_entries(&store, &entries).await;
 
-            // LIKE %...% matches substrings: "proc" matches "processing" and "process"
-            let (results, total) = store
-                .query(&LogQuery {
-                    search: Some("proc".into()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 2, "substring 'proc' should match both entries");
-            assert_eq!(results.len(), 2);
-            let (results, total) = store
-                .query(&LogQuery {
-                    search: Some("request".into()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 1);
-            assert_eq!(results[0].message, "processing request");
+        // LIKE + level filter
+        let (results, total) = store
+            .query(&LogQuery {
+                level: Some("ERROR".into()),
+                search: Some("process".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "only ERROR log matching 'process'");
+        assert_eq!(results[0].message, "failed to process");
+        let (_results, total) = store
+            .query(&LogQuery {
+                target: Some("mahbot::tools".into()),
+                search: Some("process".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "only tools target entry matching 'process'");
 
-            // LIKE matches the target column too
-            let (_results, total) = store
-                .query(&LogQuery {
-                    search: Some("module".into()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 3, "all targets contain 'module'");
-        });
+        // LIKE + since
+        let (_results, total) = store
+            .query(&LogQuery {
+                since: Some("2025-01-01T00:00:01Z".into()),
+                search: Some("process".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "only entry after timestamp matching 'process'");
     }
 
-    #[test]
-    fn test_like_search_combined_filters() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("db/logs.db");
-            let store = Arc::new(LogStore::open(&db_path).await.unwrap());
+    #[tokio::test]
+    async fn test_like_search_with_special_chars() {
+        let (store, _dir) = test_store().await;
 
-            let entries = vec![
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:00Z".into(),
-                    level: "INFO".into(),
-                    target: "mahbot::orchestrator".into(),
-                    message: "processing request".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:01Z".into(),
-                    level: "ERROR".into(),
-                    target: "mahbot::tools".into(),
-                    message: "failed to process".into(),
-                    fields: serde_json::json!({"code": 1}),
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:02Z".into(),
-                    level: "INFO".into(),
-                    target: "mahbot::api".into(),
-                    message: "started".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-            ];
+        let entries = vec![
+            LogEntry {
+                timestamp: "2025-01-01T00:00:00Z".into(),
+                level: "INFO".into(),
+                target: "module_a".into(),
+                message: "processing `Hello ${name}` template".into(),
+                fields: serde_json::Value::Null,
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+            LogEntry {
+                timestamp: "2025-01-01T00:00:01Z".into(),
+                level: "ERROR".into(),
+                target: "module_b".into(),
+                message: "normal log entry".into(),
+                fields: serde_json::Value::Null,
+                agent_id: String::new(),
+                agent_role: String::new(),
+                workspace: String::new(),
+            },
+        ];
 
-            seed_entries(&store, &entries).await;
+        seed_entries(&store, &entries).await;
 
-            // LIKE + level filter
-            let (results, total) = store
-                .query(&LogQuery {
-                    level: Some("ERROR".into()),
-                    search: Some("process".into()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 1, "only ERROR log matching 'process'");
-            assert_eq!(results[0].message, "failed to process");
-            let (_results, total) = store
-                .query(&LogQuery {
-                    target: Some("mahbot::tools".into()),
-                    search: Some("process".into()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 1, "only tools target entry matching 'process'");
+        // LIKE is literal substring — backtick and ${} match as-is
+        let (results, total) = store
+            .query(&LogQuery {
+                search: Some("template".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "LIKE should match partial word in message");
+        assert!(
+            results[0].message.contains("template"),
+            "should match the correct entry"
+        );
 
-            // LIKE + since
-            let (_results, total) = store
-                .query(&LogQuery {
-                    since: Some("2025-01-01T00:00:01Z".into()),
-                    search: Some("process".into()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 1, "only entry after timestamp matching 'process'");
-        });
-    }
-
-    #[test]
-    fn test_like_search_with_special_chars() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("db/logs.db");
-            let store = Arc::new(LogStore::open(&db_path).await.unwrap());
-
-            let entries = vec![
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:00Z".into(),
-                    level: "INFO".into(),
-                    target: "module_a".into(),
-                    message: "processing `Hello ${name}` template".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-                LogEntry {
-                    timestamp: "2025-01-01T00:00:01Z".into(),
-                    level: "ERROR".into(),
-                    target: "module_b".into(),
-                    message: "normal log entry".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
-                },
-            ];
-
-            seed_entries(&store, &entries).await;
-
-            // LIKE is literal substring — backtick and ${} match as-is
-            let (results, total) = store
-                .query(&LogQuery {
-                    search: Some("template".into()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 1, "LIKE should match partial word in message");
-            assert!(
-                results[0].message.contains("template"),
-                "should match the correct entry"
-            );
-
-            // Empty search returns all entries
-            let (_results, total) = store
-                .query(&LogQuery {
-                    search: None,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(total, 2, "no search filter should return all entries");
-        });
+        // Empty search returns all entries
+        let (_results, total) = store
+            .query(&LogQuery {
+                search: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "no search filter should return all entries");
     }
 }

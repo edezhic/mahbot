@@ -3862,7 +3862,7 @@ impl EditorState {
 
         // Update selected workspace.
         self.selected_workspace_name = Some(name.to_string());
-        self.selected_workspace_path = path.map(|s| s.to_string());
+        self.selected_workspace_path = path.map(std::string::ToString::to_string);
 
         // Clear previous state.
         let r#gen = self.generation.wrapping_add(1);

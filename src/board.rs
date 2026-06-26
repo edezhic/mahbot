@@ -909,7 +909,7 @@ impl BoardStore {
     fn build_transition_sql(
         id: &str,
         expected_phase: Option<&TicketPhase>,
-        target_phase: &TicketPhase,
+        target_phase: TicketPhase,
         reservation: Option<bool>,
     ) -> (String, Vec<turso::Value>, String) {
         let now = turso::now();
@@ -980,7 +980,7 @@ impl BoardStore {
         reservation: Option<bool>,
     ) -> Result<()> {
         let (sql, params, action) =
-            Self::build_transition_sql(id, expected_phase.as_ref(), &target_phase, reservation);
+            Self::build_transition_sql(id, expected_phase.as_ref(), target_phase, reservation);
         self.execute_and_cancel(&sql, params, id, &action).await
     }
 
@@ -995,7 +995,7 @@ impl BoardStore {
         reservation: Option<bool>,
     ) -> Result<()> {
         let (sql, params, action) =
-            Self::build_transition_sql(id, expected_phase.as_ref(), &target_phase, reservation);
+            Self::build_transition_sql(id, expected_phase.as_ref(), target_phase, reservation);
         let rows = tx.execute(&sql, params).await?;
         Self::ensure_ticket_found(rows, id, &action)?;
         Ok(())

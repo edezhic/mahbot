@@ -322,22 +322,12 @@ pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
         let ws_name = ws.name.clone();
 
         // Run the discovery body in a sub-task so that panics are captured
-        // via the JoinHandle instead of being silently swallowed (the outer
-        // JoinHandle is discarded, so any panic in a direct tokio::spawn
-        // would be silently lost, leaving the workspace stuck in "analyzing").
+        // via the JoinHandle instead of being silently swallowed.
         //
-        // NOTE: Unlike management.rs:spawn_dispatch (which transitions state
-        // to Failed + adds a system comment on panic), this guard only logs
-        // and does NOT set workspace status to "failed". The ticket that added
-        // this guard was constrained to "logging only", and the guardrail test
-        // in role.rs (all_roles_have_discovery_prompt) prevents the primary
-        // failure mode (missing prompt file). Non-prompt panics (DB errors,
-        // unexpected state) will still leave the workspace in "analyzing" —
-        // now visible in logs but not recovered. If this becomes an issue,
-        // extend this guard to call storage.set_status(ws_name, "failed").
-        // The inner task owns its own copy for finalize_discovery while the
-        // outer task retains ws_name for panic logging after the inner task
-        // completes (or panics).
+        // NOTE: Unlike management.rs:spawn_dispatch, this guard only logs
+        // and does NOT transition the workspace to "failed". Non-prompt
+        // panics will still leave the workspace in "analyzing" — visible
+        // in logs but not recovered.
         let ws_name_for_finalize = ws_name.clone();
         let inner = tokio::spawn(async move {
             // Run role discovery and diagnostics discovery concurrently.
@@ -379,7 +369,14 @@ pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
                 return;
             };
 
-            finalize_discovery(storage, &ws_name_for_finalize, discovery_generation, all_ok, &errors).await;
+            finalize_discovery(
+                storage,
+                &ws_name_for_finalize,
+                discovery_generation,
+                all_ok,
+                &errors,
+            )
+            .await;
         });
 
         match inner.await {
