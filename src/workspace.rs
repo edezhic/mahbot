@@ -276,10 +276,9 @@ async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) ->
 ///
 /// ## Invariants
 ///
-/// - If `all_ok`: sets status to `ready`. When `discovery_generation == 0` (the
-///   initial discovery), also unpauses the workspace.  Rediscovery (generation > 0)
-///   does **not** auto-unpause — if a user explicitly paused the workspace and
-///   triggered rediscovery, their choice is preserved.
+/// - If `all_ok`: sets status to `ready` and always unpauses the workspace.
+///   A successful discovery — whether initial or rediscovery — brings the
+///   workspace back to life.
 /// - If **not** `all_ok`: sets status to `failed` and leaves `paused` untouched.
 /// - Before any write, checks the generation guard: if a newer [`WorkspaceStorage::rediscover`]
 ///   bumped the generation while discovery was in flight, the writes are skipped.
@@ -299,12 +298,9 @@ async fn finalize_discovery(
 
     if all_ok {
         let _ = storage.set_status(ws_name, "ready").await;
-        // Auto-unpause only on the initial discovery (generation 0).
-        // Rediscovery should NOT auto-unpause — if a user explicitly paused the
-        // workspace and then triggered rediscovery, the workspace stays paused.
-        if discovery_generation == 0 {
-            let _ = storage.set_paused(ws_name, false).await;
-        }
+        // Always unpause on success — a successful rediscovery should bring
+        // the workspace back to life just like the initial discovery.
+        let _ = storage.set_paused(ws_name, false).await;
         tracing::info!(
             workspace_name = ws_name,
             "Workspace analysis complete — all roles ready"
@@ -1160,7 +1156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_discovery_success_gen1_no_auto_unpause() {
+    async fn finalize_discovery_success_gen1_auto_unpauses() {
         let (store, _tmp) = test_store().await;
         // Start paused with discovery_generation = 1 (rediscovery case).
         insert_direct(&store, "gen1", "/tmp/gen1", true, false, 1).await;
@@ -1173,10 +1169,7 @@ mod tests {
             .await
             .expect("fetch")
             .expect("exists");
-        assert!(
-            ws.paused,
-            "Should NOT auto-unpause on rediscovery (gen > 0)"
-        );
+        assert!(!ws.paused, "Should auto-unpause on rediscovery (gen > 0)");
         assert_eq!(ws.status, "ready", "Status should be 'ready'");
     }
 
