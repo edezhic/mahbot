@@ -54,10 +54,7 @@ pub fn push(workspace_name: &str, id: &str, old_status: &str, new_status: &str) 
         return;
     };
     let mut map = mutex.lock().unwrap_poison();
-    let deque = match map.get_mut(workspace_name) {
-        Some(d) => d,
-        None => map.entry(workspace_name.to_string()).or_default(),
-    };
+    let deque = map.entry(workspace_name.to_string()).or_default();
     if deque.len() >= PER_WORKSPACE_CAPACITY {
         warn!(
             workspace = %workspace_name,
