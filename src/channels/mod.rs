@@ -552,9 +552,9 @@ pub async fn enrich_links(content: &str) -> String {
         return content.to_string();
     }
 
-    // Check agent-browser availability once before spawning concurrent work.
+    // Check chrome-use availability once before spawning concurrent work.
     if !BrowserTool::is_available().await {
-        tracing::debug!("agent-browser not available, skipping link enrichment");
+        tracing::debug!("chrome-use not available, skipping link enrichment");
         return content.to_string();
     }
 

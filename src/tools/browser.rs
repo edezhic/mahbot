@@ -14,9 +14,9 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tracing::debug;
 
-/// Response from agent-browser `--json` commands.
+/// Response from chrome-use `--json` commands.
 #[derive(Debug, Deserialize)]
-struct AgentBrowserResponse {
+struct BrowserResponse {
     success: bool,
     data: Option<Value>,
     error: Option<String>,
@@ -132,7 +132,7 @@ impl BrowserTool {
         Self::validate_url(url)?;
 
         if !Self::is_available().await {
-            anyhow::bail!("agent-browser CLI is not available");
+            anyhow::bail!("chrome-use CLI is not available");
         }
 
         // Lock is held for the entire navigate + extract sequence so
@@ -157,9 +157,9 @@ impl BrowserTool {
         let _ = self.run_command(&["close"], Some(tab)).await;
     }
 
-    /// Check whether `agent-browser` CLI is available on `$PATH`.
+    /// Check whether `chrome-use` CLI is available on `$PATH`.
     pub async fn is_available() -> bool {
-        let cmd = agent_browser_bin();
+        let cmd = browser_bin();
         Command::new(cmd)
             .arg("--version")
             .stdout(Stdio::null())
@@ -189,13 +189,13 @@ impl BrowserTool {
         Ok(())
     }
 
-    /// Run an agent-browser command and parse the JSON response.
+    /// Run an chrome-use command and parse the JSON response.
     async fn run_command(
         &self,
         args: &[&str],
         tab: Option<&str>,
-    ) -> anyhow::Result<AgentBrowserResponse> {
-        let mut cmd = Command::new(agent_browser_bin());
+    ) -> anyhow::Result<BrowserResponse> {
+        let mut cmd = Command::new(browser_bin());
         ensure_browser_env(&mut cmd);
         cmd.args(args);
         cmd.arg("--json");
@@ -203,41 +203,41 @@ impl BrowserTool {
             cmd.args(["--session", tab]);
         }
 
-        debug!("agent-browser args: {:?}", cmd.as_std().get_args());
+        debug!("chrome-use args: {:?}", cmd.as_std().get_args());
 
         let output = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .await
-            .context("Failed to execute agent-browser CLI")?;
+            .context("Failed to execute chrome-use CLI")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // agent-browser returns exit code 1 even when it outputs valid JSON
+        // chrome-use returns exit code 1 even when it outputs valid JSON
         // with a structured error message. Try to parse the JSON first to
         // get a meaningful error, fall back to stderr-only bail otherwise.
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let error_msg = match serde_json::from_str::<AgentBrowserResponse>(&stdout) {
+            let error_msg = match serde_json::from_str::<BrowserResponse>(&stdout) {
                 Ok(resp) => resp.error.unwrap_or_default(),
                 Err(_) => stderr.trim().to_string(),
             };
             let error_msg = if error_msg.is_empty() {
-                format!("agent-browser exited with code {}", output.status)
+                format!("chrome-use exited with code {}", output.status)
             } else {
                 enhance_browser_error(error_msg)
             };
-            anyhow::bail!("agent-browser error: {error_msg}");
+            anyhow::bail!("chrome-use error: {error_msg}");
         }
 
-        let response: AgentBrowserResponse =
-            serde_json::from_str(&stdout).context("Failed to parse agent-browser JSON response")?;
+        let response: BrowserResponse =
+            serde_json::from_str(&stdout).context("Failed to parse chrome-use JSON response")?;
 
         if !response.success {
             let err = response.error.as_deref().unwrap_or("unknown error");
             let enhanced = enhance_browser_error(err.to_string());
-            anyhow::bail!("agent-browser error: {enhanced}");
+            anyhow::bail!("chrome-use error: {enhanced}");
         }
 
         Ok(response)
@@ -343,52 +343,50 @@ impl BrowserTool {
     }
 }
 
-/// Close all running agent-browser sessions at shutdown. The agent-browser
-/// child process (agent-browser.js via Node) does NOT get reaped on process
-/// exit — its sessions hold open ports and lingering Node instances that can
+/// Close all running browser sessions at shutdown. The chrome-use
+/// child process does not always get reaped on process exit — its
+/// sessions hold open ports and lingering instances that can
 /// interfere with the next daemon startup.
 pub async fn close_all_browser_sessions() {
-    let cmd = agent_browser_bin();
+    let cmd = browser_bin();
 
     // List active sessions
-    let list_output = match Command::new(cmd)
-        .args(["session", "list", "--json"])
-        .output()
-        .await
-    {
+    let mut list_cmd = Command::new(cmd);
+    ensure_browser_env(&mut list_cmd);
+    let list_output = match list_cmd.args(["session", "list", "--json"]).output().await {
         Ok(o) => o,
         Err(e) => {
-            tracing::debug!("agent-browser not available, skipping browser cleanup: {e}");
+            tracing::debug!("chrome-use not available, skipping browser cleanup: {e}");
             return;
         }
     };
 
-    let sessions: Vec<String> =
-        match serde_json::from_slice::<AgentBrowserResponse>(&list_output.stdout) {
-            Ok(resp) if resp.success => resp
-                .data
-                .and_then(|d| d.get("sessions")?.as_array().cloned())
-                .map(|arr| {
-                    arr.into_iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Ok(resp) => {
-                tracing::warn!(
-                    "agent-browser session list failed: {}",
-                    resp.error.as_deref().unwrap_or("unknown error")
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("failed to parse agent-browser session list output: {e}");
-                return;
-            }
-        };
+    let sessions: Vec<String> = match serde_json::from_slice::<BrowserResponse>(&list_output.stdout)
+    {
+        Ok(resp) if resp.success => resp
+            .data
+            .and_then(|d| d.get("sessions")?.as_array().cloned())
+            .map(|arr| {
+                arr.into_iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Ok(resp) => {
+            tracing::warn!(
+                "chrome-use session list failed: {}",
+                resp.error.as_deref().unwrap_or("unknown error")
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("failed to parse chrome-use session list output: {e}");
+            return;
+        }
+    };
 
     if sessions.is_empty() {
-        tracing::debug!("No open agent-browser sessions to close");
+        tracing::debug!("No open chrome-use sessions to close");
         return;
     }
 
@@ -397,7 +395,9 @@ pub async fn close_all_browser_sessions() {
         .map(|session_id| {
             // session_id is &String, cmd is &'static str (Copy)
             async move {
-                match Command::new(cmd)
+                let mut close_cmd = Command::new(cmd);
+                ensure_browser_env(&mut close_cmd);
+                match close_cmd
                     .args(["--session", session_id, "close"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -405,15 +405,15 @@ pub async fn close_all_browser_sessions() {
                     .await
                 {
                     Ok(status) if status.success() => {
-                        tracing::debug!("Closed agent-browser session: {session_id}");
+                        tracing::debug!("Closed chrome-use session: {session_id}");
                     }
                     Ok(status) => {
                         tracing::warn!(
-                            "agent-browser close session '{session_id}' exited with status: {status}"
+                            "chrome-use close session '{session_id}' exited with status: {status}"
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("failed to close agent-browser session '{session_id}': {e}");
+                        tracing::warn!("failed to close chrome-use session '{session_id}': {e}");
                     }
                 }
             }
@@ -643,7 +643,7 @@ impl Tool for BrowserTool {
 
         if !Self::is_available().await {
             anyhow::bail!(
-                "agent-browser CLI is not available. Install with: npm install -g agent-browser"
+                "chrome-use CLI is not available. Install with: curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh"
             );
         }
 
@@ -766,17 +766,17 @@ impl Tool for BrowserTool {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Get the platform-appropriate agent-browser binary name.
-const fn agent_browser_bin() -> &'static str {
+/// Get the platform-appropriate chrome-use binary name.
+const fn browser_bin() -> &'static str {
     if cfg!(target_os = "windows") {
-        "agent-browser.cmd"
+        "chrome-use.exe"
     } else {
-        "agent-browser"
+        "chrome-use"
     }
 }
 
 /// Set HOME, `CHROMIUM_FLAGS`, and default timeout env vars on the command
-/// so that the Chromium spawned by agent-browser works in service/docker
+/// so that the Chromium spawned by chrome-use works in service/docker
 /// environments.
 fn ensure_browser_env(cmd: &mut Command) {
     if std::env::var_os("HOME").is_none() {
@@ -790,15 +790,19 @@ fn ensure_browser_env(cmd: &mut Command) {
             "--no-first-run --no-default-browser-check --disable-gpu",
         );
     }
-    // Default 15-second timeout for all agent-browser actions (including
+    // Default 15-second timeout for all chrome-use actions (including
     // `wait --text` which would otherwise block much longer).
     cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", "15000");
-    // 5-minute idle timeout — the agent-browser daemon shuts down after
+    // 5-minute idle timeout — the chrome-use daemon shuts down after
     // 5 minutes of inactivity, cleaning up browser resources.
     cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
+    // Enable human-like interaction speed for bot-detection avoidance.
+    // chrome-use supports the same env vars as agent-browser for backward
+    // compatibility.
+    cmd.env("AGENT_BROWSER_HUMANIZE", "human");
 }
 
-/// Enhance agent-browser error messages with actionable hints for known
+/// Enhance chrome-use error messages with actionable hints for known
 /// failure patterns.
 fn enhance_browser_error(msg: String) -> String {
     let lower = msg.to_ascii_lowercase();
@@ -827,9 +831,9 @@ fn inner_text_eval_js(selector: &str) -> String {
     )
 }
 
-/// Extract textual content from an agent-browser snapshot response `data` field.
+/// Extract textual content from an chrome-use snapshot response `data` field.
 ///
-/// agent-browser can return the snapshot as:
+/// chrome-use can return the snapshot as:
 /// - A plain string (via `snapshot -c`)
 /// - An object with a `content` field (via `get_text`)
 /// - An object with `origin`, `refs`, and `snapshot` fields (via `open` auto-snapshot)
@@ -1179,18 +1183,18 @@ mod tests {
     }
 
     #[test]
-    fn agent_browser_bin_name_is_correct() {
-        let name = agent_browser_bin();
+    fn browser_bin_name_is_correct() {
+        let name = browser_bin();
         if cfg!(target_os = "windows") {
-            assert_eq!(name, "agent-browser.cmd");
+            assert_eq!(name, "chrome-use.exe");
         } else {
-            assert_eq!(name, "agent-browser");
+            assert_eq!(name, "chrome-use");
         }
     }
 
     // -----------------------------------------------------------------------
     // fetch_page_text validation — error propagation through public method
-    // (exercises the early-return preamble without agent-browser)
+    // (exercises the early-return preamble without chrome-use)
     // -----------------------------------------------------------------------
 
     #[tokio::test]

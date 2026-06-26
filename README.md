@@ -25,7 +25,7 @@ cd mahbot
 cargo run --release
 ```
 
-Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and an optional [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute arbitrary SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself.
+Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and the [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment) are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute arbitrary SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself.
 
 ## Why not just Claude Code, Codex, Pi or Cursor?
 
@@ -106,7 +106,11 @@ Rust **2024**, native **Iced** dashboard, **Tokio** async. Single-instance lock;
 **Required:**
 
 - OpenRouter API key (or compatible endpoint configured in settings)
-- [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI (browser tool and link enrichment)
+- [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment)
+  Install: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh`
+  (Windows users: download the `.exe` from [Releases](https://github.com/leeguooooo/chrome-use/releases))
+  Requires the [Chrome extension](https://chromewebstore.google.com/detail/chrome-use) and native messaging host
+  (run `chrome-use extension install` after installing the binary)
 
 **Optional:**
 
