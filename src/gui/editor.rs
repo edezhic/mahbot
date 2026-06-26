@@ -6257,54 +6257,99 @@ mod tests {
     // ── compute_text_matches ────────────────────────────────────
 
     #[test]
-    fn test_compute_text_matches_empty_query() {
-        let result = compute_text_matches("hello", "", true);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_compute_text_matches_basic() {
-        let result = compute_text_matches("hello world hello", "hello", true);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], 0..5);
-        assert_eq!(result[1], 12..17);
-    }
-
-    #[test]
-    fn test_compute_text_matches_no_match() {
-        let result = compute_text_matches("hello world", "xyz", true);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_compute_text_matches_overlapping_prevented() {
-        // "aa" in "aaaaa" should find two matches (0..2 and 2..4)
-        let result = compute_text_matches("aaaaa", "aa", true);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], 0..2);
-        assert_eq!(result[1], 2..4);
-    }
-
-    #[test]
-    fn test_compute_text_matches_case_insensitive() {
-        let result = compute_text_matches("Hello World hello", "hello", false);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], 0..5);
-        assert_eq!(result[1], 12..17);
-    }
-
-    #[test]
-    fn test_compute_text_matches_case_insensitive_no_match() {
-        let result = compute_text_matches("Hello World", "xyz", false);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_byte_offset_to_cursor_pos_unicode() {
-        let content = EditorBuffer::with_text("Привет мир", None);
-        // Byte offset at start of "м" (multi-byte) is 13, char column 7.
-        let pos = byte_offset_to_cursor_pos(&content, 13).unwrap();
-        assert_eq!(pos, (0, 7));
+    fn test_compute_text_matches() {
+        struct Case {
+            text: &'static str,
+            query: &'static str,
+            case_sensitive: bool,
+            expected: &'static [(usize, usize)],
+        }
+        let cases: &[Case] = &[
+            // Empty query
+            Case {
+                text: "hello",
+                query: "",
+                case_sensitive: true,
+                expected: &[],
+            },
+            // Basic match
+            Case {
+                text: "hello world hello",
+                query: "hello",
+                case_sensitive: true,
+                expected: &[(0, 5), (12, 17)],
+            },
+            // No match
+            Case {
+                text: "hello world",
+                query: "xyz",
+                case_sensitive: true,
+                expected: &[],
+            },
+            // Non-overlapping
+            Case {
+                text: "aaaaa",
+                query: "aa",
+                case_sensitive: true,
+                expected: &[(0, 2), (2, 4)],
+            },
+            // Case-insensitive
+            Case {
+                text: "Hello World hello",
+                query: "hello",
+                case_sensitive: false,
+                expected: &[(0, 5), (12, 17)],
+            },
+            // Case-insensitive no match
+            Case {
+                text: "Hello World",
+                query: "xyz",
+                case_sensitive: false,
+                expected: &[],
+            },
+            // Single-char queries return empty (2-char min enforcement)
+            Case {
+                text: "hello",
+                query: "h",
+                case_sensitive: true,
+                expected: &[],
+            },
+            // Boundary: shortest possible match
+            Case {
+                text: "ab",
+                query: "ab",
+                case_sensitive: true,
+                expected: &[(0, 2)],
+            },
+            // Boundary: consecutive matches
+            Case {
+                text: "abab",
+                query: "ab",
+                case_sensitive: true,
+                expected: &[(0, 2), (2, 4)],
+            },
+        ];
+        for case in cases {
+            let result = compute_text_matches(case.text, case.query, case.case_sensitive);
+            assert_eq!(
+                result.len(),
+                case.expected.len(),
+                "text={:?} query={:?} sensitive={}",
+                case.text,
+                case.query,
+                case.case_sensitive
+            );
+            for (i, &(start, end)) in case.expected.iter().enumerate() {
+                assert_eq!(
+                    result[i],
+                    start..end,
+                    "match[{i}] text={:?} query={:?} sensitive={}",
+                    case.text,
+                    case.query,
+                    case.case_sensitive
+                );
+            }
+        }
     }
 
     #[test]
@@ -6389,49 +6434,70 @@ mod tests {
     // ── byte_offset_to_cursor_pos ───────────────────────────────
 
     #[test]
-    fn test_byte_offset_to_cursor_pos_start() {
-        let content = EditorBuffer::with_text("hello\nworld", None);
-        let pos = byte_offset_to_cursor_pos(&content, 0).unwrap();
-        assert_eq!(pos.0, 0);
-        assert_eq!(pos.1, 0);
-    }
-
-    #[test]
-    fn test_byte_offset_to_cursor_pos_second_line() {
-        let content = EditorBuffer::with_text("hello\nworld", None);
-        let pos = byte_offset_to_cursor_pos(&content, 6).unwrap(); // after "hello\n"
-        assert_eq!(pos.0, 1);
-        assert_eq!(pos.1, 0);
-    }
-
-    #[test]
-    fn test_byte_offset_to_cursor_pos_mid_line() {
-        let content = EditorBuffer::with_text("hello\nworld", None);
-        let pos = byte_offset_to_cursor_pos(&content, 8).unwrap(); // "wo"
-        assert_eq!(pos.0, 1);
-        assert_eq!(pos.1, 2);
-    }
-
-    #[test]
-    fn test_byte_offset_to_cursor_pos_out_of_range() {
-        let content = EditorBuffer::with_text("hello", None);
-        assert!(byte_offset_to_cursor_pos(&content, 100).is_none());
-    }
-
-    #[test]
-    fn test_byte_offset_to_cursor_pos_empty_content() {
-        let content = EditorBuffer::with_text("", None);
-        let pos = byte_offset_to_cursor_pos(&content, 0).unwrap();
-        assert_eq!(pos.0, 0);
-        assert_eq!(pos.1, 0);
+    fn test_byte_offset_to_cursor_pos() {
+        struct Case {
+            text: &'static str,
+            byte_offset: usize,
+            expected: Option<(usize, usize)>,
+        }
+        let cases: &[Case] = &[
+            // Unicode multi-byte chars
+            Case {
+                text: "Привет мир",
+                byte_offset: 13, // start of "м"
+                expected: Some((0, 7)),
+            },
+            // Start of content
+            Case {
+                text: "hello\nworld",
+                byte_offset: 0,
+                expected: Some((0, 0)),
+            },
+            // Second line
+            Case {
+                text: "hello\nworld",
+                byte_offset: 6, // after "hello\n"
+                expected: Some((1, 0)),
+            },
+            // Middle of a line
+            Case {
+                text: "hello\nworld",
+                byte_offset: 8, // "wo"
+                expected: Some((1, 2)),
+            },
+            // Beyond text length
+            Case {
+                text: "hello",
+                byte_offset: 100,
+                expected: None,
+            },
+            // Empty content
+            Case {
+                text: "",
+                byte_offset: 0,
+                expected: Some((0, 0)),
+            },
+        ];
+        for case in cases {
+            let content = EditorBuffer::with_text(case.text, None);
+            let pos = byte_offset_to_cursor_pos(&content, case.byte_offset);
+            assert_eq!(
+                pos, case.expected,
+                "text={:?} offset={}",
+                case.text, case.byte_offset
+            );
+        }
     }
 
     // ── UndoStack ───────────────────────────────────────────────
 
+    fn setup_undo_stack(text: &str) -> (EditorBuffer, UndoStack) {
+        (EditorBuffer::with_text(text, None), UndoStack::new())
+    }
+
     #[test]
     fn test_undo_stack_snap_and_undo() {
-        let content = EditorBuffer::with_text("original", None);
-        let mut stack = UndoStack::new();
+        let (content, mut stack) = setup_undo_stack("original");
         stack.snap_before_edit(&content);
 
         // Simulate edit
@@ -6442,8 +6508,7 @@ mod tests {
 
     #[test]
     fn test_undo_stack_redo() {
-        let content = EditorBuffer::with_text("original", None);
-        let mut stack = UndoStack::new();
+        let (content, mut stack) = setup_undo_stack("original");
         stack.snap_before_edit(&content);
 
         let modified = EditorBuffer::with_text("modified", None);
@@ -6455,8 +6520,7 @@ mod tests {
 
     #[test]
     fn test_undo_stack_new_edit_clears_redo() {
-        let content = EditorBuffer::with_text("v1", None);
-        let mut stack = UndoStack::new();
+        let (content, mut stack) = setup_undo_stack("v1");
         stack.snap_before_edit(&content);
 
         let v2 = EditorBuffer::with_text("v2", None);
@@ -6471,8 +6535,7 @@ mod tests {
 
     #[test]
     fn test_undo_stack_cursor_restoration() {
-        let content = EditorBuffer::with_text("line1\nline2\nline3", None);
-        let mut stack = UndoStack::new();
+        let (content, mut stack) = setup_undo_stack("line1\nline2\nline3");
         // Move cursor to (1, 2) — line 1, column 2 ("ne2")
         content.move_to(1, 2);
         stack.snap_before_edit(&content);
@@ -7401,32 +7464,6 @@ mod tests {
         // Should not panic.
         state.navigate_find_match(&FindDirection::Next);
         state.navigate_find_match(&FindDirection::Prev);
-    }
-
-    #[test]
-    fn test_compute_text_matches_no_minimum_length() {
-        // Current implementation requires 2-char minimum. Document this
-        // behavior — single-char queries return empty.
-        let result = compute_text_matches("hello", "h", true);
-        assert!(
-            result.is_empty(),
-            "single-char query returns empty (2-char min)"
-        );
-
-        let result = compute_text_matches("hello", "he", true);
-        assert_eq!(result.len(), 1, "2-char query works");
-    }
-
-    #[test]
-    fn test_compute_text_matches_at_boundaries() {
-        let result = compute_text_matches("ab", "ab", true);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], 0..2);
-
-        let result = compute_text_matches("abab", "ab", true);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], 0..2);
-        assert_eq!(result[1], 2..4);
     }
 
     // ── Tree arrow-key navigation tests ─────────────────────────────
