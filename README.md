@@ -114,7 +114,7 @@ Rust **2024**, native **Iced** dashboard, **Tokio** async. Single-instance lock;
 
 **Optional:**
 
-- Exa API key — enables `web_search` tool
+- Firecrawl API key — enables `web_search` tool
 - Telegram bot token — remote chat on the same agent backend
 
 **Defaults (configurable):** per-role models via OpenRouter; image/video generation and transcription models in settings. See `src/config.rs` and the dashboard **Settings** page.

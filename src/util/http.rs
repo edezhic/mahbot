@@ -246,7 +246,7 @@ pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::
 /// Return the shared media-generation HTTP client, initialising it on first
 /// call with a 2-minute request timeout and a 10-second connection timeout.
 ///
-/// Used by [`crate::tools::image_gen::ImageGenTool`], [`crate::tools::video_gen::VideoGenTool`], [`crate::tools::web_search::WebSearchTool`] (Exa API),
+/// Used by [`crate::tools::image_gen::ImageGenTool`], [`crate::tools::video_gen::VideoGenTool`], [`crate::tools::web_search::WebSearchTool`] (Firecrawl API),
 /// and `MediaTranscriber` — all of which need the same timeout.  If a future
 /// consumer requires a different timeout it should call
 /// [`build_http_client`] directly with the appropriate duration.

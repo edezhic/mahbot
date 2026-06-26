@@ -221,7 +221,7 @@ fn picker_config_fields<'a>(
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum PasswordTarget {
     ProviderKey,
-    ExaKey,
+    FirecrawlKey,
     TelegramToken,
 }
 
@@ -1820,16 +1820,17 @@ impl SettingsState {
             "Integrations",
             column![
                 field_row(
-                    "Exa API Key",
+                    "Firecrawl API Key",
                     password_input(
-                        "sk-...",
-                        self.config.exa_key.as_deref().unwrap_or_default(),
-                        self.password_visible.contains(&PasswordTarget::ExaKey),
+                        "fc-...",
+                        self.config.firecrawl_key.as_deref().unwrap_or_default(),
+                        self.password_visible
+                            .contains(&PasswordTarget::FirecrawlKey),
                         |v| SettingsMessage::ConfigField {
-                            key: "exa_key",
+                            key: "firecrawl_key",
                             value: v
                         },
-                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::ExaKey),
+                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::FirecrawlKey),
                     ),
                     None,
                 ),

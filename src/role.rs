@@ -328,7 +328,7 @@ impl Role {
             }
         };
 
-        if let Some(key) = crate::config::CONFIG.exa_key() {
+        if let Some(key) = crate::config::CONFIG.firecrawl_key() {
             tools.push(Box::new(WebSearchTool::new(key)));
         }
 

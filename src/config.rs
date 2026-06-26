@@ -192,8 +192,8 @@ pub struct ConfigData {
     pub video_gen_model: Option<String>,
     /// Newline-separated list of available video generation models (for selection UI).
     pub video_gen_models: Option<String>,
-    /// Exa API key for web search.
-    pub exa_key: Option<String>,
+    /// Firecrawl API key for web search.
+    pub firecrawl_key: Option<String>,
     /// Telegram Bot API token (hot-reloaded on save).
     pub telegram_bot_token: Option<String>,
     /// Per-role model overrides.
@@ -394,7 +394,7 @@ string_config_fields! {
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
     video_gen_model [or(DEFAULT_VIDEO_GEN_MODEL)],
     video_gen_models [list_or(fallback = video_gen_model, default = DEFAULT_VIDEO_GEN_MODEL)],
-    exa_key [non_empty],
+    firecrawl_key [non_empty],
     telegram_bot_token [non_empty],
 }
 
@@ -882,7 +882,7 @@ mod tests {
         ("image_gen_models", "dall-e-3\nstable-diffusion\nmidjourney"),
         ("video_gen_model", "sora"),
         ("video_gen_models", "sora\npika\nrunway"),
-        ("exa_key", "exa-test-key"),
+        ("firecrawl_key", "fc-test-key"),
         ("telegram_bot_token", "123:abc"),
     ];
 

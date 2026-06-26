@@ -14,72 +14,76 @@ struct CachedResult {
     text: String,
 }
 
-// ── Exa API types ───────────────────────────────────────────────────────────────
+// ── Firecrawl API types ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct ContentsOptions {
-    text: bool,
-    highlights: bool,
+struct ScrapeOptions {
+    formats: Vec<String>,
+    #[serde(rename = "onlyMainContent")]
+    only_main_content: bool,
 }
 
 #[derive(Serialize)]
 struct SearchRequest {
     query: String,
-    #[serde(rename = "useAutoprompt")]
-    use_autoprompt: bool,
-    #[serde(rename = "numResults")]
-    num_results: usize,
-    contents: ContentsOptions,
+    limit: usize,
+    #[serde(rename = "scrapeOptions")]
+    scrape_options: ScrapeOptions,
 }
 
 #[derive(Deserialize, Debug)]
-struct SearchResult {
+struct WebResult {
     title: Option<String>,
     url: String,
-    text: Option<String>,
-    highlights: Option<Vec<String>>,
+    markdown: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct SearchData {
+    web: Vec<WebResult>,
 }
 
 #[derive(Deserialize, Debug)]
 struct SearchResponse {
-    results: Vec<SearchResult>,
+    success: bool,
+    data: SearchData,
 }
 
 // ── Tool ────────────────────────────────────────────────────────────────────────
 
-/// Web search tool backed by the Exa API.
+/// Web search tool backed by the Firecrawl API.
 ///
-/// Uses `api.exa.ai` for search. Results are cached per-instance in-memory and
-/// can be expanded via the `expand` parameter to retrieve full text content.
-/// Each agent session gets its own tool instance, so caches are automatically
-/// freed when the agent session ends.
+/// Uses `api.firecrawl.dev/v2/search` for search. Results are cached
+/// per-instance in-memory and can be expanded via the `expand` parameter
+/// to retrieve full text content.  Each agent session gets its own tool
+/// instance, so caches are automatically freed when the agent session ends.
 pub struct WebSearchTool {
-    exa_key: String,
+    firecrawl_key: String,
     cache: RwLock<HashMap<u64, CachedResult>>,
     next_id: AtomicU64,
 }
 
 impl WebSearchTool {
     #[must_use]
-    pub fn new(exa_key: String) -> Self {
+    pub fn new(firecrawl_key: String) -> Self {
         Self {
-            exa_key,
+            firecrawl_key,
             cache: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
 
-    async fn exa_search(&self, query: &str) -> anyhow::Result<String> {
+    async fn firecrawl_search(&self, query: &str) -> anyhow::Result<String> {
         let res = crate::util::http::media_http_client()
-            .post("https://api.exa.ai/search")
-            .header("x-api-key", &self.exa_key)
+            .post("https://api.firecrawl.dev/v2/search")
+            .header("Authorization", format!("Bearer {}", &self.firecrawl_key))
             .json(&SearchRequest {
                 query: query.to_string(),
-                use_autoprompt: true,
-                num_results: 10,
-                contents: ContentsOptions {
-                    text: true,
-                    highlights: true,
+                limit: 10,
+                scrape_options: ScrapeOptions {
+                    formats: vec!["markdown".to_string()],
+                    only_main_content: true,
                 },
             })
             .send()
@@ -92,19 +96,19 @@ impl WebSearchTool {
                 String::new()
             });
 
-            // Exa returns HTML block pages (Cloudflare, etc.) for 403 and
-            // potentially other non-2xx statuses — replace the HTML dump
-            // with a clean message to avoid polluting the LLM context.
-            if status == reqwest::StatusCode::FORBIDDEN {
-                anyhow::bail!("search provider blocked the request for unspecified reasons");
-            }
+            // Firecrawl returns structured JSON errors with a clean error message.
+            // Try to extract it for a better error message.
+            if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str()) {
+                    anyhow::bail!("search failed: {error_msg}");
+                }
 
-            anyhow::bail!("Exa search failed with status {status}: {body}");
+            anyhow::bail!("search failed with status {status}: {body}");
         }
 
         let search_resp = res.json::<SearchResponse>().await?;
 
-        if search_resp.results.is_empty() {
+        if !search_resp.success || search_resp.data.web.is_empty() {
             return Ok(format!("No results found for: {query}"));
         }
 
@@ -113,29 +117,25 @@ impl WebSearchTool {
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!("Search results for: {query}"));
 
-        for (i, result) in search_resp.results.iter().enumerate() {
+        for (i, result) in search_resp.data.web.iter().enumerate() {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let title = result.title.as_deref().unwrap_or("(no title)").to_string();
 
-            let highlights = result
-                .highlights
-                .as_ref()
-                .map(|h| h.join(" … "))
-                .unwrap_or_default();
+            let description = result.description.as_deref().unwrap_or("");
 
-            // Cache with text for later expansion
+            // Cache markdown for later expansion
             cache_guard.insert(
                 id,
                 CachedResult {
                     title: title.clone(),
                     url: result.url.clone(),
-                    text: result.text.as_deref().unwrap_or_default().to_string(),
+                    text: result.markdown.as_deref().unwrap_or_default().to_string(),
                 },
             );
 
             lines.push(format!("{}. [{title}]({url})", i + 1, url = result.url));
-            if !highlights.is_empty() {
-                lines.push(format!("   > {highlights}"));
+            if !description.is_empty() {
+                lines.push(format!("   > {description}"));
             }
             lines.push(format!("   `expand` id: `{id}`"));
         }
@@ -236,7 +236,7 @@ impl Tool for WebSearchTool {
                 }
 
                 tracing::info!("Searching web for: {}", query);
-                let output = self.exa_search(query).await?;
+                let output = self.firecrawl_search(query).await?;
                 Ok(output)
             }
             (false, true) => {
