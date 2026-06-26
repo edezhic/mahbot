@@ -462,4 +462,24 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn all_roles_have_discovery_prompt() {
+        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+            if !super::role_info(&role).has_discovery {
+                continue;
+            }
+            let prompt = role.discovery_prompt();
+            assert!(
+                !prompt.trim().is_empty(),
+                "{}: discovery_prompt() must not be empty",
+                role.as_str()
+            );
+            assert!(
+                !crate::prompt::TEMPLATE_RE.is_match(&prompt),
+                "{}: discovery prompt must not contain unsubstituted template keys",
+                role.as_str()
+            );
+        }
+    }
 }

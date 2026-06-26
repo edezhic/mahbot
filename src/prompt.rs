@@ -15,7 +15,7 @@ struct PromptAssets;
 ///
 /// Only matches keys consisting of word characters (`\w` = `[a-zA-Z0-9_]`).
 /// Future template keys must not contain hyphens, dots, or spaces.
-static TEMPLATE_RE: LazyLock<Regex> =
+pub(crate) static TEMPLATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("TEMPLATE_RE must compile"));
 
 /// Load a prompt template from embedded assets.
