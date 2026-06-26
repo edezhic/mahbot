@@ -166,6 +166,44 @@ fn hash_text(text: &str) -> u64 {
     h.finish()
 }
 
+/// Shared helper to construct a `Tab` + `TabData` pair from file text
+/// and metadata.  Returns the pair together with the file's mtime (if
+/// readable) so the caller can record it in `file_mtimes`.
+fn make_tab_and_data(
+    path: &str,
+    text: &str,
+    has_trailing_newline: bool,
+    line_ending: LineEnding,
+    is_dirty: bool,
+    saved_text_hash: u64,
+) -> (Tab, TabData, Option<SystemTime>) {
+    let content = EditorBuffer::from_file(text, path);
+    let file_name = Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
+
+    let tab = Tab {
+        path: path.to_string(),
+        file_name,
+        is_dirty,
+        has_trailing_newline,
+        line_ending,
+    };
+
+    let tab_data = TabData {
+        content,
+        undo_stack: RefCell::new(UndoStack::new()),
+        find_replace_state: None,
+        saved_text_hash,
+    };
+
+    let mtime = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+
+    (tab, tab_data, mtime)
+}
+
 // ── Undo/Redo ──────────────────────────────────────────────────────
 
 /// Snapshot-based undo/redo stack. Stores full-content snapshots
@@ -3941,25 +3979,10 @@ impl EditorState {
         let mut active_idx = 0;
 
         for (i, saved) in tabs_data.into_iter().enumerate() {
-            let content = EditorBuffer::from_file(&saved.text, &saved.file_path);
-            let file_name = Path::new(&saved.file_path).file_name().map_or_else(
-                || saved.file_path.clone(),
-                |n| n.to_string_lossy().to_string(),
-            );
-
-            let tab = Tab {
-                path: saved.file_path.clone(),
-                file_name,
-                is_dirty: saved.was_dirty,
-                has_trailing_newline: saved.has_trailing_newline,
-                line_ending: saved.line_ending,
-            };
-
             if saved.is_active {
                 active_idx = i;
             }
 
-            self.tabs.push(tab);
             let saved_hash = if saved.was_dirty {
                 // Tab was dirty when persisted — the text in DB
                 // differs from what's on disk.  Try to read the
@@ -3972,25 +3995,19 @@ impl EditorState {
             } else {
                 hash_text(&saved.text)
             };
-            let file_path = saved.file_path.clone();
-            self.tab_contents.insert(
-                saved.file_path,
-                TabData {
-                    content,
-                    undo_stack: RefCell::new(UndoStack::new()),
-                    find_replace_state: None,
-                    saved_text_hash: saved_hash,
-                },
+
+            let (tab, td, mtime) = make_tab_and_data(
+                &saved.file_path,
+                &saved.text,
+                saved.has_trailing_newline,
+                saved.line_ending,
+                saved.was_dirty,
+                saved_hash,
             );
-            // Record modification time for auto-refresh tracking.
-            // Try the on-disk file first; if the file is missing
-            // (e.g. it was saved dirty from a deleted file), no
-            // mtime is recorded so the auto-refresh won't try to
-            // reload a non-existent file.
-            if let Ok(meta) = std::fs::metadata(&file_path) {
-                if let Ok(mtime) = meta.modified() {
-                    self.file_mtimes.insert(file_path, mtime);
-                }
+            self.tabs.push(tab);
+            self.tab_contents.insert(saved.file_path.clone(), td);
+            if let Some(mtime) = mtime {
+                self.file_mtimes.insert(saved.file_path, mtime);
             }
         }
 
@@ -4063,36 +4080,19 @@ impl EditorState {
 
         match result {
             Ok(data) => {
-                let content = EditorBuffer::from_file(&data.text, &data.path);
-                let file_name = Path::new(&data.path)
-                    .file_name()
-                    .map_or_else(|| data.path.clone(), |n| n.to_string_lossy().to_string());
-
-                let tab = Tab {
-                    path: data.path.clone(),
-                    file_name,
-                    is_dirty: false,
-                    has_trailing_newline: data.has_trailing_newline,
-                    line_ending: data.line_ending,
-                };
-
                 let saved_hash = hash_text(&data.text);
-                self.tabs.push(tab);
-                let file_path = data.path.clone();
-                self.tab_contents.insert(
-                    data.path,
-                    TabData {
-                        content,
-                        undo_stack: RefCell::new(UndoStack::new()),
-                        find_replace_state: None,
-                        saved_text_hash: saved_hash,
-                    },
+                let (tab, tab_data, mtime) = make_tab_and_data(
+                    &data.path,
+                    &data.text,
+                    data.has_trailing_newline,
+                    data.line_ending,
+                    false,
+                    saved_hash,
                 );
-                // Record modification time for auto-refresh tracking.
-                if let Ok(meta) = std::fs::metadata(&file_path) {
-                    if let Ok(mtime) = meta.modified() {
-                        self.file_mtimes.insert(file_path, mtime);
-                    }
+                self.tabs.push(tab);
+                self.tab_contents.insert(data.path.clone(), tab_data);
+                if let Some(mtime) = mtime {
+                    self.file_mtimes.insert(data.path, mtime);
                 }
                 self.active_tab_index = self.tabs.len().saturating_sub(1);
                 self.session_initialized = true;
