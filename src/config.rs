@@ -768,9 +768,9 @@ pub async fn reload_from_db() -> Result<()> {
 /// 3. Warm-up a temporary provider (no global swap yet)
 /// 4. On success: write to DB, reload CONFIG, swap singletons
 /// 5. If Telegram token changed: hot-reload the listener
-pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
+pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // Validate
-    validate_config(config)?;
+    validate_config(&config)?;
 
     // Capture old Telegram token BEFORE we mutate DB so we can detect
     // changes and trigger hot-reload after persistence succeeds.
@@ -787,7 +787,7 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
 
     // ── Pre-commit warmup (no global swap) ─────────────────────
     // If this fails, nothing has changed — CONFIG, PROVIDER, and DB are untouched.
-    crate::providers::warmup_provider_from_config(config).await?;
+    crate::providers::warmup_provider_from_config(&config).await?;
 
     // ── Persist to DB ─────────────────────────────────────────
     let store = crate::config_db::store();
@@ -811,11 +811,6 @@ pub async fn save_and_reload(config: &ConfigData) -> Result<()> {
     // ── Commit to runtime ─────────────────────────────────────
     // Warmup succeeded above — now persist runtime config and swap singletons.
     //
-    // We swap the in-memory `config` directly instead of re-reading from DB
-    // (which would be redundant).  Apply the same normalisation that
-    // reload_from_db's read path would perform so the behaviour is identical.
-    let mut config = config.clone();
-
     // Apply the same normalisation + sorting that reload_from_db's read path
     // performs so the behaviour is identical regardless of which persistence
     // path produced the data.

@@ -424,7 +424,7 @@ impl SettingsState {
                 let config = self.config.clone();
                 Task::perform(
                     async move {
-                        crate::config::save_and_reload(&config)
+                        crate::config::save_and_reload(config)
                             .await
                             .map_err(|e| e.to_string())
                     },
