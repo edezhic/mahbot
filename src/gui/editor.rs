@@ -1913,14 +1913,6 @@ impl EditorState {
         self.active_modal().is_some()
     }
 
-    /// Returns `true` when an inline rename is active.  Tree keyboard
-    /// navigation keys must be suppressed during inline editing — the
-    /// text input handles its own navigation (cursor movement, etc.).
-    #[inline]
-    fn is_renaming(&self) -> bool {
-        self.rename_target.is_some()
-    }
-
     /// Save editor tabs to the database for the currently selected workspace.
     ///
     /// Returns a task that performs the async DB write, or [`None`] if:
@@ -3213,8 +3205,11 @@ impl EditorState {
 
             // ── Tree keyboard navigation ─────────────────────────────
             EditorMessage::TreeFocusToggled => {
-                // Suppress during inline rename.
-                if self.is_renaming() {
+                // Suppress during any modal overlay (QuickOpen, GlobalSearch,
+                // GotoLine, Rename, etc.) — the overlay owns keyboard focus.
+                // Rename is covered here via active_modal()'s check of
+                // rename_target (see ModalKind::Rename in active_modal()).
+                if self.modal_overlay_blocks_editor_shortcuts() {
                     return Task::none();
                 }
                 self.file_tree.tree_focused = !self.file_tree.tree_focused;
@@ -3239,10 +3234,6 @@ impl EditorState {
             EditorMessage::TreeNavDown => self.navigate_tree_vertical(&TreeNavDirection::Down),
 
             EditorMessage::TreeNavEnter => {
-                // Suppress during inline rename.
-                if self.is_renaming() {
-                    return Task::none();
-                }
                 // When global search is active, Enter selects the highlighted result.
                 // Borrow to extract the index without cloning the entire state.
                 if let Some(gs) = self.global_search.as_ref() {
@@ -3253,6 +3244,14 @@ impl EditorState {
                 if let Some(ref qo) = self.quick_open {
                     let idx = qo.selected_index.min(qo.results.len().saturating_sub(1));
                     return Task::done(EditorMessage::QuickOpenSelect(idx));
+                }
+                // When any modal overlay (Rename, GotoLine, NewItem, DeleteConfirm,
+                // CloseDialog, etc.) is active, suppress tree navigation — the
+                // overlay handles its own Enter key handling.  Must be placed
+                // AFTER the search redirects above so Enter-to-select still works
+                // in GlobalSearch and QuickOpen.
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
                 }
                 let Some((_idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
                     return Task::none();
@@ -3270,8 +3269,9 @@ impl EditorState {
             }
 
             EditorMessage::TreeNavLeft => {
-                // Suppress during inline rename.
-                if self.is_renaming() {
+                // Suppress during active modal overlays — the overlay handles
+                // its own keyboard navigation (covers Rename, GotoLine, etc.).
+                if self.modal_overlay_blocks_editor_shortcuts() {
                     return Task::none();
                 }
                 let Some((_idx, path, _)) = self.file_tree.focused_tree_node() else {
@@ -3297,8 +3297,9 @@ impl EditorState {
             }
 
             EditorMessage::TreeNavRight => {
-                // Suppress during inline rename.
-                if self.is_renaming() {
+                // Suppress during active modal overlays — the overlay handles
+                // its own keyboard navigation (covers Rename, GotoLine, etc.).
+                if self.modal_overlay_blocks_editor_shortcuts() {
                     return Task::none();
                 }
                 let Some((idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
@@ -3505,6 +3506,13 @@ impl EditorState {
             }
 
             EditorMessage::RefreshFileTree => {
+                // Suppress during active modal overlays — the file tree should
+                // not refresh behind an active overlay.  This covers both the
+                // Cmd+R / Ctrl+R keyboard shortcut AND the periodic 30-second
+                // timer subscription.
+                if self.modal_overlay_blocks_editor_shortcuts() {
+                    return Task::none();
+                }
                 let Some(ref ws_path) = self.selected_workspace_path.clone() else {
                     return Task::none();
                 };
@@ -4511,10 +4519,6 @@ impl EditorState {
     /// in priority order. Only the file-tree path returns a scroll-to-focus
     /// task; the overlay paths return `Task::none()`.
     fn navigate_tree_vertical(&mut self, direction: &TreeNavDirection) -> Task<EditorMessage> {
-        // Suppress during inline rename.
-        if self.is_renaming() {
-            return Task::none();
-        }
         // When global search is active, navigate the results list.
         if let Some(ref mut gs) = self.global_search {
             match *direction {
@@ -4539,6 +4543,13 @@ impl EditorState {
                 }
                 _ => {}
             }
+            return Task::none();
+        }
+        // When another modal overlay (GotoLine, NewItem, DeleteConfirm,
+        // CloseDialog, etc.) is active, suppress tree navigation.  The search
+        // overlay redirects above have already returned, so only non-search
+        // overlays reach this guard.
+        if self.modal_overlay_blocks_editor_shortcuts() {
             return Task::none();
         }
         // Navigate the file tree focus index.
@@ -7736,6 +7747,90 @@ mod tests {
         assert_eq!(
             state.tab_contents.get(&path).unwrap().content.text(),
             "!hello"
+        );
+    }
+
+    #[test]
+    fn test_refresh_file_tree_noop_when_quick_open_active() {
+        let mut state = make_editor_with_tree();
+        // Pre-populate dir_generations so we can detect new entries.
+        let initial_gen_count = state.dir_generations.len();
+        assert!(state.selected_workspace_path.is_some());
+
+        // Activate a modal overlay (QuickOpen).
+        state.quick_open = Some(QuickOpenState {
+            filter: String::new(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+
+        // RefreshFileTree should be suppressed — no new dir generations added.
+        let _ = state.update(EditorMessage::RefreshFileTree);
+        assert_eq!(
+            state.dir_generations.len(),
+            initial_gen_count,
+            "RefreshFileTree must not spawn directory refreshes when a modal overlay is active"
+        );
+    }
+
+    #[test]
+    fn test_tree_focus_toggled_noop_during_modal_overlay() {
+        let mut state = make_editor_with_tree();
+        // First toggle tree focus ON.
+        let _ = state.update(EditorMessage::TreeFocusToggled);
+        assert!(state.file_tree.tree_focused);
+
+        // Activate a modal overlay (QuickOpen).
+        state.quick_open = Some(QuickOpenState {
+            filter: String::new(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+
+        // TreeFocusToggled should be suppressed — focus stays ON.
+        let _ = state.update(EditorMessage::TreeFocusToggled);
+        assert!(
+            state.file_tree.tree_focused,
+            "TreeFocusToggled must not toggle focus when a modal overlay is active"
+        );
+    }
+
+    #[test]
+    fn test_tree_nav_suppressed_during_goto_line_overlay() {
+        let mut state = make_editor_with_tree();
+        state.file_tree.expanded_dirs.insert("src".to_string());
+        state.file_tree.nodes =
+            build_hierarchical_tree(&state.dir_entries, &state.file_tree.expanded_dirs, "");
+        state.file_tree.rebuild_visible();
+        state.file_tree.tree_focused = true;
+        state.file_tree.tree_focus_index = 0; // "src"
+
+        // Activate a non-search modal overlay (GotoLine).
+        state.goto_line_input = Some(String::new());
+
+        let prev_focus = state.file_tree.tree_focus_index;
+        // Up/Down/Enter/Left/Right — assert tree_focus_index unchanged.
+        let nav_msgs: &[EditorMessage] = &[
+            EditorMessage::TreeNavUp,
+            EditorMessage::TreeNavDown,
+            EditorMessage::TreeNavEnter,
+            EditorMessage::TreeNavLeft,
+            EditorMessage::TreeNavRight,
+        ];
+        for msg in nav_msgs {
+            let _ = state.update(msg.clone());
+            assert_eq!(
+                state.file_tree.tree_focus_index, prev_focus,
+                "{msg:?} should be suppressed during GotoLine overlay"
+            );
+        }
+
+        // TreeFocusToggled is handled separately because it toggles
+        // tree_focused, not tree_focus_index.
+        let _ = state.update(EditorMessage::TreeFocusToggled);
+        assert!(
+            state.file_tree.tree_focused,
+            "TreeFocusToggled should be suppressed during GotoLine overlay"
         );
     }
 
