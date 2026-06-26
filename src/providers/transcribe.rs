@@ -1,5 +1,5 @@
-use crate::providers::error::ProviderError;
 use anyhow::Context;
+use base64::Engine;
 use std::path::Path;
 
 /// Shared internal fields for media transcribers (image/audio).
@@ -9,7 +9,6 @@ use std::path::Path;
 /// the transcriber.
 #[derive(Clone)]
 pub(crate) struct MediaTranscriber {
-    client: reqwest::Client,
     api_url: String,
     model: String,
     provider_route: Option<String>,
@@ -18,7 +17,6 @@ pub(crate) struct MediaTranscriber {
 impl MediaTranscriber {
     pub(crate) fn new(api_url: String, model: String, provider_route: Option<String>) -> Self {
         Self {
-            client: crate::util::http::media_http_client().clone(),
             api_url,
             model,
             provider_route,
@@ -102,59 +100,49 @@ impl AudioTranscriber {
     }
 
     /// Transcribe an audio file, returning the transcription text.
+    ///
+    /// Uses OpenRouter's JSON API format: base64-encodes the audio file and
+    /// sends it as `input_audio.data` with the appropriate format string.
     pub async fn transcribe(&self, file_path: &Path) -> anyhow::Result<String> {
         let file_bytes = tokio::fs::read(file_path)
             .await
             .context("failed to read audio file")?;
 
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("audio")
-            .to_string();
+        // Determine the audio format from the file extension.
+        let format = match file_path.extension().and_then(|e| e.to_str()) {
+            Some(e) if e.eq_ignore_ascii_case("oga") => "ogg",
+            Some(e) => e,
+            None => "wav",
+        }
+        .to_lowercase();
 
-        let file_part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name(file_name)
-            .mime_str("application/octet-stream")?;
+        // Base64-encode the audio bytes.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
 
-        let mut form = reqwest::multipart::Form::new()
-            .part("file", file_part)
-            .text("model", self.inner.model.clone());
+        let mut body = serde_json::json!({
+            "model": self.inner.model,
+            "input_audio": {
+                "data": encoded,
+                "format": format,
+            },
+        });
 
         if let Some(route) = &self.inner.provider_route
             && let Some(routing) = crate::providers::provider_routing_json(route, false)
         {
-            form = form.text("provider", routing.to_string());
+            body["provider"] = routing;
         }
 
         let base = crate::providers::ensure_base_url(&self.inner.api_url);
         let url = format!("{base}/audio/transcriptions");
 
-        let auth = crate::util::http::bearer_auth_header()
-            .ok_or_else(|| anyhow::anyhow!("provider API key is not configured"))?;
-
-        let response = self
-            .inner
-            .client
-            .post(&url)
-            .header("Authorization", auth)
-            .multipart(form)
-            .send()
-            .await
-            .context("audio transcription request failed")?;
-
-        let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            anyhow::anyhow!("audio transcription failed to read response body: {e}")
-        })?;
-
-        if !status.is_success() {
-            let provider_err =
-                ProviderError::new(status.as_u16(), "audio transcription", &body, None);
-            return Err(anyhow::Error::from(provider_err));
-        }
-
-        let json = crate::util::http::parse_json_response(&body, "audio transcription")?;
+        // NOTE: post_json_to_provider switches from ProviderError to anyhow::bail
+        // for non-2xx responses. This is safe because the caller
+        // (transcribe_audio_marker in channels/mod.rs) catches all errors and
+        // falls back to "[Audio: ...]" — it never reaches the retry logic in the
+        // provider layer.
+        let json =
+            crate::util::http::post_json_to_provider(&url, &body, "audio transcription").await?;
 
         json.get("text")
             .and_then(|v| v.as_str())
