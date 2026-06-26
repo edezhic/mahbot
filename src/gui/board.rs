@@ -154,7 +154,10 @@ impl BoardState {
     /// Status transition actions (ported from Board.tsx `availableActions`)
     fn available_actions(status: &TicketPhase) -> Vec<(&'static str, TicketPhase)> {
         match status {
-            TicketPhase::ReadyForDevelopment => vec![("🛑 Cancel", TicketPhase::Cancelled)],
+            TicketPhase::ReadyForDevelopment => vec![
+                ("⏸ Pause", TicketPhase::Planning),
+                ("🛑 Cancel", TicketPhase::Cancelled),
+            ],
             TicketPhase::InDevelopment | TicketPhase::InQa => {
                 vec![("🛑 Cancel", TicketPhase::Cancelled)]
             }
@@ -179,7 +182,7 @@ impl BoardState {
     }
 
     /// Map an action label to the appropriate lucide icon element (16px).
-    /// Match order: Cancel → Redo → Done → Backlog → Review → QA → Dev → fallback.
+    /// Match order: Cancel → Redo → Done → Backlog → Review → QA → Pause → Dev → fallback.
     fn action_icon<'a>(label: &str) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
         if label.contains("Cancel") {
             lucide::circle_x::<iced::Theme, iced::Renderer>()
@@ -193,6 +196,8 @@ impl BoardState {
             lucide::eye::<iced::Theme, iced::Renderer>()
         } else if label.contains("QA") {
             lucide::shield_check::<iced::Theme, iced::Renderer>()
+        } else if label.contains("Pause") {
+            lucide::pause::<iced::Theme, iced::Renderer>()
         } else if label.contains("Dev") {
             lucide::play::<iced::Theme, iced::Renderer>()
         } else {
