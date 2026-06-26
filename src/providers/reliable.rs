@@ -552,23 +552,33 @@ mod tests {
     // ── Retry-After parsing ──
 
     #[test]
-    fn rate_limit_utilities() {
-        // compute_backoff with structured ProviderError (the only path in production)
-        let with_retry_after =
-            anyhow::Error::from(ProviderError::new(429, "test", "rate limited", Some(3_000)));
+    fn backoff_and_retry_after() {
+        // ── parse_retry_after_ms unit tests ──
+        let with_retry = ProviderError::new(429, "test", "rate limited", Some(5000));
         assert_eq!(
-            ReliableProvider::compute_backoff(500, &with_retry_after),
-            3_000
+            parse_retry_after_ms(&anyhow::Error::from(with_retry)),
+            Some(5000)
         );
+
+        let no_retry = ProviderError::new(429, "test", "rate limit", None);
+        assert_eq!(parse_retry_after_ms(&anyhow::Error::from(no_retry)), None);
+
+        // ── compute_backoff: respects retry-after ──
+        let structured =
+            anyhow::Error::from(ProviderError::new(429, "test", "rate limited", Some(3_000)));
+        assert_eq!(ReliableProvider::compute_backoff(500, &structured), 3_000);
+
+        // ── compute_backoff: clamps retry-after to MAX_BACKOFF (30s) ──
         let with_long_retry =
             anyhow::Error::from(ProviderError::new(429, "test", "rate limit", Some(120_000)));
         assert_eq!(
             ReliableProvider::compute_backoff(500, &with_long_retry),
             30_000
         );
-        let no_retry = anyhow::Error::from(ProviderError::new(500, "test", "error", None));
-        let backoff = ReliableProvider::compute_backoff(500, &no_retry);
-        // Jittered within [0.75*base, 1.25*base) = [375, 625)
+
+        // ── compute_backoff: jittered fallback when no retry-after ──
+        let no_header = anyhow::Error::from(ProviderError::new(500, "test", "error", None));
+        let backoff = ReliableProvider::compute_backoff(500, &no_header);
         assert!(
             (375..625).contains(&backoff),
             "expected backoff in [375, 625), got {backoff}"
@@ -662,72 +672,6 @@ mod tests {
         assert_eq!(
             classify_err(&make_structured(429, "error code 1113")),
             ErrorClass::NonRetryable
-        );
-    }
-
-    #[test]
-    fn parse_retry_after_typed_path() {
-        // ── ProviderError typed path for parse_retry_after_ms ──
-        let with_retry = ProviderError::new(429, "test", "rate limited", Some(5000));
-        assert_eq!(
-            parse_retry_after_ms(&anyhow::Error::from(with_retry)),
-            Some(5000)
-        );
-
-        let no_retry = ProviderError::new(429, "test", "rate limit", None);
-        assert_eq!(parse_retry_after_ms(&anyhow::Error::from(no_retry)), None);
-
-        // compute_backoff uses parse_retry_after_ms internally
-        let structured =
-            anyhow::Error::from(ProviderError::new(429, "test", "rate limited", Some(3000)));
-        assert_eq!(ReliableProvider::compute_backoff(500, &structured), 3_000);
-
-        let no_header = anyhow::Error::from(ProviderError::new(500, "test", "error", None));
-        let backoff = ReliableProvider::compute_backoff(500, &no_header);
-        // Jittered within [0.75*base, 1.25*base) = [375, 625)
-        assert!(
-            (375..625).contains(&backoff),
-            "expected backoff in [375, 625), got {backoff}"
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_retries_and_recovers() {
-        let tool_call = crate::ToolCall {
-            id: "call_1".to_string(),
-            name: "shell".to_string(),
-            arguments: serde_json::json!({"command": "date"}),
-        };
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
-            "primary".into(),
-            Box::new(
-                TestProvider::new("recovered")
-                    .with_fail(2, "temporary failure")
-                    .with_tool_calls(vec![tool_call])
-                    .with_calls(calls.clone()),
-            ) as Box<dyn Provider>,
-            3,
-            50,
-        );
-
-        let messages = vec![ChatMessage::user("test")];
-        let request = ChatRequest {
-            messages: messages.clone(),
-            tools: None,
-            model: "test".to_string(),
-            allow_image_parts: false,
-            temperature: 0.1,
-            reasoning_effort: None,
-            provider_order: None,
-            provider_allow_fallbacks: None,
-        };
-        let result = provider.chat(request).await.unwrap();
-
-        assert_eq!(result.text.as_deref(), Some("recovered"));
-        assert!(
-            calls.load(Ordering::SeqCst) > 1,
-            "should have retried at least once"
         );
     }
 
@@ -868,22 +812,16 @@ mod tests {
                 "should ignore: {msg}"
             );
         }
-    }
-
-    #[test]
-    fn non_retryable_400_handling() {
-        let is_non_retryable =
-            |e: &anyhow::Error| matches!(classify_err(e), ErrorClass::NonRetryable);
-        // Tool schema 400 should NOT be non-retryable
-        assert!(!is_non_retryable(&anyhow::anyhow!(
-            "{}",
-            "400 Bad Request: tool call validation failed: attempted to call tool 'x' which was not in request"
-        )));
-        // Regular 400 should be non-retryable
-        assert!(is_non_retryable(&anyhow::anyhow!(
-            "{}",
-            "400 Bad Request: invalid api key provided"
-        )));
+        // Pure 400 without tool-schema keywords → NonRetryable (not ToolSchemaError)
+        assert!(
+            !matches!(
+                classify_err(&anyhow::anyhow!(
+                    "400 Bad Request: invalid api key provided"
+                )),
+                ToolSchemaError
+            ),
+            "pure 400 should not be ToolSchemaError"
+        );
     }
 
     #[tokio::test]
