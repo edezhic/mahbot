@@ -447,8 +447,8 @@ pub struct SavedTabData {
 
 #[derive(Debug, Clone)]
 pub enum EditorMessage {
-    /// Workspace selected via the Home page picker (name, filesystem path).
-    WorkspaceSelected(String, String),
+    /// Workspace selected via the Home page picker (name, optional filesystem path).
+    WorkspaceSelected(String, Option<String>),
     /// A directory's listing was loaded from the filesystem.
     DirExpanded {
         dir_path: String,
@@ -2297,7 +2297,7 @@ impl EditorState {
     pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
         match msg {
             EditorMessage::WorkspaceSelected(ref name, ref path) => {
-                self.workspace_selected(name, path)
+                self.workspace_selected(name, path.as_deref())
             }
 
             EditorMessage::SavedTabsLoaded { tabs_data, r#gen } => {
@@ -3849,8 +3849,9 @@ impl EditorState {
     // ── Extracted handler methods ────────────────────────────────────
 
     /// Handle workspace selection — initializes file tree, loads tabs, sets up workspace.
-    fn workspace_selected(&mut self, name: &str, path: &str) -> Task<EditorMessage> {
-        if name.is_empty() && path.is_empty() {
+    fn workspace_selected(&mut self, name: &str, path: Option<&str>) -> Task<EditorMessage> {
+        // Accept personal workspaces when a path is provided.
+        if name.is_empty() && path.is_none() {
             self.selected_workspace_name = None;
             self.selected_workspace_path = None;
             self.clear_workspace_editor_state();
@@ -3861,7 +3862,7 @@ impl EditorState {
 
         // Update selected workspace.
         self.selected_workspace_name = Some(name.to_string());
-        self.selected_workspace_path = Some(path.to_string());
+        self.selected_workspace_path = path.map(|s| s.to_string());
 
         // Clear previous state.
         let r#gen = self.generation.wrapping_add(1);
@@ -3869,7 +3870,7 @@ impl EditorState {
         self.clear_workspace_editor_state();
 
         // ── Task 1: read root directory ───────────────────────
-        let root_path = path.to_string();
+        let root_path = path.unwrap_or_default().to_string();
         let root_gen = r#gen;
         let read_root_task = Task::perform(
             async move {
@@ -3887,7 +3888,7 @@ impl EditorState {
 
         // ── Task 2: load tabs from DB + file contents ────────
         let tab_ws = name.to_string();
-        let tab_path = path.to_string();
+        let tab_path = path.unwrap_or_default().to_string();
         let tab_gen = r#gen;
         let load_tabs_task = Task::perform(
             async move {
@@ -3954,7 +3955,7 @@ impl EditorState {
         tasks.push(load_tabs_task);
 
         // ── Task 3: refresh git status for file tree coloring ──
-        let git_path = path.to_string();
+        let git_path = path.unwrap_or_default().to_string();
         let git_task = Task::perform(
             async move { load_git_status(git_path).await },
             EditorMessage::GitStatusLoaded,

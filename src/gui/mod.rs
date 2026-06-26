@@ -1926,25 +1926,25 @@ fn open_url(url: &str) {
 /// personal workspace path.  If `ws_path` is `Some`, that takes priority;
 /// otherwise `personal_path` is used as a fallback ("Personal workspace — use
 /// resolved user path").  When `name` is empty and no path is available,
-/// returns two empty strings ("Personal workspace without a selected user —
+/// returns `None` for the path ("Personal workspace without a selected user —
 /// no path to send").  Logs a warning for non-empty names where neither path
 /// source is available (possible DB inconsistency).
 fn resolve_workspace_path(
     name: &str,
     ws_path: Option<&String>,
     personal_path: Option<&String>,
-) -> (String, String) {
+) -> (String, Option<String>) {
     if let Some(p) = ws_path {
-        (name.to_string(), p.clone())
+        (name.to_string(), Some(p.clone()))
     } else if let Some(p) = personal_path {
-        (name.to_string(), p.clone())
+        (name.to_string(), Some(p.clone()))
     } else if name.is_empty() {
-        (String::new(), String::new())
+        (String::new(), None)
     } else {
         tracing::warn!(
             workspace = name,
             "Workspace path not found in map — sending empty selection"
         );
-        (String::new(), String::new())
+        (String::new(), None)
     }
 }

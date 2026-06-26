@@ -86,8 +86,8 @@ struct WorkspaceShellState {
 pub enum ShellMessage {
     /// Terminal event forwarded from an embedded terminal widget.
     TerminalEvent(iced_term::Event),
-    /// Workspace selected via the Home page picker (name, filesystem path).
-    WorkspaceSelected(String, String),
+    /// Workspace selected via the Home page picker (name, optional filesystem path).
+    WorkspaceSelected(String, Option<String>),
     /// Select a tab by its index in the tab list.
     TabSelected(usize),
     /// Close a tab by its index.
@@ -412,13 +412,12 @@ impl ShellState {
     pub fn update(&mut self, msg: ShellMessage) -> Task<ShellMessage> {
         match msg {
             ShellMessage::WorkspaceSelected(name, path) => {
-                if name.is_empty() && path.is_empty() {
+                if name.is_empty() && path.is_none() {
                     self.selected_workspace_name = None;
                     return Task::none();
                 }
                 self.selected_workspace_name = Some(name.clone());
-                let ws_path = if path.is_empty() { None } else { Some(path) };
-                self.ensure_workspace_state(&name, ws_path);
+                self.ensure_workspace_state(&name, path);
                 Task::none()
             }
             ShellMessage::TerminalEvent(iced_term::Event::BackendCall(id, cmd)) => {
