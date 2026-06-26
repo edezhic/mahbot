@@ -1,7 +1,2 @@
 .DS_Store
-*.rlib
-rust_out
-test_must_use
-test_must_use2
 /target
-/models/
