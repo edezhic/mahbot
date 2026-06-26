@@ -874,21 +874,37 @@ mod tests {
         );
     }
 
+    struct Case {
+        command: &'static str,
+        allowed: bool,
+    }
+
     // ── Empty / whitespace ──────────────────────────────────────────
 
     #[test]
-    fn empty_command() {
-        ok("");
-    }
+    fn empty_whitespace_and_unknown() {
+        let cases = [
+            Case {
+                command: "",
+                allowed: true,
+            },
+            Case {
+                command: "   ",
+                allowed: true,
+            },
+            Case {
+                command: "some_obscure_tool --flag",
+                allowed: true,
+            },
+        ];
 
-    #[test]
-    fn whitespace_only() {
-        ok("   ");
-    }
-
-    #[test]
-    fn unknown_command_allowed() {
-        ok("some_obscure_tool --flag");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── Git allowlist ──────────────────────────────────────────────
@@ -904,65 +920,81 @@ mod tests {
     }
 
     #[test]
-    fn git_commit_rejected() {
-        assert_rejected("git commit -m test");
-    }
+    fn git_individual_commands() {
+        let cases = [
+            Case {
+                command: "git commit -m test",
+                allowed: false,
+            },
+            Case {
+                command: "git push",
+                allowed: false,
+            },
+            Case {
+                command: "git stash",
+                allowed: false,
+            },
+            Case {
+                command: "git stash list",
+                allowed: true,
+            },
+            Case {
+                command: "git merge feature",
+                allowed: false,
+            },
+            Case {
+                command: "git rebase main",
+                allowed: false,
+            },
+        ];
 
-    #[test]
-    fn git_push_rejected() {
-        assert_rejected("git push");
-    }
-
-    #[test]
-    fn git_stash_rejected() {
-        assert_rejected("git stash");
-    }
-
-    #[test]
-    fn git_stash_list_allowed() {
-        ok("git stash list");
-    }
-
-    #[test]
-    fn git_merge_rejected() {
-        assert_rejected("git merge feature");
-    }
-
-    #[test]
-    fn git_rebase_rejected() {
-        assert_rejected("git rebase main");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── Git --bare flag (regression: was skipped as a git global flag) ─
 
     #[test]
-    fn git_bare_status_allowed() {
-        ok("git --bare status");
-    }
+    fn git_bare_flag() {
+        let cases = [
+            Case {
+                command: "git --bare status",
+                allowed: true,
+            },
+            Case {
+                command: "git --bare log --oneline",
+                allowed: true,
+            },
+            Case {
+                command: "git --bare diff",
+                allowed: true,
+            },
+            Case {
+                command: "git --bare push",
+                allowed: false,
+            },
+            Case {
+                command: "git --bare commit -m test",
+                allowed: false,
+            },
+            Case {
+                command: "git --bare reset --hard",
+                allowed: false,
+            },
+        ];
 
-    #[test]
-    fn git_bare_log_allowed() {
-        ok("git --bare log --oneline");
-    }
-
-    #[test]
-    fn git_bare_diff_allowed() {
-        ok("git --bare diff");
-    }
-
-    #[test]
-    fn git_bare_push_rejected() {
-        assert_rejected("git --bare push");
-    }
-
-    #[test]
-    fn git_bare_commit_rejected() {
-        assert_rejected("git --bare commit -m test");
-    }
-
-    #[test]
-    fn git_bare_reset_rejected() {
-        assert_rejected("git --bare reset --hard");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── Cargo allowlist ────────────────────────────────────────────
@@ -975,40 +1007,48 @@ mod tests {
     fn all_cargo_safe_subcommands_allowed() {
         for subcmd in CARGO_SAFE_SUBCOMMANDS {
             if *subcmd == "fmt" {
-                continue; // requires --check flag — tested via cargo_fmt_check_allowed
+                continue; // requires --check flag — tested via cargo_individual_commands
             }
             ok(&format!("cargo {subcmd}"));
         }
     }
 
     #[test]
-    fn cargo_clippy_fix_rejected() {
-        assert_rejected("cargo clippy --fix");
-    }
+    fn cargo_individual_commands() {
+        let cases = [
+            Case {
+                command: "cargo clippy --fix",
+                allowed: false,
+            },
+            Case {
+                command: "cargo clippy -- --fix",
+                allowed: true,
+            },
+            Case {
+                command: "cargo fmt",
+                allowed: false,
+            },
+            Case {
+                command: "cargo fmt --check",
+                allowed: true,
+            },
+            Case {
+                command: "cargo fmt -- --check",
+                allowed: true,
+            },
+            Case {
+                command: "cargo fix",
+                allowed: false,
+            },
+        ];
 
-    #[test]
-    fn cargo_clippy_fix_after_dd_allowed() {
-        ok("cargo clippy -- --fix");
-    }
-
-    #[test]
-    fn cargo_fmt_rejected() {
-        assert_rejected("cargo fmt");
-    }
-
-    #[test]
-    fn cargo_fmt_check_allowed() {
-        ok("cargo fmt --check");
-    }
-
-    #[test]
-    fn cargo_fmt_dd_check_allowed() {
-        ok("cargo fmt -- --check");
-    }
-
-    #[test]
-    fn cargo_fix_rejected() {
-        assert_rejected("cargo fix");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── Unconditional rejections ──────────────────────────────────
@@ -1053,164 +1093,250 @@ mod tests {
     // ── Flag-dependent tests ──────────────────────────────────────
 
     #[test]
-    fn sed_stdout_allowed() {
-        ok("sed 's/a/b/' file");
-    }
+    fn flag_dependent_tests() {
+        let cases = [
+            // sed
+            Case {
+                command: "sed 's/a/b/' file",
+                allowed: true,
+            },
+            Case {
+                command: "sed -i 's/a/b/' file",
+                allowed: false,
+            },
+            Case {
+                command: "sed -i.bak 's/a/b/' file",
+                allowed: false,
+            },
+            // awk
+            Case {
+                command: "awk '{print $1}' file",
+                allowed: true,
+            },
+            Case {
+                command: "awk -i inplace '{print $1}' file",
+                allowed: false,
+            },
+            // dd
+            Case {
+                command: "dd if=/dev/zero bs=1 count=10",
+                allowed: true,
+            },
+            Case {
+                command: "dd if=/dev/zero of=file bs=1 count=10",
+                allowed: false,
+            },
+            // curl
+            Case {
+                command: "curl https://example.com",
+                allowed: true,
+            },
+            Case {
+                command: "curl -o file https://example.com",
+                allowed: false,
+            },
+            Case {
+                command: "curl -O https://example.com/file",
+                allowed: false,
+            },
+            // tar
+            Case {
+                command: "tar -tf archive.tar.gz",
+                allowed: true,
+            },
+            Case {
+                command: "tar -xzf archive.tar.gz",
+                allowed: false,
+            },
+            Case {
+                command: "tar -czf archive.tar.gz dir/",
+                allowed: false,
+            },
+            Case {
+                command: "tar --list -f archive.tar.gz",
+                allowed: true,
+            },
+            // base64
+            Case {
+                command: "base64 -d file.txt",
+                allowed: true,
+            },
+            Case {
+                command: "base64 -d -o out.bin file.txt",
+                allowed: false,
+            },
+            Case {
+                command: "base64 --decode --output out.bin file.txt",
+                allowed: false,
+            },
+        ];
 
-    #[test]
-    fn sed_inplace_rejected() {
-        assert_rejected("sed -i 's/a/b/' file");
-    }
-
-    #[test]
-    fn sed_inplace_bak_rejected() {
-        assert_rejected("sed -i.bak 's/a/b/' file");
-    }
-
-    #[test]
-    fn awk_stdout_allowed() {
-        ok("awk '{print $1}' file");
-    }
-
-    #[test]
-    fn awk_inplace_rejected() {
-        assert_rejected("awk -i inplace '{print $1}' file");
-    }
-
-    #[test]
-    fn dd_stdout_allowed() {
-        ok("dd if=/dev/zero bs=1 count=10");
-    }
-
-    #[test]
-    fn dd_of_rejected() {
-        assert_rejected("dd if=/dev/zero of=file bs=1 count=10");
-    }
-
-    #[test]
-    fn curl_allowed() {
-        ok("curl https://example.com");
-    }
-
-    #[test]
-    fn curl_output_rejected() {
-        assert_rejected("curl -o file https://example.com");
-    }
-
-    #[test]
-    fn curl_remote_name_rejected() {
-        assert_rejected("curl -O https://example.com/file");
-    }
-
-    #[test]
-    fn tar_list_allowed() {
-        ok("tar -tf archive.tar.gz");
-    }
-
-    #[test]
-    fn tar_extract_rejected() {
-        assert_rejected("tar -xzf archive.tar.gz");
-    }
-
-    #[test]
-    fn tar_create_rejected() {
-        assert_rejected("tar -czf archive.tar.gz dir/");
-    }
-
-    #[test]
-    fn base64_decode_stdout_allowed() {
-        ok("base64 -d file.txt");
-    }
-
-    #[test]
-    fn base64_decode_with_output_rejected() {
-        assert_rejected("base64 -d -o out.bin file.txt");
-    }
-
-    #[test]
-    fn base64_decode_long_output_rejected() {
-        assert_rejected("base64 --decode --output out.bin file.txt");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── Chained commands ───────────────────────────────────────────
 
     #[test]
-    fn chained_all_safe() {
-        ok("cargo check && cargo test");
-    }
+    fn chained_commands() {
+        let cases = [
+            Case {
+                command: "cargo check && cargo test",
+                allowed: true,
+            },
+            Case {
+                command: "cargo check && rm file",
+                allowed: false,
+            },
+            Case {
+                command: "git status && cargo fmt",
+                allowed: false,
+            },
+            Case {
+                command: "git log --oneline | head -20",
+                allowed: true,
+            },
+            Case {
+                command: "cargo check; rm file",
+                allowed: false,
+            },
+        ];
 
-    #[test]
-    fn chained_second_mutates() {
-        assert_rejected("cargo check && rm file");
-    }
-
-    #[test]
-    fn chained_second_mutates_fmt() {
-        assert_rejected("git status && cargo fmt");
-    }
-
-    #[test]
-    fn piped_all_safe() {
-        ok("git log --oneline | head -20");
-    }
-
-    #[test]
-    fn semicolon_second_mutates() {
-        assert_rejected("cargo check; rm file");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── Redirect tests ─────────────────────────────────────────────
 
     #[test]
-    fn redirect_to_workspace_rejected() {
-        assert_rejected("echo hello > file.txt");
-    }
+    fn redirect_tests() {
+        let cases = [
+            // Original redirect tests
+            Case {
+                command: "echo hello > file.txt",
+                allowed: false,
+            },
+            Case {
+                command: "echo hello > /dev/null",
+                allowed: true,
+            },
+            Case {
+                command: "echo hello > /tmp/output.txt",
+                allowed: true,
+            },
+            Case {
+                command: "cmd 2>&1",
+                allowed: true,
+            },
+            Case {
+                command: "echo \"hello > world\"",
+                allowed: true,
+            },
+            Case {
+                command: "echo hello >> /tmp/log",
+                allowed: true,
+            },
+            Case {
+                command: "echo hello >| /tmp/force",
+                allowed: true,
+            },
+            Case {
+                command: "cargo build > /dev/null 2>&1",
+                allowed: true,
+            },
+            // /var/tmp redirect tests
+            Case {
+                command: "echo hello > /var/tmp/output.txt",
+                allowed: true,
+            },
+            Case {
+                command: "echo hello >> /var/tmp/log",
+                allowed: true,
+            },
+            // Redirect operators refactor tests
+            Case {
+                command: "cmd > output.txt",
+                allowed: false,
+            },
+            Case {
+                command: "cmd 1>&2",
+                allowed: true,
+            },
+            Case {
+                command: "cmd 2> /tmp/errors.log",
+                allowed: true,
+            },
+            Case {
+                command: "cmd 2> errors.log",
+                allowed: false,
+            },
+            Case {
+                command: "cmd >&2",
+                allowed: false,
+            },
+            Case {
+                command: "echo \\> /tmp/file",
+                allowed: true,
+            },
+            Case {
+                command: "echo \\>",
+                allowed: true,
+            },
+            Case {
+                command: "echo \\\\\\> file",
+                allowed: true,
+            },
+            Case {
+                command: "echo \"> /tmp/foo",
+                allowed: true,
+            },
+            Case {
+                command: "echo '> /tmp/foo",
+                allowed: true,
+            },
+        ];
 
-    #[test]
-    fn redirect_to_devnull_allowed() {
-        ok("echo hello > /dev/null");
-    }
-
-    #[test]
-    fn redirect_to_tmp_allowed() {
-        ok("echo hello > /tmp/output.txt");
-    }
-
-    #[test]
-    fn stderr_to_stdout_allowed() {
-        ok("cmd 2>&1");
-    }
-
-    #[test]
-    fn redirect_in_quotes_allowed() {
-        ok("echo \"hello > world\"");
-    }
-
-    #[test]
-    fn append_to_tmp_allowed() {
-        ok("echo hello >> /tmp/log");
-    }
-
-    #[test]
-    fn noclobber_to_tmp_allowed() {
-        ok("echo hello >| /tmp/force");
-    }
-
-    #[test]
-    fn stdout_stderr_to_devnull() {
-        ok("cargo build > /dev/null 2>&1");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── mktemp (temp dir, allowed) ────────────────────────────────
 
     #[test]
     fn mktemp_allowed() {
-        ok("mktemp");
-    }
+        let cases = [
+            Case {
+                command: "mktemp",
+                allowed: true,
+            },
+            Case {
+                command: "mktemp -t mahbot.XXXXXX",
+                allowed: true,
+            },
+        ];
 
-    #[test]
-    fn mktemp_with_template_allowed() {
-        ok("mktemp -t mahbot.XXXXXX");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── Prefix stripping (P0) ──────────────────────────────────────
@@ -1227,11 +1353,6 @@ mod tests {
     /// - `git status` — a safe git command that must be allowed.
     #[test]
     fn shell_prefixes_delegating() {
-        struct Case {
-            command: &'static str,
-            allowed: bool,
-        }
-
         let cases = [
             Case {
                 command: "rm file",
@@ -1264,188 +1385,113 @@ mod tests {
         }
     }
 
+    // ── Prefix / env stripping regression tests (P0) ──────────────
+
     #[test]
-    fn sudo_flag_rm_rejected() {
-        assert_rejected("sudo -E rm file");
+    fn prefix_bypass_and_env() {
+        let cases = [
+            // Prefix stripping with flags
+            Case {
+                command: "sudo -E rm file",
+                allowed: false,
+            },
+            Case {
+                command: "sudo git status",
+                allowed: true,
+            },
+            Case {
+                command: "sudo cargo check",
+                allowed: true,
+            },
+            // Git prefix bypass
+            Case {
+                command: "sudo git push",
+                allowed: false,
+            },
+            Case {
+                command: "env git push",
+                allowed: false,
+            },
+            Case {
+                command: "GIT_DIR=/tmp sudo git push",
+                allowed: false,
+            },
+            Case {
+                command: "sudo git stash list",
+                allowed: true,
+            },
+            Case {
+                command: "cd",
+                allowed: true,
+            },
+            Case {
+                command: "cd ..",
+                allowed: true,
+            },
+            // VAR=val stripping
+            Case {
+                command: "FOO=bar rm file",
+                allowed: false,
+            },
+            Case {
+                command: "VAR=val sudo rm -rf /",
+                allowed: false,
+            },
+            Case {
+                command: "GIT_DIR=/tmp git status",
+                allowed: true,
+            },
+        ];
+
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
-    #[test]
-    fn sudo_git_status_allowed() {
-        ok("sudo git status");
-    }
+    // ── Script interpreters & container tools: read-only usage (not blocked) ─
 
     #[test]
-    fn sudo_cargo_check_allowed() {
-        ok("sudo cargo check");
-    }
+    fn script_and_container_tools() {
+        let cases = [
+            // Script interpreters
+            Case {
+                command: "python3 --version",
+                allowed: true,
+            },
+            Case {
+                command: "python3 -c \"print('hello')\"",
+                allowed: true,
+            },
+            Case {
+                command: "node -e \"console.log('hi')\"",
+                allowed: true,
+            },
+            Case {
+                command: "bash -c \"echo hello\"",
+                allowed: true,
+            },
+            // Container tools
+            Case {
+                command: "docker ps",
+                allowed: true,
+            },
+            Case {
+                command: "kubectl get pods",
+                allowed: true,
+            },
+        ];
 
-    // ── Git prefix bypass regression tests (P0) ────────────────────
-
-    #[test]
-    fn sudo_git_push_rejected() {
-        assert_rejected("sudo git push");
-    }
-
-    #[test]
-    fn env_git_push_rejected() {
-        assert_rejected("env git push");
-    }
-
-    #[test]
-    fn env_sudo_git_push_rejected() {
-        assert_rejected("GIT_DIR=/tmp sudo git push");
-    }
-
-    #[test]
-    fn sudo_git_stash_list_allowed() {
-        ok("sudo git stash list");
-    }
-
-    #[test]
-    fn pure_prefix_allowed() {
-        ok("cd"); // no command after prefix — harmless
-    }
-
-    #[test]
-    fn cd_some_dir_allowed() {
-        ok("cd .."); // builtin, no real command extracted
-    }
-
-    // ── VAR=val stripping (P0) ─────────────────────────────────────
-
-    #[test]
-    fn env_var_rm_rejected() {
-        assert_rejected("FOO=bar rm file");
-    }
-
-    #[test]
-    fn env_var_sudo_rm_rejected() {
-        assert_rejected("VAR=val sudo rm -rf /");
-    }
-
-    #[test]
-    fn env_var_git_status_allowed() {
-        ok("GIT_DIR=/tmp git status");
-    }
-
-    // ── Script interpreters: read-only usage (not blocked) ─────────
-
-    #[test]
-    fn python3_version_allowed() {
-        ok("python3 --version");
-    }
-
-    #[test]
-    fn python3_print_allowed() {
-        ok("python3 -c \"print('hello')\"");
-    }
-
-    #[test]
-    fn node_eval_allowed() {
-        ok("node -e \"console.log('hi')\"");
-    }
-
-    #[test]
-    fn bash_echo_allowed() {
-        ok("bash -c \"echo hello\"");
-    }
-
-    // ── Container tools: read-only usage (not blocked) ──────────────
-
-    #[test]
-    fn docker_ps_allowed() {
-        ok("docker ps");
-    }
-
-    #[test]
-    fn kubectl_get_allowed() {
-        ok("kubectl get pods");
-    }
-
-    // ── tar --list (P9) ────────────────────────────────────────────
-
-    #[test]
-    fn tar_long_list_allowed() {
-        ok("tar --list -f archive.tar.gz");
-    }
-
-    // ── Redirect /var/tmp (P9) ─────────────────────────────────────
-
-    #[test]
-    fn redirect_to_var_tmp_allowed() {
-        ok("echo hello > /var/tmp/output.txt");
-    }
-
-    #[test]
-    fn append_to_var_tmp_allowed() {
-        ok("echo hello >> /var/tmp/log");
-    }
-
-    // ── Redirect operators added for has_disallowed_redirect refactor ──
-    //
-    // These test previously-uncovered redirect operators and edge cases.
-    // `has_disallowed_redirect` was refactored to use a shared quote-tracking
-    // helper (`check_outside_quotes`) and a char iterator (fixing a pre-existing
-    // multi-byte UTF-8 bug where `bytes[i] as char` produced garbage for
-    // non-ASCII).
-
-    #[test]
-    fn redirect_bare_gt_rejected() {
-        // Bare > redirect to relative path = disallowed
-        assert_rejected("cmd > output.txt");
-    }
-
-    #[test]
-    fn redirect_fd_merge_stderr_to_stdout_allowed() {
-        // 1>&2 is a pure fd merge — same as 2>&1 but reversed
-        ok("cmd 1>&2");
-    }
-
-    #[test]
-    fn redirect_2gt_to_tmp_allowed() {
-        ok("cmd 2> /tmp/errors.log");
-    }
-
-    #[test]
-    fn redirect_2gt_to_workspace_rejected() {
-        assert_rejected("cmd 2> errors.log");
-    }
-
-    #[test]
-    fn redirect_gt_ampersand_rejected() {
-        // `>&2` redirects stdout to stderr (same fd, but `>&` with
-        // non-temp target = not explicitly allowed)
-        assert_rejected("cmd >&2");
-    }
-
-    #[test]
-    fn backslash_escaped_redirect_not_detected() {
-        // echo \> /tmp/file — the > is backslash-escaped, not a redirect
-        ok("echo \\> /tmp/file");
-    }
-
-    #[test]
-    fn backslash_escaped_redirect_not_detected_no_target() {
-        // echo \> — bare but escaped, not a redirect
-        ok("echo \\>");
-    }
-
-    #[test]
-    fn multiple_consecutive_backslash_escapes() {
-        // \\\\> — double backslash escapes \, then \ escapes >, so > is not a redirect
-        ok("echo \\\\\\> file");
-    }
-
-    #[test]
-    fn unclosed_double_quote_hides_redirect() {
-        // redirect operator inside unclosed double quotes = not detected
-        ok("echo \"> /tmp/foo");
-    }
-
-    #[test]
-    fn unclosed_single_quote_hides_redirect() {
-        // redirect operator inside unclosed single quotes = not detected
-        ok("echo '> /tmp/foo");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     // ── extract_git_subcommand unit tests ──────────────────────────
@@ -1520,7 +1566,7 @@ mod tests {
                 expected: "status",
             },
             Case {
-                name: "with sudo skipped — Shell prefixes like `sudo` are skipped by `find_first_command_word_index`, so \"git\" is correctly located",
+                name: "with sudo skipped",
                 input: "sudo git status",
                 expected: "status",
             },
@@ -1530,12 +1576,12 @@ mod tests {
                 expected: "status",
             },
             Case {
-                name: "env and sudo — Combined env assignment + shell prefix",
+                name: "env and sudo",
                 input: "GIT_DIR=/tmp sudo git status",
                 expected: "status",
             },
             Case {
-                name: "sudo push — Mutating subcommand with shell prefix",
+                name: "sudo push",
                 input: "sudo git push",
                 expected: "push",
             },
@@ -1556,39 +1602,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn heredoc_to_tmp_with_rust_body_allowed() {
-        ok("cat > /tmp/test_match.rs << 'EOF'\nfn test() { match x { \"a\" => 1, _ => 0 } }\nEOF");
-    }
+    // ── Temp / scratch directory tests ─────────────────────────────
 
     #[test]
-    fn redirect_to_private_tmp_allowed() {
-        ok("echo hello > /private/tmp/mahbot_test_out.txt");
-    }
+    fn temp_scratch_tests() {
+        let cases = [
+            Case {
+                command: "cat > /tmp/test_match.rs << 'EOF'\nfn test() { match x { \"a\" => 1, _ => 0 } }\nEOF",
+                allowed: true,
+            },
+            Case {
+                command: "echo hello > /private/tmp/mahbot_test_out.txt",
+                allowed: true,
+            },
+            Case {
+                command: "tee /tmp/scratch.log",
+                allowed: true,
+            },
+            Case {
+                command: "touch /tmp/scratch.txt",
+                allowed: true,
+            },
+            Case {
+                command: "mkdir -p /tmp/scratch_dir",
+                allowed: true,
+            },
+            Case {
+                command: "tee output.log",
+                allowed: false,
+            },
+            Case {
+                command: "rm /tmp/scratch.txt",
+                allowed: false,
+            },
+        ];
 
-    #[test]
-    fn tee_under_tmp_allowed() {
-        ok("tee /tmp/scratch.log");
-    }
-
-    #[test]
-    fn touch_under_tmp_allowed() {
-        ok("touch /tmp/scratch.txt");
-    }
-
-    #[test]
-    fn mkdir_p_under_tmp_allowed() {
-        ok("mkdir -p /tmp/scratch_dir");
-    }
-
-    #[test]
-    fn tee_workspace_rejected() {
-        assert_rejected("tee output.log");
-    }
-
-    #[test]
-    fn rm_under_tmp_still_rejected() {
-        assert_rejected("rm /tmp/scratch.txt");
+        for case in &cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
     }
 
     #[test]
