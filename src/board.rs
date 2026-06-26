@@ -1714,17 +1714,17 @@ impl<'a> TicketBuilder<'a> {
 
     /// Create the ticket with the accumulated parameters.
     pub(crate) async fn create(self) -> anyhow::Result<String> {
-        let (store, params) = self.into_params();
+        let (store, params) = self.into_parts();
         store.create_ticket(&params).await
     }
 
     /// Supersede `supersede_id` with this ticket (calls `supersede_and_create`).
     pub(crate) async fn supersede(self, supersede_id: &str) -> anyhow::Result<String> {
-        let (store, params) = self.into_params();
+        let (store, params) = self.into_parts();
         store.supersede_and_create(supersede_id, &params).await
     }
 
-    fn into_params(self) -> (&'a BoardStore, TicketParams) {
+    fn into_parts(self) -> (&'a BoardStore, TicketParams) {
         (
             self.store,
             TicketParams {
