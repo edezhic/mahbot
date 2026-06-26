@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6004,41 +6005,15 @@ impl EditorState {
         self.file_mtimes.remove(&target.abs_path);
         self.deleted_file_toasted.remove(&target.abs_path);
 
-        let abs_path = target.abs_path.clone();
-        let parent_dir = {
-            let path = Path::new(&target.path);
-            path.parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default()
-        };
-        let ws_path = self
-            .selected_workspace_path
-            .as_deref()
-            .unwrap_or_default()
-            .to_string();
-        let r#gen = self.generation.wrapping_add(1);
-        self.generation = r#gen;
-        // Register the generation so DirExpanded handler accepts the result.
-        self.dir_generations.insert(parent_dir.clone(), r#gen);
-
-        Task::perform(
-            async move {
-                // Delete the file.
-                if let Err(e) = tokio::fs::remove_file(&abs_path).await {
-                    return EditorMessage::Toast(super::ToastMessage::Error(format!(
-                        "Failed to delete file: {e}"
-                    )));
-                }
-                // Re-read parent directory.
-                let entries = read_directory_entries(&ws_path, &parent_dir).await;
-                EditorMessage::DirExpanded {
-                    dir_path: parent_dir,
-                    r#gen,
-                    entries,
-                    quiet: false,
-                }
+        self.perform_delete_with_refresh(
+            target.abs_path.clone(),
+            &target.path,
+            "file",
+            |abs_path| async move {
+                tokio::fs::remove_file(&abs_path)
+                    .await
+                    .map_err(|e| e.to_string())
             },
-            |msg| msg,
         )
     }
 
@@ -6075,9 +6050,38 @@ impl EditorState {
         self.deleted_file_toasted
             .retain(|path| path != &target.abs_path && !path.starts_with(&abs_prefix));
 
-        let abs_path = target.abs_path.clone();
+        self.perform_delete_with_refresh(
+            target.abs_path.clone(),
+            &target.path,
+            "directory",
+            |abs_path| async move {
+                tokio::fs::remove_dir_all(&abs_path)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+        )
+    }
+
+    /// Shared preamble for deleting a file or directory: compute parent directory,
+    /// bump generation, then run the async delete operation, re-read the parent
+    /// directory, and emit a [`DirExpanded`] message.
+    ///
+    /// `delete_op` receives the absolute path and returns `Result<(), String>`.
+    /// `error_label` is used in the toast message on failure (e.g. "file" or
+    /// "directory").
+    fn perform_delete_with_refresh<D, F>(
+        &mut self,
+        abs_path: String,
+        rel_path: &str,
+        error_label: &'static str,
+        delete_op: D,
+    ) -> Task<EditorMessage>
+    where
+        D: FnOnce(String) -> F + 'static + Send,
+        F: Future<Output = Result<(), String>> + 'static + Send,
+    {
         let parent_dir = {
-            let path = Path::new(&target.path);
+            let path = Path::new(rel_path);
             path.parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
@@ -6094,10 +6098,9 @@ impl EditorState {
 
         Task::perform(
             async move {
-                // Remove the directory and all contents.
-                if let Err(e) = tokio::fs::remove_dir_all(&abs_path).await {
+                if let Err(e) = delete_op(abs_path).await {
                     return EditorMessage::Toast(super::ToastMessage::Error(format!(
-                        "Failed to delete directory: {e}"
+                        "Failed to delete {error_label}: {e}"
                     )));
                 }
                 // Re-read parent directory.
