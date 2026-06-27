@@ -869,8 +869,8 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> Result<(usize, usize), St
         Ok(out) => {
             let parts: Vec<&str> = out.trim().split('\t').collect();
             if parts.len() == 2 {
-                let behind = parts[0].parse::<usize>().unwrap_or(0);
-                let ahead = parts[1].parse::<usize>().unwrap_or(0);
+                let ahead = parts[0].parse::<usize>().unwrap_or(0);
+                let behind = parts[1].parse::<usize>().unwrap_or(0);
                 Ok((behind, ahead))
             } else {
                 Ok((0, 0))
