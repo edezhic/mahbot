@@ -1,6 +1,6 @@
 //! Git diff parsing — parse unified diff output into structured data.
 //!
-//! Handles `git diff HEAD --no-color --find-renames` output plus
+//! Handles `git diff HEAD --no-color --find-renames` or `git show -m` output plus
 //! untracked files from `git status --porcelain`.
 
 use std::collections::HashSet;
@@ -236,7 +236,7 @@ fn handle_diff_content_line(
     });
 }
 
-/// Parse `git diff HEAD --no-color --find-renames` output.
+/// Parse unified diff output (from `git diff HEAD` or `git show -m`).
 #[must_use]
 pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();
