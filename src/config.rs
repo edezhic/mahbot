@@ -1226,7 +1226,7 @@ mod tests {
 
         let mut c = vec![];
         RoleConfig::upsert(&mut c, "engineer".into(), |c| {
-            c.model = Some("gpt-4".into())
+            c.model = Some("gpt-4".into());
         });
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].role, "engineer");
@@ -1242,7 +1242,7 @@ mod tests {
     fn upsert_reasoning_effort() {
         let mut c = vec![role_config("engineer", Some("gpt-4"), Some("low"))];
         RoleConfig::upsert(&mut c, "engineer".into(), |c| {
-            c.reasoning_effort = Some("high".into())
+            c.reasoning_effort = Some("high".into());
         });
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].reasoning_effort, Some("high".into()));
@@ -1250,7 +1250,7 @@ mod tests {
 
         let mut c = vec![];
         RoleConfig::upsert(&mut c, "engineer".into(), |c| {
-            c.reasoning_effort = Some("high".into())
+            c.reasoning_effort = Some("high".into());
         });
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].role, "engineer");
@@ -1268,7 +1268,7 @@ mod tests {
     fn upsert_provider_order() {
         let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
         ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
-            mr.provider_order = Some("Anthropic".into())
+            mr.provider_order = Some("Anthropic".into());
         });
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].provider_order, Some("Anthropic".into()));
@@ -1276,7 +1276,7 @@ mod tests {
 
         let mut r = vec![];
         ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
-            mr.provider_order = Some("OpenAi".into())
+            mr.provider_order = Some("OpenAi".into());
         });
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].model, "gpt-4");
@@ -1303,7 +1303,7 @@ mod tests {
 
         let mut r = vec![];
         ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
-            mr.allow_fallbacks = Some(false)
+            mr.allow_fallbacks = Some(false);
         });
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].model, "gpt-4");
@@ -1329,25 +1329,25 @@ mod tests {
 
         // Each upsert targets exactly one entry by key.
         RoleConfig::upsert(&mut configs, "engineer".into(), |c| {
-            c.model = Some("model-c".into())
+            c.model = Some("model-c".into());
         });
         assert_eq!(configs[0].model, Some("model-c".into()));
         assert_eq!(configs[1].model, Some("model-b".into()));
 
         RoleConfig::upsert(&mut configs, "manager".into(), |c| {
-            c.reasoning_effort = Some("low".into())
+            c.reasoning_effort = Some("low".into());
         });
         assert_eq!(configs[1].reasoning_effort, Some("low".into()));
         assert_eq!(configs[0].reasoning_effort, None);
 
         ModelRouting::upsert(&mut routings, "gpt-4".into(), |mr| {
-            mr.provider_order = Some("Google".into())
+            mr.provider_order = Some("Google".into());
         });
         assert_eq!(routings[0].provider_order, Some("Google".into()));
         assert_eq!(routings[1].provider_order, Some("Anthropic".into()));
 
         ModelRouting::upsert(&mut routings, "claude-3".into(), |mr| {
-            mr.allow_fallbacks = Some(false)
+            mr.allow_fallbacks = Some(false);
         });
         assert_eq!(routings[1].allow_fallbacks, Some(false));
         assert_eq!(routings[0].allow_fallbacks, None);
