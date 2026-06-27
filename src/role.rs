@@ -33,12 +33,9 @@ use crate::Role;
 /// * `display_label` empty string sentinel (struct update syntax)
 /// * `default_model` and `default_reasoning_effort` non-empty (struct update)
 /// * [`Role::tools()`] non-empty for every variant
-#[allow(clippy::struct_excessive_bools)]
 pub struct RoleInfo {
     /// Whether this role has a discovery prompt for workspace exploration.
     pub has_discovery: bool,
-    /// Whether users can explicitly select this role (via `/agent` command).
-    pub selectable: bool,
     /// Model temperature for LLM calls for this role.
     pub temperature: f32,
     /// Whether this role requires a vision-capable (multimodal) model.
@@ -74,7 +71,6 @@ pub struct RoleInfo {
 /// concise and make future field additions cheap.
 const BASE_ROLE_INFO: RoleInfo = RoleInfo {
     has_discovery: true,
-    selectable: false,
     temperature: 0.1,
     requires_multimodal: false,
     badge_fg: (0.0, 0.0, 0.0),
@@ -92,7 +88,6 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
 pub const fn role_info(role: &Role) -> &'static RoleInfo {
     match role {
         Role::Manager => &RoleInfo {
-            selectable: true,
             temperature: 0.01,
             badge_fg: (0.816, 0.635, 0.082),
             default_model: "deepseek/deepseek-v4-pro",
@@ -100,13 +95,11 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             ..BASE_ROLE_INFO
         },
         Role::Engineer => &RoleInfo {
-            selectable: true,
             badge_fg: (0.855, 0.439, 0.173),
             display_label: "Engineer",
             ..BASE_ROLE_INFO
         },
         Role::Analyst => &RoleInfo {
-            selectable: true,
             temperature: 0.3,
             badge_fg: (0.263, 0.522, 0.745),
             display_label: "Analyst",
@@ -138,7 +131,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         },
         Role::Artist => &RoleInfo {
             has_discovery: false,
-            selectable: true,
             requires_multimodal: true,
             badge_fg: (0.808, 0.365, 0.592),
             default_model: "qwen/qwen3.6-plus",
@@ -191,25 +183,10 @@ impl Role {
         self.into()
     }
 
-    /// Whether users can explicitly select this role.
-    #[must_use]
-    pub const fn is_selectable(&self) -> bool {
-        role_info(self).selectable
-    }
-
     /// Whether this role requires a vision-capable (multimodal) model.
     #[must_use]
     pub const fn requires_multimodal(&self) -> bool {
         role_info(self).requires_multimodal
-    }
-
-    /// Roles that users can switch between via `/agent` command.
-    #[must_use]
-    pub fn selectable_roles() -> Vec<&'static str> {
-        <Role as strum::IntoEnumIterator>::iter()
-            .filter(Role::is_selectable)
-            .map(|r| r.as_str())
-            .collect()
     }
 
     /// All roles as an iterator.
