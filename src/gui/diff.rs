@@ -202,8 +202,6 @@ pub struct DiffState {
     /// Per-file pre-computed cosmic_text buffer data. Built in `update()` when
     /// diff data or file selection changes; consumed by `view()`.
     file_buffers: Vec<DiffFileBuffer>,
-    /// Generation at which file_buffers were built (compared against self.generation).
-    buffers_generation: u64,
     /// Commit message typed by the user.
     commit_message: String,
     /// Whether a commit is in-flight.
@@ -234,7 +232,6 @@ impl DiffState {
             file_tree: FileTree::new(Id::new("diff_tree_panel")),
             selected_file: None,
             file_buffers: Vec::new(),
-            buffers_generation: 0,
             commit_message: String::new(),
             committing: false,
             current_commit_ref: None,
@@ -1358,7 +1355,6 @@ impl DiffState {
             self.selected_file.as_deref(),
             Some((MAX_HUNKS, MAX_DIFF_LINES)),
         );
-        self.buffers_generation = self.generation;
     }
 }
 
