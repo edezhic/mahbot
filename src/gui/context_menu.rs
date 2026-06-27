@@ -326,7 +326,7 @@ fn item_index_from_y(rel_y: f32, item_count: usize) -> Option<usize> {
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let idx = (rel_y / MENU_ITEM_HEIGHT) as usize;
-    if idx < item_count { Some(idx) } else { None }
+    (idx < item_count).then_some(idx)
 }
 
 impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
