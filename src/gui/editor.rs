@@ -2070,7 +2070,7 @@ impl EditorState {
     /// If the file is already open in a tab, switches to that tab.
     /// Otherwise loads the file and adds a new tab.
     fn open_file_in_editor(&mut self, path: &str) -> Task<EditorMessage> {
-        let Some(ref ws) = self.selected_workspace_path.clone() else {
+        let Some(ws) = self.workspace_root() else {
             return Task::none();
         };
         let abs_path = if path.starts_with('/') {
@@ -2353,13 +2353,9 @@ impl EditorState {
                 // Resolve tree-relative path against workspace root so that
                 // file operations and tab paths are absolute (matching restored
                 // tabs) and work regardless of MahBot's CWD.
-                let Some(_ws) = self.workspace_root() else {
-                    tracing::error!("SelectFile without workspace selected");
+                let Some(abs_path) = self.abs_path(&path) else {
                     return Task::none();
                 };
-                let abs_path = self
-                    .abs_path(&path)
-                    .expect("SelectFile: selected_workspace_path already guarded above");
 
                 if let Some(pos) = self.tabs.iter().position(|t| t.path == abs_path) {
                     return self.switch_to_tab(pos);
@@ -2687,12 +2683,9 @@ impl EditorState {
             EditorMessage::DeleteFileRequested(path) => {
                 // Cancel inline rename if open (mutual exclusion).
                 self.rename_target = None;
-                let Some(ref _ws) = self.selected_workspace_path else {
+                let Some(abs_path) = self.abs_path(&path) else {
                     return Task::none();
                 };
-                let abs_path = self
-                    .abs_path(&path)
-                    .expect("DeleteFileRequested: selected_workspace_path already guarded above");
                 self.delete_confirm = Some(DeleteConfirmTarget {
                     path,
                     is_dir: false,
@@ -2711,12 +2704,9 @@ impl EditorState {
                         "Cannot delete root directory".into(),
                     )));
                 }
-                let Some(ref _ws) = self.selected_workspace_path else {
+                let Some(abs_path) = self.abs_path(&path) else {
                     return Task::none();
                 };
-                let abs_path = self.abs_path(&path).expect(
-                    "DeleteDirectoryRequested: selected_workspace_path already guarded above",
-                );
                 let abs_prefix = format!("{abs_path}/");
 
                 // Count open tabs that are inside this directory.
@@ -2962,10 +2952,9 @@ impl EditorState {
                 dir_entries,
                 rename_gen,
             } => {
-                // Guard: workspace could have been cleared mid-rename.
-                let Some(_ws) = self.workspace_root() else {
-                    return Task::none();
-                };
+                // Workspace could have been cleared mid-rename.  abs_path()
+                // returns None when workspace_root() returns None, so we
+                // handle both cases in the Ok arm below.
 
                 // Stale-result prevention via the standard dir_generations
                 // protocol (same as dir_expanded).  Compute the parent dir
@@ -2989,12 +2978,12 @@ impl EditorState {
                         }
 
                         // ── Update open tab paths ────────────────
-                        let old_abs = self
-                            .abs_path(&old_path)
-                            .expect("RenameCompleted: workspace_root() already guarded above");
-                        let new_abs = self
-                            .abs_path(&new_path)
-                            .expect("RenameCompleted: workspace_root() already guarded above");
+                        let Some(old_abs) = self.abs_path(&old_path) else {
+                            return Task::none();
+                        };
+                        let Some(new_abs) = self.abs_path(&new_path) else {
+                            return Task::none();
+                        };
 
                         // Build a prefix-based replacement for directory renames.
                         if is_dir {
@@ -3538,7 +3527,7 @@ impl EditorState {
                 if self.modal_overlay_blocks_editor_shortcuts() {
                     return Task::none();
                 }
-                let Some(ref ws_path) = self.selected_workspace_path.clone() else {
+                let Some(ref ws_path) = self.selected_workspace_path else {
                     return Task::none();
                 };
 
