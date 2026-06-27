@@ -5374,24 +5374,10 @@ impl EditorState {
             container(content)
                 .width(width)
                 .padding(24)
-                .style(Self::dialog_container_style),
+                .style(theme::dialog_container_style),
             cancel_msg,
             opacity,
         )
-    }
-
-    /// Shared dialog container style used by all overlay dialogs:
-    /// elevated background, strong border, 8px radius.
-    fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
-        container::Style {
-            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-            border: iced::Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: theme::BORDER_STRONG,
-            },
-            ..Default::default()
-        }
     }
 
     /// Build the quick-open overlay: a centered dialog with search input
@@ -5484,7 +5470,7 @@ impl EditorState {
         let dialog = container(content)
             .width(Length::Fixed(400.0))
             .padding(12)
-            .style(Self::dialog_container_style);
+            .style(theme::dialog_container_style);
 
         Self::overlay_dialog(dialog, EditorMessage::Escape, 0.4)
     }
@@ -5665,7 +5651,7 @@ impl EditorState {
         let dialog = container(content)
             .width(Length::Fixed(600.0))
             .padding(12)
-            .style(Self::dialog_container_style);
+            .style(theme::dialog_container_style);
 
         Self::overlay_dialog(dialog, EditorMessage::GlobalSearchClose, 0.4)
     }

@@ -126,6 +126,18 @@ impl BoardState {
         }
     }
 
+    /// Reset all modal-related state fields (close detail modal).
+    fn reset_modal(&mut self) {
+        self.selected_id = None;
+        self.selected_ticket = None;
+        self.description_md = None;
+        self.comments_md.clear();
+        self.expanded_comments.clear();
+        self.commit_stats = None;
+        self.commit_stats_loading = false;
+        self.commit_stats_generation += 1;
+    }
+
     pub fn refresh(&self) -> Task<BoardMessage> {
         let ws_name = self.workspace_name.clone();
         Task::perform(
@@ -306,14 +318,7 @@ impl BoardState {
                 Self::fetch_ticket(id)
             }
             BoardMessage::CloseModal => {
-                self.selected_id = None;
-                self.selected_ticket = None;
-                self.description_md = None;
-                self.comments_md.clear();
-                self.expanded_comments.clear();
-                self.commit_stats = None;
-                self.commit_stats_loading = false;
-                self.commit_stats_generation += 1;
+                self.reset_modal();
                 Task::none()
             }
             BoardMessage::TicketDetails(ticket) => {
@@ -389,14 +394,7 @@ impl BoardState {
                 Task::done(BoardMessage::Toast(super::ToastMessage::Error(e)))
             }
             BoardMessage::Escape => {
-                self.selected_id = None;
-                self.selected_ticket = None;
-                self.description_md = None;
-                self.comments_md.clear();
-                self.expanded_comments.clear();
-                self.commit_stats = None;
-                self.commit_stats_loading = false;
-                self.commit_stats_generation += 1;
+                self.reset_modal();
                 Task::none()
             }
             BoardMessage::ToggleCommentExpand(i) => {
@@ -405,8 +403,13 @@ impl BoardState {
                 }
                 Task::none()
             }
-            BoardMessage::LinkClicked(_) => Task::none(),
-            BoardMessage::Toast(_) => Task::none(),
+            BoardMessage::LinkClicked(_)
+            | BoardMessage::Toast(_)
+            | BoardMessage::ViewCommitDiff { .. } => {
+                // Intercepted by the Dashboard before reaching board_state.update().
+                // Arms must remain for match exhaustiveness even though functionally dead.
+                Task::none()
+            }
             BoardMessage::ArchiveAllCompleted => {
                 let ws = self.workspace_name.clone();
                 Task::perform(
@@ -493,10 +496,6 @@ impl BoardState {
                         self.commit_stats = None;
                     }
                 }
-                Task::none()
-            }
-            BoardMessage::ViewCommitDiff { .. } => {
-                // Intercepted by Dashboard — cross-page navigation.
                 Task::none()
             }
         }
@@ -782,15 +781,7 @@ impl BoardState {
                 )
                 .width(Length::Fixed(400.0))
                 .padding(24)
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        width: 1.0,
-                        color: theme::BORDER_STRONG,
-                    },
-                    ..container::Style::default()
-                });
+                .style(theme::dialog_container_style);
 
                 let centered = container(dialog)
                     .width(Length::Fill)
@@ -804,15 +795,7 @@ impl BoardState {
                 let dialog = container(detail)
                     .width(Length::Fixed(600.0))
                     .padding(24)
-                    .style(|_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                        border: iced::Border {
-                            radius: 8.0.into(),
-                            width: 1.0,
-                            color: theme::BORDER_STRONG,
-                        },
-                        ..container::Style::default()
-                    });
+                    .style(theme::dialog_container_style);
 
                 let centered = container(dialog)
                     .width(Length::Fill)

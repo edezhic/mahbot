@@ -603,6 +603,23 @@ pub fn surface_card_style(_theme: &iced::Theme) -> container::Style {
     }
 }
 
+/// Style for modal dialog containers: elevated background, 8px rounded
+/// corners, and a strong border. Shared by all modal overlays across the
+/// dashboard (board detail, settings dialogs, editor overlays, diff/branch
+/// modals, etc.).
+#[must_use]
+pub fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_ELEVATED)),
+        border: iced::Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: BORDER_STRONG,
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Style for the base page background: just the BG_BASE fill with no border.
 /// Used as the outermost container on most pages (home, sessions, logs).
 #[must_use]

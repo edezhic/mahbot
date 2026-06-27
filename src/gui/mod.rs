@@ -1702,15 +1702,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(16)
-        .style(|_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-            border: iced::Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: theme::BORDER_STRONG,
-            },
-            ..container::Style::default()
-        });
+        .style(theme::dialog_container_style);
 
     let centered = row![
         Space::new().width(Length::FillPortion(1)), // 10% margin
@@ -1826,15 +1818,7 @@ fn render_branch_modal<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(16)
-        .style(|_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-            border: iced::Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: theme::BORDER_STRONG,
-            },
-            ..container::Style::default()
-        });
+        .style(theme::dialog_container_style);
 
     let centered = row![
         Space::new().width(Length::FillPortion(1)), // 10% margin

@@ -1448,7 +1448,7 @@ impl SettingsState {
             .padding(24),
         )
         .width(Length::Fixed(620.0))
-        .style(dialog_container_style)
+        .style(theme::dialog_container_style)
         .into()
     }
 
@@ -1509,7 +1509,7 @@ impl SettingsState {
             .padding(24),
         )
         .width(Length::Fixed(620.0))
-        .style(dialog_container_style)
+        .style(theme::dialog_container_style)
         .into()
     }
 
@@ -1583,7 +1583,7 @@ impl SettingsState {
             .padding(24),
         )
         .width(500)
-        .style(dialog_container_style)
+        .style(theme::dialog_container_style)
         .into()
     }
     // ── Section helpers ──────────────────────────────────────────
@@ -2119,19 +2119,6 @@ fn modal_with_backdrop(
         .align_y(Alignment::Center);
 
     iced::widget::stack([backdrop.into(), centered.into()]).into()
-}
-
-/// Style for modal dialog containers: elevated background, rounded border.
-fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-        border: iced::Border {
-            radius: 8.0.into(),
-            width: 1.0,
-            color: theme::BORDER_STRONG,
-        },
-        ..container::Style::default()
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
