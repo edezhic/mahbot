@@ -1621,8 +1621,16 @@ impl Dashboard {
     }
 }
 
-/// Render the diff modal (80% width, 100% height, centered).
-fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
+/// Wrap dialog content in a modal overlay with a semi-transparent backdrop
+/// and centered 80%-width dialog container.
+///
+/// Creates a backdrop that dismisses the modal on click, wraps `inner` in the
+/// standard dialog container style with 16px padding, and centers it at 80%
+/// width using a `FillPortion(1/8/1)` row layout.
+fn modal_overlay<'a>(
+    inner: impl Into<Element<'a, Message>>,
+    on_close: Message,
+) -> Element<'a, Message> {
     let backdrop = iced::widget::mouse_area(
         container(text(""))
             .width(Length::Fill)
@@ -1634,8 +1642,27 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
                 ..container::Style::default()
             }),
     )
-    .on_press(Message::CloseDiffModal);
+    .on_press(on_close);
 
+    let dialog = container(inner)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(16)
+        .style(theme::dialog_container_style);
+
+    let centered = row![
+        Space::new().width(Length::FillPortion(1)), // 10% margin
+        dialog.width(Length::FillPortion(8)),       // 80% content
+        Space::new().width(Length::FillPortion(1)), // 10% margin
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    iced::widget::stack([backdrop.into(), centered.into()]).into()
+}
+
+/// Render the diff modal (80% width, 100% height, centered).
+fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
     let viewing_commit = diff_state.is_viewing_commit();
 
     // Outer header: commit message (large, bold) + short hash (muted) for
@@ -1680,22 +1707,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
     let diff_content: Element<'_, diff::DiffMessage> = diff_state.view();
     let inner = column![header, diff_content.map(Message::DiffModal)].spacing(0);
 
-    // 80% width with 10% margin each side via a row with FillPortion spacers
-    let dialog = container(inner)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(16)
-        .style(theme::dialog_container_style);
-
-    let centered = row![
-        Space::new().width(Length::FillPortion(1)), // 10% margin
-        dialog.width(Length::FillPortion(8)),       // 80% content
-        Space::new().width(Length::FillPortion(1)), // 10% margin
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
-
-    iced::widget::stack([backdrop.into(), centered.into()]).into()
+    modal_overlay(inner, Message::CloseDiffModal)
 }
 
 /// Render the branch management modal (80% width, 100% height).
@@ -1707,18 +1719,6 @@ fn render_branch_modal<'a>(
     new_branch_name: &'a str,
 ) -> Element<'a, Message> {
     use iced::widget::text_input;
-    let backdrop = iced::widget::mouse_area(
-        container(text(""))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.0, 0.0, 0.0, 0.5,
-                ))),
-                ..container::Style::default()
-            }),
-    )
-    .on_press(Message::CloseBranchModal);
 
     let search_input = text_input("Search branches…", search_query)
         .on_input(Message::BranchQueryChanged)
@@ -1796,22 +1796,7 @@ fn render_branch_modal<'a>(
     .spacing(0)
     .height(Length::Fill);
 
-    // 80% width with 10% margin each side via a row with FillPortion spacers
-    let dialog = container(inner)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(16)
-        .style(theme::dialog_container_style);
-
-    let centered = row![
-        Space::new().width(Length::FillPortion(1)), // 10% margin
-        dialog.width(Length::FillPortion(8)),       // 80% content
-        Space::new().width(Length::FillPortion(1)), // 10% margin
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
-
-    iced::widget::stack([backdrop.into(), centered.into()]).into()
+    modal_overlay(inner, Message::CloseBranchModal)
 }
 
 // ── Ticket sidebar (Home page, right side) ────────────────────────
