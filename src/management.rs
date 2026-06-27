@@ -48,6 +48,15 @@ const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 50;
 /// (i.e., at ≥5 failures), failing the ticket to prevent thrashing.
 const DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD: usize = 4;
 
+/// Maximum number of consecutive sanitation failures allowed before the
+/// sanitation circuit breaker trips. The breaker trips when a ticket's
+/// sanitation failure count exceeds this threshold, failing the ticket.
+///
+/// This is a separate, lower threshold than the general comment-count
+/// circuit breaker — sanitation failures are cheap to detect and should
+/// not consume 50 comments before tripping.
+const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
+
 /// Prefix for all auto-diagnostics comments on tickets.
 const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 /// Marker appended when all diagnostics pass.
@@ -1044,17 +1053,6 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
         (a, r) => format!("Committed as `{short_hash}` (+{a}/-{r})"),
     }
 }
-
-// ── Sanitation ─────────────────────────────────────────────────────────
-
-/// Maximum number of consecutive sanitation failures allowed before the
-/// sanitation circuit breaker trips. The breaker trips when a ticket's
-/// sanitation failure count exceeds this threshold, failing the ticket.
-///
-/// This is a separate, lower threshold than the general comment-count
-/// circuit breaker — sanitation failures are cheap to detect and should
-/// not consume 50 comments before tripping.
-const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
 
 /// Handle a QaPassed ticket: check for untracked/new files and either
 /// transition to InSanitation for sanitation agent dispatch or commit
