@@ -150,11 +150,11 @@ async fn bootstrap_mahbot() -> Result<()> {
         mahbot::board::init_global(),
         mahbot::stats::init_global(),
         mahbot::chat_history::init_global(),
+        mahbot::config_db::init_global(),
     )?;
 
-    // Config DB must be initialized and loaded before providers,
-    // so that API keys and model settings take effect.
-    mahbot::config_db::init_global().await?;
+    // Config DB must be loaded before providers, so that API keys
+    // and model settings take effect.
     mahbot::config::reload_from_db().await?;
     mahbot::providers::init_global().await?;
 
