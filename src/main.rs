@@ -512,7 +512,7 @@ async fn handle_messages(mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>) {
 /// Handle a dispatch-level command. Returns `true` if the message was handled
 /// (loop should `continue`), `false` if it should be processed by the agent.
 async fn handle_dispatch_command(msg: &mut ChannelMessage) -> bool {
-    if !parse(&msg.content) {
+    if !is_start_command(&msg.content) {
         return false;
     }
 
@@ -786,13 +786,4 @@ async fn process_channel_message(mut msg: ChannelMessage) {
 
     cancel.cancel();
     stop_typing(typing_handle).await;
-}
-
-/// Parse a channel message's content and check whether it is a `/start` command.
-///
-/// Command names are case-insensitive. `/start` is the only recognized command.
-/// All other `/`-prefixed text is treated as a normal message (routed to agent).
-#[must_use]
-pub fn parse(content: &str) -> bool {
-    is_start_command(content)
 }
