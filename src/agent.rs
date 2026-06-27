@@ -187,9 +187,8 @@ impl Agent {
             .await?;
 
         // Summarize if context window is getting long.
-        // KV-cache preservation: `self.summarize()` uses the same parameters
-        // (model, temperature, reasoning_effort, tools, provider routing) as
-        // the agent's work loop so the provider can reuse the cached prefix.
+        // KV-cache preservation: self.summarize() keeps all parameters
+        // identical (see build_chat_request) so the cached prefix is reusable.
         let history_tokens = crate::session::summarization::estimate_tokens(self.session.history());
         if history_tokens > crate::session::summarization::SUMMARIZATION_THRESHOLD {
             match self.summarize().await {
@@ -580,6 +579,19 @@ impl Agent {
     ///
     /// All parameter sources are lazily resolved each call so that runtime
     /// hot-reload (model, routing, reasoning-effort) is reflected immediately.
+    ///
+    /// # KV-cache preservation
+    ///
+    /// Every call site that produces a chat request for the same logical
+    /// conversation *must* use exactly the same parameter sources — model,
+    /// temperature, reasoning_effort, tools (critically tools!), and provider
+    /// routing — so that the provider can reuse the cached prefix computed
+    /// during the original agent call.  Any deviation (including dropping
+    /// tools) forces the provider to recompute the entire KV-cache prefix.
+    ///
+    /// [`Self::extract_structured`] uses the same parameter sources (routed through
+    /// [`crate::extraction::ExtractionConfig`] rather than calling this method
+    /// directly).  [`Self::summarize`] calls this method directly.
     fn build_chat_request(
         &self,
         messages: Vec<ChatMessage>,
@@ -598,24 +610,15 @@ impl Agent {
         }
     }
 
-    // ── KV-cache-aligned extraction methods ───────────────────────────────
-    //
-    // `extract_structured()` and `summarize()` use `self.temperature()`,
-    // `self.reasoning_effort()`, `self.tool_specs`, `self.model()`,
-    // and `self.provider_routing()` so that all parameters (model,
-    // temperature, reasoning_effort, tools, provider routing) are
-    // byte-identical to the original agent call the session was built from.
-    // Any deviation forces the provider to recompute the entire KV-cache
-    // prefix.
-    // ───────────────────────────────────────────────────────────────────────
+    // ── Extraction / summarisation ──
 
-    /// Extract a structured `T` from the agent's session history by calling the
-    /// LLM with the same parameters the agent uses for its work loop.
+    /// Extract a structured `T` from the agent's session history.
     ///
-    /// KV-cache preservation: all parameters (model, temperature,
-    /// reasoning_effort, tools, provider routing) must be byte-identical
-    /// to the original agent call so the provider can reuse the cached
-    /// prefix.  Changing any parameter forces full recomputation.
+    /// KV-cache requirements: uses the same parameter sources as
+    /// [`Self::build_chat_request`] (model, temperature, reasoning_effort,
+    /// tools, provider routing), routed through
+    /// [`crate::extraction::ExtractionConfig`] instead of calling that method
+    /// directly.
     pub(crate) async fn extract_structured<T: serde::de::DeserializeOwned>(
         &self,
         extraction_prompt: &str,
@@ -642,11 +645,7 @@ impl Agent {
 
     /// Summarise the agent's session history.
     ///
-    /// KV-cache preservation: all parameters (model, temperature,
-    /// reasoning_effort, tools — critically tools! — and provider routing)
-    /// must be byte-identical to the original agent call so the provider
-    /// can reuse the cached prefix.  Changing any parameter, including
-    /// dropping tools, forces full recomputation.
+    /// KV-cache requirements: see [`Self::build_chat_request`].
     pub(crate) async fn summarize(&self) -> anyhow::Result<String> {
         let mut history = self.session.history().to_vec();
         history.push(crate::ChatMessage::user(self.role.summary_prompt()));
