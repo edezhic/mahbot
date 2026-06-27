@@ -1204,116 +1204,201 @@ mod tests {
 
     // ── RoleConfig upsert tests ───────────────────────────────────
     //
-    // Each `upsert` test covers three sub-cases in sequence:
-    //   1. updates_existing  — existing entry, upsert sets one field via
-    //                          closure, the other field is preserved unchanged
-    //   2. pushes_new_entry  — empty vec, new entry is pushed with the
-    //                          target field set and the other field None
-    //   3. can_set_none      — existing entry, upsert with None clears
-    //                          the target field
+    // Each test exercises both configurable fields on the struct.
+    // Every sub-case covers the same three scenarios (documented inline)
+    // for each field independently, with field-prefixed assertion messages
+    // to disambiguate failures.
 
     #[test]
-    fn upsert_model() {
-        let mut c = vec![role_config("engineer", Some("old"), Some("high"))];
-        RoleConfig::upsert(&mut c, "engineer".into(), |c| c.model = Some("new".into()));
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].model, Some("new".into()));
-        assert_eq!(
-            c[0].reasoning_effort,
-            Some("high".into()),
-            "other field preserved"
-        );
+    fn upsert_role_config_fields() {
+        // 1. updates_existing — existing entry, upsert sets one field,
+        //    the other field is preserved unchanged
+        {
+            let mut c = vec![role_config("engineer", Some("old"), Some("high"))];
+            RoleConfig::upsert(&mut c, "engineer".into(), |c| c.model = Some("new".into()));
+            assert_eq!(c.len(), 1);
+            assert_eq!(
+                c[0].model,
+                Some("new".into()),
+                "[model] target field updated"
+            );
+            assert_eq!(
+                c[0].reasoning_effort,
+                Some("high".into()),
+                "[model] other field preserved"
+            );
+        }
+        {
+            let mut c = vec![role_config("engineer", Some("gpt-4"), Some("low"))];
+            RoleConfig::upsert(&mut c, "engineer".into(), |c| {
+                c.reasoning_effort = Some("high".into());
+            });
+            assert_eq!(c.len(), 1);
+            assert_eq!(
+                c[0].reasoning_effort,
+                Some("high".into()),
+                "[reasoning_effort] target field updated"
+            );
+            assert_eq!(
+                c[0].model,
+                Some("gpt-4".into()),
+                "[reasoning_effort] other field preserved"
+            );
+        }
 
-        let mut c = vec![];
-        RoleConfig::upsert(&mut c, "engineer".into(), |c| {
-            c.model = Some("gpt-4".into());
-        });
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].role, "engineer");
-        assert_eq!(c[0].model, Some("gpt-4".into()));
-        assert_eq!(c[0].reasoning_effort, None);
+        // 2. pushes_new_entry — empty vec, new entry is pushed with the
+        //    target field set and the other field None
+        {
+            let mut c = vec![];
+            RoleConfig::upsert(&mut c, "engineer".into(), |c| {
+                c.model = Some("gpt-4".into());
+            });
+            assert_eq!(c.len(), 1);
+            assert_eq!(c[0].role, "engineer");
+            assert_eq!(c[0].model, Some("gpt-4".into()), "[model] set on new entry");
+            assert_eq!(c[0].reasoning_effort, None);
+        }
+        {
+            let mut c = vec![];
+            RoleConfig::upsert(&mut c, "engineer".into(), |c| {
+                c.reasoning_effort = Some("high".into());
+            });
+            assert_eq!(c.len(), 1);
+            assert_eq!(c[0].role, "engineer");
+            assert_eq!(
+                c[0].reasoning_effort,
+                Some("high".into()),
+                "[reasoning_effort] set on new entry"
+            );
+            assert_eq!(c[0].model, None);
+        }
 
-        let mut c = vec![role_config("engineer", Some("gpt-4"), None)];
-        RoleConfig::upsert(&mut c, "engineer".into(), |c| c.model = None);
-        assert_eq!(c[0].model, None, "model should be cleared to None");
-    }
-
-    #[test]
-    fn upsert_reasoning_effort() {
-        let mut c = vec![role_config("engineer", Some("gpt-4"), Some("low"))];
-        RoleConfig::upsert(&mut c, "engineer".into(), |c| {
-            c.reasoning_effort = Some("high".into());
-        });
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].reasoning_effort, Some("high".into()));
-        assert_eq!(c[0].model, Some("gpt-4".into()), "other field preserved");
-
-        let mut c = vec![];
-        RoleConfig::upsert(&mut c, "engineer".into(), |c| {
-            c.reasoning_effort = Some("high".into());
-        });
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].role, "engineer");
-        assert_eq!(c[0].reasoning_effort, Some("high".into()));
-        assert_eq!(c[0].model, None);
-
-        let mut c = vec![role_config("engineer", None, Some("high"))];
-        RoleConfig::upsert(&mut c, "engineer".into(), |c| c.reasoning_effort = None);
-        assert_eq!(c[0].reasoning_effort, None, "should be cleared to None");
+        // 3. can_set_none — existing entry has both fields set to non-None;
+        //    clearing one field via None leaves the other field unchanged
+        {
+            let mut c = vec![role_config("engineer", Some("gpt-4"), Some("high"))];
+            RoleConfig::upsert(&mut c, "engineer".into(), |c| c.model = None);
+            assert_eq!(c[0].model, None, "[model] cleared to None");
+            assert_eq!(
+                c[0].reasoning_effort,
+                Some("high".into()),
+                "[model] other field preserved when clearing"
+            );
+        }
+        {
+            let mut c = vec![role_config("engineer", Some("gpt-4"), Some("high"))];
+            RoleConfig::upsert(&mut c, "engineer".into(), |c| c.reasoning_effort = None);
+            assert_eq!(
+                c[0].reasoning_effort, None,
+                "[reasoning_effort] cleared to None"
+            );
+            assert_eq!(
+                c[0].model,
+                Some("gpt-4".into()),
+                "[reasoning_effort] other field preserved when clearing"
+            );
+        }
     }
 
     // ── ModelRouting upsert tests ─────────────────────────────────
+    //
+    // Same three-scenario structure as the RoleConfig test above.
 
     #[test]
-    fn upsert_provider_order() {
-        let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-        ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
-            mr.provider_order = Some("Anthropic".into());
-        });
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].provider_order, Some("Anthropic".into()));
-        assert_eq!(r[0].allow_fallbacks, Some(true), "other field preserved");
+    fn upsert_model_routing_fields() {
+        // 1. updates_existing
+        {
+            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
+                mr.provider_order = Some("Anthropic".into());
+            });
+            assert_eq!(r.len(), 1);
+            assert_eq!(
+                r[0].provider_order,
+                Some("Anthropic".into()),
+                "[provider_order] target field updated"
+            );
+            assert_eq!(
+                r[0].allow_fallbacks,
+                Some(true),
+                "[provider_order] other field preserved"
+            );
+        }
+        {
+            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
+                mr.allow_fallbacks = Some(false)
+            });
+            assert_eq!(r.len(), 1);
+            assert_eq!(
+                r[0].allow_fallbacks,
+                Some(false),
+                "[allow_fallbacks] target field updated"
+            );
+            assert_eq!(
+                r[0].provider_order,
+                Some("OpenAi".into()),
+                "[allow_fallbacks] other field preserved"
+            );
+        }
 
-        let mut r = vec![];
-        ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
-            mr.provider_order = Some("OpenAi".into());
-        });
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].model, "gpt-4");
-        assert_eq!(r[0].provider_order, Some("OpenAi".into()));
-        assert_eq!(r[0].allow_fallbacks, None);
+        // 2. pushes_new_entry
+        {
+            let mut r = vec![];
+            ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
+                mr.provider_order = Some("OpenAi".into());
+            });
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].model, "gpt-4");
+            assert_eq!(
+                r[0].provider_order,
+                Some("OpenAi".into()),
+                "[provider_order] set on new entry"
+            );
+            assert_eq!(r[0].allow_fallbacks, None);
+        }
+        {
+            let mut r = vec![];
+            ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
+                mr.allow_fallbacks = Some(false);
+            });
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].model, "gpt-4");
+            assert_eq!(
+                r[0].allow_fallbacks,
+                Some(false),
+                "[allow_fallbacks] set on new entry"
+            );
+            assert_eq!(r[0].provider_order, None);
+        }
 
-        let mut r = vec![model_routing("gpt-4", Some("OpenAi"), None)];
-        ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| mr.provider_order = None);
-        assert_eq!(r[0].provider_order, None);
-        assert_eq!(r[0].allow_fallbacks, None);
-    }
-
-    #[test]
-    fn upsert_allow_fallbacks() {
-        let mut r = vec![model_routing("gpt-4", Some("OpenAi"), None)];
-        ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| mr.allow_fallbacks = Some(true));
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].allow_fallbacks, Some(true));
-        assert_eq!(
-            r[0].provider_order,
-            Some("OpenAi".into()),
-            "other field preserved"
-        );
-
-        let mut r = vec![];
-        ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
-            mr.allow_fallbacks = Some(false);
-        });
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].model, "gpt-4");
-        assert_eq!(r[0].allow_fallbacks, Some(false));
-        assert_eq!(r[0].provider_order, None);
-
-        let mut r = vec![model_routing("gpt-4", None, Some(true))];
-        ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| mr.allow_fallbacks = None);
-        assert_eq!(r[0].allow_fallbacks, None);
-        assert_eq!(r[0].provider_order, None);
+        // 3. can_set_none — both fields start non-None to verify preservation
+        {
+            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| mr.provider_order = None);
+            assert_eq!(
+                r[0].provider_order, None,
+                "[provider_order] cleared to None"
+            );
+            assert_eq!(
+                r[0].allow_fallbacks,
+                Some(true),
+                "[provider_order] other field preserved when clearing"
+            );
+        }
+        {
+            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| mr.allow_fallbacks = None);
+            assert_eq!(
+                r[0].allow_fallbacks, None,
+                "[allow_fallbacks] cleared to None"
+            );
+            assert_eq!(
+                r[0].provider_order,
+                Some("OpenAi".into()),
+                "[allow_fallbacks] other field preserved when clearing"
+            );
+        }
     }
 
     #[test]
