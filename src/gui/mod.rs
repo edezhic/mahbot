@@ -369,8 +369,6 @@ pub struct Dashboard {
     /// Toast notification stack.
     toasts: Vec<Toast>,
 
-    /// Global workspace picker state.
-    workspace_options: Vec<PickOption>,
     /// Maps workspace name → filesystem path.
     workspace_paths: HashMap<String, String>,
     /// Maps workspace name → paused state (for sidebar toggle).
@@ -438,7 +436,6 @@ impl Dashboard {
             last_size: iced::Size::new(1500.0, 800.0),
             last_position: iced::Point::new(-1.0, -1.0),
             toasts: Vec::new(),
-            workspace_options: Vec::new(),
             workspace_paths: HashMap::new(),
             workspace_paused: HashMap::new(),
             workspace_maintenance: HashMap::new(),
@@ -571,8 +568,7 @@ impl Dashboard {
 
         match message {
             Message::Boot(result) => self.finish_boot(result),
-            Message::BootWorkspaces(options, paths, paused_map, maintenance_map, restored_name) => {
-                self.workspace_options.clone_from(&options);
+            Message::BootWorkspaces(_, paths, paused_map, maintenance_map, restored_name) => {
                 self.workspace_paths = paths;
                 self.workspace_paused = paused_map;
                 self.workspace_maintenance = maintenance_map;
@@ -595,10 +591,6 @@ impl Dashboard {
                 if let Some(ref user_name) = self.selected_user_name {
                     self.home_state.selected_user = Some(user_name.clone());
                 }
-                // Forward workspace options to the Home page.
-                let home_opts: Task<Message> =
-                    Task::done(home::HomeMessage::WorkspaceOptions(options.clone()))
-                        .map(Message::Home);
                 let load_users = self.home_state.load_users().map(Message::Home);
 
                 // restored_name is always Some — load_workspace_options sets it.
@@ -622,11 +614,7 @@ impl Dashboard {
                         String::new()
                     }
                 };
-                Task::batch([
-                    self.propagate_workspace_selection(&ws_name),
-                    home_opts,
-                    load_users,
-                ])
+                Task::batch([self.propagate_workspace_selection(&ws_name), load_users])
             }
             Message::Navigation(_) if !self.ready => Task::none(),
             Message::Navigation(page) => {
@@ -641,14 +629,10 @@ impl Dashboard {
                     Page::Logs | Page::Shell | Page::Editor => Task::none(),
                     Page::Home => {
                         let load_users = self.home_state.load_users().map(Message::Home);
-                        let ws_opts = Task::done(home::HomeMessage::WorkspaceOptions(
-                            self.workspace_options.clone(),
-                        ))
-                        .map(Message::Home);
                         let snap =
                             iced::widget::operation::snap_to_end::<Message>(home::CHAT_SCROLL_ID);
                         let board_refresh = self.board_state.refresh().map(Message::Board);
-                        Task::batch([load_users, ws_opts, snap, board_refresh])
+                        Task::batch([load_users, snap, board_refresh])
                     }
                     Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
                     Page::Settings => {

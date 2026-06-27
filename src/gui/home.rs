@@ -188,8 +188,6 @@ pub enum HomeMessage {
     /// user's DB-stored workspace (None if not set, Some if set).
     /// Proceeds with normal history refresh for the selected user.
     ResolveUserSelected(Option<String>),
-    /// Workspace options forwarded from the Dashboard (boot and add/delete).
-    WorkspaceOptions(Vec<PickOption>),
     /// User picked a workspace from the Home page picker.
     /// Intercepted by Dashboard; never reaches Home's own update handler.
     WorkspacePicked(String),
@@ -948,11 +946,6 @@ impl HomeState {
                         return Task::done(HomeMessage::UserSelected(first));
                     }
                 }
-                Task::none()
-            }
-            HomeMessage::WorkspaceOptions(_options) => {
-                // Workspace options were forwarded from Dashboard for the
-                // Home page picker. The picker has been removed; this is a no-op.
                 Task::none()
             }
             HomeMessage::ClearChat => {
