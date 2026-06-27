@@ -1803,6 +1803,54 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
 mod tests {
     use super::*;
 
+    /// Create a Telegram Update JSON with sensible defaults, then apply
+    /// shallow top-level overrides for test-specific fields.
+    ///
+    /// Base defaults:
+    /// ```json
+    /// { "update_id": 1, "message": { "message_id": 33, "text": "hello",
+    ///   "from": {"id": 555, "username": "alice"},
+    ///   "chat": {"id": -100_200_300} } }
+    /// ```
+    ///
+    /// Overrides replace entire top-level keys (shallow merge). To change
+    /// nested fields, pass the full nested value:
+    ///
+    /// ```ignore
+    /// let update = test_update(&[(
+    ///     "message",
+    ///     json!({
+    ///         "message_id": 42, "text": "hi",
+    ///         "from": {"id": 555, "username": "alice"},
+    ///         "chat": {"id": -100_200_300},
+    ///         "message_thread_id": 789
+    ///     }),
+    /// )]);
+    /// ```
+    fn test_update(overrides: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 33,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        let obj = update.as_object_mut().unwrap();
+        for (key, value) in overrides {
+            obj.insert(key.to_string(), value.clone());
+        }
+        update
+    }
+
+    /// Create a TelegramChannel with a test store initialized.
+    /// Uses token `"token"` and calls `init_test_store` before returning.
+    async fn test_channel() -> TelegramChannel {
+        crate::users::test_util::init_test_store().await;
+        TelegramChannel::new("token".into())
+    }
+
     #[tokio::test]
     async fn telegram_api_url() {
         let ch = TelegramChannel::new("123:ABC".into());
@@ -1962,22 +2010,8 @@ mod tests {
 
     #[tokio::test]
     async fn parse_update_message_uses_chat_id_as_reply_target() {
-        crate::users::test_util::init_test_store().await;
-        let ch = TelegramChannel::new("token".into());
-        let update = serde_json::json!({
-            "update_id": 1,
-            "message": {
-                "message_id": 33,
-                "text": "hello",
-                "from": {
-                    "id": 555,
-                    "username": "alice"
-                },
-                "chat": {
-                    "id": -100_200_300
-                }
-            }
-        });
+        let ch = test_channel().await;
+        let update = test_update(&[]);
 
         let msg = ch
             .parse_update_message(&update)
@@ -2025,11 +2059,10 @@ mod tests {
 
     #[tokio::test]
     async fn parse_update_message_denies_user_without_username() {
-        crate::users::test_util::init_test_store().await;
-        let ch = TelegramChannel::new("token".into());
-        let update = serde_json::json!({
-            "update_id": 2,
-            "message": {
+        let ch = test_channel().await;
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 9,
                 "text": "ping",
                 "from": {
@@ -2038,8 +2071,8 @@ mod tests {
                 "chat": {
                     "id": 12345
                 }
-            }
-        });
+            }),
+        )]);
 
         assert!(
             ch.parse_update_message(&update).await.is_none(),
@@ -2049,11 +2082,10 @@ mod tests {
 
     #[tokio::test]
     async fn parse_update_message_extracts_thread_id_for_forum_topic() {
-        crate::users::test_util::init_test_store().await;
-        let ch = TelegramChannel::new("token".into());
-        let update = serde_json::json!({
-            "update_id": 3,
-            "message": {
+        let ch = test_channel().await;
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 42,
                 "text": "hello from topic",
                 "from": {
@@ -2064,8 +2096,8 @@ mod tests {
                     "id": -100_200_300
                 },
                 "message_thread_id": 789
-            }
-        });
+            }),
+        )]);
 
         let msg = ch
             .parse_update_message(&update)
@@ -2245,10 +2277,10 @@ mod tests {
 
     #[tokio::test]
     async fn parse_update_message_includes_reply_context() {
-        crate::users::test_util::init_test_store().await;
-        let ch = TelegramChannel::new("t".into());
-        let update = serde_json::json!({
-            "message": {
+        let ch = test_channel().await;
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 10,
                 "text": "translate this",
                 "from": { "id": 1, "username": "alice" },
@@ -2257,8 +2289,8 @@ mod tests {
                     "from": { "username": "bot" },
                     "text": "Bonjour le monde"
                 }
-            }
-        });
+            }),
+        )]);
         let parsed = ch.parse_update_message(&update).await.unwrap();
         assert!(
             parsed.content.starts_with("> @bot:"),
@@ -2438,13 +2470,12 @@ mod tests {
 
     #[tokio::test]
     async fn forward_attribution() {
-        crate::users::test_util::init_test_store().await;
-        let ch = TelegramChannel::new("token".into());
+        let ch = test_channel().await;
 
         // forwarded from user with username
-        let update = serde_json::json!({
-            "update_id": 100,
-            "message": {
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 50,
                 "text": "Check this out",
                 "from": { "id": 1, "username": "alice" },
@@ -2455,15 +2486,15 @@ mod tests {
                     "username": "bob"
                 },
                 "forward_date": 1_700_000_000
-            }
-        });
+            }),
+        )]);
         let msg = ch.parse_update_message(&update).await.unwrap();
         assert_eq!(msg.content, "[Forwarded from @bob] Check this out");
 
         // forwarded from channel
-        let update = serde_json::json!({
-            "update_id": 101,
-            "message": {
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 51,
                 "text": "Breaking news",
                 "from": { "id": 1, "username": "alice" },
@@ -2475,8 +2506,8 @@ mod tests {
                     "type": "channel"
                 },
                 "forward_date": 1_700_000_000
-            }
-        });
+            }),
+        )]);
         let msg = ch.parse_update_message(&update).await.unwrap();
         assert_eq!(
             msg.content,
@@ -2484,37 +2515,37 @@ mod tests {
         );
 
         // forwarded hidden sender
-        let update = serde_json::json!({
-            "update_id": 102,
-            "message": {
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 52,
                 "text": "Secret tip",
                 "from": { "id": 1, "username": "alice" },
                 "chat": { "id": 999 },
                 "forward_sender_name": "Hidden User",
                 "forward_date": 1_700_000_000
-            }
-        });
+            }),
+        )]);
         let msg = ch.parse_update_message(&update).await.unwrap();
         assert_eq!(msg.content, "[Forwarded from Hidden User] Secret tip");
 
         // non-forwarded unaffected
-        let update = serde_json::json!({
-            "update_id": 103,
-            "message": {
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 53,
                 "text": "Normal message",
                 "from": { "id": 1, "username": "alice" },
                 "chat": { "id": 999 }
-            }
-        });
+            }),
+        )]);
         let msg = ch.parse_update_message(&update).await.unwrap();
         assert_eq!(msg.content, "Normal message");
 
         // forwarded from user without username
-        let update = serde_json::json!({
-            "update_id": 104,
-            "message": {
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
                 "message_id": 54,
                 "text": "Hello there",
                 "from": { "id": 1, "username": "alice" },
@@ -2524,8 +2555,8 @@ mod tests {
                     "first_name": "Charlie"
                 },
                 "forward_date": 1_700_000_000
-            }
-        });
+            }),
+        )]);
         let msg = ch.parse_update_message(&update).await.unwrap();
         assert_eq!(msg.content, "[Forwarded from Charlie] Hello there");
 
