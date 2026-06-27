@@ -197,12 +197,10 @@ where
             viewport,
         );
 
-        // Only open the menu if no child already captured the event.
         if shell.is_event_captured() {
             return;
         }
 
-        // Check for right-click to open the menu.
         if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event {
             if let Some(pos) = cursor.position_over(layout.bounds()) {
                 state.show = true;
