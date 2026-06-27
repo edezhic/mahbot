@@ -171,12 +171,7 @@ async fn transition_ticket(
             } else if let Some(ws) =
                 resolve_ticket_workspace(ticket, "cannot buffer transition").await
             {
-                ticket_buffer::push(
-                    &ws.name,
-                    &ticket.id,
-                    ticket.status.as_ref(),
-                    target.as_ref(),
-                );
+                ticket_buffer::push(&ws.name, &ticket.id, ticket.status, target);
             }
 
             Ok(())
@@ -596,7 +591,7 @@ async fn poll_round() -> anyhow::Result<()> {
                     // Buffer the claim transition. The returned ticket already
                     // has status = info.claim_target (from SQL RETURNING), so record
                     // the transition from info.source.
-                    ticket_buffer::push(&ws.name, &t.id, info.source.as_ref(), t.status.as_ref());
+                    ticket_buffer::push(&ws.name, &t.id, info.source, t.status);
                     t
                 }
                 Ok(None) => continue,
@@ -982,12 +977,7 @@ async fn commit_and_transition_ticket_from(
                     if let Some(ws) =
                         resolve_ticket_workspace(ticket, "cannot buffer Done transition").await
                     {
-                        ticket_buffer::push(
-                            &ws.name,
-                            &ticket.id,
-                            source.as_ref(),
-                            TicketPhase::Done.as_ref(),
-                        );
+                        ticket_buffer::push(&ws.name, &ticket.id, source, TicketPhase::Done);
                     }
                 }
             }
@@ -1141,8 +1131,8 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     ticket_buffer::push(
         &ticket.workspace_name,
         &ticket.id,
-        TicketPhase::QaPassed.as_ref(),
-        TicketPhase::InSanitation.as_ref(),
+        TicketPhase::QaPassed,
+        TicketPhase::InSanitation,
     );
 
     // Re-fetch ticket with updated status/comments before dispatch.

@@ -13,6 +13,7 @@ use std::fmt::Write;
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 
+use crate::board::TicketPhase;
 use crate::util::UnwrapPoison;
 
 /// Maximum number of buffered entries per workspace before oldest are dropped.
@@ -48,7 +49,7 @@ pub fn init_global() {
 /// by tests that don't run the full startup sequence. Under normal operation
 /// the buffer is always initialized before any caller reaches it, so a
 /// warning here would indicate a genuine startup-order issue.
-pub fn push(workspace_name: &str, id: &str, old_status: &str, new_status: &str) {
+pub fn push(workspace_name: &str, id: &str, old_status: TicketPhase, new_status: TicketPhase) {
     let Some(mutex) = TICKET_BUFFER.get() else {
         warn!("ticket_buffer not initialized — call init_global() first");
         return;
@@ -65,8 +66,8 @@ pub fn push(workspace_name: &str, id: &str, old_status: &str, new_status: &str) 
     }
     deque.push_back(Entry {
         id: id.to_string(),
-        old_status: old_status.to_string(),
-        new_status: new_status.to_string(),
+        old_status: old_status.as_ref().to_string(),
+        new_status: new_status.as_ref().to_string(),
     });
 }
 
@@ -120,6 +121,7 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::TicketPhase;
     use std::sync::Mutex;
 
     /// Test serialization guard — Rust runs tests in parallel by default,
@@ -131,9 +133,24 @@ mod tests {
     fn push_and_drain_ordered() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        push("ws-a", "mahbot-1", "backlog", "analysis");
-        push("ws-a", "mahbot-2", "analysis", "planning");
-        push("ws-a", "mahbot-3", "in_development", "in_diagnostics");
+        push(
+            "ws-a",
+            "mahbot-1",
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+        );
+        push(
+            "ws-a",
+            "mahbot-2",
+            TicketPhase::Analysis,
+            TicketPhase::Planning,
+        );
+        push(
+            "ws-a",
+            "mahbot-3",
+            TicketPhase::InDevelopment,
+            TicketPhase::InDiagnostics,
+        );
         let result = drain("ws-a");
         assert!(result.contains("mahbot-1: backlog → analysis"));
         assert!(result.contains("mahbot-2: analysis → planning"));
@@ -156,7 +173,12 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
         for i in 0..101 {
-            push("ws-b", &format!("mahbot-{i}"), "backlog", "analysis");
+            push(
+                "ws-b",
+                &format!("mahbot-{i}"),
+                TicketPhase::Backlog,
+                TicketPhase::Analysis,
+            );
         }
         let result = drain("ws-b");
         // mahbot-0 should be dropped (oldest), mahbot-1 through mahbot-100 retained
@@ -171,12 +193,17 @@ mod tests {
     fn workspace_isolation() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        push("ws-a", "mahbot-1", "backlog", "analysis");
+        push(
+            "ws-a",
+            "mahbot-1",
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+        );
         push(
             "ws-b",
             "mahbot-2",
-            "ready_for_development",
-            "in_development",
+            TicketPhase::ReadyForDevelopment,
+            TicketPhase::InDevelopment,
         );
         let result_a = drain("ws-a");
         assert!(result_a.contains("mahbot-1"));
@@ -190,7 +217,12 @@ mod tests {
     fn drain_consumes_entries() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        push("ws-a", "mahbot-1", "backlog", "analysis");
+        push(
+            "ws-a",
+            "mahbot-1",
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+        );
         let first = drain("ws-a");
         assert!(!first.is_empty());
         let second = drain("ws-a");

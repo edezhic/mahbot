@@ -720,8 +720,8 @@ impl BoardStore {
         crate::ticket_buffer::push(
             &params.workspace_name,
             supersede_id,
-            old_status.as_ref(),
-            TicketPhase::Cancelled.as_ref(),
+            old_status,
+            TicketPhase::Cancelled,
         );
 
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
