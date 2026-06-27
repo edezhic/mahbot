@@ -52,9 +52,6 @@ const ROPE_FREQ_BASE: f32 = 1_000_000.0;
 /// Timeout for model file download (10 minutes for ~150 MB).
 const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 
-/// Timeout for tokenizer file download (2 minutes for ~17 MB).
-const TOKENIZER_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(2);
-
 /// Default pad token ID for this model (tokenizer's eos_token_id = 128001).
 const DEFAULT_PAD_ID: u32 = 128_001;
 
@@ -92,11 +89,7 @@ static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 /// Whether a background download has been spawned.
 static DOWNLOAD_SPAWNED: AtomicBool = AtomicBool::new(false);
 
-/// Returns a reference to the global singleton [`Embedder`] RwLock.
-///
-/// Unlike the previous ONNX implementation, this NEVER panics. If the model
-/// files are missing or download hasn't completed, the Option will be `None`
-/// and [`embed()`] will gracefully return `None`.
+/// Returns a reference to the global singleton [`Embedder`] RwLock. Never panics.
 #[must_use]
 pub fn global_embedder() -> &'static RwLock<Option<Embedder>> {
     GLOBAL_EMBEDDER.get_or_init(|| RwLock::new(None))
@@ -261,18 +254,11 @@ async fn download_retry_loop() {
 
         // Download both files concurrently, skipping files that already exist.
         let (model_result, tokenizer_result) = tokio::join!(
-            maybe_download(
-                &client,
-                MODEL_URL,
-                &model_dest,
-                MODEL_DOWNLOAD_TIMEOUT,
-                Some(MODEL_SHA256)
-            ),
+            maybe_download(&client, MODEL_URL, &model_dest, Some(MODEL_SHA256)),
             maybe_download(
                 &client,
                 TOKENIZER_URL,
                 &tokenizer_dest,
-                TOKENIZER_DOWNLOAD_TIMEOUT,
                 Some(TOKENIZER_SHA256)
             ),
         );
@@ -337,7 +323,6 @@ async fn maybe_download(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
-    _timeout: Duration,
     expected_sha256: Option<&str>,
 ) -> Result<()> {
     // Skip download if the file already exists (from a previous partial success).
