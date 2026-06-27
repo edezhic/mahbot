@@ -1,6 +1,8 @@
 //! Logs dashboard page — live log viewing with streaming, filters, pagination,
 //! plus a Tool Failures tab for browsing tool error entries.
 
+#![allow(clippy::too_many_lines, clippy::manual_let_else)]
+
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use iced::widget::{
@@ -219,7 +221,7 @@ impl LogsState {
         if self.total == 0 {
             0
         } else {
-            (self.total + self.page_size - 1) / self.page_size
+            self.total.div_ceil(self.page_size)
         }
     }
 

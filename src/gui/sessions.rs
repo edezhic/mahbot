@@ -1,5 +1,11 @@
 //! Sessions dashboard page — view and manage conversation sessions.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::match_same_arms,
+    clippy::manual_let_else
+)]
+
 use crate::ChatMessage;
 use crate::session::{DecodedNativeHistoryMessage, SessionMetadata, decode_native_history_message};
 

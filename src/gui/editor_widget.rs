@@ -2,6 +2,8 @@
 //! management. Intended as a drop-in replacement for `text_editor::Content`
 //! in the editor.rs codebase.
 
+#![allow(clippy::too_many_lines, clippy::match_same_arms)]
+
 use std::cell::{Cell, RefCell};
 
 use cosmic_text::Scroll;

@@ -1,5 +1,7 @@
 //! Users dashboard page — manage user preferences.
 
+#![allow(clippy::too_many_lines)]
+
 use crate::users::{FieldUpdate, UserRecord, UserStorage};
 
 use iced::Task;

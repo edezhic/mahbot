@@ -10,6 +10,12 @@
 //! Tree keyboard navigation: when tree is focused, Arrow Up/Down navigate
 //! entries, Enter opens files or expands directories, Escape exits focus.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::match_same_arms,
+    clippy::manual_let_else
+)]
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

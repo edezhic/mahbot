@@ -6,6 +6,8 @@
 //! A right-click context menu on the terminal area offers Clear (Ctrl+L)
 //! and Select All (viewport-only visual selection).
 
+#![allow(clippy::too_many_lines)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

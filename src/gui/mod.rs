@@ -6,13 +6,9 @@
 #![allow(
     clippy::must_use_candidate,
     clippy::new_without_default,
-    clippy::too_many_lines,
     clippy::struct_excessive_bools,
-    clippy::match_same_arms,
     clippy::if_not_else,
-    clippy::collapsible_if,
-    clippy::manual_let_else,
-    clippy::manual_div_ceil
+    clippy::collapsible_if
 )]
 
 pub mod board;
@@ -526,6 +522,7 @@ impl Dashboard {
         format!("MahBot — {page_name}")
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // ── Centralized Toast and LinkClicked interception ──────────
         // These are handled at the Dashboard level before dispatching
@@ -638,7 +635,10 @@ impl Dashboard {
                 // so the auto-refresh timer starts/stops accordingly.
                 self.sessions_state.set_page_active(page == Page::Sessions);
                 match page {
-                    Page::Logs => Task::none(),
+                    // Logs and Shell maintain their own internal state; Editor
+                    // receives workspace state via WorkspaceSelected from the
+                    // Home page picker — none need a refresh on navigation.
+                    Page::Logs | Page::Shell | Page::Editor => Task::none(),
                     Page::Home => {
                         let load_users = self.home_state.load_users().map(Message::Home);
                         let ws_opts = Task::done(home::HomeMessage::WorkspaceOptions(
@@ -650,11 +650,7 @@ impl Dashboard {
                         let board_refresh = self.board_state.refresh().map(Message::Board);
                         Task::batch([load_users, ws_opts, snap, board_refresh])
                     }
-                    Page::Shell => Task::none(),
                     Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
-                    // Editor receives workspace state via WorkspaceSelected
-                    // from the Home page picker, not via refresh().
-                    Page::Editor => Task::none(),
                     Page::Settings => {
                         self.settings_state.refresh();
                         let refresh_workspaces =
@@ -693,7 +689,6 @@ impl Dashboard {
                         self.board_state.load_state.start_loading();
                         self.board_state.refresh().map(Message::Board)
                     }
-                    Page::Shell => Task::none(),
                     Page::Sessions if !self.sessions_state.load_state.loading() => {
                         self.sessions_state.load_state.start_loading();
                         self.sessions_state.refresh().map(Message::Sessions)
@@ -874,8 +869,7 @@ impl Dashboard {
                     task
                 }
             }
-            Message::Shutdown => self.save_and_exit(),
-            Message::CloseRequested(_id) => self.save_and_exit(),
+            Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
             Message::WindowEvent(_id, event) => {
                 match event {
                     window::Event::Resized(new_size) => self.last_size = new_size,
@@ -1166,9 +1160,7 @@ impl Dashboard {
                 }
             },
             Message::TogglePause if self.ready => {
-                let ws_name = if let Some(n) = self.active_workspace_name() {
-                    n
-                } else {
+                let Some(ws_name) = self.active_workspace_name() else {
                     self.toasts.push(Toast::new(
                         "No workspace selected — select a workspace first".to_string(),
                         ToastKind::Warning,
@@ -1199,9 +1191,7 @@ impl Dashboard {
                     "Failed to toggle pipeline pause",
                 ),
             Message::ToggleMaintenance if self.ready => {
-                let ws_name = if let Some(n) = self.active_workspace_name() {
-                    n
-                } else {
+                let Some(ws_name) = self.active_workspace_name() else {
                     self.toasts.push(Toast::new(
                         "No workspace selected — select a workspace first".to_string(),
                         ToastKind::Warning,
@@ -1491,6 +1481,7 @@ impl Dashboard {
             .is_some_and(|n| !n.is_empty())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, Message> {
         if let Some(err) = &self.boot_error {
             return container(
@@ -2047,6 +2038,7 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
 // ── Navigation sidebar ──────────────────────────────────────────
 
 impl Dashboard {
+    #[allow(clippy::too_many_lines)]
     fn sidebar_view(&self) -> Element<'_, Message> {
         // Sidebar navigation: Home, Editor, Shell (icon-only, 28px)
         let mut nav_col = Column::new().spacing(4);
@@ -2200,6 +2192,7 @@ impl Dashboard {
     }
 
     /// 42px footer bar — nav items (left) and active agents (right).
+    #[allow(clippy::too_many_lines)]
     fn footer_view(&self) -> Element<'_, Message> {
         // Left: footer navigation (Sessions, Logs, Settings) + git blocks
         // Icon-only, 24px. Active page in ACCENT, inactive in TEXT_MUTED.

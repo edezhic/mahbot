@@ -7,7 +7,7 @@
 //! Also manages workspaces and users (formerly separate pages), with
 //! modal dialogs for add operations.
 
-#![allow(clippy::from_iter_instead_of_collect)]
+#![allow(clippy::from_iter_instead_of_collect, clippy::too_many_lines)]
 
 use crate::Role;
 use crate::Workspace;

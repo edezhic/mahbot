@@ -4,6 +4,12 @@
 //! with the Home page workspace picker), and chat with MahBot agents in real time
 //! with full markdown rendering and typing indicators.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::match_same_arms,
+    clippy::manual_let_else
+)]
+
 use crate::ChatDirection;
 use crate::Role;
 use crate::chat_history::ChatHistoryEntry;

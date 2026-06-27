@@ -10,6 +10,8 @@
 //! the diff to just that file; click again to show all files.
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
+#![allow(clippy::too_many_lines, clippy::manual_let_else)]
+
 use super::diff_widget::{self, ADDED_COLOR, DiffBufferWidget, DiffFileBuffer, REMOVED_COLOR};
 use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
 use super::text_rendering::MAX_HIGHLIGHT_SIZE;

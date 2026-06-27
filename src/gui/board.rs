@@ -1,5 +1,7 @@
 //! Board dashboard page — ticket management.
 
+#![allow(clippy::too_many_lines)]
+
 use std::collections::HashSet;
 use std::str::FromStr;
 
@@ -160,18 +162,11 @@ impl BoardState {
                 ("⏸ Pause", TicketPhase::Planning),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
-            TicketPhase::InDevelopment | TicketPhase::InQa => {
-                vec![("🛑 Cancel", TicketPhase::Cancelled)]
-            }
-            TicketPhase::InReview => vec![("🛑 Cancel", TicketPhase::Cancelled)],
             TicketPhase::Reviewed => vec![
                 ("✅ Send to QA", TicketPhase::InQa),
                 ("🔄 Redo Dev", TicketPhase::ReadyForDevelopment),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
-            TicketPhase::QaPassed => {
-                vec![("🛑 Cancel", TicketPhase::Cancelled)]
-            }
             TicketPhase::Planning => vec![
                 ("✅ Ready for Dev", TicketPhase::ReadyForDevelopment),
                 ("🛑 Cancel", TicketPhase::Cancelled),
@@ -297,7 +292,7 @@ impl BoardState {
                 self.selected_loading = true;
                 Self::fetch_ticket(id)
             }
-            BoardMessage::CloseModal => {
+            BoardMessage::CloseModal | BoardMessage::Escape => {
                 self.reset_modal();
                 Task::none()
             }
@@ -372,10 +367,6 @@ impl BoardState {
                 self.action_loading = None;
                 self.load_state.fail(e.clone());
                 Task::done(BoardMessage::Toast(super::ToastMessage::Error(e)))
-            }
-            BoardMessage::Escape => {
-                self.reset_modal();
-                Task::none()
             }
             BoardMessage::ToggleCommentExpand(i) => {
                 if !self.expanded_comments.remove(&i) {

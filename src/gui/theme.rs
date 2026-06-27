@@ -289,10 +289,6 @@ pub fn workspace_status_color(status: &str) -> (Color, Color) {
             Color::from_rgb(0.851, 0.557, 0.0),
             Color::from_rgba(0.851, 0.557, 0.0, 0.1),
         ),
-        "pending" => (
-            Color::from_rgb(0.631, 0.631, 0.631),
-            Color::from_rgba(0.631, 0.631, 0.631, 0.1),
-        ),
         "failed" => (
             Color::from_rgb(0.957, 0.247, 0.369),
             Color::from_rgba(0.957, 0.247, 0.369, 0.1),

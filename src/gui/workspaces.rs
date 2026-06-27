@@ -1,5 +1,7 @@
 //! Workspaces dashboard page.
 
+#![allow(clippy::too_many_lines, clippy::match_same_arms)]
+
 use crate::Workspace;
 
 use iced::Task;
