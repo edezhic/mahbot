@@ -30,26 +30,6 @@ use iced_fonts::lucide;
 use fff_search::grep::{GrepMode, GrepSearchOptions};
 use fff_search::parse_grep_query;
 
-/// Apply a loaded git result (status or ignore) to the editor state.
-/// Both git variants follow the same pattern — only the cache field,
-/// loading flag, and log label differ — so this macro avoids duplicating
-/// the match arm body.
-macro_rules! apply_git_result {
-    ($result:expr, $cache:expr, $loading:expr, $label:expr) => {{
-        $loading = false;
-        match $result {
-            Ok(cache) => {
-                $cache = cache;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load {}: {e}", $label);
-                $cache.clear();
-            }
-        }
-        Task::none()
-    }};
-}
-
 use super::context_menu::ContextMenu;
 
 use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unquote_c_style};
@@ -1590,6 +1570,42 @@ impl EditorState {
             new_item_input: None,
             rename_target: None,
         }
+    }
+
+    /// Apply a loaded git status result to the editor state.
+    fn apply_git_status_result(
+        &mut self,
+        result: Result<HashMap<String, GitFileStatus>, String>,
+    ) -> Task<EditorMessage> {
+        self.git_status_loading = false;
+        match result {
+            Ok(cache) => {
+                self.git_status_cache = cache;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load git status: {e}");
+                self.git_status_cache.clear();
+            }
+        }
+        Task::none()
+    }
+
+    /// Apply a loaded git ignore result to the editor state.
+    fn apply_git_ignore_result(
+        &mut self,
+        result: Result<HashSet<String>, String>,
+    ) -> Task<EditorMessage> {
+        self.git_ignore_loading = false;
+        match result {
+            Ok(cache) => {
+                self.git_ignore_cache = cache;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load git ignore status: {e}");
+                self.git_ignore_cache.clear();
+            }
+        }
+        Task::none()
     }
 
     /// The filesystem root of the currently selected workspace, if any.
@@ -3659,23 +3675,9 @@ impl EditorState {
                 Task::none()
             }
 
-            EditorMessage::GitStatusLoaded(result) => {
-                apply_git_result!(
-                    result,
-                    self.git_status_cache,
-                    self.git_status_loading,
-                    "git status"
-                )
-            }
+            EditorMessage::GitStatusLoaded(result) => self.apply_git_status_result(result),
 
-            EditorMessage::GitIgnoredLoaded(result) => {
-                apply_git_result!(
-                    result,
-                    self.git_ignore_cache,
-                    self.git_ignore_loading,
-                    "git ignore status"
-                )
-            }
+            EditorMessage::GitIgnoredLoaded(result) => self.apply_git_ignore_result(result),
 
             EditorMessage::TabsSaved(saved_gen) => {
                 if saved_gen != self.tab_save_generation {
