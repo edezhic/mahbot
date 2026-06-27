@@ -258,24 +258,26 @@ impl UndoStack {
         }
     }
 
-    /// Pop the most recent snapshot, saving current state to the redo stack.
-    fn undo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
-        // Save current state so it can be redone.
-        self.redo.push(UndoSnapshot {
+    fn push_and_pop(
+        dst: &mut Vec<UndoSnapshot>,
+        src: &mut Vec<UndoSnapshot>,
+        content: &text_editor::Content,
+    ) -> Option<UndoSnapshot> {
+        dst.push(UndoSnapshot {
             text: content.text(),
             cursor: content.cursor(),
         });
-        self.undo.pop()
+        src.pop()
+    }
+
+    /// Pop the most recent snapshot, saving current state to the redo stack.
+    fn undo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
+        Self::push_and_pop(&mut self.redo, &mut self.undo, content)
     }
 
     /// Pop the most recent undone snapshot, saving current state to the undo stack.
     fn redo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
-        // Save current state so it can be undone again.
-        self.undo.push(UndoSnapshot {
-            text: content.text(),
-            cursor: content.cursor(),
-        });
-        self.redo.pop()
+        Self::push_and_pop(&mut self.undo, &mut self.redo, content)
     }
 
     /// Reset the stack (e.g. after sending a message).

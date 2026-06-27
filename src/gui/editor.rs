@@ -244,19 +244,26 @@ impl UndoStack {
         }
     }
 
+    fn push_and_pop(
+        dst: &mut Vec<UndoSnapshot>,
+        src: &mut Vec<UndoSnapshot>,
+        content: &super::editor_widget::EditorBuffer,
+    ) -> Option<UndoSnapshot> {
+        let cursor = content.cursor();
+        dst.push(UndoSnapshot {
+            text: content.text(),
+            cursor_line: cursor.line,
+            cursor_col: cursor.column,
+        });
+        src.pop()
+    }
+
     #[must_use]
     fn undo(&mut self, content: &super::editor_widget::EditorBuffer) -> Option<UndoSnapshot> {
         if self.batch_depth > 0 {
             return None;
         }
-        // Save current state to redo before undoing.
-        let cursor = content.cursor();
-        self.redo.push(UndoSnapshot {
-            text: content.text(),
-            cursor_line: cursor.line,
-            cursor_col: cursor.column,
-        });
-        self.undo.pop()
+        Self::push_and_pop(&mut self.redo, &mut self.undo, content)
     }
 
     #[must_use]
@@ -264,14 +271,7 @@ impl UndoStack {
         if self.batch_depth > 0 {
             return None;
         }
-        // Save current state to undo before redoing.
-        let cursor = content.cursor();
-        self.undo.push(UndoSnapshot {
-            text: content.text(),
-            cursor_line: cursor.line,
-            cursor_col: cursor.column,
-        });
-        self.redo.pop()
+        Self::push_and_pop(&mut self.undo, &mut self.redo, content)
     }
 }
 
