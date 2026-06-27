@@ -41,6 +41,7 @@ use crate::logs::LogStore;
 
 use iced::keyboard;
 use iced::widget::Space;
+use iced::widget::rule;
 use iced::widget::{Column, Row, button, column, container, row, scrollable, text, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Task};
@@ -2274,7 +2275,18 @@ impl Dashboard {
         let has_fs = self.workspace_filesystem_path.is_some();
 
         if has_fs {
-            left_icons.push(Space::new().width(9).into());
+            // ── Vertical divider between nav buttons and git blocks ──
+            left_icons.push(
+                rule::vertical(1)
+                    .style(|_: &iced::Theme| rule::Style {
+                        color: theme::TEXT_MUTED,
+                        radius: 0.0.into(),
+                        fill_mode: rule::FillMode::Padded(8),
+                        snap: true,
+                    })
+                    .into(),
+            );
+            left_icons.push(Space::new().width(4).into());
 
             // a) Branch name — clickable -> branch modal
             // Only shown when a branch is known.
