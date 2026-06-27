@@ -44,10 +44,7 @@ pub enum ToolFailuresMessage {
 pub struct ToolFailuresState {
     entries: Vec<ToolErrorEntry>,
     total: usize,
-    error: Option<String>,
-    pub(crate) loading: bool,
-    /// Whether at least one refresh has completed.
-    has_loaded: bool,
+    load_state: super::common::AsyncLoadState,
     /// Current page (0-indexed).
     page: usize,
     /// Rows per page.
@@ -76,9 +73,7 @@ impl ToolFailuresState {
         Self {
             entries: Vec::new(),
             total: 0,
-            error: None,
-            loading: false,
-            has_loaded: false,
+            load_state: super::common::AsyncLoadState::new(),
             page: 0,
             page_size: 50,
             role_filter: String::new(),
@@ -120,10 +115,9 @@ impl ToolFailuresState {
 
     /// Request a refresh from the stats store.
     ///
-    /// Sets `self.loading = true` and clears `self.error`.
+    /// Delegates to [`AsyncLoadState::start_loading`].
     pub fn refresh(&mut self) -> Task<ToolFailuresMessage> {
-        self.loading = true;
-        self.error = None;
+        self.load_state.start_loading();
         let query = self.build_query();
         let page = self.page;
         let page_size = self.page_size;
@@ -147,15 +141,14 @@ impl ToolFailuresState {
             ToolFailuresMessage::Refreshed(entries, total) => {
                 self.entries = entries;
                 self.total = total;
-                self.error = None;
-                self.loading = false;
-                self.has_loaded = true;
+                self.load_state.finish_loading();
                 Task::none()
             }
             ToolFailuresMessage::RefreshError(e) => {
-                self.error = Some(e);
-                self.loading = false;
-                self.has_loaded = true;
+                self.load_state.fail(e);
+                // ToolFailures shows "empty state" instead of "Loading…" after
+                // the first attempt, even if it failed, so mark has_loaded=true.
+                self.load_state.has_loaded = true;
                 Task::none()
             }
             ToolFailuresMessage::RoleFilterInput(v) => {
@@ -220,15 +213,15 @@ impl ToolFailuresState {
         let mut content = Column::new();
 
         // Error display
-        if let Some(ref err) = self.error {
+        if let Some(ref err) = self.load_state.error {
             content = content.push(widgets::error_banner(err));
             content = content.push(Space::new().height(8));
         }
 
         // Entries or empty state
-        if self.loading && !self.has_loaded {
+        if self.load_state.loading && !self.load_state.has_loaded {
             content = content.push(text("Loading...").size(14).color(theme::TEXT_MUTED));
-        } else if self.entries.is_empty() && self.has_loaded {
+        } else if self.entries.is_empty() && self.load_state.has_loaded {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::bug::<iced::Theme, iced::Renderer>(),
                 "No tool failures",

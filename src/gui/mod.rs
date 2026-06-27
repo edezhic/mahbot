@@ -16,6 +16,7 @@
 )]
 
 pub mod board;
+pub mod common;
 pub mod context_menu;
 pub mod diff;
 pub mod diff_widget;
@@ -642,21 +643,21 @@ impl Dashboard {
                 };
 
                 let page_task = match self.page {
-                    Page::Home if !self.board_state.loading => {
-                        self.board_state.loading = true;
+                    Page::Home if !self.board_state.load_state.loading => {
+                        self.board_state.load_state.loading = true;
                         self.board_state.refresh().map(Message::Board)
                     }
                     Page::Shell => Task::none(),
-                    Page::Sessions if !self.sessions_state.loading => {
-                        self.sessions_state.loading = true;
+                    Page::Sessions if !self.sessions_state.load_state.loading => {
+                        self.sessions_state.load_state.loading = true;
                         self.sessions_state.refresh().map(Message::Sessions)
                     }
                     Page::Settings => {
                         // Refresh workspace and user lists when on Settings page
-                        let ws_loading = self.settings_state.workspaces_state.loading;
-                        let us_loading = self.settings_state.users_state.loading;
+                        let ws_loading = self.settings_state.workspaces_state.load_state.loading;
+                        let us_loading = self.settings_state.users_state.load_state.loading;
                         let ws = if !ws_loading {
-                            self.settings_state.workspaces_state.loading = true;
+                            self.settings_state.workspaces_state.load_state.loading = true;
                             self.settings_state.workspaces_state.refresh().map(|msg| {
                                 Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg))
                             })
@@ -664,7 +665,7 @@ impl Dashboard {
                             Task::none()
                         };
                         let us = if !us_loading {
-                            self.settings_state.users_state.loading = true;
+                            self.settings_state.users_state.load_state.loading = true;
                             self.settings_state.users_state.refresh().map(|msg| {
                                 Message::Settings(settings::SettingsMessage::UserMsg(msg))
                             })
@@ -1902,7 +1903,7 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
         row![clear_btn, Space::new().width(Length::Fill), archive_btn].align_y(Alignment::Center);
 
     // Body: loading, empty, or ticket groups
-    let body: Element<'_, Message> = if !board_state.has_loaded {
+    let body: Element<'_, Message> = if !board_state.load_state.has_loaded {
         column![
             Space::new().height(8),
             text("Loading…").size(12).color(theme::TEXT_MUTED),

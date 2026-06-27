@@ -58,11 +58,7 @@ struct CachedSessionItem {
 
 pub struct SessionsState {
     sessions: Vec<SessionMetadata>,
-    error: Option<String>,
-    pub(crate) loading: bool,
-    /// Whether at least one refresh has completed (prevents "Loading..." flicker
-    /// on empty datasets when auto-poll Ticks).
-    has_loaded: bool,
+    pub(crate) load_state: super::common::AsyncLoadState,
     selected_session: Option<String>,
     selected_messages: Vec<ChatMessage>,
     /// Cached parsed markdown items for each message, populated when messages are loaded.
@@ -93,9 +89,7 @@ impl SessionsState {
     pub fn new() -> Self {
         Self {
             sessions: Vec::new(),
-            error: None,
-            loading: false,
-            has_loaded: false,
+            load_state: super::common::AsyncLoadState::new(),
             selected_session: None,
             selected_messages: Vec::new(),
             selected_md_items: Vec::new(),
@@ -158,13 +152,11 @@ impl SessionsState {
             SessionsMessage::Refreshed(sessions) => {
                 self.sessions = sessions;
                 self.rebuild_session_cache();
-                self.loading = false;
-                self.has_loaded = true;
+                self.load_state.finish_loading();
                 Task::none()
             }
             SessionsMessage::RefreshError(e) => {
-                self.error = Some(e);
-                self.loading = false;
+                self.load_state.fail(e);
                 Task::none()
             }
             SessionsMessage::SelectSession(key) => {
@@ -203,7 +195,7 @@ impl SessionsState {
                 Task::none()
             }
             SessionsMessage::SessionError(e) => {
-                self.error = Some(e);
+                self.load_state.fail(e);
                 self.selected_loading = false;
                 self.messages_refreshing = false;
                 Task::none()
@@ -894,12 +886,12 @@ impl SessionsState {
     pub fn view(&self) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 
-        if let Some(ref err) = self.error {
+        if let Some(ref err) = self.load_state.error {
             content = content.push(widgets::error_banner(err));
             content = content.push(Space::new().height(12));
         }
 
-        if self.loading && !self.has_loaded {
+        if self.load_state.loading && !self.load_state.has_loaded {
             content = content.push(text("Loading...").size(14).color(theme::TEXT_MUTED));
         } else if self.sessions.is_empty() {
             content = content.push(widgets::empty_state_placeholder(

@@ -109,11 +109,7 @@ pub enum LogMessage {
 pub struct LogsState {
     entries: Vec<LogEntry>,
     total: usize,
-    error: Option<String>,
-    loading: bool,
-    /// Whether at least one refresh has completed (prevents "Loading..." flicker
-    /// on empty datasets when auto-poll Ticks).
-    has_loaded: bool,
+    load_state: super::common::AsyncLoadState,
 
     // Filters
     role_filter: String,
@@ -154,9 +150,7 @@ impl LogsState {
         Self {
             entries: Vec::new(),
             total: 0,
-            error: None,
-            loading: false,
-            has_loaded: false,
+            load_state: super::common::AsyncLoadState::new(),
             role_filter: String::new(),
             workspace_filter: String::new(),
             search_filter: String::new(),
@@ -230,8 +224,7 @@ impl LogsState {
     }
 
     pub fn refresh(&mut self, log_store: &LogStore) -> Task<LogMessage> {
-        self.loading = true;
-        self.error = None;
+        self.load_state.start_loading();
         let query = self.build_query();
         let store = log_store.clone();
         Task::perform(
@@ -278,8 +271,7 @@ impl LogsState {
             LogMessage::Refreshed(entries, total, ws_opts) => {
                 self.entries = entries;
                 self.total = total;
-                self.loading = false;
-                self.has_loaded = true;
+                self.load_state.finish_loading();
 
                 // Build workspace options from registry
                 self.workspace_options = ws_opts;
@@ -287,8 +279,7 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::RefreshError(e) => {
-                self.error = Some(e);
-                self.loading = false;
+                self.load_state.fail(e);
                 Task::none()
             }
             LogMessage::LiveEntry(entry) => {
@@ -663,13 +654,13 @@ impl LogsState {
         let mut content = Column::new();
 
         // Error display
-        if let Some(ref err) = self.error {
+        if let Some(ref err) = self.load_state.error {
             content = content.push(widgets::error_banner(err));
             content = content.push(Space::new().height(8));
         }
 
         // Log entries
-        if self.loading && !self.has_loaded {
+        if self.load_state.loading && !self.load_state.has_loaded {
             content = content.push(text("Loading...").size(14).color(theme::TEXT_MUTED));
         } else if self.entries.is_empty() {
             content = content.push(widgets::empty_state_placeholder(

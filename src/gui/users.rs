@@ -49,11 +49,7 @@ pub enum UsersMessage {
 
 pub struct UsersState {
     pub(crate) users: Vec<UserRecord>,
-    pub(crate) error: Option<String>,
-    pub(crate) loading: bool,
-    /// Whether at least one refresh has completed (prevents "Loading..." flicker
-    /// on empty datasets when auto-poll Ticks).
-    pub(crate) has_loaded: bool,
+    pub(crate) load_state: super::common::AsyncLoadState,
 
     // Dropdown options (populated on refresh)
     pub(crate) workspace_options: Vec<super::widgets::PickOption>,
@@ -74,9 +70,7 @@ impl UsersState {
     pub const fn new() -> Self {
         Self {
             users: Vec::new(),
-            error: None,
-            loading: false,
-            has_loaded: false,
+            load_state: super::common::AsyncLoadState::new(),
             workspace_options: Vec::new(),
             role_options: Vec::new(),
             delete_target: None,
@@ -123,8 +117,7 @@ impl UsersState {
         match msg {
             UsersMessage::Refreshed(users, ws_options) => {
                 self.users = users;
-                self.loading = false;
-                self.has_loaded = true;
+                self.load_state.finish_loading();
 
                 self.workspace_options = ws_options;
 
@@ -142,8 +135,7 @@ impl UsersState {
                 Task::none()
             }
             UsersMessage::RefreshError(e) => {
-                self.error = Some(e);
-                self.loading = false;
+                self.load_state.fail(e);
                 Task::none()
             }
             UsersMessage::UpdateRole(sender, role) => Task::perform(
@@ -196,7 +188,7 @@ impl UsersState {
                 Task::done(UsersMessage::Toast(super::ToastMessage::Saved)),
             ]),
             UsersMessage::UpdateResult(Err(e)) => {
-                self.error = Some(e.clone());
+                self.load_state.error = Some(e.clone());
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
             UsersMessage::DeleteUser(sender) => {
@@ -225,7 +217,7 @@ impl UsersState {
             }
             UsersMessage::DeleteResult(Ok(()), _deleted_user) => {
                 self.deleting = false;
-                self.error = None;
+                self.load_state.error = None;
                 Task::batch([
                     self.refresh(),
                     Task::done(UsersMessage::Toast(super::ToastMessage::Deleted)),
@@ -233,7 +225,7 @@ impl UsersState {
             }
             UsersMessage::DeleteResult(Err(e), _deleted_user) => {
                 self.deleting = false;
-                self.error = Some(e.clone());
+                self.load_state.error = Some(e.clone());
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
             UsersMessage::Toast(_) => Task::none(),
@@ -314,7 +306,7 @@ impl UsersState {
                 if self.bind_target.as_deref() == Some(&user_name) {
                     self.bind_error = Some(format!("Failed to bind: {e}"));
                 } else {
-                    self.error = Some(format!("Failed to unbind: {e}"));
+                    self.load_state.error = Some(format!("Failed to unbind: {e}"));
                 }
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }

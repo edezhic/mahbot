@@ -80,11 +80,7 @@ pub enum BoardMessage {
 
 pub struct BoardState {
     pub(crate) tickets: Vec<Ticket>,
-    error: Option<String>,
-    pub(crate) loading: bool,
-    /// Whether at least one refresh has completed (prevents "Loading..." flicker
-    /// on empty datasets when auto-poll Ticks).
-    pub(crate) has_loaded: bool,
+    pub(crate) load_state: super::common::AsyncLoadState,
     selected_id: Option<String>,
     selected_ticket: Option<Ticket>,
     selected_loading: bool,
@@ -109,9 +105,7 @@ impl BoardState {
     pub fn new() -> Self {
         Self {
             tickets: Vec::new(),
-            error: None,
-            loading: false,
-            has_loaded: false,
+            load_state: super::common::AsyncLoadState::new(),
             selected_id: None,
             selected_ticket: None,
             selected_loading: false,
@@ -291,13 +285,11 @@ impl BoardState {
         match msg {
             BoardMessage::Refreshed(tickets) => {
                 self.tickets = tickets;
-                self.loading = false;
-                self.has_loaded = true;
+                self.load_state.finish_loading();
                 Task::none()
             }
             BoardMessage::RefreshError(e) => {
-                self.error = Some(e);
-                self.loading = false;
+                self.load_state.fail(e);
                 Task::none()
             }
             BoardMessage::OpenModal(id) => {
@@ -345,7 +337,7 @@ impl BoardState {
                 }
             }
             BoardMessage::DetailError(e) => {
-                self.error = Some(e);
+                self.load_state.fail(e);
                 self.selected_loading = false;
                 Task::none()
             }
@@ -378,7 +370,7 @@ impl BoardState {
             }
             BoardMessage::ActionResult(Err(e)) => {
                 self.action_loading = None;
-                self.error = Some(e.clone());
+                self.load_state.fail(e.clone());
                 Task::done(BoardMessage::Toast(super::ToastMessage::Error(e)))
             }
             BoardMessage::Escape => {

@@ -695,12 +695,12 @@ impl SettingsState {
 
         let mut rows = Column::new().spacing(4);
 
-        if let Some(ref err) = ws.error {
+        if let Some(ref err) = ws.load_state.error {
             rows = rows.push(widgets::error_banner(err));
             rows = rows.push(Space::new().height(8));
         }
 
-        if ws.loading && !ws.has_loaded {
+        if ws.load_state.loading && !ws.load_state.has_loaded {
             rows = rows.push(text("Loading...").size(13).color(theme::TEXT_MUTED));
         } else if ws.workspaces.is_empty() {
             rows = rows.push(
@@ -1037,12 +1037,12 @@ impl SettingsState {
 
         let mut rows = Column::new().spacing(4);
 
-        if let Some(ref err) = us.error {
+        if let Some(ref err) = us.load_state.error {
             rows = rows.push(widgets::error_banner(err));
             rows = rows.push(Space::new().height(8));
         }
 
-        if us.loading && !us.has_loaded {
+        if us.load_state.loading && !us.load_state.has_loaded {
             rows = rows.push(text("Loading...").size(13).color(theme::TEXT_MUTED));
         } else if us.users.is_empty() {
             rows = rows.push(

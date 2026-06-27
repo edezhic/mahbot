@@ -77,11 +77,7 @@ pub enum WorkspacesMessage {
 
 pub struct WorkspacesState {
     pub(crate) workspaces: Vec<Workspace>,
-    pub(crate) error: Option<String>,
-    pub(crate) loading: bool,
-    /// Whether at least one refresh has completed (prevents "Loading..." flicker
-    /// on empty datasets when auto-poll Ticks).
-    pub(crate) has_loaded: bool,
+    pub(crate) load_state: super::common::AsyncLoadState,
     pub(crate) delete_target: Option<String>,
     pub(crate) deleting: bool,
 
@@ -100,9 +96,7 @@ impl WorkspacesState {
     pub const fn new() -> Self {
         Self {
             workspaces: Vec::new(),
-            error: None,
-            loading: false,
-            has_loaded: false,
+            load_state: super::common::AsyncLoadState::new(),
             delete_target: None,
             deleting: false,
             context_view: None,
@@ -131,13 +125,11 @@ impl WorkspacesState {
         match msg {
             WorkspacesMessage::Refreshed(ws_list) => {
                 self.workspaces = ws_list;
-                self.loading = false;
-                self.has_loaded = true;
+                self.load_state.finish_loading();
                 Task::none()
             }
             WorkspacesMessage::RefreshError(e) => {
-                self.error = Some(e);
-                self.loading = false;
+                self.load_state.fail(e);
                 Task::none()
             }
             WorkspacesMessage::DeleteWorkspace(name) => {
@@ -164,7 +156,7 @@ impl WorkspacesState {
             }
             WorkspacesMessage::DeleteResult(Ok(())) => {
                 self.deleting = false;
-                self.error = None;
+                self.load_state.error = None;
                 Task::batch([
                     self.refresh(),
                     Task::done(WorkspacesMessage::Toast(super::ToastMessage::Deleted)),
@@ -172,7 +164,7 @@ impl WorkspacesState {
             }
             WorkspacesMessage::DeleteResult(Err(e)) => {
                 self.deleting = false;
-                self.error = Some(e.clone());
+                self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
             WorkspacesMessage::Reanalyze(name) => {
@@ -194,7 +186,7 @@ impl WorkspacesState {
                 ))),
             ]),
             WorkspacesMessage::ReanalyzeResult(Err(e)) => {
-                self.error = Some(e.clone());
+                self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
             WorkspacesMessage::ToggleMaintainer(name, enabled) => Task::perform(
@@ -211,7 +203,7 @@ impl WorkspacesState {
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Saved)),
             ]),
             WorkspacesMessage::ToggleResult(Err(e)) => {
-                self.error = Some(e.clone());
+                self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
             WorkspacesMessage::ViewContext(ws_name, role) => {
