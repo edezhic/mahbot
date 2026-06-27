@@ -114,9 +114,11 @@ enum WarmupMode {
 
 /// Shared provider and transcriber setup logic.
 ///
-/// Extracts config from [`CONFIG`], creates the provider, optionally warms it up,
-/// then atomically swaps it into [`PROVIDER`]. Also recreates both image and audio
-/// transcribers.
+/// Extracts config from [`CONFIG`], creates the provider and constructs both
+/// transcribers (synchronous, no I/O), then optionally warms the provider up
+/// (async HTTP call). After warmup (or warmup skip/graceful failure), all three
+/// globals — [`PROVIDER`], [`IMAGE_TRANSCRIBER`], [`AUDIO_TRANSCRIBER`] — are
+/// swapped in together.
 ///
 /// Used by [`init_global`] (startup, non-fatal warmup) and [`recreate_all`]
 /// (config reload, fatal warmup) to eliminate ~28 lines of duplication.
@@ -131,6 +133,24 @@ async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Res
 
     let provider: Arc<dyn Provider> = create_provider(api_key.as_deref(), endpoint_opt)?.into();
 
+    // Construct transcribers early — purely synchronous CPU work with no I/O,
+    // so there's no reason to wait until after the warmup HTTP call.
+    let image_transcriber = create_transcriber(
+        Some(&endpoint),
+        api_key.as_deref(),
+        Some(CONFIG.image_transcription_model().as_str()),
+        CONFIG.transcription_provider().as_deref(),
+        ImageTranscriber::from_inner,
+    );
+    let audio_transcriber = create_transcriber(
+        Some(&endpoint),
+        api_key.as_deref(),
+        Some(CONFIG.audio_transcription_model().as_str()),
+        CONFIG.audio_transcription_provider().as_deref(),
+        transcribe::AudioTranscriber::from_inner,
+    );
+
+    // Now warm up the provider (costly HTTP round-trip).
     match warmup_mode {
         WarmupMode::Fatal => {
             provider.warmup().await?;
@@ -142,26 +162,14 @@ async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Res
         }
     }
 
+    // Atomically swap all three globals after warmup verification.
     *PROVIDER.write().expect("PROVIDER poisoned") = Some(provider);
-
-    create_and_store_transcriber(
-        &IMAGE_TRANSCRIBER,
-        "IMAGE_TRANSCRIBER",
-        Some(&endpoint),
-        api_key.as_deref(),
-        Some(CONFIG.image_transcription_model().as_str()),
-        CONFIG.transcription_provider().as_deref(),
-        ImageTranscriber::from_inner,
-    );
-    create_and_store_transcriber(
-        &AUDIO_TRANSCRIBER,
-        "AUDIO_TRANSCRIBER",
-        Some(&endpoint),
-        api_key.as_deref(),
-        Some(CONFIG.audio_transcription_model().as_str()),
-        CONFIG.audio_transcription_provider().as_deref(),
-        transcribe::AudioTranscriber::from_inner,
-    );
+    *IMAGE_TRANSCRIBER
+        .write()
+        .expect("IMAGE_TRANSCRIBER poisoned") = image_transcriber;
+    *AUDIO_TRANSCRIBER
+        .write()
+        .expect("AUDIO_TRANSCRIBER poisoned") = audio_transcriber;
 
     Ok(())
 }
@@ -300,23 +308,6 @@ fn create_transcriber<T>(
         .to_string();
     let inner = transcribe::MediaTranscriber::new(base_url, model, route);
     Some(wrapper(inner))
-}
-
-/// Build a transcriber and store it in a global [`RwLock`] singleton.
-///
-/// Uses [`create_transcriber`] internally, then atomically swaps the result
-/// into `store`. Panics if the lock is poisoned.
-fn create_and_store_transcriber<T: Clone + Send + Sync + 'static>(
-    store: &RwLock<Option<T>>,
-    name: &str,
-    api_url: Option<&str>,
-    api_key: Option<&str>,
-    model: Option<&str>,
-    provider: Option<&str>,
-    wrapper: impl FnOnce(transcribe::MediaTranscriber) -> T,
-) {
-    let transcriber = create_transcriber(api_url, api_key, model, provider, wrapper);
-    *store.write().unwrap_or_else(|_| panic!("{name} poisoned")) = transcriber;
 }
 
 // ── Tests ─────────────────────────────────────────────────────
