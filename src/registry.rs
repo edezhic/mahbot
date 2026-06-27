@@ -103,6 +103,23 @@ impl AgentRegistry {
         }
     }
 
+    /// Cancel all agents running for a specific role within a specific workspace path.
+    /// Used when maintenance is disabled for a workspace — stops the in-flight maintainer agent.
+    pub fn cancel_by_role_and_workspace_path(&self, role: &str, ws_path: &str) {
+        let to_cancel: Vec<String> = {
+            let map = self.inner.lock().unwrap_poison();
+            map.iter()
+                .filter(|(_, entry)| {
+                    entry.handle.role == role && entry.handle.workspace_path == ws_path
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for run_id in to_cancel {
+            self.cancel(&run_id);
+        }
+    }
+
     /// Snapshot of all currently running agents (serializable).
     #[must_use]
     pub fn list(&self) -> Vec<AgentHandle> {

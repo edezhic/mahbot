@@ -626,6 +626,12 @@ impl WorkspaceStorage {
                     turso::params![val, now, name],
                 )
                 .await?;
+            // Cancel any running maintainer agent for this workspace so it
+            // doesn't continue creating tickets after maintenance was disabled.
+            if let Some(ws) = self.get_by_name(name).await? {
+                crate::registry::AGENT_REGISTRY
+                    .cancel_by_role_and_workspace_path(&Role::Maintainer.to_string(), &ws.path);
+            }
         }
         if enabled {
             tracing::info!(workspace = name, "Maintainer enabled");
