@@ -257,15 +257,6 @@ async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) ->
     Ok(())
 }
 
-// Spawn analysis for all analysis-eligible roles and set final status.
-// Runs diagnostics discovery concurrently with role discovery via `tokio::join!`.
-// Manager decision: diagnostics failure is FATAL — workspace status becomes "failed".
-//
-// `discovery_generation` is the generation counter captured by the caller
-// (either `add` or `rediscover`). Before writing final status, the task
-// re-reads the generation from the DB; if it no longer matches, a newer
-// rediscover call has been made and this task's results are stale — all
-// writes are skipped.
 // ── Discovery completion finalizer ────────────────────────────────
 
 /// Apply the final status and pause state after a discovery run completes.
@@ -320,10 +311,10 @@ pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
         // Run the discovery body in a sub-task so that panics are captured
         // via the JoinHandle instead of being silently swallowed.
         //
-        // NOTE: Unlike management.rs:spawn_dispatch, this guard only logs
-        // and does NOT transition the workspace to "failed". Non-prompt
-        // panics will still leave the workspace in "analyzing" — visible
-        // in logs but not recovered.
+        // NOTE: Unlike the ticket-dispatch panic recovery (which transitions
+        // the ticket to Failed), this guard only logs and does NOT transition
+        // the workspace to "failed". Non-prompt panics will leave the workspace
+        // in "analyzing" — visible in logs but not recovered.
         let ws_name_for_finalize = ws_name.clone();
         let inner = tokio::spawn(async move {
             // Run role discovery and diagnostics discovery concurrently.
@@ -464,10 +455,6 @@ fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
 
 impl WorkspaceStorage {
     /// Open (or create) the workspaces database at `root/db/workspaces.db`.
-    ///
-    /// The `dirty_content` column was added to the `editor_tabs` table in an
-    /// earlier version; it is now part of the `CREATE TABLE` schema and no
-    /// migration is needed.
     pub async fn open(root: &Path) -> Result<Self> {
         let db_path = root.join("db/workspaces.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
