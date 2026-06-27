@@ -325,12 +325,18 @@ impl DiffState {
                 self.personal_workspace_path.clone_from(&path_override);
                 self.current_commit_ref = None;
                 self.current_commit_message = None;
+                self.error = None;
+                self.status_message = None;
+                self.file_buffers.clear();
                 self.generation = self.generation.wrapping_add(1);
                 let generation_num = self.generation;
                 let workspace_name = name.clone();
                 let ws_path = path_override.clone();
                 self.diff_loading = true;
+                self.diff_has_loaded = false;
                 self.selected_file = None;
+                self.diff_files.clear();
+                self.diff_empty = true;
                 Task::perform(load_diff(workspace_name, ws_path, None), move |r| {
                     DiffMessage::DiffLoaded(generation_num, r)
                 })
@@ -410,11 +416,14 @@ impl DiffState {
                 self.selected_workspace_name = Some(ws_name.clone());
                 self.personal_workspace_path = None;
                 self.error = None;
+                self.status_message = None;
                 self.file_tree.expanded_dirs.clear();
                 self.tree_auto_expand_pending = true;
                 self.commit_message.clear();
                 self.committing = false;
                 self.selected_file = None;
+                self.diff_files.clear();
+                self.diff_empty = true;
                 self.file_buffers.clear();
                 self.current_commit_message = None;
                 // Set commit ref and loading BEFORE spawning task
@@ -454,8 +463,16 @@ impl DiffState {
                 };
                 // Set loading BEFORE clearing ref (prevents Tick race).
                 self.diff_loading = true;
+                self.diff_has_loaded = false;
                 self.current_commit_ref = None;
                 self.current_commit_message = None;
+                self.error = None;
+                self.status_message = None;
+                self.commit_message.clear();
+                self.committing = false;
+                self.diff_files.clear();
+                self.diff_empty = true;
+                self.file_buffers.clear();
                 self.file_tree.expanded_dirs.clear();
                 self.tree_auto_expand_pending = true;
                 self.generation = self.generation.wrapping_add(1);
@@ -2508,5 +2525,81 @@ mod tests {
             compute_truncation_index(&files, None, Some((100, 5000))),
             None,
         );
+    }
+
+    // ── Stale-data regression tests ───────────────────────────────────
+    //
+    // Verify that context-switching message handlers clear all state
+    // synchronously (before the async load task runs), preventing stale data
+    // from rendering during the loading transition.
+
+    /// Shared helper: verify that a context switch has reset all fields that
+    /// could render stale data during the async loading window.
+    fn assert_diff_state_reset(state: &DiffState) {
+        assert!(
+            state.diff_files.is_empty(),
+            "diff_files should be cleared synchronously to avoid stale data"
+        );
+        assert!(state.diff_empty, "diff_empty should be true after clearing");
+        assert!(
+            state.diff_loading,
+            "diff_loading should be set before async load"
+        );
+        assert!(
+            !state.diff_has_loaded,
+            "diff_has_loaded should be false to enable loading guard"
+        );
+        assert!(
+            state.error.is_none(),
+            "error should be cleared to prevent stale error banner"
+        );
+        assert!(
+            state.status_message.is_none(),
+            "status_message should be cleared to prevent stale status text"
+        );
+        assert!(
+            state.commit_message.is_empty(),
+            "commit_message should be cleared to prevent stale typed text"
+        );
+        assert!(!state.committing, "committing should be reset to false");
+    }
+
+    /// Create a `DiffState` populated with old/stale data to verify that each
+    /// context-switching handler resets it before the async load runs.
+    fn make_state_with_stale_data() -> DiffState {
+        let mut state = make_diff_with_tree();
+        assert!(!state.diff_files.is_empty());
+        state.diff_empty = false;
+        state.diff_has_loaded = true;
+        state.error = Some("stale error".into());
+        state.status_message = Some("stale status".into());
+        state.commit_message = "stale commit".into();
+        state.committing = true;
+        state
+    }
+
+    #[test]
+    fn test_navigate_to_commit_clears_stale_diff_files() {
+        let mut state = make_state_with_stale_data();
+        let _task = state.update(DiffMessage::NavigateToCommit(
+            "test-ws".into(),
+            "abc123".into(),
+        ));
+        assert_diff_state_reset(&state);
+    }
+
+    #[test]
+    fn test_workspace_selected_clears_stale_diff_files() {
+        let mut state = make_state_with_stale_data();
+        let _task = state.update(DiffMessage::WorkspaceSelected("new-ws".into(), None));
+        assert_diff_state_reset(&state);
+    }
+
+    #[test]
+    fn test_back_to_working_tree_clears_stale_diff_files() {
+        let mut state = make_state_with_stale_data();
+        state.selected_workspace_name = Some("test-ws".into());
+        let _task = state.update(DiffMessage::BackToWorkingTree);
+        assert_diff_state_reset(&state);
     }
 }
