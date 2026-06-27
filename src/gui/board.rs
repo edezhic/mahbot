@@ -652,7 +652,7 @@ impl BoardState {
             let removed = ticket.lines_removed.unwrap_or(0);
             let stats_parts = row![
                 text("\u{2387} ").size(10).color(theme::TEXT_SECONDARY),
-                diff_stats_row::<BoardMessage>(added, removed),
+                diff_stats_row::<BoardMessage>(added, removed, 10.0),
             ]
             .spacing(0)
             .align_y(Alignment::Center);

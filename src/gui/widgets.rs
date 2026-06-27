@@ -127,23 +127,23 @@ pub fn selectable_text<'a>(
 ///
 /// Callers typically wrap this in a styled [`button`] with an appropriate
 /// action message.
-pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64) -> Row<'a, Message> {
+pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> Row<'a, Message> {
     let mut parts: Vec<Element<'a, Message>> = Vec::new();
     if added > 0 {
         parts.push(
             text(format!("+{added}"))
-                .size(10)
+                .size(size)
                 .color(theme::STATUS_SUCCESS)
                 .into(),
         );
     }
     if added > 0 && removed > 0 {
-        parts.push(text("/").size(10).color(theme::TEXT_MUTED).into());
+        parts.push(text("/").size(size).color(theme::TEXT_MUTED).into());
     }
     if removed > 0 {
         parts.push(
             text(format!("\u{2212}{removed}"))
-                .size(10)
+                .size(size)
                 .color(theme::STATUS_ERROR)
                 .into(),
         );

@@ -2212,10 +2212,10 @@ impl Dashboard {
             .into()
     }
 
-    /// 24px footer bar — nav items (left) and active agents (right).
+    /// 36px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
         // Left: footer navigation (Sessions, Logs, Settings) + git blocks
-        // Icon-only, 16px. Active page in ACCENT, inactive in TEXT_MUTED.
+        // Icon-only, 24px. Active page in ACCENT, inactive in TEXT_MUTED.
         let mut left_icons = Vec::with_capacity(10);
 
         // Update button — leftmost, disabled while updating.
@@ -2227,11 +2227,11 @@ impl Dashboard {
                 theme::ACCENT
             };
             let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                .size(16)
+                .size(24)
                 .color(update_color);
             let update_btn = button(update_icon)
                 .style(theme::button_text)
-                .padding(2)
+                .padding(3)
                 .on_press_maybe(if self.updating {
                     None
                 } else {
@@ -2249,22 +2249,22 @@ impl Dashboard {
             };
             let icon: iced::Element<'_, Message> = match page {
                 Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>()
-                    .size(16)
+                    .size(24)
                     .color(color)
                     .into(),
                 Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>()
-                    .size(16)
+                    .size(24)
                     .color(color)
                     .into(),
                 Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>()
-                    .size(16)
+                    .size(24)
                     .color(color)
                     .into(),
                 _ => text("").into(),
             };
             let btn = button(icon)
                 .style(theme::button_text)
-                .padding(2)
+                .padding(3)
                 .on_press(Message::Navigation(*page));
             left_icons.push(btn.into());
         }
@@ -2274,7 +2274,7 @@ impl Dashboard {
         let has_fs = self.workspace_filesystem_path.is_some();
 
         if has_fs {
-            left_icons.push(Space::new().width(6).into());
+            left_icons.push(Space::new().width(9).into());
 
             // a) Branch name — clickable -> branch modal
             // Only shown when a branch is known.
@@ -2291,15 +2291,15 @@ impl Dashboard {
                 };
                 let branch_content = row![
                     lucide::git_branch::<iced::Theme, iced::Renderer>()
-                        .size(16)
+                        .size(24)
                         .color(theme::ACCENT),
-                    text(truncated).size(11).color(theme::ACCENT),
+                    text(truncated).size(16).color(theme::ACCENT),
                 ]
-                .spacing(4)
+                .spacing(6)
                 .align_y(Alignment::Center);
                 let branch_btn = button(branch_content)
                     .style(theme::button_text)
-                    .padding(2)
+                    .padding(3)
                     .on_press(Message::OpenBranchModal);
                 left_icons.push(branch_btn.into());
             }
@@ -2317,18 +2317,18 @@ impl Dashboard {
                     };
                     let sync_content = row![
                         lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                            .size(16)
+                            .size(24)
                             .color(if self.git_syncing {
                                 theme::TEXT_MUTED
                             } else {
                                 theme::ACCENT
                             }),
-                        text(sync_text).size(11).color(theme::TEXT_MUTED),
+                        text(sync_text).size(16).color(theme::TEXT_MUTED),
                     ]
-                    .spacing(4)
+                    .spacing(6)
                     .align_y(Alignment::Center);
                     let sync_btn = button(sync_content)
-                        .padding(2)
+                        .padding(3)
                         .style(theme::button_text)
                         .on_press_maybe(if self.git_syncing {
                             None
@@ -2343,10 +2343,10 @@ impl Dashboard {
             // Only rendered when there are non-zero changes.
             if let Some((added, removed)) = self.git_diff_stats {
                 if added > 0 || removed > 0 {
-                    let stats_row = widgets::diff_stats_row::<Message>(added, removed);
+                    let stats_row = widgets::diff_stats_row::<Message>(added, removed, 15.0);
                     let diff_btn = button(stats_row)
                         .style(theme::button_text)
-                        .padding(2)
+                        .padding(3)
                         .on_press(Message::OpenDiffModal(None));
                     left_icons.push(diff_btn.into());
                 }
@@ -2354,7 +2354,7 @@ impl Dashboard {
         }
 
         let left = Row::with_children(left_icons)
-            .spacing(4)
+            .spacing(6)
             .align_y(Alignment::Center);
 
         // Right: active agent icons (horizontal, one per role, "×N" for multiples)
@@ -2372,14 +2372,14 @@ impl Dashboard {
                 for (role_str, count) in &role_counts {
                     let role: crate::Role = role_str.parse().unwrap_or(crate::Role::Engineer);
                     let (color, _bg) = theme::role_badge_color_for(&role);
-                    let icon = theme::role_icon(&role).size(16).color(color);
+                    let icon = theme::role_icon(&role).size(24).color(color);
                     if *count > 1 {
-                        let label = text(format!("×{count}")).size(10).color(color);
+                        let label = text(format!("×{count}")).size(15).color(color);
                         icons.push(
-                            container(row![icon, label].spacing(2).align_y(Alignment::Center))
+                            container(row![icon, label].spacing(3).align_y(Alignment::Center))
                                 .padding(iced::Padding {
-                                    left: 2.0,
-                                    right: 2.0,
+                                    left: 3.0,
+                                    right: 3.0,
                                     top: 0.0,
                                     bottom: 0.0,
                                 })
@@ -2389,8 +2389,8 @@ impl Dashboard {
                         icons.push(
                             container(icon)
                                 .padding(iced::Padding {
-                                    left: 2.0,
-                                    right: 2.0,
+                                    left: 3.0,
+                                    right: 3.0,
                                     top: 0.0,
                                     bottom: 0.0,
                                 })
@@ -2399,7 +2399,7 @@ impl Dashboard {
                     }
                 }
                 let c = Row::with_children(icons)
-                    .spacing(8)
+                    .spacing(12)
                     .align_y(Alignment::Center);
                 c.into()
             }
@@ -2409,13 +2409,13 @@ impl Dashboard {
             .align_y(Alignment::Center)
             .padding(iced::Padding {
                 top: 0.0,
-                right: 12.0,
-                bottom: 4.0,
-                left: 12.0,
+                right: 18.0,
+                bottom: 6.0,
+                left: 18.0,
             });
 
         container(footer_row)
-            .height(Length::Fixed(24.0))
+            .height(Length::Fixed(36.0))
             .width(Length::Fill)
             .style(theme::surface_container_style)
             .into()
