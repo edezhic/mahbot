@@ -1198,28 +1198,15 @@ impl Dashboard {
                     move |result| Message::TogglePauseResult(result, ws_name, new_paused),
                 )
             }
-            Message::TogglePauseResult(result, ws_name, intended_state) if self.ready => {
-                match result {
-                    Ok(()) => {
-                        self.toasts.push(Toast::new(
-                            if intended_state {
-                                format!("Pipeline paused for {ws_name}")
-                            } else {
-                                format!("Pipeline resumed for {ws_name}")
-                            },
-                            ToastKind::Success,
-                        ));
-                        refresh_workspace_states_task()
-                    }
-                    Err(e) => {
-                        self.toasts.push(Toast::new(
-                            format!("Failed to toggle pipeline pause: {e}"),
-                            ToastKind::Error,
-                        ));
-                        Task::none()
-                    }
-                }
-            }
+            Message::TogglePauseResult(result, ws_name, intended_state) if self.ready => self
+                .handle_toggle_result(
+                    result,
+                    &ws_name,
+                    intended_state,
+                    "Pipeline paused",
+                    "Pipeline resumed",
+                    "Failed to toggle pipeline pause",
+                ),
             Message::ToggleMaintenance if self.ready => {
                 let ws_name = if let Some(n) = self.active_workspace_name() {
                     n
@@ -1244,28 +1231,15 @@ impl Dashboard {
                     move |result| Message::ToggleMaintenanceResult(result, ws_name, new_enabled),
                 )
             }
-            Message::ToggleMaintenanceResult(result, ws_name, intended_state) if self.ready => {
-                match result {
-                    Ok(()) => {
-                        self.toasts.push(Toast::new(
-                            if intended_state {
-                                format!("Maintainer enabled for {ws_name}")
-                            } else {
-                                format!("Maintainer disabled for {ws_name}")
-                            },
-                            ToastKind::Success,
-                        ));
-                        refresh_workspace_states_task()
-                    }
-                    Err(e) => {
-                        self.toasts.push(Toast::new(
-                            format!("Failed to toggle maintainer: {e}"),
-                            ToastKind::Error,
-                        ));
-                        Task::none()
-                    }
-                }
-            }
+            Message::ToggleMaintenanceResult(result, ws_name, intended_state) if self.ready => self
+                .handle_toggle_result(
+                    result,
+                    &ws_name,
+                    intended_state,
+                    "Maintainer enabled",
+                    "Maintainer disabled",
+                    "Failed to toggle maintainer",
+                ),
             Message::WorkspaceStatesRefreshed(paused_map, maintenance_map) if self.ready => {
                 self.workspace_paused = paused_map;
                 self.workspace_maintenance = maintenance_map;
@@ -1304,6 +1278,33 @@ impl Dashboard {
             | Message::GitCreate
             | Message::GitSync
             | Message::OpenBranchModal => Task::none(),
+        }
+    }
+
+    /// Shared handler for toggle-pause / toggle-maintenance results.
+    fn handle_toggle_result(
+        &mut self,
+        result: Result<(), String>,
+        ws_name: &str,
+        intended_state: bool,
+        on_label: &str,
+        off_label: &str,
+        err_prefix: &str,
+    ) -> Task<Message> {
+        match result {
+            Ok(()) => {
+                let label = if intended_state { on_label } else { off_label };
+                self.toasts.push(Toast::new(
+                    format!("{label} for {ws_name}"),
+                    ToastKind::Success,
+                ));
+                refresh_workspace_states_task()
+            }
+            Err(e) => {
+                self.toasts
+                    .push(Toast::new(format!("{err_prefix}: {e}"), ToastKind::Error));
+                Task::none()
+            }
         }
     }
 
