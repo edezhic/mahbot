@@ -1588,42 +1588,6 @@ impl EditorState {
         }
     }
 
-    /// Apply a loaded git status result to the editor state.
-    fn apply_git_status_result(
-        &mut self,
-        result: Result<HashMap<String, GitFileStatus>, String>,
-    ) -> Task<EditorMessage> {
-        self.git_status_loading = false;
-        match result {
-            Ok(cache) => {
-                self.git_status_cache = cache;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load git status: {e}");
-                self.git_status_cache.clear();
-            }
-        }
-        Task::none()
-    }
-
-    /// Apply a loaded git ignore result to the editor state.
-    fn apply_git_ignore_result(
-        &mut self,
-        result: Result<HashSet<String>, String>,
-    ) -> Task<EditorMessage> {
-        self.git_ignore_loading = false;
-        match result {
-            Ok(cache) => {
-                self.git_ignore_cache = cache;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load git ignore status: {e}");
-                self.git_ignore_cache.clear();
-            }
-        }
-        Task::none()
-    }
-
     /// The filesystem root of the currently selected workspace, if any.
     /// Always absolute — validated & canonicalized at creation time.
     #[inline]
@@ -3682,9 +3646,29 @@ impl EditorState {
                 Task::none()
             }
 
-            EditorMessage::GitStatusLoaded(result) => self.apply_git_status_result(result),
+            EditorMessage::GitStatusLoaded(result) => {
+                self.git_status_loading = false;
+                match result {
+                    Ok(cache) => self.git_status_cache = cache,
+                    Err(e) => {
+                        tracing::warn!("Failed to load git status: {e}");
+                        self.git_status_cache.clear();
+                    }
+                }
+                Task::none()
+            }
 
-            EditorMessage::GitIgnoredLoaded(result) => self.apply_git_ignore_result(result),
+            EditorMessage::GitIgnoredLoaded(result) => {
+                self.git_ignore_loading = false;
+                match result {
+                    Ok(cache) => self.git_ignore_cache = cache,
+                    Err(e) => {
+                        tracing::warn!("Failed to load git ignore status: {e}");
+                        self.git_ignore_cache.clear();
+                    }
+                }
+                Task::none()
+            }
 
             EditorMessage::TabsSaved(saved_gen) => {
                 if saved_gen != self.tab_save_generation {
