@@ -378,7 +378,9 @@ impl SettingsState {
             }
             SettingsMessage::RoleModel { role, model } => {
                 let model_opt = Some(model).filter(|s| !s.is_empty());
-                RoleConfig::upsert_model(&mut self.config.per_role_configs, role, model_opt);
+                RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
+                    c.model = model_opt;
+                });
                 Task::none()
             }
             SettingsMessage::RoleReasoning { role, effort } => {
@@ -387,28 +389,22 @@ impl SettingsState {
                 } else {
                     Some(effort).filter(|s| !s.is_empty())
                 };
-                RoleConfig::upsert_reasoning_effort(
-                    &mut self.config.per_role_configs,
-                    role,
-                    effort_opt,
-                );
+                RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
+                    c.reasoning_effort = effort_opt;
+                });
                 Task::none()
             }
             SettingsMessage::ModelRoutingOrder { model, order } => {
                 let order_opt = Some(order).filter(|s| !s.is_empty());
-                ModelRouting::upsert_provider_order(
-                    &mut self.config.model_routings,
-                    model,
-                    order_opt,
-                );
+                ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
+                    mr.provider_order = order_opt;
+                });
                 Task::none()
             }
             SettingsMessage::ModelRoutingAllowFallbacks { model, allow } => {
-                ModelRouting::upsert_allow_fallbacks(
-                    &mut self.config.model_routings,
-                    model,
-                    Some(allow),
-                );
+                ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
+                    mr.allow_fallbacks = Some(allow);
+                });
                 Task::none()
             }
             SettingsMessage::TogglePasswordVisibility(target) => {
