@@ -102,7 +102,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         Role::Engineer => &RoleInfo {
             selectable: true,
             badge_fg: (0.855, 0.439, 0.173),
-            default_model: "deepseek/deepseek-v4-pro",
             display_label: "Engineer",
             ..BASE_ROLE_INFO
         },
@@ -150,7 +149,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         Role::Maintainer => &RoleInfo {
             temperature: 0.5,
             badge_fg: (0.753, 0.376, 0.502),
-            default_model: "deepseek/deepseek-v4-pro",
             display_label: "Maintainer",
             ..BASE_ROLE_INFO
         },
