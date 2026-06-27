@@ -155,7 +155,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             ..BASE_ROLE_INFO
         },
         Role::Sanitation => &RoleInfo {
-            temperature: 0.1,
             badge_fg: (0.482, 0.482, 0.482),
             display_label: "Sanitation",
             ..BASE_ROLE_INFO
