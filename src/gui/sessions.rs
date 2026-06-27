@@ -44,9 +44,6 @@ pub enum SessionsMessage {
     /// Dismiss modals/panels (Escape key).
     Escape,
 
-    /// Request toast notification.
-    Toast(super::ToastMessage),
-
     /// A link was clicked in rendered markdown.
     LinkClicked(String),
 }
@@ -282,7 +279,6 @@ impl SessionsState {
                 Task::none()
             }
             SessionsMessage::LinkClicked(_) => Task::none(),
-            SessionsMessage::Toast(_) => Task::none(),
         }
     }
 

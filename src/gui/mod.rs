@@ -535,7 +535,6 @@ impl Dashboard {
                 | logs::LogMessage::ToolFailures(ToolFailuresMessage::Toast(ref tm)),
             )
             | Message::Board(board::BoardMessage::Toast(ref tm))
-            | Message::Sessions(sessions::SessionsMessage::Toast(ref tm))
             | Message::DiffModal(diff::DiffMessage::Toast(ref tm))
             | Message::Editor(editor::EditorMessage::Toast(ref tm))
             | Message::Settings(
