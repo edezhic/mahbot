@@ -308,8 +308,6 @@ pub struct HomeState {
     typing_tick_state: u8,
     /// Whether the initial history load has happened for the current user+workspace.
     history_loaded: bool,
-    /// Loading state.
-    loading: bool,
     /// Generation counter for stale sending timeout detection.
     sending_gen: u64,
     /// True when WorkspaceChanged arrived before a user was selected — the
@@ -341,7 +339,6 @@ impl HomeState {
             typing: false,
             typing_tick_state: 0,
             history_loaded: false,
-            loading: false,
             sending_gen: 0,
             pending_workspace_refresh: false,
             auto_scroll_enabled: true,
@@ -924,13 +921,11 @@ impl HomeState {
                     self.seen_ids.insert(msg_id);
                 }
                 self.history_loaded = true;
-                self.loading = false;
                 // Snap to end only if auto-scroll is enabled.
                 self.maybe_snap()
             }
             HomeMessage::HistoryLoadError(e) => {
                 tracing::warn!(error = %e, "Home: failed to load chat history");
-                self.loading = false;
                 Task::none()
             }
             HomeMessage::UsersLoaded(options) => {
