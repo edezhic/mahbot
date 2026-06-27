@@ -6963,121 +6963,156 @@ mod tests {
     // ── Git status porcelain parsing tests ─────────────────────────
 
     #[test]
-    fn test_porcelain_modified_file() {
-        let map = parse_git_status_porcelain(" M src/main.rs\n");
-        assert_eq!(map.get("src/main.rs"), Some(&GitFileStatus::Modified));
-    }
+    fn test_parse_git_status_porcelain() {
+        struct Case {
+            /// Short label for failure messages.
+            name: &'static str,
+            /// Raw git status --porcelain output.
+            input: &'static str,
+            /// Expected entries: (path, Some(status)) asserts the file has that
+            /// status; (path, None) asserts the file is absent from the map.
+            /// An empty slice asserts the entire map is empty.
+            expected: &'static [(&'static str, Option<GitFileStatus>)],
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "unstaged modified file",
+                input: " M src/main.rs\n",
+                expected: &[("src/main.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "staged added file",
+                input: "A  new_file.rs\n",
+                expected: &[("new_file.rs", Some(GitFileStatus::Added))],
+            },
+            Case {
+                name: "untracked file",
+                input: "?? new_file.rs\n",
+                expected: &[("new_file.rs", Some(GitFileStatus::Added))],
+            },
+            Case {
+                name: "staged and unstaged modified (MM)",
+                input: "MM both.rs\n",
+                expected: &[("both.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "staged added + unstaged modified (AM)",
+                input: "AM partial.rs\n",
+                expected: &[("partial.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "rename (old -> new)",
+                input: "R  old.rs -> new.rs\n",
+                expected: &[("new.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "rename with arrow in old path",
+                input: "R  \"old -> name.rs\" -> \"new -> name.rs\"\n",
+                expected: &[("new -> name.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "untracked directory (trailing slash stripped)",
+                input: "?? new_dir/\n",
+                expected: &[("new_dir", Some(GitFileStatus::Added))],
+            },
+            Case {
+                name: "quoted path with spaces",
+                input: " M \"path with spaces.rs\"\n",
+                expected: &[("path with spaces.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "deleted file (unstaged) skipped",
+                input: " D gone.rs\n",
+                expected: &[],
+            },
+            Case {
+                name: "deleted file (staged) skipped",
+                input: "D  gone.rs\n",
+                expected: &[],
+            },
+            Case {
+                name: "clean (unrecognized status) not present",
+                input: "   clean.rs\n",
+                expected: &[("clean.rs", None)],
+            },
+            Case {
+                name: "multiple entries same file — modified wins over added",
+                input: "A  dup.rs\n M dup.rs\n",
+                expected: &[("dup.rs", Some(GitFileStatus::Modified))],
+            },
+            Case {
+                name: "multiple entries same file — added sticks",
+                input: "?? dup.rs\nA  dup.rs\n",
+                expected: &[("dup.rs", Some(GitFileStatus::Added))],
+            },
+            Case {
+                name: "empty output",
+                input: "",
+                expected: &[],
+            },
+            Case {
+                name: "mixed statuses",
+                input: concat!(
+                    " M src/main.rs\n",
+                    "?? new_file.rs\n",
+                    "A  staged.rs\n",
+                    " D deleted.rs\n",
+                ),
+                expected: &[
+                    ("src/main.rs", Some(GitFileStatus::Modified)),
+                    ("new_file.rs", Some(GitFileStatus::Added)),
+                    ("staged.rs", Some(GitFileStatus::Added)),
+                    ("deleted.rs", None),
+                ],
+            },
+        ];
 
-    #[test]
-    fn test_porcelain_staged_added() {
-        let map = parse_git_status_porcelain("A  new_file.rs\n");
-        assert_eq!(map.get("new_file.rs"), Some(&GitFileStatus::Added));
-    }
+        for case in cases {
+            let map = parse_git_status_porcelain(case.input);
 
-    #[test]
-    fn test_porcelain_untracked() {
-        let map = parse_git_status_porcelain("?? new_file.rs\n");
-        assert_eq!(map.get("new_file.rs"), Some(&GitFileStatus::Added));
-    }
-
-    #[test]
-    fn test_porcelain_staged_and_unstaged_modified() {
-        // MM = staged modified + additional unstaged changes → Modified
-        let map = parse_git_status_porcelain("MM both.rs\n");
-        assert_eq!(map.get("both.rs"), Some(&GitFileStatus::Modified));
-    }
-
-    #[test]
-    fn test_porcelain_staged_added_unstaged_modified() {
-        // AM = staged added, but additionally modified in worktree → Modified
-        let map = parse_git_status_porcelain("AM partial.rs\n");
-        assert_eq!(map.get("partial.rs"), Some(&GitFileStatus::Modified));
-    }
-
-    #[test]
-    fn test_porcelain_rename() {
-        let map = parse_git_status_porcelain("R  old.rs -> new.rs\n");
-        assert_eq!(map.get("new.rs"), Some(&GitFileStatus::Modified));
-    }
-
-    #[test]
-    fn test_porcelain_rename_with_arrow_in_old_path() {
-        // Old path contains " -> " — rsplit_once extracts only the new path.
-        let map = parse_git_status_porcelain("R  \"old -> name.rs\" -> \"new -> name.rs\"\n");
-        assert_eq!(map.get("new -> name.rs"), Some(&GitFileStatus::Modified));
-    }
-
-    #[test]
-    fn test_porcelain_untracked_directory() {
-        // Git reports untracked directories with trailing slash.
-        let map = parse_git_status_porcelain("?? new_dir/\n");
-        assert_eq!(map.get("new_dir"), Some(&GitFileStatus::Added));
-    }
-
-    #[test]
-    fn test_porcelain_quoted_path_with_spaces() {
-        let map = parse_git_status_porcelain(" M \"path with spaces.rs\"\n");
-        assert_eq!(
-            map.get("path with spaces.rs"),
-            Some(&GitFileStatus::Modified)
-        );
-    }
-
-    #[test]
-    fn test_porcelain_deleted_file_skipped() {
-        let map = parse_git_status_porcelain(" D gone.rs\n");
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_porcelain_staged_deleted_skipped() {
-        let map = parse_git_status_porcelain("D  gone.rs\n");
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_porcelain_clean_file_not_present() {
-        // A clean (unmodified) tracked file won't appear in porcelain output,
-        // but if a line with no recognized status comes through, it's skipped.
-        let map = parse_git_status_porcelain("   clean.rs\n");
-        assert!(!map.contains_key("clean.rs"));
-    }
-
-    #[test]
-    fn test_porcelain_multiple_entries_same_file_modified_wins() {
-        // Staged added + unstaged modified (two lines for same file).
-        // The parser should keep Modified over Added.
-        let map = parse_git_status_porcelain("A  dup.rs\n M dup.rs\n");
-        assert_eq!(map.get("dup.rs"), Some(&GitFileStatus::Modified));
-    }
-
-    #[test]
-    fn test_porcelain_multiple_entries_same_file_untracked_wins() {
-        // Two untracked entries for same file? Real porcelain doesn't produce
-        // this, but we verify Added sticks when both are Added-level.
-        let map = parse_git_status_porcelain("?? dup.rs\nA  dup.rs\n");
-        assert_eq!(map.get("dup.rs"), Some(&GitFileStatus::Added));
-    }
-
-    #[test]
-    fn test_porcelain_empty_output() {
-        let map = parse_git_status_porcelain("");
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_porcelain_mixed_statuses() {
-        let output = concat!(
-            " M src/main.rs\n",
-            "?? new_file.rs\n",
-            "A  staged.rs\n",
-            " D deleted.rs\n",
-        );
-        let map = parse_git_status_porcelain(output);
-        assert_eq!(map.get("src/main.rs"), Some(&GitFileStatus::Modified));
-        assert_eq!(map.get("new_file.rs"), Some(&GitFileStatus::Added));
-        assert_eq!(map.get("staged.rs"), Some(&GitFileStatus::Added));
-        assert!(!map.contains_key("deleted.rs"));
+            if case.expected.is_empty() {
+                assert!(
+                    map.is_empty(),
+                    "case '{}' (input={:?}): expected empty map, got {:#?}",
+                    case.name,
+                    case.input,
+                    map
+                );
+            } else {
+                let expected_count = case.expected.iter().filter(|(_, s)| s.is_some()).count();
+                assert_eq!(
+                    map.len(),
+                    expected_count,
+                    "case '{}' (input={:?}): map has unexpected entries",
+                    case.name,
+                    case.input,
+                );
+                for &(path, expected_status) in case.expected {
+                    match expected_status {
+                        Some(status) => {
+                            assert_eq!(
+                                map.get(path),
+                                Some(&status),
+                                "case '{}' (input={:?}): path={:?}",
+                                case.name,
+                                case.input,
+                                path
+                            );
+                        }
+                        None => {
+                            assert!(
+                                !map.contains_key(path),
+                                "case '{}' (input={:?}): path={:?} should be absent, got {:?}",
+                                case.name,
+                                case.input,
+                                path,
+                                map.get(path)
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Find/Replace tests ───────────────────────────────────────────
