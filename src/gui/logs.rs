@@ -186,9 +186,7 @@ impl LogsState {
         let level = match self.active_tab {
             LogsTab::AllLogs => None,
             LogsTab::Issues => Some("ERROR,WARN".to_string()),
-            LogsTab::ToolFailures => unreachable!(
-                "build_query called on LogsState for ToolFailures tab — should use ToolFailuresState"
-            ),
+            LogsTab::ToolFailures => return LogQuery::default(),
         };
 
         LogQuery {
@@ -349,7 +347,10 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::StreamLagged => {
-                // On lag, just refresh
+                // On lag, just refresh (but not on ToolFailures tab)
+                if self.active_tab == LogsTab::ToolFailures {
+                    return Task::none();
+                }
                 self.refresh(log_store)
             }
             // ── Filter routing based on active tab ─────────────
@@ -401,6 +402,9 @@ impl LogsState {
                 }
             },
             LogMessage::DebouncedRefresh(generation) => {
+                if self.active_tab == LogsTab::ToolFailures {
+                    return Task::none();
+                }
                 if widgets::debounce_should_process(
                     generation,
                     self.debounce_generation,
