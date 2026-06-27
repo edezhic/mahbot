@@ -5691,7 +5691,6 @@ impl EditorState {
         let modal_overlay_open = self.active_modal().is_some();
         // Find/replace allows cursor navigation while its text inputs are focused.
         let ignore_keyboard = tree_focused || modal_overlay_open || find_bar_open;
-        let block_editing = find_bar_open;
 
         // Compute match highlight tuples from find/replace state.
         // Each tuple is (line, byte_col_start, byte_col_end) for
@@ -5729,7 +5728,6 @@ impl EditorState {
             content,
             Some(path.as_str()),
             ignore_keyboard,
-            block_editing,
             match_tuples,
             match_current_idx,
             self.blink_gen,
@@ -5743,7 +5741,6 @@ impl EditorState {
         content: &'a super::editor_widget::EditorBuffer,
         buffer_key: Option<&'a str>,
         ignore_keyboard: bool,
-        block_editing: bool,
         matches: Vec<(usize, usize, usize)>,
         match_current_idx: usize,
         blink_gen: u64,
@@ -5753,7 +5750,6 @@ impl EditorState {
             .font_size(EDITOR_FONT_SIZE)
             .padding(8.0)
             .ignore_keyboard(ignore_keyboard)
-            .block_editing(block_editing)
             .matches(matches, match_current_idx)
             .blink_gen(blink_gen)
             .bracket_pair(bracket_pair)

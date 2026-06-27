@@ -2158,12 +2158,6 @@ pub struct EditorWidget<'a> {
     /// When `true`, skip all keyboard event processing (e.g. when the
     /// file-tree panel or find/replace bar has focus).
     ignore_keyboard: bool,
-    /// When `true` and `ignore_keyboard` is also `true`, only blocks editing
-    /// keys (Insert, Backspace, Delete, Enter, char typing) while allowing
-    /// cursor movement (arrows, Home, End, PageUp/Down). Used when the
-    /// find/replace bar is open — the text_input handles its own editing,
-    /// but the editor should still respond to cursor navigation.
-    block_editing: bool,
     /// Find match highlights: `Vec<(line, byte_col_start, byte_col_end)>`.
     /// Set fresh each frame from the editor page's find/replace state.
     /// Empty/none when no find bar is open or no matches exist.
@@ -2191,7 +2185,6 @@ impl<'a> EditorWidget<'a> {
             font_size: 13.0,
             padding: 8.0,
             ignore_keyboard: false,
-            block_editing: false,
             matches: None,
             match_current_idx: 0,
             blink_gen: 0,
@@ -2220,17 +2213,6 @@ impl<'a> EditorWidget<'a> {
     #[must_use]
     pub const fn ignore_keyboard(mut self, ignore: bool) -> Self {
         self.ignore_keyboard = ignore;
-        self
-    }
-
-    /// When `true` (and `ignore_keyboard` is also `true`), only block
-    /// text-editing keys (Insert, Backspace, Delete, Enter, char input)
-    /// while allowing cursor movement keys (arrows, Home, End, PgUp/Down).
-    /// Used when the find/replace bar is open so the editor can still
-    /// scroll and navigate while the text_input handles its own editing.
-    #[must_use]
-    pub const fn block_editing(mut self, block: bool) -> Self {
-        self.block_editing = block;
         self
     }
 
