@@ -2839,30 +2839,33 @@ mod tests {
         );
     }
 
-    /// Verify that transitioning a ticket to [`TicketPhase::Failed`] does NOT
-    /// pause the workspace. The old auto-pause behavior was removed — workspace
-    /// pausing is no longer part of the Failed transition.
-    #[tokio::test]
-    async fn transition_to_failed_does_not_pause_workspace() {
+    // ── Transition does not pause workspace ─────────────────────────
+
+    /// Shared helper: initialise test stores and workspace store, create a
+    /// workspace in DB, create a ticket, and return the ticket.
+    ///
+    /// The caller is responsible for any additional store initialisation
+    /// (e.g. manager queue) needed by the specific transition path.
+    async fn setup_workspace_and_ticket(name: &str, path: &str) -> crate::board::Ticket {
         init_test_stores().await;
         if crate::workspace::WORKSPACES.get().is_none() {
             let _ = crate::workspace::init_global().await;
         }
 
-        let ws_name = "ws_no_pause_on_fail_test";
-        let ws_path = "/tmp/test_ws_no_pause_on_fail";
         let now = crate::turso::now();
         crate::workspace::store()
             .conn
             .execute(
                 "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                turso::params![ws_name, ws_path, now.clone(), now, 0],
+                turso::params![name, path, now.clone(), now, 0],
             )
             .await
             .expect("insert test workspace");
 
-        let ws = test_ws_named(ws_path, ws_name);
+        // test_ws_named takes (path, name) — parameters are swapped
+        // relative to this helper's (name, path) signature.
+        let ws = test_ws_named(path, name);
 
         let ticket_id = TicketBuilder::new(board(), ws)
             .title("Test Ticket")
@@ -2870,11 +2873,21 @@ mod tests {
             .await
             .expect("create_ticket");
 
-        let ticket = board()
+        board()
             .get_ticket(&ticket_id)
             .await
             .expect("get_ticket")
-            .expect("ticket exists");
+            .expect("ticket exists")
+    }
+
+    /// Verify that transitioning a ticket to [`TicketPhase::Failed`] does NOT
+    /// pause the workspace. The old auto-pause behavior was removed — workspace
+    /// pausing is no longer part of the Failed transition.
+    #[tokio::test]
+    async fn transition_to_failed_does_not_pause_workspace() {
+        let ticket =
+            setup_workspace_and_ticket("ws_no_pause_on_fail_test", "/tmp/test_ws_no_pause_on_fail")
+                .await;
 
         // Transition to Failed with Buffer policy — workspace should NOT pause
         transition_ticket(
@@ -2887,8 +2900,7 @@ mod tests {
         .await
         .expect("transition to Failed");
 
-        // Verify workspace is NOT paused
-        let ws = crate::workspace::get_by_name(ws_name)
+        let ws = crate::workspace::get_by_name("ws_no_pause_on_fail_test")
             .await
             .expect("get_by_name")
             .expect("workspace exists");
@@ -2902,40 +2914,14 @@ mod tests {
     /// the workspace. Transitions should never pause the workspace.
     #[tokio::test]
     async fn transition_to_non_failed_does_not_pause() {
-        init_test_stores().await;
-        if crate::workspace::WORKSPACES.get().is_none() {
-            let _ = crate::workspace::init_global().await;
-        }
+        // Manager queue — needed by the Notify path inside notify_ticket.
+        // Race-safe: if another test already initialized it, init_global
+        // returns an error which we ignore.
         if crate::manager_queue::MANAGER_QUEUE.get().is_none() {
             let _ = crate::manager_queue::init_global();
         }
 
-        let ws_name = "ws_no_pause_test";
-        let ws_path = "/tmp/test_ws_no_pause";
-        let now = crate::turso::now();
-        crate::workspace::store()
-            .conn
-            .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                turso::params![ws_name, ws_path, now.clone(), now, 0],
-            )
-            .await
-            .expect("insert test workspace");
-
-        let ws = test_ws_named(ws_path, ws_name);
-
-        let ticket_id = TicketBuilder::new(board(), ws)
-            .title("Test Ticket")
-            .create()
-            .await
-            .expect("create_ticket");
-
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = setup_workspace_and_ticket("ws_no_pause_test", "/tmp/test_ws_no_pause").await;
 
         // Transition from Backlog to Analysis (non-failure) with Notify policy
         transition_ticket(
@@ -2948,8 +2934,7 @@ mod tests {
         .await
         .expect("transition to Analysis");
 
-        // Verify workspace is NOT paused
-        let ws = crate::workspace::get_by_name(ws_name)
+        let ws = crate::workspace::get_by_name("ws_no_pause_test")
             .await
             .expect("get_by_name")
             .expect("workspace exists");
