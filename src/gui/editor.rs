@@ -714,7 +714,7 @@ fn rename_input_style(_theme: &iced::Theme, _status: text_input::Status) -> text
 /// - Empty (or all-whitespace) name
 /// - Path separators (`/`, `\`, NUL)
 /// - Reserved path components (`.`, `..`)
-/// - OS-reserved names (CON, NUL, PRN, AUX, COM1–COM9, LPT1–LPT9)
+/// - OS-reserved names (CON, NUL, PRN, AUX, COM1–COM9, LPT1–LPT9) — Windows only
 #[must_use]
 fn validate_item_name(name: &str) -> Option<&'static str> {
     if name.is_empty() {
@@ -726,14 +726,16 @@ fn validate_item_name(name: &str) -> Option<&'static str> {
     if name == "." || name == ".." {
         return Some("Invalid name");
     }
-    // OS-reserved names (Windows-style, checked on all platforms for safety).
-    let reserved = [
-        "con", "nul", "prn", "aux", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-    ];
-    let stem = name.split('.').next().unwrap_or(name);
-    if reserved.contains(&stem.to_lowercase().as_str()) {
-        return Some("Name is reserved by the operating system");
+    #[cfg(target_os = "windows")]
+    {
+        let reserved = [
+            "con", "nul", "prn", "aux", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+            "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        ];
+        let stem = name.split('.').next().unwrap_or(name);
+        if reserved.contains(&stem.to_lowercase().as_str()) {
+            return Some("Name is reserved by the operating system");
+        }
     }
     None
 }
@@ -8224,6 +8226,7 @@ mod tests {
         assert_eq!(err, Some("Invalid name"));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn test_rename_validation_os_reserved_names() {
         let reserved = ["con", "NUL", "prn", "AUX", "com1", "lpt3"];
