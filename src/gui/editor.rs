@@ -6252,7 +6252,7 @@ mod tests {
         struct Case {
             text: &'static str,
             query: &'static str,
-            case_sensitive: bool,
+            sensitive: bool,
             expected: &'static [(usize, usize)],
         }
         let cases: &[Case] = &[
@@ -6260,75 +6260,75 @@ mod tests {
             Case {
                 text: "hello",
                 query: "",
-                case_sensitive: true,
+                sensitive: true,
                 expected: &[],
             },
             // Basic match
             Case {
                 text: "hello world hello",
                 query: "hello",
-                case_sensitive: true,
+                sensitive: true,
                 expected: &[(0, 5), (12, 17)],
             },
             // No match
             Case {
                 text: "hello world",
                 query: "xyz",
-                case_sensitive: true,
+                sensitive: true,
                 expected: &[],
             },
             // Non-overlapping
             Case {
                 text: "aaaaa",
                 query: "aa",
-                case_sensitive: true,
+                sensitive: true,
                 expected: &[(0, 2), (2, 4)],
             },
             // Case-insensitive
             Case {
                 text: "Hello World hello",
                 query: "hello",
-                case_sensitive: false,
+                sensitive: false,
                 expected: &[(0, 5), (12, 17)],
             },
             // Case-insensitive no match
             Case {
                 text: "Hello World",
                 query: "xyz",
-                case_sensitive: false,
+                sensitive: false,
                 expected: &[],
             },
             // Single-char queries return empty (2-char min enforcement)
             Case {
                 text: "hello",
                 query: "h",
-                case_sensitive: true,
+                sensitive: true,
                 expected: &[],
             },
             // Boundary: shortest possible match
             Case {
                 text: "ab",
                 query: "ab",
-                case_sensitive: true,
+                sensitive: true,
                 expected: &[(0, 2)],
             },
             // Boundary: consecutive matches
             Case {
                 text: "abab",
                 query: "ab",
-                case_sensitive: true,
+                sensitive: true,
                 expected: &[(0, 2), (2, 4)],
             },
         ];
         for case in cases {
-            let result = compute_text_matches(case.text, case.query, case.case_sensitive);
+            let result = compute_text_matches(case.text, case.query, case.sensitive);
             assert_eq!(
                 result.len(),
                 case.expected.len(),
                 "text={:?} query={:?} sensitive={}",
                 case.text,
                 case.query,
-                case.case_sensitive
+                case.sensitive
             );
             for (i, &(start, end)) in case.expected.iter().enumerate() {
                 assert_eq!(
@@ -6337,7 +6337,7 @@ mod tests {
                     "match[{i}] text={:?} query={:?} sensitive={}",
                     case.text,
                     case.query,
-                    case.case_sensitive
+                    case.sensitive
                 );
             }
         }
