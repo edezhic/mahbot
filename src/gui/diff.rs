@@ -1786,40 +1786,69 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_tree_nav_up_clamped() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0;
-        let _ = state.update(DiffMessage::TreeNavUp);
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-    }
+    fn test_tree_nav_up_down() {
+        struct Case {
+            name: &'static str,
+            focused: bool,
+            start_idx: usize,
+            msg: DiffMessage,
+            expected_idx: usize,
+        }
+        // 3 visible nodes after expanding "src": ["src", "src/lib.rs", "src/main.rs"]
+        let last_idx = 2;
 
-    #[test]
-    fn test_diff_tree_nav_down_clamped() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        let last = state.file_tree.visible_tree_nodes.len() - 1;
-        state.file_tree.tree_focus_index = last;
-        let _ = state.update(DiffMessage::TreeNavDown);
-        assert_eq!(state.file_tree.tree_focus_index, last);
-    }
-
-    #[test]
-    fn test_diff_tree_nav_up_down_moves_focus() {
-        let mut state = make_diff_with_tree();
-        // Expand "src" so there are multiple nodes to navigate.
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1;
-        let _ = state.update(DiffMessage::TreeNavUp);
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-        let _ = state.update(DiffMessage::TreeNavDown);
-        assert_eq!(state.file_tree.tree_focus_index, 1);
+        let cases: &[Case] = &[
+            Case {
+                name: "up_at_top_clamped",
+                focused: true,
+                start_idx: 0,
+                msg: DiffMessage::TreeNavUp,
+                expected_idx: 0,
+            },
+            Case {
+                name: "down_at_bottom_clamped",
+                focused: true,
+                start_idx: last_idx,
+                msg: DiffMessage::TreeNavDown,
+                expected_idx: last_idx,
+            },
+            Case {
+                name: "up_moves_focus",
+                focused: true,
+                start_idx: 1,
+                msg: DiffMessage::TreeNavUp,
+                expected_idx: 0,
+            },
+            Case {
+                name: "down_moves_focus",
+                focused: true,
+                start_idx: 0,
+                msg: DiffMessage::TreeNavDown,
+                expected_idx: 1,
+            },
+            Case {
+                name: "ignored_when_not_focused",
+                focused: false,
+                start_idx: 0,
+                msg: DiffMessage::TreeNavDown,
+                expected_idx: 0,
+            },
+        ];
+        for case in cases {
+            let mut state = make_diff_with_tree();
+            // Pre-expand "src" for all cases so the tree has >1 visible node.
+            state.file_tree.expanded_dirs.insert("src".to_string());
+            state.file_tree.nodes = build_tree(&state.diff_files);
+            state.file_tree.rebuild_visible();
+            state.file_tree.tree_focused = case.focused;
+            state.file_tree.tree_focus_index = case.start_idx;
+            let _ = state.update(case.msg.clone());
+            assert_eq!(
+                state.file_tree.tree_focus_index, case.expected_idx,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -1883,161 +1912,209 @@ mod tests {
     // ── Tree arrow-key navigation tests ─────────────────────────────
 
     #[test]
-    fn test_diff_tree_nav_left_on_expanded_dir_collapses() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (expanded)
-        assert!(state.file_tree.expanded_dirs.contains("src"));
-
-        let _ = state.update(DiffMessage::TreeNavLeft);
-        assert!(!state.file_tree.expanded_dirs.contains("src"));
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn test_diff_tree_nav_left_on_file_navigates_to_parent() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1; // "src/main.rs"
-
-        let _ = state.update(DiffMessage::TreeNavLeft);
-        // Should navigate to parent "src"
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    }
-
-    #[test]
-    fn test_diff_tree_nav_left_on_root_item_noop() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = true;
-        // Focus on "src" (root-level collapsed dir) — no parent to navigate to.
-        state.file_tree.tree_focus_index = 0;
-
-        let _ = state.update(DiffMessage::TreeNavLeft);
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn test_diff_tree_nav_right_on_collapsed_dir_expands_and_advances() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (collapsed)
-
-        let _ = state.update(DiffMessage::TreeNavRight);
-        assert!(state.file_tree.expanded_dirs.contains("src"));
-        // After expanding, focus moves to first child (sorted alphabetically).
-        assert_eq!(state.file_tree.tree_focus_index, 1);
-        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/lib.rs");
-    }
-
-    #[test]
-    fn test_diff_tree_nav_right_on_expanded_dir_moves_to_first_child() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (already expanded)
-
-        let _ = state.update(DiffMessage::TreeNavRight);
-        assert_eq!(state.file_tree.tree_focus_index, 1);
-        assert_eq!(state.file_tree.visible_tree_nodes[1].0, "src/lib.rs");
-    }
-
-    #[test]
-    fn test_diff_tree_nav_right_on_file_noop() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1; // "src/main.rs" (file)
-
-        let _ = state.update(DiffMessage::TreeNavRight);
-        // ArrowRight on file does nothing
-        assert_eq!(state.file_tree.tree_focus_index, 1);
+    fn test_tree_nav_left_right() {
+        struct Case {
+            name: &'static str,
+            start_idx: usize,
+            /// Pre-expand "src" before the message
+            pre_expand_src: bool,
+            msg: DiffMessage,
+            expected_idx: usize,
+            /// Additional per-case assertions
+            check: Option<fn(&DiffState, name: &str)>,
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "left_on_expanded_dir_collapses",
+                start_idx: 0,
+                pre_expand_src: true,
+                msg: DiffMessage::TreeNavLeft,
+                expected_idx: 0,
+                check: Some(|s, name| {
+                    assert!(!s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                }),
+            },
+            Case {
+                name: "left_on_file_navigates_to_parent",
+                start_idx: 1,
+                pre_expand_src: true,
+                msg: DiffMessage::TreeNavLeft,
+                expected_idx: 0,
+                check: Some(|s, name| {
+                    assert_eq!(s.file_tree.visible_tree_nodes[0].0, "src", "case: {name}");
+                }),
+            },
+            Case {
+                name: "left_on_root_item_noop",
+                start_idx: 0,
+                pre_expand_src: false,
+                msg: DiffMessage::TreeNavLeft,
+                expected_idx: 0,
+                check: None,
+            },
+            Case {
+                name: "right_on_collapsed_dir_expands_and_advances",
+                start_idx: 0,
+                pre_expand_src: false,
+                msg: DiffMessage::TreeNavRight,
+                expected_idx: 1,
+                check: Some(|s, name| {
+                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                    assert_eq!(
+                        s.file_tree.visible_tree_nodes[1].0, "src/lib.rs",
+                        "case: {name}",
+                    );
+                }),
+            },
+            Case {
+                name: "right_on_expanded_dir_moves_to_first_child",
+                start_idx: 0,
+                pre_expand_src: true,
+                msg: DiffMessage::TreeNavRight,
+                expected_idx: 1,
+                check: Some(|s, name| {
+                    assert_eq!(
+                        s.file_tree.visible_tree_nodes[1].0, "src/lib.rs",
+                        "case: {name}",
+                    );
+                }),
+            },
+            Case {
+                name: "right_on_file_noop",
+                start_idx: 1,
+                pre_expand_src: true,
+                msg: DiffMessage::TreeNavRight,
+                expected_idx: 1,
+                check: None,
+            },
+        ];
+        for case in cases {
+            let mut state = make_diff_with_tree();
+            if case.pre_expand_src {
+                state.file_tree.expanded_dirs.insert("src".to_string());
+                state.file_tree.nodes = build_tree(&state.diff_files);
+                state.file_tree.rebuild_visible();
+            }
+            state.file_tree.tree_focused = true;
+            state.file_tree.tree_focus_index = case.start_idx;
+            let _ = state.update(case.msg.clone());
+            assert_eq!(
+                state.file_tree.tree_focus_index, case.expected_idx,
+                "case: {}",
+                case.name
+            );
+            if let Some(check) = case.check {
+                check(&state, case.name);
+            }
+        }
     }
 
     // ── TreeNavEnter tests ──────────────────────────────────────────
 
     #[test]
-    fn test_diff_tree_nav_enter_on_collapsed_dir_expands_and_advances() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (collapsed)
-
-        let _ = state.update(DiffMessage::TreeNavEnter);
-        assert!(state.file_tree.expanded_dirs.contains("src"));
-        // After expanding, focus moves to first child (sorted: lib.rs before main.rs).
-        assert!(state.file_tree.tree_focus_index < state.file_tree.visible_tree_nodes.len());
-        assert_eq!(
-            state.file_tree.visible_tree_nodes[state.file_tree.tree_focus_index].0,
-            "src/lib.rs"
-        );
-    }
-
-    #[test]
-    fn test_diff_tree_nav_enter_on_expanded_dir_collapses_and_keeps_focus() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 0; // "src" (already expanded)
-
-        let _ = state.update(DiffMessage::TreeNavEnter);
-        // Directory should be collapsed.
-        assert!(!state.file_tree.expanded_dirs.contains("src"));
-        // Focus should remain on "src".
-        assert_eq!(state.file_tree.tree_focus_index, 0);
-        assert_eq!(state.file_tree.visible_tree_nodes[0].0, "src");
-    }
-
-    #[test]
-    fn test_diff_tree_nav_enter_on_file_does_not_expand_or_collapse() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.expanded_dirs.insert("src".to_string());
-        state.file_tree.nodes = build_tree(&state.diff_files);
-        state.file_tree.rebuild_visible();
-        state.file_tree.tree_focused = true;
-        state.file_tree.tree_focus_index = 1; // "src/main.rs" (file)
-
-        let expanded_before = state.file_tree.expanded_dirs.clone();
-        let _ = state.update(DiffMessage::TreeNavEnter);
-        // File should not trigger any expand/collapse — tree unchanged.
-        assert_eq!(state.file_tree.expanded_dirs, expanded_before);
-        // tree_focused remains true (SelectFile does not clear it).
-        assert!(state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_diff_tree_nav_enter_not_focused_noop() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = false;
-        let focus_before = state.file_tree.tree_focus_index;
-
-        let _ = state.update(DiffMessage::TreeNavEnter);
-        // No state changes when not focused.
-        assert_eq!(state.file_tree.tree_focus_index, focus_before);
-        assert!(!state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_diff_tree_nav_enter_empty_tree_noop() {
-        let mut state = DiffState::new();
-        state.file_tree.tree_focused = true;
-
-        let _ = state.update(DiffMessage::TreeNavEnter);
-        // Empty tree, no diff_files — tree focus unchanged.
-        assert!(state.file_tree.visible_tree_nodes.is_empty());
-        assert!(state.file_tree.tree_focused);
-        assert_eq!(state.file_tree.tree_focus_index, 0);
+    fn test_tree_nav_enter() {
+        struct Case {
+            name: &'static str,
+            focused: bool,
+            start_idx: usize,
+            /// Use DiffState::new() instead of make_diff_with_tree()
+            empty_tree: bool,
+            /// Pre-expand "src" before the message
+            pre_expand_src: bool,
+            expected_idx: usize,
+            /// Additional per-case assertions
+            check: Option<fn(&DiffState, name: &str)>,
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "on_collapsed_dir_expands_and_advances",
+                focused: true,
+                start_idx: 0,
+                empty_tree: false,
+                pre_expand_src: false,
+                expected_idx: 1,
+                check: Some(|s, name| {
+                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                    assert_eq!(
+                        s.file_tree.visible_tree_nodes[s.file_tree.tree_focus_index].0,
+                        "src/lib.rs",
+                        "case: {name}",
+                    );
+                }),
+            },
+            Case {
+                name: "on_expanded_dir_collapses_and_keeps_focus",
+                focused: true,
+                start_idx: 0,
+                empty_tree: false,
+                pre_expand_src: true,
+                expected_idx: 0,
+                check: Some(|s, name| {
+                    assert!(!s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                    assert_eq!(s.file_tree.visible_tree_nodes[0].0, "src", "case: {name}");
+                }),
+            },
+            Case {
+                name: "on_file_does_not_expand_or_collapse",
+                focused: true,
+                start_idx: 1,
+                empty_tree: false,
+                pre_expand_src: true,
+                expected_idx: 1,
+                check: Some(|s, name| {
+                    assert_eq!(s.file_tree.expanded_dirs.len(), 1, "case: {name}");
+                    assert!(s.file_tree.expanded_dirs.contains("src"), "case: {name}");
+                    assert!(s.file_tree.tree_focused, "case: {name}");
+                }),
+            },
+            Case {
+                name: "not_focused_noop",
+                focused: false,
+                start_idx: 0,
+                empty_tree: false,
+                pre_expand_src: false,
+                expected_idx: 0,
+                check: Some(|s, name| {
+                    assert!(!s.file_tree.tree_focused, "case: {name}");
+                }),
+            },
+            Case {
+                name: "empty_tree_noop",
+                focused: true,
+                start_idx: 0,
+                empty_tree: true,
+                pre_expand_src: false,
+                expected_idx: 0,
+                check: Some(|s, name| {
+                    assert!(s.file_tree.visible_tree_nodes.is_empty(), "case: {name}");
+                    assert!(s.file_tree.tree_focused, "case: {name}");
+                }),
+            },
+        ];
+        for case in cases {
+            let mut state = if case.empty_tree {
+                DiffState::new()
+            } else {
+                let mut s = make_diff_with_tree();
+                if case.pre_expand_src {
+                    s.file_tree.expanded_dirs.insert("src".to_string());
+                    s.file_tree.nodes = build_tree(&s.diff_files);
+                    s.file_tree.rebuild_visible();
+                }
+                s
+            };
+            state.file_tree.tree_focused = case.focused;
+            state.file_tree.tree_focus_index = case.start_idx;
+            let _ = state.update(DiffMessage::TreeNavEnter);
+            assert_eq!(
+                state.file_tree.tree_focus_index, case.expected_idx,
+                "case: {}",
+                case.name
+            );
+            if let Some(check) = case.check {
+                check(&state, case.name);
+            }
+        }
     }
 
     // ── Click-to-select focus index tests ────────────────────────────
