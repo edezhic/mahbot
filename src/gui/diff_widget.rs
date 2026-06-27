@@ -244,7 +244,6 @@ where
         widget::tree::Tag::of::<DiffBufferState>()
     }
 
-    #[allow(clippy::cast_precision_loss)]
     fn layout(
         &mut self,
         tree: &mut Tree,
@@ -1022,13 +1021,14 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
     fn test_gutter_column_positions_are_right_edges() {
         let width = gutter_width_from_digits(3);
         let (old_right, new_right) = gutter_column_right_edges(10.0, 8.0, width);
-
-        assert_eq!(old_right, 10.0 + 8.0 + width / 2.0);
-        assert_eq!(new_right, 10.0 + 8.0 + width);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(old_right, 10.0 + 8.0 + width / 2.0);
+            assert_eq!(new_right, 10.0 + 8.0 + width);
+        }
         assert!(new_right > old_right);
     }
 
