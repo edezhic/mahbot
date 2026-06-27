@@ -2339,6 +2339,7 @@ mod tests {
     /// requires reservation=1. This is intentional — unstarted backlog tickets
     /// are considered active to suppress Done notifications until the pipeline
     /// is fully drained.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_has_active_tickets_excluding() {
         let (store, _tmp) = open_test_store().await;
@@ -4028,6 +4029,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// Catches silent field mapping bugs where [`TICKET_COLUMNS`] column order
     /// drifts from the [`COL_TICKET_*`] integer constants — the same class of
     /// bug that previously caused the stale doc comment on this module.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_ticket_roundtrip_all_fields() {
         let (store, _tmp) = open_test_store().await;

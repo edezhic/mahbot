@@ -1327,7 +1327,7 @@ mod tests {
         {
             let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
             ModelRouting::upsert(&mut r, "gpt-4".into(), |mr| {
-                mr.allow_fallbacks = Some(false)
+                mr.allow_fallbacks = Some(false);
             });
             assert_eq!(r.len(), 1);
             assert_eq!(

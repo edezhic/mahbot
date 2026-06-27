@@ -8442,7 +8442,7 @@ mod tests {
             Some(&"content_b".to_string())
         );
         assert_eq!(map.get("other"), Some(&"content_c".to_string()));
-        assert!(map.get("dir/file.rs").is_none());
+        assert!(!map.contains_key("dir/file.rs"));
     }
 
     #[test]

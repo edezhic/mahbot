@@ -2423,6 +2423,7 @@ mod tests {
     /// ReadyForDevelopment tickets in the same workspace are moved to Planning
     /// with a system comment referencing the tripped ticket. Tickets in other
     /// workspaces must not be affected.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning() {
         init_test_stores().await;
@@ -3221,15 +3222,15 @@ D  deleted.rs
 
         let results = vec![
             ParallelVerdict {
-                response: "".into(),
+                response: String::new(),
                 verdict: None,
             },
             ParallelVerdict {
-                response: "".into(),
+                response: String::new(),
                 verdict: None,
             },
             ParallelVerdict {
-                response: "".into(),
+                response: String::new(),
                 verdict: None,
             },
         ];
@@ -3477,10 +3478,7 @@ D  deleted.rs
             trip_circuit_breaker_if_exceeded(&ticket, TicketPhase::InReview, "test").await;
         assert!(
             !tripped,
-            "Should NOT trip with {} comments (threshold: {}, needs > {})",
-            CIRCUIT_BREAKER_COMMENT_THRESHOLD,
-            CIRCUIT_BREAKER_COMMENT_THRESHOLD,
-            CIRCUIT_BREAKER_COMMENT_THRESHOLD
+            "Should NOT trip with {CIRCUIT_BREAKER_COMMENT_THRESHOLD} comments (threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}, needs > {CIRCUIT_BREAKER_COMMENT_THRESHOLD})"
         );
 
         let status = board()
@@ -3762,15 +3760,15 @@ D  deleted.rs
         // All three analysts have no verdict (None)
         let results = vec![
             ParallelVerdict {
-                response: "".into(),
+                response: String::new(),
                 verdict: None,
             },
             ParallelVerdict {
-                response: "".into(),
+                response: String::new(),
                 verdict: None,
             },
             ParallelVerdict {
-                response: "".into(),
+                response: String::new(),
                 verdict: None,
             },
         ];

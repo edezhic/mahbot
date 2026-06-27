@@ -2680,6 +2680,7 @@ mod tests {
 
     // ── extend_past_open_tag tests ─────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_extend_past_open_tag() {
         struct Case {
