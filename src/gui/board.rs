@@ -148,7 +148,7 @@ impl BoardState {
     }
 
     /// Status transition actions (ported from Board.tsx `availableActions`)
-    fn available_actions(status: &TicketPhase) -> Vec<(&'static str, TicketPhase)> {
+    fn available_actions(status: TicketPhase) -> Vec<(&'static str, TicketPhase)> {
         match status {
             TicketPhase::ReadyForDevelopment => vec![
                 ("⏸ Pause", TicketPhase::Planning),
@@ -253,10 +253,10 @@ impl BoardState {
         if ticket.prerequisites.is_empty() {
             return (0, Vec::new());
         }
-        let status_map: std::collections::HashMap<&str, &TicketPhase> = self
+        let status_map: std::collections::HashMap<&str, TicketPhase> = self
             .tickets
             .iter()
-            .map(|t| (t.id.as_str(), &t.status))
+            .map(|t| (t.id.as_str(), t.status))
             .collect();
         let mut unfulfilled_ids = Vec::new();
         for prereq_id in &ticket.prerequisites {
@@ -621,7 +621,7 @@ impl BoardState {
         let (badge_bg, badge_text) = theme::ticket_status_color(ticket.status);
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
-        let actions = Self::available_actions(&ticket.status);
+        let actions = Self::available_actions(ticket.status);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
         let (unfulfilled_count, unfulfilled_ids) = self.unfulfilled_prereq_count(ticket);
@@ -864,7 +864,7 @@ impl BoardState {
         let (badge_bg, badge_text) = theme::ticket_status_color(ticket.status);
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
-        let actions = Self::available_actions(&ticket.status);
+        let actions = Self::available_actions(ticket.status);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
         let mut detail = column![

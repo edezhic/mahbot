@@ -230,7 +230,7 @@ impl DiffState {
             else {
                 return None;
             };
-            let km = super::detect_keyboard_mods(&modifiers);
+            let km = super::detect_keyboard_mods(modifiers);
             if !km.altgr_active && km.is_cmd && key.to_latin(physical_key) == Some('b') {
                 return Some(DiffMessage::TreeFocusToggled);
             }

@@ -2955,7 +2955,7 @@ where
                 // ── Clipboard shortcuts (Cmd/Ctrl+C/X/V) ──────────────
                 // On macOS, only Cmd (not Ctrl) triggers clipboard shortcuts;
                 // Ctrl+C/X/V are terminal control characters.
-                if super::detect_keyboard_mods(modifiers).is_text_platform_mod() {
+                if super::detect_keyboard_mods(*modifiers).is_text_platform_mod() {
                     if let Some(latin) = key_press.to_latin(*physical_key) {
                         match latin {
                             'c' | 'x' => {
@@ -2987,7 +2987,8 @@ where
                 // Plain arrows (no cmd/ctrl, no alt) use visual navigation;
                 // Shift+Up/Down extends selection visually.
                 {
-                    let platform_mod = super::detect_keyboard_mods(modifiers).is_nav_platform_mod();
+                    let platform_mod =
+                        super::detect_keyboard_mods(*modifiers).is_nav_platform_mod();
                     let alt = modifiers.alt();
                     let shift = modifiers.shift();
                     let is_arrow_up = matches!(key_press, key::Key::Named(key::Named::ArrowUp));
@@ -3101,7 +3102,8 @@ where
                 // behavior: first press goes to the visual row boundary,
                 // second press goes to the logical line start/end.
                 {
-                    let platform_mod = super::detect_keyboard_mods(modifiers).is_nav_platform_mod();
+                    let platform_mod =
+                        super::detect_keyboard_mods(*modifiers).is_nav_platform_mod();
                     let alt = modifiers.alt();
                     let shift = modifiers.shift();
                     let is_cmd_left = platform_mod
@@ -3218,7 +3220,7 @@ where
                 // On non-macOS, both Ctrl and Cmd are platform modifiers;
                 // Ctrl+Alt (AltGr) is excluded because it produces text
                 // characters for international layouts.
-                if !super::detect_keyboard_mods(modifiers).is_text_platform_mod() {
+                if !super::detect_keyboard_mods(*modifiers).is_text_platform_mod() {
                     if let Some(committed) = text {
                         if !committed.is_empty() {
                             if let Some(ref suppress) = state.ime_commit_suppress {
@@ -3416,7 +3418,7 @@ fn map_key_to_action(
     // Ctrl is reserved for emacs-style shortcuts (Ctrl+F/B/A/E/etc.)
     // and terminal conventions. On other platforms, Ctrl triggers
     // platform shortcuts alongside the Windows/Super key.
-    let platform_mod = super::detect_keyboard_mods(&modifiers).is_nav_platform_mod();
+    let platform_mod = super::detect_keyboard_mods(modifiers).is_nav_platform_mod();
     let shift = modifiers.shift();
     let alt = modifiers.alt();
 

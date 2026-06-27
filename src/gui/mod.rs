@@ -8,7 +8,6 @@
     clippy::new_without_default,
     clippy::too_many_lines,
     clippy::struct_excessive_bools,
-    clippy::trivially_copy_pass_by_ref,
     clippy::match_same_arms,
     clippy::if_not_else,
     clippy::collapsible_if,
@@ -296,7 +295,7 @@ impl KeyboardMods {
     ///
     /// On other platforms: Cmd or Ctrl.
     #[must_use]
-    pub fn is_nav_platform_mod(&self) -> bool {
+    pub fn is_nav_platform_mod(self) -> bool {
         #[cfg(target_os = "macos")]
         {
             self.is_cmd
@@ -315,7 +314,7 @@ impl KeyboardMods {
     /// other platforms, AltGr (Ctrl+Alt) is excluded because it produces
     /// text characters for international keyboard layouts.
     #[must_use]
-    pub fn is_text_platform_mod(&self) -> bool {
+    pub fn is_text_platform_mod(self) -> bool {
         #[cfg(target_os = "macos")]
         {
             self.is_cmd && !self.ctrl_held
@@ -331,7 +330,7 @@ impl KeyboardMods {
 ///
 /// Encapsulates the `#[cfg(target_os = "macos")]` / `#[cfg(not(...))]`
 /// blocks that every keyboard subscription handler previously inlined.
-pub(crate) fn detect_keyboard_mods(modifiers: &keyboard::Modifiers) -> KeyboardMods {
+pub(crate) fn detect_keyboard_mods(modifiers: keyboard::Modifiers) -> KeyboardMods {
     let is_cmd = modifiers.command();
     let is_platform_mod = modifiers.command() || modifiers.control();
     let ctrl_held = modifiers.control();
@@ -2015,7 +2014,7 @@ impl Dashboard {
                 else {
                     return None;
                 };
-                let km = detect_keyboard_mods(&modifiers);
+                let km = detect_keyboard_mods(modifiers);
 
                 let latin = key.to_latin(physical_key);
                 // Cmd+F (macOS) / Ctrl+F (other) → focus search.

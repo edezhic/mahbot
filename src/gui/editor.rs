@@ -1778,7 +1778,7 @@ impl EditorState {
             else {
                 return None;
             };
-            let km = super::detect_keyboard_mods(&modifiers);
+            let km = super::detect_keyboard_mods(modifiers);
 
             // Helper: match a Character key by its Latin equivalent.
             let latin = |target: char| -> bool { key.to_latin(physical_key) == Some(target) };

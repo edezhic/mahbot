@@ -745,7 +745,7 @@ impl HomeState {
             else {
                 return None;
             };
-            let km = super::detect_keyboard_mods(&modifiers);
+            let km = super::detect_keyboard_mods(modifiers);
             // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
             if km.is_platform_mod
                 && !km.is_emacs_ctrl
