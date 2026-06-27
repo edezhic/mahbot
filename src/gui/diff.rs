@@ -1496,13 +1496,7 @@ async fn compute_old_highlights(
         .ok()
         .flatten()?;
 
-    // Skip highlighting for files over the size limit.
-    if content.len() > MAX_HIGHLIGHT_SIZE {
-        return None;
-    }
-
-    let mut parser = make_parser(lang);
-    Some(parse_file_highlights(&mut parser, &content, lang))
+    compute_highlights_for_content(&content, lang)
 }
 
 async fn compute_new_highlights(
@@ -1529,20 +1523,22 @@ async fn compute_new_highlights(
         tokio::fs::read_to_string(&full_path).await.ok()?
     };
 
-    // Skip highlighting for files over the size limit.
+    compute_highlights_for_content(&content, lang)
+}
+
+/// Compute tree-sitter highlights for a given content string.
+/// Returns `None` if the content exceeds the maximum highlight size.
+fn compute_highlights_for_content(
+    content: &str,
+    lang: HighlightLanguage,
+) -> Option<FileHighlights> {
     if content.len() > MAX_HIGHLIGHT_SIZE {
         return None;
     }
-
-    let mut parser = make_parser(lang);
-    Some(parse_file_highlights(&mut parser, &content, lang))
-}
-
-fn make_parser(lang: HighlightLanguage) -> tree_sitter::Parser {
     let mut parser = tree_sitter::Parser::new();
     let ts_lang = lang.tree_sitter_language();
     let _ = parser.set_language(&ts_lang);
-    parser
+    Some(parse_file_highlights(&mut parser, content, lang))
 }
 
 /// Build a directory tree from the list of diff files.
