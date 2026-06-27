@@ -37,6 +37,58 @@ const MAX_DIFF_LINES: usize = 5000;
 const MAX_HUNKS: usize = 100;
 const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 
+/// Compute the index of the first [`DiffFile`] to exclude due to truncation limits.
+///
+/// Iterates over `diff_files`, applying the same `selected_file` filter and
+/// binary/too-large skipping as the rendering functions. Returns `Some(idx)`
+/// where `idx` is the first file that would exceed either `max_hunks` or
+/// `max_lines`, or `None` if all files fit within the limits.
+///
+/// When `limits` is `None`, always returns `None` (no truncation).
+///
+/// # Behavioural contract
+///
+/// - Truncation is **file-boundary only**: no mid-hunk or mid-file cut-off.
+/// - Binary and too-large files consume no hunk/line capacity but occupy
+///   array positions — the returned index accounts for them.
+/// - The `selected_file` filter is applied identically to both callers so
+///   that the returned index is consistent.
+pub(super) fn compute_truncation_index(
+    diff_files: &[DiffFile],
+    selected_file: Option<&str>,
+    limits: Option<(usize, usize)>,
+) -> Option<usize> {
+    let (max_hunks, max_lines) = limits?;
+    let mut total_hunks = 0usize;
+    let mut total_lines = 0usize;
+
+    for (idx, file) in diff_files.iter().enumerate() {
+        // Apply the same file-selection filter as the rendering functions.
+        if let Some(sel) = selected_file {
+            if file.dfile.path != sel {
+                continue;
+            }
+        }
+
+        // Binary and too-large files consume no hunk/line capacity.
+        if file.dfile.is_binary || file.dfile.too_large_size.is_some() {
+            continue;
+        }
+
+        let file_hunks = file.dfile.hunks.len();
+        let file_lines: usize = file.dfile.hunks.iter().map(|h| h.lines.len()).sum();
+
+        if total_hunks + file_hunks > max_hunks || total_lines + file_lines > max_lines {
+            return Some(idx);
+        }
+
+        total_hunks += file_hunks;
+        total_lines += file_lines;
+    }
+
+    None
+}
+
 const FILE_HEADER_COLOR: Color = theme::STATUS_WARNING;
 const RENAME_COLOR: Color = theme::ACCENT_LIGHT;
 
@@ -1158,27 +1210,29 @@ impl DiffState {
             .into();
         }
 
+        let truncate_at = compute_truncation_index(
+            &self.diff_files,
+            self.selected_file.as_deref(),
+            Some((MAX_HUNKS, MAX_DIFF_LINES)),
+        );
         let mut rows: Vec<Element<'_, DiffMessage>> = Vec::new();
-        let mut total_hunks: usize = 0;
-        let mut total_lines: usize = 0;
         let mut truncated = false;
         let mut buffer_idx = 0usize;
 
-        for file in &self.diff_files {
+        for (idx, file) in self.diff_files.iter().enumerate() {
             // File selection filter
             if let Some(ref sel) = self.selected_file {
                 if file.dfile.path != *sel {
                     continue;
                 }
             }
-            if truncated {
-                break;
-            }
 
-            total_hunks += file.dfile.hunks.len();
-            if total_hunks > MAX_HUNKS || total_lines > MAX_DIFF_LINES {
-                truncated = true;
-                break;
+            // Truncation check — stop before the first file that would exceed caps
+            if let Some(limit) = truncate_at {
+                if idx >= limit {
+                    truncated = true;
+                    break;
+                }
             }
 
             // File header
@@ -1259,11 +1313,6 @@ impl DiffState {
             // Find the matching buffer by index
             if let Some(buf) = self.file_buffers.get(buffer_idx) {
                 buffer_idx += 1;
-
-                // Count lines for truncation check
-                for hunk in &file.dfile.hunks {
-                    total_lines += hunk.lines.len();
-                }
 
                 rows.push(iced::Element::new(DiffBufferWidget::new(buf)));
             }
@@ -2290,5 +2339,178 @@ mod tests {
         state.file_tree.tree_focused = true;
         let _ = state.update(DiffMessage::CommitMessageChanged("fix bug".to_owned()));
         assert!(!state.file_tree.tree_focused);
+    }
+
+    // ── compute_truncation_index tests ─────────────────────────────
+
+    fn make_file_with_hunks(path: &str, num_hunks: usize, lines_per_hunk: usize) -> DiffFile {
+        let hunks = (0..num_hunks)
+            .map(|_i| crate::diff_parse::DiffHunk {
+                header: format!("@@ -1,{} +1,{} @@", lines_per_hunk, lines_per_hunk),
+                lines: (0..lines_per_hunk)
+                    .map(|_| crate::diff_parse::DiffLine {
+                        kind: crate::diff_parse::DiffLineKind::Added,
+                        old_line_number: None,
+                        new_line_number: Some(1),
+                        content: String::new(),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        DiffFile {
+            dfile: crate::diff_parse::DiffFile {
+                path: path.to_string(),
+                old_path: None,
+                hunks,
+                status: crate::diff_parse::DiffFileStatus::Modified,
+                is_binary: false,
+                too_large_size: None,
+            },
+            old_highlights: None,
+            new_highlights: None,
+            add_count: num_hunks * lines_per_hunk,
+            remove_count: 0,
+        }
+    }
+
+    fn make_binary_file(path: &str) -> DiffFile {
+        DiffFile {
+            dfile: crate::diff_parse::DiffFile {
+                path: path.to_string(),
+                old_path: None,
+                hunks: Vec::new(),
+                status: crate::diff_parse::DiffFileStatus::Modified,
+                is_binary: true,
+                too_large_size: None,
+            },
+            old_highlights: None,
+            new_highlights: None,
+            add_count: 0,
+            remove_count: 0,
+        }
+    }
+
+    fn make_too_large_file(path: &str) -> DiffFile {
+        DiffFile {
+            dfile: crate::diff_parse::DiffFile {
+                path: path.to_string(),
+                old_path: None,
+                hunks: Vec::new(),
+                status: crate::diff_parse::DiffFileStatus::Modified,
+                is_binary: false,
+                too_large_size: Some(5_000_000),
+            },
+            old_highlights: None,
+            new_highlights: None,
+            add_count: 0,
+            remove_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_truncation_no_limits() {
+        let files = vec![make_file_with_hunks("a.rs", 200, 200)];
+        assert_eq!(compute_truncation_index(&files, None, None), None);
+    }
+
+    #[test]
+    fn test_truncation_empty_slice() {
+        let files: Vec<DiffFile> = Vec::new();
+        assert_eq!(
+            compute_truncation_index(&files, None, Some((100, 5000))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_truncation_all_files_fit() {
+        let files = vec![
+            make_file_with_hunks("a.rs", 30, 40),
+            make_file_with_hunks("b.rs", 30, 40),
+        ];
+        // 60 hunks, 2400 lines — both under limits
+        assert_eq!(
+            compute_truncation_index(&files, None, Some((100, 5000))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_truncation_hunk_cap() {
+        let files = vec![
+            make_file_with_hunks("a.rs", 60, 10),
+            make_file_with_hunks("b.rs", 50, 10),
+        ];
+        // After a: 60 hunks, 600 lines. Adding b: 60+50=110 > 100 → truncate at b (idx=1)
+        assert_eq!(
+            compute_truncation_index(&files, None, Some((100, 5000))),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn test_truncation_line_cap() {
+        let files = vec![
+            make_file_with_hunks("a.rs", 10, 100), // 1000 lines
+            make_file_with_hunks("b.rs", 10, 100), // +1000 = 2000
+            make_file_with_hunks("c.rs", 10, 500), // +5000 = 7000 > 5000 → truncate at c
+        ];
+        assert_eq!(
+            compute_truncation_index(&files, None, Some((100, 5000))),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn test_truncation_binary_files_skipped() {
+        let files = vec![
+            make_binary_file("binary.bin"),
+            make_file_with_hunks("a.rs", 60, 10), // 600 lines
+            make_file_with_hunks("b.rs", 50, 10), // +500 = 1100 (under cap, but 110 > 100 hunks)
+        ];
+        // Binary at idx=0 consumes no capacity.
+        // idx=1 (a.rs): 60 hunks, 600 lines — within cap
+        // idx=2 (b.rs): 60+50=110 > 100 hunks → truncate at idx=2
+        assert_eq!(
+            compute_truncation_index(&files, None, Some((100, 5000))),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn test_truncation_selected_file_filter() {
+        let files = vec![
+            make_file_with_hunks("a.rs", 80, 50),
+            make_file_with_hunks("b.rs", 10, 10), // <-- selected
+            make_file_with_hunks("c.rs", 80, 50),
+        ];
+        // Only b.rs passes the filter — 10 hunks, 100 lines — within cap
+        assert_eq!(
+            compute_truncation_index(&files, Some("b.rs"), Some((100, 5000))),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_truncation_selected_file_exceeds_cap() {
+        let files = vec![make_file_with_hunks("b.rs", 60, 100)]; // 6000 lines
+        assert_eq!(
+            compute_truncation_index(&files, Some("b.rs"), Some((100, 5000))),
+            Some(0),
+        );
+    }
+
+    #[test]
+    fn test_truncation_too_large_files_skipped() {
+        let files = vec![
+            make_too_large_file("large.bin"),
+            make_file_with_hunks("a.rs", 40, 30), // 1200 lines
+            make_file_with_hunks("b.rs", 40, 30), // +1200 = 2400 (within)
+        ];
+        assert_eq!(
+            compute_truncation_index(&files, None, Some((100, 5000))),
+            None,
+        );
     }
 }

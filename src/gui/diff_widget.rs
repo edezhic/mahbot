@@ -625,14 +625,22 @@ pub fn build_file_buffers(
     selected_file: Option<&str>,
     limits: Option<(usize, usize)>,
 ) -> Vec<DiffFileBuffer> {
+    // Single source of truth for truncation — shared with build_diff_content.
+    // compute_truncation_index already handles `None` limits internally.
+    let truncate_at = super::diff::compute_truncation_index(diff_files, selected_file, limits);
     let mut buffers: Vec<DiffFileBuffer> = Vec::new();
-    let mut total_hunks = 0usize;
-    let mut total_lines = 0usize;
 
-    for file in diff_files {
+    for (idx, file) in diff_files.iter().enumerate() {
         if let Some(sel) = selected_file {
             if file.dfile.path != *sel {
                 continue;
+            }
+        }
+
+        // Truncation check — use the pre-computed index from the shared helper.
+        if let Some(limit) = truncate_at {
+            if idx >= limit {
+                break;
             }
         }
 
@@ -641,20 +649,6 @@ pub fn build_file_buffers(
         // construction for binary and too-large files.
         if file.dfile.is_binary || file.dfile.too_large_size.is_some() {
             continue;
-        }
-
-        if let Some((max_hunks, max_lines)) = limits {
-            let file_hunks = file.dfile.hunks.len();
-            if total_hunks + file_hunks > max_hunks || total_lines > max_lines {
-                break;
-            }
-            total_hunks += file_hunks;
-            for hunk in &file.dfile.hunks {
-                total_lines += hunk.lines.len();
-                if total_lines > max_lines {
-                    return buffers;
-                }
-            }
         }
 
         buffers.push(build_single_file_buffer(file));
