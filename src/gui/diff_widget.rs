@@ -705,11 +705,12 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
             text.push('\n');
             let end = text.len();
 
-            let (fg_color, kind) = match line.kind {
-                DiffLineKind::Added => (ADDED_COLOR, DiffLineKind::Added),
-                DiffLineKind::Removed => (REMOVED_COLOR, DiffLineKind::Removed),
-                DiffLineKind::Context => (CONTEXT_COLOR, DiffLineKind::Context),
+            let fg_color = match line.kind {
+                DiffLineKind::Added => ADDED_COLOR,
+                DiffLineKind::Removed => REMOVED_COLOR,
+                DiffLineKind::Context => CONTEXT_COLOR,
             };
+            let kind = line.kind;
 
             let content_len = end - content_start;
 
