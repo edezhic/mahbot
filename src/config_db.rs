@@ -424,6 +424,139 @@ mod tests {
         (store, dir)
     }
 
+    // ── Macro: 9-step lifecycle for config_role / config_model_routing ──────
+    //
+    // Invocation protocol:
+    //   ($test_name, $set $get $get_all $delete,
+    //    $empty_key, $key1, $key2,
+    //    ($ins_args..),     $ins_expected,           // step 2 — full insert
+    //    ($partial_args..), $partial_expected, $partial_field,  // step 3 — Some→None
+    //    ($overwrite_args..), $overwrite_expected,   // step 4 — full overwrite
+    //    ($second_args..),  $all_expected,            // step 5 — add second item
+    //                                                  // (consumed via .into_iter() at step 9;
+    //                                                  //  pass a value expr like vec![], not a var)
+    //    $id_field,                                   // struct key field (e.g., role, model)
+    //    $key_name,                                   // human-readable key name for messages
+    //    $table)                                      // noun for error messages
+    //
+    // Step 9 expectation is derived from $all_expected by filtering out key1
+    // via $id_field, so the two can never drift out of sync.
+
+    macro_rules! lifecycle_test_9step {
+        (
+            $name:ident,
+            $set:ident $get:ident $get_all:ident $delete:ident,
+            $empty_key:expr, $key1:expr, $key2:expr,
+            ($($ins_args:expr),*), $ins_expected:expr,
+            ($($partial_args:expr),*), $partial_expected:expr, $partial_field:expr,
+            ($($overwrite_args:expr),*), $overwrite_expected:expr,
+            ($($second_args:expr),*), $all_expected:expr,
+            $id_field:ident,
+            $key_name:expr,
+            $table:expr,
+        ) => {
+            #[tokio::test]
+            async fn $name() {
+                let (store, _dir) = setup().await;
+
+                // 1. empty state
+                let val = store.$get($empty_key).await.unwrap();
+                assert!(val.is_none(), concat!(stringify!($get), " should return None for missing ", $key_name));
+
+                // 2. insert with all fields
+                store.$set($key1, $($ins_args),*).await.unwrap();
+                let val = store.$get($key1).await.unwrap();
+                assert_eq!(val, $ins_expected, concat!(stringify!($get), " should return inserted config"));
+
+                // 3. partial set (Some → None on optional field)
+                store.$set($key1, $($partial_args),*).await.unwrap();
+                let val = store.$get($key1).await.unwrap();
+                assert_eq!(val, $partial_expected, concat!(stringify!($set), " with None ", $partial_field, " should clear it"));
+
+                // 4. overwrite with both fields
+                store.$set($key1, $($overwrite_args),*).await.unwrap();
+                let val = store.$get($key1).await.unwrap();
+                assert_eq!(val, $overwrite_expected, concat!(stringify!($set), " should fully overwrite existing row"));
+
+                // 5. get_all with multiple items (sorted by key)
+                store.$set($key2, $($second_args),*).await.unwrap();
+                let all = store.$get_all().await.unwrap();
+                assert_eq!(all, $all_expected, concat!(stringify!($get_all), " should return all rows sorted by ", $key_name));
+
+                // 6. delete
+                store.$delete($key1).await.unwrap();
+                let val = store.$get($key1).await.unwrap();
+                assert!(val.is_none(), concat!(stringify!($get), " should return None after delete"));
+
+                // 7. delete non-existent key (no-op, must not error)
+                store.$delete("never-existed").await.unwrap();
+
+                // 8. delete already-deleted key (also a no-op)
+                store.$delete($key1).await.unwrap();
+
+                // 9. remaining item still present — derived from $all_expected
+                let remaining: Vec<_> = $all_expected
+                    .into_iter()
+                    .filter(|item| item.$id_field != $key1)
+                    .collect();
+                let all = store.$get_all().await.unwrap();
+                assert_eq!(all, remaining, concat!("only the undeleted ", $table, " should remain"));
+            }
+        };
+    }
+
+    // ── Lifecycle tests ──────────────────────────────────────
+
+    lifecycle_test_9step!(
+        test_config_role_lifecycle,
+        set_role_config get_role_config get_all_role_configs delete_role_config,
+        "nonexistent-role", "engineer", "reviewer",
+        // step 2 — insert with all fields
+        (Some("gpt-4"), Some("high")),
+        Some(RoleConfig { role: "engineer".into(), model: Some("gpt-4".into()), reasoning_effort: Some("high".into()) }),
+        // step 3 — partial set (Some → None on optional field)
+        (Some("gpt-5"), None),
+        Some(RoleConfig { role: "engineer".into(), model: Some("gpt-5".into()), reasoning_effort: None }),
+        "reasoning_effort",
+        // step 4 — overwrite with both fields
+        (Some("claude-4"), Some("low")),
+        Some(RoleConfig { role: "engineer".into(), model: Some("claude-4".into()), reasoning_effort: Some("low".into()) }),
+        // step 5 — add second item, verify get_all is sorted
+        (Some("o1"), None),
+        vec![
+            RoleConfig { role: "engineer".into(), model: Some("claude-4".into()), reasoning_effort: Some("low".into()) },
+            RoleConfig { role: "reviewer".into(), model: Some("o1".into()), reasoning_effort: None },
+        ],
+        role,       // step 9: filter $all_expected by this field != key1
+        "role",     // key name for failure messages
+        "role config",
+    );
+
+    lifecycle_test_9step!(
+        test_config_model_routing_lifecycle,
+        set_model_routing get_model_routing get_all_model_routings delete_model_routing,
+        "nonexistent-model", "gpt-4", "claude-3",
+        // step 2 — insert with all fields
+        (Some("OpenAI"), Some(true)),
+        Some(ModelRouting { model: "gpt-4".into(), provider_order: Some("OpenAI".into()), allow_fallbacks: Some(true) }),
+        // step 3 — partial set (Some → None on optional field)
+        (Some("Azure"), None),
+        Some(ModelRouting { model: "gpt-4".into(), provider_order: Some("Azure".into()), allow_fallbacks: None }),
+        "allow_fallbacks",
+        // step 4 — overwrite with both fields
+        (Some("OpenRouter"), Some(false)),
+        Some(ModelRouting { model: "gpt-4".into(), provider_order: Some("OpenRouter".into()), allow_fallbacks: Some(false) }),
+        // step 5 — add second item, verify get_all is sorted
+        (None, Some(true)),
+        vec![
+            ModelRouting { model: "claude-3".into(), provider_order: None, allow_fallbacks: Some(true) },
+            ModelRouting { model: "gpt-4".into(), provider_order: Some("OpenRouter".into()), allow_fallbacks: Some(false) },
+        ],
+        model,      // step 9: filter $all_expected by this field != key1
+        "model",    // key name for failure messages
+        "model routing",
+    );
+
     // ── config_kv lifecycle ──────────────────────────────────
 
     #[tokio::test]
@@ -484,337 +617,107 @@ mod tests {
         );
     }
 
-    // ── config_role lifecycle ──────────────────────────────
-
-    #[tokio::test]
-    async fn test_config_role_lifecycle() {
-        let (store, _dir) = setup().await;
-
-        // 1. empty state
-        let val = store.get_role_config("nonexistent-role").await.unwrap();
-        assert!(
-            val.is_none(),
-            "get_role_config should return None for missing role"
-        );
-
-        // 2. insert with all fields
-        store
-            .set_role_config("engineer", Some("gpt-4"), Some("high"))
-            .await
-            .unwrap();
-        let val = store.get_role_config("engineer").await.unwrap();
-        assert_eq!(
-            val,
-            Some(RoleConfig {
-                role: "engineer".to_string(),
-                model: Some("gpt-4".to_string()),
-                reasoning_effort: Some("high".to_string()),
-            }),
-            "get_role_config should return inserted config"
-        );
-
-        // 3. partial set (Some → None on reasoning_effort)
-        store
-            .set_role_config("engineer", Some("gpt-5"), None)
-            .await
-            .unwrap();
-        let val = store.get_role_config("engineer").await.unwrap();
-        assert_eq!(
-            val,
-            Some(RoleConfig {
-                role: "engineer".to_string(),
-                model: Some("gpt-5".to_string()),
-                reasoning_effort: None,
-            }),
-            "set_role_config with None reasoning_effort should clear it"
-        );
-
-        // 4. overwrite with both fields
-        store
-            .set_role_config("engineer", Some("claude-4"), Some("low"))
-            .await
-            .unwrap();
-        let val = store.get_role_config("engineer").await.unwrap();
-        assert_eq!(
-            val,
-            Some(RoleConfig {
-                role: "engineer".to_string(),
-                model: Some("claude-4".to_string()),
-                reasoning_effort: Some("low".to_string()),
-            }),
-            "set_role_config should fully overwrite existing row"
-        );
-
-        // 5. get_all with multiple items (sorted by role)
-        store
-            .set_role_config("reviewer", Some("o1"), None)
-            .await
-            .unwrap();
-        let all = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            all,
-            vec![
-                RoleConfig {
-                    role: "engineer".to_string(),
-                    model: Some("claude-4".to_string()),
-                    reasoning_effort: Some("low".to_string()),
-                },
-                RoleConfig {
-                    role: "reviewer".to_string(),
-                    model: Some("o1".to_string()),
-                    reasoning_effort: None,
-                },
-            ],
-            "get_all_role_configs should return all rows sorted by role"
-        );
-
-        // 6. delete
-        store.delete_role_config("engineer").await.unwrap();
-        let val = store.get_role_config("engineer").await.unwrap();
-        assert!(
-            val.is_none(),
-            "get_role_config should return None after delete"
-        );
-
-        // 7. delete non-existent key (no-op, must not error)
-        store.delete_role_config("never-existed").await.unwrap();
-
-        // 8. delete already-deleted key (also a no-op)
-        store.delete_role_config("engineer").await.unwrap();
-
-        // 9. remaining item still present
-        let all = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            all,
-            vec![RoleConfig {
-                role: "reviewer".to_string(),
-                model: Some("o1".to_string()),
-                reasoning_effort: None,
-            },],
-            "only the undeleted role config should remain"
-        );
-    }
-
-    // ── config_model_routing lifecycle ──────────────────────
-
-    #[tokio::test]
-    async fn test_config_model_routing_lifecycle() {
-        let (store, _dir) = setup().await;
-
-        // 1. empty state
-        let val = store.get_model_routing("nonexistent-model").await.unwrap();
-        assert!(
-            val.is_none(),
-            "get_model_routing should return None for missing model"
-        );
-
-        // 2. insert with all fields
-        store
-            .set_model_routing("gpt-4", Some("OpenAI"), Some(true))
-            .await
-            .unwrap();
-        let val = store.get_model_routing("gpt-4").await.unwrap();
-        assert_eq!(
-            val,
-            Some(ModelRouting {
-                model: "gpt-4".to_string(),
-                provider_order: Some("OpenAI".to_string()),
-                allow_fallbacks: Some(true),
-            }),
-            "get_model_routing should return inserted config"
-        );
-
-        // 3. partial set (Some → None on allow_fallbacks)
-        store
-            .set_model_routing("gpt-4", Some("Azure"), None)
-            .await
-            .unwrap();
-        let val = store.get_model_routing("gpt-4").await.unwrap();
-        assert_eq!(
-            val,
-            Some(ModelRouting {
-                model: "gpt-4".to_string(),
-                provider_order: Some("Azure".to_string()),
-                allow_fallbacks: None,
-            }),
-            "set_model_routing with None allow_fallbacks should clear it"
-        );
-
-        // 4. overwrite with both fields
-        store
-            .set_model_routing("gpt-4", Some("OpenRouter"), Some(false))
-            .await
-            .unwrap();
-        let val = store.get_model_routing("gpt-4").await.unwrap();
-        assert_eq!(
-            val,
-            Some(ModelRouting {
-                model: "gpt-4".to_string(),
-                provider_order: Some("OpenRouter".to_string()),
-                allow_fallbacks: Some(false),
-            }),
-            "set_model_routing should fully overwrite existing row"
-        );
-
-        // 5. get_all with multiple items (sorted by model)
-        store
-            .set_model_routing("claude-3", None, Some(true))
-            .await
-            .unwrap();
-        let all = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            all,
-            vec![
-                ModelRouting {
-                    model: "claude-3".to_string(),
-                    provider_order: None,
-                    allow_fallbacks: Some(true),
-                },
-                ModelRouting {
-                    model: "gpt-4".to_string(),
-                    provider_order: Some("OpenRouter".to_string()),
-                    allow_fallbacks: Some(false),
-                },
-            ],
-            "get_all_model_routings should return all rows sorted by model"
-        );
-
-        // 6. delete
-        store.delete_model_routing("gpt-4").await.unwrap();
-        let val = store.get_model_routing("gpt-4").await.unwrap();
-        assert!(
-            val.is_none(),
-            "get_model_routing should return None after delete"
-        );
-
-        // 7. delete non-existent key (no-op, must not error)
-        store.delete_model_routing("never-existed").await.unwrap();
-
-        // 8. delete already-deleted key (also a no-op)
-        store.delete_model_routing("gpt-4").await.unwrap();
-
-        // 9. remaining item still present
-        let all = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            all,
-            vec![ModelRouting {
-                model: "claude-3".to_string(),
-                provider_order: None,
-                allow_fallbacks: Some(true),
-            },],
-            "only the undeleted model routing should remain"
-        );
-    }
-
     // ── save_role_and_routing_configs ──────────────────────────
+
+    /// Save role configs and model routings, then verify the saved data
+    /// matches input. Input slices are sorted to match DB ORDER BY.
+    async fn assert_save_configs(
+        store: &ConfigStore,
+        role_configs: &[RoleConfig],
+        model_routings: &[ModelRouting],
+    ) {
+        let mut roles = role_configs.to_vec();
+        let mut routings = model_routings.to_vec();
+        roles.sort_by(|a, b| a.role.cmp(&b.role));
+        routings.sort_by(|a, b| a.model.cmp(&b.model));
+        store
+            .save_role_and_routing_configs(&roles, &routings)
+            .await
+            .unwrap();
+        let saved_roles = store.get_all_role_configs().await.unwrap();
+        assert_eq!(saved_roles, roles, "saved role configs should match input");
+        let saved_routings = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            saved_routings, routings,
+            "saved model routings should match input"
+        );
+    }
 
     #[tokio::test]
     async fn test_save_role_and_routing_configs_initial_save() {
         let (store, _dir) = setup().await;
-
-        let mut role_configs = vec![
-            RoleConfig {
-                role: "engineer".to_string(),
-                model: Some("gpt-4".to_string()),
-                reasoning_effort: Some("high".to_string()),
-            },
-            RoleConfig {
-                role: "reviewer".to_string(),
-                model: Some("claude-3".to_string()),
-                reasoning_effort: None,
-            },
-        ];
-        let mut model_routings = vec![ModelRouting {
-            model: "gpt-4".to_string(),
-            provider_order: Some("OpenAI".to_string()),
-            allow_fallbacks: Some(true),
-        }];
-        // Sort to match the DB ORDER BY in get_all_* queries
-        role_configs.sort_by(|a, b| a.role.cmp(&b.role));
-        model_routings.sort_by(|a, b| a.model.cmp(&b.model));
-
-        store
-            .save_role_and_routing_configs(&role_configs, &model_routings)
-            .await
-            .unwrap();
-
-        let saved_roles = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            saved_roles, role_configs,
-            "saved role configs should match input"
-        );
-
-        let saved_routings = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            saved_routings, model_routings,
-            "saved model routings should match input"
-        );
+        assert_save_configs(
+            &store,
+            &[
+                RoleConfig {
+                    role: "engineer".to_string(),
+                    model: Some("gpt-4".to_string()),
+                    reasoning_effort: Some("high".to_string()),
+                },
+                RoleConfig {
+                    role: "reviewer".to_string(),
+                    model: Some("claude-3".to_string()),
+                    reasoning_effort: None,
+                },
+            ],
+            &[ModelRouting {
+                model: "gpt-4".to_string(),
+                provider_order: Some("OpenAI".to_string()),
+                allow_fallbacks: Some(true),
+            }],
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_save_role_and_routing_configs_replaces_old_rows() {
         let (store, _dir) = setup().await;
 
-        // Insert initial data
-        let initial_roles = vec![RoleConfig {
-            role: "manager".to_string(),
-            model: Some("old-model".to_string()),
-            reasoning_effort: Some("low".to_string()),
-        }];
-        let initial_routings = vec![ModelRouting {
-            model: "old-model".to_string(),
-            provider_order: Some("OldProvider".to_string()),
-            allow_fallbacks: Some(false),
-        }];
-        store
-            .save_role_and_routing_configs(&initial_roles, &initial_routings)
-            .await
-            .unwrap();
+        // Pre-insert initial data
+        assert_save_configs(
+            &store,
+            &[RoleConfig {
+                role: "manager".to_string(),
+                model: Some("old-model".to_string()),
+                reasoning_effort: Some("low".to_string()),
+            }],
+            &[ModelRouting {
+                model: "old-model".to_string(),
+                provider_order: Some("OldProvider".to_string()),
+                allow_fallbacks: Some(false),
+            }],
+        )
+        .await;
 
-        // Replace with completely different data (sorted to match DB ORDER BY)
-        let new_roles = vec![RoleConfig {
-            role: "qa".to_string(),
-            model: Some("new-model".to_string()),
-            reasoning_effort: None,
-        }];
-        let mut new_routings = vec![
-            ModelRouting {
-                model: "fallback-model".to_string(),
-                provider_order: None,
-                allow_fallbacks: None,
-            },
-            ModelRouting {
-                model: "new-model".to_string(),
-                provider_order: Some("NewProvider".to_string()),
-                allow_fallbacks: Some(true),
-            },
-        ];
-        // Both slices must be sorted to match DB ORDER BY
-        new_routings.sort_by(|a, b| a.model.cmp(&b.model));
-        store
-            .save_role_and_routing_configs(&new_roles, &new_routings)
-            .await
-            .unwrap();
-
-        // Old rows must be gone; only new rows present
-        let saved_roles = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            saved_roles, new_roles,
-            "old role configs should be completely replaced"
-        );
-
-        let saved_routings = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            saved_routings, new_routings,
-            "old model routings should be completely replaced"
-        );
+        // Replace with completely different data
+        assert_save_configs(
+            &store,
+            &[RoleConfig {
+                role: "qa".to_string(),
+                model: Some("new-model".to_string()),
+                reasoning_effort: None,
+            }],
+            &[
+                ModelRouting {
+                    model: "fallback-model".to_string(),
+                    provider_order: None,
+                    allow_fallbacks: None,
+                },
+                ModelRouting {
+                    model: "new-model".to_string(),
+                    provider_order: Some("NewProvider".to_string()),
+                    allow_fallbacks: Some(true),
+                },
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_save_role_and_routing_configs_empty_slices() {
         let (store, _dir) = setup().await;
 
-        // Pre-insert some data
+        // Pre-insert some data via individual set calls
         store
             .set_role_config("should-be-cleared", Some("x"), None)
             .await
@@ -825,19 +728,7 @@ mod tests {
             .unwrap();
 
         // Save with empty slices — should clear both tables
-        store.save_role_and_routing_configs(&[], &[]).await.unwrap();
-
-        let saved_roles = store.get_all_role_configs().await.unwrap();
-        assert!(
-            saved_roles.is_empty(),
-            "all role configs should be deleted after save with empty slice"
-        );
-
-        let saved_routings = store.get_all_model_routings().await.unwrap();
-        assert!(
-            saved_routings.is_empty(),
-            "all model routings should be deleted after save with empty slice"
-        );
+        assert_save_configs(&store, &[], &[]).await;
     }
 
     #[tokio::test]
