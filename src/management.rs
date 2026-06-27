@@ -234,6 +234,17 @@ async fn resolve_ticket_workspace(
 /// This is a pure notification function — it does NOT pause the workspace.
 /// The Manager handles failed tickets autonomously via the triage prompt.
 ///
+/// # Invariant: failure comment before Failed transition
+///
+/// When `status == TicketPhase::Failed`, the warning template loads
+/// failure-specific details from the **latest comment** on the ticket (via
+/// [`BoardStore::get_comments`]). Every code path that transitions a ticket to
+/// `Failed` MUST write a relevant comment first — otherwise the warning will
+/// surface unrelated or stale content (or "No failure details available."
+/// if no comment exists). This invariant is upheld by all four
+/// existing failure paths (dispatch panic, agent failure, circuit breaker, all
+/// verifiers failed) but is not enforced at the type or API level.
+///
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
 /// must see both notification context and user conversation history in a unified
@@ -269,7 +280,7 @@ async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
     // the next delivery attempt.
     let drained = crate::ticket_buffer::drain(&ws.name);
 
-    let message = substitute(
+    let mut message = substitute(
         &load_prompt("notification.md"),
         &[
             ("{{ticket_id}}", &ticket.id),
@@ -279,6 +290,30 @@ async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
             ("{{ticket_updates}}", &drained),
         ],
     );
+
+    if status == TicketPhase::Failed {
+        let failure_details = match board().get_comments(&ticket.id).await {
+            Ok(comments) => comments.last().map_or_else(
+                || "No failure details available.".to_string(),
+                |c| c.content.clone(),
+            ),
+            Err(e) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to load comments for failure notification",
+                );
+                "No failure details available.".to_string()
+            }
+        };
+
+        let warning = substitute(
+            &load_prompt("warning.md"),
+            &[("{{failure_details}}", &failure_details)],
+        );
+        message.push_str("\n\n");
+        message.push_str(&warning);
+    }
 
     // Enqueue to the serialized Manager queue instead of spawning a task.
     // Routing is handled by the consumer loop via DB lookup.
@@ -2922,6 +2957,75 @@ mod tests {
             !ws.paused,
             "Workspace should NOT be paused after non-failure transition"
         );
+    }
+
+    // ── notify_ticket — smoke tests ──────────────────────────────────
+
+    /// Smoke test: transitioning to Failed with Notify should not panic.
+    /// Catches asset-loading or DB panics in the notification path.
+    #[tokio::test]
+    async fn notify_ticket_failed_transition_does_not_panic() {
+        let ws = setup_ticket_to_done_test("failed_notify_test").await;
+
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Failed Notify Test")
+            .create()
+            .await
+            .expect("create_ticket");
+
+        // Add a comment mimicking the actual failure path
+        let _ = board()
+            .add_comment(&ticket_id, "system", "❌ Test failure detail")
+            .await;
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // Transition to Failed with Notify — must not panic
+        transition_ticket(
+            &ticket,
+            DEFAULT_TICKET_PHASE,
+            TicketPhase::Failed,
+            NotifyPolicy::Notify,
+            None,
+        )
+        .await
+        .expect("transition to Failed");
+    }
+
+    /// Smoke test: transitioning to a non-Failed phase with Notify should not
+    /// panic. The warning template is only loaded for Failed transitions, so
+    /// this path exercises that the conditional guard works.
+    #[tokio::test]
+    async fn notify_ticket_non_failed_transition_does_not_panic() {
+        let ws = setup_ticket_to_done_test("non_failed_notify_test").await;
+
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Non-Failed Notify Test")
+            .phase(TicketPhase::Backlog)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // Transition from Backlog to Analysis with Notify — must not panic
+        transition_ticket(
+            &ticket,
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+            NotifyPolicy::Notify,
+            None,
+        )
+        .await
+        .expect("transition to Analysis");
     }
 
     // ── parse_untracked_from_porcelain — git porcelain parsing ──
