@@ -2072,107 +2072,97 @@ mod tests {
     // ── Discard changes tests ──────────────────────────────────────
 
     #[test]
-    fn test_discard_path_noop_in_commit_view() {
-        let mut state = make_diff_with_tree();
-        state.current_commit_ref = Some("abc1234".to_owned());
-        assert!(!state.diff_loading);
+    fn test_discard_changes() {
+        struct Case {
+            name: &'static str,
+            setup: fn(&mut DiffState),
+            msg: DiffMessage,
+            check: fn(&DiffState, name: &str),
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "discard_path_noop_in_commit_view",
+                // Must not mark loading in commit-view — DiscardPath is a no-op
+                // when viewing a historical commit (you can't discard history).
+                setup: |s| {
+                    s.current_commit_ref = Some("abc1234".to_owned());
+                },
+                msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
+                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+            },
+            Case {
+                name: "discard_path_noop_without_workspace",
+                // Without a selected workspace there's nothing to discard into,
+                // so DiscardPath is a no-op.
+                setup: |s| {
+                    s.selected_workspace_name = None;
+                },
+                msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
+                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+            },
+            Case {
+                name: "discard_path_sets_loading",
+                setup: |s| {
+                    s.selected_workspace_name = Some("test-ws".to_owned());
+                },
+                msg: DiffMessage::DiscardPath("src/main.rs".to_owned(), DiscardTarget::File),
+                check: |s, name| assert!(s.diff_loading, "case: {name}"),
+            },
+            Case {
+                name: "discard_result_success_no_workspace_resets_loading",
+                // Without a selected workspace the success path falls through
+                // to the no-refresh branch and resets loading.
+                setup: |s| {
+                    s.selected_workspace_name = None;
+                    s.diff_loading = true;
+                },
+                msg: DiffMessage::DiscardResult(Ok(())),
+                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+            },
+            Case {
+                name: "discard_result_success_with_workspace_keeps_loading_for_refresh",
+                // When there IS a selected workspace, a successful discard
+                // triggers an immediate diff refresh — diff_loading stays true
+                // throughout so the UI shows a loading indicator.
+                setup: |s| {
+                    s.selected_workspace_name = Some("test-ws".to_owned());
+                    s.diff_loading = true;
+                },
+                msg: DiffMessage::DiscardResult(Ok(())),
+                check: |s, name| assert!(s.diff_loading, "case: {name}"),
+            },
+            Case {
+                name: "discard_result_error_resets_loading",
+                setup: |s| {
+                    s.selected_workspace_name = Some("test-ws".to_owned());
+                    s.diff_loading = true;
+                },
+                msg: DiffMessage::DiscardResult(Err("something went wrong".to_owned())),
+                check: |s, name| assert!(!s.diff_loading, "case: {name}"),
+            },
+            Case {
+                name: "discard_path_file_target_vs_dir_target",
+                setup: |s| {
+                    s.selected_workspace_name = Some("ws".to_owned());
+                },
+                msg: DiffMessage::DiscardPath("src".to_owned(), DiscardTarget::Directory),
+                check: |s, name| assert!(s.diff_loading, "case: {name}"),
+            },
+        ];
 
-        let _ = state.update(DiffMessage::DiscardPath(
-            "src/main.rs".to_owned(),
-            DiscardTarget::File,
-        ));
-
-        // Must not mark loading in commit-view.
-        assert!(!state.diff_loading);
-    }
-
-    #[test]
-    fn test_discard_path_noop_without_workspace() {
-        let mut state = make_diff_with_tree();
-        state.selected_workspace_name = None;
-        assert!(!state.diff_loading);
-
-        let _ = state.update(DiffMessage::DiscardPath(
-            "src/main.rs".to_owned(),
-            DiscardTarget::File,
-        ));
-
-        assert!(!state.diff_loading);
-    }
-
-    #[test]
-    fn test_discard_path_sets_loading() {
-        let mut state = make_diff_with_tree();
-        state.selected_workspace_name = Some("test-ws".to_owned());
-        assert!(!state.diff_loading);
-
-        let _ = state.update(DiffMessage::DiscardPath(
-            "src/main.rs".to_owned(),
-            DiscardTarget::File,
-        ));
-
-        // Must mark loading to show progress.
-        assert!(state.diff_loading);
-    }
-
-    #[test]
-    fn test_discard_result_success_no_workspace_resets_loading() {
-        let mut state = make_diff_with_tree();
-        // Without a selected workspace, the success path falls through to
-        // the no-refresh branch and resets loading.
-        state.selected_workspace_name = None;
-        state.diff_loading = true;
-
-        let _ = state.update(DiffMessage::DiscardResult(Ok(())));
-
-        assert!(!state.diff_loading);
-    }
-
-    #[test]
-    fn test_discard_result_success_with_workspace_keeps_loading_for_refresh() {
-        // When there IS a selected workspace, a successful discard triggers an
-        // immediate diff refresh — diff_loading stays true throughout.
-        let mut state = make_diff_with_tree();
-        state.selected_workspace_name = Some("test-ws".to_owned());
-        state.diff_loading = true;
-
-        let _ = state.update(DiffMessage::DiscardResult(Ok(())));
-
-        assert!(state.diff_loading);
-    }
-
-    #[test]
-    fn test_discard_result_error_resets_loading() {
-        let mut state = make_diff_with_tree();
-        state.selected_workspace_name = Some("test-ws".to_owned());
-        state.diff_loading = true;
-
-        let _ = state.update(DiffMessage::DiscardResult(Err(
-            "something went wrong".to_owned()
-        )));
-
-        assert!(!state.diff_loading);
-    }
-
-    #[test]
-    fn test_discard_path_file_target_vs_dir_target() {
-        // Verify that DiscardTarget::File and DiscardTarget::Directory are
-        // distinct values that both produce a Task (state changes on both).
-        let mut state_file = make_diff_with_tree();
-        state_file.selected_workspace_name = Some("ws".to_owned());
-        let _task_file = state_file.update(DiffMessage::DiscardPath(
-            "src/main.rs".to_owned(),
-            DiscardTarget::File,
-        ));
-        assert!(state_file.diff_loading);
-
-        let mut state_dir = make_diff_with_tree();
-        state_dir.selected_workspace_name = Some("ws".to_owned());
-        let _task_dir = state_dir.update(DiffMessage::DiscardPath(
-            "src".to_owned(),
-            DiscardTarget::Directory,
-        ));
-        assert!(state_dir.diff_loading);
+        for case in cases {
+            let mut state = make_diff_with_tree();
+            // All cases build from scratch with make_diff_with_tree, which
+            // starts with diff_loading = false.
+            assert!(
+                !state.diff_loading,
+                "case: {} — expected clean state",
+                case.name
+            );
+            (case.setup)(&mut state);
+            let _ = state.update(case.msg.clone());
+            (case.check)(&state, case.name);
+        }
     }
 
     fn make_diff_loaded(files: Vec<DiffFile>) -> DiffState {
