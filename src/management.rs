@@ -1256,7 +1256,7 @@ async fn trip_sanitation_circuit_breaker_if_exceeded(
                 .filter(|c| {
                     c.role == "system"
                         && c.content.contains(SANITATION_FAILED_PREFIX)
-                        && !c.content.contains("Circuit breaker")
+                        && !c.content.contains(CIRCUIT_BREAKER_TRIP_MARKER)
                 })
                 .count()
         },
