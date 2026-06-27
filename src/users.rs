@@ -581,7 +581,10 @@ pub async fn resolve_user_by_channel(channel: &str, identifier: &str) -> Option<
     store
         .resolve_user_by_channel(channel, identifier)
         .await
-        .unwrap_or(None)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, ?channel, ?identifier, "Failed to resolve user by channel");
+            None
+        })
 }
 
 /// Update reply_target for a channel binding (called on every incoming message).
