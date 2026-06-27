@@ -2,7 +2,7 @@
 
 Mahbot is an agentic development environment built for **reliability**. It treats software work as a managed pipeline, not a chat session: you talk to a **Manager** about product intent and scope; specialist agents implement, validate, and review; every change is analyzed before edits and checked again afterward. Reliability comes from **orchestration and process**, not from betting that the current frontier model will do everything right. It also includes a background maintenance process to clean up usual videcoding bloat and other code quality issues.
 
-Mahbot packages the best practices into one system: role separation, subagents, persistent state, deterministic diagnostics, independent review and QA, and automatic dev loops when validation fails. It is designed to make inexpensive open-weight and API models useful through structure. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot now works on it's own codebase 24/7, spawns >1000 agents every day and this costs only about 10-15$/day.
+Mahbot packages the best practices into one system: role separation, subagents, persistent state, deterministic diagnostics, independent review and QA, and automatic dev loops when validation fails. It is designed to make inexpensive open-weight and API models useful through structure. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot now works on it's own codebase 24/7, spawns >1000 agents every day and this costs only about 10$/day.
 
 
 ## Getting Started
