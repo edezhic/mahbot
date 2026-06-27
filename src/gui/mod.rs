@@ -527,6 +527,51 @@ impl Dashboard {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // ── Centralized Toast and LinkClicked interception ──────────
+        // These are handled at the Dashboard level before dispatching
+        // to page handlers, eliminating repeated per-page intercept
+        // blocks (~50 lines of boilerplate).
+        if self.ready {
+            // Toast: push to dashboard toast stack and return early.
+            // All page-level handlers return Task::none() for Toast
+            // variants, so skipping them is safe.
+            if let Message::Home(home::HomeMessage::Toast(ref tm))
+            | Message::Logs(
+                logs::LogMessage::Toast(ref tm)
+                | logs::LogMessage::ToolFailures(ToolFailuresMessage::Toast(ref tm)),
+            )
+            | Message::Board(board::BoardMessage::Toast(ref tm))
+            | Message::Sessions(sessions::SessionsMessage::Toast(ref tm))
+            | Message::DiffModal(diff::DiffMessage::Toast(ref tm))
+            | Message::Editor(editor::EditorMessage::Toast(ref tm))
+            | Message::Settings(
+                settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(
+                    ref tm,
+                ))
+                | settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(ref tm)),
+            ) = message
+            {
+                self.toasts.push(Toast::from_toast_msg(tm));
+                return Task::none();
+            }
+
+            // LinkClicked: open URL in system browser and return early.
+            // All page-level handlers return Task::none() for LinkClicked
+            // variants.
+            // HomeMessage::LinkClicked is deliberately NOT intercepted
+            // here — home.rs handles its own LinkClicked internally
+            // (inline context links).
+            if let Message::Board(board::BoardMessage::LinkClicked(ref url))
+            | Message::Sessions(sessions::SessionsMessage::LinkClicked(ref url))
+            | Message::Settings(settings::SettingsMessage::WorkspaceMsg(
+                workspaces::WorkspacesMessage::LinkClicked(ref url),
+            )) = message
+            {
+                open_url(url);
+                return Task::none();
+            }
+        }
+
         match message {
             Message::Boot(result) => self.finish_boot(result),
             Message::BootWorkspaces(options, paths, paused_map, maintenance_map, restored_name) => {
@@ -719,26 +764,13 @@ impl Dashboard {
                         self.selected_user_name.as_deref(),
                     );
                 }
-                // Intercept Toast: push to dashboard toast stack.
-                if let home::HomeMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
                 self.home_state.update(msg).map(Message::Home)
             }
             Message::Shell(msg) if self.ready => self.shell_state.update(msg).map(Message::Shell),
-            Message::Logs(msg) if self.ready => {
-                // Intercept Toast messages — both direct LogMessage::Toast
-                // and nested ToolFailuresMessage::Toast from the TF tab.
-                if let logs::LogMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
-                if let logs::LogMessage::ToolFailures(ToolFailuresMessage::Toast(ref tm)) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
-                self.logs_state
-                    .update(msg, self.log_store.as_ref().expect("ready"))
-                    .map(Message::Logs)
-            }
+            Message::Logs(msg) if self.ready => self
+                .logs_state
+                .update(msg, self.log_store.as_ref().expect("ready"))
+                .map(Message::Logs),
             Message::Board(msg) if self.ready => {
                 // Intercept ViewCommitDiff for cross-page navigation
                 // before it reaches board_state.update.
@@ -765,64 +797,18 @@ impl Dashboard {
                         ))),
                     ]);
                 }
-                if let board::BoardMessage::LinkClicked(ref url) = msg {
-                    open_url(url);
-                }
-                if let board::BoardMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
                 self.board_state.update(msg).map(Message::Board)
             }
             Message::Sessions(msg) if self.ready => {
-                if let sessions::SessionsMessage::LinkClicked(ref url) = msg {
-                    open_url(url);
-                }
-                if let sessions::SessionsMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
                 self.sessions_state.update(msg).map(Message::Sessions)
             }
             Message::DiffModal(msg) if self.ready => {
-                if let diff::DiffMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
                 self.diff_state.update(msg).map(Message::DiffModal)
             }
             Message::Editor(msg) if self.ready => {
-                if let editor::EditorMessage::Toast(ref tm) = msg {
-                    self.toasts.push(Toast::from_toast_msg(tm));
-                }
                 self.editor_state.update(msg).map(Message::Editor)
             }
             Message::Settings(msg) if self.ready => {
-                // Intercept workspace link clicks from the context-view modal
-                if let settings::SettingsMessage::WorkspaceMsg(
-                    ref wm @ workspaces::WorkspacesMessage::LinkClicked(ref url),
-                ) = msg
-                {
-                    open_url(url);
-                    return self
-                        .settings_state
-                        .update(settings::SettingsMessage::WorkspaceMsg(wm.clone()))
-                        .map(Message::Settings);
-                }
-                // Intercept toast messages from workspace and user state.
-                let toast = if let settings::SettingsMessage::WorkspaceMsg(
-                    workspaces::WorkspacesMessage::Toast(ref tm),
-                ) = msg
-                {
-                    Some(tm.clone())
-                } else if let settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(
-                    ref tm,
-                )) = msg
-                {
-                    Some(tm.clone())
-                } else {
-                    None
-                };
-                if let Some(tm) = toast {
-                    self.toasts.push(Toast::from_toast_msg(&tm));
-                }
                 // Intercept SwitchUser from user messages.
                 if let settings::SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
                     ref user,
