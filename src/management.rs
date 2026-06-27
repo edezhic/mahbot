@@ -3178,4 +3178,685 @@ D  deleted.rs
             "Circuit breaker should transition to Failed"
         );
     }
+
+    // ── Setup helpers ──────────────────────────────────────────────────────
+
+    /// Initialize all global stores needed by management decision functions
+    /// that call `transition_ticket` (workspace store for buffer/notify
+    /// resolution, manager queue for notification enqueue).
+    ///
+    /// Idempotent across concurrent tests (OnceCell guards).
+    async fn setup_test_state() {
+        init_test_stores().await;
+        ensure_ticket_buffer_initialized();
+        if crate::workspace::WORKSPACES.get().is_none() {
+            let _ = crate::workspace::init_global().await;
+        }
+        if crate::manager_queue::MANAGER_QUEUE.get().is_none() {
+            let _ = crate::manager_queue::init_global();
+        }
+    }
+
+    /// Shared helper: create a passing verdict (score >= REVIEW_QA_THRESHOLD).
+    fn pass_verdict() -> crate::Verdict {
+        crate::Verdict {
+            score: REVIEW_QA_THRESHOLD,
+            critique: Some("Good work.".into()),
+            issues_detected: vec![],
+        }
+    }
+
+    /// Shared helper: create a failing verdict (score < REVIEW_QA_THRESHOLD).
+    fn fail_verdict() -> crate::Verdict {
+        crate::Verdict {
+            score: 3,
+            critique: Some("Missing error handling.".into()),
+            issues_detected: vec!["No timeout check".into()],
+        }
+    }
+
+    // ── process_verdict_results — verdict processing ─────────────────────
+
+    /// Verify all three reviewers fail to produce verdicts → Failed phase.
+    #[tokio::test]
+    async fn verdict_processing_all_failed() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "vp_all_fail");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("VP All Failed")
+            .phase(TicketPhase::InReview)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        let results = vec![
+            ParallelVerdict {
+                response: "".into(),
+                verdict: None,
+            },
+            ParallelVerdict {
+                response: "".into(),
+                verdict: None,
+            },
+            ParallelVerdict {
+                response: "".into(),
+                verdict: None,
+            },
+        ];
+
+        process_verdict_results(&ticket, &results, REVIEWER_VI).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(status, TicketPhase::Failed, "all-verdicts-none => Failed");
+    }
+
+    /// Verify one failing reviewer (with two passing) bounces back
+    /// to ReadyForDevelopment.
+    #[tokio::test]
+    async fn verdict_processing_any_failed_bounces_back() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "vp_any_fail");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("VP Any Failed")
+            .phase(TicketPhase::InReview)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // 2 passing + 1 failing → priority-2 bounce-back with pipeline reservation.
+        let results = vec![
+            ParallelVerdict {
+                response: "Good.".into(),
+                verdict: Some(pass_verdict()),
+            },
+            ParallelVerdict {
+                response: "Issues found.".into(),
+                verdict: Some(fail_verdict()),
+            },
+            ParallelVerdict {
+                response: "Looks fine.".into(),
+                verdict: Some(pass_verdict()),
+            },
+        ];
+
+        process_verdict_results(&ticket, &results, REVIEWER_VI).await;
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+        assert_eq!(
+            ticket.status,
+            TicketPhase::ReadyForDevelopment,
+            "any-failed => ReadyForDevelopment"
+        );
+        assert!(
+            ticket.pipeline_reservation,
+            "bounce-back must set pipeline_reservation so the ticket \
+             gets priority over fresh ReadyForDevelopment tickets"
+        );
+    }
+
+    /// Verify all reviewers pass → success phase (Reviewed for REVIEWER_VI).
+    #[tokio::test]
+    async fn verdict_processing_all_passed() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "vp_all_pass");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("VP All Pass")
+            .phase(TicketPhase::InReview)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // All reviewers pass → priority-3 transition to Reviewed (buffered).
+        let results = vec![
+            ParallelVerdict {
+                response: "Good.".into(),
+                verdict: Some(pass_verdict()),
+            },
+            ParallelVerdict {
+                response: "Fine.".into(),
+                verdict: Some(pass_verdict()),
+            },
+            ParallelVerdict {
+                response: "OK.".into(),
+                verdict: Some(pass_verdict()),
+            },
+        ];
+
+        process_verdict_results(&ticket, &results, REVIEWER_VI).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Reviewed,
+            "all-pass with REVIEWER_VI => Reviewed"
+        );
+    }
+
+    /// Verify QA verifier all-pass → QaPassed (distinct from reviewer path).
+    #[tokio::test]
+    async fn verdict_processing_qa_verifier_passed() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "vp_qa_pass");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("VP QA Pass")
+            .phase(TicketPhase::InQa)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        let results = vec![
+            ParallelVerdict {
+                response: "QA pass.".into(),
+                verdict: Some(pass_verdict()),
+            },
+            ParallelVerdict {
+                response: "OK.".into(),
+                verdict: Some(pass_verdict()),
+            },
+            ParallelVerdict {
+                response: "Good.".into(),
+                verdict: Some(pass_verdict()),
+            },
+        ];
+
+        process_verdict_results(&ticket, &results, QA_VI).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::QaPassed,
+            "all-pass with QA_VI => QaPassed"
+        );
+    }
+
+    // ── trip_circuit_breaker_if_exceeded — general circuit breaker ────────
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_at_comment_threshold() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "cb_thresh");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("CB Threshold")
+            .phase(TicketPhase::InReview)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        // Add CIRCUIT_BREAKER_COMMENT_THRESHOLD + 1 (= 51) comments
+        for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
+            board()
+                .add_comment(&ticket_id, "user", &format!("Comment {i}"))
+                .await
+                .expect("add_comment");
+        }
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        let tripped =
+            trip_circuit_breaker_if_exceeded(&ticket, TicketPhase::InReview, "test").await;
+        assert!(
+            tripped,
+            "Should trip with {} comments (threshold: {})",
+            CIRCUIT_BREAKER_COMMENT_THRESHOLD + 1,
+            CIRCUIT_BREAKER_COMMENT_THRESHOLD
+        );
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Failed,
+            "tripped circuit breaker => Failed"
+        );
+    }
+
+    /// Verify the breaker does NOT trip when at exactly the threshold
+    /// (count > threshold, not >=).
+    #[tokio::test]
+    async fn circuit_breaker_does_not_trip_at_threshold() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "cb_no_trip");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("CB No Trip")
+            .phase(TicketPhase::InReview)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        // Add exactly CIRCUIT_BREAKER_COMMENT_THRESHOLD comments (50) — should NOT trip
+        for i in 0..CIRCUIT_BREAKER_COMMENT_THRESHOLD {
+            board()
+                .add_comment(&ticket_id, "user", &format!("Comment {i}"))
+                .await
+                .expect("add_comment");
+        }
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        let tripped =
+            trip_circuit_breaker_if_exceeded(&ticket, TicketPhase::InReview, "test").await;
+        assert!(
+            !tripped,
+            "Should NOT trip with {} comments (threshold: {}, needs > {})",
+            CIRCUIT_BREAKER_COMMENT_THRESHOLD,
+            CIRCUIT_BREAKER_COMMENT_THRESHOLD,
+            CIRCUIT_BREAKER_COMMENT_THRESHOLD
+        );
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::InReview,
+            "should remain InReview when not tripped"
+        );
+    }
+
+    /// The general circuit breaker's count_fn (`<[TicketComment]>::len`) does
+    /// *not* filter out its own trip comment (unlike the diagnostics breaker
+    /// which has explicit self-counting prevention). Cascade prevention relies
+    /// on the phase guard: after tripping, the ticket transitions to Failed,
+    /// and `guard_phase_and_circuit_breaker` rejects the next cycle via
+    /// phase mismatch before the breaker is called.
+    #[tokio::test]
+    async fn circuit_breaker_guard_prevents_retrip() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "cb_guard");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("CB Guard")
+            .phase(TicketPhase::InReview)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
+            board()
+                .add_comment(&ticket_id, "user", &format!("Comment {i}"))
+                .await
+                .expect("add_comment");
+        }
+
+        // Trip the breaker
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        let tripped =
+            trip_circuit_breaker_if_exceeded(&ticket, TicketPhase::InReview, "test").await;
+        assert!(tripped, "breaker should trip");
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Failed,
+            "ticket should be Failed after trip"
+        );
+
+        // The trip comment must contain the marker substring so that the
+        // diagnostics breaker's self-counting filter (which excludes comments
+        // containing CIRCUIT_BREAKER_TRIP_MARKER) correctly identifies it.
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        let has_marker = comments
+            .iter()
+            .any(|c| c.content.to_lowercase().contains("circuit breaker"));
+        assert!(
+            has_marker,
+            "trip comment must contain circuit breaker marker"
+        );
+
+        // Phase guard prevents a second trip: the ticket is now Failed, not
+        // InReview, so is_ticket_in_phase rejects it before the breaker runs.
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        let guarded = guard_phase_and_circuit_breaker(&ticket, TicketPhase::InReview, "test").await;
+        assert!(
+            !guarded,
+            "phase guard must reject re-trip (ticket is now Failed)"
+        );
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(status, TicketPhase::Failed, "ticket must remain Failed");
+    }
+
+    // ── handle_analyst_verdicts — analyst scoring and transitions ─────────
+
+    /// Verify handle_analyst_verdicts: all analysts pass (score >=
+    /// ANALYSIS_THRESHOLD) → transitions to Planning with an "All LGTM"
+    /// summary comment.
+    #[tokio::test]
+    async fn analyst_verdicts_all_pass_to_planning() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "an_all_pass");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Analyst All Pass")
+            .phase(TicketPhase::Analysis)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // All three analysts pass with LGTM (score >= 7, no issues)
+        let results = vec![
+            ParallelVerdict {
+                response: "Analysis A".into(),
+                verdict: Some(crate::Verdict {
+                    score: 10,
+                    critique: Some("Great analysis.".into()),
+                    issues_detected: vec![],
+                }),
+            },
+            ParallelVerdict {
+                response: "Analysis B".into(),
+                verdict: Some(crate::Verdict {
+                    score: 9,
+                    critique: Some("Solid work.".into()),
+                    issues_detected: vec![],
+                }),
+            },
+            ParallelVerdict {
+                response: "Analysis C".into(),
+                verdict: Some(crate::Verdict {
+                    score: 8,
+                    critique: Some("Good analysis.".into()),
+                    issues_detected: vec![],
+                }),
+            },
+        ];
+
+        handle_analyst_verdicts(&ticket, &results).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Planning,
+            "all analysts pass => Planning"
+        );
+
+        // Verify comments: 3 per-analyst + 1 system summary = 4
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert_eq!(
+            comments.len(),
+            4,
+            "3 per-analyst + 1 system summary comment expected"
+        );
+
+        let system = comments.iter().find(|c| c.role == "system");
+        assert!(system.is_some(), "system summary comment should exist");
+        assert!(
+            system.unwrap().content.contains("All LGTM"),
+            "system comment should indicate all passed, got: {}",
+            system.unwrap().content,
+        );
+    }
+
+    /// Verify that even when some analysts fail (score < ANALYSIS_THRESHOLD),
+    /// the ticket still transitions to Planning with appropriate summary.
+    #[tokio::test]
+    async fn analyst_verdicts_partial_fail_to_planning() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "an_partial");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Analyst Partial Fail")
+            .phase(TicketPhase::Analysis)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // 2 passing (score >= 7), 1 failing (score < 7)
+        let results = vec![
+            ParallelVerdict {
+                response: "Analysis A".into(),
+                verdict: Some(crate::Verdict {
+                    score: 10,
+                    critique: Some("Great.".into()),
+                    issues_detected: vec![],
+                }),
+            },
+            ParallelVerdict {
+                response: "Analysis B".into(),
+                verdict: Some(crate::Verdict {
+                    score: 3,
+                    critique: Some("Poor analysis.".into()),
+                    issues_detected: vec!["Missing data".into()],
+                }),
+            },
+            ParallelVerdict {
+                response: "Analysis C".into(),
+                verdict: Some(crate::Verdict {
+                    score: 8,
+                    critique: Some("Decent.".into()),
+                    issues_detected: vec!["Minor issue".into()],
+                }),
+            },
+        ];
+
+        handle_analyst_verdicts(&ticket, &results).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Planning,
+            "partial fail should still => Planning"
+        );
+
+        // System comment should mention blockers or issues
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        let system = comments.iter().find(|c| c.role == "system");
+        assert!(system.is_some(), "system summary comment should exist");
+        assert!(
+            system.unwrap().content.contains("blockers"),
+            "system comment should mention 'flagged potential blockers', got: {}",
+            system.unwrap().content,
+        );
+    }
+
+    /// Verify that when all analysts produce no verdict (extraction failed
+    /// or empty response), the ticket still transitions to Planning with a
+    /// summary noting no analysis was provided.
+    #[tokio::test]
+    async fn analyst_verdicts_no_verdicts_to_planning() {
+        setup_test_state().await;
+
+        let ws = test_ws_named("/tmp/test", "an_no_v");
+        let ticket_id = TicketBuilder::new(board(), ws)
+            .title("Analyst No Verdicts")
+            .phase(TicketPhase::Analysis)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        // All three analysts have no verdict (None)
+        let results = vec![
+            ParallelVerdict {
+                response: "".into(),
+                verdict: None,
+            },
+            ParallelVerdict {
+                response: "".into(),
+                verdict: None,
+            },
+            ParallelVerdict {
+                response: "".into(),
+                verdict: None,
+            },
+        ];
+
+        handle_analyst_verdicts(&ticket, &results).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Planning,
+            "no verdicts should still => Planning"
+        );
+
+        // System comment should mention "no analysis"
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        let system = comments.iter().find(|c| c.role == "system");
+        assert!(system.is_some(), "system summary comment should exist");
+        assert!(
+            system.unwrap().content.contains("no analysis"),
+            "system comment should mention 'no analysis', got: {}",
+            system.unwrap().content,
+        );
+    }
+
+    // ── handle_qa_passed / finalize_qa_passed — QA → Done path ──────────
+
+    /// handle_qa_passed first checks whether git is available and whether the
+    /// workspace path is a git repo. In test environments git may exist, but
+    /// the workspace path is deliberately not a git repo, so the function
+    /// falls through to finalize_qa_passed → transition_ticket_to_done.
+    /// This test validates the graceful non-git fallback path.
+    #[tokio::test]
+    async fn handle_qa_passed_no_git_to_done() {
+        setup_test_state().await;
+
+        // Use a path that cannot be a git repo regardless of the test
+        // environment's current working directory.
+        let ws = test_ws_named("/nonexistent/mahbot-test-qa-no-git", "qa_no_git");
+        let ticket_id = TicketBuilder::new(board(), ws.clone())
+            .title("QA No Git")
+            .phase(TicketPhase::QaPassed)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        handle_qa_passed(ticket, ws).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::Done,
+            "QA passed should eventually transition to Done"
+        );
+    }
 }
