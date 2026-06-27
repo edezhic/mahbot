@@ -148,7 +148,7 @@ impl ToolFailuresState {
                 self.load_state.fail(e);
                 // ToolFailures shows "empty state" instead of "Loading…" after
                 // the first attempt, even if it failed, so mark has_loaded=true.
-                self.load_state.has_loaded = true;
+                self.load_state.set_has_loaded();
                 Task::none()
             }
             ToolFailuresMessage::RoleFilterInput(v) => {
@@ -213,15 +213,15 @@ impl ToolFailuresState {
         let mut content = Column::new();
 
         // Error display
-        if let Some(ref err) = self.load_state.error {
+        if let Some(err) = self.load_state.error() {
             content = content.push(widgets::error_banner(err));
             content = content.push(Space::new().height(8));
         }
 
         // Entries or empty state
-        if self.load_state.loading && !self.load_state.has_loaded {
+        if self.load_state.loading() && !self.load_state.has_loaded() {
             content = content.push(text("Loading...").size(14).color(theme::TEXT_MUTED));
-        } else if self.entries.is_empty() && self.load_state.has_loaded {
+        } else if self.entries.is_empty() && self.load_state.has_loaded() {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::bug::<iced::Theme, iced::Renderer>(),
                 "No tool failures",

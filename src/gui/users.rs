@@ -188,7 +188,7 @@ impl UsersState {
                 Task::done(UsersMessage::Toast(super::ToastMessage::Saved)),
             ]),
             UsersMessage::UpdateResult(Err(e)) => {
-                self.load_state.error = Some(e.clone());
+                self.load_state.fail(e.clone());
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
             UsersMessage::DeleteUser(sender) => {
@@ -217,7 +217,7 @@ impl UsersState {
             }
             UsersMessage::DeleteResult(Ok(()), _deleted_user) => {
                 self.deleting = false;
-                self.load_state.error = None;
+                self.load_state.clear_error();
                 Task::batch([
                     self.refresh(),
                     Task::done(UsersMessage::Toast(super::ToastMessage::Deleted)),
@@ -225,7 +225,7 @@ impl UsersState {
             }
             UsersMessage::DeleteResult(Err(e), _deleted_user) => {
                 self.deleting = false;
-                self.load_state.error = Some(e.clone());
+                self.load_state.fail(e.clone());
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
             UsersMessage::Toast(_) => Task::none(),
@@ -306,7 +306,7 @@ impl UsersState {
                 if self.bind_target.as_deref() == Some(&user_name) {
                     self.bind_error = Some(format!("Failed to bind: {e}"));
                 } else {
-                    self.load_state.error = Some(format!("Failed to unbind: {e}"));
+                    self.load_state.fail(format!("Failed to unbind: {e}"));
                 }
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }

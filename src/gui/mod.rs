@@ -643,21 +643,24 @@ impl Dashboard {
                 };
 
                 let page_task = match self.page {
-                    Page::Home if !self.board_state.load_state.loading => {
-                        self.board_state.load_state.loading = true;
+                    Page::Home if !self.board_state.load_state.loading() => {
+                        self.board_state.load_state.start_loading();
                         self.board_state.refresh().map(Message::Board)
                     }
                     Page::Shell => Task::none(),
-                    Page::Sessions if !self.sessions_state.load_state.loading => {
-                        self.sessions_state.load_state.loading = true;
+                    Page::Sessions if !self.sessions_state.load_state.loading() => {
+                        self.sessions_state.load_state.start_loading();
                         self.sessions_state.refresh().map(Message::Sessions)
                     }
                     Page::Settings => {
                         // Refresh workspace and user lists when on Settings page
-                        let ws_loading = self.settings_state.workspaces_state.load_state.loading;
-                        let us_loading = self.settings_state.users_state.load_state.loading;
+                        let ws_loading = self.settings_state.workspaces_state.load_state.loading();
+                        let us_loading = self.settings_state.users_state.load_state.loading();
                         let ws = if !ws_loading {
-                            self.settings_state.workspaces_state.load_state.loading = true;
+                            self.settings_state
+                                .workspaces_state
+                                .load_state
+                                .start_loading();
                             self.settings_state.workspaces_state.refresh().map(|msg| {
                                 Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg))
                             })
@@ -665,7 +668,7 @@ impl Dashboard {
                             Task::none()
                         };
                         let us = if !us_loading {
-                            self.settings_state.users_state.load_state.loading = true;
+                            self.settings_state.users_state.load_state.start_loading();
                             self.settings_state.users_state.refresh().map(|msg| {
                                 Message::Settings(settings::SettingsMessage::UserMsg(msg))
                             })
@@ -1903,7 +1906,7 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
         row![clear_btn, Space::new().width(Length::Fill), archive_btn].align_y(Alignment::Center);
 
     // Body: loading, empty, or ticket groups
-    let body: Element<'_, Message> = if !board_state.load_state.has_loaded {
+    let body: Element<'_, Message> = if !board_state.load_state.has_loaded() {
         column![
             Space::new().height(8),
             text("Loading…").size(12).color(theme::TEXT_MUTED),
@@ -2202,7 +2205,7 @@ impl Dashboard {
         let inner = nav_col.spacing(2);
 
         container(inner)
-            .width(Length::Fixed(130.0))
+            .width(Length::Fixed(56.0))
             .height(Length::Fill)
             .style(theme::surface_container_style)
             .padding(12)
@@ -2286,7 +2289,15 @@ impl Dashboard {
                 } else {
                     b.clone()
                 };
-                let branch_btn = button(text(truncated).size(11).color(theme::ACCENT))
+                let branch_content = row![
+                    lucide::git_branch::<iced::Theme, iced::Renderer>()
+                        .size(16)
+                        .color(theme::ACCENT),
+                    text(truncated).size(11).color(theme::ACCENT),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center);
+                let branch_btn = button(branch_content)
                     .style(theme::button_text)
                     .padding(2)
                     .on_press(Message::OpenBranchModal);
@@ -2304,25 +2315,26 @@ impl Dashboard {
                     } else {
                         format!("\u{2193}{behind}")
                     };
-                    let sync_btn = button(
-                        row![
-                            text("\u{21bb}").size(14).color(if self.git_syncing {
+                    let sync_content = row![
+                        lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+                            .size(16)
+                            .color(if self.git_syncing {
                                 theme::TEXT_MUTED
                             } else {
                                 theme::ACCENT
                             }),
-                            text(sync_text).size(11).color(theme::TEXT_MUTED),
-                        ]
-                        .spacing(4)
-                        .align_y(Alignment::Center),
-                    )
-                    .padding(2)
-                    .style(theme::button_text)
-                    .on_press_maybe(if self.git_syncing {
-                        None
-                    } else {
-                        Some(Message::GitSync)
-                    });
+                        text(sync_text).size(11).color(theme::TEXT_MUTED),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center);
+                    let sync_btn = button(sync_content)
+                        .padding(2)
+                        .style(theme::button_text)
+                        .on_press_maybe(if self.git_syncing {
+                            None
+                        } else {
+                            Some(Message::GitSync)
+                        });
                     left_icons.push(sync_btn.into());
                 }
             }

@@ -886,12 +886,12 @@ impl SessionsState {
     pub fn view(&self) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 
-        if let Some(ref err) = self.load_state.error {
+        if let Some(err) = self.load_state.error() {
             content = content.push(widgets::error_banner(err));
             content = content.push(Space::new().height(12));
         }
 
-        if self.load_state.loading && !self.load_state.has_loaded {
+        if self.load_state.loading() && !self.load_state.has_loaded() {
             content = content.push(text("Loading...").size(14).color(theme::TEXT_MUTED));
         } else if self.sessions.is_empty() {
             content = content.push(widgets::empty_state_placeholder(

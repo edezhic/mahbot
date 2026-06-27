@@ -156,7 +156,7 @@ impl WorkspacesState {
             }
             WorkspacesMessage::DeleteResult(Ok(())) => {
                 self.deleting = false;
-                self.load_state.error = None;
+                self.load_state.clear_error();
                 Task::batch([
                     self.refresh(),
                     Task::done(WorkspacesMessage::Toast(super::ToastMessage::Deleted)),

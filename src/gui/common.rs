@@ -11,12 +11,13 @@
 /// # Behavioural note
 ///
 /// Most pages set `has_loaded` only on success, but `ToolFailuresState` also sets it
-/// on error.  That page accesses the field directly to preserve the divergence.
+/// on error.  That page uses [`set_has_loaded`](AsyncLoadState::set_has_loaded) to
+/// preserve the divergence without exposing the fields directly.
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncLoadState {
-    pub(crate) loading: bool,
-    pub(crate) has_loaded: bool,
-    pub(crate) error: Option<String>,
+    loading: bool,
+    has_loaded: bool,
+    error: Option<String>,
 }
 
 impl AsyncLoadState {
@@ -26,6 +27,21 @@ impl AsyncLoadState {
             has_loaded: false,
             error: None,
         }
+    }
+
+    /// Returns `true` while an async fetch is in progress.
+    pub(crate) fn loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Returns `true` after at least one successful fetch has completed.
+    pub(crate) fn has_loaded(&self) -> bool {
+        self.has_loaded
+    }
+
+    /// The last error message, if any.
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     /// Mark the start of an async load — clears any previous error.
@@ -45,9 +61,25 @@ impl AsyncLoadState {
     /// Note: does **not** touch `has_loaded` — most pages leave it at its previous
     /// value (the initial `false`) so the view continues to show "Loading…".
     /// Pages that need to set `has_loaded = true` on error (e.g. `ToolFailuresState`)
-    /// can do so via direct field access.
+    /// can do so via [`set_has_loaded`](Self::set_has_loaded).
     pub(crate) fn fail(&mut self, error: String) {
         self.error = Some(error);
         self.loading = false;
+    }
+
+    /// Clear the error state without starting a new load.
+    ///
+    /// Used after a successful operation (e.g. delete) that should dismiss any
+    /// prior error banner without re-triggering the loading spinner.
+    pub(crate) fn clear_error(&mut self) {
+        self.error = None;
+    }
+
+    /// Mark `has_loaded` as `true` regardless of error state.
+    ///
+    /// Only used by `ToolFailuresState` which shows an empty state instead of
+    /// "Loading…" after the first attempt, even on failure.
+    pub(crate) fn set_has_loaded(&mut self) {
+        self.has_loaded = true;
     }
 }
