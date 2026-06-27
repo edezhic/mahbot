@@ -1023,15 +1023,7 @@ impl SettingsState {
                 .padding(16),
             )
             .width(Length::Fill)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: theme::BORDER_STRONG,
-                },
-                ..container::Style::default()
-            });
+            .style(theme::dialog_container_style);
 
             section_content = section_content.push(view_container);
         }

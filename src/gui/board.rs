@@ -190,26 +190,14 @@ impl BoardState {
     }
 
     /// Map an action label to the appropriate lucide icon element (16px).
-    /// Match order: Cancel → Redo → Done → Backlog → Review → QA → Pause → Dev → fallback.
     fn action_icon<'a>(label: &str) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
-        if label.contains("Cancel") {
-            lucide::circle_x::<iced::Theme, iced::Renderer>()
-        } else if label.contains("Redo") {
-            lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-        } else if label.contains("Done") {
-            lucide::circle_check::<iced::Theme, iced::Renderer>()
-        } else if label.contains("Backlog") {
-            lucide::rotate_ccw::<iced::Theme, iced::Renderer>()
-        } else if label.contains("Review") {
-            lucide::eye::<iced::Theme, iced::Renderer>()
-        } else if label.contains("QA") {
-            lucide::shield_check::<iced::Theme, iced::Renderer>()
-        } else if label.contains("Pause") {
-            lucide::pause::<iced::Theme, iced::Renderer>()
-        } else if label.contains("Dev") {
-            lucide::play::<iced::Theme, iced::Renderer>()
-        } else {
-            lucide::circle_check::<iced::Theme, iced::Renderer>()
+        match label {
+            l if l.contains("Cancel") => lucide::circle_x(),
+            l if l.contains("Redo") => lucide::refresh_cw(),
+            l if l.contains("QA") => lucide::shield_check(),
+            l if l.contains("Pause") => lucide::pause(),
+            l if l.contains("Dev") => lucide::play(),
+            _ => lucide::circle_check(),
         }
     }
 

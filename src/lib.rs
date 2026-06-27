@@ -1,7 +1,7 @@
 //! Library crate for mahbot.
 //!
 //! The binary (`main.rs`) uses the same module tree. This crate root
-//! provides the public API for both the daemon and external crates.
+//! provides the public API for both the dashboard and background agent dispatch.
 
 #![warn(clippy::pedantic)]
 #![allow(
@@ -107,7 +107,7 @@ impl DiagnosticsCommands {
 // ---------------------------------------------------------------------------
 
 /// A persisted workspace entry.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Workspace {
     pub name: String,
     pub path: String,
@@ -133,6 +133,24 @@ pub struct Workspace {
     /// RFC 3339 timestamp of the last completed diagnostics discovery run.
     /// `None` before the first diagnostics discovery run.
     pub diagnostics_updated_at: Option<String>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            name: String::default(),
+            path: String::default(),
+            status: String::default(),
+            created_at: String::default(),
+            updated_at: String::default(),
+            maintenance: bool::default(),
+            paused: bool::default(),
+            maintainer_debounce_mins: 5,
+            maintainer_last_run_at: Option::default(),
+            diagnostics: Option::default(),
+            diagnostics_updated_at: Option::default(),
+        }
+    }
 }
 
 impl Workspace {
