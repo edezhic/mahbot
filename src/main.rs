@@ -125,15 +125,9 @@ async fn bootstrap_mahbot_safe() -> Result<(), String> {
     }
 }
 
-/// Extract a human-readable message from a panic payload (e.g. from
-/// [`catch_unwind`](futures_util::FutureExt::catch_unwind)).
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    mahbot::util::panic_message(payload)
-}
-
 /// Format a startup panic payload into an error string for the boot log.
 fn format_startup_panic(payload: &(dyn std::any::Any + Send)) -> String {
-    format!("Startup panicked: {}", panic_message(payload))
+    format!("Startup panicked: {}", mahbot::util::panic_message(payload))
 }
 
 /// Async startup for `MahBot` — runs on Iced's Tokio runtime via a boot [`Task`].
@@ -205,7 +199,7 @@ fn spawn_cancellable<F>(
                 if let Err(payload) = result {
                     error!(
                         "Background task panicked [{name}]: {}",
-                        panic_message(&*payload),
+                        mahbot::util::panic_message(&*payload),
                     );
                 }
             }

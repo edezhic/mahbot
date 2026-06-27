@@ -423,6 +423,14 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let ticket_for_failure = Arc::clone(&ticket);
 
     tokio::spawn(async move {
+        // Safety: AssertUnwindSafe is sound because:
+        //   - `ticket` is Arc<Ticket> (atomic refcount, panic-safe); the inner
+        //     Ticket data may be inconsistent after a panic, but it is consumed
+        //     entirely within the unwound closure and never inspected afterwards.
+        //   - `ticket_for_failure` is a separate Arc clone captured by the outer
+        //     closure — it is not wrapped in AssertUnwindSafe, so panic recovery
+        //     always has a valid reference for error reporting.
+        //   - `ws` is moved in and consumed; no shared state remains.
         let result = std::panic::AssertUnwindSafe(async move {
             match phase {
                 PollPhase::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
@@ -2425,17 +2433,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning() {
-        init_test_stores().await;
-        // Initialize workspace store if not already done by a sibling test.
-        // Required by transition_ticket for ticket buffer resolution.
-        // The workspace does not need to exist in the store
-        // (resolve_ticket_workspace returns None gracefully for
-        // non-existent workspaces, merely skipping the buffer push).
-        // Initialize workspace store — race-safe: if another test already
-        // initialized it, init_global returns an error which we ignore.
-        if crate::workspace::WORKSPACES.get().is_none() {
-            let _ = crate::workspace::init_global().await;
-        }
+        init_management_test_stores().await;
 
         let ws_a = test_ws_named("/ws_a", "ws_a");
         let ws_b = test_ws_named("/ws_b", "ws_b");
@@ -2676,54 +2674,50 @@ mod tests {
 
     // ── transition_ticket_to_done — conditional notification ─────────
 
-    /// Ensures the ticket buffer is initialized exactly once across all tests.
-    /// Unlike `ticket_buffer::reset()`, this does not clear existing entries
-    /// from other workspaces, avoiding flake when tests run concurrently.
-    static TICKET_BUF_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    fn ensure_ticket_buffer_initialized() {
+    /// Initialize all stores needed by management tests that call
+    /// [`transition_ticket`] or interact with the ticket buffer.
+    ///
+    /// Idempotent across concurrent tests — all globals use OnceCell/OnceLock
+    /// guards, so duplicate initialization is a harmless no-op.
+    async fn init_management_test_stores() {
+        init_test_stores().await;
+        // Ticket buffer — OnceLock ensures exactly-once initialization.
+        static TICKET_BUF_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         TICKET_BUF_INIT.get_or_init(|| {
-            // `init_global` panics if already set, but OnceLock ensures
-            // this code runs exactly once.
             crate::ticket_buffer::init_global();
         });
+        // init_global() returns Err if already set — ignored (idempotent).
+        let _ = crate::workspace::init_global().await;
+        let _ = crate::manager_queue::init_global();
     }
 
-    /// Prepare a workspace for `transition_ticket_to_done` tests (QaPassed→Done path).
-    ///
-    /// Ensures all global stores (board, workspace, manager_queue) are
-    /// initialized (race-safe with concurrent tests), creates a unique
-    /// workspace in the store, and returns a [`Workspace`] struct referencing
-    /// it. Each test must pass a unique `suffix` to avoid UNIQUE constraint
-    /// and cross-test pollution on the shared ticket buffer.
-    async fn setup_ticket_to_done_test(suffix: &str) -> crate::Workspace {
-        init_test_stores().await;
-        ensure_ticket_buffer_initialized();
-        // Workspace store — race-safe: if another test already initialized it,
-        // init_global returns an error which we ignore.
-        if crate::workspace::WORKSPACES.get().is_none() {
-            let _ = crate::workspace::init_global().await;
-        }
-        // Manager queue — needed by the Notify path inside notify_ticket.
-        // Race-safe: if another test already initialized it, init_global
-        // returns an error which we ignore.
-        if crate::manager_queue::MANAGER_QUEUE.get().is_none() {
-            let _ = crate::manager_queue::init_global();
-        }
-
-        let ws_name = format!("ws_{suffix}");
-        let ws_path = format!("/tmp/test_{suffix}");
+    /// Create a test workspace — parameters are `(name, path)`;
+    /// [`test_ws_named`] takes `(path, name)`, so the order is swapped internally.
+    async fn create_test_workspace(name: &str, path: &str) -> crate::Workspace {
         let now = crate::turso::now();
         crate::workspace::store()
             .conn
             .execute(
                 "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                turso::params![ws_name.clone(), ws_path.clone(), now.clone(), now, 0],
+                turso::params![name, path, now.clone(), now, 0],
             )
             .await
             .expect("insert test workspace");
+        test_ws_named(path, name)
+    }
 
-        test_ws_named(&ws_path, &ws_name)
+    /// Shorthand for [`init_management_test_stores`] + [`create_test_workspace`]
+    /// with a generated `ws_{suffix}` / `/tmp/test_{suffix}` name/path.
+    ///
+    /// Each test must pass a unique `suffix` to avoid UNIQUE constraint
+    /// and cross-test pollution on the shared ticket buffer.
+    async fn setup_ticket_to_done_test(suffix: &str) -> crate::Workspace {
+        init_management_test_stores().await;
+
+        let ws_name = format!("ws_{suffix}");
+        let ws_path = format!("/tmp/test_{suffix}");
+        create_test_workspace(&ws_name, &ws_path).await
     }
 
     /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
@@ -2810,57 +2804,11 @@ mod tests {
 
     // ── Transition does not pause workspace ─────────────────────────
 
-    /// Shared helper: initialise test stores and workspace store, create a
-    /// workspace in DB, create a ticket, and return the ticket.
-    ///
-    /// The caller is responsible for any additional store initialisation
-    /// (e.g. manager queue) needed by the specific transition path.
-    async fn setup_workspace_and_ticket(name: &str, path: &str) -> crate::board::Ticket {
-        init_test_stores().await;
-        if crate::workspace::WORKSPACES.get().is_none() {
-            let _ = crate::workspace::init_global().await;
-        }
-
-        let now = crate::turso::now();
-        crate::workspace::store()
-            .conn
-            .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                turso::params![name, path, now.clone(), now, 0],
-            )
-            .await
-            .expect("insert test workspace");
-
-        // test_ws_named takes (path, name) — parameters are swapped
-        // relative to this helper's (name, path) signature.
-        let ws = test_ws_named(path, name);
-
-        let ticket_id = TicketBuilder::new(board(), ws)
-            .title("Test Ticket")
-            .create()
-            .await
-            .expect("create_ticket");
-
-        board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists")
-    }
-
     /// Verify that transitioning a ticket never pauses the workspace.
     /// The old auto-pause behavior was removed — workspace pausing is no
     /// longer part of any transition path.
     #[tokio::test]
     async fn transition_never_pauses_workspace() {
-        // Manager queue — needed by the Notify path inside notify_ticket.
-        // Race-safe: if another test already initialized it, init_global()
-        // returns an error which we ignore.
-        if crate::manager_queue::MANAGER_QUEUE.get().is_none() {
-            let _ = crate::manager_queue::init_global();
-        }
-
         struct Case {
             name: &'static str,
             ws_suffix: &'static str,
@@ -2889,8 +2837,19 @@ mod tests {
             },
         ];
 
+        init_management_test_stores().await;
         for case in &cases {
-            let ticket = setup_workspace_and_ticket(case.ws_suffix, case.ws_path).await;
+            let ws = create_test_workspace(case.ws_suffix, case.ws_path).await;
+            let ticket_id = TicketBuilder::new(board(), ws)
+                .title("Test Ticket")
+                .create()
+                .await
+                .expect("create_ticket");
+            let ticket = board()
+                .get_ticket(&ticket_id)
+                .await
+                .expect("get_ticket")
+                .expect("ticket exists");
 
             transition_ticket(&ticket, case.source, case.target, case.policy, None)
                 .await
@@ -3077,7 +3036,7 @@ D  deleted.rs
     /// Verify that the sanitation circuit breaker counting logic works correctly.
     #[tokio::test]
     async fn sanitation_breaker_counts_failures() {
-        init_test_stores().await;
+        init_management_test_stores().await;
         let ws = test_ws_named("/tmp/test", "san_breaker_test");
         let ticket_id = TicketBuilder::new(board(), ws)
             .title("Sanitation Breaker Test")
@@ -3159,22 +3118,6 @@ D  deleted.rs
 
     // ── Setup helpers ──────────────────────────────────────────────────────
 
-    /// Initialize all global stores needed by management decision functions
-    /// that call `transition_ticket` (workspace store for buffer/notify
-    /// resolution, manager queue for notification enqueue).
-    ///
-    /// Idempotent across concurrent tests (OnceCell guards).
-    async fn setup_test_state() {
-        init_test_stores().await;
-        ensure_ticket_buffer_initialized();
-        if crate::workspace::WORKSPACES.get().is_none() {
-            let _ = crate::workspace::init_global().await;
-        }
-        if crate::manager_queue::MANAGER_QUEUE.get().is_none() {
-            let _ = crate::manager_queue::init_global();
-        }
-    }
-
     /// Shared helper: create a passing verdict (score >= REVIEW_QA_THRESHOLD).
     fn pass_verdict() -> crate::Verdict {
         crate::Verdict {
@@ -3202,7 +3145,7 @@ D  deleted.rs
     /// - All passed (QA) → QaPassed
     #[tokio::test]
     async fn process_verdict_results_cases() {
-        setup_test_state().await;
+        init_management_test_stores().await;
 
         struct Case {
             name: &'static str,
@@ -3344,7 +3287,7 @@ D  deleted.rs
     /// - `= CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → does NOT trip
     #[tokio::test]
     async fn circuit_breaker_comment_boundary() {
-        setup_test_state().await;
+        init_management_test_stores().await;
 
         struct Case {
             name: &'static str,
@@ -3417,7 +3360,7 @@ D  deleted.rs
     /// phase mismatch before the breaker is called.
     #[tokio::test]
     async fn circuit_breaker_guard_prevents_retrip() {
-        setup_test_state().await;
+        init_management_test_stores().await;
 
         let ws = test_ws_named("/tmp/test", "cb_guard");
         let ticket_id = TicketBuilder::new(board(), ws)
@@ -3501,7 +3444,7 @@ D  deleted.rs
     /// - No verdicts → Planning with "no analysis" summary
     #[tokio::test]
     async fn handle_analyst_verdicts_cases() {
-        setup_test_state().await;
+        init_management_test_stores().await;
 
         struct Case {
             name: &'static str,
@@ -3661,7 +3604,7 @@ D  deleted.rs
     /// This test validates the graceful non-git fallback path.
     #[tokio::test]
     async fn handle_qa_passed_no_git_to_done() {
-        setup_test_state().await;
+        init_management_test_stores().await;
 
         // Use a path that cannot be a git repo regardless of the test
         // environment's current working directory.
