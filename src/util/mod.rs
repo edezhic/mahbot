@@ -88,6 +88,19 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
     }
 }
 
+/// Extract a human-readable message from a panic payload returned by
+/// [`catch_unwind`](futures_util::FutureExt::catch_unwind).
+#[must_use]
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        msg.to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 /// Parse a JSON value from text that may be markdown-fenced.
 ///
 /// Supports ` ```json ... ``` ` blocks, generic ` ``` ... ``` ` blocks,

@@ -128,13 +128,7 @@ async fn bootstrap_mahbot_safe() -> Result<(), String> {
 /// Extract a human-readable message from a panic payload (e.g. from
 /// [`catch_unwind`](futures_util::FutureExt::catch_unwind)).
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(msg) = payload.downcast_ref::<&str>() {
-        msg.to_string()
-    } else if let Some(msg) = payload.downcast_ref::<String>() {
-        msg.clone()
-    } else {
-        "unknown panic".to_string()
-    }
+    mahbot::util::panic_message(payload)
 }
 
 /// Format a startup panic payload into an error string for the boot log.

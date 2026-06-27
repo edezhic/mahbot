@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use futures_util::FutureExt;
 use futures_util::future::join_all;
 
 use crate::agent::run_agent;
@@ -33,6 +34,7 @@ use crate::prompt::{load_prompt, substitute};
 use crate::session::ticket_session_key;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
+use crate::util::panic_message;
 use crate::{Role, Tool, Workspace};
 
 /// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
@@ -399,9 +401,10 @@ pub async fn run_management() {
 ///
 /// # Panic safety
 ///
-/// The dispatch runs inside an inner [`tokio::spawn`] so panics are caught via
-/// the [`JoinHandle`](tokio::task::JoinHandle).  On panic the ticket transitions
-/// to [`TicketPhase::Failed`] with notification so the manager can investigate.
+/// The dispatch runs inside a single [`tokio::spawn`] and uses
+/// [`FutureExt::catch_unwind`](futures_util::FutureExt::catch_unwind) to catch
+/// panics.  On panic the ticket transitions to [`TicketPhase::Failed`] with
+/// notification so the manager can investigate.
 fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let phase_info = phase.info();
     let target_phase = phase_info.claim_target;
@@ -420,9 +423,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let ticket_for_failure = Arc::clone(&ticket);
 
     tokio::spawn(async move {
-        // Spawn an inner task so panics inside the dispatch are caught via
-        // the JoinHandle rather than silently swallowed by the outer spawn.
-        let handle = tokio::spawn(async move {
+        let result = std::panic::AssertUnwindSafe(async move {
             match phase {
                 PollPhase::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
                 PollPhase::EngineerDevelopment => dispatch_engineer(ticket, ws).await,
@@ -430,46 +431,40 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                 PollPhase::DiagnosticsCheck => dispatch_diagnostics(ticket, ws).await,
                 PollPhase::VerifierCheck(vi) => dispatch_verifiers(ticket, ws, vi).await,
             }
-        });
+        })
+        .catch_unwind()
+        .await;
 
-        match handle.await {
-            Ok(()) => {
-                // Happy path — dispatch completed successfully and handled
-                // its own transitions.
-            }
-            Err(join_error) => {
-                // Dispatch panicked — terminal failure.
-                // JoinError's Display impl includes the panic payload for
-                // panicked tasks, and "cancelled" for cancelled tasks.
-                error!(
-                    ticket = %ticket_for_failure.id,
-                    panic = %join_error,
-                    "Dispatch panicked — transitioning ticket to Failed",
-                );
-                // Best-effort transition: the ticket may have been moved
-                // externally while the dispatch was running.
-                let _ = board()
-                    .add_comment(
-                        &ticket_for_failure.id,
-                        "system",
-                        &format!("❌ Dispatch panicked: {join_error}"),
-                    )
-                    .await;
-                if let Err(e) = transition_ticket(
-                    &ticket_for_failure,
-                    target_phase,
-                    TicketPhase::Failed,
-                    NotifyPolicy::Notify,
-                    None,
+        if let Err(payload) = result {
+            let msg = panic_message(&*payload);
+            error!(
+                ticket = %ticket_for_failure.id,
+                panic = %msg,
+                "Dispatch panicked — transitioning ticket to Failed",
+            );
+            // Best-effort transition: the ticket may have been moved
+            // externally while the dispatch was running.
+            let _ = board()
+                .add_comment(
+                    &ticket_for_failure.id,
+                    "system",
+                    &format!("❌ Dispatch panicked: {msg}"),
                 )
-                .await
-                {
-                    warn!(
-                        ticket = %ticket_for_failure.id,
-                        error = %e,
-                        "Failed to transition ticket to Failed after dispatch panic",
-                    );
-                }
+                .await;
+            if let Err(e) = transition_ticket(
+                &ticket_for_failure,
+                target_phase,
+                TicketPhase::Failed,
+                NotifyPolicy::Notify,
+                None,
+            )
+            .await
+            {
+                warn!(
+                    ticket = %ticket_for_failure.id,
+                    error = %e,
+                    "Failed to transition ticket to Failed after dispatch panic",
+                );
             }
         }
     });
