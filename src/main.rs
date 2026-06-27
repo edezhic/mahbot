@@ -20,10 +20,11 @@ use mahbot::channels::{
 use mahbot::config::CONFIG;
 use mahbot::extraction::{decode_action, decode_callback, is_action, is_callback};
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
+use mahbot::is_start_command;
 use mahbot::manager_queue;
 use mahbot::session::{Session, direct_session_key, manager_session_key};
 use mahbot::util::UnwrapPoison;
-use mahbot::{Agent, Channel, ChannelMessage, Command, Role, Workspace};
+use mahbot::{Agent, Channel, ChannelMessage, Role, Workspace};
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
 const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regular.ttf");
 
@@ -511,10 +512,9 @@ async fn handle_messages(mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>) {
 /// Handle a dispatch-level command. Returns `true` if the message was handled
 /// (loop should `continue`), `false` if it should be processed by the agent.
 async fn handle_dispatch_command(msg: &mut ChannelMessage) -> bool {
-    let cmd = parse(&msg.content);
-    let Some(cmd) = cmd else {
+    if !parse(&msg.content) {
         return false;
-    };
+    }
 
     // Only Telegram gets the /start inline keyboard; GUI and other channels
     // route /start as a normal message (returns false to fall through to
@@ -523,9 +523,7 @@ async fn handle_dispatch_command(msg: &mut ChannelMessage) -> bool {
         return false;
     }
 
-    match cmd {
-        Command::Start => handle_start_command(msg).await,
-    }
+    handle_start_command(msg).await;
     true
 }
 
@@ -790,19 +788,11 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     stop_typing(typing_handle).await;
 }
 
-/// Parse a channel message's content and classify it.
+/// Parse a channel message's content and check whether it is a `/start` command.
 ///
 /// Command names are case-insensitive. `/start` is the only recognized command.
 /// All other `/`-prefixed text is treated as a normal message (routed to agent).
 #[must_use]
-pub fn parse(content: &str) -> Option<Command> {
-    let cmd_line = content.trim().strip_prefix('/')?;
-    let (cmd, _arg) = cmd_line
-        .split_once(' ')
-        .map_or((cmd_line, ""), |(c, a)| (c, a.trim()));
-
-    match cmd.to_ascii_lowercase().as_str() {
-        "start" => Some(Command::Start),
-        _ => None,
-    }
+pub fn parse(content: &str) -> bool {
+    is_start_command(content)
 }

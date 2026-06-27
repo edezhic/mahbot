@@ -211,21 +211,20 @@ pub fn generate_suffix() -> String {
     generate_nanoid(6)
 }
 
-// ── Command ──────────────────────────────────────────────
+// ── Command predicates ─────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Command {
-    /// `/start` — display inline keyboard with actions for Telegram,
-    /// or route as normal message for other channels.
-    Start,
-}
-
-impl Command {
-    /// Whether this command requires a full-permission user.
-    #[must_use]
-    pub const fn needs_full_user(&self) -> bool {
-        false
-    }
+/// Check whether `content` is a `/start` command.
+///
+/// Command names are case-insensitive. `/start` is the only recognized
+/// dispatch-level command. All other `/`-prefixed text is treated as a
+/// normal message (routed to the agent).
+#[must_use]
+pub fn is_start_command(content: &str) -> bool {
+    content
+        .trim()
+        .strip_prefix('/')
+        .map(|cmd| cmd.split_once(' ').map_or(cmd, |(c, _)| c))
+        .is_some_and(|cmd| cmd.eq_ignore_ascii_case("start"))
 }
 
 // ── Channel trait + types ───────────────────────────────────────
@@ -893,11 +892,5 @@ mod tests {
             unit_test: None,
         };
         assert!(!partial.is_empty());
-    }
-
-    #[test]
-    fn command_needs_full_user() {
-        // The only command is Start, which does not require full user
-        assert!(!Command::Start.needs_full_user());
     }
 }
