@@ -300,7 +300,6 @@ async fn reacquire_instance_lock() -> Result<()> {
 /// which is detected by the presence of `{CARGO_MANIFEST_DIR}/Cargo.toml`.
 /// `CARGO_MANIFEST_DIR` is a compile-time constant — if the binary was moved
 /// from its build directory, this returns `false`.
-#[inline]
 #[must_use]
 pub fn is_update_available() -> bool {
     Path::new(env!("CARGO_MANIFEST_DIR"))
