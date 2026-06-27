@@ -67,6 +67,16 @@ const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 /// — must stay in sync between `comment_text` and `count_fn`.
 const CIRCUIT_BREAKER_TRIP_MARKER: &str = "Circuit breaker";
 
+/// Role string for diagnostics comments — used both when posting diagnostics
+/// comments and in the circuit breaker filter. Must stay in sync between
+/// both sites to prevent silent miscounting on re-dispatch.
+const DIAGNOSTICS_ROLE: &str = "diagnostics";
+
+/// Prefix for sanitation failure system comments — the circuit breaker's
+/// `count_fn` depends on substring matching this value, so it must not drift
+/// from comment text.
+const SANITATION_FAILED_PREFIX: &str = "Sanitation failed";
+
 /// Minimum acceptable verification score (0-10) for analysis phase.
 const ANALYSIS_THRESHOLD: u8 = 7;
 
@@ -231,6 +241,34 @@ async fn resolve_ticket_workspace(
             );
             None
         }
+    }
+}
+
+/// Bounce a ticket back to ReadyForDevelopment with pipeline reservation,
+/// logging success/failure. Used when diagnostics, sanitation, or verifier
+/// review/QA fails and the ticket needs priority re-dispatch.
+async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_label: &str) {
+    if let Err(e) = transition_ticket(
+        ticket,
+        source,
+        TicketPhase::ReadyForDevelopment,
+        NotifyPolicy::Buffer,
+        Some(true),
+    )
+    .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "{log_label} failed but transition to ReadyForDevelopment also failed",
+            log_label = log_label,
+        );
+    } else {
+        info!(
+            ticket = %ticket.id,
+            "{log_label} failed — pipeline reservation set for rework priority",
+            log_label = log_label,
+        );
     }
 }
 
@@ -538,7 +576,7 @@ impl PollPhase {
                 source: TicketPhase::InDiagnostics,
                 claim_target: TicketPhase::InDiagnostics,
                 require_clear_pipeline: false,
-                role_label: "diagnostics",
+                role_label: DIAGNOSTICS_ROLE,
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
                 source: vi.source,
@@ -1222,7 +1260,7 @@ async fn trip_sanitation_circuit_breaker_if_exceeded(
                 .iter()
                 .filter(|c| {
                     c.role == "system"
-                        && c.content.contains("Sanitation failed")
+                        && c.content.contains(SANITATION_FAILED_PREFIX)
                         && !c.content.contains("Circuit breaker")
                 })
                 .count()
@@ -1327,7 +1365,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             .add_comment(
                 &ticket.id,
                 "system",
-                "Sanitation failed — agent returned no output",
+                &format!("{SANITATION_FAILED_PREFIX} — agent returned no output"),
             )
             .await;
         let _ = board().set_assigned_to(&ticket.id, None).await;
@@ -1354,7 +1392,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
                 .add_comment(
                     &ticket.id,
                     "system",
-                    &format!("Sanitation failed — verdict extraction error: {e}"),
+                    &format!("{SANITATION_FAILED_PREFIX} — verdict extraction error: {e}"),
                 )
                 .await;
             let _ = board().set_assigned_to(&ticket.id, None).await;
@@ -1418,32 +1456,13 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
                 &ticket.id,
                 "system",
                 &format!(
-                    "Sanitation failed — garbage files: {count}",
+                    "{SANITATION_FAILED_PREFIX} — garbage files: {count}",
                     count = verdict.garbage_files.len(),
                 ),
             )
             .await;
 
-        if let Err(e) = transition_ticket(
-            &ticket,
-            TicketPhase::InSanitation,
-            TicketPhase::ReadyForDevelopment,
-            NotifyPolicy::Buffer,
-            Some(true),
-        )
-        .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Sanitation failed but transition to ReadyForDevelopment also failed",
-            );
-        } else {
-            info!(
-                ticket = %ticket.id,
-                "Sanitation failed — pipeline reservation set for rework priority",
-            );
-        }
+        bounce_back_to_development(&ticket, TicketPhase::InSanitation, "Sanitation").await;
     }
 }
 
@@ -1628,54 +1647,35 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     // 3. Final outcome.
-    let target = if all_passed {
+    if all_passed {
         comment.push_str("\n\n---\n");
         comment.push_str(DIAGNOSTICS_PASSED_MARKER);
-        TicketPhase::DiagnosticsDone
     } else {
         let _ = write!(comment, "\n\n---\n{DIAGNOSTICS_FAILED_MARKER} {failed_at}");
-        TicketPhase::ReadyForDevelopment
-    };
+    }
     let _ = board()
-        .add_comment(&ticket.id, "diagnostics", &comment)
+        .add_comment(&ticket.id, DIAGNOSTICS_ROLE, &comment)
         .await;
 
-    if target == TicketPhase::ReadyForDevelopment {
+    if all_passed {
         if let Err(e) = transition_ticket(
             &ticket,
             TicketPhase::InDiagnostics,
-            TicketPhase::ReadyForDevelopment,
+            TicketPhase::DiagnosticsDone,
             NotifyPolicy::Buffer,
-            Some(true),
+            None,
         )
         .await
         {
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Diagnostics failed but transition to ReadyForDevelopment also failed",
-            );
-        } else {
-            info!(
-                ticket = %ticket.id,
-                "Diagnostics failed — pipeline reservation set for rework priority",
+                "Diagnostics completed but transition to DiagnosticsDone \
+                 failed — ticket stuck in DiagnosticsDone",
             );
         }
-    } else if let Err(e) = transition_ticket(
-        &ticket,
-        TicketPhase::InDiagnostics,
-        target,
-        NotifyPolicy::Buffer,
-        None,
-    )
-    .await
-    {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Diagnostics completed but transition to DiagnosticsDone \
-             failed — ticket stuck in DiagnosticsDone",
-        );
+    } else {
+        bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
     }
 }
 
@@ -1700,7 +1700,7 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(ticket: &Ticket) -> bool {
             comments
                 .iter()
                 .filter(|c| {
-                    c.role == "diagnostics"
+                    c.role == DIAGNOSTICS_ROLE
                         && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
                         && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
                         && !c.content.contains(CIRCUIT_BREAKER_TRIP_MARKER)
@@ -2305,30 +2305,8 @@ async fn process_verdict_results(
     }
 
     // Priority 2: any verifier failed — bounce back to development.
-    let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
-    if any_failed {
-        if let Err(e) = transition_ticket(
-            ticket,
-            verifier.active_phase,
-            TicketPhase::ReadyForDevelopment,
-            NotifyPolicy::Buffer,
-            Some(true),
-        )
-        .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "{log_label} failed but transition to ReadyForDevelopment also failed",
-                log_label = verifier.log_label,
-            );
-        } else {
-            info!(
-                ticket = %ticket.id,
-                "{log_label} failed — pipeline reservation set for rework priority",
-                log_label = verifier.log_label,
-            );
-        }
+    if results.iter().any(|r| !verdict_passes(r.verdict.as_ref())) {
+        bounce_back_to_development(ticket, verifier.active_phase, verifier.log_label).await;
         return;
     }
 
@@ -3123,7 +3101,11 @@ D  deleted.rs
         // Add 2 sanitation failure comments (below threshold of 3).
         for _ in 0..2 {
             let _ = board()
-                .add_comment(&ticket_id, "system", "Sanitation failed — garbage files: 1")
+                .add_comment(
+                    &ticket_id,
+                    "system",
+                    &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
+                )
                 .await;
         }
 
@@ -3143,14 +3125,22 @@ D  deleted.rs
         // which counts by the "Sanitation failed" substring, using fresh comments
         // from DB, not the stale in-memory ticket.comments).
         let _ = board()
-            .add_comment(&ticket_id, "system", "Sanitation failed — garbage files: 1")
+            .add_comment(
+                &ticket_id,
+                "system",
+                &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
+            )
             .await;
 
         // ... actually 3 <= 3 means the breaker does NOT trip yet.
         // The breaker trips when count > threshold, i.e., at 4 failures.
         // Add a 4th failure.
         let _ = board()
-            .add_comment(&ticket_id, "system", "Sanitation failed — garbage files: 1")
+            .add_comment(
+                &ticket_id,
+                "system",
+                &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
+            )
             .await;
 
         // Now with 4 failures, should trip (4 > 3).
