@@ -1066,6 +1066,22 @@ fn build_save_task(
     )
 }
 
+/// Update the dirty flag for a tab by comparing current text hash against
+/// the saved hash.  A free function (not a `&mut self` method) so callers
+/// can avoid borrow-checker conflicts from simultaneous mutable borrows
+/// of `self.tabs` and immutable borrows of `self.tab_contents`.
+fn update_dirty_flag(
+    tabs: &mut [Tab],
+    tab_contents: &HashMap<String, TabData>,
+    idx: usize,
+    path: &str,
+) {
+    if let (Some(tab), Some(tab_data)) = (tabs.get_mut(idx), tab_contents.get(path)) {
+        let current_hash = hash_text(&tab_data.content.text());
+        tab.is_dirty = current_hash != tab_data.saved_text_hash;
+    }
+}
+
 // ── Helpers — tree building ──────────────────────────────────────
 
 /// Recursively build a hierarchical tree from flat directory entries.
@@ -2196,11 +2212,8 @@ impl EditorState {
             tab_data
                 .content
                 .move_to(snapshot.cursor_line, snapshot.cursor_col);
-            if let Some(tab) = self.tabs.get_mut(idx) {
-                let current_hash = hash_text(&tab_data.content.text());
-                tab.is_dirty = current_hash != tab_data.saved_text_hash;
-            }
         }
+        update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
     }
 
     /// Apply an undo or redo operation to the active tab.
@@ -2455,12 +2468,9 @@ impl EditorState {
                             .snap_before_edit(&tab_data.content);
                     }
                     tab_data.content.perform_action(action);
-                    if is_edit {
-                        if let Some(tab) = self.tabs.get_mut(idx) {
-                            let current_hash = hash_text(&tab_data.content.text());
-                            tab.is_dirty = current_hash != tab_data.saved_text_hash;
-                        }
-                    }
+                }
+                if is_edit {
+                    update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
                 }
                 Task::none()
             }
@@ -3486,10 +3496,6 @@ impl EditorState {
                                     &text[range.end..]
                                 );
                                 tab_data.content = EditorBuffer::from_file(&new_text, &path);
-                                if let Some(tab) = self.tabs.get_mut(idx) {
-                                    let current_hash = hash_text(&new_text);
-                                    tab.is_dirty = current_hash != tab_data.saved_text_hash;
-                                }
                                 // Recompute matches and auto-advance to next match.
                                 if let Some(ref mut state) = tab_data.find_replace_state {
                                     state.matches = compute_text_matches(
@@ -3536,6 +3542,7 @@ impl EditorState {
                         }
                     }
                 }
+                update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
                 Task::none()
             }
 
@@ -4461,10 +4468,6 @@ impl EditorState {
                     let max_line = tab_data.content.line_count().saturating_sub(1);
                     let line = cursor_before.line.min(max_line);
                     tab_data.content.move_to(line, cursor_before.column);
-                    if let Some(tab) = self.tabs.get_mut(idx) {
-                        let current_hash = hash_text(&new_text);
-                        tab.is_dirty = current_hash != tab_data.saved_text_hash;
-                    }
                     // Clear matches since they're all replaced.
                     if let Some(ref mut state) = tab_data.find_replace_state {
                         state.matches.clear();
@@ -4476,6 +4479,7 @@ impl EditorState {
                 }
             }
         }
+        update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
         if let Some(t) = toast {
             Task::done(t)
         } else {
