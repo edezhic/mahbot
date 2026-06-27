@@ -754,6 +754,24 @@ fn rekey_compute_new_key(key: &str, old_prefix: &str, new_prefix: &str) -> Strin
     }
 }
 
+/// Collect all keys matching `old_prefix` and compute their new key with
+/// `new_prefix` substituted.  Returns a vec of `(old_key, new_key)` pairs.
+/// Used by [`rekey_map_prefix`] and [`rekey_set_prefix`] to avoid
+/// duplicating the filter-and-collect logic.
+fn rekey_keys(
+    old_prefix: &str,
+    new_prefix: &str,
+    keys: impl IntoIterator<Item = String>,
+) -> Vec<(String, String)> {
+    keys.into_iter()
+        .filter(|k| k.starts_with(old_prefix))
+        .map(|k| {
+            let new_key = rekey_compute_new_key(&k, old_prefix, new_prefix);
+            (k, new_key)
+        })
+        .collect()
+}
+
 /// Re-key entries in a `HashMap<String, V>` whose keys start with
 /// `old_prefix` to use `new_prefix` instead.  Each value passes through
 /// `modify` before re-insertion (use `|_| {}` when no modification is
@@ -767,15 +785,10 @@ fn rekey_map_prefix<V>(
     new_prefix: &str,
     modify: impl Fn(&mut V),
 ) {
-    let keys: Vec<String> = map
-        .keys()
-        .filter(|k| k.starts_with(old_prefix))
-        .cloned()
-        .collect();
-    for k in keys {
-        if let Some(mut v) = map.remove(&k) {
+    let key_pairs = rekey_keys(old_prefix, new_prefix, map.keys().cloned());
+    for (old_key, new_key) in key_pairs {
+        if let Some(mut v) = map.remove(&old_key) {
             modify(&mut v);
-            let new_key = rekey_compute_new_key(&k, old_prefix, new_prefix);
             map.insert(new_key, v);
         }
     }
@@ -785,14 +798,9 @@ fn rekey_map_prefix<V>(
 /// `old_prefix` to use `new_prefix` instead.  Same prefix conventions
 /// as [`rekey_map_prefix`].
 fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &str) {
-    let keys: Vec<String> = set
-        .iter()
-        .filter(|k| k.starts_with(old_prefix))
-        .cloned()
-        .collect();
-    for k in keys {
-        set.remove(&k);
-        let new_key = rekey_compute_new_key(&k, old_prefix, new_prefix);
+    let key_pairs = rekey_keys(old_prefix, new_prefix, set.iter().cloned());
+    for (old_key, new_key) in key_pairs {
+        set.remove(&old_key);
         set.insert(new_key);
     }
 }
@@ -8374,6 +8382,97 @@ mod tests {
             );
             (case.check)(&state);
         }
+    }
+
+    // ── rekey helpers ──────────────────────────────────────────
+
+    #[test]
+    fn test_rekey_keys_empty() {
+        let pairs = rekey_keys("old/", "new/", Vec::<String>::new());
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_rekey_keys_no_match() {
+        let keys = vec!["a".to_string(), "b".to_string()];
+        let pairs = rekey_keys("old/", "new/", keys);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_rekey_keys_some_match() {
+        let keys = vec![
+            "old/foo".to_string(),
+            "other".to_string(),
+            "old/bar/baz".to_string(),
+        ];
+        let mut pairs = rekey_keys("old/", "new", keys);
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs[0],
+            ("old/bar/baz".to_string(), "new/bar/baz".to_string())
+        );
+        assert_eq!(pairs[1], ("old/foo".to_string(), "new/foo".to_string()));
+    }
+
+    #[test]
+    fn test_rekey_keys_exact_prefix() {
+        let keys = vec!["dir".to_string()];
+        let pairs = rekey_keys("dir", "newdir", keys);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("dir".to_string(), "newdir".to_string()));
+    }
+
+    #[test]
+    fn test_rekey_map_prefix_no_modify() {
+        let mut map = HashMap::from([
+            ("dir/file.rs".to_string(), "content_a".to_string()),
+            ("dir/sub/file.rs".to_string(), "content_b".to_string()),
+            ("other".to_string(), "content_c".to_string()),
+        ]);
+        rekey_map_prefix(&mut map, "dir/", "newdir", |_| {});
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("newdir/file.rs"), Some(&"content_a".to_string()));
+        assert_eq!(
+            map.get("newdir/sub/file.rs"),
+            Some(&"content_b".to_string())
+        );
+        assert_eq!(map.get("other"), Some(&"content_c".to_string()));
+        assert!(map.get("dir/file.rs").is_none());
+    }
+
+    #[test]
+    fn test_rekey_map_prefix_with_modify() {
+        let mut map = HashMap::from([
+            ("old/key".to_string(), vec![1, 2]),
+            ("old/other".to_string(), vec![3]),
+            ("keep".to_string(), vec![4]),
+        ]);
+        rekey_map_prefix(&mut map, "old/", "new", |v: &mut Vec<i32>| v.push(99));
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("new/key"), Some(&vec![1, 2, 99]));
+        assert_eq!(map.get("new/other"), Some(&vec![3, 99]));
+        assert_eq!(map.get("keep"), Some(&vec![4]));
+    }
+
+    #[test]
+    fn test_rekey_set_prefix_basic() {
+        let mut set = HashSet::from(["a/x".to_string(), "a/y".to_string(), "b/z".to_string()]);
+        rekey_set_prefix(&mut set, "a/", "b");
+        assert_eq!(set.len(), 3);
+        assert!(set.contains("b/x"));
+        assert!(set.contains("b/y"));
+        assert!(set.contains("b/z"));
+    }
+
+    #[test]
+    fn test_rekey_set_prefix_exact() {
+        let mut set = HashSet::from(["dir".to_string()]);
+        rekey_set_prefix(&mut set, "dir", "newdir");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("newdir"));
+        assert!(!set.contains("dir"));
     }
 
     #[test]
