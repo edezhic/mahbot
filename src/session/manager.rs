@@ -156,7 +156,7 @@ impl Session {
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::board::Ticket>,
-    ) -> Result<()> {
+    ) {
         // Build fresh system prompt (may have changed since session start).
         let mut compacted = Self::build_context_messages(ws, role, ticket).await;
 
@@ -181,8 +181,6 @@ impl Session {
         } else {
             self.history = compacted;
         }
-
-        Ok(())
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────

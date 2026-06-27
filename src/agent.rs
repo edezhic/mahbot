@@ -202,7 +202,7 @@ impl Agent {
                             &self.role,
                             self.ticket.as_ref(),
                         )
-                        .await?;
+                        .await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Summarization failed — continuing with full history");
