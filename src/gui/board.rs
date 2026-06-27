@@ -1068,17 +1068,11 @@ impl BoardState {
                     file_col = file_col.push(row);
                 }
 
-                detail = detail.push(container(file_col).padding([4, 8]).style(
-                    |_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            width: 1.0,
-                            color: theme::BORDER,
-                        },
-                        ..container::Style::default()
-                    },
-                ));
+                detail = detail.push(
+                    container(file_col)
+                        .padding([4, 8])
+                        .style(theme::surface_card_style),
+                );
             }
             // If loading is done but stats is None (error) → render nothing
         }
@@ -1096,28 +1090,12 @@ impl BoardState {
                     .style(theme::scrollbar_style),
                 )
                 .padding(8)
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        width: 1.0,
-                        color: theme::BORDER,
-                    },
-                    ..container::Style::default()
-                })
+                .style(theme::surface_card_style)
                 .into()
             } else {
                 container(selectable_text(&ticket.description, theme::TEXT_PRIMARY).size(13))
                     .padding(8)
-                    .style(|_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            width: 1.0,
-                            color: theme::BORDER,
-                        },
-                        ..container::Style::default()
-                    })
+                    .style(theme::surface_card_style)
                     .into()
             };
             detail = detail.push(desc_md);
@@ -1196,19 +1174,7 @@ impl BoardState {
                     row![
                         container(text(&comment.role).size(11).color(role_color))
                             .padding([1, 6])
-                            .style(move |_theme: &iced::Theme| container::Style {
-                                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                                    role_color.r,
-                                    role_color.g,
-                                    role_color.b,
-                                    0.1,
-                                ),)),
-                                border: iced::Border {
-                                    radius: 4.0.into(),
-                                    ..iced::Border::default()
-                                },
-                                ..container::Style::default()
-                            }),
+                            .style(move |t| theme::role_badge_pill_style(t, role_color)),
                         Space::new().width(8),
                         text(theme::format_timestamp(&comment.created_at))
                             .size(10)
@@ -1221,17 +1187,11 @@ impl BoardState {
                     comment_col = comment_col.push(btn);
                 }
 
-                cmt_col = cmt_col.push(container(comment_col).padding(8).style(
-                    |_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            width: 1.0,
-                            color: theme::BORDER,
-                        },
-                        ..container::Style::default()
-                    },
-                ));
+                cmt_col = cmt_col.push(
+                    container(comment_col)
+                        .padding(8)
+                        .style(theme::surface_card_style),
+                );
             }
             detail = detail.push(cmt_col);
         }

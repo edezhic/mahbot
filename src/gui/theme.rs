@@ -587,6 +587,58 @@ pub fn container_bar(_theme: &iced::Theme) -> container::Style {
     }
 }
 
+/// Style for surface cards: surface background with a 1px border and
+/// 4px rounded corners. Used for ticket detail sections, comment cards,
+/// log entries, and session transcript messages.
+#[must_use]
+pub fn surface_card_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_SURFACE)),
+        border: iced::Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: BORDER,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Style for the base page background: just the BG_BASE fill with no border.
+/// Used as the outermost container on most pages (home, sessions, logs).
+#[must_use]
+pub fn base_container_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_BASE)),
+        ..container::Style::default()
+    }
+}
+
+/// Style for surface-only containers: surface background with no border.
+/// Used for sidebar panels, tab bars, and filter bars.
+#[must_use]
+pub fn surface_container_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_SURFACE)),
+        ..container::Style::default()
+    }
+}
+
+/// Style for role badge pills: a pill-shaped container with a translucent
+/// version of the role's color and 4px rounded corners.
+#[must_use]
+pub fn role_badge_pill_style(_theme: &iced::Theme, color: Color) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(
+            color.r, color.g, color.b, 0.1,
+        ))),
+        border: iced::Border {
+            radius: 4.0.into(),
+            ..iced::Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

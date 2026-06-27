@@ -515,10 +515,7 @@ impl LogsState {
                 .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_SURFACE)),
-            ..container::Style::default()
-        });
+        .style(theme::surface_container_style);
 
         // ── Shared filter bar ─────────────────────────────────────
         let filter_bar = self.shared_filter_bar();
@@ -539,10 +536,7 @@ impl LogsState {
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..container::Style::default()
-            })
+            .style(theme::base_container_style)
             .into()
     }
 
@@ -660,10 +654,7 @@ impl LogsState {
         container(filter_row)
             .width(Length::Fill)
             .padding([8, 24])
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                ..container::Style::default()
-            })
+            .style(theme::surface_container_style)
             .into()
     }
 
@@ -754,10 +745,7 @@ impl LogsState {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(24)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..container::Style::default()
-            });
+            .style(theme::base_container_style);
 
         base.into()
     }
@@ -895,15 +883,7 @@ impl LogsState {
         } else {
             container(entry_view)
                 .padding(6)
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        width: 1.0,
-                        color: theme::BORDER,
-                    },
-                    ..container::Style::default()
-                })
+                .style(theme::surface_card_style)
                 .into()
         }
     }

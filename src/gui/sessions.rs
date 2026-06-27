@@ -762,19 +762,7 @@ impl SessionsState {
                     msg_col = msg_col.push(
                         container(text(dm_role.clone()).size(11).color(dm_role_color))
                             .padding([1, 6])
-                            .style(move |_theme: &iced::Theme| container::Style {
-                                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                                    dm_role_color.r,
-                                    dm_role_color.g,
-                                    dm_role_color.b,
-                                    0.1,
-                                ))),
-                                border: iced::Border {
-                                    radius: 4.0.into(),
-                                    ..iced::Border::default()
-                                },
-                                ..container::Style::default()
-                            }),
+                            .style(move |t| theme::role_badge_pill_style(t, dm_role_color)),
                     );
                     if !content.is_empty() {
                         msg_col = msg_col.push({
@@ -788,18 +776,11 @@ impl SessionsState {
                             md
                         });
                     }
-                    items =
-                        items.push(container(msg_col).padding(8).style(|_theme: &iced::Theme| {
-                            container::Style {
-                                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                                border: iced::Border {
-                                    radius: 4.0.into(),
-                                    width: 1.0,
-                                    color: theme::BORDER,
-                                },
-                                ..container::Style::default()
-                            }
-                        }));
+                    items = items.push(
+                        container(msg_col)
+                            .padding(8)
+                            .style(theme::surface_card_style),
+                    );
                     i += 1;
                 }
                 DecodedMsgKind::Regular { content_parts: cp } => {
@@ -824,19 +805,7 @@ impl SessionsState {
                     msg_col = msg_col.push(
                         container(text(dm_role).size(11).color(dm_role_color))
                             .padding([1, 6])
-                            .style(move |_theme: &iced::Theme| container::Style {
-                                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                                    dm_role_color.r,
-                                    dm_role_color.g,
-                                    dm_role_color.b,
-                                    0.1,
-                                ))),
-                                border: iced::Border {
-                                    radius: 4.0.into(),
-                                    ..iced::Border::default()
-                                },
-                                ..container::Style::default()
-                            }),
+                            .style(move |t| theme::role_badge_pill_style(t, dm_role_color)),
                     );
 
                     if let Some(ref t) = thinking {
@@ -902,18 +871,11 @@ impl SessionsState {
                         });
                     }
 
-                    items =
-                        items.push(container(msg_col).padding(8).style(|_theme: &iced::Theme| {
-                            container::Style {
-                                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                                border: iced::Border {
-                                    radius: 4.0.into(),
-                                    width: 1.0,
-                                    color: theme::BORDER,
-                                },
-                                ..container::Style::default()
-                            }
-                        }));
+                    items = items.push(
+                        container(msg_col)
+                            .padding(8)
+                            .style(theme::surface_card_style),
+                    );
 
                     i += 1;
                 }
@@ -1009,15 +971,7 @@ impl SessionsState {
                         ]
                         .spacing(2),
                     )
-                    .style(|_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            width: 1.0,
-                            color: theme::BORDER,
-                        },
-                        ..container::Style::default()
-                    });
+                    .style(theme::surface_card_style);
 
                     session_list = session_list.push(sess_row);
                 }
@@ -1074,10 +1028,7 @@ impl SessionsState {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(24)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..container::Style::default()
-            })
+            .style(theme::base_container_style)
             .into()
     }
 }

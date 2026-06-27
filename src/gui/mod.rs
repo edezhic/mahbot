@@ -1961,10 +1961,7 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
         .padding([8, 12])
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_SURFACE)),
-            ..container::Style::default()
-        })
+        .style(theme::surface_container_style)
         .into()
 }
 
@@ -2314,10 +2311,7 @@ impl Dashboard {
         container(inner)
             .width(Length::Fixed(130.0))
             .height(Length::Fill)
-            .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                ..container::Style::default()
-            })
+            .style(theme::surface_container_style)
             .padding(12)
             .into()
     }
@@ -2440,10 +2434,7 @@ impl Dashboard {
         container(footer_row)
             .height(Length::Fixed(24.0))
             .width(Length::Fill)
-            .style(move |_theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                ..container::Style::default()
-            })
+            .style(theme::surface_container_style)
             .into()
     }
 }

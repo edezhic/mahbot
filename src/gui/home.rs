@@ -475,15 +475,7 @@ impl HomeState {
                 .height(Length::Fill)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
-                .style(|_theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_BASE)),
-                    border: iced::Border {
-                        radius: 0.0.into(),
-                        width: 0.0,
-                        color: iced::Color::TRANSPARENT,
-                    },
-                    ..Default::default()
-                })
+                .style(theme::base_container_style)
         } else {
             // Build message bubbles with typing indicator.
             let mut children: Vec<Element<'_, HomeMessage>> = self
@@ -626,15 +618,7 @@ impl HomeState {
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                border: iced::Border {
-                    radius: 0.0.into(),
-                    width: 0.0,
-                    color: iced::Color::TRANSPARENT,
-                },
-                ..Default::default()
-            })
+            .style(theme::base_container_style)
         };
 
         // ── Input area ───────────────────────────────────────────
@@ -734,18 +718,7 @@ impl HomeState {
                 .into(),
         ]))
         .padding(8)
-        .style(|_theme: &iced::Theme| {
-            use iced::widget::container;
-            container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                border: iced::Border {
-                    radius: 0.0.into(),
-                    width: 0.0,
-                    color: theme::BORDER,
-                },
-                ..container::Style::default()
-            }
-        });
+        .style(theme::base_container_style);
 
         // ── Full layout ──────────────────────────────────────────
         column![chat_area, input_area,]
