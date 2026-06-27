@@ -67,8 +67,8 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
 
     let mut last_raw = String::new();
 
+    let routing = CONFIG.model_routing(config.model);
     for _attempt in 1..=config.max_attempts {
-        let routing = CONFIG.model_routing(config.model);
         let response = chat(ChatRequest {
             messages: extraction_history.clone(),
             tools: config.tool_specs.map(<[ToolSpec]>::to_vec),
@@ -76,7 +76,7 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
             allow_image_parts: false, // extractions never need image parts
             temperature: config.temperature,
             reasoning_effort: config.reasoning_effort.clone(),
-            provider_order: routing.provider_order,
+            provider_order: routing.provider_order.clone(),
             provider_allow_fallbacks: routing.allow_fallbacks,
         })
         .await?;
