@@ -231,7 +231,7 @@ pub enum Message {
     /// Close the diff modal.
     CloseDiffModal,
 
-    // ── Git sidebar ────────────────────────────────────────────
+    // ── Git state ────────────────────────────────────────────────
     /// Result of `run_git_diff_stats`. `None` when not a git repo.
     GitDiffStats(Option<(i64, i64)>),
     /// Result of `run_git_current_branch`. `None` when not a git repo.
@@ -404,7 +404,7 @@ pub struct Dashboard {
     // ── Diff modal ──────────────────────────────────────────────
     show_diff_modal: bool,
 
-    // ── Git sidebar ─────────────────────────────────────────────
+    // ── Git state ───────────────────────────────────────────────
     /// Cached filesystem path for the currently selected workspace.
     workspace_filesystem_path: Option<String>,
     /// Cached diff stats (+N / -M) from periodic refresh.
@@ -425,7 +425,7 @@ pub struct Dashboard {
     git_branch_error: Option<String>,
     /// Current value of the "new branch name" text input.
     new_branch_name: String,
-    /// Whether a git sidebar eagerly refreshed recently — skip the next
+    /// Whether git state was eagerly refreshed recently — skip the next
     /// Tick-based refresh to avoid double-firing after workspace switch.
     git_refresh_eagerly: bool,
 }
@@ -676,14 +676,14 @@ impl Dashboard {
                     _ => Task::none(),
                 };
 
-                // ── Git sidebar refresh (every second) ─────────────
+                // ── Git state refresh (every second) ────────────────
                 // Skip if an eager refresh was just triggered (e.g. after
                 // workspace switch) to avoid 6 subprocess calls in <1 second.
                 let git_tasks = if self.git_refresh_eagerly {
                     self.git_refresh_eagerly = false;
                     Task::none()
                 } else {
-                    self.refresh_git_sidebar()
+                    self.refresh_git_state()
                 };
 
                 Task::batch([ws_refresh, page_task, git_tasks])
@@ -928,7 +928,7 @@ impl Dashboard {
                 self.show_diff_modal = false;
                 Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
             }
-            // ── Git sidebar ───────────────────────────────────────
+            // ── Git state ─────────────────────────────────────────
             Message::GitDiffStats(stats) => {
                 self.git_diff_stats = stats;
                 Task::none()
@@ -1313,7 +1313,7 @@ impl Dashboard {
     ///
     /// An empty name selects the "Personal" workspace (no shared workspace).
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
-        // Clear git sidebar state — eagerly refreshed below; Tick skips once.
+        // Clear git state — eagerly refreshed below; Tick skips once.
         self.git_diff_stats = None;
         self.git_current_branch = None;
         self.git_behind_ahead = None;
@@ -1389,7 +1389,7 @@ impl Dashboard {
         let diff_name = name.to_string();
         let diff_path = personal_path.clone();
 
-        // Cache workspace filesystem path on Dashboard for git sidebar + modal use.
+        // Cache workspace filesystem path on Dashboard for git state + modal use.
         let resolved_path = ws_path.clone().or_else(|| personal_path.clone());
         self.workspace_filesystem_path = resolved_path;
 
@@ -1415,7 +1415,7 @@ impl Dashboard {
             diff_task,
             shell_task,
             home_task,
-            self.refresh_git_sidebar(),
+            self.refresh_git_state(),
         ])
     }
 
@@ -1430,9 +1430,9 @@ impl Dashboard {
         )
     }
 
-    /// Refresh git sidebar information (diff stats, current branch, behind/ahead).
+    /// Refresh git state information (diff stats, current branch, behind/ahead).
     /// Called every tick when a workspace with a git repo is selected.
-    fn refresh_git_sidebar(&self) -> Task<Message> {
+    fn refresh_git_state(&self) -> Task<Message> {
         let ws_path = match &self.workspace_filesystem_path {
             Some(p) => p.clone(),
             None => return Task::none(),
@@ -2121,98 +2121,6 @@ impl Dashboard {
             nav_col = nav_col.push(btn);
         }
 
-        // ── Git section (diff stats, branch, behind/ahead) ────────
-        let has_git = self.workspace_filesystem_path.is_some() && self.git_current_branch.is_some();
-
-        if has_git {
-            nav_col = nav_col.push(Space::new().height(8));
-
-            // a) Uncommitted diff stats — clickable -> open diff modal (working tree)
-            let stats_text: Element<'_, Message> = match self.git_diff_stats {
-                Some((added, removed)) if added > 0 || removed > 0 => row![
-                    text::<iced::Theme, iced::Renderer>(format!("+{added}"))
-                        .size(11)
-                        .color(theme::STATUS_SUCCESS),
-                    text::<iced::Theme, iced::Renderer>(format!(" \u{2212}{removed}"))
-                        .size(11)
-                        .color(theme::STATUS_ERROR),
-                ]
-                .spacing(2)
-                .align_y(Alignment::Center)
-                .into(),
-                _ => text("clean").size(10).color(theme::TEXT_MUTED).into(),
-            };
-            let stats_btn = button(
-                container(stats_text)
-                    .width(Length::Fill)
-                    .center_x(Length::Fill)
-                    .padding([2, 0]),
-            )
-            .width(Length::Fill)
-            .padding(0)
-            .style(theme::button_text)
-            .on_press(Message::OpenDiffModal(None));
-            nav_col = nav_col.push(stats_btn);
-
-            // b) Current branch name — clickable -> branch modal
-            let branch_text: Element<'_, Message> = match &self.git_current_branch {
-                Some(b) => {
-                    let truncated = if b.len() > 20 {
-                        format!("{}…", &b[..19])
-                    } else {
-                        b.clone()
-                    };
-                    text(truncated).size(11).color(theme::ACCENT).into()
-                }
-                None => text("").into(),
-            };
-            let branch_btn = button(
-                container(branch_text)
-                    .width(Length::Fill)
-                    .center_x(Length::Fill)
-                    .padding([2, 0]),
-            )
-            .width(Length::Fill)
-            .padding(0)
-            .style(theme::button_text)
-            .on_press(Message::OpenBranchModal);
-            nav_col = nav_col.push(branch_btn);
-
-            // c) Behind/ahead counts — clickable -> sync
-            if let Some((behind, ahead)) = self.git_behind_ahead {
-                if behind > 0 || ahead > 0 {
-                    let sync_text = if behind > 0 && ahead > 0 {
-                        format!("\u{2193}{behind} \u{2191}{ahead}")
-                    } else if behind > 0 {
-                        format!("\u{2193}{behind}")
-                    } else {
-                        format!("\u{2191}{ahead}")
-                    };
-                    let sync_btn = button(
-                        row![
-                            text("\u{21bb}").size(14).color(if self.git_syncing {
-                                theme::TEXT_MUTED
-                            } else {
-                                theme::ACCENT
-                            }),
-                            text(sync_text.clone()).size(11).color(theme::TEXT_MUTED),
-                        ]
-                        .spacing(4)
-                        .align_y(Alignment::Center),
-                    )
-                    .padding([2, 0])
-                    .width(Length::Fill)
-                    .style(theme::button_text)
-                    .on_press_maybe(if self.git_syncing {
-                        None
-                    } else {
-                        Some(Message::GitSync)
-                    });
-                    nav_col = nav_col.push(sync_btn);
-                }
-            }
-        }
-
         // Spacer to push buttons to the bottom of the sidebar
         nav_col = nav_col.push(Space::new().height(Length::Fill));
 
@@ -2317,9 +2225,32 @@ impl Dashboard {
 
     /// 24px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
-        // Left: footer navigation (Sessions, Logs, Settings)
+        // Left: footer navigation (Sessions, Logs, Settings) + git blocks
         // Icon-only, 16px. Active page in ACCENT, inactive in TEXT_MUTED.
-        let mut left_icons = Vec::with_capacity(6);
+        let mut left_icons = Vec::with_capacity(10);
+
+        // Update button — leftmost, disabled while updating.
+        // Only shown when self-update is available on this installation.
+        if self.update_available {
+            let update_color = if self.updating {
+                theme::TEXT_FAINT
+            } else {
+                theme::ACCENT
+            };
+            let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+                .size(16)
+                .color(update_color);
+            let update_btn = button(update_icon)
+                .style(theme::button_text)
+                .padding(2)
+                .on_press_maybe(if self.updating {
+                    None
+                } else {
+                    Some(Message::UpdateBot)
+                });
+            left_icons.push(update_btn.into());
+        }
+
         for page in Page::footer_pages() {
             let is_active = self.page == *page;
             let color = if is_active {
@@ -2348,27 +2279,82 @@ impl Dashboard {
                 .on_press(Message::Navigation(*page));
             left_icons.push(btn.into());
         }
-        // Update button — inline with navigation, disabled while updating.
-        // Only shown when self-update is available on this installation.
-        if self.update_available {
-            let update_color = if self.updating {
-                theme::TEXT_FAINT
-            } else {
-                theme::ACCENT
-            };
-            let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                .size(16)
-                .color(update_color);
-            let update_btn = button(update_icon)
-                .style(theme::button_text)
-                .padding(2)
-                .on_press_maybe(if self.updating {
-                    None
+
+        // Git blocks — branch, sync, diff — after Settings,
+        // visually grouped with a small gap from nav buttons.
+        let has_fs = self.workspace_filesystem_path.is_some();
+
+        if has_fs {
+            left_icons.push(Space::new().width(6).into());
+
+            // a) Branch name — clickable -> branch modal
+            // Only shown when a branch is known.
+            if let Some(b) = &self.git_current_branch {
+                let truncated = if b.len() > 20 {
+                    // Safe truncation at char boundary
+                    let mut end = 19;
+                    while !b.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}…", &b[..end])
                 } else {
-                    Some(Message::UpdateBot)
-                });
-            left_icons.push(update_btn.into());
+                    b.clone()
+                };
+                let branch_btn = button(text(truncated).size(11).color(theme::ACCENT))
+                    .style(theme::button_text)
+                    .padding(2)
+                    .on_press(Message::OpenBranchModal);
+                left_icons.push(branch_btn.into());
+            }
+
+            // b) Sync — ↻ icon + behind/ahead counts, clickable -> git sync
+            // ↑ for ahead (push up), ↓ for behind (pull down)
+            if let Some((behind, ahead)) = self.git_behind_ahead {
+                if behind > 0 || ahead > 0 {
+                    let sync_text = if ahead > 0 && behind > 0 {
+                        format!("\u{2191}{ahead} \u{2193}{behind}")
+                    } else if ahead > 0 {
+                        format!("\u{2191}{ahead}")
+                    } else {
+                        format!("\u{2193}{behind}")
+                    };
+                    let sync_btn = button(
+                        row![
+                            text("\u{21bb}").size(14).color(if self.git_syncing {
+                                theme::TEXT_MUTED
+                            } else {
+                                theme::ACCENT
+                            }),
+                            text(sync_text).size(11).color(theme::TEXT_MUTED),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding(2)
+                    .style(theme::button_text)
+                    .on_press_maybe(if self.git_syncing {
+                        None
+                    } else {
+                        Some(Message::GitSync)
+                    });
+                    left_icons.push(sync_btn.into());
+                }
+            }
+
+            // c) Diff stats — ticket card format (+X/−Y), clickable -> diff modal
+            // Only rendered when there are non-zero changes.
+            if let Some((added, removed)) = self.git_diff_stats {
+                if added > 0 || removed > 0 {
+                    let stats_row = widgets::diff_stats_row::<Message>(added, removed);
+                    let diff_btn = button(stats_row)
+                        .style(theme::button_text)
+                        .padding(2)
+                        .on_press(Message::OpenDiffModal(None));
+                    left_icons.push(diff_btn.into());
+                }
+            }
         }
+
         let left = Row::with_children(left_icons)
             .spacing(4)
             .align_y(Alignment::Center);

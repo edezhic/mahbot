@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use iced::widget::{self, button, column, container, pick_list, scrollable, text, text_input};
+use iced::widget::{self, Row, button, column, container, pick_list, scrollable, text, text_input};
 use iced::{Alignment, Color, Element, Length, Padding, Task};
 
 use iced_selection;
@@ -118,6 +118,39 @@ pub fn selectable_text<'a>(
         color: Some(color),
         ..Default::default()
     })
+}
+
+/// Render formatted diff stats (+X/−Y) matching ticket card style.
+///
+/// Returns a [`Row`] showing only non-zero sides with a `/` separator.
+/// Returns an empty [`Row`] when both `added` and `removed` are zero.
+///
+/// Callers typically wrap this in a styled [`button`] with an appropriate
+/// action message.
+pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64) -> Row<'a, Message> {
+    let mut parts: Vec<Element<'a, Message>> = Vec::new();
+    if added > 0 {
+        parts.push(
+            text(format!("+{added}"))
+                .size(10)
+                .color(theme::STATUS_SUCCESS)
+                .into(),
+        );
+    }
+    if added > 0 && removed > 0 {
+        parts.push(text("/").size(10).color(theme::TEXT_MUTED).into());
+    }
+    if removed > 0 {
+        parts.push(
+            text(format!("\u{2212}{removed}"))
+                .size(10)
+                .color(theme::STATUS_ERROR)
+                .into(),
+        );
+    }
+    Row::with_children(parts)
+        .spacing(0)
+        .align_y(Alignment::Center)
 }
 
 // ── Debounce helpers ───────────────────────────────────────────────

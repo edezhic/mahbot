@@ -14,7 +14,7 @@ use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
 use super::theme;
-use super::widgets::selectable_text;
+use super::widgets::{diff_stats_row, selectable_text};
 
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
@@ -671,32 +671,13 @@ impl BoardState {
         if let (Some(hash), Some(ws_name)) = (&ticket.commit_hash, &self.workspace_name) {
             let added = ticket.lines_added.unwrap_or(0);
             let removed = ticket.lines_removed.unwrap_or(0);
-            let mut stats_parts: Vec<Element<'_, BoardMessage>> = vec![
-                text("\u{2387} ")
-                    .size(10)
-                    .color(theme::TEXT_SECONDARY)
-                    .into(),
-            ];
-            if added > 0 {
-                stats_parts.push(
-                    text(format!("+{added}"))
-                        .size(10)
-                        .color(theme::STATUS_SUCCESS)
-                        .into(),
-                );
-            }
-            if added > 0 && removed > 0 {
-                stats_parts.push(text("/").size(10).color(theme::TEXT_MUTED).into());
-            }
-            if removed > 0 {
-                stats_parts.push(
-                    text(format!("\u{2212}{removed}"))
-                        .size(10)
-                        .color(theme::STATUS_ERROR)
-                        .into(),
-                );
-            }
-            let stats_button = button(row(stats_parts).spacing(0).align_y(Alignment::Center))
+            let stats_parts = row![
+                text("\u{2387} ").size(10).color(theme::TEXT_SECONDARY),
+                diff_stats_row::<BoardMessage>(added, removed),
+            ]
+            .spacing(0)
+            .align_y(Alignment::Center);
+            let stats_button = button(stats_parts)
                 .padding([2, 6])
                 .style(theme::button_text)
                 .on_press(BoardMessage::ViewCommitDiff {
