@@ -83,7 +83,6 @@ pub enum BoardMessage {
 pub struct BoardState {
     pub(crate) tickets: Vec<Ticket>,
     pub(crate) load_state: super::common::AsyncLoadState,
-    selected_id: Option<String>,
     selected_ticket: Option<Ticket>,
     selected_loading: bool,
     action_loading: Option<String>,
@@ -108,7 +107,6 @@ impl BoardState {
         Self {
             tickets: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
-            selected_id: None,
             selected_ticket: None,
             selected_loading: false,
             action_loading: None,
@@ -124,7 +122,6 @@ impl BoardState {
 
     /// Reset all modal-related state fields (close detail modal).
     fn reset_modal(&mut self) {
-        self.selected_id = None;
         self.selected_ticket = None;
         self.description_md = None;
         self.comments_md.clear();
@@ -288,7 +285,6 @@ impl BoardState {
                 Task::none()
             }
             BoardMessage::OpenModal(id) => {
-                self.selected_id = Some(id.clone());
                 self.selected_loading = true;
                 Self::fetch_ticket(id)
             }
@@ -356,12 +352,13 @@ impl BoardState {
                 self.action_loading = None;
                 // Refresh ticket list and detail
                 let refresh = self.refresh();
-                let detail_refresh = self
-                    .selected_id
-                    .clone()
+                let detail_refetch = self
+                    .selected_ticket
+                    .as_ref()
+                    .map(|t| t.id.clone())
                     .map_or(Task::none(), Self::fetch_ticket);
                 let toast = Task::done(BoardMessage::Toast(super::ToastMessage::Saved));
-                Task::batch([refresh, detail_refresh, toast])
+                Task::batch([refresh, detail_refetch, toast])
             }
             BoardMessage::ActionResult(Err(e)) => {
                 self.action_loading = None;
@@ -451,7 +448,7 @@ impl BoardState {
                 )
             }
             BoardMessage::CommitStatsLoaded(id, generation, result) => {
-                if self.selected_id.as_deref() != Some(&id)
+                if self.selected_ticket.as_ref().map(|t| t.id.as_str()) != Some(id.as_str())
                     || generation != self.commit_stats_generation
                 {
                     // Stale callback — ticket changed or modal reopened
