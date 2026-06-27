@@ -2213,7 +2213,7 @@ impl Dashboard {
             .into()
     }
 
-    /// 36px footer bar — nav items (left) and active agents (right).
+    /// 42px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
         // Left: footer navigation (Sessions, Logs, Settings) + git blocks
         // Icon-only, 24px. Active page in ACCENT, inactive in TEXT_MUTED.
@@ -2286,7 +2286,6 @@ impl Dashboard {
                     })
                     .into(),
             );
-            left_icons.push(Space::new().width(4).into());
 
             // a) Branch name — clickable -> branch modal
             // Only shown when a branch is known.
@@ -2317,15 +2316,49 @@ impl Dashboard {
             }
 
             // b) Sync — ↻ icon + behind/ahead counts, clickable -> git sync
-            // ↑ for ahead (push up), ↓ for behind (pull down)
+            // Uses lucide arrow_up/arrow_down at 16px (same as number text) for
+            // consistent vertical alignment with the 24px refresh icon.
             if let Some((behind, ahead)) = self.git_behind_ahead {
                 if behind > 0 || ahead > 0 {
-                    let sync_text = if ahead > 0 && behind > 0 {
-                        format!("\u{2191}{ahead} \u{2193}{behind}")
-                    } else if ahead > 0 {
-                        format!("\u{2191}{ahead}")
-                    } else {
-                        format!("\u{2193}{behind}")
+                    // Build arrow+number text using lucide icons (not Unicode arrows)
+                    // so all elements share the same vertical baseline.
+                    let sync_text_label: iced::Element<'_, Message> = {
+                        let mut parts: Vec<iced::Element<'_, Message>> = Vec::new();
+                        if ahead > 0 {
+                            parts.push(
+                                lucide::arrow_up::<iced::Theme, iced::Renderer>()
+                                    .size(16)
+                                    .color(theme::TEXT_MUTED)
+                                    .into(),
+                            );
+                            parts.push(
+                                text(format!("{ahead}"))
+                                    .size(16)
+                                    .color(theme::TEXT_MUTED)
+                                    .into(),
+                            );
+                        }
+                        if behind > 0 {
+                            if ahead > 0 {
+                                parts.push(Space::new().width(8).into());
+                            }
+                            parts.push(
+                                lucide::arrow_down::<iced::Theme, iced::Renderer>()
+                                    .size(16)
+                                    .color(theme::TEXT_MUTED)
+                                    .into(),
+                            );
+                            parts.push(
+                                text(format!("{behind}"))
+                                    .size(16)
+                                    .color(theme::TEXT_MUTED)
+                                    .into(),
+                            );
+                        }
+                        Row::with_children(parts)
+                            .spacing(2)
+                            .align_y(Alignment::Center)
+                            .into()
                     };
                     let sync_content = row![
                         lucide::refresh_cw::<iced::Theme, iced::Renderer>()
@@ -2335,7 +2368,7 @@ impl Dashboard {
                             } else {
                                 theme::ACCENT
                             }),
-                        text(sync_text).size(16).color(theme::TEXT_MUTED),
+                        sync_text_label,
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center);
@@ -2420,14 +2453,15 @@ impl Dashboard {
         let footer_row = row![left, Space::new().width(Length::Fill), right]
             .align_y(Alignment::Center)
             .padding(iced::Padding {
-                top: 0.0,
+                top: 3.0,
                 right: 18.0,
-                bottom: 6.0,
+                bottom: 3.0,
                 left: 18.0,
             });
 
         container(footer_row)
-            .height(Length::Fixed(36.0))
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(42.0))
             .width(Length::Fill)
             .style(theme::surface_container_style)
             .into()
