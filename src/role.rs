@@ -256,10 +256,11 @@ impl Role {
 // ── Tool set factory ──────────────────────────────────────────────────────
 
 use crate::Tool;
+use crate::config::CONFIG;
 use crate::tools::{
-    AddCommentTool, AskTool, BrowserTool, CreateTicketTool, EditTool, GetTicketTool, ImageGenTool,
-    ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool, ShellMode, ShellTool,
-    UpdateTicketTool, VideoGenTool, WebSearchTool,
+    AddCommentTool, AskTool, BrowserTool, CreateTicketTool, EditTool, ExaSearchTool, GetTicketTool,
+    ImageGenTool, ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool, ShellMode,
+    ShellTool, UpdateTicketTool, VideoGenTool, WebSearchTool,
 };
 
 impl Role {
@@ -328,8 +329,28 @@ impl Role {
             }
         };
 
-        if let Some(key) = crate::config::CONFIG.firecrawl_key() {
-            tools.push(Box::new(WebSearchTool::new(key)));
+        // ── Web search provider dispatch ──────────────────────
+        // Exactly one web_search tool is registered, depending on config.
+        // Auto-selection: Firecrawl wins ties (both keys set, no preference).
+        let firecrawl_key = CONFIG.firecrawl_key();
+        let exa_key = CONFIG.exa_key();
+        match CONFIG.web_search_provider().as_deref() {
+            Some(p) if p.eq_ignore_ascii_case("firecrawl") && firecrawl_key.is_some() => {
+                tools.push(Box::new(WebSearchTool::new(firecrawl_key.unwrap())));
+            }
+            Some(p) if p.eq_ignore_ascii_case("exa") && exa_key.is_some() => {
+                tools.push(Box::new(ExaSearchTool::new(exa_key.unwrap())));
+            }
+            Some(other) => {
+                tracing::warn!("Unknown web_search_provider: {other}");
+            }
+            None => {
+                if let Some(key) = firecrawl_key {
+                    tools.push(Box::new(WebSearchTool::new(key)));
+                } else if let Some(key) = exa_key {
+                    tools.push(Box::new(ExaSearchTool::new(key)));
+                }
+            }
         }
 
         tools

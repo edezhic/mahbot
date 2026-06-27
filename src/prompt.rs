@@ -305,7 +305,7 @@ mod tests {
         //
         // Iterate over every role's tool list so that adding a new tool to
         // Role::tools() automatically checks it here.  web_search is
-        // conditionally added when a Firecrawl API key is configured, so it may
+        // conditionally added when a Firecrawl or Exa API key is configured, so it may
         // not appear in tests — we add it explicitly.
         use crate::Role;
         use std::collections::HashSet;
@@ -316,7 +316,7 @@ mod tests {
                 expected.insert(tool.name().to_string());
             }
         }
-        // web_search is gated on CONFIG.firecrawl_key() which is None in tests.
+        // web_search is gated on CONFIG.firecrawl_key() or CONFIG.exa_key() which are None in tests.
         expected.insert("web_search".to_string());
 
         // ── Collect available tool description files from embedded assets ─

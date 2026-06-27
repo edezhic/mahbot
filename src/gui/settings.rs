@@ -222,6 +222,7 @@ fn picker_config_fields<'a>(
 pub enum PasswordTarget {
     ProviderKey,
     FirecrawlKey,
+    ExaKey,
     TelegramToken,
 }
 
@@ -1816,9 +1817,35 @@ impl SettingsState {
     }
 
     fn integrations_section(&self) -> Element<'_, SettingsMessage> {
+        // ── Web search provider pick list ──────────────────────────
+        // Three options: Auto (None), Firecrawl, Exa
+        let current_display = match self.config.web_search_provider.as_deref() {
+            Some("firecrawl") => "Firecrawl",
+            Some("exa") => "Exa",
+            _ => "Auto",
+        };
+        let pick_options: &[&str] = &["Auto", "Firecrawl", "Exa"];
+        let pick_list = pick_list(pick_options, Some(current_display), |v| {
+            let value = match v {
+                "Firecrawl" => "firecrawl".to_string(),
+                "Exa" => "exa".to_string(),
+                _ => String::new(), // "Auto" → empty → None
+            };
+            SettingsMessage::ConfigField {
+                key: "web_search_provider",
+                value,
+            }
+        })
+        .text_size(13)
+        .style(super::widgets::pick_list_style)
+        .width(Length::Fixed(180.0));
+
+        let provider_row = field_row("Web Search Provider", pick_list.into(), None);
+
         section(
             "Integrations",
             column![
+                provider_row,
                 field_row(
                     "Firecrawl API Key",
                     password_input(
@@ -1831,6 +1858,20 @@ impl SettingsState {
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::FirecrawlKey),
+                    ),
+                    None,
+                ),
+                field_row(
+                    "Exa API Key",
+                    password_input(
+                        "exa-...",
+                        self.config.exa_key.as_deref().unwrap_or_default(),
+                        self.password_visible.contains(&PasswordTarget::ExaKey),
+                        |v| SettingsMessage::ConfigField {
+                            key: "exa_key",
+                            value: v
+                        },
+                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::ExaKey),
                     ),
                     None,
                 ),

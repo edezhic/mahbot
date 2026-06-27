@@ -5,6 +5,7 @@ use anyhow::Context;
 pub mod ask;
 pub mod browser;
 pub mod edit;
+pub mod exa_search;
 pub mod image_gen;
 pub mod path;
 pub mod read;
@@ -14,6 +15,7 @@ pub mod shell;
 pub mod ticket;
 pub mod video_gen;
 pub mod web_search;
+pub mod web_search_shared;
 
 /// Maximum file size allowed for read, edit, search tool operations, and the dashboard editor (10 MB).
 /// Guards against OOM when agents or the GUI attempt to read very large files.
@@ -53,6 +55,7 @@ pub(crate) fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
 pub use ask::AskTool;
 pub use browser::BrowserTool;
 pub use edit::EditTool;
+pub use exa_search::ExaSearchTool;
 pub use image_gen::ImageGenTool;
 pub use read::ReadTool;
 pub use search::SearchTool;

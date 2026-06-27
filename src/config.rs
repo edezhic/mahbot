@@ -194,6 +194,11 @@ pub struct ConfigData {
     pub video_gen_models: Option<String>,
     /// Firecrawl API key for web search.
     pub firecrawl_key: Option<String>,
+    /// Exa API key for web search (alternative to Firecrawl).
+    pub exa_key: Option<String>,
+    /// Web search provider selection: "firecrawl" or "exa" (case-insensitive).
+    /// When `None`, auto-selects based on which keys are configured (Firecrawl wins on tie).
+    pub web_search_provider: Option<String>,
     /// Telegram Bot API token (hot-reloaded on save).
     pub telegram_bot_token: Option<String>,
     /// Per-role model overrides.
@@ -395,6 +400,8 @@ string_config_fields! {
     video_gen_model [or(DEFAULT_VIDEO_GEN_MODEL)],
     video_gen_models [list_or(fallback = video_gen_model, default = DEFAULT_VIDEO_GEN_MODEL)],
     firecrawl_key [non_empty],
+    exa_key [non_empty],
+    web_search_provider [non_empty],
     telegram_bot_token [non_empty],
 }
 
@@ -883,6 +890,8 @@ mod tests {
         ("video_gen_model", "sora"),
         ("video_gen_models", "sora\npika\nrunway"),
         ("firecrawl_key", "fc-test-key"),
+        ("exa_key", "exa-test-key"),
+        ("web_search_provider", "exa"),
         ("telegram_bot_token", "123:abc"),
     ];
 

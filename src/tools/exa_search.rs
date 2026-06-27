@@ -4,75 +4,63 @@ use serde::{Deserialize, Serialize};
 
 use super::web_search_shared::WebSearchCache;
 
-// ── Firecrawl API types ─────────────────────────────────────────────────────────
+// ── Exa API types ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct ScrapeOptions {
-    formats: Vec<String>,
-    #[serde(rename = "onlyMainContent")]
-    only_main_content: bool,
+struct ExaContentsOptions {
+    text: bool,
 }
 
 #[derive(Serialize)]
-struct SearchRequest {
+struct ExaSearchBody {
     query: String,
-    limit: usize,
-    #[serde(rename = "scrapeOptions")]
-    scrape_options: ScrapeOptions,
+    #[serde(rename = "numResults")]
+    num_results: usize,
+    contents: ExaContentsOptions,
 }
 
 #[derive(Deserialize, Debug)]
-struct WebResult {
+struct ExaResult {
     title: Option<String>,
     url: String,
-    markdown: Option<String>,
-    description: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-struct SearchData {
-    web: Vec<WebResult>,
+struct ExaSearchResponse {
+    results: Vec<ExaResult>,
 }
 
-#[derive(Deserialize, Debug)]
-struct SearchResponse {
-    success: bool,
-    data: SearchData,
-}
+// ── Tool ──────────────────────────────────────────────────────────────────
 
-// ── Tool ────────────────────────────────────────────────────────────────────────
-
-/// Web search tool backed by the Firecrawl API.
+/// Web search tool backed by the Exa API.
 ///
-/// Uses `api.firecrawl.dev/v2/search` for search. Results are cached
+/// Uses `api.exa.ai/search` for search. Results are cached
 /// per-instance in-memory and can be expanded via the `expand` parameter
 /// to retrieve full text content.  Each agent session gets its own tool
 /// instance, so caches are automatically freed when the agent session ends.
-pub struct WebSearchTool {
-    firecrawl_key: String,
+pub struct ExaSearchTool {
+    exa_key: String,
     cache: WebSearchCache,
 }
 
-impl WebSearchTool {
+impl ExaSearchTool {
     #[must_use]
-    pub fn new(firecrawl_key: String) -> Self {
+    pub fn new(exa_key: String) -> Self {
         Self {
-            firecrawl_key,
+            exa_key,
             cache: WebSearchCache::new(),
         }
     }
 
-    async fn firecrawl_search(&self, query: &str) -> anyhow::Result<String> {
+    async fn exa_search(&self, query: &str) -> anyhow::Result<String> {
         let res = crate::util::http::media_http_client()
-            .post("https://api.firecrawl.dev/v2/search")
-            .header("Authorization", format!("Bearer {}", &self.firecrawl_key))
-            .json(&SearchRequest {
+            .post("https://api.exa.ai/search")
+            .header("x-api-key", &self.exa_key)
+            .json(&ExaSearchBody {
                 query: query.to_string(),
-                limit: 10,
-                scrape_options: ScrapeOptions {
-                    formats: vec!["markdown".to_string()],
-                    only_main_content: true,
-                },
+                num_results: 10,
+                contents: ExaContentsOptions { text: true },
             })
             .send()
             .await?;
@@ -84,8 +72,7 @@ impl WebSearchTool {
                 String::new()
             });
 
-            // Firecrawl returns structured JSON errors with a clean error message.
-            // Try to extract it for a better error message.
+            // Exa returns structured JSON errors — try to extract for a better error message.
             if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)
                 && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str())
             {
@@ -95,32 +82,28 @@ impl WebSearchTool {
             anyhow::bail!("search failed with status {status}: {body}");
         }
 
-        let search_resp = res.json::<SearchResponse>().await?;
+        let search_resp = res.json::<ExaSearchResponse>().await?;
 
-        if !search_resp.success || search_resp.data.web.is_empty() {
+        if search_resp.results.is_empty() {
             return Ok(format!("No results found for: {query}"));
         }
 
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!("Search results for: {query}"));
 
-        for (i, result) in search_resp.data.web.iter().enumerate() {
+        for (i, result) in search_resp.results.iter().enumerate() {
             let title = result.title.as_deref().unwrap_or("(no title)").to_string();
-            let description = result.description.as_deref().unwrap_or("");
 
             let id = self
                 .cache
                 .cache_result(
                     title.clone(),
                     result.url.clone(),
-                    result.markdown.as_deref().unwrap_or_default().to_string(),
+                    result.text.as_deref().unwrap_or_default().to_string(),
                 )
                 .await;
 
             lines.push(format!("{}. [{title}]({url})", i + 1, url = result.url));
-            if !description.is_empty() {
-                lines.push(format!("   > {description}"));
-            }
             lines.push(format!("   `expand` id: `{id}`"));
         }
 
@@ -129,7 +112,7 @@ impl WebSearchTool {
 }
 
 #[async_trait]
-impl Tool for WebSearchTool {
+impl Tool for ExaSearchTool {
     fn name(&self) -> &'static str {
         "web_search"
     }
@@ -158,7 +141,7 @@ impl Tool for WebSearchTool {
             return self.cache.expand_result(id).await;
         }
 
-        tracing::info!("Searching web (Firecrawl) for: {}", query);
-        self.firecrawl_search(query).await
+        tracing::info!("Searching web (Exa) for: {}", query);
+        self.exa_search(query).await
     }
 }
