@@ -76,6 +76,15 @@ const COL_MR_TEST_PROVIDER_ORDER: usize = 0; // SELECT provider_order FROM confi
 #[cfg(test)]
 const COL_MR_TEST_ALLOW_FALLBACKS: usize = 1;
 
+// ── SQL statement constants ──────────────────────────────────
+
+/// UPSERT a key-value pair in config_kv.
+const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
+/// Delete a key-value pair from config_kv by key. Succeeds even if the key does not exist.
+const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
+
 impl ConfigStore {
     /// Open (or create) the config database at `root/db/config.db`.
     pub async fn open(root: &Path) -> Result<Self> {
@@ -95,11 +104,7 @@ impl ConfigStore {
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
         self.conn
-            .execute(
-                "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                turso::params![key, value],
-            )
+            .execute(UPSERT_KV_SQL, turso::params![key, value])
             .await?;
         Ok(())
     }
@@ -107,7 +112,7 @@ impl ConfigStore {
     /// Delete a key-value pair. Succeeds even if the key does not exist.
     pub async fn delete_kv(&self, key: &str) -> Result<()> {
         self.conn
-            .execute("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
+            .execute(DELETE_KV_SQL, turso::params![key])
             .await?;
         Ok(())
     }
@@ -255,12 +260,8 @@ impl ConfigStore {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        tx.execute(
-            "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            turso::params![key, value],
-        )
-        .await?;
+        tx.execute(UPSERT_KV_SQL, turso::params![key, value])
+            .await?;
         Ok(())
     }
 
@@ -268,8 +269,7 @@ impl ConfigStore {
     /// Like [`delete_kv`] but executes on the supplied [`turso::TxGuard`].
     /// Succeeds even if the key does not exist.
     pub(crate) async fn delete_kv_tx(&self, tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
-        tx.execute("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
-            .await?;
+        tx.execute(DELETE_KV_SQL, turso::params![key]).await?;
         Ok(())
     }
 }
