@@ -739,60 +739,45 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_fts_query_keeps_alphanumeric() {
-        assert_eq!(sanitize_fts_query("hello world"), "hello world");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_strips_special_chars() {
-        assert_eq!(sanitize_fts_query("`Hello ${name}`"), "Hello name");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_preserves_word_boundaries() {
-        assert_eq!(
-            sanitize_fts_query("contact user@example.com now"),
-            "contact user example com now"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_handles_punctuation() {
-        assert_eq!(
-            sanitize_fts_query("hello, world! How's it going?"),
-            "hello world How s it going"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_empty_result() {
-        assert_eq!(sanitize_fts_query("!@#$%"), "");
+    fn test_sanitize_fts_query() {
+        let cases = [
+            ("hello world", "hello world"),
+            ("`Hello ${name}`", "Hello name"),
+            (
+                "contact user@example.com now",
+                "contact user example com now",
+            ),
+            (
+                "hello, world! How's it going?",
+                "hello world How s it going",
+            ),
+            ("!@#$%", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(sanitize_fts_query(input), expected, "input: {input:?}",);
+        }
     }
 
     // ── parse_utc_timestamp tests ─────────────────────────────────────
 
     #[test]
-    fn parse_utc_timestamp_valid_zulu() {
-        let ts = parse_utc_timestamp("2024-01-15T10:30:00Z").unwrap();
-        assert_eq!(ts.to_rfc3339(), "2024-01-15T10:30:00+00:00");
-    }
+    fn test_parse_utc_timestamp() {
+        let valid_cases = [
+            ("2024-01-15T10:30:00Z", "2024-01-15T10:30:00+00:00"),
+            ("2024-06-15T14:30:00+05:00", "2024-06-15T09:30:00+00:00"),
+            ("2024-12-25T20:00:00-08:00", "2024-12-26T04:00:00+00:00"),
+        ];
+        for (input, expected) in valid_cases {
+            let ts = parse_utc_timestamp(input)
+                .unwrap_or_else(|e| panic!("parse_utc_timestamp({input:?}) failed: {e}"));
+            assert_eq!(ts.to_rfc3339(), expected, "input: {input:?}");
+        }
 
-    #[test]
-    fn parse_utc_timestamp_valid_offset() {
-        let ts = parse_utc_timestamp("2024-06-15T14:30:00+05:00").unwrap();
-        assert_eq!(ts.to_rfc3339(), "2024-06-15T09:30:00+00:00");
-    }
-
-    #[test]
-    fn parse_utc_timestamp_negative_offset() {
-        let ts = parse_utc_timestamp("2024-12-25T20:00:00-08:00").unwrap();
-        assert_eq!(ts.to_rfc3339(), "2024-12-26T04:00:00+00:00");
-    }
-
-    #[test]
-    fn parse_utc_timestamp_invalid_returns_err() {
-        assert!(parse_utc_timestamp("garbage").is_err());
-        assert!(parse_utc_timestamp("").is_err());
-        assert!(parse_utc_timestamp("2024-01-15").is_err());
+        for invalid in ["garbage", "", "2024-01-15"] {
+            assert!(
+                parse_utc_timestamp(invalid).is_err(),
+                "expected error for: {invalid:?}",
+            );
+        }
     }
 }
