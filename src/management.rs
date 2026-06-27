@@ -2068,12 +2068,15 @@ fn build_analyst_summary(
 ///
 /// # Parameters
 ///
+/// * `ticket` — the ticket being evaluated for the circuit breaker.
 /// * `expected` — the phase the ticket must currently be in for the transition
 ///   to succeed (passed through to [`transition_ticket`]).
 /// * `threshold` — the count at which the breaker trips (using `>` comparison).
 /// * `count_fn` — extracts the count from the fetched comment list. Responsible
 ///   for its own filtering (including self-counting prevention).
 /// * `comment_text` — formats the system comment body given the count.
+/// * `log_label` — human-readable label used in log messages to identify the
+///   circuit breaker caller.
 #[must_use]
 async fn run_circuit_breaker(
     ticket: &Ticket,
