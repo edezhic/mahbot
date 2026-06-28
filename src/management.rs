@@ -2382,7 +2382,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
 mod tests {
     use super::*;
     use crate::board::DEFAULT_TICKET_PHASE;
-    use crate::board::TicketBuilder;
+    use crate::util::test::TicketBuilder;
     use crate::util::test::{expect_ticket, expect_ticket_status, init_test_stores};
     use crate::workspace::test_ws_named;
 

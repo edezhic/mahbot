@@ -144,7 +144,7 @@ mod tests {
         let (store, _tmp) = open_test_store().await;
         // Create and archive a ticket so FTS has something to find
         let ws = crate::workspace::test_ws("ws");
-        let id = crate::board::TicketBuilder::new(&store, ws)
+        let id = crate::util::test::TicketBuilder::new(&store, ws)
             .title("UniqueSearchableTitleXYZ")
             .phase(crate::board::TicketPhase::Done)
             .create()
@@ -166,14 +166,14 @@ mod tests {
     async fn test_format_results_formats_correctly() {
         let (store, _tmp) = open_test_store().await;
         let ws = crate::workspace::test_ws("ws");
-        let id_a = crate::board::TicketBuilder::new(&store, ws.clone())
+        let id_a = crate::util::test::TicketBuilder::new(&store, ws.clone())
             .title("Alpha ticket")
             .phase(crate::board::TicketPhase::Done)
             .create()
             .await
             .expect("create");
         store.set_archived(&id_a).await.expect("archive");
-        let id_b = crate::board::TicketBuilder::new(&store, ws)
+        let id_b = crate::util::test::TicketBuilder::new(&store, ws)
             .title("Beta ticket")
             .phase(crate::board::TicketPhase::Cancelled)
             .create()

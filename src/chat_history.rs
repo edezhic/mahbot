@@ -203,23 +203,20 @@ impl ChatHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_history::ChatHistoryStore;
     use crate::turso;
     use tempfile::TempDir;
 
-    fn test_setup() -> (TempDir, std::path::PathBuf) {
+    async fn test_setup() -> (ChatHistoryStore, TempDir) {
         let tmp = TempDir::new().expect("failed to create test temp dir");
-        let root = tmp.path().to_path_buf();
-        (tmp, root)
+        let store = ChatHistoryStore::open(tmp.path())
+            .await
+            .expect("ChatHistoryStore::open should succeed on fresh database");
+        (store, tmp)
     }
 
     #[tokio::test]
     async fn test_open_smoke() {
-        let (_tmp, root) = test_setup();
-
-        let store = ChatHistoryStore::open(&root)
-            .await
-            .expect("ChatHistoryStore::open should succeed on fresh database");
+        let (store, _tmp) = test_setup().await;
 
         // Verify there is no session_key column.
         let rows = store

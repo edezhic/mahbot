@@ -1,4 +1,5 @@
-//! Shared test utilities for initializing global stores.
+//! Shared test utilities for initializing global stores and building test
+//! tickets.
 //!
 //! Provides a single temporary directory shared across all test initializations,
 //! eliminating the duplicated `init_with_temp_dir()` pattern that was previously
@@ -7,10 +8,14 @@
 //! The temp directory is intentionally leaked for the process lifetime to avoid
 //! races at shutdown — since global [`OnceCell`]s can only be set once, each
 //! store is initialized at most once per test run.
+//!
+//! Also provides [`TicketBuilder`], a builder for creating test tickets that was
+//! historically defined in the `board` module and imported from there by sibling
+//! modules. Moved here so all test infrastructure lives in one place.
 
 #![cfg(test)]
 
-use crate::board::{BoardStore, Ticket, TicketPhase};
+use crate::board::{BoardStore, Ticket, TicketParams, TicketPhase};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -77,17 +82,146 @@ pub async fn expect_ticket_status(store: &BoardStore, id: &str) -> TicketPhase {
         .expect("expected ticket status to exist")
 }
 
-/// Initialize all global test stores (session, board) with a shared
-/// temp directory.
+/// Builder for creating test tickets with common defaults.
+///
+/// Defaults: `desc="desc"`, `phase=Backlog`, `prerequisites=[]`, `reporter="test"`,
+/// `embedding=None`. Title is required (no default) via `.title()`.
+///
+/// # Examples
+/// ```ignore
+/// // Simple ticket with defaults
+/// TicketBuilder::new(&store, &ws).title("A").create().await?;
+///
+/// // Custom phase and prerequisites
+/// TicketBuilder::new(&store, &ws)
+///     .title("B")
+///     .phase(TicketPhase::InDevelopment)
+///     .prereqs(&[a_id, b_id])
+///     .create().await?;
+///
+/// // Supersede an existing ticket
+/// TicketBuilder::new(&store, &ws)
+///     .title("New title")
+///     .supersede(&old_id).await?;
+///
+/// // With embedding bytes
+/// TicketBuilder::new(&store, &ws)
+///     .title("Embedded")
+///     .embedding(&blob)
+///     .create().await?;
+/// ```
+pub(crate) struct TicketBuilder<'a> {
+    store: &'a BoardStore,
+    ws: crate::Workspace,
+    title: String,
+    desc: String,
+    phase: TicketPhase,
+    prereqs: Vec<String>,
+    reporter: String,
+    embedding: Option<Vec<u8>>,
+}
+
+impl<'a> TicketBuilder<'a> {
+    /// Start building a test ticket for `store` in workspace `ws`.
+    pub(crate) fn new(store: &'a BoardStore, ws: crate::Workspace) -> Self {
+        Self {
+            store,
+            ws,
+            title: String::new(),
+            desc: "desc".into(),
+            phase: TicketPhase::Backlog,
+            prereqs: Vec::new(),
+            reporter: "test".into(),
+            embedding: None,
+        }
+    }
+
+    /// Set the ticket title (required).
+    pub(crate) fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+
+    /// Set the description (default: `"desc"`).
+    pub(crate) fn desc(mut self, desc: impl Into<String>) -> Self {
+        self.desc = desc.into();
+        self
+    }
+
+    /// Set the phase (default: [`TicketPhase::Backlog`]).
+    pub(crate) fn phase(mut self, phase: TicketPhase) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// Set prerequisites (default: empty).
+    pub(crate) fn prereqs(mut self, prereqs: &[String]) -> Self {
+        self.prereqs = prereqs.to_vec();
+        self
+    }
+
+    /// Set the reporter (default: `"test"`).
+    pub(crate) fn reporter(mut self, reporter: impl Into<String>) -> Self {
+        self.reporter = reporter.into();
+        self
+    }
+
+    /// Set embedding bytes (default: `None`).
+    pub(crate) fn embedding(mut self, blob: &[u8]) -> Self {
+        self.embedding = Some(blob.to_vec());
+        self
+    }
+
+    /// Create the ticket with the accumulated parameters.
+    pub(crate) async fn create(self) -> anyhow::Result<String> {
+        let (store, params) = self.into_parts();
+        store.create_ticket(&params).await
+    }
+
+    /// Supersede `supersede_id` with this ticket (calls `supersede_and_create`).
+    pub(crate) async fn supersede(self, supersede_id: &str) -> anyhow::Result<String> {
+        let (store, params) = self.into_parts();
+        store.supersede_and_create(supersede_id, &params).await
+    }
+
+    fn into_parts(self) -> (&'a BoardStore, TicketParams) {
+        (
+            self.store,
+            TicketParams {
+                title: self.title,
+                description: self.desc,
+                workspace_name: self.ws.name,
+                phase: self.phase,
+                prerequisites: self.prereqs,
+                reporter: self.reporter,
+                embedding: self.embedding,
+            },
+        )
+    }
+}
+
+/// Initialize all global test stores (session, board, workspace, users,
+/// config, stats, chat_history) with a shared temp directory.
+///
+/// Also initializes the search engine registry (required by workspace store)
+/// and sets the CONFIG storage root.
 ///
 /// Idempotent — subsequent calls are no-ops.
 pub async fn init_test_stores() {
+    use crate::chat_history::ChatHistoryStore;
+    use crate::config_db::ConfigStore;
     use crate::session::SessionStore;
+    use crate::stats::StatsStore;
+    use crate::users::UserStore;
+    use crate::workspace::WorkspaceStore;
 
     static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     INIT.get_or_init(|| async {
         // Set CONFIG storage root (no-op if already set by another test)
         let _ = crate::config::CONFIG.try_set_storage_root(test_root().clone());
+
+        // search_engine is sync — must be initialized before workspace
+        crate::search_engine::init_global();
 
         crate::session::SESSIONS
             .set(
@@ -103,6 +237,41 @@ pub async fn init_test_stores() {
                     .expect("failed to create BoardStore for tests"),
             )
             .expect("BOARD already initialized by another path");
+        crate::workspace::WORKSPACES
+            .set(
+                WorkspaceStore::open(test_root())
+                    .await
+                    .expect("failed to create WorkspaceStore for tests"),
+            )
+            .expect("WORKSPACES already initialized by another path");
+        crate::users::USER_STORE
+            .set(
+                UserStore::open(test_root())
+                    .await
+                    .expect("failed to create UserStore for tests"),
+            )
+            .expect("USER_STORE already initialized by another path");
+        crate::config_db::CONFIG_STORE
+            .set(
+                ConfigStore::open(test_root())
+                    .await
+                    .expect("failed to create ConfigStore for tests"),
+            )
+            .expect("CONFIG_STORE already initialized by another path");
+        crate::stats::STATS_STORE
+            .set(
+                StatsStore::open(test_root())
+                    .await
+                    .expect("failed to create StatsStore for tests"),
+            )
+            .expect("STATS_STORE already initialized by another path");
+        crate::chat_history::CHAT_HISTORY
+            .set(
+                ChatHistoryStore::open(test_root())
+                    .await
+                    .expect("failed to create ChatHistoryStore for tests"),
+            )
+            .expect("CHAT_HISTORY already initialized by another path");
     })
     .await;
 }

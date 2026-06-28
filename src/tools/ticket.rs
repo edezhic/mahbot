@@ -382,7 +382,7 @@ async fn guard_not_pipeline_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::TicketBuilder;
+    use crate::util::test::TicketBuilder;
     use crate::workspace::test_ws;
     use serde_json::json;
 
