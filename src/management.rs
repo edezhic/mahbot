@@ -29,6 +29,7 @@ use futures_util::future::join_all;
 
 use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, Ticket, TicketComment, TicketPhase};
+use crate::diff_parse::list_untracked_files;
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
 use crate::role::DIAGNOSTICS_ROLE;
@@ -1417,60 +1418,6 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     }
 }
 
-/// List untracked/new files in the working tree by running `git status --porcelain`.
-///
-/// Delegates to [`parse_untracked_from_porcelain`] for the actual parsing logic.
-/// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
-/// including `A ` clean staged and `AM` staged+modified).
-async fn list_untracked_files(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
-    use tokio::process::Command;
-
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo_path)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git status --porcelain failed: {stderr}");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_untracked_from_porcelain(&stdout))
-}
-
-/// Parse untracked/new file paths from `git status --porcelain` output.
-///
-/// Returns file paths for entries where the index status indicates a new file:
-/// - `??` — untracked file
-/// - `A ` at position 0 — staged as new (first char is `A`)
-///
-/// This correctly catches `A ` (staged, clean) and `AM` (staged as new, then
-/// modified in working tree) because both start with `A`. The porcelain format
-/// is `<XY><space><path>` where X = index status, Y = working tree status.
-/// Path always starts at index 3.
-///
-/// Excludes ` A` (not tracked, added only to working tree — this is a file
-/// that exists but is not tracked by git; it falls under `??` instead).
-#[must_use]
-fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
-    porcelain
-        .lines()
-        .filter(|line| line.starts_with("?? ") || line.starts_with('A'))
-        // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
-        // we guard with `get()` to prevent panics on malformed input.
-        .filter_map(|line| {
-            let path = line.get(3..)?;
-            if path.is_empty() {
-                None
-            } else {
-                Some(path.to_string())
-            }
-        })
-        .collect()
-}
-
 // ── Post-development diagnostics ───────────────────────────────────────
 
 /// Run diagnostics commands after the engineer completes development.
@@ -2834,68 +2781,6 @@ mod tests {
         )
         .await
         .expect("transition to Analysis");
-    }
-
-    // ── parse_untracked_from_porcelain — git porcelain parsing ──
-
-    /// Verify that `parse_untracked_from_porcelain` correctly extracts untracked
-    /// and staged-as-new file paths from git porcelain output.
-    #[test]
-    fn parse_untracked_from_porcelain_extracts_new_files() {
-        let porcelain = "\
-?? new_file.rs
-M  modified.rs
-?? another_new.py
-A  staged_new.js
-?? dir/untracked.txt
- M working_tree_only.txt
-?? temp.log
-AM staged_then_modified.js
- A working_tree_new.txt
-";
-
-        let files = parse_untracked_from_porcelain(porcelain);
-
-        assert_eq!(files.len(), 6);
-        assert!(files.contains(&"new_file.rs".to_string()));
-        assert!(files.contains(&"another_new.py".to_string()));
-        assert!(files.contains(&"staged_new.js".to_string()));
-        assert!(files.contains(&"dir/untracked.txt".to_string()));
-        assert!(files.contains(&"temp.log".to_string()));
-        assert!(files.contains(&"staged_then_modified.js".to_string()));
-        // These should be excluded:
-        assert!(!files.contains(&"modified.rs".to_string()));
-        assert!(!files.contains(&"working_tree_only.txt".to_string()));
-        assert!(!files.contains(&"working_tree_new.txt".to_string()));
-    }
-
-    /// Verify that porcelain parsing returns empty for both clean output
-    /// (no new/untracked files) and malformed/truncated lines.
-    #[test]
-    fn parse_untracked_from_porcelain_returns_empty() {
-        let porcelain = "\
-M  modified.rs
- M working_tree_only.txt
-D  deleted.rs
- A working_tree_new.txt
-";
-
-        let files = parse_untracked_from_porcelain(porcelain);
-        assert!(
-            files.is_empty(),
-            "Should be empty when no new/untracked files"
-        );
-
-        // Malformed/truncated lines that match the filter but are too short
-        // for path extraction should also produce empty results without panicking.
-        let short_lines = ["A", "A ", "?? ", "??"];
-        for &bad_line in &short_lines {
-            let files = parse_untracked_from_porcelain(bad_line);
-            assert!(
-                files.is_empty(),
-                "Malformed line {bad_line:?} should produce empty result, got {files:?}"
-            );
-        }
     }
 
     // ── run_circuit_breaker — sanitation counting ──
