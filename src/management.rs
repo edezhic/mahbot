@@ -65,8 +65,7 @@ const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 /// Marker appended when diagnostics fail (includes the failed-at label after it).
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
-/// Substring used both by the breaker trip comment and the self-counting guard
-/// — must stay in sync between `comment_text` and `count_fn`.
+/// Substring used by circuit breaker trip comments.
 const CIRCUIT_BREAKER_TRIP_MARKER: &str = "Circuit breaker";
 
 /// Role string for diagnostics comments — used both when posting diagnostics
@@ -1255,8 +1254,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 /// to Planning), and consistent failure handling with the general breaker.
 ///
 /// Counts system comments where role == "system" and content contains
-/// "Sanitation failed" but NOT "Circuit breaker" (to prevent self-counting
-/// cascade on re-dispatch after the breaker trips).
+/// "Sanitation failed".
 ///
 /// Separate from the general comment-count circuit breaker so that
 /// garbage-thrashing tickets are caught early without consuming the full
@@ -1273,11 +1271,7 @@ async fn trip_sanitation_circuit_breaker_if_exceeded(
         |comments| {
             comments
                 .iter()
-                .filter(|c| {
-                    c.role == "system"
-                        && c.content.contains(SANITATION_FAILED_PREFIX)
-                        && !c.content.contains(CIRCUIT_BREAKER_TRIP_MARKER)
-                })
+                .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
                 .count()
         },
         |count| {
@@ -1692,8 +1686,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 /// exceeds [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`] (i.e., trip at ≥5 failures).
 ///
 /// Re-fetches comments because the ticket snapshot may be stale.
-/// Excludes comments already containing "Circuit breaker" to prevent
-/// self-counting cascade on re-dispatch.
 ///
 /// Returns `true` if the circuit breaker tripped (caller should abort);
 /// `false` otherwise, including on comment fetch errors (fail-open).
@@ -1711,7 +1703,6 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(ticket: &Ticket) -> bool {
                     c.role == DIAGNOSTICS_ROLE
                         && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
                         && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
-                        && !c.content.contains(CIRCUIT_BREAKER_TRIP_MARKER)
                 })
                 .count()
         },
@@ -2066,13 +2057,18 @@ fn build_analyst_summary(
 ///
 /// # Self-counting prevention
 ///
-/// The `count_fn` closure is responsible for filtering out comments that the
-/// breaker itself produces — otherwise the breaker would count its own comments
-/// on subsequent iterations and re-trip immediately. For the diagnostics breaker
-/// specifically, `count_fn` excludes comments containing `"Circuit breaker"`,
-/// and the corresponding `comment_text` closure MUST produce a comment that
-/// includes that exact substring. A mismatch between these two closures creates
-/// a self-counting cascade on re-dispatch.
+/// The `count_fn` closure must not count the breaker's own trip comment.
+/// Each domain-specific breaker naturally excludes its trip comment:
+///
+/// * **Diagnostics breaker** — filters comments by role `"diagnostics"`,
+///   but trip comments always use role `"system"` (set by this function).
+/// * **Sanitation breaker** — filters comments by content containing
+///   `"Sanitation failed"`, but trip comments use different text.
+/// * **General breaker** — counts all comments (`len`); it prevents
+///   re-dispatch by transitioning to the terminal `Failed` phase.
+///
+/// The `comment_text` closure should produce output consistent with
+/// `count_fn`'s filters to avoid accidental self-counting.
 ///
 /// # Return value
 ///
@@ -3380,9 +3376,8 @@ D  deleted.rs
             "ticket should be Failed after trip"
         );
 
-        // The trip comment must contain the marker substring so that the
-        // diagnostics breaker's self-counting filter (which excludes comments
-        // containing CIRCUIT_BREAKER_TRIP_MARKER) correctly identifies it.
+        // The trip comment contains the circuit breaker marker for consistency
+        // with other circuit breaker trip messages.
         let comments = board()
             .get_comments(&ticket_id)
             .await
