@@ -1596,20 +1596,11 @@ impl SettingsState {
                     ),
                     None,
                 ),
-                field_row(
+                config_text_input(
                     "Endpoint",
-                    text_input(
-                        "https://openrouter.ai/api/v1",
-                        self.config.provider_endpoint.as_deref().unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "provider_endpoint",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(375.0))
-                    .into(),
-                    None,
+                    "https://openrouter.ai/api/v1",
+                    self.config.provider_endpoint.as_deref().unwrap_or_default(),
+                    "provider_endpoint",
                 ),
             ],
         )
@@ -1691,77 +1682,41 @@ impl SettingsState {
         section(
             "Transcription",
             column![
-                field_row(
+                config_text_input(
                     "Image Model",
-                    text_input(
-                        "qwen/qwen3.6-plus",
-                        self.config
-                            .image_transcription_model
-                            .as_deref()
-                            .unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "image_transcription_model",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(375.0))
-                    .into(),
-                    None,
+                    "qwen/qwen3.6-plus",
+                    self.config
+                        .image_transcription_model
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "image_transcription_model",
                 ),
-                field_row(
+                config_text_input(
                     "Audio Model",
-                    text_input(
-                        "xiaomi/mimo-v2.5",
-                        self.config
-                            .audio_transcription_model
-                            .as_deref()
-                            .unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "audio_transcription_model",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(375.0))
-                    .into(),
-                    None,
+                    "xiaomi/mimo-v2.5",
+                    self.config
+                        .audio_transcription_model
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "audio_transcription_model",
                 ),
-                field_row(
+                config_text_input(
                     "Transcription Provider",
-                    text_input(
-                        "",
-                        self.config
-                            .transcription_provider
-                            .as_deref()
-                            .unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "transcription_provider",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(375.0))
-                    .into(),
-                    None,
+                    "",
+                    self.config
+                        .transcription_provider
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "transcription_provider",
                 ),
-                field_row(
+                config_text_input(
                     "Audio Provider",
-                    text_input(
-                        "",
-                        self.config
-                            .audio_transcription_provider
-                            .as_deref()
-                            .unwrap_or_default(),
-                    )
-                    .on_input(|v| SettingsMessage::ConfigField {
-                        key: "audio_transcription_provider",
-                        value: v
-                    })
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(375.0))
-                    .into(),
-                    None,
+                    "",
+                    self.config
+                        .audio_transcription_provider
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "audio_transcription_provider",
                 ),
             ],
         )
@@ -2081,6 +2036,27 @@ fn save_button<'a>(saving: bool) -> Element<'a, SettingsMessage> {
             .on_press(SettingsMessage::Save);
     }
     btn.into()
+}
+
+/// Config text input — label on left, styled text input on right.
+fn config_text_input<'a>(
+    label: &'static str,
+    placeholder: &str,
+    value: &str,
+    config_key: &'static str,
+) -> Element<'a, SettingsMessage> {
+    field_row(
+        label,
+        text_input(placeholder, value)
+            .on_input(move |v| SettingsMessage::ConfigField {
+                key: config_key,
+                value: v,
+            })
+            .style(super::widgets::text_input_style)
+            .width(Length::Fixed(375.0))
+            .into(),
+        None,
+    )
 }
 
 /// Wrap a dialog element inside a semi-transparent backdrop, centered on screen.
