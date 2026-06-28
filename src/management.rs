@@ -59,9 +59,17 @@ const DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD: usize = 4;
 /// not consume 50 comments before tripping.
 const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
 
+/// Compile-time invariant: the sanitation circuit breaker must always trip
+/// before the general comment-count breaker, otherwise a ticket could
+/// accumulate `CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments during repeated
+/// sanitation loops before tripping.
+const _: () = assert!(SANITATION_CIRCUIT_BREAKER_THRESHOLD < CIRCUIT_BREAKER_COMMENT_THRESHOLD);
+
 /// Prefix for all auto-diagnostics comments on tickets.
 const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
-/// Marker appended when all diagnostics pass.
+/// Comment-formatting constant — appended to the diagnostics comment body when
+/// all checks pass. This is **not** a circuit-breaker marker; the circuit breaker
+/// only checks for [`DIAGNOSTICS_FAILED_MARKER`] prefix and [`DIAGNOSTICS_ROLE`].
 const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 /// Marker appended when diagnostics fail (includes the failed-at label after it).
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
