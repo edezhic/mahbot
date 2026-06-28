@@ -88,13 +88,24 @@ impl AgentRegistry {
         }
     }
 
-    /// Cancel all agents running for a specific `ticket_id`.
-    /// Used on ticket status transitions — stops any agent currently working on it.
-    pub fn cancel_by_ticket_id(&self, ticket_id: &str) {
+    /// Cancel all agents matching a predicate.
+    ///
+    /// The lock is dropped **before** calling [`cancel`](AgentRegistry::cancel) on each matched
+    /// run ID to avoid deadlock — `cancel` acquires the same lock internally.
+    ///
+    /// # Lock-ordering invariant
+    ///
+    /// The predicate is evaluated while the lock is held, then the lock is released
+    /// and cancellation proceeds without it. This is the only safe ordering — any
+    /// future `cancel_by_*` method MUST follow this pattern or risk deadlock.
+    fn cancel_matching<F>(&self, predicate: F)
+    where
+        F: Fn(&AgentEntry) -> bool,
+    {
         let to_cancel: Vec<String> = {
             let map = self.inner.lock().unwrap_poison();
             map.iter()
-                .filter(|(_, entry)| entry.handle.ticket_id.as_deref() == Some(ticket_id))
+                .filter(|(_, entry)| predicate(entry))
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -103,21 +114,18 @@ impl AgentRegistry {
         }
     }
 
+    /// Cancel all agents running for a specific `ticket_id`.
+    /// Used on ticket status transitions — stops any agent currently working on it.
+    pub fn cancel_by_ticket_id(&self, ticket_id: &str) {
+        self.cancel_matching(|entry| entry.handle.ticket_id.as_deref() == Some(ticket_id));
+    }
+
     /// Cancel all agents running for a specific role within a specific workspace path.
     /// Used when maintenance is disabled for a workspace — stops the in-flight maintainer agent.
     pub fn cancel_by_role_and_workspace_path(&self, role: &str, ws_path: &str) {
-        let to_cancel: Vec<String> = {
-            let map = self.inner.lock().unwrap_poison();
-            map.iter()
-                .filter(|(_, entry)| {
-                    entry.handle.role == role && entry.handle.workspace_path == ws_path
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
-        for run_id in to_cancel {
-            self.cancel(&run_id);
-        }
+        self.cancel_matching(|entry| {
+            entry.handle.role == role && entry.handle.workspace_path == ws_path
+        });
     }
 
     /// Snapshot of all currently running agents (serializable).
