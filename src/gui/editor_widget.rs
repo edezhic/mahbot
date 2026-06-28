@@ -184,27 +184,7 @@ pub struct EditorBuffer {
 impl EditorBuffer {
     /// Create an empty buffer with no language (no syntax highlighting).
     pub fn new() -> Self {
-        let buffer = with_font_system(|font_sys| {
-            let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
-            buffer.set_text(
-                font_sys,
-                "",
-                &cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono")),
-                cosmic_text::Shaping::Advanced,
-                None,
-            );
-            buffer
-        });
-        Self {
-            buffer: RefCell::new(buffer),
-            cursor_line: Cell::new(0),
-            cursor_col: Cell::new(0),
-            sel_line: Cell::new(0),
-            sel_col: Cell::new(0),
-            has_selection: Cell::new(false),
-            language: None,
-            file_extension: RefCell::new(None),
-        }
+        Self::with_text("", None)
     }
 
     /// Create a buffer pre-populated with the given text.
