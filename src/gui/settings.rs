@@ -2096,145 +2096,213 @@ mod tests {
     // ── parse_models ─────────────────────────────────────────
 
     #[test]
-    fn parse_models_none_returns_empty() {
-        assert!(parse_models(None).is_empty());
-    }
+    fn parse_models_cases() {
+        struct Case {
+            name: &'static str,
+            input: Option<&'static str>,
+            expected: &'static [&'static str],
+        }
 
-    #[test]
-    fn parse_models_empty_string_returns_empty() {
-        assert!(parse_models(Some("")).is_empty());
-    }
+        let cases = [
+            Case {
+                name: "None returns empty",
+                input: None,
+                expected: &[],
+            },
+            Case {
+                name: "empty string returns empty",
+                input: Some(""),
+                expected: &[],
+            },
+            Case {
+                name: "single line",
+                input: Some("google/gemini-3.1-flash-image-preview"),
+                expected: &["google/gemini-3.1-flash-image-preview"],
+            },
+            Case {
+                name: "multiple lines",
+                input: Some("model-a\nmodel-b\nmodel-c"),
+                expected: &["model-a", "model-b", "model-c"],
+            },
+            Case {
+                name: "trims whitespace",
+                input: Some("  model-a  \n  model-b  "),
+                expected: &["model-a", "model-b"],
+            },
+            Case {
+                name: "skips empty lines",
+                input: Some("model-a\n\n\nmodel-b"),
+                expected: &["model-a", "model-b"],
+            },
+            Case {
+                name: "skips whitespace-only lines",
+                input: Some("model-a\n   \nmodel-b"),
+                expected: &["model-a", "model-b"],
+            },
+        ];
 
-    #[test]
-    fn parse_models_single_line() {
-        assert_eq!(
-            parse_models(Some("google/gemini-3.1-flash-image-preview")),
-            vec!["google/gemini-3.1-flash-image-preview"]
-        );
-    }
-
-    #[test]
-    fn parse_models_multiple_lines() {
-        assert_eq!(
-            parse_models(Some("model-a\nmodel-b\nmodel-c")),
-            vec!["model-a", "model-b", "model-c"]
-        );
-    }
-
-    #[test]
-    fn parse_models_trims_whitespace() {
-        assert_eq!(
-            parse_models(Some("  model-a  \n  model-b  ")),
-            vec!["model-a", "model-b"]
-        );
-    }
-
-    #[test]
-    fn parse_models_skips_empty_lines() {
-        assert_eq!(
-            parse_models(Some("model-a\n\n\nmodel-b")),
-            vec!["model-a", "model-b"]
-        );
-    }
-
-    #[test]
-    fn parse_models_skips_whitespace_only_lines() {
-        assert_eq!(
-            parse_models(Some("model-a\n   \nmodel-b")),
-            vec!["model-a", "model-b"]
-        );
+        for case in &cases {
+            let result = parse_models(case.input);
+            let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(result, expected, "case: {}", case.name);
+        }
     }
 
     // ── add_model_to_list ────────────────────────────────────
 
     #[test]
-    fn add_model_to_list_empty_input_does_nothing() {
-        let mut input = String::new();
-        let mut list = None;
-        add_model_to_list(&mut input, &mut list);
-        assert!(list.is_none());
-    }
+    fn add_model_to_list_cases() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            initial_list: Option<&'static str>,
+            expected_list: Option<&'static str>,
+            expect_input_cleared: bool,
+        }
 
-    #[test]
-    fn add_model_to_list_whitespace_input_does_nothing() {
-        let mut input = "  ".to_string();
-        let mut list = None;
-        add_model_to_list(&mut input, &mut list);
-        assert!(list.is_none());
-    }
+        let cases = [
+            Case {
+                name: "empty input does nothing",
+                input: "",
+                initial_list: None,
+                expected_list: None,
+                expect_input_cleared: false,
+            },
+            Case {
+                name: "whitespace input does nothing",
+                input: "  ",
+                initial_list: None,
+                expected_list: None,
+                expect_input_cleared: false,
+            },
+            Case {
+                name: "adds to empty list",
+                input: "model-a",
+                initial_list: None,
+                expected_list: Some("model-a"),
+                expect_input_cleared: true,
+            },
+            Case {
+                name: "adds to existing list",
+                input: "model-c",
+                initial_list: Some("model-a\nmodel-b"),
+                expected_list: Some("model-a\nmodel-b\nmodel-c"),
+                expect_input_cleared: true,
+            },
+            Case {
+                name: "skips duplicates",
+                input: "model-a",
+                initial_list: Some("model-a\nmodel-b"),
+                expected_list: Some("model-a\nmodel-b"),
+                expect_input_cleared: true,
+            },
+            Case {
+                name: "trims input",
+                input: "  model-a  ",
+                initial_list: Some("model-b"),
+                expected_list: Some("model-b\nmodel-a"),
+                expect_input_cleared: true,
+            },
+        ];
 
-    #[test]
-    fn add_model_to_list_adds_to_empty_list() {
-        let mut input = "model-a".to_string();
-        let mut list = None;
-        add_model_to_list(&mut input, &mut list);
-        assert_eq!(list, Some("model-a".to_string()));
-        assert!(input.is_empty(), "input buffer should be cleared");
-    }
-
-    #[test]
-    fn add_model_to_list_adds_to_existing_list() {
-        let mut input = "model-b".to_string();
-        let mut list = Some("model-a".to_string());
-        add_model_to_list(&mut input, &mut list);
-        assert_eq!(list, Some("model-a\nmodel-b".to_string()));
-    }
-
-    #[test]
-    fn add_model_to_list_skips_duplicates() {
-        let mut input = "model-a".to_string();
-        let mut list = Some("model-a\nmodel-b".to_string());
-        add_model_to_list(&mut input, &mut list);
-        // List unchanged
-        assert_eq!(list, Some("model-a\nmodel-b".to_string()));
-        // Input buffer still cleared
-        assert!(input.is_empty());
-    }
-
-    #[test]
-    fn add_model_to_list_trims_input() {
-        let mut input = "  model-a  ".to_string();
-        let mut list = Some("model-b".to_string());
-        add_model_to_list(&mut input, &mut list);
-        assert_eq!(list, Some("model-b\nmodel-a".to_string()));
+        for case in &cases {
+            let mut input = case.input.to_string();
+            let mut list = case.initial_list.map(String::from);
+            add_model_to_list(&mut input, &mut list);
+            assert_eq!(
+                list,
+                case.expected_list.map(String::from),
+                "case: {} — list mismatch",
+                case.name
+            );
+            if case.expect_input_cleared {
+                assert!(
+                    input.is_empty(),
+                    "case: {} — input buffer should be cleared",
+                    case.name
+                );
+            } else {
+                assert_eq!(
+                    input, case.input,
+                    "case: {} — input should remain unchanged",
+                    case.name
+                );
+            }
+        }
     }
 
     // ── remove_model_from_list ───────────────────────────────
 
     #[test]
-    fn remove_model_from_list_removes_and_updates_active() {
-        let mut list = Some("model-a\nmodel-b\nmodel-c".to_string());
-        let mut active = Some("model-b".to_string());
-        remove_model_from_list("model-b", &mut list, &mut active);
-        assert_eq!(list, Some("model-a\nmodel-c".to_string()));
-        // Active resets to first remaining
-        assert_eq!(active, Some("model-a".to_string()));
-    }
+    fn remove_model_from_list_cases() {
+        struct Case {
+            name: &'static str,
+            model: &'static str,
+            initial_list: Option<&'static str>,
+            initial_active: Option<&'static str>,
+            expected_list: Option<&'static str>,
+            expected_active: Option<&'static str>,
+        }
 
-    #[test]
-    fn remove_model_from_list_non_active_keeps_active() {
-        let mut list = Some("model-a\nmodel-b\nmodel-c".to_string());
-        let mut active = Some("model-a".to_string());
-        remove_model_from_list("model-b", &mut list, &mut active);
-        assert_eq!(list, Some("model-a\nmodel-c".to_string()));
-        assert_eq!(active, Some("model-a".to_string()));
-    }
+        let cases = [
+            Case {
+                name: "removes and updates active",
+                model: "model-b",
+                initial_list: Some("model-a\nmodel-b\nmodel-c"),
+                initial_active: Some("model-b"),
+                expected_list: Some("model-a\nmodel-c"),
+                expected_active: Some("model-a"),
+            },
+            Case {
+                name: "non-active removal keeps active",
+                model: "model-b",
+                initial_list: Some("model-a\nmodel-b\nmodel-c"),
+                initial_active: Some("model-a"),
+                expected_list: Some("model-a\nmodel-c"),
+                expected_active: Some("model-a"),
+            },
+            Case {
+                name: "last entry clears active",
+                model: "model-a",
+                initial_list: Some("model-a"),
+                initial_active: Some("model-a"),
+                expected_list: None,
+                expected_active: None,
+            },
+            Case {
+                name: "not found no change",
+                model: "model-c",
+                initial_list: Some("model-a\nmodel-b"),
+                initial_active: Some("model-a"),
+                expected_list: Some("model-a\nmodel-b"),
+                expected_active: Some("model-a"),
+            },
+            Case {
+                name: "empty list with matching active clears active",
+                model: "model-a",
+                initial_list: None,
+                initial_active: Some("model-a"),
+                expected_list: None,
+                expected_active: None,
+            },
+        ];
 
-    #[test]
-    fn remove_model_from_list_last_entry_clears_active() {
-        let mut list = Some("model-a".to_string());
-        let mut active = Some("model-a".to_string());
-        remove_model_from_list("model-a", &mut list, &mut active);
-        assert!(list.is_none());
-        assert!(active.is_none());
-    }
-
-    #[test]
-    fn remove_model_from_list_not_found_no_change() {
-        let mut list = Some("model-a\nmodel-b".to_string());
-        let mut active = Some("model-a".to_string());
-        remove_model_from_list("model-c", &mut list, &mut active);
-        assert_eq!(list, Some("model-a\nmodel-b".to_string()));
-        assert_eq!(active, Some("model-a".to_string()));
+        for case in &cases {
+            let mut list = case.initial_list.map(String::from);
+            let mut active = case.initial_active.map(String::from);
+            remove_model_from_list(case.model, &mut list, &mut active);
+            assert_eq!(
+                list,
+                case.expected_list.map(String::from),
+                "case: {} — list mismatch",
+                case.name
+            );
+            assert_eq!(
+                active,
+                case.expected_active.map(String::from),
+                "case: {} — active mismatch",
+                case.name
+            );
+        }
     }
 }
