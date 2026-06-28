@@ -496,6 +496,30 @@ impl EditorBuffer {
                     cosmic_text::Shaping::Advanced,
                     None,
                 );
+                // `set_rich_text` (unlike `set_text`) does NOT append a trailing
+                // empty line for trailing newlines because `BidiParagraphs` does
+                // not produce an empty trailing paragraph.  This causes a
+                // mismatch: buffer line count differs from what `set_text` would
+                // produce, leading to cursor clamping in `edit_text()` that
+                // makes Enter at end-of-file appear to insert the newline
+                // *before* the last line instead of after it.
+                //
+                // Mirror `set_text` behaviour: if the original text ends with a
+                // newline and the last buffer line has a non-None line ending,
+                // append an empty trailing line with `LineEnding::None`.
+                if text.ends_with('\n')
+                    && buffer
+                        .lines
+                        .last()
+                        .is_some_and(|l| l.ending() != cosmic_text::LineEnding::None)
+                {
+                    buffer.lines.push(cosmic_text::BufferLine::new(
+                        "",
+                        cosmic_text::LineEnding::None,
+                        cosmic_text::AttrsList::new(&base_attrs),
+                        cosmic_text::Shaping::Advanced,
+                    ));
+                }
                 return;
             }
         }
@@ -3610,6 +3634,45 @@ mod tests {
         assert_eq!(cursor.line, 1);
         // "hello world" has no leading whitespace, so auto-indent produces
         // column 0 (empty indent on the new line).
+        assert_eq!(cursor.column, 0);
+    }
+
+    #[test]
+    fn test_enter_at_end_of_highlighted_file_with_trailing_newline() {
+        // Regression test for mahbot-531: Enter at end of a highlighted file
+        // that *has* a trailing newline must place cursor on a new blank line,
+        // not jump to the start of the last content line.
+        let buf = EditorBuffer::with_text("fn main() {}\n", Some(HighlightLanguage::Rust));
+        // Buffer should have a trailing empty sentinel line (2 lines).
+        assert_eq!(buf.line_count(), 2);
+        let cursor_before = buf.cursor();
+        assert_eq!(cursor_before.line, 0);
+        assert_eq!(cursor_before.column, 0);
+        // Move cursor to end of the content line (right after '}').
+        let content_len = "fn main() {}".chars().count();
+        buf.move_to(0, content_len);
+        buf.perform_action(EditorAction::Enter);
+        // Text should be: original line + inserted newline + trailing sentinel.
+        assert_eq!(buf.text(), "fn main() {}\n\n");
+        let cursor = buf.cursor();
+        // Cursor must be on the newly created blank line (line 1).
+        assert_eq!(cursor.line, 1);
+        assert_eq!(cursor.column, 0);
+    }
+
+    #[test]
+    fn test_enter_at_end_of_highlighted_file_no_trailing_newline() {
+        // Same as above but the file has *no* trailing newline — the bug
+        // would clamp cursor to (line=0, col=0) instead of (line=1, col=0).
+        let buf = EditorBuffer::with_text("fn main() {}", Some(HighlightLanguage::Rust));
+        assert_eq!(buf.line_count(), 1);
+        let content_len = "fn main() {}".chars().count();
+        buf.move_to(0, content_len);
+        buf.perform_action(EditorAction::Enter);
+        // Enter inserts \n; buffer_text now includes a trailing newline.
+        assert_eq!(buf.text(), "fn main() {}\n");
+        let cursor = buf.cursor();
+        assert_eq!(cursor.line, 1);
         assert_eq!(cursor.column, 0);
     }
 
