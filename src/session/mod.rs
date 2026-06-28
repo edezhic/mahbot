@@ -14,8 +14,8 @@ use std::path::Path;
 
 global_store! {
     /// Global session store.
-    pub static SESSIONS: SessionStorage,
-    constructor = SessionStorage::new_global,
+    pub static SESSIONS: SessionStore,
+    constructor = SessionStore::open,
     expect = "SESSIONS not initialized",
 }
 
@@ -76,12 +76,12 @@ pub struct SessionMetadata {
 
 /// Turso-backed session store.
 #[derive(Clone, Debug)]
-pub struct SessionStorage {
+pub struct SessionStore {
     pub(crate) conn: Connection,
 }
 
-impl SessionStorage {
-    pub async fn new_global(sessions_root: &Path) -> Result<Self> {
+impl SessionStore {
+    pub async fn open(sessions_root: &Path) -> Result<Self> {
         let db_path = sessions_root.join("db/sessions.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
         Ok(Self { conn })
@@ -121,7 +121,7 @@ fn session_metadata_from_row(
 }
 
 /// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction.
-/// Shared helper used by [`SessionStorage::batch_append`] and [`SessionStorage::replace_messages`].
+/// Shared helper used by [`SessionStore::batch_append`] and [`SessionStore::replace_messages`].
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
     session_key: &str,
@@ -153,7 +153,7 @@ async fn insert_messages_in_transaction(
 
 // ── Methods — callable on the static ──────────────────────────
 
-impl SessionStorage {
+impl SessionStore {
     pub(crate) async fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let rows = match self
             .conn

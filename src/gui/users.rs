@@ -2,12 +2,12 @@
 
 #![allow(clippy::too_many_lines)]
 
-use crate::users::{FieldUpdate, UserRecord, UserStorage};
+use crate::users::{FieldUpdate, UserRecord, UserStore};
 
 use iced::Task;
 
 /// De-duplicated access to the global user store.
-pub(crate) fn user_store() -> Result<&'static UserStorage, String> {
+pub(crate) fn user_store() -> Result<&'static UserStore, String> {
     crate::users::USER_STORE
         .get()
         .ok_or_else(|| "User store not initialized".to_string())

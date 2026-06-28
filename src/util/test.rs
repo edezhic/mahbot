@@ -114,7 +114,7 @@ pub async fn expect_ticket_status(store: &BoardStore, id: &str) -> TicketPhase {
 ///
 /// Idempotent — subsequent calls are no-ops.
 pub async fn init_test_stores() {
-    use crate::session::SessionStorage;
+    use crate::session::SessionStore;
 
     static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     INIT.get_or_init(|| async {
@@ -123,9 +123,9 @@ pub async fn init_test_stores() {
 
         crate::session::SESSIONS
             .set(
-                SessionStorage::new_global(test_root())
+                SessionStore::open(test_root())
                     .await
-                    .expect("failed to create SessionStorage for tests"),
+                    .expect("failed to create SessionStore for tests"),
             )
             .expect("SESSIONS already initialized by another path");
         crate::board::BOARD

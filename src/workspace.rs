@@ -16,8 +16,8 @@ use tracing::warn;
 
 global_store! {
     /// Global workspace store.
-    pub static WORKSPACES: WorkspaceStorage,
-    constructor = WorkspaceStorage::open,
+    pub static WORKSPACES: WorkspaceStore,
+    constructor = WorkspaceStore::open,
     expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",
 }
 
@@ -33,7 +33,7 @@ pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
 
 /// Turso-backed workspace storage.
 #[derive(Clone, Debug)]
-pub struct WorkspaceStorage {
+pub struct WorkspaceStore {
     pub(crate) conn: Connection,
 }
 
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS editor_tabs (
 ///
 /// `discovery_generation` is intentionally excluded from this column list: it
 /// is read only via its own single-column SELECT in
-/// [`WorkspaceStorage::get_discovery_generation`] and is never part of a workspace struct query.
+/// [`WorkspaceStore::get_discovery_generation`] and is never part of a workspace struct query.
 const WORKSPACE_COLUMNS: &str = "name, path, status, created_at, updated_at, \
      maintenance, paused, maintainer_debounce_mins, maintainer_last_run_at, \
      diagnostics, diagnostics_updated_at";
@@ -101,7 +101,7 @@ const COL_WS_DIAGNOSTICS_UPDATED_AT: usize = 10;
 ///
 /// The column order here must match the positional indices defined in
 /// [`COL_ET_FILE_PATH`] through [`COL_ET_DIRTY_CONTENT`], which are used
-/// in [`WorkspaceStorage::load_editor_tabs`].
+/// in [`WorkspaceStore::load_editor_tabs`].
 const EDITOR_TAB_COLUMNS: &str = "file_path, tab_order, is_active, is_dirty, dirty_content";
 
 /// Column-index constants for [`EDITOR_TAB_COLUMNS`].
@@ -117,7 +117,7 @@ const COL_ET_DIRTY_CONTENT: usize = 4;
 ///
 /// The column order here must match the positional indices defined in
 /// [`COL_WSST_NAME`] through [`COL_WSST_MAINTENANCE`], which are used
-/// in [`WorkspaceStorage::list_states`].
+/// in [`WorkspaceStore::list_states`].
 const WS_STATE_COLUMNS: &str = "name, paused, maintenance";
 
 /// Column-index constants for [`WS_STATE_COLUMNS`].
@@ -126,10 +126,10 @@ const COL_WSST_PAUSED: usize = 1;
 const COL_WSST_MAINTENANCE: usize = 2;
 
 /// Check the discovery generation counter: return `true` if the calling task
-/// is still the latest (OK to proceed), `false` if a newer [`WorkspaceStorage::rediscover`] has
+/// is still the latest (OK to proceed), `false` if a newer [`WorkspaceStore::rediscover`] has
 /// been triggered (stale — do not proceed).
 async fn check_discovery_generation(
-    storage: &WorkspaceStorage,
+    storage: &WorkspaceStore,
     workspace_name: &str,
     discovery_generation: i64,
     label: &str,
@@ -155,7 +155,7 @@ async fn check_discovery_generation(
 ///
 /// `discovery_generation` is the generation counter captured at spawn time.
 /// Before writing the context, we re-read the current generation from the DB;
-/// if it no longer matches, a newer [`WorkspaceStorage::rediscover`] call has been made and this
+/// if it no longer matches, a newer [`WorkspaceStore::rediscover`] call has been made and this
 /// task's result is stale — the write is skipped silently.
 ///
 /// Returns `Ok(())` on success, or an error describing what went wrong.
@@ -204,7 +204,7 @@ async fn run_workspace_discovery(
 /// to scan build files and identify commands for format, lint, type-check, build,
 /// and unit-test categories. Extracts structured output via [`crate::extraction::retry_extract_structured`].
 ///
-/// `discovery_generation` guards against stale writes — if a newer [`WorkspaceStorage::rediscover`]
+/// `discovery_generation` guards against stale writes — if a newer [`WorkspaceStore::rediscover`]
 /// was triggered while diagnostics were being computed, the write is skipped.
 ///
 /// On failure, existing diagnostics data is left untouched.
@@ -271,10 +271,10 @@ async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) ->
 ///   A successful discovery — whether initial or rediscovery — brings the
 ///   workspace back to life.
 /// - If **not** `all_ok`: sets status to `failed` and leaves `paused` untouched.
-/// - Before any write, checks the generation guard: if a newer [`WorkspaceStorage::rediscover`]
+/// - Before any write, checks the generation guard: if a newer [`WorkspaceStore::rediscover`]
 ///   bumped the generation while discovery was in flight, the writes are skipped.
 async fn finalize_discovery(
-    storage: &WorkspaceStorage,
+    storage: &WorkspaceStore,
     ws_name: &str,
     discovery_generation: i64,
     all_ok: bool,
@@ -453,8 +453,7 @@ fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
     })
 }
 
-impl WorkspaceStorage {
-    /// Open (or create) the workspaces database at `root/db/workspaces.db`.
+impl WorkspaceStore {
     pub async fn open(root: &Path) -> Result<Self> {
         let db_path = root.join("db/workspaces.db");
         let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
@@ -946,9 +945,9 @@ mod tests {
     /// Open a temporary workspace store for testing.
     /// Returns (store, temp_dir). The temp_dir is kept alive for the lifetime
     /// of the store (~ the test function).
-    async fn test_store() -> (WorkspaceStorage, TempDir) {
+    async fn test_store() -> (WorkspaceStore, TempDir) {
         let tmp = TempDir::new().expect("temp dir");
-        let store = WorkspaceStorage::open(tmp.path())
+        let store = WorkspaceStore::open(tmp.path())
             .await
             .expect("open workspace store");
         (store, tmp)
@@ -958,7 +957,7 @@ mod tests {
     /// bypassing `add()` (which has side-effects like initializing search
     /// engine globals).
     async fn insert_direct(
-        store: &WorkspaceStorage,
+        store: &WorkspaceStore,
         name: &str,
         path: &str,
         paused: bool,

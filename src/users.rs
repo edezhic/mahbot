@@ -27,13 +27,13 @@ use tracing::warn;
 
 global_store! {
     /// Global user store.
-    pub static USER_STORE: UserStorage,
-    constructor = UserStorage::open,
+    pub static USER_STORE: UserStore,
+    constructor = UserStore::open,
 }
 
 /// Turso-backed user preferences storage.
 #[derive(Clone, Debug)]
-pub struct UserStorage {
+pub struct UserStore {
     pub(crate) conn: Connection,
 }
 
@@ -67,7 +67,7 @@ const COL_UC_CHANNEL: usize = 0;
 const COL_UC_IDENTIFIER: usize = 1;
 const COL_UC_REPLY_TARGET: usize = 2;
 
-impl UserStorage {
+impl UserStore {
     /// Open (or create) the users database at `root/db/users.db`.
     /// On fresh databases, auto-creates the `admin` user with full permissions.
     pub async fn open(root: &Path) -> Result<Self> {
@@ -325,7 +325,7 @@ impl UserStorage {
 
 /// Represents an optional update to a user column.
 ///
-/// Used by [`UserStorage::update_user`] to express whether a column should be
+/// Used by [`UserStore::update_user`] to express whether a column should be
 /// left alone, set to NULL, or updated to a specific value — replacing the
 /// confusing `Option<Option<&str>>` tri-state with a self-documenting enum.
 #[derive(Debug, Clone, Copy)]
@@ -362,7 +362,7 @@ async fn upsert_user_field(
 
 // ── UserRecord ────────────────────────────────────────────────
 
-/// A full user row, returned by [`UserStorage::list_users`].
+/// A full user row, returned by [`UserStore::list_users`].
 #[derive(Debug, Clone, Serialize)]
 pub struct UserRecord {
     /// The canonical user name.
@@ -547,7 +547,7 @@ pub(crate) mod test_util {
             return;
         }
         let dir = tempfile::TempDir::new().expect("Failed to create temp dir for test user store");
-        let store = UserStorage::open(dir.path())
+        let store = UserStore::open(dir.path())
             .await
             .expect("Failed to open test user store");
         store
