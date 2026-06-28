@@ -338,17 +338,6 @@ impl Connection {
     ) -> turso::Result<u64> {
         self.maybe_rollback_dangling_tx().await?;
         let conn = self.conn.lock().await;
-        Self::execute_impl(&conn, sql, params).await
-    }
-
-    /// Core execution logic shared by [`Connection::execute`] and
-    /// [`TxGuard::execute`].  Operates on a raw connection that is already
-    /// locked (no lock acquisition).
-    async fn execute_impl(
-        conn: &turso::Connection,
-        sql: &str,
-        params: impl IntoParams + Send + 'static,
-    ) -> turso::Result<u64> {
         conn.execute(sql, params).await
     }
 
@@ -510,7 +499,7 @@ impl TxGuard<'_> {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<u64> {
-        Connection::execute_impl(&self.conn, sql, params).await
+        self.conn.execute(sql, params).await
     }
 
     /// Execute a query that returns exactly one row.
@@ -524,37 +513,6 @@ impl TxGuard<'_> {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         Connection::query_row_impl(&self.conn, sql, params, map).await
-    }
-
-    /// Execute a query that returns zero or one row.
-    ///
-    /// Returns `Ok(Some(val))` if a row is found, `Ok(None)` when no row
-    /// matches (i.e. [`turso::Error::QueryReturnedNoRows`] is caught), or
-    /// `Err` if the query fails for another reason.
-    ///
-    /// This is a convenience wrapper around [`Self::query_row`] that
-    /// eliminates the common `match { Ok(val) => Ok(Some(val)),
-    /// Err(QueryReturnedNoRows) => Ok(None), Err(e) => Err(e.into()) }`
-    /// boilerplate.
-    ///
-    /// **Note:** Added for API symmetry with [`Connection::query_optional`].
-    /// No existing callers use this method — it exists so that code working
-    /// inside a transaction has the same optional-row helper available
-    /// without switching back to the `Connection` interface.
-    pub async fn query_optional<T, E>(
-        &self,
-        sql: &str,
-        params: impl IntoParams + Send + 'static,
-        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
-    ) -> anyhow::Result<Option<T>>
-    where
-        E: std::fmt::Display + Send + Sync + 'static,
-    {
-        match self.query_row(sql, params, map).await {
-            Ok(val) => Ok(Some(val)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// Execute a query returning zero or more rows.
