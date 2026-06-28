@@ -624,6 +624,21 @@ pub async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Result<Co
     Ok(conn)
 }
 
+/// Open a store database under `<root>/db/<name>.db`.
+///
+/// Creates parent directories if needed and runs the provided `schema` via
+/// [`open_with_schema`].  This is a convenience helper for the near-identical
+/// [`open`] methods on each store module, keeping the DB filename and path
+/// construction centralised in one place.
+pub(crate) async fn open_store(
+    root: &Path,
+    name: &str,
+    schema: &str,
+) -> anyhow::Result<Connection> {
+    let db_path = root.join("db").join(format!("{name}.db"));
+    open_with_schema(&db_path, schema).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

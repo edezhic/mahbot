@@ -77,8 +77,7 @@ impl UserStore {
     /// Open (or create) the users database at `root/db/users.db`.
     /// On fresh databases, auto-creates the `admin` user with full permissions.
     pub async fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join("db/users.db");
-        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+        let conn = turso::open_store(root, "users", SCHEMA).await?;
         let this = Self { conn };
         this.ensure_admin_user().await?;
         Ok(this)

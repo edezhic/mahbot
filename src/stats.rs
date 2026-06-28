@@ -85,9 +85,7 @@ impl StatsStore {
     /// The `workspace` column was added to the schema in an earlier version;
     /// it is now part of the `CREATE TABLE` schema and no migration is needed.
     pub async fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join("db/stats.db");
-        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
-
+        let conn = turso::open_store(root, "stats", SCHEMA).await?;
         Ok(Self { conn })
     }
 

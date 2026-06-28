@@ -87,9 +87,8 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub async fn open(sessions_root: &Path) -> Result<Self> {
-        let db_path = sessions_root.join("db/sessions.db");
-        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+    pub async fn open(root: &Path) -> Result<Self> {
+        let conn = turso::open_store(root, "sessions", SCHEMA).await?;
         Ok(Self { conn })
     }
 }

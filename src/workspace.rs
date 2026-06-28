@@ -447,9 +447,7 @@ fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
 
 impl WorkspaceStore {
     pub async fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join("db/workspaces.db");
-        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
-
+        let conn = turso::open_store(root, "workspaces", SCHEMA).await?;
         Ok(Self { conn })
     }
 

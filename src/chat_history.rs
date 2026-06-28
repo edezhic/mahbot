@@ -89,8 +89,7 @@ pub struct ChatHistoryStore {
 impl ChatHistoryStore {
     /// Open (or create) the chat history database at `root/db/chat_history.db`.
     pub async fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join("db/chat_history.db");
-        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+        let conn = turso::open_store(root, "chat_history", SCHEMA).await?;
         Ok(Self { conn })
     }
 

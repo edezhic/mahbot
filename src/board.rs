@@ -484,8 +484,7 @@ struct AddCommentSql {
 impl BoardStore {
     /// Open (or create) the board database at `root/db/board.db`.
     pub async fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join("db/board.db");
-        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+        let conn = turso::open_store(root, "board", SCHEMA).await?;
 
         crate::turso::ensure_fts_index(
             &conn,

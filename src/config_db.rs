@@ -98,8 +98,7 @@ const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 impl ConfigStore {
     /// Open (or create) the config database at `root/db/config.db`.
     pub async fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join("db/config.db");
-        let conn = turso::open_with_schema(&db_path, SCHEMA).await?;
+        let conn = turso::open_store(root, "config", SCHEMA).await?;
         Ok(Self { conn })
     }
 
