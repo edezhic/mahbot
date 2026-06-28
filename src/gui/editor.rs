@@ -1491,10 +1491,6 @@ pub struct EditorState {
     tab_contents: HashMap<String, TabData>,
     /// Scrollable ID for the tab bar.
     tab_scroll_id: Id,
-    /// Pending close dialog: (tab_index, action_sentinel).
-    close_dialog: Option<(usize, CloseAction)>,
-    /// When set, "close other tabs" dialog is shown (tab index to keep).
-    close_others_target: Option<usize>,
     /// When set, after the next successful save, close this tab (used by Save-from-close-dialog).
     pending_save_close: Option<usize>,
     /// Save queue for close-others: (keep_idx, remaining dirty indices to save).
@@ -1533,44 +1529,35 @@ pub struct EditorState {
     /// Paths for which a "file deleted" toast has already been shown.
     /// Prevents spamming the toast every 300 ms.
     deleted_file_toasted: HashSet<String>,
-    /// Go-to-line bar input text (None when bar is hidden).
-    goto_line_input: Option<String>,
-    /// Quick-open state (None when closed).
-    quick_open: Option<QuickOpenState>,
+    /// Which modal overlay is currently open (None when no overlay is active).
+    /// Enforced by the type system to be mutually exclusive — only one overlay
+    /// may be open at a time.
+    active_modal: Option<ModalKind>,
     /// Cached list of all workspace files for quick-open filtering.
     /// Populated on each quick-open toggle from currently expanded dirs.
     all_workspace_files: Vec<String>,
-    /// Global search (find-in-files) state (None when closed).
-    global_search: Option<GlobalSearchState>,
     /// Generation counter for global search stale-result prevention.
     global_search_gen: u64,
     /// When set, the next file load for this path+generation should jump to this line.
     /// The tuple is (abs_path, 1-based line_number, expected_file_gen). Consumed by the
     /// `FileLoaded` handler only when both path and generation match.
     pending_goto: Option<(String, usize, u64)>,
-    /// Pending delete confirmation dialog.
-    delete_confirm: Option<DeleteConfirmTarget>,
-    /// Pending new file/directory name input.
-    new_item_input: Option<NewItemTarget>,
-    /// Current inline rename target (None when not renaming).
-    rename_target: Option<RenameTarget>,
 }
 
 /// Identifies which modal overlay is currently open, in Escape-dismissal
 /// priority order (GlobalSearch highest, CloseOthers lowest).
 ///
-/// Used by [`EditorState::active_modal()`] to return the topmost open modal,
-/// and by [`EditorState::escape()`] to dispatch dismissal in the correct order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Each variant carries the state data for that overlay.
+#[derive(Debug, Clone)]
 enum ModalKind {
-    GlobalSearch,
-    GotoLine,
-    QuickOpen,
-    Rename,
-    NewItem,
-    DeleteConfirm,
-    CloseDialog,
-    CloseOthers,
+    GlobalSearch(GlobalSearchState),
+    GotoLine(String),
+    QuickOpen(QuickOpenState),
+    Rename(RenameTarget),
+    NewItem(NewItemTarget),
+    DeleteConfirm(DeleteConfirmTarget),
+    CloseDialog(usize),
+    CloseOthers(usize),
 }
 
 /// State for the quick-open file picker.
@@ -1601,8 +1588,6 @@ impl EditorState {
             active_tab_index: 0,
             tab_contents: HashMap::new(),
             tab_scroll_id: Id::new("editor_tabs_bar"),
-            close_dialog: None,
-            close_others_target: None,
             pending_save_close: None,
             pending_close_others: None,
             session_initialized: false,
@@ -1616,15 +1601,10 @@ impl EditorState {
             tab_save_counter: Arc::new(AtomicU64::new(0)),
             file_mtimes: HashMap::new(),
             deleted_file_toasted: HashSet::new(),
-            goto_line_input: None,
-            quick_open: None,
+            active_modal: None,
             all_workspace_files: Vec::new(),
-            global_search: None,
             global_search_gen: 0,
             pending_goto: None,
-            delete_confirm: None,
-            new_item_input: None,
-            rename_target: None,
         }
     }
 
@@ -1750,10 +1730,12 @@ impl EditorState {
         &'a self,
         node: &'a widgets::TreeNode,
     ) -> Option<Element<'a, EditorMessage>> {
-        let rt = self
-            .rename_target
-            .as_ref()
-            .filter(|rt| rt.path == node.full_path)?;
+        let ModalKind::Rename(rt) = self.active_modal.as_ref()? else {
+            return None;
+        };
+        if rt.path != node.full_path {
+            return None;
+        }
         let input: Element<'a, EditorMessage> = text_input("", &rt.input_text)
             .id(Id::from(format!("rename_input_{}", node.full_path)))
             .on_input(EditorMessage::RenameInput)
@@ -1955,36 +1937,9 @@ impl EditorState {
             .is_some()
     }
 
-    /// Returns the highest-priority modal overlay that is currently open, or
-    /// [`None`] if no modal is active.  Priority order matches Escape's
-    /// dismissal cascade: GlobalSearch → GotoLine → QuickOpen → Rename →
-    /// NewItem → DeleteConfirm → CloseDialog → CloseOthers.
-    fn active_modal(&self) -> Option<ModalKind> {
-        if self.global_search.is_some() {
-            return Some(ModalKind::GlobalSearch);
-        }
-        if self.goto_line_input.is_some() {
-            return Some(ModalKind::GotoLine);
-        }
-        if self.quick_open.is_some() {
-            return Some(ModalKind::QuickOpen);
-        }
-        if self.rename_target.is_some() {
-            return Some(ModalKind::Rename);
-        }
-        if self.new_item_input.is_some() {
-            return Some(ModalKind::NewItem);
-        }
-        if self.delete_confirm.is_some() {
-            return Some(ModalKind::DeleteConfirm);
-        }
-        if self.close_dialog.is_some() {
-            return Some(ModalKind::CloseDialog);
-        }
-        if self.close_others_target.is_some() {
-            return Some(ModalKind::CloseOthers);
-        }
-        None
+    /// Returns the active modal overlay, if any.
+    fn active_modal(&self) -> Option<&ModalKind> {
+        self.active_modal.as_ref()
     }
 
     /// Returns `true` when a modal overlay or text input owns keyboard focus
@@ -2208,10 +2163,10 @@ impl EditorState {
             return Task::none();
         }
         if self.tabs[idx].is_dirty {
-            self.close_dialog = Some((idx, CloseAction::Cancel));
+            self.active_modal = Some(ModalKind::CloseDialog(idx));
             return Task::none();
         }
-        self.close_dialog = None;
+        self.active_modal = None;
         self.remove_tab_at(idx);
         self.save_current_tabs().unwrap_or(Task::none())
     }
@@ -2295,8 +2250,7 @@ impl EditorState {
         self.git_ignore_cache.clear();
         self.git_ignore_loading = false;
         self.session_initialized = false;
-        self.close_dialog = None;
-        self.close_others_target = None;
+        self.active_modal = None;
         self.pending_save_close = None;
         self.pending_close_others = None;
         self.file_tree.visible_tree_nodes.clear();
@@ -2307,24 +2261,17 @@ impl EditorState {
         self.tab_save_counter.store(0, Ordering::Release);
         self.file_mtimes.clear();
         self.deleted_file_toasted.clear();
-        self.goto_line_input = None;
-        self.quick_open = None;
         self.all_workspace_files.clear();
-        self.global_search = None;
         self.global_search_gen = 0;
         self.pending_goto = None;
-        self.delete_confirm = None;
-        self.new_item_input = None;
-        self.rename_target = None;
     }
 
     /// Start creating a new item (file or directory) in the given parent directory.
     ///
-    /// Cancels any inline rename, resolves the absolute parent path, and sets up
-    /// the `new_item_input` state so the user can type a name.
+    /// Resolves the absolute parent path and sets up the `new_item_input` state
+    /// so the user can type a name.  Any previously active modal is implicitly
+    /// replaced since `active_modal` enforces mutual exclusion.
     fn start_new_item_creation(&mut self, parent_dir: String, is_dir: bool) -> Task<EditorMessage> {
-        // Cancel inline rename if open.
-        self.rename_target = None;
         let Some(ref ws) = self.selected_workspace_path else {
             return Task::none();
         };
@@ -2336,13 +2283,13 @@ impl EditorState {
                 .to_string_lossy()
                 .to_string()
         };
-        self.new_item_input = Some(NewItemTarget {
+        self.active_modal = Some(ModalKind::NewItem(NewItemTarget {
             parent_dir,
             is_dir,
             abs_parent,
             ws_root: ws.clone(),
             input_text: String::new(),
-        });
+        }));
         iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
     }
 
@@ -2367,8 +2314,8 @@ impl EditorState {
             EditorMessage::ToggleDir(dir_path) => {
                 // Cancel inline rename (clicking a tree row while renaming
                 // means the user is dismissing the rename).
-                if self.rename_target.is_some() {
-                    self.rename_target = None;
+                if matches!(self.active_modal, Some(ModalKind::Rename(_))) {
+                    self.active_modal = None;
                 }
                 // Clear any previously-selected file highlight — navigating
                 // to a directory should visually show the directory as focused,
@@ -2402,8 +2349,8 @@ impl EditorState {
                 self.file_tree.tree_focused = true;
                 // Cancel inline rename (clicking a tree row while renaming
                 // means the user is dismissing the rename).
-                if self.rename_target.is_some() {
-                    self.rename_target = None;
+                if matches!(self.active_modal, Some(ModalKind::Rename(_))) {
+                    self.active_modal = None;
                 }
                 self.pending_enter_dir = None;
                 // Remember the clicked file's position for Ctrl+B re-focus.
@@ -2457,7 +2404,9 @@ impl EditorState {
                 // tree to the editor, matching Escape handler behavior.
                 self.file_tree.tree_focused = false;
                 self.pending_enter_dir = None;
-                self.rename_target = None;
+                if matches!(self.active_modal, Some(ModalKind::Rename(_))) {
+                    self.active_modal = None;
+                }
 
                 let Some((idx, path)) = self.active_tab() else {
                     return Task::none();
@@ -2514,17 +2463,17 @@ impl EditorState {
                 CloseAction::Save => {
                     if tab_index < self.tabs.len() {
                         // Clear dialog immediately; close tab after save completes.
-                        self.close_dialog = None;
+                        self.active_modal = None;
                         self.pending_save_close = Some(tab_index);
 
                         build_save_task(&self.tabs, &self.tab_contents, tab_index)
                     } else {
-                        self.close_dialog = None;
+                        self.active_modal = None;
                         Task::none()
                     }
                 }
                 CloseAction::Discard => {
-                    self.close_dialog = None;
+                    self.active_modal = None;
                     self.pending_save_close = None;
                     if tab_index < self.tabs.len() {
                         self.remove_tab_at(tab_index);
@@ -2532,7 +2481,7 @@ impl EditorState {
                     self.save_current_tabs().unwrap_or(Task::none())
                 }
                 CloseAction::Cancel => {
-                    self.close_dialog = None;
+                    self.active_modal = None;
                     self.pending_save_close = None;
                     Task::none()
                 }
@@ -2540,14 +2489,13 @@ impl EditorState {
 
             EditorMessage::CloseOthersDialog { keep_idx, action } => match action {
                 CloseAction::Save => {
-                    self.close_others_target = None;
+                    self.active_modal = None;
                     // Collect all dirty tabs (excluding keep_idx) to save sequentially.
                     let mut dirty: Vec<usize> = (0..self.tabs.len())
                         .filter(|&i| i != keep_idx && self.tabs[i].is_dirty)
                         .collect();
                     if dirty.is_empty() {
                         // Nothing to save — just close the rest and persist.
-                        self.close_others_target = None;
                         self.remove_all_tabs_except(keep_idx);
                         return self.save_current_tabs().unwrap_or(Task::none());
                     }
@@ -2557,14 +2505,14 @@ impl EditorState {
                     build_save_task(&self.tabs, &self.tab_contents, first)
                 }
                 CloseAction::Discard => {
-                    self.close_others_target = None;
+                    self.active_modal = None;
                     self.pending_close_others = None;
                     // Close all tabs except keep_idx, discarding unsaved changes.
                     self.remove_all_tabs_except(keep_idx);
                     self.save_current_tabs().unwrap_or(Task::none())
                 }
                 CloseAction::Cancel => {
-                    self.close_others_target = None;
+                    self.active_modal = None;
                     self.pending_close_others = None;
                     Task::none()
                 }
@@ -2583,7 +2531,7 @@ impl EditorState {
                     self.remove_all_tabs_except(idx);
                     return self.save_current_tabs().unwrap_or(Task::none());
                 }
-                self.close_others_target = Some(idx);
+                self.active_modal = Some(ModalKind::CloseOthers(idx));
                 Task::none()
             }
 
@@ -2591,24 +2539,23 @@ impl EditorState {
 
             // ── Go-to-line ────────────────────────────────────────────
             EditorMessage::GoToLineToggle => {
-                // Allow toggle-to-close when goto_line is already open, but
+                // Allow toggle-to-close when GotoLine is already open, but
                 // block if any other modal is active.
-                if self
-                    .active_modal()
-                    .is_some_and(|m| m != ModalKind::GotoLine)
-                {
-                    return Task::none();
+                if let Some(modal) = &self.active_modal {
+                    if !matches!(modal, ModalKind::GotoLine(_)) {
+                        return Task::none();
+                    }
                 }
                 if let Some((_, path)) = self.active_tab() {
-                    if self.goto_line_input.is_some() {
-                        self.goto_line_input = None;
+                    if matches!(self.active_modal, Some(ModalKind::GotoLine(_))) {
+                        self.active_modal = None;
                         return Task::none();
                     }
                     // Close find bar when opening go-to-line.
                     if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                         tab_data.find_replace_state = None;
                     }
-                    self.goto_line_input = Some(String::new());
+                    self.active_modal = Some(ModalKind::GotoLine(String::new()));
                     return iced::widget::operation::focus::<EditorMessage>(Id::new(
                         GOTO_LINE_INPUT_ID,
                     ));
@@ -2619,14 +2566,16 @@ impl EditorState {
             EditorMessage::GoToLineInput(input) => {
                 // Only keep digits in the input.
                 let digits: String = input.chars().filter(char::is_ascii_digit).collect();
-                self.goto_line_input = Some(digits);
+                if matches!(self.active_modal, Some(ModalKind::GotoLine(_))) {
+                    self.active_modal = Some(ModalKind::GotoLine(digits));
+                }
                 Task::none()
             }
 
             EditorMessage::GoToLineGo => {
-                let input = match self.goto_line_input.as_ref() {
-                    Some(v) => v.clone(),
-                    None => return Task::none(),
+                let input = match &self.active_modal {
+                    Some(ModalKind::GotoLine(v)) => v.clone(),
+                    _ => return Task::none(),
                 };
                 let line_num: usize = match input.parse::<usize>() {
                     Ok(n) if n > 0 => n.saturating_sub(1), // convert 1-based to 0-based
@@ -2640,7 +2589,7 @@ impl EditorState {
                     let line = line_num.min(max_line.saturating_sub(1));
                     tab_data.content.move_to(line, 0);
                 }
-                self.goto_line_input = None;
+                self.active_modal = None;
                 Task::none()
             }
 
@@ -2648,9 +2597,9 @@ impl EditorState {
             EditorMessage::GlobalSearchToggle => self.global_search_toggle(),
 
             EditorMessage::GlobalSearchInput(query) => {
-                let state = match self.global_search.as_mut() {
-                    Some(s) => s,
-                    None => return Task::none(),
+                let state = match &mut self.active_modal {
+                    Some(ModalKind::GlobalSearch(s)) => s,
+                    _ => return Task::none(),
                 };
                 state.query.clone_from(&query);
 
@@ -2691,9 +2640,9 @@ impl EditorState {
             } => self.global_search_results(r#gen, results, error),
 
             EditorMessage::GlobalSearchSelect(idx) => {
-                let state = match self.global_search.as_ref() {
-                    Some(s) => s,
-                    None => return Task::none(),
+                let state = match &self.active_modal {
+                    Some(ModalKind::GlobalSearch(s)) => s,
+                    _ => return Task::none(),
                 };
                 let Some(match_result) = state.results.get(idx) else {
                     return Task::none();
@@ -2703,7 +2652,7 @@ impl EditorState {
                 let line_number = match_result.line_number as usize;
 
                 // Close the search panel.
-                self.global_search = None;
+                self.active_modal = None;
 
                 // Open the file and move to the matching line.
                 // Convert from 1-based (grep) to 0-based (editor).
@@ -2730,29 +2679,25 @@ impl EditorState {
             }
 
             EditorMessage::GlobalSearchClose => {
-                self.global_search = None;
+                self.active_modal = None;
                 Task::none()
             }
 
             // ── Context menu actions ─────────────────────────────────
             EditorMessage::DeleteFileRequested(path) => {
-                // Cancel inline rename if open (mutual exclusion).
-                self.rename_target = None;
                 let Some(abs_path) = self.abs_path(&path) else {
                     return Task::none();
                 };
-                self.delete_confirm = Some(DeleteConfirmTarget {
+                self.active_modal = Some(ModalKind::DeleteConfirm(DeleteConfirmTarget {
                     path,
                     is_dir: false,
                     dirty_tab_count: 0,
                     abs_path,
-                });
+                }));
                 Task::none()
             }
 
             EditorMessage::DeleteDirectoryRequested(path) => {
-                // Cancel inline rename if open (mutual exclusion).
-                self.rename_target = None;
                 // Guard: don't allow deleting the root directory.
                 if path.is_empty() {
                     return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(
@@ -2774,12 +2719,12 @@ impl EditorState {
                     }
                 }
 
-                self.delete_confirm = Some(DeleteConfirmTarget {
+                self.active_modal = Some(ModalKind::DeleteConfirm(DeleteConfirmTarget {
                     path,
                     is_dir: true,
                     dirty_tab_count: dirty_count,
                     abs_path,
-                });
+                }));
                 Task::none()
             }
 
@@ -2798,10 +2743,10 @@ impl EditorState {
             EditorMessage::CopyAbsolutePath(path) => iced::clipboard::write(path),
 
             EditorMessage::ConfirmDelete => {
-                let Some(target) = self.delete_confirm.clone() else {
+                let Some(ModalKind::DeleteConfirm(target)) = self.active_modal.clone() else {
                     return Task::none();
                 };
-                self.delete_confirm = None;
+                self.active_modal = None;
                 if target.is_dir {
                     self.perform_dir_delete(&target)
                 } else {
@@ -2810,12 +2755,12 @@ impl EditorState {
             }
 
             EditorMessage::CancelDelete => {
-                self.delete_confirm = None;
+                self.active_modal = None;
                 Task::none()
             }
 
             EditorMessage::NewItemSubmit(name) => {
-                let Some(target) = self.new_item_input.clone() else {
+                let Some(ModalKind::NewItem(target)) = self.active_modal.clone() else {
                     return Task::none();
                 };
                 let trimmed = name.trim();
@@ -2824,12 +2769,12 @@ impl EditorState {
                         msg.into(),
                     )));
                 }
-                self.new_item_input = None;
+                self.active_modal = None;
                 self.perform_create_item(&target, trimmed)
             }
 
             EditorMessage::NewItemInput(new_text) => {
-                if let Some(ref mut target) = self.new_item_input {
+                if let Some(ModalKind::NewItem(ref mut target)) = self.active_modal {
                     target.input_text = new_text;
                 }
                 Task::none()
@@ -2846,10 +2791,6 @@ impl EditorState {
                         "Cannot rename root directory".into(),
                     )));
                 }
-                // Cancel new-item dialog and delete confirmation if open
-                // (mutual exclusion — only one modal state at a time).
-                self.new_item_input = None;
-                self.delete_confirm = None;
                 let abs_path = self
                     .abs_path(&path)
                     .expect("RenameRequested: selected_workspace_path already guarded above");
@@ -2860,21 +2801,21 @@ impl EditorState {
                 // Determine if it's a directory by checking the actual filesystem.
                 let is_dir = Path::new(&abs_path).is_dir();
 
-                self.rename_target = Some(RenameTarget {
+                self.active_modal = Some(ModalKind::Rename(RenameTarget {
                     abs_path,
                     ws_root: ws.clone(),
                     path: path.clone(),
                     is_dir,
                     input_text: file_name,
                     error: None,
-                });
+                }));
                 iced::widget::operation::focus::<EditorMessage>(Id::from(format!(
                     "rename_input_{path}"
                 )))
             }
 
             EditorMessage::RenameInput(new_text) => {
-                if let Some(ref mut target) = self.rename_target {
+                if let Some(ModalKind::Rename(ref mut target)) = self.active_modal {
                     target.input_text = new_text;
                     // Clear error when user starts typing again.
                     if target.error.is_some() {
@@ -2885,7 +2826,7 @@ impl EditorState {
             }
 
             EditorMessage::RenameSubmit => {
-                let Some(target) = self.rename_target.clone() else {
+                let Some(ModalKind::Rename(target)) = self.active_modal.clone() else {
                     return Task::none();
                 };
                 // All-space names fall through to the empty-name check below.
@@ -2896,7 +2837,7 @@ impl EditorState {
                 // dot/dotdot, and OS-reserved names.
                 let error_msg = validate_item_name(&trimmed);
                 if let Some(msg) = error_msg {
-                    if let Some(ref mut rt) = self.rename_target {
+                    if let Some(ModalKind::Rename(ref mut rt)) = self.active_modal {
                         rt.error = Some(msg.into());
                     }
                     return Task::none();
@@ -2919,7 +2860,7 @@ impl EditorState {
 
                 // Check if target already exists.
                 if Path::new(&new_abs_path).exists() {
-                    if let Some(ref mut rt) = self.rename_target {
+                    if let Some(ModalKind::Rename(ref mut rt)) = self.active_modal {
                         rt.error = Some("A file or directory with that name already exists".into());
                     }
                     return Task::none();
@@ -2927,7 +2868,7 @@ impl EditorState {
 
                 // All validations passed — clear the inline rename state
                 // and fire the async rename task.
-                self.rename_target = None;
+                self.active_modal = None;
 
                 let old_abs = target.abs_path.clone();
                 let old_rel = target.path.clone();
@@ -2995,7 +2936,7 @@ impl EditorState {
             }
 
             EditorMessage::RenameCancel => {
-                self.rename_target = None;
+                self.active_modal = None;
                 Task::none()
             }
 
@@ -3196,28 +3137,28 @@ impl EditorState {
 
             // ── Quick-open file picker ────────────────────────────────
             EditorMessage::QuickOpenToggle => {
-                if self.quick_open.is_some() {
-                    self.quick_open = None;
+                if matches!(self.active_modal, Some(ModalKind::QuickOpen(_))) {
+                    self.active_modal = None;
                     return Task::none();
                 }
-                if self.active_modal().is_some() {
+                if self.active_modal.is_some() {
                     return Task::none();
                 }
 
                 // Refresh file list from all currently expanded directories.
                 self.scan_all_workspace_files();
 
-                self.quick_open = Some(QuickOpenState {
+                self.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
                     filter: String::new(),
                     selected_index: 0,
                     results: Vec::new(),
-                });
+                }));
                 iced::widget::operation::focus::<EditorMessage>(Id::new(QUICK_OPEN_INPUT_ID))
             }
 
             EditorMessage::QuickOpenInput(filter) => {
                 let results = self.filter_workspace_files(&filter);
-                if let Some(ref mut qo) = self.quick_open {
+                if let Some(ModalKind::QuickOpen(ref mut qo)) = self.active_modal {
                     qo.filter = filter;
                     qo.results = results;
                     qo.selected_index = 0;
@@ -3226,11 +3167,11 @@ impl EditorState {
             }
 
             EditorMessage::QuickOpenSelect(idx) => {
-                let result_path = self
-                    .quick_open
-                    .as_ref()
-                    .and_then(|qo| qo.results.get(idx).cloned());
-                self.quick_open = None;
+                let result_path = match &self.active_modal {
+                    Some(ModalKind::QuickOpen(qo)) => qo.results.get(idx).cloned(),
+                    _ => None,
+                };
+                self.active_modal = None;
                 if let Some(path) = result_path {
                     return self.open_file_in_editor(&path);
                 }
@@ -3255,9 +3196,8 @@ impl EditorState {
             // ── Tree keyboard navigation ─────────────────────────────
             EditorMessage::TreeFocusToggled => {
                 // Suppress during any modal overlay (QuickOpen, GlobalSearch,
-                // GotoLine, Rename, etc.) — the overlay owns keyboard focus.
-                // Rename is covered here via active_modal()'s check of
-                // rename_target (see ModalKind::Rename in active_modal()).
+                // GotoLine, Rename, etc.) — the overlay owns keyboard focus
+                // and the single-field `active_modal` covers all variants.
                 if self.modal_overlay_blocks_editor_shortcuts() {
                     return Task::none();
                 }
@@ -3285,12 +3225,12 @@ impl EditorState {
             EditorMessage::TreeNavEnter => {
                 // When global search is active, Enter selects the highlighted result.
                 // Borrow to extract the index without cloning the entire state.
-                if let Some(gs) = self.global_search.as_ref() {
+                if let Some(ModalKind::GlobalSearch(ref gs)) = self.active_modal {
                     let idx = gs.selected_index.min(gs.results.len().saturating_sub(1));
                     return Task::done(EditorMessage::GlobalSearchSelect(idx));
                 }
                 // When quick-open is active, Enter selects the highlighted file.
-                if let Some(ref qo) = self.quick_open {
+                if let Some(ModalKind::QuickOpen(ref qo)) = self.active_modal {
                     let idx = qo.selected_index.min(qo.results.len().saturating_sub(1));
                     return Task::done(EditorMessage::QuickOpenSelect(idx));
                 }
@@ -3407,7 +3347,9 @@ impl EditorState {
                             auto_jump_to_first_match(&mut tab_data.content, &mut state);
                         }
                         // Close go-to-line when opening find bar (mutually exclusive).
-                        self.goto_line_input = None;
+                        if matches!(self.active_modal, Some(ModalKind::GotoLine(_))) {
+                            self.active_modal = None;
+                        }
                         tab_data.find_replace_state = Some(state);
                     }
                     // Already open — re-focus the search input (no state change needed).
@@ -4203,61 +4145,28 @@ impl EditorState {
     }
 
     /// Handle Escape key — dismisses modal overlays, find bar, tree focus,
-    /// and residual close-dialog state in priority order.
+    /// and residual close-dialog auxiliary state in priority order.
     ///
     /// Priority:
-    /// 1. Any modal overlay (via [`active_modal()`], which returns the
-    ///    highest-priority open modal in Escape-cascade order).
+    /// 1. Active modal overlay (closed via [`ModalKind`] match on
+    ///    [`active_modal`] — clears auxiliary state for `CloseDialog`
+    ///    and `CloseOthers`).
     /// 2. Find/replace bar on the active tab.
     /// 3. File-tree focus.
-    /// 4. Residual [`close_dialog`] / [`close_others_target`] state cleanup.
-    ///
-    /// Note: the original code checked only GlobalSearch before find_bar,
-    /// with GotoLine/QuickOpen/Rename/NewItem/DeleteConfirm after it.
-    /// The current rule (all modals before find_bar) is not observable in
-    /// practice because every modal toggle closes find_bar when opening.
-    /// If simultaneous modal+find_bar state ever becomes possible, the
-    /// priority order here (modal first) is the more intuitive choice.
+    /// 4. Residual [`pending_save_close`] / [`pending_close_others`] state.
     fn escape(&mut self) -> Task<EditorMessage> {
-        // Close modal overlays first (GlobalSearch has highest priority,
-        // followed by GotoLine, QuickOpen, etc.).
-        if let Some(modal) = self.active_modal() {
-            return match modal {
-                ModalKind::GlobalSearch => {
-                    self.global_search = None;
-                    Task::none()
-                }
-                ModalKind::GotoLine => {
-                    self.goto_line_input = None;
-                    Task::none()
-                }
-                ModalKind::QuickOpen => {
-                    self.quick_open = None;
-                    Task::none()
-                }
-                ModalKind::Rename => {
-                    self.rename_target = None;
-                    Task::none()
-                }
-                ModalKind::NewItem => {
-                    self.new_item_input = None;
-                    Task::none()
-                }
-                ModalKind::DeleteConfirm => {
-                    self.delete_confirm = None;
-                    Task::none()
-                }
-                ModalKind::CloseDialog => {
-                    self.close_dialog = None;
+        // Close modal overlays first.
+        if let Some(modal) = self.active_modal.take() {
+            match modal {
+                ModalKind::CloseDialog(..) => {
                     self.pending_save_close = None;
-                    Task::none()
                 }
-                ModalKind::CloseOthers => {
-                    self.close_others_target = None;
+                ModalKind::CloseOthers(..) => {
                     self.pending_close_others = None;
-                    Task::none()
                 }
-            };
+                _ => {}
+            }
+            return Task::none();
         }
 
         // Close find bar on active tab next, if open.
@@ -4276,8 +4185,6 @@ impl EditorState {
             self.pending_enter_dir = None;
             return Task::none();
         }
-        self.close_dialog = None;
-        self.close_others_target = None;
         self.pending_save_close = None;
         self.pending_close_others = None;
         Task::none()
@@ -4286,21 +4193,20 @@ impl EditorState {
     /// Handle global search toggle — opens/closes the search overlay,
     /// spawns search engine initialization.
     fn global_search_toggle(&mut self) -> Task<EditorMessage> {
-        if self.global_search.is_some() {
+        if matches!(self.active_modal, Some(ModalKind::GlobalSearch(_))) {
             // Close if already open.
-            self.global_search = None;
+            self.active_modal = None;
             return Task::none();
         }
-        if self.active_modal().is_some() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
-        // Close find bar and go-to-line when opening global search.
+        // Close find bar when opening global search.
         if let Some((_, path)) = self.active_tab() {
             if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                 tab_data.find_replace_state = None;
             }
         }
-        self.goto_line_input = None;
 
         let ws_path = match self.selected_workspace_path.as_ref() {
             Some(p) => p.clone(),
@@ -4314,13 +4220,13 @@ impl EditorState {
         self.global_search_gen = self.global_search_gen.wrapping_add(1);
         let gs_gen = self.global_search_gen;
 
-        self.global_search = Some(GlobalSearchState {
+        self.active_modal = Some(ModalKind::GlobalSearch(GlobalSearchState {
             query: String::new(),
             results: Vec::new(),
             selected_index: 0,
             status: GlobalSearchStatus::Idle,
             search_gen: gs_gen,
-        });
+        }));
 
         // Start scanning the search engine and show readiness status.
         let engine_task = Task::perform(
@@ -4373,9 +4279,9 @@ impl EditorState {
             return Task::none();
         }
 
-        let state = match self.global_search.as_mut() {
-            Some(s) => s,
-            None => return Task::none(),
+        let state = match &mut self.active_modal {
+            Some(ModalKind::GlobalSearch(s)) => s,
+            _ => return Task::none(),
         };
 
         if let Some(err) = error {
@@ -4486,7 +4392,7 @@ impl EditorState {
     /// task; the overlay paths return `Task::none()`.
     fn navigate_tree_vertical(&mut self, direction: &TreeNavDirection) -> Task<EditorMessage> {
         // When global search is active, navigate the results list.
-        if let Some(ref mut gs) = self.global_search {
+        if let Some(ModalKind::GlobalSearch(ref mut gs)) = self.active_modal {
             match *direction {
                 TreeNavDirection::Up if gs.selected_index > 0 => {
                     gs.selected_index -= 1;
@@ -4499,7 +4405,7 @@ impl EditorState {
             return Task::none();
         }
         // When quick-open is active, navigate the results list.
-        if let Some(ref mut qo) = self.quick_open {
+        if let Some(ModalKind::QuickOpen(ref mut qo)) = self.active_modal {
             match *direction {
                 TreeNavDirection::Up if qo.selected_index > 0 => {
                     qo.selected_index -= 1;
@@ -4570,80 +4476,7 @@ impl EditorState {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        // ── Close dialog overlay ─────────────────────────────────────
-        let dialog = self.close_dialog.map(|(tab_idx, _)| {
-            let on_save = EditorMessage::CloseDialog {
-                tab_index: tab_idx,
-                action: CloseAction::Save,
-            };
-            let on_discard = EditorMessage::CloseDialog {
-                tab_index: tab_idx,
-                action: CloseAction::Discard,
-            };
-            let on_cancel = EditorMessage::CloseDialog {
-                tab_index: tab_idx,
-                action: CloseAction::Cancel,
-            };
-            Self::build_close_dialog(
-                on_save,
-                on_discard,
-                on_cancel,
-                "This file has unsaved changes. What would you like to do?".to_string(),
-            )
-        });
-
-        let close_others_overlay = self.close_others_target.map(|keep_idx| {
-            let dirty_count = self
-                .tabs
-                .iter()
-                .enumerate()
-                .filter(|(i, t)| *i != keep_idx && t.is_dirty)
-                .count();
-            let desc = if dirty_count == 1 {
-                "1 file has unsaved changes. What would you like to do?".to_string()
-            } else {
-                format!("{dirty_count} files have unsaved changes. What would you like to do?")
-            };
-            let on_save = EditorMessage::CloseOthersDialog {
-                keep_idx,
-                action: CloseAction::Save,
-            };
-            let on_discard = EditorMessage::CloseOthersDialog {
-                keep_idx,
-                action: CloseAction::Discard,
-            };
-            let on_cancel = EditorMessage::CloseOthersDialog {
-                keep_idx,
-                action: CloseAction::Cancel,
-            };
-            Self::build_close_dialog(on_save, on_discard, on_cancel, desc)
-        });
-
-        // ── Quick-open overlay ────────────────────────────────────────
-        let quick_open_overlay = self
-            .quick_open
-            .as_ref()
-            .map(|qo| Self::build_quick_open_overlay(qo));
-
-        // ── Global search overlay ─────────────────────────────────────
-        let global_search_overlay = self
-            .global_search
-            .as_ref()
-            .map(|gs| Self::build_global_search_overlay(gs));
-
-        // ── Delete confirmation overlay ──────────────────────────────
-        let delete_overlay = self
-            .delete_confirm
-            .as_ref()
-            .map(|target| Self::build_delete_confirm_dialog(target));
-
-        // ── New item name input overlay ──────────────────────────────
-        let new_item_overlay = self
-            .new_item_input
-            .as_ref()
-            .map(|target| Self::build_new_item_input(target));
-
-        // ── Assemble ─────────────────────────────────────────────────
+        // ── Overlay (single match on active_modal) ────────────────────
         let col_children: Vec<Element<'_, EditorMessage>> = vec![split.into()];
 
         let body = column(col_children)
@@ -4659,13 +4492,86 @@ impl EditorState {
             .width(Length::Shrink)
             .height(Length::Shrink)
             .into();
-        let overlay = dialog
-            .or(close_others_overlay)
-            .or(global_search_overlay)
-            .or(quick_open_overlay)
-            .or(new_item_overlay)
-            .or(delete_overlay)
-            .unwrap_or(placeholder);
+
+        let overlay: Element<'_, EditorMessage> = match &self.active_modal {
+            Some(ModalKind::CloseDialog(tab_idx)) => Self::wrap_dialog(
+                Self::build_close_dialog(
+                    EditorMessage::CloseDialog {
+                        tab_index: *tab_idx,
+                        action: CloseAction::Save,
+                    },
+                    EditorMessage::CloseDialog {
+                        tab_index: *tab_idx,
+                        action: CloseAction::Discard,
+                    },
+                    EditorMessage::CloseDialog {
+                        tab_index: *tab_idx,
+                        action: CloseAction::Cancel,
+                    },
+                    "This file has unsaved changes. What would you like to do?".to_string(),
+                ),
+                420,
+                EditorMessage::Escape,
+                0.5,
+            ),
+            Some(ModalKind::CloseOthers(keep_idx)) => {
+                let dirty_count = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, t)| *i != *keep_idx && t.is_dirty)
+                    .count();
+                let desc = if dirty_count == 1 {
+                    "1 file has unsaved changes. What would you like to do?".to_string()
+                } else {
+                    format!("{dirty_count} files have unsaved changes. What would you like to do?")
+                };
+                Self::wrap_dialog(
+                    Self::build_close_dialog(
+                        EditorMessage::CloseOthersDialog {
+                            keep_idx: *keep_idx,
+                            action: CloseAction::Save,
+                        },
+                        EditorMessage::CloseOthersDialog {
+                            keep_idx: *keep_idx,
+                            action: CloseAction::Discard,
+                        },
+                        EditorMessage::CloseOthersDialog {
+                            keep_idx: *keep_idx,
+                            action: CloseAction::Cancel,
+                        },
+                        desc,
+                    ),
+                    420,
+                    EditorMessage::Escape,
+                    0.5,
+                )
+            }
+            Some(ModalKind::GlobalSearch(gs)) => Self::overlay_dialog(
+                Self::build_global_search_overlay(gs),
+                EditorMessage::GlobalSearchClose,
+                0.3,
+            ),
+            Some(ModalKind::QuickOpen(qo)) => Self::overlay_dialog(
+                Self::build_quick_open_overlay(qo),
+                EditorMessage::Escape,
+                0.3,
+            ),
+            Some(ModalKind::NewItem(target)) => Self::wrap_dialog(
+                Self::build_new_item_input(target),
+                400,
+                EditorMessage::Escape,
+                0.5,
+            ),
+            Some(ModalKind::DeleteConfirm(target)) => Self::wrap_dialog(
+                Self::build_delete_confirm_dialog(target),
+                400,
+                EditorMessage::CancelDelete,
+                0.5,
+            ),
+            // GotoLine and Rename are rendered inline (not as stack overlays).
+            Some(ModalKind::GotoLine(_) | ModalKind::Rename(_)) | None => placeholder,
+        };
 
         iced::widget::stack([body.into(), overlay]).into()
     }
@@ -5272,7 +5178,9 @@ impl EditorState {
     /// Build the go-to-line input bar. Appears in the same slot as the find
     /// bar (below the tab bar) and is mutually exclusive with it.
     fn build_go_to_line_bar(&self) -> Option<Element<'_, EditorMessage>> {
-        let input_text = self.goto_line_input.as_ref()?;
+        let ModalKind::GotoLine(input_text) = self.active_modal.as_ref()? else {
+            return None;
+        };
 
         let line_input = text_input("Line #", input_text)
             .on_input(EditorMessage::GoToLineInput)
@@ -6725,19 +6633,19 @@ mod tests {
                 setup: |s| {
                     s.file_tree.tree_focused = true;
                     s.pending_enter_dir = Some("src".to_string());
-                    s.rename_target = Some(RenameTarget {
+                    s.active_modal = Some(ModalKind::Rename(RenameTarget {
                         path: "src/main.rs".to_string(),
                         abs_path: String::new(),
                         is_dir: false,
                         ws_root: String::new(),
                         input_text: "main.rs".to_string(),
                         error: None,
-                    });
+                    }));
                 },
                 check: |s, name| {
                     assert!(!s.file_tree.tree_focused, "case: {name}");
                     assert_eq!(s.pending_enter_dir, None, "case: {name}");
-                    assert!(s.rename_target.is_none(), "case: {name}");
+                    assert!(s.active_modal.is_none(), "case: {name}");
                 },
             },
         ];
@@ -7747,121 +7655,91 @@ mod tests {
     }
 
     /// Each [`ModalKind`] variant must be returned by [`EditorState::active_modal()`]
-    /// when the corresponding field is set.  This catches the case where a new
-    /// variant is added to the enum but the if-else chain in `active_modal()`
-    /// is not updated (unlike `escape()`'s match, the if-else chain is not
-    /// compiler-enforced).
+    /// when the corresponding modal is open.  This catches the case where a new
+    /// variant is added to the enum but `escape()`'s match is not updated (the
+    /// compiler enforces exhaustiveness).
     #[test]
     fn test_active_modal_returns_correct_variant() {
         let mut state = EditorState::new();
 
         // None when no modal is open.
-        assert_eq!(state.active_modal(), None);
+        assert!(state.active_modal().is_none());
 
-        // Each variant in priority order — set only that field, verify it
-        // returns the expected variant, then clear and test the next.
-        state.global_search = Some(GlobalSearchState {
+        // Each variant — set it, verify it returns the expected variant,
+        // then clear and test the next.
+        state.active_modal = Some(ModalKind::GlobalSearch(GlobalSearchState {
             query: String::new(),
             results: Vec::new(),
             selected_index: 0,
             status: GlobalSearchStatus::Idle,
             search_gen: 0,
-        });
-        assert_eq!(state.active_modal(), Some(ModalKind::GlobalSearch));
-        state.global_search = None;
+        }));
+        assert!(matches!(
+            state.active_modal(),
+            Some(ModalKind::GlobalSearch(_))
+        ));
+        state.active_modal = None;
 
-        state.goto_line_input = Some(String::new());
-        assert_eq!(state.active_modal(), Some(ModalKind::GotoLine));
-        state.goto_line_input = None;
+        state.active_modal = Some(ModalKind::GotoLine(String::new()));
+        assert!(matches!(state.active_modal(), Some(ModalKind::GotoLine(_))));
+        state.active_modal = None;
 
-        state.quick_open = Some(QuickOpenState {
+        state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
             filter: String::new(),
             selected_index: 0,
             results: Vec::new(),
-        });
-        assert_eq!(state.active_modal(), Some(ModalKind::QuickOpen));
-        state.quick_open = None;
+        }));
+        assert!(matches!(
+            state.active_modal(),
+            Some(ModalKind::QuickOpen(_))
+        ));
+        state.active_modal = None;
 
-        state.rename_target = Some(RenameTarget {
+        state.active_modal = Some(ModalKind::Rename(RenameTarget {
             path: "foo".into(),
             abs_path: String::new(),
             is_dir: false,
             ws_root: String::new(),
             input_text: "foo".into(),
             error: None,
-        });
-        assert_eq!(state.active_modal(), Some(ModalKind::Rename));
-        state.rename_target = None;
+        }));
+        assert!(matches!(state.active_modal(), Some(ModalKind::Rename(_))));
+        state.active_modal = None;
 
-        state.new_item_input = Some(NewItemTarget {
+        state.active_modal = Some(ModalKind::NewItem(NewItemTarget {
             parent_dir: String::new(),
             is_dir: false,
             abs_parent: String::new(),
             ws_root: String::new(),
             input_text: String::new(),
-        });
-        assert_eq!(state.active_modal(), Some(ModalKind::NewItem));
-        state.new_item_input = None;
+        }));
+        assert!(matches!(state.active_modal(), Some(ModalKind::NewItem(_))));
+        state.active_modal = None;
 
-        state.delete_confirm = Some(DeleteConfirmTarget {
+        state.active_modal = Some(ModalKind::DeleteConfirm(DeleteConfirmTarget {
             path: "foo".into(),
             is_dir: false,
             dirty_tab_count: 0,
             abs_path: String::new(),
-        });
-        assert_eq!(state.active_modal(), Some(ModalKind::DeleteConfirm));
-        state.delete_confirm = None;
+        }));
+        assert!(matches!(
+            state.active_modal(),
+            Some(ModalKind::DeleteConfirm(_))
+        ));
+        state.active_modal = None;
 
-        state.close_dialog = Some((0, CloseAction::Save));
-        assert_eq!(state.active_modal(), Some(ModalKind::CloseDialog));
-        state.close_dialog = None;
+        state.active_modal = Some(ModalKind::CloseDialog(0));
+        assert!(matches!(
+            state.active_modal(),
+            Some(ModalKind::CloseDialog(..))
+        ));
+        state.active_modal = None;
 
-        state.close_others_target = Some(0);
-        assert_eq!(state.active_modal(), Some(ModalKind::CloseOthers));
-    }
-
-    /// When multiple modals are open simultaneously, `active_modal()` must
-    /// return the highest-priority one according to the documented Escape
-    /// cascade order: GlobalSearch > GotoLine > QuickOpen > Rename > NewItem
-    /// > DeleteConfirm > CloseDialog > CloseOthers.
-    #[test]
-    fn test_active_modal_priority_when_multiple_open() {
-        let mut state = EditorState::new();
-
-        // Set multiple fields: higher-priority should win.
-        state.goto_line_input = Some(String::new());
-        state.quick_open = Some(QuickOpenState {
-            filter: String::new(),
-            selected_index: 0,
-            results: Vec::new(),
-        });
-        // GotoLine > QuickOpen → expects GotoLine.
-        assert_eq!(state.active_modal(), Some(ModalKind::GotoLine));
-
-        // Now add a GlobalSearch — should beat GotoLine.
-        state.global_search = Some(GlobalSearchState {
-            query: String::new(),
-            results: Vec::new(),
-            selected_index: 0,
-            status: GlobalSearchStatus::Idle,
-            search_gen: 0,
-        });
-        assert_eq!(state.active_modal(), Some(ModalKind::GlobalSearch));
-
-        // Clear GlobalSearch, keep GotoLine and QuickOpen; still GotoLine.
-        state.global_search = None;
-        assert_eq!(state.active_modal(), Some(ModalKind::GotoLine));
-
-        // Clear all, add low-priority pair: CloseOthers should lose to CloseDialog.
-        state.goto_line_input = None;
-        state.quick_open = None;
-        state.close_dialog = Some((0, CloseAction::Save));
-        state.close_others_target = Some(0);
-        assert_eq!(state.active_modal(), Some(ModalKind::CloseDialog));
-
-        // Clear CloseDialog, CloseOthers should win by default.
-        state.close_dialog = None;
-        assert_eq!(state.active_modal(), Some(ModalKind::CloseOthers));
+        state.active_modal = Some(ModalKind::CloseOthers(0));
+        assert!(matches!(
+            state.active_modal(),
+            Some(ModalKind::CloseOthers(_))
+        ));
     }
 
     #[test]
@@ -7875,11 +7753,11 @@ mod tests {
                 .snap_before_edit(&tab_data.content);
             tab_data.content.perform_action(EditorAction::Insert('!'));
         }
-        state.quick_open = Some(QuickOpenState {
+        state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
             filter: String::new(),
             selected_index: 0,
             results: Vec::new(),
-        });
+        }));
         let _ = state.update(EditorMessage::Undo);
         assert_eq!(
             state.tab_contents.get(&path).unwrap().content.text(),
@@ -7895,11 +7773,11 @@ mod tests {
         assert!(state.selected_workspace_path.is_some());
 
         // Activate a modal overlay (QuickOpen).
-        state.quick_open = Some(QuickOpenState {
+        state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
             filter: String::new(),
             selected_index: 0,
             results: Vec::new(),
-        });
+        }));
 
         // RefreshFileTree should be suppressed — no new dir generations added.
         let _ = state.update(EditorMessage::RefreshFileTree);
@@ -7918,11 +7796,11 @@ mod tests {
         assert!(state.file_tree.tree_focused);
 
         // Activate a modal overlay (QuickOpen).
-        state.quick_open = Some(QuickOpenState {
+        state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
             filter: String::new(),
             selected_index: 0,
             results: Vec::new(),
-        });
+        }));
 
         // TreeFocusToggled should be suppressed — focus stays ON.
         let _ = state.update(EditorMessage::TreeFocusToggled);
@@ -7943,7 +7821,7 @@ mod tests {
         state.file_tree.tree_focus_index = 0; // "src"
 
         // Activate a non-search modal overlay (GotoLine).
-        state.goto_line_input = Some(String::new());
+        state.active_modal = Some(ModalKind::GotoLine(String::new()));
 
         let prev_focus = state.file_tree.tree_focus_index;
         // Up/Down/Enter/Left/Right — assert tree_focus_index unchanged.
@@ -8015,21 +7893,21 @@ mod tests {
     #[test]
     fn test_quick_open_toggle_blocked_when_goto_line_open() {
         let mut state = make_editor_with_single_tab("hello");
-        state.goto_line_input = Some(String::new());
+        state.active_modal = Some(ModalKind::GotoLine(String::new()));
         let _ = state.update(EditorMessage::QuickOpenToggle);
-        assert!(state.quick_open.is_none());
+        assert!(!matches!(state.active_modal, Some(ModalKind::QuickOpen(_))));
     }
 
     #[test]
     fn test_quick_open_toggle_closes_when_already_open() {
         let mut state = make_editor_with_single_tab("hello");
-        state.quick_open = Some(QuickOpenState {
+        state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
             filter: "foo".to_string(),
             selected_index: 0,
             results: Vec::new(),
-        });
+        }));
         let _ = state.update(EditorMessage::QuickOpenToggle);
-        assert!(state.quick_open.is_none());
+        assert!(state.active_modal.is_none());
     }
 
     #[test]
@@ -8037,13 +7915,16 @@ mod tests {
         let mut state = make_editor_with_single_tab("hello");
         state.selected_workspace_name = Some("ws".to_string());
         state.selected_workspace_path = Some("/tmp/ws".to_string());
-        state.quick_open = Some(QuickOpenState {
+        state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
             filter: String::new(),
             selected_index: 0,
             results: Vec::new(),
-        });
+        }));
         let _ = state.update(EditorMessage::GlobalSearchToggle);
-        assert!(state.global_search.is_none());
+        assert!(!matches!(
+            state.active_modal,
+            Some(ModalKind::GlobalSearch(_))
+        ));
     }
 
     // ── Inline rename tests ────────────────────────────────────
@@ -8053,8 +7934,11 @@ mod tests {
         let mut state = make_editor_with_tree();
         state.selected_workspace_path = Some("/tmp".to_string());
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(state.rename_target.is_some());
-        let rt = state.rename_target.unwrap();
+        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
+        let rt = match state.active_modal {
+            Some(ModalKind::Rename(ref rt)) => rt.clone(),
+            _ => panic!("expected Rename modal"),
+        };
         assert_eq!(rt.path, "Cargo.toml");
         assert_eq!(rt.input_text, "Cargo.toml");
         assert!(!rt.is_dir);
@@ -8078,8 +7962,11 @@ mod tests {
             }],
         );
         let _ = state.update(EditorMessage::RenameRequested("src".into()));
-        assert!(state.rename_target.is_some());
-        let rt = state.rename_target.unwrap();
+        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
+        let rt = match state.active_modal {
+            Some(ModalKind::Rename(ref rt)) => rt.clone(),
+            _ => panic!("expected Rename modal"),
+        };
         assert_eq!(rt.path, "src");
         assert_eq!(rt.input_text, "src");
         assert!(rt.is_dir);
@@ -8090,7 +7977,10 @@ mod tests {
         let mut state = make_editor_with_tree();
         state.selected_workspace_path = Some("/tmp".to_string());
         let _ = state.update(EditorMessage::RenameRequested(String::new()));
-        assert!(state.rename_target.is_none());
+        assert!(
+            state.active_modal.is_none()
+                || !matches!(state.active_modal, Some(ModalKind::Rename(_)))
+        );
     }
 
     #[test]
@@ -8099,12 +7989,18 @@ mod tests {
         state.selected_workspace_path = Some("/tmp".to_string());
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
         // Simulate a validation error
-        state.rename_target.as_mut().unwrap().error = Some("bad".into());
+        if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
+            rt.error = Some("bad".into());
+        }
         // Type new text
         let _ = state.update(EditorMessage::RenameInput("new_name".into()));
-        assert_eq!(state.rename_target.as_ref().unwrap().input_text, "new_name");
-        // Error should be cleared when user types
-        assert!(state.rename_target.as_ref().unwrap().error.is_none());
+        if let Some(ModalKind::Rename(ref rt)) = state.active_modal {
+            assert_eq!(rt.input_text, "new_name");
+            // Error should be cleared when user types
+            assert!(rt.error.is_none());
+        } else {
+            panic!("expected Rename modal");
+        }
     }
 
     #[test]
@@ -8112,9 +8008,9 @@ mod tests {
         let mut state = make_editor_with_tree();
         state.selected_workspace_path = Some("/tmp".to_string());
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(state.rename_target.is_some());
+        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
         let _ = state.update(EditorMessage::RenameCancel);
-        assert!(state.rename_target.is_none());
+        assert!(state.active_modal.is_none());
     }
 
     #[test]
@@ -8122,9 +8018,9 @@ mod tests {
         let mut state = make_editor_with_tree();
         state.selected_workspace_path = Some("/tmp".to_string());
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(state.rename_target.is_some());
+        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
         let _ = state.update(EditorMessage::Escape);
-        assert!(state.rename_target.is_none());
+        assert!(state.active_modal.is_none());
     }
 
     #[test]
@@ -8173,18 +8069,19 @@ mod tests {
 
         // Start rename, then NewFileRequested should cancel it.
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(state.rename_target.is_some());
+        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
         let _ = state.update(EditorMessage::NewFileRequested("src".into()));
-        assert!(state.rename_target.is_none());
-        assert!(state.new_item_input.is_some());
+        assert!(
+            state.active_modal.is_none()
+                || !matches!(state.active_modal, Some(ModalKind::Rename(_)))
+        );
+        assert!(matches!(state.active_modal, Some(ModalKind::NewItem(_))));
 
-        // Clear new_item, start rename again — rename should cancel new_item.
-        state.new_item_input = None;
+        // Start new item again — and confirm rename cancels new_item.
         let _ = state.update(EditorMessage::NewFileRequested(String::new()));
-        assert!(state.new_item_input.is_some());
+        assert!(matches!(state.active_modal, Some(ModalKind::NewItem(_))));
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        assert!(state.rename_target.is_some());
-        assert!(state.new_item_input.is_none());
+        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
     }
 
     // ── Rename validation tests ────────────────────────────────
@@ -8193,7 +8090,9 @@ mod tests {
     fn setup_rename_state(state: &mut EditorState, input_text: &str) {
         state.selected_workspace_path = Some("/tmp".to_string());
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        state.rename_target.as_mut().unwrap().input_text = input_text.to_string();
+        if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
+            rt.input_text = input_text.to_string();
+        }
     }
 
     #[test]
@@ -8201,7 +8100,10 @@ mod tests {
         let mut state = make_editor_with_tree();
         setup_rename_state(&mut state, "   ");
         let _ = state.update(EditorMessage::RenameSubmit);
-        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        let err = match &state.active_modal {
+            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+            _ => None,
+        };
         assert_eq!(err, Some("Name cannot be empty"));
     }
 
@@ -8210,21 +8112,30 @@ mod tests {
         let mut state = make_editor_with_tree();
         setup_rename_state(&mut state, "foo/bar.rs");
         let _ = state.update(EditorMessage::RenameSubmit);
-        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        let err = match &state.active_modal {
+            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+            _ => None,
+        };
         assert_eq!(err, Some("Name cannot contain path separators"));
 
         // Backslash
         let mut state = make_editor_with_tree();
         setup_rename_state(&mut state, "foo\\bar.rs");
         let _ = state.update(EditorMessage::RenameSubmit);
-        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        let err = match &state.active_modal {
+            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+            _ => None,
+        };
         assert_eq!(err, Some("Name cannot contain path separators"));
 
         // Null byte
         let mut state = make_editor_with_tree();
         setup_rename_state(&mut state, "foo\0bar.rs");
         let _ = state.update(EditorMessage::RenameSubmit);
-        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        let err = match &state.active_modal {
+            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+            _ => None,
+        };
         assert_eq!(err, Some("Name cannot contain path separators"));
     }
 
@@ -8233,13 +8144,19 @@ mod tests {
         let mut state = make_editor_with_tree();
         setup_rename_state(&mut state, ".");
         let _ = state.update(EditorMessage::RenameSubmit);
-        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        let err = match &state.active_modal {
+            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+            _ => None,
+        };
         assert_eq!(err, Some("Invalid name"));
 
         let mut state = make_editor_with_tree();
         setup_rename_state(&mut state, "..");
         let _ = state.update(EditorMessage::RenameSubmit);
-        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        let err = match &state.active_modal {
+            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+            _ => None,
+        };
         assert_eq!(err, Some("Invalid name"));
     }
 
@@ -8251,7 +8168,10 @@ mod tests {
             let mut state = make_editor_with_tree();
             setup_rename_state(&mut state, name);
             let _ = state.update(EditorMessage::RenameSubmit);
-            let err = state.rename_target.as_ref().unwrap().error.as_deref();
+            let err = match &state.active_modal {
+                Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+                _ => None,
+            };
             assert_eq!(
                 err,
                 Some("Name is reserved by the operating system"),
@@ -8271,9 +8191,14 @@ mod tests {
         let mut state = make_editor_with_tree();
         state.selected_workspace_path = Some(ws.clone());
         let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-        state.rename_target.as_mut().unwrap().input_text = "existing.txt".to_string();
+        if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
+            rt.input_text = "existing.txt".to_string();
+        }
         let _ = state.update(EditorMessage::RenameSubmit);
-        let err = state.rename_target.as_ref().unwrap().error.as_deref();
+        let err = match &state.active_modal {
+            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
+            _ => None,
+        };
         assert_eq!(
             err,
             Some("A file or directory with that name already exists")
@@ -8292,7 +8217,9 @@ mod tests {
         // staleness check in RenameCompleted (which only applies when the
         // parent dir is non-empty) is actually exercised.
         let _ = state.update(EditorMessage::RenameRequested("src/main.rs".into()));
-        state.rename_target.as_mut().unwrap().input_text = "lib.rs".to_string();
+        if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
+            rt.input_text = "lib.rs".to_string();
+        }
         let _ = state.update(EditorMessage::RenameSubmit);
 
         // Simulate a stale RenameCompleted whose rename_gen does not
@@ -8340,12 +8267,13 @@ mod tests {
             state.selected_workspace_path = Some("/tmp".to_string());
             let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
             assert!(
-                state.rename_target.is_some(),
+                matches!(state.active_modal, Some(ModalKind::Rename(_))),
                 "rename should be active before {trigger:?}"
             );
             let _ = state.update(trigger.clone());
             assert!(
-                state.rename_target.is_none(),
+                state.active_modal.is_none()
+                    || !matches!(state.active_modal, Some(ModalKind::Rename(_))),
                 "rename should be cancelled by {trigger:?}"
             );
         }
@@ -8364,24 +8292,28 @@ mod tests {
         let cases: &[Case] = &[
             Case {
                 msg: EditorMessage::NewFileRequested("src".into()),
-                check: |s| assert!(s.new_item_input.is_some()),
+                check: |s| assert!(matches!(s.active_modal, Some(ModalKind::NewItem(_)))),
             },
             Case {
                 msg: EditorMessage::NewDirectoryRequested("src".into()),
-                check: |s| assert!(s.new_item_input.is_some()),
+                check: |s| assert!(matches!(s.active_modal, Some(ModalKind::NewItem(_)))),
             },
             Case {
                 msg: EditorMessage::DeleteFileRequested("other.rs".into()),
                 check: |s| {
-                    assert!(s.delete_confirm.is_some());
-                    assert_eq!(s.delete_confirm.as_ref().unwrap().path, "other.rs");
+                    assert!(matches!(s.active_modal, Some(ModalKind::DeleteConfirm(_))));
+                    if let Some(ModalKind::DeleteConfirm(ref target)) = s.active_modal {
+                        assert_eq!(target.path, "other.rs");
+                    }
                 },
             },
             Case {
                 msg: EditorMessage::DeleteDirectoryRequested("src".into()),
                 check: |s| {
-                    assert!(s.delete_confirm.is_some());
-                    assert_eq!(s.delete_confirm.as_ref().unwrap().path, "src");
+                    assert!(matches!(s.active_modal, Some(ModalKind::DeleteConfirm(_))));
+                    if let Some(ModalKind::DeleteConfirm(ref target)) = s.active_modal {
+                        assert_eq!(target.path, "src");
+                    }
                 },
             },
         ];
@@ -8391,12 +8323,16 @@ mod tests {
 
             // Start rename.
             let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-            assert!(state.rename_target.is_some(), "case {:?}", case.msg);
+            assert!(
+                matches!(state.active_modal, Some(ModalKind::Rename(_))),
+                "case {:?}",
+                case.msg
+            );
 
             // Fire the competing modal message.
             let _ = state.update(case.msg.clone());
             assert!(
-                state.rename_target.is_none(),
+                !matches!(state.active_modal, Some(ModalKind::Rename(_))),
                 "rename should be cancelled by {:?}",
                 case.msg
             );
