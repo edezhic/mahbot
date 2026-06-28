@@ -717,7 +717,9 @@ mod tests {
             );
         }
 
-        // Workspace-relative checks require a real TempDir.
+        // Workspace-relative checks (ws_cases below) require a real
+        // TempDir because they exercise workspace-scope behavior that
+        // can't be tested against a static "." base.
         let tmp = TempDir::new().expect("tempdir");
         let ws = tmp.path().to_path_buf();
 
@@ -759,7 +761,7 @@ mod tests {
                 safe: true,
             },
             Case {
-                name: "traversal_etc_passwd",
+                name: "ws_traversal_etc_passwd",
                 path: "../etc/passwd",
                 safe: false,
             },
@@ -792,6 +794,24 @@ mod tests {
                 case.name
             );
         }
+
+        // Paths outside the workspace (even temp dirs and dependency paths)
+        // must be blocked — the extra-read bypass is read-only and must not
+        // affect write-path checks.
+        {
+            let temp_file = std::env::temp_dir().join("test-spill.txt");
+            assert!(
+                !is_path_safe_for_workspace(temp_file.to_str().unwrap(), &ws),
+                "Temp file should be blocked by base check"
+            );
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let dep_path = format!("{home}/.cargo/registry/src/crate-0.1.0/src/lib.rs");
+            assert!(
+                !is_path_safe_for_workspace(&dep_path, &ws),
+                "Dependency path should be blocked by base check"
+            );
+        }
     }
 
     // ── is_path_under_allowed_temp tests ────────────────────────────────
@@ -811,17 +831,7 @@ mod tests {
     // ── check_path_read_allowed: spill / extra-read ────────────────────
 
     #[test]
-    fn check_path_read_allowed_var_tmp() {
-        let tmp = TempDir::new().expect("tempdir");
-        let workspace = tmp.path().to_path_buf();
-        assert!(
-            check_path_read_allowed("/var/tmp/mahbot-test.txt", &workspace).is_ok(),
-            "/var/tmp should be readable via EXTRA_READ_ALLOWED"
-        );
-    }
-
-    #[test]
-    fn is_mahbot_spill_file_all_cases() {
+    fn check_path_read_allowed_all_cases() {
         struct Case {
             name: &'static str,
             path: String,
@@ -857,6 +867,11 @@ mod tests {
             path: "/etc/passwd".to_string(),
             allowed: false,
         });
+        cases.push(Case {
+            name: "var_tmp_allowed",
+            path: "/var/tmp/mahbot-test.txt".to_string(),
+            allowed: true,
+        });
 
         for case in &cases {
             let result = check_path_read_allowed(&case.path, &workspace);
@@ -872,6 +887,9 @@ mod tests {
         // macOS per-user temp path (e.g. /var/folders/xx/yy/T/…) should be
         // detected as a temp-root spill even when it doesn't match the active
         // temp_dir() at-test-time (which may be /private/var/…).
+        // Inline rather than table-driven because this path relies on
+        // is_os_temp_root's Unix-specific /var/folders/… detection and
+        // #[cfg(unix)] wrapping a table push() would be more awkward.
         #[cfg(unix)]
         {
             let mac_spill = PathBuf::from("/var/folders/xx/yy/T/.agent/spill_cd34.txt");
@@ -882,6 +900,9 @@ mod tests {
         }
 
         // Non-temp spill-shaped path outside the workspace must be rejected.
+        // Inline rather than table-driven for the same reason as the
+        // macOS-spill block above — the path relies on is_os_temp_root's
+        // Unix-specific logic and the #[cfg(unix)] guard is cleaner here.
         #[cfg(unix)]
         {
             let outside = PathBuf::from("/usr/local/.agent/spill_ab12.txt");
@@ -894,17 +915,6 @@ mod tests {
 
     // ── EXTRA_READ_ALLOWED tests ──────────────────────────────────────
 
-    /// Init doesn't panic even with many non-existent paths (e.g. Windows
-    /// paths on macOS, or missing optional toolchains).
-    #[test]
-    fn extra_allowed_init_does_not_panic() {
-        // Force initialization of the LazyLock.
-        let dirs = &*EXTRA_READ_ALLOWED;
-        // The temp dirs + all dependency paths should be present.
-        // On a typical dev machine, at least a few entries should exist.
-        assert!(!dirs.is_empty(), "EXTRA_READ_ALLOWED should not be empty");
-    }
-
     #[test]
     fn extra_allowed_all_cases() {
         struct Case {
@@ -912,6 +922,13 @@ mod tests {
             path: &'static str,
             allowed: bool,
         }
+
+        // Force LazyLock init and verify it's populated (preserved from the
+        // removed extra_allowed_init_does_not_panic for diagnostic clarity).
+        assert!(
+            !EXTRA_READ_ALLOWED.is_empty(),
+            "EXTRA_READ_ALLOWED should not be empty"
+        );
 
         // Paths inside known dependency directories should match via
         // is_path_in_extra_allowed.
@@ -997,32 +1014,6 @@ mod tests {
             assert!(
                 check_path_read_allowed(tilde_input, &workspace).is_ok(),
                 "~-prefixed dependency path should be allowed for read"
-            );
-        }
-    }
-
-    /// `is_path_safe_for_workspace` blocks paths outside the workspace even
-    /// when they're in [`EXTRA_READ_ALLOWED`] — the extra-read bypass is
-    /// read-only and must not affect write-path checks.
-    #[test]
-    fn is_path_safe_for_workspace_blocks_extra_dependency_paths() {
-        let tmp = TempDir::new().expect("tempdir");
-        let workspace = tmp.path().to_path_buf();
-
-        // Temp dir spill files — should be blocked by is_path_safe_for_workspace
-        let temp_file = std::env::temp_dir().join("test-spill.txt");
-        let temp_str = temp_file.to_string_lossy().to_string();
-        assert!(
-            !is_path_safe_for_workspace(&temp_str, &workspace),
-            "Temp file should be blocked by base check"
-        );
-
-        // Dependency path (if $HOME is set)
-        if let Ok(home) = std::env::var("HOME") {
-            let dep_path = format!("{home}/.cargo/registry/src/crate-0.1.0/src/lib.rs");
-            assert!(
-                !is_path_safe_for_workspace(&dep_path, &workspace),
-                "Dependency path should be blocked by base check"
             );
         }
     }
