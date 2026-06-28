@@ -126,6 +126,7 @@ impl BoardState {
     /// Reset all modal-related state fields (close detail modal).
     fn reset_modal(&mut self) {
         self.selected_ticket = None;
+        self.selected_loading = false;
         self.detail_error = None;
         self.description_md = None;
         self.comments_md.clear();
@@ -357,7 +358,6 @@ impl BoardState {
                 }
             }
             BoardMessage::DetailError(e) => {
-                self.load_state.fail(e.clone());
                 self.detail_error = Some(e);
                 self.selected_loading = false;
                 Task::none()
