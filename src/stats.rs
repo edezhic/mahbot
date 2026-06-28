@@ -1,7 +1,9 @@
-//! Per-agent tool usage statistics stored in `stats.db`.
+//! Per-agent tool call statistics stored in `stats.db`.
 //!
+//! Each tool invocation is recorded as an individual row with its full
+//! serialized arguments, execution duration, and success/failure outcome.
 //! Stats accumulate in-memory in each [`crate::Agent`] via a
-//! `std::sync::Mutex<HashMap<String, ToolUsage>>` and are flushed to
+//! `std::sync::Mutex<Vec<ToolCallRecord>>` and are flushed to
 //! the database on session finalization via [`StatsStore::flush_batch`].
 
 use crate::turso::{self};
@@ -15,46 +17,53 @@ crate::define_store! {
 }
 
 const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS tool_usage (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id    TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    tool_name   TEXT NOT NULL,
-    call_count  INTEGER NOT NULL,
-    errors      TEXT NOT NULL DEFAULT '[]',
-    workspace   TEXT NOT NULL DEFAULT '',
-    recorded_at TEXT NOT NULL
+DROP TABLE IF EXISTS tool_usage;
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id       TEXT NOT NULL,
+    role           TEXT NOT NULL,
+    tool_name      TEXT NOT NULL,
+    arguments      TEXT NOT NULL DEFAULT '{}',
+    duration_ms    INTEGER NOT NULL DEFAULT 0,
+    success        INTEGER NOT NULL DEFAULT 1,
+    error_message  TEXT,
+    workspace      TEXT NOT NULL DEFAULT '',
+    recorded_at    TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_tool_usage_agent_id ON tool_usage(agent_id);
-CREATE INDEX IF NOT EXISTS idx_tool_usage_role ON tool_usage(role);
-CREATE INDEX IF NOT EXISTS idx_tool_usage_recorded_at ON tool_usage(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_tool_usage_workspace ON tool_usage(workspace);";
+CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);";
 
 // Column definitions for tool_error SELECT queries.
 crate::columns! {
     TOOL_ERROR_COLUMNS [TE] {
-        TOOL_NAME    => "tool_name",
-        ROLE         => "role",
-        ERROR        => "json_each.value AS error",
-        WORKSPACE    => "workspace",
-        RECORDED_AT  => "recorded_at",
+        TOOL_NAME      => "tool_name",
+        ROLE           => "role",
+        ERROR_MESSAGE  => "COALESCE(error_message, '') AS error_message",
+        ARGUMENTS      => "arguments",
+        DURATION_MS    => "duration_ms",
+        SUCCESS        => "success",
+        WORKSPACE      => "workspace",
+        RECORDED_AT    => "recorded_at",
     }
 }
 
-/// Column-index constant for the single-column SELECT in
-/// [`StatsStore::query_tool_usage`] (`call_count`).
-const COL_TU_CALL_COUNT: usize = 0;
-
-/// Column-index constant for the single-column COUNT(*) SELECT in
-/// [`StatsStore::count_tool_errors`].
+/// Column-index constants for the single-column SELECTs.
+const COL_TU_COUNT: usize = 0;
 const COL_TE_COUNT: usize = 0;
 
-/// A single tool error flattened from the `errors` JSON array.
+/// A single tool error entry queried from the DB.
 #[derive(Debug, Clone)]
 pub struct ToolErrorEntry {
     pub tool_name: String,
     pub role: String,
-    pub error: String,
+    pub error_message: String,
+    pub arguments: String,
+    pub duration_ms: i64,
+    pub success: bool,
     pub workspace: String,
     pub recorded_at: String,
 }
@@ -73,24 +82,22 @@ pub struct ToolErrorQuery {
 }
 
 impl StatsStore {
-    /// Query the most recent `call_count` for a given agent and tool.
+    /// Query the count of tool calls for a given agent and tool.
     ///
-    /// Returns `None` if no row exists for the combination.
-    /// When multiple rows exist (e.g. multiple flush calls), uses the most
-    /// recent row (`ORDER BY id DESC LIMIT 1`).
-    pub async fn query_tool_usage(&self, agent_id: &str, tool_name: &str) -> Result<Option<i64>> {
+    /// Uses `COUNT(*)` which always returns a row.
+    pub async fn query_tool_usage(&self, agent_id: &str, tool_name: &str) -> Result<i64> {
         self.conn
             .query_optional(
-                "SELECT call_count FROM tool_usage \
-                 WHERE agent_id = ?1 AND tool_name = ?2 \
-                 ORDER BY id DESC LIMIT 1",
+                "SELECT COUNT(*) FROM tool_calls \
+                 WHERE agent_id = ?1 AND tool_name = ?2",
                 turso::params![agent_id, tool_name],
-                |row| row.get::<i64>(COL_TU_CALL_COUNT),
+                |row| row.get::<i64>(COL_TU_COUNT),
             )
             .await
+            .map(|opt| opt.unwrap_or(0))
     }
 
-    /// Build a parameterized WHERE clause and params for tool error queries.
+    /// Build a parameterized WHERE clause and params for tool error (failure) queries.
     ///
     /// Returns `(where_clause, params)` where `where_clause` does NOT include
     /// the leading `WHERE` keyword — it is a set of `AND`-joined expressions
@@ -101,7 +108,7 @@ impl StatsStore {
     /// a store instance if needed.
     #[must_use]
     pub fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<turso::Value>) {
-        let mut clauses = vec!["errors != '[]'".to_string()];
+        let mut clauses = vec!["error_message IS NOT NULL".to_string()];
         let mut params = Vec::new();
 
         if let Some(ref role) = query.role_filter {
@@ -116,22 +123,17 @@ impl StatsStore {
 
         if let Some(ref search) = query.search {
             params.push(turso::Value::Text(format!("%{search}%")));
-            clauses.push("json_each.value LIKE ?".to_string());
+            clauses.push("error_message LIKE ?".to_string());
         }
 
         (clauses.join(" AND "), params)
     }
 
-    /// Count the total number of individual errors across all tool_usage rows
-    /// matching the optional query filters.
-    ///
-    /// Uses SQLite's `json_each` to flatten the `errors` JSON array so each
-    /// array element counts as one row.
+    /// Count the total number of tool call error rows matching the optional
+    /// query filters.
     pub async fn count_tool_errors(&self, query: &ToolErrorQuery) -> Result<usize> {
         let (where_clause, params) = Self::build_tool_error_filter(query);
-        let sql = format!(
-            "SELECT COUNT(*) FROM tool_usage, json_each(tool_usage.errors) WHERE {where_clause}",
-        );
+        let sql = format!("SELECT COUNT(*) FROM tool_calls WHERE {where_clause}");
         let rows = self
             .conn
             .query(&sql, turso::params_from_iter(params))
@@ -146,10 +148,10 @@ impl StatsStore {
         Ok(count)
     }
 
-    /// Query flattened tool errors with optional filters and pagination.
+    /// Query tool call error entries with optional filters and pagination.
     ///
-    /// Each individual error from the `errors` JSON array appears as its own row.
-    /// Returns `(entries, total_count)`.
+    /// Returns `(entries, total_count)` where each entry corresponds to a
+    /// single failed tool call (error_message IS NOT NULL).
     pub async fn query_tool_errors(
         &self,
         query: &ToolErrorQuery,
@@ -165,11 +167,9 @@ impl StatsStore {
         let limit_val = i64::try_from(limit).unwrap_or(50);
         let offset_val = i64::try_from(offset).unwrap_or(0);
 
-        // Build the SQL with filter params first, then limit/offset.
-        // All placeholders use unnamed `?` — params_from_iter binds positionally.
         let sql = format!(
             "SELECT {TOOL_ERROR_COLUMNS} \
-             FROM tool_usage, json_each(tool_usage.errors) \
+             FROM tool_calls \
              WHERE {where_clause} \
              ORDER BY recorded_at DESC \
              LIMIT ? OFFSET ?",
@@ -189,7 +189,10 @@ impl StatsStore {
             entries.push(ToolErrorEntry {
                 tool_name: row.get::<String>(COL_TE_TOOL_NAME)?,
                 role: row.get::<String>(COL_TE_ROLE)?,
-                error: row.get::<String>(COL_TE_ERROR)?,
+                error_message: row.get::<String>(COL_TE_ERROR_MESSAGE)?,
+                arguments: row.get::<String>(COL_TE_ARGUMENTS)?,
+                duration_ms: row.get::<i64>(COL_TE_DURATION_MS)?,
+                success: row.get::<i64>(COL_TE_SUCCESS)? != 0,
                 workspace: row.get::<String>(COL_TE_WORKSPACE)?,
                 recorded_at: row.get::<String>(COL_TE_RECORDED_AT)?,
             });
@@ -198,39 +201,29 @@ impl StatsStore {
         Ok((entries, total))
     }
 
-    /// Write a batch of tool usage entries for a single agent flush.
+    /// Write a batch of per-call tool records for a single agent flush.
     pub async fn flush_batch(
         &self,
         agent_id: &str,
         role: &str,
         workspace: &str,
-        stats: &std::collections::HashMap<String, crate::ToolUsage>,
+        stats: &[crate::ToolCallRecord],
     ) -> Result<()> {
         let recorded_at = turso::now();
-        for (tool_name, usage) in stats {
-            let errors_json = serde_json::to_string(&usage.errors).unwrap_or_default();
+        for record in stats {
             self.conn
                 .execute(
-                    "INSERT INTO tool_usage (agent_id, role, tool_name, call_count, errors, workspace, recorded_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO tool_calls \
+                     (agent_id, role, tool_name, arguments, duration_ms, success, error_message, workspace, recorded_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     turso::params![
                         agent_id,
                         role,
-                        tool_name.clone(),
-                        {
-                            let raw_count = usage.call_count;
-                            i64::try_from(raw_count).unwrap_or_else(|_| {
-                                tracing::warn!(
-                                    agent_id = %agent_id,
-                                    role = %role,
-                                    tool_name = %tool_name,
-                                    call_count = raw_count,
-                                    "Tool call count overflowed i64, clamping to i64::MAX"
-                                );
-                                i64::MAX
-                            })
-                        },
-                        errors_json,
+                        record.tool_name.clone(),
+                        record.arguments.clone(),
+                        record.duration_ms,
+                        i64::from(record.success),
+                        record.error_message.clone(),
                         workspace.to_string(),
                         recorded_at.clone(),
                     ],
@@ -262,7 +255,7 @@ mod tests {
             Case {
                 name: "no_filters",
                 query: ToolErrorQuery::default(),
-                expected_clause: "errors != '[]'",
+                expected_clause: "error_message IS NOT NULL",
                 expected_params: vec![],
             },
             Case {
@@ -272,7 +265,7 @@ mod tests {
                     workspace_filter: None,
                     search: None,
                 },
-                expected_clause: "errors != '[]' AND role = ?",
+                expected_clause: "error_message IS NOT NULL AND role = ?",
                 expected_params: vec![turso::Value::Text("Engineer".to_string())],
             },
             Case {
@@ -282,7 +275,7 @@ mod tests {
                     workspace_filter: Some("my-workspace".to_string()),
                     search: None,
                 },
-                expected_clause: "errors != '[]' AND workspace = ?",
+                expected_clause: "error_message IS NOT NULL AND workspace = ?",
                 expected_params: vec![turso::Value::Text("my-workspace".to_string())],
             },
             Case {
@@ -292,7 +285,7 @@ mod tests {
                     workspace_filter: None,
                     search: Some("timeout".to_string()),
                 },
-                expected_clause: "errors != '[]' AND json_each.value LIKE ?",
+                expected_clause: "error_message IS NOT NULL AND error_message LIKE ?",
                 expected_params: vec![turso::Value::Text("%timeout%".to_string())],
             },
             Case {
@@ -302,7 +295,7 @@ mod tests {
                     workspace_filter: Some("ws1".to_string()),
                     search: None,
                 },
-                expected_clause: "errors != '[]' AND role = ? AND workspace = ?",
+                expected_clause: "error_message IS NOT NULL AND role = ? AND workspace = ?",
                 expected_params: vec![
                     turso::Value::Text("Analyst".to_string()),
                     turso::Value::Text("ws1".to_string()),
@@ -315,7 +308,7 @@ mod tests {
                     workspace_filter: None,
                     search: Some("connection refused".to_string()),
                 },
-                expected_clause: "errors != '[]' AND role = ? AND json_each.value LIKE ?",
+                expected_clause: "error_message IS NOT NULL AND role = ? AND error_message LIKE ?",
                 expected_params: vec![
                     turso::Value::Text("Analyst".to_string()),
                     turso::Value::Text("%connection refused%".to_string()),
@@ -328,7 +321,7 @@ mod tests {
                     workspace_filter: Some("ws2".to_string()),
                     search: Some("error msg".to_string()),
                 },
-                expected_clause: "errors != '[]' AND workspace = ? AND json_each.value LIKE ?",
+                expected_clause: "error_message IS NOT NULL AND workspace = ? AND error_message LIKE ?",
                 expected_params: vec![
                     turso::Value::Text("ws2".to_string()),
                     turso::Value::Text("%error msg%".to_string()),
@@ -341,7 +334,7 @@ mod tests {
                     workspace_filter: Some("ws3".to_string()),
                     search: Some("fatal".to_string()),
                 },
-                expected_clause: "errors != '[]' AND role = ? AND workspace = ? AND json_each.value LIKE ?",
+                expected_clause: "error_message IS NOT NULL AND role = ? AND workspace = ? AND error_message LIKE ?",
                 expected_params: vec![
                     turso::Value::Text("Manager".to_string()),
                     turso::Value::Text("ws3".to_string()),
@@ -355,5 +348,148 @@ mod tests {
             assert_eq!(clause, case.expected_clause, "case: {}", case.name);
             assert_eq!(params, case.expected_params, "case: {}", case.name);
         }
+    }
+
+    /// Integration test: write per-call records via flush_batch, then verify
+    /// they can be read back via query_tool_usage and query_tool_errors.
+    #[tokio::test]
+    async fn flush_and_query_round_trip() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let store = StatsStore::open(tmp.path()).await.expect("open store");
+
+        let records = vec![
+            crate::ToolCallRecord {
+                tool_name: "read".to_string(),
+                arguments: r#"{"path":"src/main.rs"}"#.to_string(),
+                duration_ms: 42,
+                success: true,
+                error_message: None,
+            },
+            crate::ToolCallRecord {
+                tool_name: "create_ticket".to_string(),
+                arguments: r#"{"title":"Fix bug"}"#.to_string(),
+                duration_ms: 150,
+                success: true,
+                error_message: None,
+            },
+            crate::ToolCallRecord {
+                tool_name: "write".to_string(),
+                arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
+                duration_ms: 0,
+                success: false,
+                error_message: Some("Error executing write: permission denied".to_string()),
+            },
+        ];
+
+        // Flush the batch
+        store
+            .flush_batch("test-agent", "Engineer", "my-workspace", &records)
+            .await
+            .expect("flush_batch");
+
+        // Verify query_tool_usage (COUNT)
+        let count = store
+            .query_tool_usage("test-agent", "create_ticket")
+            .await
+            .expect("query_tool_usage");
+        assert_eq!(count, 1, "should have 1 create_ticket call");
+
+        let count = store
+            .query_tool_usage("test-agent", "read")
+            .await
+            .expect("query_tool_usage");
+        assert_eq!(count, 1, "should have 1 read call");
+
+        let count = store
+            .query_tool_usage("test-agent", "nonexistent")
+            .await
+            .expect("query_tool_usage");
+        assert_eq!(count, 0, "should have 0 nonexistent calls");
+
+        // Verify query_tool_errors — only the 'write' call failed
+        let (errors, total) = store
+            .query_tool_errors(&ToolErrorQuery::default(), 100, 0)
+            .await
+            .expect("query_tool_errors");
+        assert_eq!(total, 1, "should have 1 error");
+        assert_eq!(errors.len(), 1, "should return 1 entry");
+        assert_eq!(errors[0].tool_name, "write");
+        assert!(errors[0].error_message.contains("permission denied"));
+        assert!(!errors[0].success);
+        assert_eq!(errors[0].duration_ms, 0);
+        assert_eq!(errors[0].arguments, r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(errors[0].role, "Engineer");
+        assert_eq!(errors[0].workspace, "my-workspace");
+
+        // Verify error filtering by role
+        let query = ToolErrorQuery {
+            role_filter: Some("Engineer".to_string()),
+            workspace_filter: None,
+            search: None,
+        };
+        let (errors, total) = store
+            .query_tool_errors(&query, 100, 0)
+            .await
+            .expect("query_tool_errors with role filter");
+        assert_eq!(total, 1, "Engineer should have 1 error");
+        assert_eq!(errors.len(), 1);
+
+        let query = ToolErrorQuery {
+            role_filter: Some("Manager".to_string()),
+            workspace_filter: None,
+            search: None,
+        };
+        let (_errors, total) = store
+            .query_tool_errors(&query, 100, 0)
+            .await
+            .expect("query_tool_errors with role filter");
+        assert_eq!(total, 0, "Manager should have 0 errors");
+
+        // Verify error filtering by search text
+        let query = ToolErrorQuery {
+            role_filter: None,
+            workspace_filter: None,
+            search: Some("permission".to_string()),
+        };
+        let (errors, total) = store
+            .query_tool_errors(&query, 100, 0)
+            .await
+            .expect("query_tool_errors with search");
+        assert_eq!(total, 1, "search 'permission' should find 1 error");
+        assert_eq!(errors[0].tool_name, "write");
+
+        let query = ToolErrorQuery {
+            role_filter: None,
+            workspace_filter: None,
+            search: Some("timeout".to_string()),
+        };
+        let (_errors, total) = store
+            .query_tool_errors(&query, 100, 0)
+            .await
+            .expect("query_tool_errors with search");
+        assert_eq!(total, 0, "search 'timeout' should find 0 errors");
+
+        // Verify error filtering by workspace
+        let query = ToolErrorQuery {
+            role_filter: None,
+            workspace_filter: Some("my-workspace".to_string()),
+            search: None,
+        };
+        let (_errors, total) = store
+            .query_tool_errors(&query, 100, 0)
+            .await
+            .expect("query_tool_errors with workspace filter");
+        assert_eq!(total, 1, "my-workspace should have 1 error");
+
+        let query = ToolErrorQuery {
+            role_filter: None,
+            workspace_filter: Some("other-ws".to_string()),
+            search: None,
+        };
+        let (_errors, total) = store
+            .query_tool_errors(&query, 100, 0)
+            .await
+            .expect("query_tool_errors with workspace filter");
+        assert_eq!(total, 0, "other-ws should have 0 errors");
     }
 }

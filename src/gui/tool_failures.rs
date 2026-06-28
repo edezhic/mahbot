@@ -289,7 +289,8 @@ impl ToolFailuresState {
     /// Render a single error row with two-line layout:
     ///   Line 1: HH:MM:SS timestamp | tool name badge | role badge | workspace
     ///   Line 2: error message (selectable monospace text)
-    fn render_error_row(entry: &ToolErrorEntry) -> iced::Element<'_, ToolFailuresMessage> {
+    /// Build the metadata badge row for a tool error entry.
+    fn render_metadata_row(entry: &ToolErrorEntry) -> iced::widget::Row<'_, ToolFailuresMessage> {
         let (fg, bg) = theme::role_badge_color(&entry.role);
 
         let timestamp = if entry.recorded_at.len() > 19 {
@@ -298,26 +299,35 @@ impl ToolFailuresState {
             &entry.recorded_at
         };
 
-        let metadata_row = row![
+        let duration_label = format!("{}ms", entry.duration_ms);
+
+        let badge_style = |_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::HOVER)),
+            border: iced::Border {
+                radius: 3.0.into(),
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        };
+
+        row![
             // Timestamp
             text(timestamp).size(10).color(theme::TEXT_MUTED),
             Space::new().width(8),
             // Tool name badge
             container(text(&entry.tool_name).size(10).color(theme::TEXT_SECONDARY))
                 .padding([1, 6])
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::HOVER)),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        ..iced::Border::default()
-                    },
-                    ..container::Style::default()
-                }),
+                .style(badge_style),
+            Space::new().width(4),
+            // Duration badge
+            container(text(duration_label).size(10).color(theme::TEXT_MUTED))
+                .padding([1, 6])
+                .style(badge_style),
             Space::new().width(4),
             // Role badge
             container(text(&entry.role).size(10).color(fg))
                 .padding([1, 6])
-                .style(move |_theme: &iced::Theme| container::Style {
+                .style(move |_t: &iced::Theme| container::Style {
                     background: Some(iced::Background::Color(bg)),
                     border: iced::Border {
                         radius: 3.0.into(),
@@ -334,17 +344,57 @@ impl ToolFailuresState {
             },
         ]
         .align_y(Alignment::Center)
-        .spacing(2);
+        .spacing(2)
+    }
+
+    /// Compute an optional arguments preview string, truncated to 200 chars.
+    fn compute_args_preview(entry: &ToolErrorEntry) -> Option<String> {
+        if entry.arguments.is_empty() || entry.arguments == "{}" {
+            return None;
+        }
+        if entry.arguments.len() > 200 {
+            let mut s = entry.arguments[..entry.arguments.floor_char_boundary(200)].to_string();
+            s.push('…');
+            Some(s)
+        } else {
+            Some(entry.arguments.clone())
+        }
+    }
+
+    fn render_error_row(entry: &ToolErrorEntry) -> iced::Element<'_, ToolFailuresMessage> {
+        let metadata_row = Self::render_metadata_row(entry);
+        let args_preview = Self::compute_args_preview(entry);
 
         let row_content = column![
             metadata_row,
             Space::new().height(2),
-            selectable_text(&entry.error, theme::TEXT_PRIMARY)
-                .size(13)
-                .font(super::JETBRAINS_MONO)
-                .width(Length::Fill),
+            if let Some(ref preview) = args_preview {
+                iced::Element::new(
+                    selectable_text(preview.clone(), theme::TEXT_MUTED)
+                        .size(11)
+                        .font(super::JETBRAINS_MONO)
+                        .width(Length::Fill),
+                )
+            } else {
+                iced::Element::new(iced::widget::Space::new().height(0))
+            },
+            if !entry.error_message.is_empty() {
+                let mut parts = column![].spacing(0);
+                if args_preview.is_some() {
+                    parts = parts.push(Space::new().height(2));
+                }
+                parts = parts.push(
+                    selectable_text(&entry.error_message, theme::TEXT_PRIMARY)
+                        .size(13)
+                        .font(super::JETBRAINS_MONO)
+                        .width(Length::Fill),
+                );
+                iced::Element::new(parts)
+            } else {
+                iced::Element::new(iced::widget::Space::new().height(0))
+            },
         ]
-        .spacing(1);
+        .spacing(0);
 
         container(row_content)
             .padding(6)

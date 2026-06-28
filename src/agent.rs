@@ -29,6 +29,10 @@ use tracing::Instrument;
 /// truly stuck loops.
 const MAX_LLM_ITERATIONS: usize = 1000;
 
+/// Maximum length of serialized arguments stored in per-call stats.
+/// Longer arguments are truncated at a UTF-8-safe boundary.
+const MAX_STATS_ARG_LENGTH: usize = 500;
+
 /// Extract file paths from successful media-generation tool outcomes.
 ///
 /// Scans the zipped tool calls and outcomes for media-generation tools,
@@ -108,7 +112,7 @@ impl Agent {
             cancel_token,
             ticket,
             generation,
-            tool_stats: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tool_stats: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -447,21 +451,26 @@ impl Agent {
             }
         };
 
-        // Inlined stats recording — always increments call_count; errors are
-        // scrubbed and logged.
+        // Inlined per-call stats recording — each tool invocation produces
+        // one record with arguments, duration, success/failure, and error.
         {
+            let elapsed_ms = start.elapsed().as_millis();
+            let duration_ms = i64::try_from(elapsed_ms).unwrap_or(0);
+            let args_str =
+                serde_json::to_string(&tool_arguments).expect("Value is always serializable");
+            let args_scrubbed = scrub_credentials(&args_str);
+            let arguments = args_scrubbed
+                [..args_scrubbed.floor_char_boundary(MAX_STATS_ARG_LENGTH)]
+                .to_string();
+
             let mut guard = self.tool_stats.lock().unwrap_poison();
-            let entry = guard.entry(tool_name.clone()).or_default();
-            entry.call_count += 1;
-            if let Some(ref reason) = error_reason {
-                let args_str =
-                    serde_json::to_string(&tool_arguments).expect("Value is always serializable");
-                let args_scrubbed = scrub_credentials(&args_str);
-                let args_truncated = &args_scrubbed[..args_scrubbed.floor_char_boundary(500)];
-                entry
-                    .errors
-                    .push(format!("{reason} | Args: {args_truncated}"));
-            }
+            guard.push(crate::ToolCallRecord {
+                tool_name,
+                arguments,
+                duration_ms,
+                success: outcome.success,
+                error_message: error_reason,
+            });
         }
         outcome
     }
@@ -892,7 +901,7 @@ mod tests {
             cancel_token: CancellationToken::new(),
             ticket: None,
             generation: 0,
-            tool_stats: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tool_stats: std::sync::Mutex::new(Vec::new()),
         }
     }
 

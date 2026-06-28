@@ -479,12 +479,24 @@ pub enum Role {
 
 // ── Agent ───────────────────────────────────────────────────────
 
-/// Accumulated usage stats for a single tool, collected in-memory during
-/// an agent's work loop and flushed to `stats.db` on session finalization.
-#[derive(Debug, Clone, Default)]
-pub struct ToolUsage {
-    pub call_count: u64,
-    pub errors: Vec<String>,
+/// A single tool call record, stored per-call in the stats database.
+///
+/// Each tool invocation produces one record with its full serialized
+/// arguments, execution duration, and success/failure outcome.
+/// Records are accumulated in-memory in the agent and flushed to
+/// `stats.db` on session finalization.
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    /// The tool's name.
+    pub tool_name: String,
+    /// Serialized arguments as JSON string (credentials scrubbed).
+    pub arguments: String,
+    /// Execution duration in milliseconds.
+    pub duration_ms: i64,
+    /// Whether the tool call succeeded.
+    pub success: bool,
+    /// Error message on failure (`None` on success).
+    pub error_message: Option<String>,
 }
 
 /// Running context for an agent turn.
@@ -510,10 +522,10 @@ pub struct Agent {
     /// Generation counter from the agent registry — used in [`Drop`] for
     /// safe deregistration. 0 means not registered (e.g. test agents).
     generation: u64,
-    /// Per-tool usage stats accumulated during this agent's work loop.
+    /// Per-call tool stats accumulated during this agent's work loop.
     /// Flushed to `stats.db` on [`Agent::finalize_session`]; silently
     /// lost if the agent is dropped without finalization.
-    tool_stats: std::sync::Mutex<std::collections::HashMap<String, ToolUsage>>,
+    tool_stats: std::sync::Mutex<Vec<crate::ToolCallRecord>>,
 }
 
 // ── Verdict type ─────────────────────────────────────────────────

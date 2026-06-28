@@ -152,11 +152,11 @@ async fn compute_debounce(agent_id: &str, current: i64, ws_name: &str) -> i64 {
     let store = crate::stats::store();
 
     match store.query_tool_usage(agent_id, "create_ticket").await {
-        Ok(Some(call_count)) if call_count > 0 => {
+        Ok(call_count) if call_count > 0 => {
             info!(workspace = %ws_name, "Maintainer: produced tickets — reset debounce to 1");
             1
         }
-        Ok(Some(_) | None) => {
+        Ok(_) => {
             let new_val = advance_debounce(current);
             if new_val >= 240 && current < 240 {
                 info!(workspace = %ws_name, "Maintainer: no tickets created — debounce capped at 240");
