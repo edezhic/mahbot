@@ -752,7 +752,7 @@ async fn poll_round() -> anyhow::Result<()> {
         for_tickets_in_phase(TicketPhase::SanitationPassed, &ws.name, |ticket| {
             let ws = ws.clone();
             tokio::spawn(async move {
-                finalize_sanitation_passed(ticket, ws).await;
+                finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed).await;
             });
         })
         .await;
@@ -869,8 +869,8 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 
 // ── QA to Done (auto-commit) ───────────────────────────────────────────
 //
-// NOTE: finalize_qa_passed takes `Ticket` by value. It is called from
-// `poll_round` via `tokio::spawn` (not `spawn_dispatch`) because:
+// NOTE: finalize_ticket_from_phase takes `Ticket` by value. It is called
+// from `poll_round` via `tokio::spawn` (not `spawn_dispatch`) because:
 // - There is no claim transition — the ticket stays in QaPassed until
 //   commit succeeds, so transient failures are harmless (re-dispatched
 //   next poll cycle).
@@ -937,8 +937,8 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, reason:
 
 /// Auto-commit changes and move the ticket to Done.
 ///
-/// Parameterized by source phase so both [`finalize_qa_passed`] and
-/// [`finalize_sanitation_passed`] share the same implementation.
+/// Parameterized by source phase so both the QaPassed→Done and
+/// SanitationPassed→Done flows share the same implementation.
 ///
 /// Checks for a dirty working tree via `git status --porcelain`:
 /// - **Clean tree:** skips commit, transitions directly to Done with notification.
@@ -1004,11 +1004,6 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
             );
         }
     }
-}
-
-/// Auto-commit changes after QA passes and move the ticket to Done.
-async fn finalize_qa_passed(ticket: Ticket, ws: Workspace) {
-    finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
 }
 
 /// After a successful `git commit`, persist the metadata and transition the
@@ -1127,7 +1122,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 
     // Only check git if it's available and the repo exists.
     if !crate::diff_parse::git_is_installed().await || !crate::diff_parse::is_git_repo(repo_path) {
-        finalize_qa_passed(ticket, ws).await;
+        finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
         return;
     }
 
@@ -1147,7 +1142,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 
     if untracked.is_empty() {
         // No new/untracked files — commit directly (current behavior).
-        finalize_qa_passed(ticket, ws).await;
+        finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
         return;
     }
 
@@ -1539,13 +1534,6 @@ fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
             }
         })
         .collect()
-}
-
-/// Finalize a SanitationPassed ticket: commit changes and transition to Done.
-///
-/// Delegates to the parameterized [`finalize_ticket_from_phase`].
-async fn finalize_sanitation_passed(ticket: Ticket, ws: Workspace) {
-    finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed).await;
 }
 
 // ── Post-development diagnostics ───────────────────────────────────────
@@ -2275,7 +2263,7 @@ async fn trip_circuit_breaker_if_exceeded(
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
 ///    `success_phase` with [`NotifyPolicy::Buffer`]. No immediate notification fires —
 ///    it waits until the ticket reaches Done (after the QaPassed commit succeeds in
-///    [`finalize_qa_passed`]).
+///    [`finalize_ticket_from_phase`]).
 async fn process_verdict_results(
     ticket: &Ticket,
     results: &[ParallelVerdict],
@@ -3588,12 +3576,12 @@ D  deleted.rs
         }
     }
 
-    // ── handle_qa_passed / finalize_qa_passed — QA → Done path ──────────
+    // ── handle_qa_passed — QA → Done path ───────────────────────────────
 
     /// handle_qa_passed first checks whether git is available and whether the
     /// workspace path is a git repo. In test environments git may exist, but
     /// the workspace path is deliberately not a git repo, so the function
-    /// falls through to finalize_qa_passed → transition_ticket_to_done.
+    /// falls through to finalize_ticket_from_phase → transition_ticket_to_done.
     /// This test validates the graceful non-git fallback path.
     #[tokio::test]
     async fn handle_qa_passed_no_git_to_done() {
