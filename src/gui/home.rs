@@ -401,6 +401,45 @@ impl HomeState {
         }
     }
 
+    /// Reverse-sync the DB-stored workspace preference for a user.
+    ///
+    /// Checks whether the user has a stored workspace preference that differs
+    /// from the current sidebar selection. If so, returns
+    /// [`RequestWorkspaceChange`] to trigger a Dashboard-level change (which
+    /// will cascade to [`WorkspaceChanged`] → `refresh_history`). Otherwise
+    /// returns [`ResolveUserSelected`] to proceed with a normal history refresh.
+    ///
+    /// NOTE: We deliberately do NOT write the sidebar workspace to the
+    /// impersonated user's DB record.  The GUI sidebar is a per-session
+    /// context — persisting it would silently overwrite the user's real
+    /// workspace choice (see mahbot-557).
+    async fn resolve_user_workspace_sync(user: String, current_ws: Option<String>) -> HomeMessage {
+        match crate::users::get_raw_selected_workspace(&user).await {
+            Ok(Some(ws_name)) => {
+                // User has an explicit stored workspace preference.
+                // Normalize personal workspaces to the GUI sentinel "".
+                let ws_gui = if crate::users::is_personal_workspace(&ws_name) {
+                    String::new()
+                } else {
+                    ws_name.clone()
+                };
+                if Some(&ws_gui) != current_ws.as_ref() {
+                    HomeMessage::RequestWorkspaceChange(ws_gui)
+                } else {
+                    HomeMessage::ResolveUserSelected(current_ws.clone())
+                }
+            }
+            Ok(None) => {
+                // User has no stored preference — keep current sidebar selection.
+                HomeMessage::ResolveUserSelected(current_ws.clone())
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get raw workspace for user {user}: {e}");
+                HomeMessage::ResolveUserSelected(current_ws.clone())
+            }
+        }
+    }
+
     /// Refresh chat history from the store for the current user + workspace.
     fn refresh_history(&self) -> Task<HomeMessage> {
         let user_name = match &self.selected_user {
@@ -914,46 +953,10 @@ impl HomeState {
                 // per-session context — persisting it would silently
                 // overwrite the user's real workspace choice (see mahbot-557).
 
-                // Reverse sync: check whether the user has a DB-stored
-                // workspace that differs from the sidebar selection.  If so,
-                // request a Dashboard-level workspace change (which will
-                // trigger a WorkspaceChanged → refresh_history).  Otherwise,
-                // proceed with the normal history refresh for the current
-                // sidebar workspace.
-                let u_sync = user.clone();
-                let current_ws = self.selected_workspace.clone();
-                let sync_task = Task::perform(
-                    async move {
-                        match crate::users::get_raw_selected_workspace(&u_sync).await {
-                            Ok(Some(ws_name)) => {
-                                // User has an explicit stored workspace preference.
-                                // Normalize personal workspaces to the GUI sentinel "".
-                                let ws_gui = if crate::users::is_personal_workspace(&ws_name) {
-                                    String::new()
-                                } else {
-                                    ws_name.clone()
-                                };
-                                if Some(&ws_gui) != current_ws.as_ref() {
-                                    HomeMessage::RequestWorkspaceChange(ws_gui)
-                                } else {
-                                    HomeMessage::ResolveUserSelected(current_ws.clone())
-                                }
-                            }
-                            Ok(None) => {
-                                // User has no stored preference — keep current sidebar selection.
-                                HomeMessage::ResolveUserSelected(current_ws.clone())
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to get raw workspace for user {u_sync}: {e}"
-                                );
-                                HomeMessage::ResolveUserSelected(current_ws.clone())
-                            }
-                        }
-                    },
+                Task::perform(
+                    Self::resolve_user_workspace_sync(user, self.selected_workspace.clone()),
                     |msg| msg,
-                );
-                Task::batch([sync_task])
+                )
             }
             HomeMessage::WorkspaceChanged(ws_name) => {
                 self.selected_workspace.clone_from(&ws_name);
