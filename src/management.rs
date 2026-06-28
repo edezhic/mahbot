@@ -68,7 +68,7 @@ const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 /// Role string for diagnostics comments — used both when posting diagnostics
 /// comments and in the circuit breaker filter. Must stay in sync between
 /// both sites to prevent silent miscounting on re-dispatch.
-const DIAGNOSTICS_ROLE: &str = "diagnostics";
+pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 
 /// Prefix for sanitation failure system comments — the circuit breaker's
 /// `count_fn` depends on substring matching this value, so it must not drift

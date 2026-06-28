@@ -1,6 +1,7 @@
 //! Ticket/board system — Turso-backed task management.
 
 use crate::global_store;
+use crate::management::DIAGNOSTICS_ROLE;
 use crate::turso::{self, Connection, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -1084,11 +1085,16 @@ impl BoardStore {
             .conn
             .execute(
                 "UPDATE tickets \
-                 SET assigned_to = 'diagnostics', updated_at = ?1 \
-                 WHERE id = ?2 \
+                 SET assigned_to = ?1, updated_at = ?2 \
+                 WHERE id = ?3 \
                  AND assigned_to IS NULL \
-                 AND status = ?3",
-                turso::params![now, id, TicketPhase::InDiagnostics.as_ref()],
+                 AND status = ?4",
+                turso::params![
+                    DIAGNOSTICS_ROLE,
+                    now,
+                    id,
+                    TicketPhase::InDiagnostics.as_ref()
+                ],
             )
             .await?;
 
