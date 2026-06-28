@@ -7,6 +7,11 @@
 
 use crate::Role;
 
+/// Role string for diagnostics comments — used both when posting diagnostics
+/// comments and in the circuit breaker filter. Must stay in sync between
+/// both sites to prevent silent miscounting on re-dispatch.
+pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
+
 // ── RoleInfo ──────────────────────────────────────────────────────────────
 
 /// All static metadata for a [`Role`] variant.

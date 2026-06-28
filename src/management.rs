@@ -31,6 +31,7 @@ use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, Ticket, TicketComment, TicketPhase};
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
+use crate::role::DIAGNOSTICS_ROLE;
 use crate::session::ticket_session_key;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
@@ -73,10 +74,6 @@ const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 /// Marker appended when diagnostics fail (includes the failed-at label after it).
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
-/// Role string for diagnostics comments — used both when posting diagnostics
-/// comments and in the circuit breaker filter. Must stay in sync between
-/// both sites to prevent silent miscounting on re-dispatch.
-pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 
 /// Prefix for sanitation failure system comments — the circuit breaker's
 /// `count_fn` depends on substring matching this value, so it must not drift

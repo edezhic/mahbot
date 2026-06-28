@@ -1,6 +1,6 @@
 //! Ticket/board system — Turso-backed task management.
 
-use crate::management::DIAGNOSTICS_ROLE;
+use crate::role::DIAGNOSTICS_ROLE;
 use crate::turso::{self, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
