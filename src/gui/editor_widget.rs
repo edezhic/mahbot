@@ -2385,7 +2385,6 @@ where
         layout::Node::new(bounds)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn draw(
         &self,
         tree: &Tree,
@@ -2406,16 +2405,6 @@ where
         let text_area_width = text_rect.width;
         let text_area_height = text_rect.height;
 
-        // ── 1. Fill background ──
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                border: iced::Border::default(),
-                ..renderer::Quad::default()
-            },
-            theme::BG_BASE,
-        );
-
         // Use the buffer Arc that was prepared in layout()
         let buffer_for_draw = state.buffer_for_render.clone().unwrap_or_else(|| {
             // Fallback: create a fresh buffer if layout wasn't called
@@ -2434,228 +2423,51 @@ where
 
         let text_clip = text_rect;
 
-        // ── Draw line numbers ──
-        let number_color = theme::TEXT_MUTED;
-        let number_clip = gutter_clip_rect(bounds, self.padding, gutter_width, text_area_height);
-
-        let mut last_line_i = usize::MAX;
-        for run in buffer_for_draw.layout_runs() {
-            // Only draw the first run per line (avoid duplicates for wrapped lines)
-            if run.line_i == last_line_i {
-                continue;
-            }
-            last_line_i = run.line_i;
-            let num = run.line_i + 1;
-            let num_str = num.to_string();
-            let num_text = iced::advanced::text::Text {
-                content: num_str,
-                bounds: Size::new(gutter_width, run.line_height),
-                size: iced::Pixels(GUTTER_FONT_SIZE),
-                line_height: iced::advanced::text::LineHeight::Relative(1.3),
-                font: renderer.default_font(),
-                align_x: iced::alignment::Horizontal::Right.into(),
-                align_y: iced::alignment::Vertical::Center,
-                shaping: iced::advanced::text::Shaping::Advanced,
-                wrapping: iced::advanced::text::Wrapping::None,
-            };
-            renderer.fill_text(
-                num_text,
-                Point::new(
-                    bounds.x + self.padding + gutter_width,
-                    text_y + run.line_top + run.line_height / 2.0,
-                ),
-                number_color,
-                number_clip,
-            );
-        }
-
-        // ── Draw find match highlights ──
-        // Match highlights are drawn BEFORE selection so selection
-        // (ACCENT_DIM teal) renders on top of match highlights.
-        // Text is drawn AFTER both via fill_raw, so highlights
-        // appear as background tints behind the glyphs.
-        if let Some(ref matches) = self.matches {
-            for (i, &(match_line, col_start, col_end)) in matches.iter().enumerate() {
-                let color = if i == self.match_current_idx {
-                    theme::FIND_MATCH_CURRENT
-                } else {
-                    theme::FIND_MATCH_DIM
-                };
-                for run in buffer_for_draw.layout_runs() {
-                    if run.line_i != match_line {
-                        continue;
-                    }
-                    // Use cosmic_text::Cursor with byte-offset indices to
-                    // compute the pixel span of this match within the line.
-                    if let Some(hl) = run.highlight(
-                        cosmic_text::Cursor {
-                            line: match_line,
-                            index: col_start,
-                            ..cosmic_text::Cursor::default()
-                        },
-                        cosmic_text::Cursor {
-                            line: match_line,
-                            index: col_end,
-                            ..cosmic_text::Cursor::default()
-                        },
-                    ) {
-                        draw_highlight_background(
-                            renderer, text_clip, text_x, text_y, &run, hl.0, hl.1, color,
-                        );
-                    }
-                    // Match may span multiple visual runs on soft-wrapped
-                    // lines — don't break, continue checking all runs for
-                    // this logical line.
-                }
-            }
-        }
-
-        // ── Draw bracket matching highlights ──
-        // Draw a subtle background under both the opening and closing bracket.
-        if let Some(((open_line, open_col), (close_line, close_col))) = self.bracket_pair {
-            let bracket_color = theme::BRACKET_MATCH;
-            for &(b_line, b_col) in &[(open_line, open_col), (close_line, close_col)] {
-                let line_text = buffer_for_draw.lines.get(b_line).map_or("", |l| l.text());
-                let (byte_start, byte_end) = char_col_to_byte_range_in_line(line_text, b_col);
-                for run in buffer_for_draw.layout_runs() {
-                    if run.line_i != b_line {
-                        continue;
-                    }
-                    // Highlight one character at the bracket position.
-                    if let Some(hl) = run.highlight(
-                        cosmic_text::Cursor {
-                            line: b_line,
-                            index: byte_start,
-                            ..cosmic_text::Cursor::default()
-                        },
-                        cosmic_text::Cursor {
-                            line: b_line,
-                            index: byte_end,
-                            ..cosmic_text::Cursor::default()
-                        },
-                    ) {
-                        draw_highlight_background(
-                            renderer,
-                            text_clip,
-                            text_x,
-                            text_y,
-                            &run,
-                            hl.0,
-                            hl.1,
-                            bracket_color,
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-
-        // ── Draw selection rectangles ──
-        let cursor_state = self.buffer.cursor();
-        let has_selection = cursor_state.selection.is_some();
-
-        if let Some(ref anchor) = cursor_state.selection {
-            let start = (cursor_state.line, cursor_state.column);
-            let end = (anchor.line, anchor.column);
-            let (sel_start, sel_end) = if start < end {
-                (start, end)
-            } else {
-                (end, start)
-            };
-
-            let sel_start_byte = buffer_for_draw.lines.get(sel_start.0).map_or(0, |l| {
-                char_col_to_byte_offset_in_line(l.text(), sel_start.1)
-            });
-            let sel_end_byte = buffer_for_draw
-                .lines
-                .get(sel_end.0)
-                .map_or(0, |l| char_col_to_byte_offset_in_line(l.text(), sel_end.1));
-
-            for run in buffer_for_draw.layout_runs() {
-                if let Some(highlight) = run.highlight(
-                    cosmic_text::Cursor {
-                        line: sel_start.0,
-                        index: sel_start_byte,
-                        ..cosmic_text::Cursor::default()
-                    },
-                    cosmic_text::Cursor {
-                        line: sel_end.0,
-                        index: sel_end_byte,
-                        ..cosmic_text::Cursor::default()
-                    },
-                ) {
-                    draw_highlight_background(
-                        renderer,
-                        text_clip,
-                        text_x,
-                        text_y,
-                        &run,
-                        highlight.0,
-                        highlight.1,
-                        theme::ACCENT_DIM,
-                    );
-                }
-            }
-        }
-
-        // ── 5. Draw text via fill_raw ──
-        renderer.fill_raw(TextRaw {
-            buffer: Arc::downgrade(&buffer_for_draw),
-            position: Point::new(text_x, text_y),
-            color: iced::Color::WHITE, // neutral multiplier preserves per-glyph colors
-            clip_bounds: text_clip,
-        });
-
-        // ── 6. Draw cursor (blinking vertical line) ──
-        let now = std::time::Instant::now();
-        let blink_on = now.duration_since(state.last_blink).as_millis() % 1000 < 500;
-
-        if blink_on && !has_selection {
-            let cursor_x;
-            let cursor_y;
-            let cursor_height;
-
-            if let Some(run) = find_cursor_run(
-                buffer_for_draw.layout_runs(),
-                cursor_state.line,
-                cursor_state.column,
-            ) {
-                cursor_y = text_y + run.line_top;
-                cursor_height = run.line_height;
-                let found_x = run
-                    .glyphs
-                    .iter()
-                    .find(|g| {
-                        cursor_state.column < run.text[..g.end.min(run.text.len())].chars().count()
-                    })
-                    .map(|g| g.x);
-                cursor_x = text_x
-                    + found_x
-                        .unwrap_or_else(|| run.glyphs.last().map_or(0.0, |last| last.x + last.w));
-            } else {
-                cursor_x = 0.0;
-                cursor_y = text_y;
-                cursor_height = font_metrics().line_height;
-            }
-
-            let cursor_rect = Rectangle {
-                x: cursor_x,
-                y: cursor_y,
-                width: 1.5,
-                height: cursor_height,
-            };
-
-            if let Some(clipped) = text_clip.intersection(&cursor_rect) {
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: clipped,
-                        border: iced::Border::default(),
-                        ..renderer::Quad::default()
-                    },
-                    theme::TEXT_PRIMARY,
-                );
-            }
-        }
+        draw_background(renderer, bounds);
+        draw_line_numbers(
+            renderer,
+            &buffer_for_draw,
+            bounds,
+            self.padding,
+            text_y,
+            gutter_width,
+            text_area_height,
+        );
+        draw_find_match_highlights(
+            renderer,
+            &buffer_for_draw,
+            text_clip,
+            text_x,
+            text_y,
+            self.matches.as_ref(),
+            self.match_current_idx,
+        );
+        draw_bracket_match_highlights(
+            renderer,
+            &buffer_for_draw,
+            text_clip,
+            text_x,
+            text_y,
+            self.bracket_pair,
+        );
+        draw_selection(
+            renderer,
+            &buffer_for_draw,
+            text_clip,
+            text_x,
+            text_y,
+            self.buffer,
+        );
+        draw_text(renderer, &buffer_for_draw, text_x, text_y, text_clip);
+        draw_cursor(
+            renderer,
+            &buffer_for_draw,
+            text_clip,
+            text_x,
+            text_y,
+            state,
+            self.buffer,
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3301,6 +3113,313 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         mouse::Interaction::Text
+    }
+}
+
+// ── Draw layer helpers ──────────────────────────────────────────────
+
+/// Fill the widget background.
+fn draw_background<Renderer>(renderer: &mut Renderer, bounds: Rectangle)
+where
+    Renderer: iced::advanced::Renderer,
+{
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds,
+            border: iced::Border::default(),
+            ..renderer::Quad::default()
+        },
+        theme::BG_BASE,
+    );
+}
+
+/// Draw line numbers in the gutter area.
+fn draw_line_numbers<Renderer>(
+    renderer: &mut Renderer,
+    buffer: &cosmic_text::Buffer,
+    bounds: Rectangle,
+    padding: f32,
+    text_y: f32,
+    gutter_width: f32,
+    text_area_height: f32,
+) where
+    Renderer: iced::advanced::text::Renderer,
+{
+    let number_color = theme::TEXT_MUTED;
+    let number_clip = gutter_clip_rect(bounds, padding, gutter_width, text_area_height);
+
+    let mut last_line_i = usize::MAX;
+    for run in buffer.layout_runs() {
+        // Only draw the first run per line (avoid duplicates for wrapped lines)
+        if run.line_i == last_line_i {
+            continue;
+        }
+        last_line_i = run.line_i;
+        let num = run.line_i + 1;
+        let num_str = num.to_string();
+        let num_text = iced::advanced::text::Text {
+            content: num_str,
+            bounds: Size::new(gutter_width, run.line_height),
+            size: iced::Pixels(GUTTER_FONT_SIZE),
+            line_height: iced::advanced::text::LineHeight::Relative(1.3),
+            font: renderer.default_font(),
+            align_x: iced::alignment::Horizontal::Right.into(),
+            align_y: iced::alignment::Vertical::Center,
+            shaping: iced::advanced::text::Shaping::Advanced,
+            wrapping: iced::advanced::text::Wrapping::None,
+        };
+        renderer.fill_text(
+            num_text,
+            Point::new(
+                bounds.x + padding + gutter_width,
+                text_y + run.line_top + run.line_height / 2.0,
+            ),
+            number_color,
+            number_clip,
+        );
+    }
+}
+
+/// Draw find match highlight backgrounds behind text.
+/// Rendered before selection so selection teal appears on top.
+fn draw_find_match_highlights<Renderer>(
+    renderer: &mut Renderer,
+    buffer: &cosmic_text::Buffer,
+    text_clip: Rectangle,
+    text_x: f32,
+    text_y: f32,
+    matches: Option<&Vec<(usize, usize, usize)>>,
+    match_current_idx: usize,
+) where
+    Renderer: iced::advanced::Renderer,
+{
+    // Match highlights are drawn BEFORE selection so selection
+    // (ACCENT_DIM teal) renders on top of match highlights.
+    // Text is drawn AFTER both via fill_raw, so highlights
+    // appear as background tints behind the glyphs.
+    if let Some(matches) = matches {
+        for (i, &(match_line, col_start, col_end)) in matches.iter().enumerate() {
+            let color = if i == match_current_idx {
+                theme::FIND_MATCH_CURRENT
+            } else {
+                theme::FIND_MATCH_DIM
+            };
+            for run in buffer.layout_runs() {
+                if run.line_i != match_line {
+                    continue;
+                }
+                // Use cosmic_text::Cursor with byte-offset indices to
+                // compute the pixel span of this match within the line.
+                if let Some(hl) = run.highlight(
+                    cosmic_text::Cursor {
+                        line: match_line,
+                        index: col_start,
+                        ..cosmic_text::Cursor::default()
+                    },
+                    cosmic_text::Cursor {
+                        line: match_line,
+                        index: col_end,
+                        ..cosmic_text::Cursor::default()
+                    },
+                ) {
+                    draw_highlight_background(
+                        renderer, text_clip, text_x, text_y, &run, hl.0, hl.1, color,
+                    );
+                }
+                // Match may span multiple visual runs on soft-wrapped
+                // lines — don't break, continue checking all runs for
+                // this logical line.
+            }
+        }
+    }
+}
+
+/// Draw bracket matching highlight backgrounds behind the open/close bracket.
+fn draw_bracket_match_highlights<Renderer>(
+    renderer: &mut Renderer,
+    buffer: &cosmic_text::Buffer,
+    text_clip: Rectangle,
+    text_x: f32,
+    text_y: f32,
+    bracket_pair: Option<((usize, usize), (usize, usize))>,
+) where
+    Renderer: iced::advanced::Renderer,
+{
+    // Draw a subtle background under both the opening and closing bracket.
+    if let Some(((open_line, open_col), (close_line, close_col))) = bracket_pair {
+        let bracket_color = theme::BRACKET_MATCH;
+        for &(b_line, b_col) in &[(open_line, open_col), (close_line, close_col)] {
+            let line_text = buffer.lines.get(b_line).map_or("", |l| l.text());
+            let (byte_start, byte_end) = char_col_to_byte_range_in_line(line_text, b_col);
+            for run in buffer.layout_runs() {
+                if run.line_i != b_line {
+                    continue;
+                }
+                // Highlight one character at the bracket position.
+                if let Some(hl) = run.highlight(
+                    cosmic_text::Cursor {
+                        line: b_line,
+                        index: byte_start,
+                        ..cosmic_text::Cursor::default()
+                    },
+                    cosmic_text::Cursor {
+                        line: b_line,
+                        index: byte_end,
+                        ..cosmic_text::Cursor::default()
+                    },
+                ) {
+                    draw_highlight_background(
+                        renderer,
+                        text_clip,
+                        text_x,
+                        text_y,
+                        &run,
+                        hl.0,
+                        hl.1,
+                        bracket_color,
+                    );
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Draw selection highlight rectangles.
+fn draw_selection<Renderer>(
+    renderer: &mut Renderer,
+    buffer: &cosmic_text::Buffer,
+    text_clip: Rectangle,
+    text_x: f32,
+    text_y: f32,
+    editor_buffer: &EditorBuffer,
+) where
+    Renderer: iced::advanced::Renderer,
+{
+    let cursor_state = editor_buffer.cursor();
+
+    if let Some(ref anchor) = cursor_state.selection {
+        let start = (cursor_state.line, cursor_state.column);
+        let end = (anchor.line, anchor.column);
+        let (sel_start, sel_end) = if start < end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        let sel_start_byte = buffer.lines.get(sel_start.0).map_or(0, |l| {
+            char_col_to_byte_offset_in_line(l.text(), sel_start.1)
+        });
+        let sel_end_byte = buffer
+            .lines
+            .get(sel_end.0)
+            .map_or(0, |l| char_col_to_byte_offset_in_line(l.text(), sel_end.1));
+
+        for run in buffer.layout_runs() {
+            if let Some(highlight) = run.highlight(
+                cosmic_text::Cursor {
+                    line: sel_start.0,
+                    index: sel_start_byte,
+                    ..cosmic_text::Cursor::default()
+                },
+                cosmic_text::Cursor {
+                    line: sel_end.0,
+                    index: sel_end_byte,
+                    ..cosmic_text::Cursor::default()
+                },
+            ) {
+                draw_highlight_background(
+                    renderer,
+                    text_clip,
+                    text_x,
+                    text_y,
+                    &run,
+                    highlight.0,
+                    highlight.1,
+                    theme::ACCENT_DIM,
+                );
+            }
+        }
+    }
+}
+
+/// Draw the text glyphs via `fill_raw` for syntax-coloured output.
+fn draw_text<Renderer>(
+    renderer: &mut Renderer,
+    buffer: &Arc<cosmic_text::Buffer>,
+    text_x: f32,
+    text_y: f32,
+    text_clip: Rectangle,
+) where
+    Renderer: iced::advanced::graphics::text::Renderer,
+{
+    renderer.fill_raw(TextRaw {
+        buffer: Arc::downgrade(buffer),
+        position: Point::new(text_x, text_y),
+        color: iced::Color::WHITE, // neutral multiplier preserves per-glyph colors
+        clip_bounds: text_clip,
+    });
+}
+
+/// Draw the blinking cursor caret when no selection is active.
+fn draw_cursor<Renderer>(
+    renderer: &mut Renderer,
+    buffer: &cosmic_text::Buffer,
+    text_clip: Rectangle,
+    text_x: f32,
+    text_y: f32,
+    state: &EditorWidgetState,
+    editor_buffer: &EditorBuffer,
+) where
+    Renderer: iced::advanced::Renderer,
+{
+    let now = std::time::Instant::now();
+    let blink_on = now.duration_since(state.last_blink).as_millis() % 1000 < 500;
+    let cursor_state = editor_buffer.cursor();
+    let has_selection = cursor_state.selection.is_some();
+
+    if blink_on && !has_selection {
+        let cursor_x;
+        let cursor_y;
+        let cursor_height;
+
+        if let Some(run) =
+            find_cursor_run(buffer.layout_runs(), cursor_state.line, cursor_state.column)
+        {
+            cursor_y = text_y + run.line_top;
+            cursor_height = run.line_height;
+            let found_x = run
+                .glyphs
+                .iter()
+                .find(|g| {
+                    cursor_state.column < run.text[..g.end.min(run.text.len())].chars().count()
+                })
+                .map(|g| g.x);
+            cursor_x = text_x
+                + found_x.unwrap_or_else(|| run.glyphs.last().map_or(0.0, |last| last.x + last.w));
+        } else {
+            cursor_x = 0.0;
+            cursor_y = text_y;
+            cursor_height = font_metrics().line_height;
+        }
+
+        let cursor_rect = Rectangle {
+            x: cursor_x,
+            y: cursor_y,
+            width: 1.5,
+            height: cursor_height,
+        };
+
+        if let Some(clipped) = text_clip.intersection(&cursor_rect) {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: clipped,
+                    border: iced::Border::default(),
+                    ..renderer::Quad::default()
+                },
+                theme::TEXT_PRIMARY,
+            );
+        }
     }
 }
 
