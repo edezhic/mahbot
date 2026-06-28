@@ -26,12 +26,6 @@ pub struct RoleConfig {
 }
 
 impl RoleConfig {
-    /// Normalise optional string fields: trim whitespace, collapse empty → `None`.
-    pub(crate) fn normalize(&mut self) {
-        self.model = non_empty(self.model.take());
-        self.reasoning_effort = non_empty(self.reasoning_effort.take());
-    }
-
     /// Find-or-push: update a subset of fields on an existing entry matching
     /// `role`, or push a new entry (all fields defaulted to `None`).
     ///
@@ -66,11 +60,6 @@ pub struct ModelRouting {
 }
 
 impl ModelRouting {
-    /// Normalise optional string fields: trim whitespace, collapse empty → `None`.
-    pub(crate) fn normalize(&mut self) {
-        self.provider_order = non_empty(self.provider_order.take());
-    }
-
     /// Find-or-push: update a subset of fields on an existing entry matching
     /// `model`, or push a new entry (all fields defaulted to `None`).
     ///
@@ -374,7 +363,7 @@ string_config_fields! {
 }
 
 impl ConfigData {
-    /// Normalise all Vec entry inner `Option<String>` fields in place:
+    /// Normalise inner `Option<String>` fields of `Vec` entries in place:
     /// trim whitespace and collapse empty/whitespace-only values to `None`.
     ///
     /// This is the Vec-entry counterpart of [`normalize_string_fields()`] —
@@ -382,10 +371,11 @@ impl ConfigData {
     /// not the inner fields of [`RoleConfig`] and [`ModelRouting`] entries.
     pub(crate) fn normalize_entries(&mut self) {
         for rc in &mut self.per_role_configs {
-            rc.normalize();
+            rc.model = non_empty(rc.model.take());
+            rc.reasoning_effort = non_empty(rc.reasoning_effort.take());
         }
         for mr in &mut self.model_routings {
-            mr.normalize();
+            mr.provider_order = non_empty(mr.provider_order.take());
         }
     }
 
@@ -1046,8 +1036,8 @@ mod tests {
     // exercised through the integration test — there is no need for
     // per-struct test duplication.
 
-    /// Verify that [`ConfigData::normalize_entries`] applies `normalize()` to
-    /// every entry in `per_role_configs` and `model_routings`.
+    /// Verify that [`ConfigData::normalize_entries`] normalises every entry in
+    /// `per_role_configs` and `model_routings`.
     #[test]
     fn normalize_entries_works() {
         let mut config = ConfigData {
