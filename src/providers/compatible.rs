@@ -318,15 +318,29 @@ fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
 
     for caps in crate::util::MEDIA_MARKER_RE.captures_iter(content) {
-        if caps.get(1).unwrap().as_str() == "IMAGE" {
-            let path = caps.get(2).unwrap().as_str().trim();
+        if caps
+            .name("kind")
+            .expect("MEDIA_MARKER_RE: expected 'kind' group")
+            .as_str()
+            == "IMAGE"
+        {
+            let path = caps
+                .name("path")
+                .expect("MEDIA_MARKER_RE: expected 'path' group")
+                .as_str()
+                .trim();
             refs.push(path.to_string());
         }
     }
 
     // Strip IMAGE markers; preserve AUDIO and other non-IMAGE markers.
     let cleaned = crate::util::MEDIA_MARKER_RE.replace_all(content, |caps: &regex::Captures| {
-        if caps.get(1).unwrap().as_str() == "IMAGE" {
+        if caps
+            .name("kind")
+            .expect("MEDIA_MARKER_RE: expected 'kind' group")
+            .as_str()
+            == "IMAGE"
+        {
             String::new()
         } else {
             caps.get(0).unwrap().as_str().to_string()

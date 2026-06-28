@@ -44,7 +44,8 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
 /// cause it to be automatically stripped in multimodal mode unless the closure
 /// is explicitly updated to preserve it.
 pub(crate) static MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[(IMAGE|AUDIO|VIDEO):([^\]]+)\]").expect("MEDIA_MARKER_RE must compile")
+    Regex::new(r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]]+)\]")
+        .expect("MEDIA_MARKER_RE must compile")
 });
 
 /// Truncate a string to `max_chars` Unicode characters, appending "…" if truncated.

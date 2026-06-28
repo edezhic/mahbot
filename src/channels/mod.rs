@@ -385,7 +385,13 @@ fn finish_enrichment(
     let keep_image = matches!(strategy, EnrichmentStrategy::Multimodal { .. });
     let cleaned = MEDIA_MARKER_RE
         .replace_all(content, |caps: &regex::Captures| {
-            if keep_image && caps.get(1).unwrap().as_str() == "IMAGE" {
+            if keep_image
+                && caps
+                    .name("kind")
+                    .expect("MEDIA_MARKER_RE: expected 'kind' group")
+                    .as_str()
+                    == "IMAGE"
+            {
                 caps.get(0).unwrap().as_str().to_string()
             } else {
                 String::new()
@@ -436,8 +442,14 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
 
     for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {
         let whole = caps.get(0).unwrap();
-        let kind = caps.get(1).unwrap().as_str();
-        let path = caps.get(2).unwrap().as_str();
+        let kind = caps
+            .name("kind")
+            .expect("MEDIA_MARKER_RE: expected 'kind' group")
+            .as_str();
+        let path = caps
+            .name("path")
+            .expect("MEDIA_MARKER_RE: expected 'path' group")
+            .as_str();
         let path_obj = std::path::Path::new(path);
 
         match kind {
