@@ -567,6 +567,21 @@ impl EditorBuffer {
         Some((start_off, end_off))
     }
 
+    /// If a selection exists, delete it and return `true`.
+    fn delete_if_selected(&self) -> bool {
+        if let Some((start, end)) = self.delete_selection_get_range() {
+            self.edit_text(|text| {
+                let mut new_text = text.to_string();
+                new_text.replace_range(start..end, "");
+                let (line, col) = byte_offset_to_line_col(&new_text, start);
+                (new_text, Some((line, col)))
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     /// Helper: apply a text edit that replaces a byte range. The closure
     /// receives the byte offset and can return an optional new cursor
     /// (line, col). If the closure returns `None`, cursor is not adjusted.
@@ -667,14 +682,7 @@ impl EditorBuffer {
 
     /// Delete the character behind the cursor.
     fn do_backspace(&self) {
-        // If selection exists, delete it and we're done.
-        if let Some((start, end)) = self.delete_selection_get_range() {
-            self.edit_text(|text| {
-                let mut new_text = text.to_string();
-                new_text.replace_range(start..end, "");
-                let (line, col) = byte_offset_to_line_col(&new_text, start);
-                (new_text, Some((line, col)))
-            });
+        if self.delete_if_selected() {
             return;
         }
 
@@ -711,14 +719,7 @@ impl EditorBuffer {
 
     /// Delete the character in front of the cursor.
     fn do_delete(&self) {
-        // If selection exists, delete it.
-        if let Some((start, end)) = self.delete_selection_get_range() {
-            self.edit_text(|text| {
-                let mut new_text = text.to_string();
-                new_text.replace_range(start..end, "");
-                let (line, col) = byte_offset_to_line_col(&new_text, start);
-                (new_text, Some((line, col)))
-            });
+        if self.delete_if_selected() {
             return;
         }
 
@@ -1101,14 +1102,7 @@ impl EditorBuffer {
 
     /// Delete from cursor backward to start of previous word.
     fn do_delete_word_back(&self) {
-        // If selection exists, delete it.
-        if let Some((start, end)) = self.delete_selection_get_range() {
-            self.edit_text(|text| {
-                let mut new_text = text.to_string();
-                new_text.replace_range(start..end, "");
-                let (line, col) = byte_offset_to_line_col(&new_text, start);
-                (new_text, Some((line, col)))
-            });
+        if self.delete_if_selected() {
             return;
         }
 
@@ -1128,14 +1122,7 @@ impl EditorBuffer {
 
     /// Delete from cursor forward to start of next word.
     fn do_delete_word_forward(&self) {
-        // If selection exists, delete it.
-        if let Some((start, end)) = self.delete_selection_get_range() {
-            self.edit_text(|text| {
-                let mut new_text = text.to_string();
-                new_text.replace_range(start..end, "");
-                let (line, col) = byte_offset_to_line_col(&new_text, start);
-                (new_text, Some((line, col)))
-            });
+        if self.delete_if_selected() {
             return;
         }
 
