@@ -2613,15 +2613,8 @@ mod tests {
     /// Idempotent across concurrent tests — all globals use OnceCell/OnceLock
     /// guards, so duplicate initialization is a harmless no-op.
     async fn init_management_test_stores() {
-        // Ticket buffer — OnceLock ensures exactly-once initialization.
-        static TICKET_BUF_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
         init_test_stores().await;
 
-        TICKET_BUF_INIT.get_or_init(|| {
-            crate::ticket_buffer::init_global();
-        });
-        // init_global() returns Err if already set — ignored (idempotent).
         let _ = crate::workspace::init_global().await;
         let _ = crate::manager_queue::init_global();
     }

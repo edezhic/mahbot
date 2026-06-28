@@ -223,6 +223,9 @@ pub async fn init_test_stores() {
         // search_engine is sync — must be initialized before workspace
         crate::search_engine::init_global();
 
+        // ticket_buffer is sync — lightweight allocation, no DB I/O.
+        crate::ticket_buffer::init_global();
+
         crate::session::SESSIONS
             .set(
                 SessionStore::open(test_root())

@@ -43,17 +43,13 @@ pub fn init_global() {
 /// If the per-workspace capacity (`PER_WORKSPACE_CAPACITY`) is exceeded,
 /// the oldest entry for that workspace is dropped and a warning is emitted.
 ///
-/// If the buffer has not been initialized via [`init_global`], this is a
-/// silent no-op with a warning log. This forgiving behavior exists because
-/// some call sites (e.g., [`crate::board::BoardStore::supersede_and_create`]) are exercised
-/// by tests that don't run the full startup sequence. Under normal operation
-/// the buffer is always initialized before any caller reaches it, so a
-/// warning here would indicate a genuine startup-order issue.
+/// # Panics
+///
+/// Panics if the buffer has not been initialized via [`init_global`].
 pub fn push(workspace_name: &str, id: &str, old_status: TicketPhase, new_status: TicketPhase) {
-    let Some(mutex) = TICKET_BUFFER.get() else {
-        warn!("ticket_buffer not initialized — call init_global() first");
-        return;
-    };
+    let mutex = TICKET_BUFFER
+        .get()
+        .expect("ticket_buffer not initialized — call init_global() first");
     let mut map = mutex.lock().unwrap_poison();
     let deque = map.entry(workspace_name.to_string()).or_default();
     if deque.len() >= PER_WORKSPACE_CAPACITY {
@@ -74,8 +70,11 @@ pub fn push(workspace_name: &str, id: &str, old_status: TicketPhase, new_status:
 /// Drain all buffered entries for a workspace.
 ///
 /// Returns a formatted string ready for insertion into a notification,
-/// or an empty string if no entries are buffered (or if the buffer has
-/// not been initialized).
+/// or an empty string if no entries are buffered.
+///
+/// # Panics
+///
+/// Panics if the buffer has not been initialized via [`init_global`].
 ///
 /// Format:
 /// ```text
@@ -84,9 +83,9 @@ pub fn push(workspace_name: &str, id: &str, old_status: TicketPhase, new_status:
 /// • mahbot-43: in_diagnostics → diagnostics_done
 /// ```
 pub fn drain(workspace_name: &str) -> String {
-    let Some(mutex) = TICKET_BUFFER.get() else {
-        return String::new();
-    };
+    let mutex = TICKET_BUFFER
+        .get()
+        .expect("ticket_buffer not initialized — call init_global() first");
     let mut map = mutex.lock().unwrap_poison();
     let Some(entries) = map.remove(workspace_name) else {
         return String::new();

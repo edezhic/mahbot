@@ -1779,6 +1779,7 @@ mod tests {
     use crate::Tool;
     use crate::util::test::TicketBuilder;
     use crate::util::test::expect_ticket;
+    use crate::util::test::init_test_stores;
     use crate::workspace::test_ws;
     use crate::workspace::test_ws_named;
     use strum::IntoEnumIterator;
@@ -3177,10 +3178,14 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     #[tokio::test]
     async fn test_supersede_and_create_basic() {
-        let (store, _tmp, old_id) = setup().await;
+        init_test_stores().await;
+        let store = crate::board::BOARD.get().unwrap();
         let ws = test_ws_named("/ws", "ws");
-
-        // Existing ticket (created by setup)
+        let old_id = TicketBuilder::new(store, ws.clone())
+            .title("Test")
+            .create()
+            .await
+            .expect("setup");
 
         // Supersede it
         let new_id = TicketBuilder::new(&store, ws)
@@ -3217,7 +3222,8 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     #[tokio::test]
     async fn test_supersede_rewires_only_matching_prerequisite() {
-        let (store, _tmp) = open_test_store().await;
+        init_test_stores().await;
+        let store = crate::board::BOARD.get().unwrap();
         let ws = test_ws_named("/ws", "ws");
 
         // Create ticket A (will be superseded) and ticket C (independent).
@@ -3410,10 +3416,16 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     #[tokio::test]
     async fn test_supersede_already_cancelled() {
-        let (store, _tmp, old_id) = setup().await;
+        init_test_stores().await;
+        let store = crate::board::BOARD.get().unwrap();
         let ws = test_ws_named("/ws", "ws");
+        let old_id = TicketBuilder::new(store, ws.clone())
+            .title("Test")
+            .create()
+            .await
+            .expect("setup");
 
-        // Cancel the ticket (created by setup)
+        // Cancel the ticket
         store
             .transition_to(&old_id, None, TicketPhase::Cancelled, None)
             .await
@@ -4594,7 +4606,8 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// old ticket shows Superseded by + Archived.
     #[tokio::test]
     async fn test_detailed_display_supersedes_chain() {
-        let (store, _tmp) = open_test_store().await;
+        init_test_stores().await;
+        let store = crate::board::BOARD.get().unwrap();
         let ws = test_ws_named("/ws", "ws");
 
         // Create an old ticket first
