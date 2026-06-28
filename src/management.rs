@@ -651,6 +651,28 @@ async fn for_tickets_in_phase(phase: TicketPhase, ws_name: &str, mut action: imp
     }
 }
 
+/// Dispatch unassigned tickets in the given phase.
+///
+/// Both DiagnosticsCheck and SanitationCheck use this pattern because the
+/// ticket stays in its current phase while the agent runs (rather than
+/// transitioning via the claim loop). We list tickets for the phase directly
+/// and guard against re-dispatch via \`assigned_to IS NULL\` — tickets that
+/// already have an \`assigned_to\` value are mid-execution and should not be
+/// re-dispatched.
+async fn dispatch_unassigned_in_phase(
+    phase: TicketPhase,
+    dispatch_phase: PollPhase,
+    ws: &Workspace,
+) {
+    for_tickets_in_phase(phase, &ws.name, |ticket| {
+        if ticket.assigned_to.is_some() {
+            return;
+        }
+        spawn_dispatch(dispatch_phase, ticket, ws.clone());
+    })
+    .await;
+}
+
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
 /// Single pass over workspaces — for each, attempt claims across all pipeline
@@ -717,21 +739,10 @@ async fn poll_round() -> anyhow::Result<()> {
             spawn_dispatch(phase, ticket, ws.clone());
         }
 
-        // 2. Dispatch unassigned InDiagnostics tickets.
-        //
-        // DiagnosticsCheck does NOT use the claim loop because claim
-        // transitions source→target atomically, but diagnostics keeps the
-        // ticket in InDiagnostics while running (only transitions on
-        // completion). Instead, we list InDiagnostics tickets for this
-        // workspace directly and guard against re-dispatch via
-        // `assigned_to IS NULL`.
-        for_tickets_in_phase(TicketPhase::InDiagnostics, &ws.name, |ticket| {
-            if ticket.assigned_to.is_some() {
-                return; // already dispatched, still running
-            }
-            spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws.clone());
-        })
-        .await;
+        // 2. DiagnosticsCheck — diagnostics keeps the ticket in InDiagnostics
+        // while running, so the claim loop isn't applicable.
+        dispatch_unassigned_in_phase(TicketPhase::InDiagnostics, PollPhase::DiagnosticsCheck, ws)
+            .await;
 
         // 3. SanitationPassed → Done (auto-commit).
         //
@@ -763,19 +774,10 @@ async fn poll_round() -> anyhow::Result<()> {
         })
         .await;
 
-        // 5. Dispatch unassigned InSanitation tickets.
-        //
-        // SanitationCheck does NOT use the claim loop — the claim (QaPassed→InSanitation)
-        // happens inside handle_qa_passed, which also pushes the ticket_buffer entry.
-        // We guard against re-dispatch via assigned_to IS NULL, matching the
-        // DiagnosticsCheck pattern.
-        for_tickets_in_phase(TicketPhase::InSanitation, &ws.name, |ticket| {
-            if ticket.assigned_to.is_some() {
-                return; // already dispatched, still running
-            }
-            spawn_dispatch(PollPhase::SanitationCheck, ticket, ws.clone());
-        })
-        .await;
+        // 5. SanitationCheck — the claim (QaPassed→InSanitation) already happened
+        // inside handle_qa_passed, so we only dispatch unassigned tickets.
+        dispatch_unassigned_in_phase(TicketPhase::InSanitation, PollPhase::SanitationCheck, ws)
+            .await;
     }
 
     Ok(())
