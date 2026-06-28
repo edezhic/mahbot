@@ -100,18 +100,14 @@ async fn handle_option_callback(mut msg: ChannelMessage) {
     });
 }
 
-/// Build a session key for a given user, role, and source channel.
+/// Build a session key for a given workspace, role, and source channel.
 /// Non-Manager sessions include the channel scope: `{channel}_{user_name}_{role}_{ws}`.
 /// Manager sessions stay channel-agnostic: `manager_{ws_name}`.
-async fn build_session_key(user_name: &str, role: &Role, source_channel: &str) -> String {
-    let ws_name = match mahbot::users::get_workspace(user_name).await {
-        Ok(Some(ws)) => ws.name,
-        _ => "unknown".to_string(),
-    };
-    if *role == Role::Manager {
-        manager_session_key(&ws_name)
+fn build_session_key(ws_name: &str, user_name: &str, role: Role, source_channel: &str) -> String {
+    if role == Role::Manager {
+        manager_session_key(ws_name)
     } else {
-        direct_session_key(source_channel, user_name, role.as_str(), &ws_name)
+        direct_session_key(source_channel, user_name, role.as_str(), ws_name)
     }
 }
 
@@ -158,16 +154,18 @@ async fn bootstrap_mahbot() -> Result<()> {
     mahbot::config::reload_from_db().await?;
     mahbot::providers::init_global().await?;
 
-    spawn_background_tasks(log_store.clone());
-
-    info!("MahBot initialized — dashboard ready");
-
     BOOT_LOG_STORE
         .set(log_store.as_ref().clone())
         .map_err(|_| anyhow::anyhow!("BOOT_LOG_STORE already set"))?;
 
+    spawn_background_tasks(log_store.clone());
+
+    info!("MahBot initialized — dashboard ready");
+
     let admin_target = mahbot::self_update::resolve_admin_telegram_target().await;
-    mahbot::self_update::notify_admin("✅ MahBot is back online.", admin_target.as_ref()).await;
+    tokio::spawn(async move {
+        mahbot::self_update::notify_admin("✅ MahBot is back online.", admin_target.as_ref()).await;
+    });
 
     Ok(())
 }
@@ -622,9 +620,13 @@ async fn handle_action_callback(msg: ChannelMessage) {
             // Acknowledge callback silently first (dismiss spinner)
             answer_telegram_callback(&msg, None).await;
 
-            // Resolve role and reset session
-            let role = mahbot::users::resolve_active_role(&msg.user_name).await;
-            let session_key = build_session_key(&msg.user_name, &role, &msg.source_channel).await;
+            // Resolve workspace and role in parallel, then reset session
+            let (ws, role) = tokio::join!(
+                resolve_workspace_for_user(&msg),
+                mahbot::users::resolve_active_role(&msg.user_name),
+            );
+            let session_key =
+                build_session_key(&ws.name, &msg.user_name, role, &msg.source_channel);
             let reply = Session::reset(&session_key).await;
             send_channel_reply(reply, &msg).await;
         }
@@ -694,7 +696,10 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         mahbot::util::truncate(&msg.content, 80)
     );
 
-    let ws = resolve_workspace_for_user(&msg).await;
+    let (ws, role) = tokio::join!(
+        resolve_workspace_for_user(&msg),
+        mahbot::users::resolve_active_role(&msg.user_name),
+    );
 
     // Populate workspace on the message so downstream broadcasts and
     // chat_history writes carry the correct workspace (non-Manager agent
@@ -706,8 +711,6 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // chat_history. Workspace resolution must happen first so the
     // workspace field is correct.
     write_incoming_to_broadcast(&msg).await;
-
-    let role = mahbot::users::resolve_active_role(&msg.user_name).await;
 
     // Personal workspaces do not support the Manager agent — no board
     // pipeline, no maintainer. If the role is Manager and we're in a
