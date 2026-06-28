@@ -3085,187 +3085,135 @@ mod tests {
 
     // ── apply_line_truncation unit tests ──────────────────────────────
 
-    enum PreExpect {
-        Some,
-        None,
-    }
-
-    struct TruncationCase {
-        name: &'static str,
-        profile: Profile,
-        output: String,
-        eq: Option<&'static str>,
-        contains: &'static [&'static str],
-        not_contains: &'static [&'static str],
-        starts_with: Option<&'static str>,
-        ends_with: Option<&'static str>,
-        expected_line_count: Option<usize>,
-        pre: PreExpect,
-    }
-
-    /// Defaults for optional assertion fields. Callers always override `name`,
-    /// `profile`, and `output` — these are set to unused placeholder values here
-    /// to enable the `..defaults()` struct-update pattern.
-    fn defaults() -> TruncationCase {
-        TruncationCase {
-            name: "",
-            profile: Profile::new("test"),
-            output: String::new(),
-            eq: None,
-            contains: &[],
-            not_contains: &[],
-            starts_with: None,
-            ends_with: None,
-            expected_line_count: None,
-            pre: PreExpect::None,
-        }
-    }
-
-    fn check_truncation(cases: &[TruncationCase]) {
-        for case in cases {
-            let (result, pre) = apply_line_truncation(&case.output, &case.profile);
-            if let Some(e) = case.eq {
-                assert_eq!(
-                    result, e,
-                    "[{}] expected eq {:?}\n  got: {result:?}",
-                    case.name, e,
-                );
-            }
-            for &s in case.contains {
-                assert!(
-                    result.contains(s),
-                    "[{}] expected contains {s:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
-            for &s in case.not_contains {
-                assert!(
-                    !result.contains(s),
-                    "[{}] expected NOT contains {s:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
-            if let Some(v) = case.starts_with {
-                assert!(
-                    result.starts_with(v),
-                    "[{}] expected starts_with {v:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
-            if let Some(v) = case.ends_with {
-                assert!(
-                    result.ends_with(v),
-                    "[{}] expected ends_with {v:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
-            if let Some(n) = case.expected_line_count {
-                assert_eq!(
-                    result.lines().count(),
-                    n,
-                    "[{}] expected line count {n}\n  got: {} lines",
-                    case.name,
-                    result.lines().count(),
-                );
-            }
-            match case.pre {
-                PreExpect::Some => {
-                    assert!(
-                        pre.is_some(),
-                        "[{}] expected pre.is_some()\n  got: {pre:?}",
-                        case.name,
-                    );
-                }
-                PreExpect::None => {
-                    assert_eq!(pre, None, "[{}] expected pre=None", case.name);
-                }
-            }
-        }
+    #[test]
+    fn truncate_no_config_passthrough() {
+        let p = Profile::new("passthrough");
+        let output = "line1\nline2\nline3";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output);
+        assert_eq!(pre, None);
     }
 
     #[test]
-    fn apply_line_truncation_cases() {
-        fn large_output() -> String {
-            let lines: Vec<String> = (0..100)
-                .map(|i| {
-                    format!(
-                        "line {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    )
-                })
-                .collect();
-            let o = lines.join("\n");
-            assert!(o.len() > SPILL_THRESHOLD_BYTES, "large_output too small");
-            o
-        }
+    fn truncate_head_tail_only_small_output_no_sandwich() {
+        // Small output (< SPILL_THRESHOLD_BYTES) should not trigger sandwich
+        let p = Profile::new("test").head(2).tail(2);
+        let output = "line1\nline2\nline3\nline4\nline5";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output, "small output passes through");
+        assert_eq!(pre, None, "no pre-truncation for small output");
+    }
 
-        check_truncation(&[
-            TruncationCase {
-                name: "no_config_passthrough",
-                profile: Profile::new("passthrough"),
-                output: "line1\nline2\nline3".into(),
-                eq: Some("line1\nline2\nline3"),
-                ..defaults()
-            },
-            TruncationCase {
-                name: "head_tail_only_small_output_no_sandwich",
-                profile: Profile::new("test").head(2).tail(2),
-                output: "line1\nline2\nline3\nline4\nline5".into(),
-                eq: Some("line1\nline2\nline3\nline4\nline5"),
-                ..defaults()
-            },
-            TruncationCase {
-                name: "head_tail_triggers_sandwich_large_output",
-                profile: Profile::new("test").head(2).tail(2),
-                output: large_output(),
-                contains: &["... (96 lines omitted)"],
-                starts_with: Some("line 0 aaaaaaaa"),
-                ends_with: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                pre: PreExpect::Some,
-                ..defaults()
-            },
-            TruncationCase {
-                name: "max_only_caps_at_limit",
-                profile: Profile::new("test").max(3),
-                output: "a\nb\nc\nd\ne".into(),
-                contains: &["... (2 lines truncated)"],
-                // 3 data lines + 1 truncation marker
-                expected_line_count: Some(4),
-                ..defaults()
-            },
-            TruncationCase {
-                name: "max_only_fits_no_truncation",
-                profile: Profile::new("test").max(10),
-                output: "a\nb\nc".into(),
-                eq: Some("a\nb\nc"),
-                ..defaults()
-            },
-            TruncationCase {
-                name: "head_tail_plus_max_byte_threshold_exceeded",
-                profile: Profile::new("test").head(2).tail(2).max(100),
-                output: large_output(),
-                contains: &["... (96 lines omitted)"],
-                // Defensive cap no-op: head+tail+1 (5) <= max (100)
-                not_contains: &["lines truncated"],
-                pre: PreExpect::Some,
-                ..defaults()
-            },
-            TruncationCase {
-                name: "head_tail_plus_max_byte_threshold_not_exceeded",
-                profile: Profile::new("test").head(2).tail(2).max(3),
-                output: "a\nb\nc\nd\ne".into(),
-                // Byte threshold not exceeded → head/tail skipped, max cap applies
-                contains: &["... (2 lines truncated)"],
-                expected_line_count: Some(4),
-                ..defaults()
-            },
-            // Only 4 lines total — fewer than head+tail (8), no truncation
-            TruncationCase {
-                name: "head_tail_fits_when_under_limit",
-                profile: Profile::new("test").head(5).tail(3),
-                output: "a\nb\nc\nd".into(),
-                eq: Some("a\nb\nc\nd"),
-                ..defaults()
-            },
-        ]);
+    #[test]
+    fn truncate_head_tail_triggers_sandwich_large_output() {
+        let p = Profile::new("test").head(2).tail(2);
+        // Generate output large enough to exceed SPILL_THRESHOLD_BYTES
+        let lines: Vec<String> = (0..100)
+            .map(|i| {
+                format!(
+                    "line {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+            })
+            .collect();
+        let output = lines.join("\n");
+        assert!(
+            output.len() > SPILL_THRESHOLD_BYTES,
+            "test output must exceed threshold (got {} bytes)",
+            output.len()
+        );
+
+        let (result, pre) = apply_line_truncation(&output, &p);
+        assert!(pre.is_some(), "should capture pre-truncation output");
+        assert!(
+            result.contains("... (96 lines omitted)"),
+            "should have omission marker"
+        );
+        assert!(
+            result.starts_with("line 0 aaaaaaaa"),
+            "should start with head"
+        );
+        assert!(
+            result.ends_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "should end with tail"
+        );
+    }
+
+    #[test]
+    fn truncate_max_only_caps_at_limit() {
+        let p = Profile::new("test").max(3);
+        let output = "a\nb\nc\nd\ne";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(pre, None, "no pre-truncation for max-only");
+        assert_eq!(
+            result.lines().count(),
+            4, // 3 lines + 1 truncation marker
+            "should have max+1 lines (3 data + marker)"
+        );
+        assert!(result.contains("... (2 lines truncated)"));
+    }
+
+    #[test]
+    fn truncate_max_only_fits_no_truncation() {
+        let p = Profile::new("test").max(10);
+        let output = "a\nb\nc";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output, "fits within max, passthrough");
+        assert_eq!(pre, None);
+    }
+
+    #[test]
+    fn truncate_head_tail_plus_max_byte_threshold_exceeded() {
+        let p = Profile::new("test").head(2).tail(2).max(100);
+        let lines: Vec<String> = (0..100)
+            .map(|i| {
+                format!(
+                    "line {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+            })
+            .collect();
+        let output = lines.join("\n");
+        assert!(
+            output.len() > SPILL_THRESHOLD_BYTES,
+            "test output must exceed threshold (got {} bytes)",
+            output.len()
+        );
+
+        let (result, pre) = apply_line_truncation(&output, &p);
+        assert!(pre.is_some(), "should capture pre-truncation");
+        // head+tail+1 = 5 <= max=100, so defensive cap is no-op
+        assert!(
+            result.contains("... (96 lines omitted)"),
+            "should have sandwich omission marker"
+        );
+        assert!(
+            !result.contains("lines truncated"),
+            "defensive cap should not fire when head+tail+1 <= max"
+        );
+    }
+
+    #[test]
+    fn truncate_head_tail_plus_max_byte_threshold_not_exceeded() {
+        let p = Profile::new("test").head(2).tail(2).max(3);
+        // Small output: byte threshold NOT exceeded, so head/tail skipped,
+        // but max cap should still apply.
+        let output = "a\nb\nc\nd\ne";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(pre, None, "no pre-truncation for small output");
+        assert_eq!(
+            result.lines().count(),
+            4, // 3 lines + 1 truncation marker
+            "max cap should apply"
+        );
+        assert!(result.contains("... (2 lines truncated)"));
+    }
+
+    #[test]
+    fn truncate_head_tail_fits_when_under_limit() {
+        let p = Profile::new("test").head(5).tail(3);
+        // Only 4 lines total — fewer than head+tail (8), so no truncation
+        let output = "a\nb\nc\nd";
+        let (result, pre) = apply_line_truncation(output, &p);
+        assert_eq!(result, output, "not enough lines to truncate");
+        assert_eq!(pre, None);
     }
 }
