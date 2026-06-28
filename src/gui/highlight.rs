@@ -1067,69 +1067,83 @@ mod tests {
     }
 
     #[test]
-    fn test_markdown_italic_star() {
-        let code = "*italic*";
-        let fh = parse_markdown_highlights(code);
-        assert_eq!(fh.spans.len(), 1, "single line expected");
-        // Opening delimiter retains Operator colour.
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 1, "opening *");
-        // Content between delimiters gets text.emphasis → Function.
-        line0_has_class_in_range(&fh, HighlightClass::Function, 1, 7, "italic content");
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 7, 8, "closing *");
-    }
+    fn test_inline_markdown_formatting() {
+        // Table-driven test consolidating 6 individual inline formatting tests.
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: Vec<(HighlightClass, usize, usize, &'static str)>,
+        }
 
-    #[test]
-    fn test_markdown_bold_single_char() {
-        let code = "**X**";
-        let fh = parse_markdown_highlights(code);
-        assert_eq!(fh.spans.len(), 1);
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 2, "opening **");
-        line0_has_class_in_range(&fh, HighlightClass::Keyword, 2, 3, "X content");
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 3, 5, "closing **");
-    }
+        let cases = vec![
+            Case {
+                name: "test_markdown_bold_single_char",
+                input: "**X**",
+                expected: vec![
+                    (HighlightClass::Operator, 0, 2, "opening **"),
+                    (HighlightClass::Keyword, 2, 3, "X content"),
+                    (HighlightClass::Operator, 3, 5, "closing **"),
+                ],
+            },
+            Case {
+                name: "test_markdown_bold_star",
+                input: "**bold**",
+                expected: vec![
+                    (HighlightClass::Operator, 0, 2, "opening **"),
+                    (HighlightClass::Keyword, 2, 6, "bold content"),
+                    (HighlightClass::Operator, 6, 8, "closing **"),
+                ],
+            },
+            Case {
+                name: "test_markdown_bold_underscore",
+                input: "__bold__",
+                expected: vec![
+                    (HighlightClass::Operator, 0, 2, "opening __"),
+                    (HighlightClass::Keyword, 2, 6, "bold content"),
+                    (HighlightClass::Operator, 6, 8, "closing __"),
+                ],
+            },
+            Case {
+                name: "test_markdown_italic_star",
+                input: "*italic*",
+                expected: vec![
+                    (HighlightClass::Operator, 0, 1, "opening *"),
+                    (HighlightClass::Function, 1, 7, "italic content"),
+                    (HighlightClass::Operator, 7, 8, "closing *"),
+                ],
+            },
+            Case {
+                name: "test_markdown_italic_underscore",
+                input: "_italic_",
+                expected: vec![
+                    (HighlightClass::Operator, 0, 1, "opening _"),
+                    (HighlightClass::Function, 1, 7, "italic content"),
+                    (HighlightClass::Operator, 7, 8, "closing _"),
+                ],
+            },
+            Case {
+                name: "test_markdown_inline_code",
+                input: "`code`",
+                expected: vec![
+                    (HighlightClass::Operator, 0, 1, "opening `"),
+                    (HighlightClass::String, 1, 5, "code content"),
+                    (HighlightClass::Operator, 5, 6, "closing `"),
+                ],
+            },
+        ];
 
-    #[test]
-    fn test_markdown_bold_star() {
-        let code = "**bold**";
-        let fh = parse_markdown_highlights(code);
-        assert_eq!(fh.spans.len(), 1);
-        // Opening delimiter retains Operator colour.
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 2, "opening **");
-        // Content between delimiters gets text.strong → Keyword.
-        line0_has_class_in_range(&fh, HighlightClass::Keyword, 2, 6, "bold content");
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 6, 8, "closing **");
-    }
-
-    #[test]
-    fn test_markdown_italic_underscore() {
-        let code = "_italic_";
-        let fh = parse_markdown_highlights(code);
-        assert_eq!(fh.spans.len(), 1);
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 1, "opening _");
-        line0_has_class_in_range(&fh, HighlightClass::Function, 1, 7, "italic content");
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 7, 8, "closing _");
-    }
-
-    #[test]
-    fn test_markdown_bold_underscore() {
-        let code = "__bold__";
-        let fh = parse_markdown_highlights(code);
-        assert_eq!(fh.spans.len(), 1);
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 2, "opening __");
-        line0_has_class_in_range(&fh, HighlightClass::Keyword, 2, 6, "bold content");
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 6, 8, "closing __");
-    }
-
-    #[test]
-    fn test_markdown_inline_code() {
-        let code = "`code`";
-        let fh = parse_markdown_highlights(code);
-        assert_eq!(fh.spans.len(), 1);
-        // Opening backtick is Operator (code_span_delimiter → punctuation.delimiter).
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 0, 1, "opening `");
-        // Code content gets text.literal → String.
-        line0_has_class_in_range(&fh, HighlightClass::String, 1, 5, "code content");
-        line0_has_class_in_range(&fh, HighlightClass::Operator, 5, 6, "closing `");
+        for case in &cases {
+            let fh = parse_markdown_highlights(case.input);
+            assert_eq!(
+                fh.spans.len(),
+                1,
+                "case: {} — expected single line",
+                case.name
+            );
+            for &(class, lo, hi, label) in &case.expected {
+                line0_has_class_in_range(&fh, class, lo, hi, label);
+            }
+        }
     }
 
     #[test]
@@ -1222,151 +1236,148 @@ mod tests {
         line_has_class_in_range(&fh, 2, HighlightClass::String, 20, 24, "inline code");
     }
 
-    // ── Direct distribute_byte_spans tests ──────────────────────────
-
     #[test]
-    fn test_distribute_byte_spans_no_overlap() {
-        // Non-overlapping spans should be emitted as-is.
-        let source = "abcde";
-        let spans = vec![
-            (0, 1, HighlightClass::Keyword),
-            (2, 5, HighlightClass::Number),
-        ];
-        let fh = distribute_byte_spans(source, &spans);
-        assert_eq!(fh.spans.len(), 1);
-        let expected = vec![
-            HighlightSpan {
-                start: 0,
-                end: 1,
-                highlight_class: HighlightClass::Keyword,
-            },
-            HighlightSpan {
-                start: 1,
-                end: 2,
-                highlight_class: HighlightClass::Text,
-            },
-            HighlightSpan {
-                start: 2,
-                end: 5,
-                highlight_class: HighlightClass::Number,
-            },
-        ];
-        assert_eq!(fh.spans[0], expected, "non-overlapping spans");
-    }
+    fn test_distribute_byte_spans() {
+        // Table-driven test consolidating 4 distribute_byte_spans tests.
+        struct Case {
+            name: &'static str,
+            source: &'static str,
+            spans: Vec<(usize, usize, HighlightClass)>,
+            expected_lines: Vec<Vec<HighlightSpan>>,
+        }
 
-    #[test]
-    fn test_distribute_byte_spans_overlap_tail_emission() {
-        // Overlapping spans: delimiter (Operator) followed by parent formatting
-        // (Keyword). The parent span should emit its tail after the delimiter.
-        let source = "**bold**";
-        let spans = vec![
-            (0, 2, HighlightClass::Operator), // opening ** delimiter
-            (0, 8, HighlightClass::Keyword),  // **bold** strong_emphasis
-            (6, 8, HighlightClass::Operator), // closing ** delimiter
+        let cases = vec![
+            Case {
+                name: "no_overlap",
+                source: "abcde",
+                spans: vec![
+                    (0, 1, HighlightClass::Keyword),
+                    (2, 5, HighlightClass::Number),
+                ],
+                expected_lines: vec![vec![
+                    HighlightSpan {
+                        start: 0,
+                        end: 1,
+                        highlight_class: HighlightClass::Keyword,
+                    },
+                    HighlightSpan {
+                        start: 1,
+                        end: 2,
+                        highlight_class: HighlightClass::Text,
+                    },
+                    HighlightSpan {
+                        start: 2,
+                        end: 5,
+                        highlight_class: HighlightClass::Number,
+                    },
+                ]],
+            },
+            Case {
+                name: "tail_emission",
+                source: "**bold**",
+                spans: vec![
+                    (0, 2, HighlightClass::Operator),
+                    (0, 8, HighlightClass::Keyword),
+                    (6, 8, HighlightClass::Operator),
+                ],
+                expected_lines: vec![vec![
+                    HighlightSpan {
+                        start: 0,
+                        end: 2,
+                        highlight_class: HighlightClass::Operator,
+                    },
+                    HighlightSpan {
+                        start: 2,
+                        end: 6,
+                        highlight_class: HighlightClass::Keyword,
+                    },
+                    HighlightSpan {
+                        start: 6,
+                        end: 8,
+                        highlight_class: HighlightClass::Operator,
+                    },
+                ]],
+            },
+            Case {
+                name: "partial_overlap",
+                source: "abcdef",
+                spans: vec![
+                    (1, 3, HighlightClass::String),
+                    (2, 5, HighlightClass::Keyword),
+                ],
+                expected_lines: vec![vec![
+                    HighlightSpan {
+                        start: 0,
+                        end: 1,
+                        highlight_class: HighlightClass::Text,
+                    },
+                    HighlightSpan {
+                        start: 1,
+                        end: 3,
+                        highlight_class: HighlightClass::String,
+                    },
+                    HighlightSpan {
+                        start: 3,
+                        end: 5,
+                        highlight_class: HighlightClass::Keyword,
+                    },
+                    HighlightSpan {
+                        start: 5,
+                        end: 6,
+                        highlight_class: HighlightClass::Text,
+                    },
+                ]],
+            },
+            Case {
+                name: "multi_line_overlap",
+                source: "hello\n*world*",
+                spans: vec![
+                    (6, 7, HighlightClass::Operator),
+                    (6, 13, HighlightClass::Function),
+                    (12, 13, HighlightClass::Operator),
+                ],
+                expected_lines: vec![
+                    vec![HighlightSpan {
+                        start: 0,
+                        end: 5,
+                        highlight_class: HighlightClass::Text,
+                    }],
+                    vec![
+                        HighlightSpan {
+                            start: 0,
+                            end: 1,
+                            highlight_class: HighlightClass::Operator,
+                        },
+                        HighlightSpan {
+                            start: 1,
+                            end: 6,
+                            highlight_class: HighlightClass::Function,
+                        },
+                        HighlightSpan {
+                            start: 6,
+                            end: 7,
+                            highlight_class: HighlightClass::Operator,
+                        },
+                    ],
+                ],
+            },
         ];
-        let fh = distribute_byte_spans(source, &spans);
-        assert_eq!(fh.spans.len(), 1, "single line");
-        // Expected: [0,2) Operator, [2,6) Keyword, [6,8) Operator.
-        let expected = vec![
-            HighlightSpan {
-                start: 0,
-                end: 2,
-                highlight_class: HighlightClass::Operator,
-            },
-            HighlightSpan {
-                start: 2,
-                end: 6,
-                highlight_class: HighlightClass::Keyword,
-            },
-            HighlightSpan {
-                start: 6,
-                end: 8,
-                highlight_class: HighlightClass::Operator,
-            },
-        ];
-        assert_eq!(fh.spans[0], expected, "delimiter priority overlap");
-    }
 
-    #[test]
-    fn test_distribute_byte_spans_partial_overlap() {
-        // Partial overlap: the second span only partially overlaps.
-        let source = "abcdef";
-        let spans = vec![
-            (1, 3, HighlightClass::String),  // "bc" -> String
-            (2, 5, HighlightClass::Keyword), // "cde" -> Keyword, overlaps at [2,3)
-        ];
-        let fh = distribute_byte_spans(source, &spans);
-        assert_eq!(fh.spans.len(), 1);
-        // Expected: [0,1) Text, [1,3) String, [3,5) Keyword, [5,6) Text.
-        let expected = vec![
-            HighlightSpan {
-                start: 0,
-                end: 1,
-                highlight_class: HighlightClass::Text,
-            },
-            HighlightSpan {
-                start: 1,
-                end: 3,
-                highlight_class: HighlightClass::String,
-            },
-            HighlightSpan {
-                start: 3,
-                end: 5,
-                highlight_class: HighlightClass::Keyword,
-            },
-            HighlightSpan {
-                start: 5,
-                end: 6,
-                highlight_class: HighlightClass::Text,
-            },
-        ];
-        assert_eq!(fh.spans[0], expected, "partial overlap");
-    }
-
-    #[test]
-    fn test_distribute_byte_spans_multi_line_overlap() {
-        // Multi-line input where spans cross line boundaries.
-        // "hello\n*world*\n" (14 bytes, \n at positions 5 and 12)
-        // line 0: "hello" (bytes 0-5), line 1: "*world*" (bytes 6-13)
-        let source = "hello\n*world*";
-        let spans = vec![
-            // emphasis_delimiter (opening) on line 1
-            (6, 7, HighlightClass::Operator),
-            // emphasis covering line 1 content
-            (6, 13, HighlightClass::Function),
-            // emphasis_delimiter (closing) on line 1
-            (12, 13, HighlightClass::Operator),
-        ];
-        let fh = distribute_byte_spans(source, &spans);
-        assert_eq!(fh.spans.len(), 2, "two lines");
-        // Line 0: "hello" — no capture spans, so a single Text fill.
-        assert_eq!(
-            fh.spans[0],
-            vec![HighlightSpan {
-                start: 0,
-                end: 5,
-                highlight_class: HighlightClass::Text
-            }],
-            "line 0 plain text fill"
-        );
-        // Line 1: [0,1) Operator, [1,6) Function, [6,7) Operator.
-        let expected_line1 = vec![
-            HighlightSpan {
-                start: 0,
-                end: 1,
-                highlight_class: HighlightClass::Operator,
-            },
-            HighlightSpan {
-                start: 1,
-                end: 6,
-                highlight_class: HighlightClass::Function,
-            },
-            HighlightSpan {
-                start: 6,
-                end: 7,
-                highlight_class: HighlightClass::Operator,
-            },
-        ];
-        assert_eq!(fh.spans[1], expected_line1, "line 1 overlap");
+        for case in &cases {
+            let fh = distribute_byte_spans(case.source, &case.spans);
+            assert_eq!(
+                fh.spans.len(),
+                case.expected_lines.len(),
+                "case: {} — line count mismatch",
+                case.name
+            );
+            for (line_idx, expected) in case.expected_lines.iter().enumerate() {
+                assert_eq!(
+                    fh.spans[line_idx], *expected,
+                    "case: {} — line {} mismatch",
+                    case.name, line_idx
+                );
+            }
+        }
     }
 }
