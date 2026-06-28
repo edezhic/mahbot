@@ -139,7 +139,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 /// circuit breaker could trip. Adding the pre-agent guard saves LLM credits
 /// by failing tickets with excessive churn before verifier agents run, at the
 /// cost of removing that last-chance review cycle. Diagnostics uses a separate
-/// circuit breaker (see [`trip_diagnostics_circuit_breaker_if_exceeded`]).
+/// circuit breaker (see [`run_circuit_breaker`]).
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
     ticket: &Ticket,
@@ -149,7 +149,22 @@ async fn guard_phase_and_circuit_breaker(
     if !is_ticket_in_phase(&ticket.id, expected).await {
         return false;
     }
-    if trip_circuit_breaker_if_exceeded(ticket, expected, label).await {
+    if run_circuit_breaker(
+        ticket,
+        expected,
+        CIRCUIT_BREAKER_COMMENT_THRESHOLD,
+        <[TicketComment]>::len,
+        |count| {
+            format!(
+                "Failed after {count} comments — ticket has accumulated too many comments \
+                 (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
+                 Ticket failed — Manager will triage."
+            )
+        },
+        label,
+    )
+    .await
+    {
         return false;
     }
     true
@@ -1180,45 +1195,6 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
 }
 
-/// Sanitation circuit breaker — trip if the ticket has accumulated too
-/// many consecutive sanitation failures.
-///
-/// Delegates to [`run_circuit_breaker`] to ensure fresh comment fetching,
-/// proper sibling ticket drainage (moving other ReadyForDevelopment tickets
-/// to Planning), and consistent failure handling with the general breaker.
-///
-/// Counts system comments where role == "system" and content contains
-/// "Sanitation failed".
-///
-/// Separate from the general comment-count circuit breaker so that
-/// garbage-thrashing tickets are caught early without consuming the full
-/// 50-comment budget.
-#[must_use]
-async fn trip_sanitation_circuit_breaker_if_exceeded(
-    ticket: &Ticket,
-    expected: TicketPhase,
-) -> bool {
-    run_circuit_breaker(
-        ticket,
-        expected,
-        SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-        |comments| {
-            comments
-                .iter()
-                .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
-                .count()
-        },
-        |count| {
-            format!(
-                "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
-                 (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
-            )
-        },
-        "Sanitation",
-    )
-    .await
-}
-
 /// Run the sanitation agent to inspect new/untracked files in the workspace.
 ///
 /// Called by [`PollPhase::SanitationCheck`] via [`spawn_dispatch`]. Runs a
@@ -1245,7 +1221,40 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     // Check the sanitation-specific circuit breaker before running the agent.
-    if trip_sanitation_circuit_breaker_if_exceeded(&ticket, TicketPhase::InSanitation).await {
+    //
+    // Sanitation circuit breaker — trip if the ticket has accumulated too
+    // many consecutive sanitation failures.
+    //
+    // Delegates to run_circuit_breaker to ensure fresh comment fetching,
+    // proper sibling ticket drainage (moving other ReadyForDevelopment tickets
+    // to Planning), and consistent failure handling with the general breaker.
+    //
+    // Counts system comments where role == "system" and content contains
+    // "Sanitation failed".
+    //
+    // Separate from the general comment-count circuit breaker so that
+    // garbage-thrashing tickets are caught early without consuming the full
+    // 50-comment budget.
+    if run_circuit_breaker(
+        &ticket,
+        TicketPhase::InSanitation,
+        SANITATION_CIRCUIT_BREAKER_THRESHOLD,
+        |comments| {
+            comments
+                .iter()
+                .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
+                .count()
+        },
+        |count| {
+            format!(
+                "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+                 (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
+            )
+        },
+        "Sanitation",
+    )
+    .await
+    {
         return;
     }
 
@@ -1533,7 +1542,33 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     };
 
     // Check circuit breaker before running diagnostics.
-    if trip_diagnostics_circuit_breaker_if_exceeded(&ticket).await {
+    // Counts prior diagnostics system comments that indicate failures, and
+    // fails the ticket if the count exceeds DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD
+    // (i.e., trip at ≥5 failures).
+    if run_circuit_breaker(
+        &ticket,
+        TicketPhase::InDiagnostics,
+        DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
+        |comments| {
+            comments
+                .iter()
+                .filter(|c| {
+                    c.role == DIAGNOSTICS_ROLE
+                        && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
+                        && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
+                })
+                .count()
+        },
+        |count| {
+            format!(
+                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
+                 failures. Failing ticket."
+            )
+        },
+        "Diagnostics",
+    )
+    .await
+    {
         return;
     }
 
@@ -1613,42 +1648,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     } else {
         bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
     }
-}
-
-/// Diagnostics-specific circuit breaker: counts prior diagnostics system
-/// comments that indicate failures, and fails the ticket if the count
-/// exceeds [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`] (i.e., trip at ≥5 failures).
-///
-/// Re-fetches comments because the ticket snapshot may be stale.
-///
-/// Returns `true` if the circuit breaker tripped (caller should abort);
-/// `false` otherwise, including on comment fetch errors (fail-open).
-/// On transition failure, still returns `true` to abort dispatch.
-#[must_use]
-async fn trip_diagnostics_circuit_breaker_if_exceeded(ticket: &Ticket) -> bool {
-    run_circuit_breaker(
-        ticket,
-        TicketPhase::InDiagnostics,
-        DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
-        |comments| {
-            comments
-                .iter()
-                .filter(|c| {
-                    c.role == DIAGNOSTICS_ROLE
-                        && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
-                        && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
-                })
-                .count()
-        },
-        |count| {
-            format!(
-                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
-                 failures. Failing ticket."
-            )
-        },
-        "Diagnostics",
-    )
-    .await
 }
 
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
@@ -2139,40 +2138,6 @@ async fn run_circuit_breaker(
     }
 
     true
-}
-
-/// Trip the circuit breaker if a ticket has accumulated excessive activity.
-///
-/// Counts ALL ticket comments (system, analyst, engineer, reviewer, QA alike)
-/// without filtering by role or type. This is intentional — the circuit breaker
-/// measures total ticket activity, not review/QA cycles specifically. Any ticket
-/// that generates excessive churn of any kind gets failed.
-///
-/// If the comment count exceeds [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`], fail the ticket
-/// (via [`TicketPhase::Failed`]).
-/// Return `true` (caller should early-return). On transition failure, still returns
-/// `true` to abort dispatch.
-#[must_use]
-async fn trip_circuit_breaker_if_exceeded(
-    ticket: &Ticket,
-    expected: TicketPhase,
-    log_label: &str,
-) -> bool {
-    run_circuit_breaker(
-        ticket,
-        expected,
-        CIRCUIT_BREAKER_COMMENT_THRESHOLD,
-        <[TicketComment]>::len,
-        |count| {
-            format!(
-                "Failed after {count} comments — ticket has accumulated too many comments \
-                 (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
-                 Ticket failed — Manager will triage."
-            )
-        },
-        log_label,
-    )
-    .await
 }
 
 /// Process parallel verifier results: add failing comments, determine pass/fail,
@@ -2934,7 +2899,7 @@ D  deleted.rs
         }
     }
 
-    // ── trip_sanitation_circuit_breaker_if_exceeded — counting ──
+    // ── run_circuit_breaker — sanitation counting ──
 
     /// Verify that the sanitation circuit breaker counting logic works correctly.
     #[tokio::test]
@@ -2967,7 +2932,27 @@ D  deleted.rs
 
         // Should NOT trip (2 <= 3)
         assert!(
-            !trip_sanitation_circuit_breaker_if_exceeded(&ticket, TicketPhase::InSanitation).await,
+            !run_circuit_breaker(
+                &ticket,
+                TicketPhase::InSanitation,
+                SANITATION_CIRCUIT_BREAKER_THRESHOLD,
+                |comments| {
+                    comments
+                        .iter()
+                        .filter(|c| {
+                            c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX)
+                        })
+                        .count()
+                },
+                |count| {
+                    format!(
+                        "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+                         (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
+                    )
+                },
+                "Sanitation",
+            )
+            .await,
             "Should NOT trip with 2 failures (threshold: 3)"
         );
 
@@ -3002,8 +2987,25 @@ D  deleted.rs
             .expect("get_ticket")
             .expect("ticket exists");
 
-        let tripped =
-            trip_sanitation_circuit_breaker_if_exceeded(&ticket, TicketPhase::InSanitation).await;
+        let tripped = run_circuit_breaker(
+            &ticket,
+            TicketPhase::InSanitation,
+            SANITATION_CIRCUIT_BREAKER_THRESHOLD,
+            |comments| {
+                comments
+                    .iter()
+                    .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
+                    .count()
+            },
+            |count| {
+                format!(
+                    "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+                     (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
+                )
+            },
+            "Sanitation",
+        )
+        .await;
         assert!(tripped, "Should trip with 4 failures (threshold: 3, 4 > 3)");
 
         // Verify the ticket is now Failed
@@ -3184,7 +3186,7 @@ D  deleted.rs
         }
     }
 
-    // ── trip_circuit_breaker_if_exceeded — general circuit breaker ────────
+    // ── run_circuit_breaker — general circuit breaker ────────
 
     /// Verify the circuit breaker trips at the threshold boundary:
     /// - `> CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → trips (ticket → Failed)
@@ -3239,8 +3241,21 @@ D  deleted.rs
 
             let ticket = expect_ticket(board(), &ticket_id).await;
 
-            let tripped =
-                trip_circuit_breaker_if_exceeded(&ticket, TicketPhase::InReview, "test").await;
+            let tripped = run_circuit_breaker(
+                &ticket,
+                TicketPhase::InReview,
+                CIRCUIT_BREAKER_COMMENT_THRESHOLD,
+                <[TicketComment]>::len,
+                |count| {
+                    format!(
+                        "Failed after {count} comments — ticket has accumulated too many comments \
+                         (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
+                         Ticket failed — Manager will triage."
+                    )
+                },
+                "test",
+            )
+            .await;
             assert_eq!(
                 tripped, case.expected_trip,
                 "case {}: expected trip={}, got tripped={}",
@@ -3288,8 +3303,21 @@ D  deleted.rs
             .expect("get_ticket")
             .expect("ticket exists");
 
-        let tripped =
-            trip_circuit_breaker_if_exceeded(&ticket, TicketPhase::InReview, "test").await;
+        let tripped = run_circuit_breaker(
+            &ticket,
+            TicketPhase::InReview,
+            CIRCUIT_BREAKER_COMMENT_THRESHOLD,
+            <[TicketComment]>::len,
+            |count| {
+                format!(
+                    "Failed after {count} comments — ticket has accumulated too many comments \
+                     (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
+                     Ticket failed — Manager will triage."
+                )
+            },
+            "test",
+        )
+        .await;
         assert!(tripped, "breaker should trip");
 
         let status = board()
