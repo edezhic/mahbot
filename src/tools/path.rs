@@ -536,7 +536,7 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     if lower.contains("..%2f") || lower.contains("%2f..") {
         return false;
     }
-    if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+    if path.starts_with('~') && !path.starts_with("~/") {
         return false;
     }
     let expanded_path = crate::config::expand_tilde(path);
