@@ -760,7 +760,7 @@ impl BoardState {
     /// Includes the empty-case placeholder for `Stack` widget type stability.
     #[must_use]
     pub fn render_modal_overlay(&self) -> Element<'_, BoardMessage> {
-        if self.selected_ticket.is_some() || self.selected_loading || self.detail_error.is_some() {
+        if self.is_modal_open() {
             if self.selected_loading {
                 let dialog = container(
                     column![
