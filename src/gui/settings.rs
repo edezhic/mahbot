@@ -369,6 +369,22 @@ impl SettingsState {
             || self.users_state.bind_target.is_some()
     }
 
+    /// Close the add-workspace modal and reset all form fields.
+    fn close_add_workspace_modal(&mut self) {
+        self.show_add_workspace_modal = false;
+        self.add_workspace_name.clear();
+        self.add_workspace_path.clear();
+        self.add_workspace_adding = false;
+    }
+
+    /// Close the add-user modal and reset all form fields.
+    fn close_add_user_modal(&mut self) {
+        self.show_add_user_modal = false;
+        self.add_user_sender.clear();
+        self.add_user_permissions.clear();
+        self.add_user_adding = false;
+    }
+
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
             // ── Config field edits ─────────────────────────────
@@ -448,10 +464,7 @@ impl SettingsState {
             SettingsMessage::ToggleAddWorkspaceModal => {
                 self.show_add_workspace_modal = !self.show_add_workspace_modal;
                 if !self.show_add_workspace_modal {
-                    // Reset form when closing
-                    self.add_workspace_name.clear();
-                    self.add_workspace_path.clear();
-                    self.add_workspace_adding = false;
+                    self.close_add_workspace_modal();
                 }
                 Task::none()
             }
@@ -481,10 +494,7 @@ impl SettingsState {
                 )
             }
             SettingsMessage::AddWorkspaceResult(Ok(_ws)) => {
-                self.add_workspace_adding = false;
-                self.show_add_workspace_modal = false;
-                self.add_workspace_name.clear();
-                self.add_workspace_path.clear();
+                self.close_add_workspace_modal();
                 Task::batch([
                     self.workspaces_state
                         .refresh()
@@ -509,10 +519,7 @@ impl SettingsState {
             SettingsMessage::ToggleAddUserModal => {
                 self.show_add_user_modal = !self.show_add_user_modal;
                 if !self.show_add_user_modal {
-                    // Reset form when closing
-                    self.add_user_sender.clear();
-                    self.add_user_permissions.clear();
-                    self.add_user_adding = false;
+                    self.close_add_user_modal();
                 }
                 Task::none()
             }
@@ -548,10 +555,7 @@ impl SettingsState {
                 )
             }
             SettingsMessage::AddUserResult(Ok(())) => {
-                self.add_user_adding = false;
-                self.show_add_user_modal = false;
-                self.add_user_sender.clear();
-                self.add_user_permissions.clear();
+                self.close_add_user_modal();
                 Task::batch([
                     self.users_state.refresh().map(SettingsMessage::UserMsg),
                     Task::done(SettingsMessage::UserMsg(users::UsersMessage::Toast(
@@ -591,15 +595,9 @@ impl SettingsState {
 
             SettingsMessage::Escape => {
                 if self.show_add_workspace_modal {
-                    self.show_add_workspace_modal = false;
-                    self.add_workspace_name.clear();
-                    self.add_workspace_path.clear();
-                    self.add_workspace_adding = false;
+                    self.close_add_workspace_modal();
                 } else if self.show_add_user_modal {
-                    self.show_add_user_modal = false;
-                    self.add_user_sender.clear();
-                    self.add_user_permissions.clear();
-                    self.add_user_adding = false;
+                    self.close_add_user_modal();
                 } else {
                     return Task::batch([
                         self.workspaces_state
