@@ -2343,7 +2343,7 @@ where
                 let est_y = cursor.line as f32 * metrics.line_height;
                 if est_y < state.scroll_y {
                     state.scroll_y = est_y;
-                } else if est_y > state.scroll_y + text_area_height {
+                } else if est_y >= state.scroll_y + text_area_height {
                     state.scroll_y = (est_y - text_area_height + metrics.line_height).max(0.0);
                 }
             }
