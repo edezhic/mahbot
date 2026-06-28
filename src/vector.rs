@@ -125,40 +125,59 @@ pub fn hybrid_merge(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::float_cmp,
-    clippy::approx_constant,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation
-)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_cosine_similarity_identical() {
-        let v = vec![1.0, 2.0, 3.0];
-        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    fn cosine_similarity_all_cases() {
+        struct Case {
+            name: &'static str,
+            a: &'static [f32],
+            b: &'static [f32],
+            expected: f32,
+        }
+
+        let cases = [
+            Case {
+                name: "identical vectors",
+                a: &[1.0, 2.0, 3.0],
+                b: &[1.0, 2.0, 3.0],
+                expected: 1.0,
+            },
+            Case {
+                name: "orthogonal vectors",
+                a: &[1.0, 0.0, 0.0],
+                b: &[0.0, 1.0, 0.0],
+                expected: 0.0,
+            },
+            Case {
+                name: "empty first vector",
+                a: &[],
+                b: &[1.0, 2.0],
+                expected: 0.0,
+            },
+            Case {
+                name: "different lengths",
+                a: &[1.0, 2.0],
+                b: &[1.0, 2.0, 3.0],
+                expected: 0.0,
+            },
+        ];
+
+        for case in &cases {
+            let result = cosine_similarity(case.a, case.b);
+            assert!(
+                (result - case.expected).abs() < 1e-6,
+                "case: {} — expected {}, got {}",
+                case.name,
+                case.expected,
+                result,
+            );
+        }
     }
 
     #[test]
-    fn test_cosine_similarity_orthogonal() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 0.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_cosine_similarity_empty() {
-        assert_eq!(cosine_similarity(&[], &[1.0, 2.0]), 0.0);
-    }
-
-    #[test]
-    fn test_cosine_similarity_different_lengths() {
-        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0, 2.0, 3.0]), 0.0);
-    }
-
-    #[test]
-    fn test_vec_bytes_roundtrip() {
+    fn vec_bytes_roundtrip() {
         let v = vec![1.0_f32, -2.5, 0.0];
         let bytes = vec_to_bytes(&v);
         assert_eq!(bytes.len(), v.len() * 4);
@@ -169,20 +188,47 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_merge_combines_results() {
-        let vector = vec![("A".into(), 0.9), ("B".into(), 0.7)];
-        let keyword = vec![("B".into(), 1.2), ("C".into(), 0.5)];
-        let merged = hybrid_merge(&vector, &keyword);
-        assert!(!merged.is_empty());
-        // B appears in both → highest score
-        assert_eq!(merged[0].id, "B");
-    }
+    fn hybrid_merge_all_cases() {
+        struct Case {
+            name: &'static str,
+            vector: Vec<(String, f32)>,
+            keyword: Vec<(String, f32)>,
+            expected_len: usize,
+            expected_first: Option<&'static str>,
+        }
 
-    #[test]
-    fn test_hybrid_merge_empty_inputs() {
-        let vector: Vec<(String, f32)> = vec![];
-        let keyword: Vec<(String, f32)> = vec![];
-        let merged = hybrid_merge(&vector, &keyword);
-        assert!(merged.is_empty());
+        let cases = [
+            Case {
+                // B appears in both lists, so RRF additively boosts it above
+                // items that appear in only one source.
+                name: "combines results from both sources — B boosted by RRF",
+                vector: vec![("A".into(), 0.9), ("B".into(), 0.7)],
+                keyword: vec![("B".into(), 1.2), ("C".into(), 0.5)],
+                expected_len: 3,
+                expected_first: Some("B"),
+            },
+            Case {
+                name: "empty inputs yield empty output",
+                vector: vec![],
+                keyword: vec![],
+                expected_len: 0,
+                expected_first: None,
+            },
+        ];
+
+        for case in &cases {
+            let merged = hybrid_merge(&case.vector, &case.keyword);
+            assert_eq!(
+                merged.len(),
+                case.expected_len,
+                "case: {} — expected len {}",
+                case.name,
+                case.expected_len,
+            );
+            if let Some(first) = case.expected_first {
+                assert!(!merged.is_empty(), "case: {}", case.name);
+                assert_eq!(merged[0].id, first, "case: {}", case.name);
+            }
+        }
     }
 }
