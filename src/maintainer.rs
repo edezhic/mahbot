@@ -15,9 +15,10 @@ use crate::turso;
 ///
 /// Runs a Maintainer agent per workspace with the investigation prompt.
 /// On success (agent produced a response), updates `maintainer_last_run_at`
-/// and adjusts debounce: resets to 1 min if tickets were created, doubles
-/// (capped at 240 min) otherwise.  On cancellation or error, debounce and
-/// last-run timestamp are left unchanged.
+/// and adjusts debounce: resets to 1 min if tickets were created, advances
+/// otherwise (`advance_debounce`: clamps current to [5, 240], doubles,
+/// caps at 240 — producing the sequence 1 → 10 → 20 → … → 240).
+/// On cancellation or error, debounce and last-run timestamp are left unchanged.
 #[allow(clippy::too_many_lines)]
 pub async fn run_maintainer_loop() {
     let interval = Duration::from_mins(1);
@@ -160,7 +161,7 @@ async fn compute_debounce(agent_id: &str, current: i64, ws_name: &str) -> i64 {
             if new_val >= 240 && current < 240 {
                 info!(workspace = %ws_name, "Maintainer: no tickets created — debounce capped at 240");
             } else {
-                info!(workspace = %ws_name, "Maintainer: no tickets created — debounce doubled to {new_val}");
+                info!(workspace = %ws_name, "Maintainer: no tickets created — debounce advanced to {new_val}");
             }
             new_val
         }
