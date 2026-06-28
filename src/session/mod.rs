@@ -7,8 +7,8 @@ pub mod summarization;
 
 use crate::global_store;
 use crate::turso::{self, Connection, TxGuard, Value, params};
-use crate::{ChatMessage, Reasoning, ToolCall as ProviderToolCall};
-use anyhow::Result;
+use crate::{ChatMessage, MessageRole, Reasoning, ToolCall as ProviderToolCall};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
@@ -138,7 +138,7 @@ async fn insert_messages_in_transaction(
             "INSERT INTO sessions (session_key, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![
                 session_key,
-                msg.role.clone(),
+                msg.role.to_string(),
                 msg.content.clone(),
                 now.clone()
             ],
@@ -167,7 +167,7 @@ impl SessionStore {
                 params![session_key],
                 |row| {
                     Ok::<_, anyhow::Error>(ChatMessage {
-                        role: row.get(COL_SM_ROLE)?,
+                        role: row.get::<String>(COL_SM_ROLE)?.parse().map_err(|e: String| anyhow!(e))?,
                         content: row.get(COL_SM_CONTENT)?,
                     })
                 },
@@ -644,7 +644,7 @@ pub(crate) fn decode_native_history_message(
 ) -> Option<DecodedNativeHistoryMessage> {
     let parsed = serde_json::from_str::<serde_json::Value>(&message.content).ok();
 
-    if message.role == "assistant"
+    if message.role == MessageRole::Assistant
         && let Some(value) = parsed.as_ref()
     {
         let content = value
@@ -681,7 +681,7 @@ pub(crate) fn decode_native_history_message(
         }
     }
 
-    if message.role == "tool"
+    if message.role == MessageRole::Tool
         && let Some(value) = parsed.as_ref()
     {
         return Some(DecodedNativeHistoryMessage::ToolResult {

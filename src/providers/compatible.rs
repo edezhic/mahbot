@@ -8,7 +8,7 @@ use crate::providers::reasoning_roundtrip;
 use crate::providers::{ensure_chat_completions_url, provider_routing_json};
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderUsage, Reasoning, StreamError, StreamEvent, StreamResult,
+    MessageRole, Provider, ProviderUsage, Reasoning, StreamError, StreamEvent, StreamResult,
     ToolCall as ProviderToolCall, ToolSpec,
 };
 use async_trait::async_trait;
@@ -372,16 +372,16 @@ pub(crate) struct ImageUrlPart {
 
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
 ///
-/// When `allow_user_image_parts` is true and the role is `"user"`, image markers
+/// When `allow_user_image_parts` is true and the role is [`MessageRole::User`], image markers
 /// (e.g. `[IMAGE:data:image/png;base64,...]`) are parsed into [`MessagePart::ImageUrl`]
 /// entries alongside the cleaned text. Otherwise the raw content is returned as
 /// [`MessageContent::Text`].
 pub(crate) fn to_message_content(
-    role: &str,
+    role: MessageRole,
     content: &str,
     allow_user_image_parts: bool,
 ) -> MessageContent {
-    if role != "user" || !allow_user_image_parts {
+    if role != MessageRole::User || !allow_user_image_parts {
         return MessageContent::Text(content.to_string());
     }
 
@@ -460,9 +460,9 @@ impl OpenAiCompatibleProvider {
                     decoded.map(crate::session::DecodedNativeHistoryMessage::into_parts)
                 else {
                     return NativeMessage {
-                        role: message.role.clone(),
+                        role: message.role.to_string(),
                         content: Some(to_message_content(
-                            &message.role,
+                            message.role,
                             &message.content,
                             allow_user_image_parts,
                         )),
@@ -1036,7 +1036,8 @@ mod tests {
     #[test]
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(to_message_content("user", content, true)).unwrap();
+        let value =
+            serde_json::to_value(to_message_content(MessageRole::User, content, true)).unwrap();
         let parts = value
             .as_array()
             .expect("multimodal content should be an array");
@@ -1050,14 +1051,15 @@ mod tests {
     #[test]
     fn to_message_content_keeps_markers_as_text_when_user_image_parts_disabled() {
         let content = "Policy [IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(to_message_content("user", content, false)).unwrap();
+        let value =
+            serde_json::to_value(to_message_content(MessageRole::User, content, false)).unwrap();
         assert_eq!(value, serde_json::json!(content));
     }
 
     #[test]
     fn to_message_content_keeps_plain_text_for_non_user_roles() {
         let value = serde_json::to_value(to_message_content(
-            "system",
+            MessageRole::System,
             "You are a helpful assistant.",
             true,
         ))

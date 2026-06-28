@@ -666,11 +666,55 @@ pub enum ToolOutputPhase {
     After,
 }
 
+// ── Message role enum ──────────────────────────────────────────
+
+/// Typed role for a [`ChatMessage`].
+///
+/// Replaces the previous `String`-based role to prevent typos and
+/// make the message-role API self-documenting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    /// System prompt message.
+    System,
+    /// User (human) message.
+    User,
+    /// Assistant (LLM) message.
+    Assistant,
+    /// Tool result message.
+    Tool,
+}
+
+impl std::fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => write!(f, "system"),
+            Self::User => write!(f, "user"),
+            Self::Assistant => write!(f, "assistant"),
+            Self::Tool => write!(f, "tool"),
+        }
+    }
+}
+
+impl std::str::FromStr for MessageRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "system" => Ok(Self::System),
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            "tool" => Ok(Self::Tool),
+            other => Err(format!("Unknown message role: {other}")),
+        }
+    }
+}
+
 // ── Provider trait + types ──────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,
+    pub role: MessageRole,
     pub content: String,
 }
 
@@ -678,7 +722,7 @@ impl ChatMessage {
     #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: "system".into(),
+            role: MessageRole::System,
             content: content.into(),
         }
     }
@@ -686,7 +730,7 @@ impl ChatMessage {
     #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: "user".into(),
+            role: MessageRole::User,
             content: content.into(),
         }
     }
@@ -694,14 +738,14 @@ impl ChatMessage {
     #[must_use]
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: "assistant".into(),
+            role: MessageRole::Assistant,
             content: content.into(),
         }
     }
 
     fn tool(content: impl Into<String>) -> Self {
         Self {
-            role: "tool".into(),
+            role: MessageRole::Tool,
             content: content.into(),
         }
     }

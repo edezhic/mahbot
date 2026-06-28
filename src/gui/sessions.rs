@@ -383,7 +383,7 @@ impl SessionsState {
         let mut decoded_msgs: Vec<DecodedMsg> = Vec::new();
         for msg in messages {
             let decoded = decode_native_history_message(msg);
-            let role_color = theme::role_badge_color(&msg.role).0;
+            let role_color = theme::role_badge_color(&msg.role.to_string()).0;
 
             let kind = if let Some(ref d) = decoded {
                 match d {
@@ -453,7 +453,7 @@ impl SessionsState {
             };
 
             decoded_msgs.push(DecodedMsg {
-                role: msg.role.clone(),
+                role: msg.role.to_string(),
                 role_color,
                 kind,
             });
