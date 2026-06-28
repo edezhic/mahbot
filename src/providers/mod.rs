@@ -268,7 +268,7 @@ pub fn create_provider(
     let resolved_key = key_owned.as_deref();
     let base_url = endpoint
         .and_then(trimmed_or_none)
-        .unwrap_or_else(|| crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string());
+        .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string());
 
     let mut extra_headers = std::collections::HashMap::new();
     extra_headers.insert("X-Title".to_string(), "MahBot".to_string());

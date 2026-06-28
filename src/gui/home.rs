@@ -972,7 +972,7 @@ impl HomeState {
                             .await
                             .ok()
                             .flatten()
-                            .unwrap_or_else(|| Role::Manager.as_str().to_string());
+                            .unwrap_or(Role::Manager.as_str().to_string());
                         // Clear the session.
                         let session_key = if role == Role::Manager.as_str() {
                             crate::session::manager_session_key(&ws)

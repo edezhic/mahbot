@@ -444,7 +444,7 @@ fn non_empty(val: Option<String>) -> Option<String> {
 /// Resolve a value with a fallback: use `val` if non-empty (after trimming), else `fallback`.
 #[must_use]
 fn resolve_or(val: Option<String>, fallback: &str) -> String {
-    non_empty(val).unwrap_or_else(|| fallback.to_string())
+    non_empty(val).unwrap_or(fallback.to_string())
 }
 
 /// Parse a newline-separated list field, falling back to a singular field, then to a hardcoded

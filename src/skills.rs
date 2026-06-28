@@ -135,7 +135,7 @@ async fn load_skill(path: &Path, skill_dir: &Path) -> Result<Skill> {
         }),
         description: meta
             .description
-            .unwrap_or_else(|| "No description provided.".to_string()),
+            .unwrap_or("No description provided.".to_string()),
         location: path.to_path_buf(),
     })
 }

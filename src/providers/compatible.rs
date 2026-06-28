@@ -557,7 +557,7 @@ impl OpenAiCompatibleProvider {
             .into_iter()
             .filter_map(|tc| {
                 let name = tc.function_name()?;
-                let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
+                let arguments = tc.function_arguments().unwrap_or("{}".to_string());
                 let parsed_arguments = parse_tool_call_arguments(&name, &arguments);
                 Some(ProviderToolCall {
                     id: tc.id.unwrap_or_else(crate::generate_id),

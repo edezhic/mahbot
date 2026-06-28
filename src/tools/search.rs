@@ -650,7 +650,7 @@ impl Tool for SearchTool {
 
                 // Resolve the effective query using the same normalization as
                 // execute() — 'pattern' alias, path/ext constraint composition.
-                let query = resolve_query(args).unwrap_or_else(|| "?".to_string());
+                let query = resolve_query(args).unwrap_or("?".to_string());
 
                 let prefix = match mode {
                     Some(m) => format!("{m}: "),
