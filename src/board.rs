@@ -1347,10 +1347,8 @@ impl BoardStore {
 
     /// Add a comment to a ticket (append-only).
     pub async fn add_comment(&self, id: &str, role: &str, content: &str) -> Result<()> {
-        let sql = Self::build_add_comment_sql(id, role, content);
         let tx = self.conn.begin_tx().await?;
-        tx.execute(&sql.insert_sql, sql.insert_params).await?;
-        tx.execute(&sql.update_sql, sql.update_params).await?;
+        Self::add_comment_tx(&tx, id, role, content).await?;
         tx.commit().await?;
         Ok(())
     }
