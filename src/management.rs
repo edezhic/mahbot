@@ -166,19 +166,19 @@ enum NotifyPolicy {
 /// different sources: [`transition_ticket`] passes its `expected` parameter,
 /// while [`commit_and_transition_ticket_from`] passes its own `source`).
 ///
-/// The `context` string is forwarded to [`resolve_ticket_workspace`] to
+/// The `log_label` string is forwarded to [`resolve_ticket_workspace`] to
 /// distinguish callers in log messages.
 async fn dispatch_notification(
     ticket: &Ticket,
     target: TicketPhase,
     source: TicketPhase,
     notify: NotifyPolicy,
-    context: &'static str,
+    log_label: &'static str,
 ) {
     match notify {
         NotifyPolicy::Notify => notify_ticket(ticket, target).await,
         NotifyPolicy::Buffer => {
-            if let Some(ws) = resolve_ticket_workspace(ticket, context).await {
+            if let Some(ws) = resolve_ticket_workspace(ticket, log_label).await {
                 ticket_buffer::push(&ws.name, &ticket.id, source, target);
             }
         }
@@ -242,7 +242,7 @@ async fn transition_ticket(
 #[must_use]
 async fn resolve_ticket_workspace(
     ticket: &Ticket,
-    context: &'static str,
+    log_label: &'static str,
 ) -> Option<crate::Workspace> {
     match crate::workspace::get_by_name(&ticket.workspace_name).await {
         Ok(Some(ws)) => Some(ws),
@@ -250,7 +250,7 @@ async fn resolve_ticket_workspace(
             warn!(
                 ticket = %ticket.id,
                 workspace_name = %ticket.workspace_name,
-                "Workspace not found for ticket — {context}",
+                "Workspace not found for ticket — {log_label}",
             );
             None
         }
@@ -259,7 +259,7 @@ async fn resolve_ticket_workspace(
                 ticket = %ticket.id,
                 workspace_name = %ticket.workspace_name,
                 error = %e,
-                "Failed to look up workspace for ticket — {context}",
+                "Failed to look up workspace for ticket — {log_label}",
             );
             None
         }
