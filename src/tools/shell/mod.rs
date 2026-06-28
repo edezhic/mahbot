@@ -1874,6 +1874,492 @@ mod tests {
         ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    // ── Table-driven test helpers ─────────────────────────────────────
+    // These helpers reduce boilerplate for process_shell_output and
+    // filter_cargo_test_output test groups. Each case carries its own
+    // assertions (contains, not_contains, eq) with a descriptive name
+    // so test failures show exactly which scenario broke.
+
+    /// A test case for [`process_shell_output`] with multi-assertion support.
+    #[derive(Default)]
+    struct ShellOutputCase {
+        /// Human-readable name for failure diagnostics.
+        name: &'static str,
+        /// Canonical/shell command string passed to select_profile.
+        command: &'static str,
+        stdout: &'static str,
+        /// Stderr input. Default: `""`.
+        stderr: &'static str,
+        /// Exit code. Default: `0`.
+        exit_code: i32,
+        /// Elapsed time in seconds. Default: `0.0`.
+        elapsed_secs: f64,
+        /// Strings that must all be present in the output.
+        contains: &'static [&'static str],
+        /// Strings that must all be absent from the output.
+        not_contains: &'static [&'static str],
+        /// If set, asserts `result.trim() == eq` (leading/trailing whitespace
+        /// is stripped before comparison, consistent with how profiles
+        /// trim output in short-circuit messages).
+        eq: Option<&'static str>,
+    }
+
+    #[derive(Default)]
+    /// A test case for [`filter_cargo_test_output`].
+    struct CargoTestFilterCase {
+        /// Human-readable name for failure diagnostics.
+        name: &'static str,
+        output: &'static str,
+        exit_code: i32,
+        contains: &'static [&'static str],
+        not_contains: &'static [&'static str],
+    }
+
+    /// Run [`process_shell_output`] for each case and assert expectations.
+    ///
+    /// `contains` and `not_contains` are checked against the raw result.
+    /// `eq` (if set) compares against `result.trim()` — leading/trailing
+    /// whitespace is stripped, consistent with how profiles produce
+    /// short-circuit messages (e.g. `"[cargo test: ok]"`).
+    fn check_shell_output(cases: &[ShellOutputCase]) {
+        for case in cases {
+            let result = process_shell_output(
+                case.command,
+                case.stdout,
+                case.stderr,
+                case.exit_code,
+                Duration::from_secs_f64(case.elapsed_secs),
+            );
+            for &s in case.contains {
+                assert!(
+                    result.contains(s),
+                    "[{}] expected contains {s:?}\n  got: {result:?}",
+                    case.name,
+                );
+            }
+            for &s in case.not_contains {
+                assert!(
+                    !result.contains(s),
+                    "[{}] expected NOT contains {s:?}\n  got: {result:?}",
+                    case.name,
+                );
+            }
+            if let Some(expected) = case.eq {
+                assert_eq!(
+                    result.trim(),
+                    expected,
+                    "[{}] expected eq {expected:?}",
+                    case.name,
+                );
+            }
+        }
+    }
+
+    /// Run [`filter_cargo_test_output`] for each case and assert expectations.
+    fn check_cargo_test_filter(cases: &[CargoTestFilterCase]) {
+        for case in cases {
+            let result = filter_cargo_test_output(case.output, case.exit_code);
+            for &s in case.contains {
+                assert!(
+                    result.contains(s),
+                    "[{}] expected contains {s:?}\n  got: {result:?}",
+                    case.name,
+                );
+            }
+            for &s in case.not_contains {
+                assert!(
+                    !result.contains(s),
+                    "[{}] expected NOT contains {s:?}\n  got: {result:?}",
+                    case.name,
+                );
+            }
+        }
+    }
+
+    // ── Consolidated table-driven tests ───────────────────────────────
+    //
+    // Each `_cases` function replaces multiple individual test functions
+    // that followed the same pattern (call process_shell_output →
+    // assert contains/not_contains). Adding a new scenario is a single
+    // struct literal with a descriptive name.
+
+    #[test]
+    fn cargo_test_filter_cases() {
+        // Cargo test output filter state machine — consolidated table.
+        let cases: &[CargoTestFilterCase] = &[
+            CargoTestFilterCase {
+                name: "failure block captures failures and panic message",
+                output: "\n\
+                    Compiling foo v1.0.0\n\
+                    test test1 ... ok\n\
+                    test test2 ... FAILED\n\
+                    \n\
+                    failures:\n\
+                    \n\
+                    ---- test2 stdout ----\n\
+                    thread 'test2' panicked at src/lib.rs:42:\n\
+                    assertion failed\n\
+                    \n\
+                    \n\
+                    failures:\n\
+                    test2\n\
+                    \n\
+                    test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                ",
+                exit_code: 1,
+                contains: &["test2 ... FAILED", "assertion failed", "test result:"],
+                not_contains: &["Compiling", "test1 ... ok"],
+            },
+            CargoTestFilterCase {
+                name: "all pass returns summary",
+                output: "\
+                    Compiling foo v1.0.0\n\
+                    Checking bar v2.0.0\n\
+                    test test1 ... ok\n\
+                    test test2 ... ok\n\
+                    \n\
+                    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                ",
+                exit_code: 0,
+                contains: &["test result:"],
+                not_contains: &["Compiling", "Checking", "test1 ... ok", "test2 ... ok"],
+            },
+            CargoTestFilterCase {
+                name: "compile error fallback preserves errors",
+                output: "\
+                    Compiling foo v1.0.0\n\
+                    error[E0425]: cannot find value `bar` in this scope\n\
+                     --> src/lib.rs:1:5\n\
+                    \n\
+                    error: could not compile `foo` due to 1 previous error\n\
+                ",
+                exit_code: 1,
+                contains: &["error[E0425]", "could not compile"],
+                not_contains: &["Compiling"],
+            },
+            CargoTestFilterCase {
+                name: "Running preserved in test output",
+                output: "\
+                    Compiling foo v1.0.0\n\
+                    Running unittests src/lib.rs\n\
+                    test test1 ... ok\n\
+                    test test2 ... FAILED\n\
+                    \n\
+                    failures:\n\
+                    \n\
+                    ---- test2 stdout ----\n\
+                    assertion failed\n\
+                    \n\
+                    failures:\n\
+                    test2\n\
+                    \n\
+                    test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                ",
+                exit_code: 1,
+                contains: &["Running unittests", "test2 ... FAILED", "test result:"],
+                not_contains: &["Compiling"],
+            },
+        ];
+        check_cargo_test_filter(cases);
+    }
+
+    #[test]
+    fn profile_selection_cases() {
+        // Profile selection/dispatch tests — consolidated table.
+        // Includes detection of correct profiles from canonical commands,
+        // fallback behavior for unknown/builtin-only commands, and chained
+        // command dispatch that selects the first matching segment.
+        let cases: &[ShellOutputCase] = &[
+            ShellOutputCase {
+                name: "cargo --release test triggers state machine",
+                command: "cargo --release test",
+                eq: Some("[cargo test: ok]"),
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "git -C /repo diff triggers git diff short-circuit",
+                command: "git -C /repo diff",
+                eq: Some("[git diff: no changes]"),
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "unknown tool falls through to generic",
+                command: "some_obscure_tool --flag",
+                stdout: "some\nrandom\noutput\n",
+                contains: &["some", "output"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "empty command uses fallback",
+                command: "",
+                stdout: "hello world",
+                contains: &["hello"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "builtins-only falls through to generic",
+                command: "cd .. && cd /tmp",
+                stdout: "some output",
+                contains: &["some output"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "chained command selects first matching profile (pnpm install)",
+                command: "cd frontend && pnpm install && pnpm build",
+                stdout: "Already up to date\nsome output\n",
+                not_contains: &["Already up to date"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "chained cargo test uses state machine",
+                command: "cd project && cargo test",
+                stdout: "Compiling foo v1.0.0\ntest test1 ... ok\ntest test2 ... FAILED\n\nfailures:\n\n---- test2 stdout ----\npanic!\n\nfailures:\n    test2\n\ntest result: FAILED. 1 passed; 1 failed\n",
+                exit_code: 1,
+                contains: &["test2 ... FAILED"],
+                not_contains: &["Compiling", "test1 ... ok"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "chained git log preserves content",
+                command: "cd repo && git log --oneline",
+                stdout: "commit abc123\nAuthor: test\nDate:   Mon Jan 1\n\n    initial commit\n",
+                contains: &["commit", "Author"],
+                ..Default::default()
+            },
+        ];
+        check_shell_output(cases);
+    }
+
+    #[test]
+    fn tool_profile_cases() {
+        // Specific tool profile tests — consolidated table.
+        // Covers short-circuit, strip, and transform behaviors of named
+        // tool profiles (git, docker, df, du, make, rsync, tsc, gh,
+        // terraform, pytest, and the generic fallback pipeline).
+        let cases: &[ShellOutputCase] = &[
+            ShellOutputCase {
+                name: "git diff no changes short-circuits",
+                command: "git diff",
+                contains: &["no changes"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "docker build short-circuits on success",
+                command: "docker build -t myimage .",
+                stdout: "Step 1/3 : FROM alpine\n ---> abc123\nStep 2/3 : RUN echo hi\n ---> Using cache\nStep 3/3 : CMD [\"sh\"]\n ---> def456\nSuccessfully built abc123\nSuccessfully tagged myimage:latest\n",
+                contains: &["[docker"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "git log preserves content",
+                command: "git log --oneline",
+                stdout: "commit abc123\nAuthor: test\nDate:   Mon Jan 1\n\n    initial commit\n\ncommit def456\nAuthor: test\nDate:   Tue Jan 2\n\n    second commit\n\n",
+                contains: &["commit", "Author"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "generic pipeline: strips ANSI, collapses repeats, preserves content",
+                command: "unknown",
+                stdout: "Compiling foo v1.0.0 (/tmp)\nCompiling bar v2.0.0 (/tmp)\nresult: ok\nline1\nline2\nline3\nline3\nline3\nline3\nline3\nline3\nline3\n",
+                contains: &["Compiling", "[repeated", "result: ok"],
+                not_contains: &["\x1B["],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "du strips blank lines",
+                command: "du -sh",
+                stdout: "1.0K\t./file1\n\n2.0K\t./file2\n\n\n3.0K\t./file3",
+                not_contains: &["\n\n"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "make strips directory noise",
+                command: "make",
+                stdout: "make[1]: Entering directory `/tmp'\nmake[1]: Leaving directory `/tmp'\ncc -c file.c\nNothing to be done",
+                not_contains: &["Entering directory", "Nothing to be done"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "rsync short-circuits on success",
+                command: "rsync -avz source/ dest/",
+                stdout: "building file list ... done\nsent 100 bytes  received 50 bytes\n\ntotal size is 98765  speedup is 658.43\n",
+                eq: Some("ok (synced)"),
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "tsc on empty returns ok",
+                command: "tsc --noEmit",
+                eq: Some("[tsc: ok] (0.0s)"),
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "tsc on empty shows timing",
+                command: "tsc --noEmit",
+                elapsed_secs: 3.2,
+                contains: &["(3.2s)"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "docker strips build steps and short-circuits",
+                command: "docker build -t myapp .",
+                stdout: "Step 1/10 : FROM node:18\nStep 2/10 : WORKDIR /app\n ---> Using cache\nSuccessfully built abc123\nSuccessfully tagged myapp:latest\n",
+                contains: &["[docker build: ok]"],
+                not_contains: &["Step "],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "gh strips warning noise",
+                command: "gh pr create --fill",
+                stdout: "  \n - some detail\nwarning: consider updating gh\n✓ Created pull request\n",
+                contains: &["[gh: ok]"],
+                not_contains: &["warning:"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "terraform short-circuits on no changes",
+                command: "terraform plan",
+                stdout: "data.aws_region.current: Refreshing state...\nNo changes. Your infrastructure matches the configuration.\n",
+                contains: &["[terraform: no changes]"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "pytest strips collected count",
+                command: "pytest",
+                stdout: "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n",
+                not_contains: &["collected"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "python -m pytest falls through to generic (collected preserved)",
+                command: "python -m pytest tests/",
+                stdout: "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n",
+                contains: &["collected"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "poetry run pytest falls through to generic (collected preserved)",
+                command: "poetry run pytest tests/",
+                stdout: "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n",
+                contains: &["collected"],
+                ..Default::default()
+            },
+        ];
+        check_shell_output(cases);
+    }
+
+    #[test]
+    fn compact_ls_cases() {
+        // ls compaction profile tests — consolidated table.
+        // compact_ls transforms `ls -la` output into a compact summary.
+        // Plain `ls` (no -l) and chained/piped commands are excluded
+        // from compaction via standalone_only and selection logic.
+        let cases: &[ShellOutputCase] = &[
+            ShellOutputCase {
+                name: "empty directory shows (empty)",
+                command: "ls -la",
+                stdout: "total 0\ndrwxr-xr-x  2 user  group  64 May 21 10:00 .\ndrwxr-xr-x  3 user  group  96 May 21 10:00 ..\n",
+                eq: Some("(empty)"),
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "mixed files and dirs shows summary",
+                command: "ls -la",
+                stdout: "total 32\ndrwxr-xr-x  5 user  group   160 May 21 10:00 .\ndrwxr-xr-x  3 user  group    96 May 21 10:00 ..\n-rw-r--r--  1 user  group  2048 May 21 10:00 main.rs\n-rw-r--r--  1 user  group  4096 May 21 10:00 lib.rs\ndrwxr-xr-x  2 user  group    64 May 21 10:00 src\nlrwxr-xr-x  1 user  group     5 May 21 10:00 link -> target\n",
+                contains: &["src/", "main.rs", "lib.rs", "Summary:"],
+                not_contains: &["link -> target"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "dotless files classified as no ext",
+                command: "ls -la",
+                stdout: "total 16\n-rw-r--r--  1 user  group  1024 May 21 10:00 Makefile\n-rw-r--r--  1 user  group  2048 May 21 10:00 README\n-rw-r--r--  1 user  group   512 May 21 10:00 .gitignore\n-rw-r--r--  1 user  group  1024 May 21 10:00 main.rs\n",
+                contains: &["Makefile", "README", "no ext", ".rs"],
+                not_contains: &[".Makefile", ".README"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "plain ls passes through without compaction",
+                command: "ls",
+                stdout: "Cargo.toml\nCargo.lock\nsrc\ntarget\nREADME.md\n",
+                contains: &["Cargo.toml", "src"],
+                not_contains: &["(empty)", "Summary:"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "chained ls skips compact_ls",
+                command: "ls -l && echo done",
+                stdout: "total 8\n-rw-r--r--  1 user  group  1024 May 21 10:00 foo\n-rw-r--r--  1 user  group  2048 May 21 10:00 bar\ndone\n",
+                contains: &["done"],
+                not_contains: &["Summary:"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "piped ls skips compact_ls",
+                command: "ls -l | head -5",
+                stdout: "total 8\n-rw-r--r--  1 user  group  1024 May 21 10:00 foo\n-rw-r--r--  1 user  group  2048 May 21 10:00 bar\n",
+                contains: &["total 8"],
+                not_contains: &["Summary:"],
+                ..Default::default()
+            },
+        ];
+        check_shell_output(cases);
+    }
+
+    #[test]
+    fn cargo_build_cases() {
+        // Cargo build/check profile tests — consolidated table.
+        let cases: &[ShellOutputCase] = &[
+            ShellOutputCase {
+                name: "cargo build strips Compiling, preserves errors",
+                command: "cargo build",
+                stdout: "Compiling foo v1.0.0 (/tmp)\nCompiling bar v2.0.0 (/tmp)\n   Compiling baz v3.0.0 (/tmp)\nerror[E0425]: cannot find value\n\nFor more information about this error, try `rustc --explain E0425`.\nerror: could not compile `foo` due to 1 previous error",
+                exit_code: 1,
+                contains: &["error[E0425]", "could not compile"],
+                not_contains: &["Compiling foo"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "cargo check strips Checking lines",
+                command: "cargo check",
+                stdout: "    Checking foo v1.0.0\n    Checking bar v2.0.0\n    warning: unused import\n\nwarning: 1 warning emitted\n\n    Finished `dev` profile [unoptimized] target\n",
+                not_contains: &["Checking"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "cargo build strips Compiling and Finished on success",
+                command: "cargo build",
+                stdout: "   Compiling foo v1.0.0\n   Compiling bar v2.0.0\n    Finished dev [unoptimized]\n",
+                not_contains: &["Compiling", "Finished"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "absolute cargo check strips Compiling",
+                command: "/usr/local/bin/cargo check",
+                stdout: "   Compiling foo v1.0.0\nwarning: unused import\n",
+                not_contains: &["Compiling"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "chained cargo build strips Compiling, preserves errors",
+                command: "cd project && cargo build",
+                stdout: "   Compiling foo v1.0.0\n   Compiling bar v2.0.0\nerror[E0425]: cannot find value\n",
+                exit_code: 1,
+                contains: &["error[E0425]"],
+                not_contains: &["Compiling"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "cargo build keeps stderr warnings on success",
+                command: "cargo build",
+                stdout: "   Compiling foo v1.0.0\n    Finished\n",
+                stderr: "warning: unused import: `std::fs`\n  --> src/main.rs:1:5\n",
+                contains: &["warning:"],
+                ..Default::default()
+            },
+        ];
+        check_shell_output(cases);
+    }
+
     /// Create a minimal [`Workspace`] from a path for testing.
 
     #[test]
@@ -2101,34 +2587,6 @@ mod tests {
     }
 
     #[test]
-    fn cargo_build_compiling_lines_stripped() {
-        let input = "Compiling foo v1.0.0 (/tmp)\nCompiling bar v2.0.0 (/tmp)\n   Compiling baz v3.0.0 (/tmp)\nerror[E0425]: cannot find value\n\nFor more information about this error, try `rustc --explain E0425`.\nerror: could not compile `foo` due to 1 previous error";
-        let result = process_shell_output("cargo build", input, "", 1, Duration::ZERO);
-        // Compiling lines should be stripped by cargo build profile
-        assert!(
-            !result.contains("Compiling foo"),
-            "compiling lines should be stripped"
-        );
-        // Error info should be preserved
-        assert!(result.contains("error[E0425]"), "error info preserved");
-        assert!(
-            result.contains("could not compile"),
-            "build failure preserved"
-        );
-    }
-
-    #[test]
-    fn cargo_check_short_circuit_on_success() {
-        let input = "    Checking foo v1.0.0\n    Checking bar v2.0.0\n    warning: unused import\n\nwarning: 1 warning emitted\n\n    Finished `dev` profile [unoptimized] target\n";
-        let result = process_shell_output("cargo check", input, "", 0, Duration::ZERO);
-        // No "0 errors" pattern, so it should go through the normal pipe
-        assert!(
-            !result.contains("Checking"),
-            "checking lines should be stripped"
-        );
-    }
-
-    #[test]
     fn long_lines_truncated() {
         let long = "a".repeat(500);
         let result = truncate_line_width(&long, 100);
@@ -2218,32 +2676,6 @@ mod tests {
         let short = "hello".to_string();
         let result = try_spill_to_file(short.clone(), 5_000);
         assert_eq!(result, short, "short output should pass through unchanged");
-    }
-
-    #[test]
-    fn compress_shell_output_pipeline_full() {
-        let input = "Compiling foo v1.0.0 (/tmp)\nCompiling bar v2.0.0 (/tmp)\nresult: ok\nline1\nline2\nline3\nline3\nline3\nline3\nline3\nline3\nline3\n";
-        let result = process_shell_output("unknown", input, "", 0, Duration::ZERO);
-        // Input is pre-stripped by the caller — verify no ANSI contamination
-        assert!(
-            !result.contains("\x1B["),
-            "ANSI escapes should be stripped (input pre-stripped)"
-        );
-        // Generic fallback doesn't strip cargo lines — they remain (only profiled cargo commands strip them)
-        assert!(
-            result.contains("Compiling"),
-            "generic fallback preserves cargo lines"
-        );
-        // Consecutive lines deduped
-        assert!(
-            result.contains("[repeated"),
-            "repeated lines should be collapsed"
-        );
-        // Original data preserved
-        assert!(
-            result.contains("result: ok"),
-            "non-pattern content preserved"
-        );
     }
 
     #[cfg(unix)]
@@ -2389,129 +2821,6 @@ mod tests {
             !result.contains("x\nx\nx\nx\nx\nx"),
             "should not keep individual lines"
         );
-    }
-
-    #[test]
-    fn cargo_test_failure_block_capture() {
-        let output = "\n\
-            Compiling foo v1.0.0\n\
-            test test1 ... ok\n\
-            test test2 ... FAILED\n\
-            \n\
-            failures:\n\
-            \n\
-            ---- test2 stdout ----\n\
-            thread 'test2' panicked at src/lib.rs:42:\n\
-            assertion failed\n\
-            \n\
-            \n\
-            failures:\n\
-            test2\n\
-            \n\
-            test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
-        ";
-        let result = filter_cargo_test_output(output, 1);
-        assert!(!result.contains("Compiling"), "compiling stripped");
-        assert!(!result.contains("test1 ... ok"), "passing tests stripped");
-        assert!(result.contains("test2 ... FAILED"), "failure preserved");
-        assert!(
-            result.contains("assertion failed"),
-            "panic message preserved"
-        );
-        assert!(result.contains("test result:"), "summary preserved");
-    }
-
-    #[test]
-    fn cargo_test_all_pass_returns_summary() {
-        let output = "\
-            Compiling foo v1.0.0\n\
-            Checking bar v2.0.0\n\
-            test test1 ... ok\n\
-            test test2 ... ok\n\
-            \n\
-            test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
-        ";
-        let result = filter_cargo_test_output(output, 0);
-        assert!(!result.contains("Compiling"), "compiling stripped");
-        assert!(!result.contains("Checking"), "checking stripped");
-        assert!(!result.contains("test1 ... ok"), "passing stripped");
-        assert!(!result.contains("test2 ... ok"), "passing stripped");
-        assert!(result.contains("test result:"), "summary preserved");
-    }
-
-    #[test]
-    fn cargo_test_compile_error_fallback() {
-        let output = "\
-            Compiling foo v1.0.0\n\
-            error[E0425]: cannot find value `bar` in this scope\n\
-             --> src/lib.rs:1:5\n\
-            \n\
-            error: could not compile `foo` due to 1 previous error\n\
-        ";
-        let result = filter_cargo_test_output(output, 1);
-        assert!(!result.contains("Compiling"), "compiling stripped");
-        assert!(result.contains("error[E0425]"), "error preserved");
-        assert!(
-            result.contains("could not compile"),
-            "build error preserved"
-        );
-    }
-
-    #[test]
-    fn cargo_test_running_preserved() {
-        // `Running unittests src/lib.rs` is useful context and must NOT be stripped.
-        // Use a failure scenario so the function returns the full output (not just summary).
-        let output = "\
-            Compiling foo v1.0.0\n\
-            Running unittests src/lib.rs\n\
-            test test1 ... ok\n\
-            test test2 ... FAILED\n\
-            \n\
-            failures:\n\
-            \n\
-            ---- test2 stdout ----\n\
-            assertion failed\n\
-            \n\
-            failures:\n\
-            test2\n\
-            \n\
-            test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
-        ";
-        let result = filter_cargo_test_output(output, 1);
-        assert!(!result.contains("Compiling"), "compiling stripped");
-        assert!(
-            result.contains("Running unittests"),
-            "Running preserved in test output (not cargo noise)"
-        );
-        assert!(result.contains("test2 ... FAILED"), "failure preserved");
-        assert!(result.contains("test result:"), "summary preserved");
-    }
-
-    #[test]
-    fn git_diff_no_changes() {
-        let result = process_shell_output("git diff", "", "", 0, Duration::ZERO);
-        assert!(result.contains("no changes"), "short-circuit on empty diff");
-    }
-
-    #[test]
-    fn docker_build_ok_short_circuit() {
-        let input = "Step 1/3 : FROM alpine\n ---> abc123\nStep 2/3 : RUN echo hi\n ---> Using cache\nStep 3/3 : CMD [\"sh\"]\n ---> def456\nSuccessfully built abc123\nSuccessfully tagged myimage:latest\n";
-        let result =
-            process_shell_output("docker build -t myimage .", input, "", 0, Duration::ZERO);
-        assert!(
-            result.contains("[docker"),
-            "docker build should short-circuit to ok message"
-        );
-    }
-
-    #[test]
-    fn git_log_filter() {
-        let input = "commit abc123\nAuthor: test\nDate:   Mon Jan 1\n\n    initial commit\n\ncommit def456\nAuthor: test\nDate:   Tue Jan 2\n\n    second commit\n\n";
-        let result = process_shell_output("git log --oneline", input, "", 0, Duration::ZERO);
-        // git log profile has head_lines: 20, max_lines: 50 — with small output it passes through
-        assert!(result.contains("commit"), "git log content preserved");
-        // No strip patterns beyond blank lines, so should be mostly preserved
-        assert!(result.contains("Author"), "Author field preserved");
     }
 
     // ── Chained command and canonical command tests ─────────────────
@@ -2661,120 +2970,6 @@ mod tests {
     }
 
     #[test]
-    fn select_profile_cargo_test_with_flags_triggers_state_machine() {
-        // Regression: flags before 'test' used to bypass the cargo test state machine.
-        // With empty output and exit code 0, the state machine produces [cargo test: ok].
-        let result = process_shell_output("cargo --release test", "", "", 0, Duration::ZERO);
-        assert_eq!(result.trim(), "[cargo test: ok]");
-    }
-
-    #[test]
-    fn select_profile_chained_cargo_build_strips_compiling() {
-        let output =
-            "   Compiling foo v1.0.0\n   Compiling bar v2.0.0\nerror[E0425]: cannot find value\n";
-        let result =
-            process_shell_output("cd project && cargo build", output, "", 1, Duration::ZERO);
-        assert!(
-            !result.contains("Compiling"),
-            "chained cargo build: compiling lines stripped"
-        );
-        assert!(
-            result.contains("error[E0425]"),
-            "chained cargo build: errors preserved"
-        );
-    }
-
-    #[test]
-    fn select_profile_absolute_cargo_strips_compiling() {
-        let output = "   Compiling foo v1.0.0\nwarning: unused import\n";
-        let result =
-            process_shell_output("/usr/local/bin/cargo check", output, "", 0, Duration::ZERO);
-        assert!(
-            !result.contains("Compiling"),
-            "absolute cargo: compiling lines stripped"
-        );
-    }
-
-    #[test]
-    fn select_profile_git_with_c_flag_triggers_git_diff() {
-        let result = process_shell_output("git -C /repo diff", "", "", 0, Duration::ZERO);
-        // git diff profile short-circuits on empty
-        assert_eq!(result.trim(), "[git diff: no changes]");
-    }
-
-    #[test]
-    fn select_profile_fallback_for_unknown_uses_generic() {
-        let output = "some\nrandom\noutput\n";
-        let result =
-            process_shell_output("some_obscure_tool --flag", output, "", 0, Duration::ZERO);
-        assert!(result.contains("some"), "generic: output passes through");
-        assert!(result.contains("output"), "generic: output passes through");
-    }
-
-    #[test]
-    fn chained_command_matches_correct_profile() {
-        // Should match pnpm install (the first matching segment)
-        let output = "Already up to date\nsome output\n";
-        let result = process_shell_output(
-            "cd frontend && pnpm install && pnpm build",
-            output,
-            "",
-            0,
-            Duration::ZERO,
-        );
-        // pnpm install strips "Already up to date" — that profile matched
-        assert!(
-            !result.contains("Already up to date"),
-            "pnpm install profile matched and stripped noise line"
-        );
-    }
-
-    #[test]
-    fn empty_command_uses_fallback() {
-        let result = process_shell_output("", "hello world", "", 0, Duration::ZERO);
-        assert!(result.contains("hello"));
-    }
-
-    #[test]
-    fn only_shell_builtins_use_fallback() {
-        let result = process_shell_output("cd .. && cd /tmp", "some output", "", 0, Duration::ZERO);
-        assert!(
-            result.contains("some output"),
-            "builtins-only falls through to generic"
-        );
-    }
-
-    #[test]
-    fn chained_cargo_test_uses_state_machine() {
-        // Uses the cargo test state machine, not the generic profile
-        let output = "Compiling foo v1.0.0\ntest test1 ... ok\ntest test2 ... FAILED\n\nfailures:\n\n---- test2 stdout ----\npanic!\n\nfailures:\n    test2\n\ntest result: FAILED. 1 passed; 1 failed\n";
-        let result =
-            process_shell_output("cd project && cargo test", output, "", 1, Duration::ZERO);
-        assert!(
-            !result.contains("Compiling"),
-            "cargo test: compiling stripped"
-        );
-        assert!(!result.contains("test1 ... ok"), "passing tests stripped");
-        assert!(
-            result.contains("test2 ... FAILED"),
-            "failures preserved in chained cargo test"
-        );
-    }
-
-    #[test]
-    fn chained_git_log_preserves_content() {
-        let input = "commit abc123\nAuthor: test\nDate:   Mon Jan 1\n\n    initial commit\n";
-        let result =
-            process_shell_output("cd repo && git log --oneline", input, "", 0, Duration::ZERO);
-        // Should match git log profile (after git global flags in canonical form:
-        // "git log --oneline" → canonical "git log", matches ^git\s+log\b)
-        assert!(result.contains("commit"), "git log content preserved");
-        assert!(result.contains("Author"), "Author field preserved");
-    }
-
-    // ── New feature tests ──────────────────────────────────────────
-
-    #[test]
     fn test_all_profiles_have_valid_configs() {
         let profiles = PROFILES.iter().collect::<Vec<_>>();
         assert!(
@@ -2809,238 +3004,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_du_strips_blank_lines() {
-        let input = "1.0K\t./file1\n\n2.0K\t./file2\n\n\n3.0K\t./file3";
-        let result = process_shell_output("du -sh", input, "", 0, Duration::ZERO);
-        assert!(
-            !result.contains("\n\n"),
-            "should not have consecutive blank lines"
-        );
-    }
-
-    #[test]
-    fn profile_make_strips_directory_noise() {
-        let input = "make[1]: Entering directory `/tmp'\nmake[1]: Leaving directory `/tmp'\ncc -c file.c\nNothing to be done";
-        let result = process_shell_output("make", input, "", 0, Duration::ZERO);
-        assert!(
-            !result.contains("Entering directory"),
-            "make noise stripped"
-        );
-        assert!(
-            !result.contains("Nothing to be done"),
-            "'nothing to be done' stripped"
-        );
-    }
-
-    #[test]
-    fn profile_rsync_short_circuits_on_success() {
-        let input = "building file list ... done\nsent 100 bytes  received 50 bytes\n\ntotal size is 98765  speedup is 658.43\n";
-        let result = process_shell_output("rsync -avz source/ dest/", input, "", 0, Duration::ZERO);
-        assert_eq!(
-            result.trim(),
-            "ok (synced)",
-            "rsync should short-circuit on 'total size is'"
-        );
-    }
-
-    #[test]
-    fn profile_cargo_build_strips_noise() {
-        let input =
-            "   Compiling foo v1.0.0\n   Compiling bar v2.0.0\n    Finished dev [unoptimized]\n";
-        let result = process_shell_output("cargo build", input, "", 0, Duration::ZERO);
-        assert!(
-            !result.contains("Compiling"),
-            "cargo build strips Compiling lines"
-        );
-        assert!(
-            !result.contains("Finished"),
-            "cargo build strips Finished lines"
-        );
-    }
-
-    #[test]
-    fn profile_tsc_on_empty_returns_ok() {
-        let result = process_shell_output("tsc --noEmit", "", "", 0, Duration::ZERO);
-        assert_eq!(result.trim(), "[tsc: ok] (0.0s)");
-    }
-
-    #[test]
-    fn profile_docker_strips_build_steps() {
-        let input = "Step 1/10 : FROM node:18\nStep 2/10 : WORKDIR /app\n ---> Using cache\nSuccessfully built abc123\nSuccessfully tagged myapp:latest\n";
-        let result = process_shell_output("docker build -t myapp .", input, "", 0, Duration::ZERO);
-        assert!(!result.contains("Step "), "docker strips step lines");
-        assert!(
-            result.contains("[docker build: ok]"),
-            "docker short-circuits on success"
-        );
-    }
-
-    #[test]
-    fn profile_pytest_strips_collected() {
-        let input = "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n";
-        let result = process_shell_output("pytest", input, "", 0, Duration::ZERO);
-        assert!(
-            !result.contains("collected"),
-            "pytest strips collected count"
-        );
-    }
-
-    #[test]
-    fn profile_pytest_python_m_falls_through_to_generic() {
-        // Regression test: python -m pytest must NOT match the pytest profile
-        // because canonical_command strips the `-m` flag, producing
-        // "python pytest" which doesn't start with "^pytest\b".
-        // The "collected" line should be preserved (GEN_FALLBACK doesn't strip it).
-        let input = "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n";
-        let result = process_shell_output("python -m pytest tests/", input, "", 0, Duration::ZERO);
-        assert!(
-            result.contains("collected"),
-            "python -m pytest falls through to GEN_FALLBACK (collected preserved)"
-        );
-    }
-
-    #[test]
-    fn profile_pytest_poetry_run_falls_through_to_generic() {
-        // Regression test: poetry run pytest must NOT match the pytest profile
-        // because canonical_command treats `run` as poetry's subcommand,
-        // producing "poetry run" which doesn't match "^pytest\b".
-        let input = "============================= test session starts ==============================\ncollected 5 items\n\n.test..\n\n============================== 5 passed ==============================\n";
-        let result = process_shell_output("poetry run pytest tests/", input, "", 0, Duration::ZERO);
-        assert!(
-            result.contains("collected"),
-            "poetry run pytest falls through to GEN_FALLBACK (collected preserved)"
-        );
-    }
-
-    #[test]
-    fn profile_keep_stderr_warnings_on_success() {
-        let stderr = "warning: unused import: `std::fs`\n  --> src/main.rs:1:5\n";
-        let result = process_shell_output(
-            "cargo build",
-            "   Compiling foo v1.0.0\n    Finished\n",
-            stderr,
-            0,
-            Duration::ZERO,
-        );
-        assert!(
-            result.contains("warning:"),
-            "cargo build warnings shown on success"
-        );
-    }
-
-    #[test]
-    fn compact_ls_empty_directory() {
-        let input = "total 0\ndrwxr-xr-x  2 user  group  64 May 21 10:00 .\ndrwxr-xr-x  3 user  group  96 May 21 10:00 ..\n";
-        let result = process_shell_output("ls -la", input, "", 0, Duration::ZERO);
-        assert_eq!(
-            result.trim(),
-            "(empty)",
-            "empty ls output should show (empty)"
-        );
-    }
-
-    #[test]
-    fn compact_ls_mixed_files_and_dirs() {
-        let input = "total 32\ndrwxr-xr-x  5 user  group   160 May 21 10:00 .\ndrwxr-xr-x  3 user  group    96 May 21 10:00 ..\n-rw-r--r--  1 user  group  2048 May 21 10:00 main.rs\n-rw-r--r--  1 user  group  4096 May 21 10:00 lib.rs\ndrwxr-xr-x  2 user  group    64 May 21 10:00 src\nlrwxr-xr-x  1 user  group     5 May 21 10:00 link -> target\n";
-        let result = process_shell_output("ls -la", input, "", 0, Duration::ZERO);
-        assert!(result.contains("src/"), "directory should end with slash");
-        assert!(result.contains("main.rs"), "file name preserved");
-        assert!(result.contains("lib.rs"), "file name preserved");
-        assert!(result.contains("Summary:"), "should have summary");
-        assert!(
-            !result.contains("link -> target"),
-            "symlink target stripped"
-        );
-    }
-
-    #[test]
-    fn compact_ls_dotless_files() {
-        let input = "total 16\n-rw-r--r--  1 user  group  1024 May 21 10:00 Makefile\n-rw-r--r--  1 user  group  2048 May 21 10:00 README\n-rw-r--r--  1 user  group   512 May 21 10:00 .gitignore\n-rw-r--r--  1 user  group  1024 May 21 10:00 main.rs\n";
-        let result = process_shell_output("ls -la", input, "", 0, Duration::ZERO);
-        assert!(result.contains("Makefile"), "dotless file preserved");
-        assert!(result.contains("README"), "dotless file preserved");
-        assert!(
-            !result.contains(".Makefile"),
-            "dotless file should not get fake extension"
-        );
-        assert!(
-            !result.contains(".README"),
-            "dotless file should not get fake extension"
-        );
-        // The summary should classify these as "no ext", not as fake extensions
-        assert!(
-            result.contains("no ext"),
-            "summary should include 'no ext' for dotless files"
-        );
-        // .gitignore is a dotfile — its stem is empty, extension is "gitignore"
-        assert!(
-            result.contains(".rs"),
-            "main.rs should be classified as .rs"
-        );
-    }
-
-    #[test]
-    fn compact_ls_plain_ls_passes_through() {
-        // Plain `ls` output (no `-l` flag) has no "total N" header.
-        // compact_ls should pass it through unchanged instead of returning "(empty)".
-        let input = "Cargo.toml\nCargo.lock\nsrc\ntarget\nREADME.md\n";
-        let result = process_shell_output("ls", input, "", 0, Duration::ZERO);
-        assert!(
-            result.contains("Cargo.toml"),
-            "plain ls output should show filenames unchanged"
-        );
-        assert!(
-            result.contains("src"),
-            "plain ls output should show filenames unchanged"
-        );
-        assert!(
-            !result.contains("(empty)"),
-            "plain ls output should NOT show (empty)"
-        );
-        assert!(
-            !result.contains("Summary:"),
-            "plain ls output should NOT be compacted — no Summary header"
-        );
-    }
-
-    #[test]
-    fn chained_ls_skips_compact_ls() {
-        // Chained `ls -l && echo done` should NOT go through compact_ls —
-        // the standalone_only flag ensures the transform is skipped for
-        // chained commands, preserving output from later segments.
-        let input = "total 8\n-rw-r--r--  1 user  group  1024 May 21 10:00 foo\n-rw-r--r--  1 user  group  2048 May 21 10:00 bar\ndone\n";
-        let result = process_shell_output("ls -l && echo done", input, "", 0, Duration::ZERO);
-        assert!(
-            result.contains("done"),
-            "chained ls: later segments' output preserved"
-        );
-        assert!(
-            !result.contains("Summary:"),
-            "chained ls: compact_ls should not be applied"
-        );
-    }
-
-    #[test]
     fn save_raw_output_if_large_skips_small_output() {
         let result = save_raw_output_if_large(b"hello", b"", "echo hello");
         assert!(result.is_none(), "should skip saving for small output");
-    }
-
-    #[test]
-    fn chained_ls_with_pipe_skips_compact_ls() {
-        // Piped `ls -l | head -5` should NOT go through compact_ls —
-        // the standalone_only flag causes select_profile to skip the ls
-        // profile for chained commands, falling through to GEN_FALLBACK.
-        let input = "total 8\n-rw-r--r--  1 user  group  1024 May 21 10:00 foo\n-rw-r--r--  1 user  group  2048 May 21 10:00 bar\n";
-        let result = process_shell_output("ls -l | head -5", input, "", 0, Duration::ZERO);
-        assert!(
-            !result.contains("Summary:"),
-            "piped ls: compact_ls should not be applied"
-        );
-        assert!(
-            result.contains("total 8"),
-            "piped ls: raw -l format should be preserved"
-        );
     }
 
     #[test]
@@ -3056,34 +3022,6 @@ mod tests {
         assert!(
             hint.contains("[view with: read"),
             "should provide read hint"
-        );
-    }
-
-    #[test]
-    fn profile_on_empty_shows_timing() {
-        let result = process_shell_output("tsc --noEmit", "", "", 0, Duration::from_secs_f64(3.2));
-        // The on_empty message should include timing
-        assert!(
-            result.contains("(3.2s)"),
-            "timing should appear in on_empty message"
-        );
-    }
-
-    #[test]
-    fn profile_gh_strips_noise() {
-        let input = "  \n - some detail\nwarning: consider updating gh\n✓ Created pull request\n";
-        let result = process_shell_output("gh pr create --fill", input, "", 0, Duration::ZERO);
-        assert!(!result.contains("warning:"), "gh: warning stripped");
-        assert!(result.contains("[gh: ok]"), "gh: short-circuit on success");
-    }
-
-    #[test]
-    fn profile_terraform_short_circuits() {
-        let input = "data.aws_region.current: Refreshing state...\nNo changes. Your infrastructure matches the configuration.\n";
-        let result = process_shell_output("terraform plan", input, "", 0, Duration::ZERO);
-        assert!(
-            result.contains("[terraform: no changes]"),
-            "terraform: short-circuits on 'No changes'"
         );
     }
 
