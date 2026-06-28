@@ -93,6 +93,32 @@ fn board() -> &'static BoardStore {
     crate::board::store()
 }
 
+// ── Circuit breaker helper functions ──────────────────────────────────────────
+
+/// Count only sanitation-failure system comments (role == "system", content
+/// contains [`SANITATION_FAILED_PREFIX`]). Used by the sanitation circuit breaker.
+fn count_sanitation_failures(comments: &[TicketComment]) -> usize {
+    comments
+        .iter()
+        .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
+        .count()
+}
+
+fn general_breaker_comment(count: usize) -> String {
+    format!(
+        "Failed after {count} comments — ticket has accumulated too many comments \
+         (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
+         Ticket failed — Manager will triage."
+    )
+}
+
+fn sanitation_breaker_comment(count: usize) -> String {
+    format!(
+        "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+         (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
+    )
+}
+
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
 /// Returns `false` if the ticket was moved externally or an error occurred.
 #[must_use]
@@ -152,13 +178,7 @@ async fn guard_phase_and_circuit_breaker(
         expected,
         CIRCUIT_BREAKER_COMMENT_THRESHOLD,
         <[TicketComment]>::len,
-        |count| {
-            format!(
-                "Failed after {count} comments — ticket has accumulated too many comments \
-                 (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
-                 Ticket failed — Manager will triage."
-            )
-        },
+        general_breaker_comment,
         label,
     )
     .await
@@ -1239,18 +1259,8 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         &ticket,
         TicketPhase::InSanitation,
         SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-        |comments| {
-            comments
-                .iter()
-                .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
-                .count()
-        },
-        |count| {
-            format!(
-                "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
-                 (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
-            )
-        },
+        count_sanitation_failures,
+        sanitation_breaker_comment,
         "Sanitation",
     )
     .await
@@ -2820,20 +2830,8 @@ mod tests {
                 &ticket,
                 TicketPhase::InSanitation,
                 SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-                |comments| {
-                    comments
-                        .iter()
-                        .filter(|c| {
-                            c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX)
-                        })
-                        .count()
-                },
-                |count| {
-                    format!(
-                        "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
-                         (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
-                    )
-                },
+                count_sanitation_failures,
+                sanitation_breaker_comment,
                 "Sanitation",
             )
             .await,
@@ -2875,18 +2873,8 @@ mod tests {
             &ticket,
             TicketPhase::InSanitation,
             SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-            |comments| {
-                comments
-                    .iter()
-                    .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
-                    .count()
-            },
-            |count| {
-                format!(
-                    "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
-                     (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
-                )
-            },
+            count_sanitation_failures,
+            sanitation_breaker_comment,
             "Sanitation",
         )
         .await;
@@ -3130,13 +3118,7 @@ mod tests {
                 TicketPhase::InReview,
                 CIRCUIT_BREAKER_COMMENT_THRESHOLD,
                 <[TicketComment]>::len,
-                |count| {
-                    format!(
-                        "Failed after {count} comments — ticket has accumulated too many comments \
-                         (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
-                         Ticket failed — Manager will triage."
-                    )
-                },
+                general_breaker_comment,
                 "test",
             )
             .await;
@@ -3192,13 +3174,7 @@ mod tests {
             TicketPhase::InReview,
             CIRCUIT_BREAKER_COMMENT_THRESHOLD,
             <[TicketComment]>::len,
-            |count| {
-                format!(
-                    "Failed after {count} comments — ticket has accumulated too many comments \
-                     (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
-                     Ticket failed — Manager will triage."
-                )
-            },
+            general_breaker_comment,
             "test",
         )
         .await;
