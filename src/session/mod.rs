@@ -5,17 +5,16 @@ pub use manager::Session;
 
 pub mod summarization;
 
-use crate::global_store;
-use crate::turso::{self, Connection, TxGuard, Value, params};
+use crate::turso::{self, TxGuard, Value, params};
 use crate::{ChatMessage, MessageRole, Reasoning, ToolCall as ProviderToolCall};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use std::path::Path;
 
-global_store! {
+crate::define_store! {
     /// Global session store.
     pub static SESSIONS: SessionStore,
-    constructor = SessionStore::open,
+    db_name = "sessions",
+    schema = SCHEMA,
     expect = "SESSIONS not initialized",
 }
 
@@ -81,18 +80,6 @@ pub struct SessionMetadata {
 }
 
 /// Turso-backed session store.
-#[derive(Clone, Debug)]
-pub struct SessionStore {
-    pub(crate) conn: Connection,
-}
-
-impl SessionStore {
-    pub async fn open(root: &Path) -> Result<Self> {
-        let conn = turso::open_store(root, "sessions", SCHEMA).await?;
-        Ok(Self { conn })
-    }
-}
-
 /// Parse an RFC 3339 timestamp string, falling back to `Utc::now()` on failure.
 ///
 /// Logs a warning with the field name, the raw value, and the parse error

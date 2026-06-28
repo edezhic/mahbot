@@ -6,18 +6,17 @@
 use crate::Role;
 use crate::Workspace;
 use crate::agent::run_agent;
-use crate::global_store;
 use crate::session::discovery_session_key;
-use crate::turso::{self, Connection};
+use crate::turso::{self};
 use anyhow::{Context, Result};
 use futures_util::future::join_all;
-use std::path::Path;
 use tracing::warn;
 
-global_store! {
+crate::define_store! {
     /// Global workspace store.
     pub static WORKSPACES: WorkspaceStore,
-    constructor = WorkspaceStore::open,
+    db_name = "workspaces",
+    schema = SCHEMA,
     expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",
 }
 
@@ -29,12 +28,6 @@ pub async fn get_by_path(path: &str) -> Result<Option<Workspace>> {
 /// Look up a workspace by its name.
 pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
     store().get_by_name(name).await
-}
-
-/// Turso-backed workspace storage.
-#[derive(Clone, Debug)]
-pub struct WorkspaceStore {
-    pub(crate) conn: Connection,
 }
 
 const SCHEMA: &str = "\
@@ -446,11 +439,6 @@ fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
 }
 
 impl WorkspaceStore {
-    pub async fn open(root: &Path) -> Result<Self> {
-        let conn = turso::open_store(root, "workspaces", SCHEMA).await?;
-        Ok(Self { conn })
-    }
-
     /// Run a query that returns zero-or-one workspace row, mapping the result to
     /// `Ok(Some(ws))` / `Ok(None)` / `Err`.
     async fn query_one(

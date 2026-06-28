@@ -18,23 +18,18 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::global_store;
-use crate::turso::{self, Connection, TxGuard};
+use crate::turso::{self, TxGuard};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-global_store! {
+crate::define_store! {
     /// Global user store.
     pub static USER_STORE: UserStore,
-    constructor = UserStore::open,
-}
-
-/// Turso-backed user preferences storage.
-#[derive(Clone, Debug)]
-pub struct UserStore {
-    pub(crate) conn: Connection,
+    db_name = "users",
+    schema = SCHEMA,
+    post_open = ensure_admin_user,
 }
 
 const SCHEMA: &str = "\
@@ -74,15 +69,6 @@ crate::columns! {
 }
 
 impl UserStore {
-    /// Open (or create) the users database at `root/db/users.db`.
-    /// On fresh databases, auto-creates the `admin` user with full permissions.
-    pub async fn open(root: &Path) -> Result<Self> {
-        let conn = turso::open_store(root, "users", SCHEMA).await?;
-        let this = Self { conn };
-        this.ensure_admin_user().await?;
-        Ok(this)
-    }
-
     /// Auto-create the admin user if this is a fresh database.
     async fn ensure_admin_user(&self) -> Result<()> {
         let rows = self

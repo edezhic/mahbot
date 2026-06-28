@@ -7,21 +7,14 @@
 //! - `config_model_routing` — per-model provider order and fallback settings.
 
 use crate::config::{ModelRouting, RoleConfig};
-use crate::global_store;
-use crate::turso::{self, Connection};
+use crate::turso::{self};
 use anyhow::Result;
-use std::path::Path;
 
-global_store! {
+crate::define_store! {
     /// Global config store.
     pub static CONFIG_STORE: ConfigStore,
-    constructor = ConfigStore::open,
-}
-
-/// Turso-backed config storage.
-#[derive(Clone, Debug)]
-pub struct ConfigStore {
-    pub(crate) conn: Connection,
+    db_name = "config",
+    schema = SCHEMA,
 }
 
 const SCHEMA: &str = "\
@@ -96,12 +89,6 @@ const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) 
 const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
 impl ConfigStore {
-    /// Open (or create) the config database at `root/db/config.db`.
-    pub async fn open(root: &Path) -> Result<Self> {
-        let conn = turso::open_store(root, "config", SCHEMA).await?;
-        Ok(Self { conn })
-    }
-
     /// Begin a transaction that serializes all subsequent operations until
     /// committed or rolled back. The returned guard keeps the connection locked.
     pub async fn begin_tx(&self) -> Result<turso::TxGuard<'_>> {

@@ -6,15 +6,14 @@
 //! Each message gets a NanoID for deduplication.
 
 use crate::ChatDirection;
-use crate::global_store;
-use crate::turso::{self, Connection, Row};
+use crate::turso::{self, Row};
 use anyhow::Result;
-use std::path::Path;
 
-global_store! {
+crate::define_store! {
     /// Global chat history store.
     pub static CHAT_HISTORY: ChatHistoryStore,
-    constructor = ChatHistoryStore::open,
+    db_name = "chat_history",
+    schema = SCHEMA,
 }
 
 const SCHEMA: &str = "\
@@ -80,19 +79,7 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
     })
 }
 
-/// Turso-backed chat history storage.
-#[derive(Clone, Debug)]
-pub struct ChatHistoryStore {
-    pub(crate) conn: Connection,
-}
-
 impl ChatHistoryStore {
-    /// Open (or create) the chat history database at `root/db/chat_history.db`.
-    pub async fn open(root: &Path) -> Result<Self> {
-        let conn = turso::open_store(root, "chat_history", SCHEMA).await?;
-        Ok(Self { conn })
-    }
-
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
     /// Silently ignores duplicate `message_id` values (UPSERT no-op).
     #[allow(clippy::too_many_arguments)]

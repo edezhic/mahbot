@@ -4,21 +4,14 @@
 //! `std::sync::Mutex<HashMap<String, ToolUsage>>` and are flushed to
 //! the database on session finalization via [`StatsStore::flush_batch`].
 
-use crate::global_store;
-use crate::turso::{self, Connection};
+use crate::turso::{self};
 use anyhow::Result;
-use std::path::Path;
 
-global_store! {
+crate::define_store! {
     /// Global stats store.
     pub static STATS_STORE: StatsStore,
-    constructor = StatsStore::open,
-}
-
-/// Turso-backed tool usage stats storage.
-#[derive(Clone, Debug)]
-pub struct StatsStore {
-    pub(crate) conn: Connection,
+    db_name = "stats",
+    schema = SCHEMA,
 }
 
 const SCHEMA: &str = "\
@@ -80,15 +73,6 @@ pub struct ToolErrorQuery {
 }
 
 impl StatsStore {
-    /// Open (or create) the stats database at `root/db/stats.db`.
-    ///
-    /// The `workspace` column was added to the schema in an earlier version;
-    /// it is now part of the `CREATE TABLE` schema and no migration is needed.
-    pub async fn open(root: &Path) -> Result<Self> {
-        let conn = turso::open_store(root, "stats", SCHEMA).await?;
-        Ok(Self { conn })
-    }
-
     /// Query the most recent `call_count` for a given agent and tool.
     ///
     /// Returns `None` if no row exists for the combination.

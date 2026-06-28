@@ -1,20 +1,20 @@
 //! Ticket/board system — Turso-backed task management.
 
-use crate::global_store;
 use crate::management::DIAGNOSTICS_ROLE;
-use crate::turso::{self, Connection, TxGuard, Value, params_from_iter};
+use crate::turso::{self, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::path::Path;
 use tracing::{debug, info, warn};
 
-global_store! {
+crate::define_store! {
     /// Global board store.
     pub static BOARD: BoardStore,
-    constructor = BoardStore::open,
+    db_name = "board",
+    schema = SCHEMA,
+    post_open = after_open,
 }
 
 /// Background task: auto-archive cancelled tickets older than 1 hour.
@@ -483,18 +483,16 @@ struct AddCommentSql {
 }
 
 impl BoardStore {
-    /// Open (or create) the board database at `root/db/board.db`.
-    pub async fn open(root: &Path) -> Result<Self> {
-        let conn = turso::open_store(root, "board", SCHEMA).await?;
-
+    /// Post-open FTS index setup.
+    async fn after_open(&self) -> anyhow::Result<()> {
         crate::turso::ensure_fts_index(
-            &conn,
+            &self.conn,
             TICKETS_FTS_INDEX_NAME,
             "ngram",
             TICKETS_FTS_INDEX_DDL,
         )
         .await?;
-        Ok(Self { conn })
+        Ok(())
     }
 
     /// Shared INSERT logic for [`BoardStore::create_ticket`] and [`BoardStore::supersede_and_create`].
@@ -1757,11 +1755,6 @@ impl BoardStore {
         }
         Ok(results)
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct BoardStore {
-    pub(crate) conn: Connection,
 }
 
 /// Returns a reference to the global [`BoardStore`] singleton.
