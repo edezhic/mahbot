@@ -80,54 +80,66 @@ pub enum EditorAction {
         /// Target character-based column.
         col: usize,
     },
-    /// Move cursor one character left.
-    MoveLeft,
-    /// Move cursor one character right.
-    MoveRight,
-    /// Move cursor one line up.
-    MoveUp,
-    /// Move cursor one line down.
-    MoveDown,
-    /// Move cursor to start of current line.
-    MoveHome,
-    /// Move cursor to end of current line.
-    MoveEnd,
-    /// Move cursor one word left.
-    MoveWordLeft,
-    /// Move cursor one word right.
-    MoveWordRight,
-    /// Move cursor to start of document.
-    MoveDocStart,
-    /// Move cursor to end of document.
-    MoveDocEnd,
-    /// Move cursor one page up.
-    MovePageUp,
-    /// Move cursor one page down.
-    MovePageDown,
-    /// Extend selection one character left.
-    SelectLeft,
-    /// Extend selection one character right.
-    SelectRight,
-    /// Extend selection one line up.
-    SelectUp,
-    /// Extend selection one line down.
-    SelectDown,
-    /// Extend selection to start of current line.
-    SelectHome,
-    /// Extend selection to end of current line.
-    SelectEnd,
-    /// Extend selection one word left.
-    SelectWordLeft,
-    /// Extend selection one word right.
-    SelectWordRight,
-    /// Extend selection to start of document.
-    SelectDocStart,
-    /// Extend selection to end of document.
-    SelectDocEnd,
-    /// Extend selection one page up.
-    SelectPageUp,
-    /// Extend selection one page down.
-    SelectPageDown,
+    /// Move cursor (or extend selection) one character left.
+    MoveLeft {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) one character right.
+    MoveRight {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) one line up.
+    MoveUp {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) one line down.
+    MoveDown {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) to start of current line.
+    MoveHome {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) to end of current line.
+    MoveEnd {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) one word left.
+    MoveWordLeft {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) one word right.
+    MoveWordRight {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) to start of document.
+    MoveDocStart {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) to end of document.
+    MoveDocEnd {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) one page up.
+    MovePageUp {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
+    /// Move cursor (or extend selection) one page down.
+    MovePageDown {
+        /// `true` extends the selection instead of moving the cursor.
+        select: bool,
+    },
     /// Delete from cursor to start of previous word.
     DeleteWordBack,
     /// Delete from cursor to start of next word.
@@ -398,30 +410,18 @@ impl EditorBuffer {
             }
             EditorAction::Indent => self.do_indent(),
             EditorAction::Unindent => self.do_unindent(),
-            EditorAction::MoveLeft => self.do_move_left(false),
-            EditorAction::MoveRight => self.do_move_right(false),
-            EditorAction::MoveUp => self.do_move_up(false),
-            EditorAction::MoveDown => self.do_move_down(false),
-            EditorAction::MoveHome => self.do_move_home(false),
-            EditorAction::MoveEnd => self.do_move_end(false),
-            EditorAction::MoveWordLeft => self.do_move_word_left(false),
-            EditorAction::MoveWordRight => self.do_move_word_right(false),
-            EditorAction::MoveDocStart => self.do_move_doc_start(false),
-            EditorAction::MoveDocEnd => self.do_move_doc_end(false),
-            EditorAction::MovePageUp => self.do_move_page_up(false),
-            EditorAction::MovePageDown => self.do_move_page_down(false),
-            EditorAction::SelectLeft => self.do_move_left(true),
-            EditorAction::SelectRight => self.do_move_right(true),
-            EditorAction::SelectUp => self.do_move_up(true),
-            EditorAction::SelectDown => self.do_move_down(true),
-            EditorAction::SelectHome => self.do_move_home(true),
-            EditorAction::SelectEnd => self.do_move_end(true),
-            EditorAction::SelectWordLeft => self.do_move_word_left(true),
-            EditorAction::SelectWordRight => self.do_move_word_right(true),
-            EditorAction::SelectDocStart => self.do_move_doc_start(true),
-            EditorAction::SelectDocEnd => self.do_move_doc_end(true),
-            EditorAction::SelectPageUp => self.do_move_page_up(true),
-            EditorAction::SelectPageDown => self.do_move_page_down(true),
+            EditorAction::MoveLeft { select } => self.do_move_left(select),
+            EditorAction::MoveRight { select } => self.do_move_right(select),
+            EditorAction::MoveUp { select } => self.do_move_up(select),
+            EditorAction::MoveDown { select } => self.do_move_down(select),
+            EditorAction::MoveHome { select } => self.do_move_home(select),
+            EditorAction::MoveEnd { select } => self.do_move_end(select),
+            EditorAction::MoveWordLeft { select } => self.do_move_word_left(select),
+            EditorAction::MoveWordRight { select } => self.do_move_word_right(select),
+            EditorAction::MoveDocStart { select } => self.do_move_doc_start(select),
+            EditorAction::MoveDocEnd { select } => self.do_move_doc_end(select),
+            EditorAction::MovePageUp { select } => self.do_move_page_up(select),
+            EditorAction::MovePageDown { select } => self.do_move_page_down(select),
             EditorAction::DeleteWordBack => self.do_delete_word_back(),
             EditorAction::DeleteWordForward => self.do_delete_word_forward(),
             EditorAction::ToggleLineComment => self.do_toggle_line_comment(),
@@ -3300,30 +3300,18 @@ const fn is_cursor_movement_key(key: &key::Key) -> bool {
 const fn is_action_cursor_movement(action: &EditorAction) -> bool {
     matches!(
         action,
-        EditorAction::MoveLeft
-            | EditorAction::MoveRight
-            | EditorAction::MoveUp
-            | EditorAction::MoveDown
-            | EditorAction::MoveHome
-            | EditorAction::MoveEnd
-            | EditorAction::MoveWordLeft
-            | EditorAction::MoveWordRight
-            | EditorAction::MoveDocStart
-            | EditorAction::MoveDocEnd
-            | EditorAction::MovePageUp
-            | EditorAction::MovePageDown
-            | EditorAction::SelectLeft
-            | EditorAction::SelectRight
-            | EditorAction::SelectUp
-            | EditorAction::SelectDown
-            | EditorAction::SelectHome
-            | EditorAction::SelectEnd
-            | EditorAction::SelectWordLeft
-            | EditorAction::SelectWordRight
-            | EditorAction::SelectDocStart
-            | EditorAction::SelectDocEnd
-            | EditorAction::SelectPageUp
-            | EditorAction::SelectPageDown
+        EditorAction::MoveLeft { .. }
+            | EditorAction::MoveRight { .. }
+            | EditorAction::MoveUp { .. }
+            | EditorAction::MoveDown { .. }
+            | EditorAction::MoveHome { .. }
+            | EditorAction::MoveEnd { .. }
+            | EditorAction::MoveWordLeft { .. }
+            | EditorAction::MoveWordRight { .. }
+            | EditorAction::MoveDocStart { .. }
+            | EditorAction::MoveDocEnd { .. }
+            | EditorAction::MovePageUp { .. }
+            | EditorAction::MovePageDown { .. }
             | EditorAction::SelectWordAt { .. }
             | EditorAction::JumpToMatchingBracket
             | EditorAction::MoveLineUp
@@ -3362,53 +3350,59 @@ fn map_key_to_action(
         key::Key::Named(named) => {
             match (named, platform_mod, shift, alt) {
                 // Platform mod + Up/Down → jump to document start/end
-                (key::Named::ArrowUp, true, false, false) => Some(EditorAction::MoveDocStart),
-                (key::Named::ArrowDown, true, false, false) => Some(EditorAction::MoveDocEnd),
-                (key::Named::ArrowUp, true, true, false) => Some(EditorAction::SelectDocStart),
-                (key::Named::ArrowDown, true, true, false) => Some(EditorAction::SelectDocEnd),
+                (key::Named::ArrowUp, true, s, false) => {
+                    Some(EditorAction::MoveDocStart { select: s })
+                }
+                (key::Named::ArrowDown, true, s, false) => {
+                    Some(EditorAction::MoveDocEnd { select: s })
+                }
 
-                // Navigation (no modifiers)
-                (key::Named::ArrowLeft, false, false, false) => Some(EditorAction::MoveLeft),
-                (key::Named::ArrowRight, false, false, false) => Some(EditorAction::MoveRight),
-                (key::Named::ArrowUp, false, false, false) => Some(EditorAction::MoveUp),
-                (key::Named::ArrowDown, false, false, false) => Some(EditorAction::MoveDown),
-                (key::Named::Home, false, false, false) => Some(EditorAction::MoveHome),
-                (key::Named::End, false, false, false) => Some(EditorAction::MoveEnd),
-
-                // Navigation + Shift
-                (key::Named::ArrowLeft, false, true, false) => Some(EditorAction::SelectLeft),
-                (key::Named::ArrowRight, false, true, false) => Some(EditorAction::SelectRight),
-                (key::Named::ArrowUp, false, true, false) => Some(EditorAction::SelectUp),
-                (key::Named::ArrowDown, false, true, false) => Some(EditorAction::SelectDown),
-                (key::Named::Home, false, true, false) => Some(EditorAction::SelectHome),
-                (key::Named::End, false, true, false) => Some(EditorAction::SelectEnd),
+                // Navigation (no modifiers) / Navigation + Shift
+                (key::Named::ArrowLeft, false, s, false) => {
+                    Some(EditorAction::MoveLeft { select: s })
+                }
+                (key::Named::ArrowRight, false, s, false) => {
+                    Some(EditorAction::MoveRight { select: s })
+                }
+                (key::Named::ArrowUp, false, s, false) => Some(EditorAction::MoveUp { select: s }),
+                (key::Named::ArrowDown, false, s, false) => {
+                    Some(EditorAction::MoveDown { select: s })
+                }
+                (key::Named::Home, false, s, false) => Some(EditorAction::MoveHome { select: s }),
+                (key::Named::End, false, s, false) => Some(EditorAction::MoveEnd { select: s }),
 
                 // Page keys
-                (key::Named::PageUp, false, false, false) => Some(EditorAction::MovePageUp),
-                (key::Named::PageDown, false, false, false) => Some(EditorAction::MovePageDown),
-                (key::Named::PageUp, false, true, false) => Some(EditorAction::SelectPageUp),
-                (key::Named::PageDown, false, true, false) => Some(EditorAction::SelectPageDown),
+                (key::Named::PageUp, false, s, false) => {
+                    Some(EditorAction::MovePageUp { select: s })
+                }
+                (key::Named::PageDown, false, s, false) => {
+                    Some(EditorAction::MovePageDown { select: s })
+                }
 
                 // Alt+Left/Right → word boundary navigation
-                (key::Named::ArrowLeft, false, false, true) => Some(EditorAction::MoveWordLeft),
-                (key::Named::ArrowRight, false, false, true) => Some(EditorAction::MoveWordRight),
-                (key::Named::ArrowLeft, false, true, true) => Some(EditorAction::SelectWordLeft),
-                (key::Named::ArrowRight, false, true, true) => Some(EditorAction::SelectWordRight),
+                (key::Named::ArrowLeft, false, s, true) => {
+                    Some(EditorAction::MoveWordLeft { select: s })
+                }
+                (key::Named::ArrowRight, false, s, true) => {
+                    Some(EditorAction::MoveWordRight { select: s })
+                }
 
-                // Alt+Up/Down → move line up/down
+                // Alt+Up/Down → move line up/down (no selection variant — always moves)
                 (key::Named::ArrowUp, false, false, true) => Some(EditorAction::MoveLineUp),
                 (key::Named::ArrowDown, false, false, true) => Some(EditorAction::MoveLineDown),
 
                 // Platform mod + Left/Right → jump to line start/end
-                (key::Named::ArrowLeft, true, false, false) => Some(EditorAction::MoveHome),
-                (key::Named::ArrowRight, true, false, false) => Some(EditorAction::MoveEnd),
-                (key::Named::ArrowLeft, true, true, false) => Some(EditorAction::SelectHome),
-                (key::Named::ArrowRight, true, true, false) => Some(EditorAction::SelectEnd),
+                (key::Named::ArrowLeft, true, s, false) => {
+                    Some(EditorAction::MoveHome { select: s })
+                }
+                (key::Named::ArrowRight, true, s, false) => {
+                    Some(EditorAction::MoveEnd { select: s })
+                }
                 // Platform mod + Home/End → document start/end
-                (key::Named::Home, true, false, false) => Some(EditorAction::MoveDocStart),
-                (key::Named::End, true, false, false) => Some(EditorAction::MoveDocEnd),
-                (key::Named::Home, true, true, false) => Some(EditorAction::SelectDocStart),
-                (key::Named::End, true, true, false) => Some(EditorAction::SelectDocEnd),
+                (key::Named::Home, true, s, false) => {
+                    Some(EditorAction::MoveDocStart { select: s })
+                }
+                (key::Named::End, true, s, false) => Some(EditorAction::MoveDocEnd { select: s }),
 
                 // Delete/Backspace
                 (key::Named::Backspace, false, false, false) => Some(EditorAction::Backspace),
@@ -3450,14 +3444,14 @@ fn map_key_to_action(
                 let ctrl = modifiers.control();
                 if ctrl && !modifiers.command() {
                     match latin {
-                        Some('f') => return Some(EditorAction::MoveRight),
-                        Some('b') => return Some(EditorAction::MoveLeft),
-                        Some('a') => return Some(EditorAction::MoveHome),
-                        Some('e') => return Some(EditorAction::MoveEnd),
+                        Some('f') => return Some(EditorAction::MoveRight { select: false }),
+                        Some('b') => return Some(EditorAction::MoveLeft { select: false }),
+                        Some('a') => return Some(EditorAction::MoveHome { select: false }),
+                        Some('e') => return Some(EditorAction::MoveEnd { select: false }),
                         Some('h') => return Some(EditorAction::Backspace),
                         Some('d') => return Some(EditorAction::Delete),
-                        Some('n') => return Some(EditorAction::MoveDown),
-                        Some('p') => return Some(EditorAction::MoveUp),
+                        Some('n') => return Some(EditorAction::MoveDown { select: false }),
+                        Some('p') => return Some(EditorAction::MoveUp { select: false }),
                         _ => {}
                     }
                 }
@@ -4183,7 +4177,7 @@ mod tests {
     #[test]
     fn test_shift_left_at_bof_no_selection() {
         let buf = EditorBuffer::with_text("hello", None);
-        buf.perform_action(EditorAction::SelectLeft);
+        buf.perform_action(EditorAction::MoveLeft { select: true });
         let cursor = buf.cursor();
         assert_eq!(cursor.line, 0);
         assert_eq!(cursor.column, 0);
@@ -4206,8 +4200,8 @@ mod tests {
     fn test_shift_right_then_back_collapses_selection() {
         let buf = EditorBuffer::with_text("hello", None);
         buf.move_to(0, 0);
-        buf.perform_action(EditorAction::SelectRight);
-        buf.perform_action(EditorAction::SelectLeft);
+        buf.perform_action(EditorAction::MoveRight { select: true });
+        buf.perform_action(EditorAction::MoveLeft { select: true });
         let cursor = buf.cursor();
         assert_eq!(cursor.line, 0);
         assert_eq!(cursor.column, 0);
