@@ -274,10 +274,16 @@ async fn finalize_discovery(
     }
 
     if all_ok {
-        let _ = storage.set_status(ws_name, "ready").await;
-        // Always unpause on success — a successful rediscovery should bring
-        // the workspace back to life just like the initial discovery.
-        let _ = storage.set_paused(ws_name, false).await;
+        // Single atomic UPDATE for both status and paused columns, following
+        // the same pattern used by WorkspaceStore::rediscover.
+        let _ = storage
+            .conn
+            .execute(
+                "UPDATE workspaces SET status = 'ready', paused = 0, updated_at = ? WHERE name = ?",
+                turso::params![turso::now(), ws_name],
+            )
+            .await;
+        tracing::info!(workspace = ws_name, "Workspace pipeline resumed");
         tracing::info!(
             workspace_name = ws_name,
             "Workspace analysis complete — all roles ready"
