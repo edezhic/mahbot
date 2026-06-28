@@ -1100,64 +1100,73 @@ Binary files a/image.png and b/image.png differ
         }
     }
 
-    // ── rename from integration tests ──────────────────────────────────
-
     #[test]
-    fn test_rename_from_unquoted() {
-        let diff = r"diff --git a/old.rs b/new.rs
+    fn test_rename_from_cases() {
+        // Cases: (name, diff, expected_old_path, expected_path).
+        let cases: &[(&str, &str, Option<&str>, &str)] = &[
+            // Unquoted rename — no special characters.
+            (
+                "unquoted",
+                r"diff --git a/old.rs b/new.rs
 similarity index 100%
 rename from old.rs
 rename to new.rs
-";
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].status, DiffFileStatus::Renamed);
-        assert_eq!(output[0].old_path, Some("old.rs".to_string()));
-        assert_eq!(output[0].path, "new.rs");
-    }
-
-    #[test]
-    fn test_rename_from_quoted_with_escapes() {
-        // Trigger char: double-quote in the old filename.
-        let diff = r#"diff --git "a/old\"name.rs" "b/new\"name.rs"
+",
+                Some("old.rs"),
+                "new.rs",
+            ),
+            // Quoted with escape sequences (double-quote in filename).
+            (
+                "quoted_with_escapes",
+                r#"diff --git "a/old\"name.rs" "b/new\"name.rs"
 similarity index 100%
 rename from "old\"name.rs"
 rename to "new\"name.rs"
-"#;
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].status, DiffFileStatus::Renamed);
-        assert_eq!(output[0].old_path, Some("old\"name.rs".to_string()));
-        assert_eq!(output[0].path, "new\"name.rs");
-    }
-
-    #[test]
-    fn test_rename_from_quoted_tab_in_name() {
-        // Trigger char: tab.
-        let diff = "diff --git \"a/old\\tname.rs\" \"b/new\\tname.rs\"\n\
-similarity index 100%\n\
-rename from \"old\\tname.rs\"\n\
-rename to \"new\\tname.rs\"\n";
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].status, DiffFileStatus::Renamed);
-        assert_eq!(output[0].old_path, Some("old\tname.rs".to_string()));
-    }
-
-    #[test]
-    fn test_rename_from_no_trigger_chars() {
-        // Spaces do NOT trigger quoting in git.
-        let diff = r"diff --git a/old name.rs b/new name.rs
+"#,
+                Some("old\"name.rs"),
+                "new\"name.rs",
+            ),
+            // Tab character triggers quoting.
+            (
+                "quoted_tab_in_name",
+                r#"diff --git "a/old\tname.rs" "b/new\tname.rs"
+similarity index 100%
+rename from "old\tname.rs"
+rename to "new\tname.rs"
+"#,
+                Some("old\tname.rs"),
+                "new\tname.rs",
+            ),
+            // Spaces without quoting — no trigger characters.
+            (
+                "no_trigger_chars",
+                r"diff --git a/old name.rs b/new name.rs
 similarity index 100%
 rename from old name.rs
 rename to new name.rs
-";
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].status, DiffFileStatus::Renamed);
-        // Spaces are literal — no quoting means no unquoting needed.
-        assert_eq!(output[0].old_path, Some("old name.rs".to_string()));
-        assert_eq!(output[0].path, "new name.rs");
+",
+                Some("old name.rs"),
+                "new name.rs",
+            ),
+        ];
+        for (i, (name, diff, expected_old_path, expected_path)) in cases.iter().enumerate() {
+            let output = parse_git_diff(diff);
+            assert_eq!(output.len(), 1, "case {i} ({name})");
+            assert_eq!(
+                output[0].status,
+                DiffFileStatus::Renamed,
+                "case {i} ({name})"
+            );
+            assert_eq!(
+                output[0].old_path.as_deref(),
+                *expected_old_path,
+                "case {i} ({name}): old_path mismatch"
+            );
+            assert_eq!(
+                output[0].path, *expected_path,
+                "case {i} ({name}): path mismatch"
+            );
+        }
     }
 
     #[test]
