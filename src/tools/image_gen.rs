@@ -300,51 +300,57 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_response_parts_image_and_text() {
-        let body = make_response(
-            Some("data:image/png;base64,abc123"),
-            Some("Here is your generated image"),
-        );
-        let result = extract_response_parts(&body);
-        assert_eq!(
-            result.image_data,
-            Some("data:image/png;base64,abc123".to_string())
-        );
-        assert_eq!(
-            result.text_content,
-            Some("Here is your generated image".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_response_parts_image_only() {
-        let body = make_response(Some("data:image/png;base64,def456"), None);
-        let result = extract_response_parts(&body);
-        assert_eq!(
-            result.image_data,
-            Some("data:image/png;base64,def456".to_string())
-        );
-        assert_eq!(result.text_content, None);
-    }
-
-    #[test]
-    fn test_extract_response_parts_text_only() {
-        let body = make_response(None, Some("Just text, no image"));
-        let result = extract_response_parts(&body);
-        assert_eq!(result.image_data, None);
-        assert_eq!(result.text_content, Some("Just text, no image".to_string()));
-    }
-
-    #[test]
-    fn test_extract_response_parts_empty_content() {
-        // Empty text content should yield None (preserving the empty-string guard)
-        let body = make_response(Some("data:image/png;base64,ghi789"), Some(""));
-        let result = extract_response_parts(&body);
-        assert_eq!(
-            result.image_data,
-            Some("data:image/png;base64,ghi789".to_string())
-        );
-        assert_eq!(result.text_content, None);
+    fn test_extract_response_parts_variants() {
+        // Table-driven tests covering normal variants of extract_response_parts.
+        //
+        // Each case is:
+        //   (image_url, text_content, expected_image_data, expected_text_content, label)
+        //
+        // - Empty text content → None (empty-string guard in extract_response_parts).
+        let cases: Vec<(Option<&str>, Option<&str>, Option<&str>, Option<&str>, &str)> = vec![
+            (
+                Some("data:image/png;base64,abc123"),
+                Some("Here is your generated image"),
+                Some("data:image/png;base64,abc123"),
+                Some("Here is your generated image"),
+                "image_and_text",
+            ),
+            (
+                Some("data:image/png;base64,def456"),
+                None,
+                Some("data:image/png;base64,def456"),
+                None,
+                "image_only",
+            ),
+            (
+                None,
+                Some("Just text, no image"),
+                None,
+                Some("Just text, no image"),
+                "text_only",
+            ),
+            (
+                Some("data:image/png;base64,ghi789"),
+                Some(""),
+                Some("data:image/png;base64,ghi789"),
+                None,
+                "empty_content — empty text yields None",
+            ),
+        ];
+        for (img_url, text, exp_img, exp_text, label) in &cases {
+            let body = make_response(*img_url, *text);
+            let result = extract_response_parts(&body);
+            assert_eq!(
+                result.image_data,
+                (*exp_img).map(|s| s.to_string()),
+                "{label}: image_data mismatch",
+            );
+            assert_eq!(
+                result.text_content,
+                (*exp_text).map(|s| s.to_string()),
+                "{label}: text_content mismatch",
+            );
+        }
     }
 
     #[test]
