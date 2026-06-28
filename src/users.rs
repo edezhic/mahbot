@@ -67,12 +67,6 @@ const COL_UC_CHANNEL: usize = 0;
 const COL_UC_IDENTIFIER: usize = 1;
 const COL_UC_REPLY_TARGET: usize = 2;
 
-// Single-column query constants (no COLUMNS string needed, matching stats.rs pattern)
-const COL_PERMISSIONS: usize = 0; // SELECT permissions FROM users
-const COL_SELECTED_WORKSPACE: usize = 0; // SELECT selected_workspace FROM users
-const COL_SELECTED_ROLE: usize = 0; // SELECT selected_role FROM users
-const COL_USER_NAME: usize = 0; // SELECT user_name FROM user_channels
-
 impl UserStorage {
     /// Open (or create) the users database at `root/db/users.db`.
     /// On fresh databases, auto-creates the `admin` user with full permissions.
@@ -135,78 +129,32 @@ impl UserStorage {
         Ok(())
     }
 
-    /// Get permissions for a user.
-    pub async fn get_permissions(&self, name: &str) -> Result<Option<String>> {
+    /// Get a single TEXT column from the `users` table for a user.
+    ///
+    /// The `column` parameter MUST be a compile-time-known column name literal
+    /// to prevent SQL injection.
+    async fn get_user_column(&self, user_name: &str, column: &str) -> Result<Option<String>> {
         let rows = self
             .conn
             .query(
-                "SELECT permissions FROM users WHERE name = ?1",
-                turso::params![name],
+                &format!("SELECT {column} FROM users WHERE name = ?1"),
+                turso::params![user_name],
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(COL_PERMISSIONS)?),
+            Some(row) => Ok(row.get::<Option<String>>(0)?),
             None => Ok(None),
         }
-    }
-
-    // ── Workspace ─────────────────────────────────────────────
-
-    /// Set the selected workspace for a user. Pass `None` to clear it
-    /// (switching back to personal workspace).
-    pub async fn set_workspace(&self, user_name: &str, workspace_name: Option<&str>) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO users (name, selected_workspace) VALUES (?1, ?2) \
-                 ON CONFLICT(name) DO UPDATE SET selected_workspace = excluded.selected_workspace",
-                turso::params![user_name, workspace_name],
-            )
-            .await?;
-        Ok(())
     }
 
     /// Get the selected workspace name for a user, if any.
     pub async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
-        let rows = self
-            .conn
-            .query(
-                "SELECT selected_workspace FROM users WHERE name = ?1",
-                turso::params![user_name],
-            )
-            .await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(COL_SELECTED_WORKSPACE)?),
-            None => Ok(None),
-        }
-    }
-
-    // ── Role ──────────────────────────────────────────────────
-
-    /// Set the active role for a user.
-    pub async fn set_active_role(&self, user_name: &str, role_name: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO users (name, selected_role) VALUES (?1, ?2) \
-                 ON CONFLICT(name) DO UPDATE SET selected_role = excluded.selected_role",
-                turso::params![user_name, role_name],
-            )
-            .await?;
-        Ok(())
+        self.get_user_column(user_name, "selected_workspace").await
     }
 
     /// Get the active role for a user, if any.
     pub async fn get_active_role(&self, user_name: &str) -> Result<Option<String>> {
-        let rows = self
-            .conn
-            .query(
-                "SELECT selected_role FROM users WHERE name = ?1",
-                turso::params![user_name],
-            )
-            .await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(COL_SELECTED_ROLE)?),
-            None => Ok(None),
-        }
+        self.get_user_column(user_name, "selected_role").await
     }
 
     // ── Channel bindings ──────────────────────────────────────
@@ -279,7 +227,7 @@ impl UserStorage {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(Some(row.get::<String>(COL_USER_NAME)?)),
+            Some(row) => Ok(Some(row.get::<String>(0)?)),
             None => Ok(None),
         }
     }
@@ -492,19 +440,6 @@ async fn init_personal_workspace_dir(name: &str) {
 
 // ── Free functions ──────────────────────────────────────────────
 
-/// Switch a user's active workspace to a shared workspace (from workspaces.db).
-/// Returns the `Workspace` on success.
-pub async fn set_workspace(user_name: &str, name: &str) -> Result<Workspace> {
-    let ws = match crate::workspace::get_by_name(name).await {
-        Ok(Some(ws)) => ws,
-        Ok(None) => anyhow::bail!("Workspace '{name}' not found"),
-        Err(e) => anyhow::bail!("Database error looking up workspace '{name}': {e}"),
-    };
-    let user_store = store();
-    user_store.set_workspace(user_name, Some(&ws.name)).await?;
-    Ok(ws)
-}
-
 /// Get the raw `selected_workspace` column value for a user.
 /// Returns `None` if the user has no stored preference (NULL) or if the
 /// user doesn't exist.  Unlike [`get_workspace`], this does NOT synthesize
@@ -545,11 +480,6 @@ pub fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
     ws
 }
 
-/// Set the active role for a user.
-pub async fn set_active_role(user_name: &str, role_name: &str) -> Result<()> {
-    store().set_active_role(user_name, role_name).await
-}
-
 /// Get the active role for a user, if any.
 pub async fn get_active_role(user_name: &str) -> Result<Option<String>> {
     store().get_active_role(user_name).await
@@ -561,17 +491,6 @@ pub async fn resolve_active_role(user_name: &str) -> Role {
         Ok(Some(name)) => name.parse::<Role>().unwrap_or(Role::Analyst),
         _ => Role::Analyst,
     }
-}
-
-/// Check if a user has "full" permissions.
-pub async fn is_full_user(user_name: &str) -> bool {
-    let Some(store) = USER_STORE.get() else {
-        return false;
-    };
-    matches!(
-        store.get_permissions(user_name).await,
-        Ok(Some(p)) if p == "full"
-    )
 }
 
 /// Resolve a channel+identifier pair to the canonical user name.
