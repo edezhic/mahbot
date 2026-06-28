@@ -109,9 +109,11 @@ crate::columns! {
 }
 
 // Column definitions for comment SELECT queries.
-// Note: `id` and `ticket_id` were removed from the SELECT (these fields
-// are dead — never consumed by any production code). The remaining columns
-// are renumbered from 0.
+// Note: `id` and `ticket_id` are intentionally excluded from the column list
+// because they are not consumed by the comment rendering path:
+// - `ticket_id` is already known from the parent ticket query context
+// - `id` is not read by any comment consumer
+// These columns remain in the database schema and are not candidates for removal.
 crate::columns! {
     COMMENT_COLUMNS [COMMENT] {
         ROLE       => "role",
