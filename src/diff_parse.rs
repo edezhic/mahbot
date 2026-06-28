@@ -102,163 +102,139 @@ impl DiffLineKind {
     }
 }
 
-/// Flush the current file (with optional pending hunk) into the files vec.
-fn flush_file(
-    current_file: &mut Option<DiffFile>,
-    current_hunk: &mut Option<DiffHunk>,
-    files: &mut Vec<DiffFile>,
-) {
-    if let Some(mut file) = current_file.take() {
-        if let Some(hunk) = current_hunk.take() {
-            file.hunks.push(hunk);
-        }
-        files.push(file);
-    }
+#[derive(Default)]
+struct DiffParser {
+    files: Vec<DiffFile>,
+    current_file: Option<DiffFile>,
+    current_hunk: Option<DiffHunk>,
+    old_counter: usize,
+    new_counter: usize,
 }
 
-/// Handle a `diff --git` line: flush previous file, reset counters, and create a new file entry.
-fn handle_diff_git_header(
-    line: &str,
-    current_file: &mut Option<DiffFile>,
-    current_hunk: &mut Option<DiffHunk>,
-    files: &mut Vec<DiffFile>,
-    old_counter: &mut usize,
-    new_counter: &mut usize,
-) {
-    flush_file(current_file, current_hunk, files);
-    *old_counter = 0;
-    *new_counter = 0;
+impl DiffParser {
+    /// Flush the current file (with optional pending hunk) into the files vec.
+    fn flush(&mut self) {
+        if let Some(mut file) = self.current_file.take() {
+            if let Some(hunk) = self.current_hunk.take() {
+                file.hunks.push(hunk);
+            }
+            self.files.push(file);
+        }
+    }
 
-    if let Some(path) = parse_diff_git_line(line) {
-        *current_file = Some(DiffFile {
-            path,
-            old_path: None,
-            hunks: Vec::new(),
-            status: DiffFileStatus::Modified,
-            is_binary: false,
-            too_large_size: None,
+    /// Handle a `diff --git` line: flush previous file, reset counters, and create a new file entry.
+    fn handle_diff_git_header(&mut self, line: &str) {
+        self.flush();
+        self.old_counter = 0;
+        self.new_counter = 0;
+
+        if let Some(path) = parse_diff_git_line(line) {
+            self.current_file = Some(DiffFile {
+                path,
+                old_path: None,
+                hunks: Vec::new(),
+                status: DiffFileStatus::Modified,
+                is_binary: false,
+                too_large_size: None,
+            });
+        }
+    }
+
+    /// Handle a `rename from` line: set rename status and parse the old path.
+    /// Falls back to `Modified` status when the rename path is malformed.
+    fn handle_rename_from(&mut self, line: &str) {
+        let Some(f) = self.current_file.as_mut() else {
+            return;
+        };
+
+        f.status = DiffFileStatus::Renamed;
+        let raw = line.strip_prefix("rename from ").unwrap_or("");
+        let Some(old_path) = unquote_c_style(raw) else {
+            warn!(
+                line = %line,
+                "rename from: malformed C-style escape, dropping rename info"
+            );
+            f.status = DiffFileStatus::Modified;
+            return;
+        };
+        f.old_path = Some(old_path);
+    }
+
+    /// Handle a hunk header line (`@@ -old,count +new,count @@`): flush previous hunk,
+    /// parse the header, and set up a new hunk with fresh line counters.
+    fn handle_hunk_header(&mut self, line: &str) {
+        if let Some(hunk) = self.current_hunk.take()
+            && let Some(f) = &mut self.current_file
+        {
+            f.hunks.push(hunk);
+        }
+        let (old_start, new_start) = parse_hunk_header(line);
+        self.old_counter = old_start;
+        self.new_counter = new_start;
+        self.current_hunk = Some(DiffHunk {
+            header: line.to_string(),
+            lines: Vec::new(),
         });
     }
-}
 
-/// Handle a `rename from` line: set rename status and parse the old path.
-/// Falls back to `Modified` status when the rename path is malformed.
-fn handle_rename_from(line: &str, current_file: &mut Option<DiffFile>) {
-    let Some(f) = current_file.as_mut() else {
-        return;
-    };
+    /// Handle a content line within a hunk: classify as Added/Removed/Context, track
+    /// line numbers, and push to the hunk.
+    ///
+    /// Annotation lines (`\ No newline at end of file` or unknown lines) are silently
+    /// skipped — the caller continues normally.
+    fn handle_diff_content_line(&mut self, line: &str) {
+        // If no hunk is active, this line falls outside any diff hunk — skip.
+        let Some(hunk) = self.current_hunk.as_mut() else {
+            return;
+        };
 
-    f.status = DiffFileStatus::Renamed;
-    let raw = line.strip_prefix("rename from ").unwrap_or("");
-    let Some(old_path) = unquote_c_style(raw) else {
-        warn!(
-            line = %line,
-            "rename from: malformed C-style escape, dropping rename info"
-        );
-        f.status = DiffFileStatus::Modified;
-        return;
-    };
-    f.old_path = Some(old_path);
-}
+        let line_kind = if line.starts_with('+') {
+            DiffLineKind::Added
+        } else if line.starts_with('-') {
+            DiffLineKind::Removed
+        } else if line.starts_with(' ') {
+            DiffLineKind::Context
+        } else if line == r"\ No newline at end of file" {
+            // Skip this annotation — handled implicitly
+            return;
+        } else {
+            // Unknown line — skip
+            return;
+        };
 
-/// Handle a hunk header line (`@@ -old,count +new,count @@`): flush previous hunk,
-/// parse the header, and set up a new hunk with fresh line counters.
-fn handle_hunk_header(
-    line: &str,
-    current_file: &mut Option<DiffFile>,
-    current_hunk: &mut Option<DiffHunk>,
-    old_counter: &mut usize,
-    new_counter: &mut usize,
-) {
-    if let Some(hunk) = current_hunk.take()
-        && let Some(f) = current_file
-    {
-        f.hunks.push(hunk);
+        let content = line[1..].trim_end_matches('\r');
+        let (old_num, new_num) = match line_kind {
+            DiffLineKind::Added => {
+                let n = Some(self.new_counter);
+                self.new_counter += 1;
+                (None, n)
+            }
+            DiffLineKind::Removed => {
+                let n = Some(self.old_counter);
+                self.old_counter += 1;
+                (n, None)
+            }
+            DiffLineKind::Context => {
+                let o = Some(self.old_counter);
+                let n = Some(self.new_counter);
+                self.old_counter += 1;
+                self.new_counter += 1;
+                (o, n)
+            }
+        };
+
+        hunk.lines.push(DiffLine {
+            kind: line_kind,
+            old_line_number: old_num,
+            new_line_number: new_num,
+            content: content.to_string(),
+        });
     }
-    let (old_start, new_start) = parse_hunk_header(line);
-    *old_counter = old_start;
-    *new_counter = new_start;
-    *current_hunk = Some(DiffHunk {
-        header: line.to_string(),
-        lines: Vec::new(),
-    });
-}
 
-/// Handle a content line within a hunk: classify as Added/Removed/Context, track
-/// line numbers, and push to the hunk.
-///
-/// Annotation lines (`\ No newline at end of file` or unknown lines) are silently
-/// skipped — the caller continues normally.
-fn handle_diff_content_line(
-    line: &str,
-    hunk: &mut DiffHunk,
-    old_counter: &mut usize,
-    new_counter: &mut usize,
-) {
-    let line_kind = if line.starts_with('+') {
-        DiffLineKind::Added
-    } else if line.starts_with('-') {
-        DiffLineKind::Removed
-    } else if line.starts_with(' ') {
-        DiffLineKind::Context
-    } else if line == r"\ No newline at end of file" {
-        // Skip this annotation — handled implicitly
-        return;
-    } else {
-        // Unknown line — skip
-        return;
-    };
-
-    let content = line[1..].trim_end_matches('\r');
-    let (old_num, new_num) = match line_kind {
-        DiffLineKind::Added => {
-            let n = Some(*new_counter);
-            *new_counter += 1;
-            (None, n)
-        }
-        DiffLineKind::Removed => {
-            let n = Some(*old_counter);
-            *old_counter += 1;
-            (n, None)
-        }
-        DiffLineKind::Context => {
-            let o = Some(*old_counter);
-            let n = Some(*new_counter);
-            *old_counter += 1;
-            *new_counter += 1;
-            (o, n)
-        }
-    };
-
-    hunk.lines.push(DiffLine {
-        kind: line_kind,
-        old_line_number: old_num,
-        new_line_number: new_num,
-        content: content.to_string(),
-    });
-}
-
-/// Parse unified diff output (from `git diff HEAD` or `git show -m`).
-#[must_use]
-pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
-    let mut files: Vec<DiffFile> = Vec::new();
-    let mut current_file: Option<DiffFile> = None;
-    let mut current_hunk: Option<DiffHunk> = None;
-
-    // Track old/new line counters for line number assignment
-    let mut old_counter: usize = 0;
-    let mut new_counter: usize = 0;
-
-    for line in diff_output.lines() {
+    /// Process a single line from the diff output.
+    fn process_line(&mut self, line: &str) {
         if line.starts_with("diff --git ") {
-            handle_diff_git_header(
-                line,
-                &mut current_file,
-                &mut current_hunk,
-                &mut files,
-                &mut old_counter,
-                &mut new_counter,
-            );
+            self.handle_diff_git_header(line);
         } else if line.starts_with("index ")
             || line.starts_with("new file mode ")
             || line.starts_with("deleted file mode ")
@@ -267,8 +243,7 @@ pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
         {
             // Metadata lines — currently just skip
         } else if line.starts_with("--- ") || line.starts_with("+++ ") {
-            // File markers
-            if let Some(ref mut f) = current_file {
+            if let Some(ref mut f) = self.current_file {
                 if line.starts_with("--- /dev/null") && f.status != DiffFileStatus::Renamed {
                     f.status = DiffFileStatus::Added;
                 } else if line.starts_with("+++ /dev/null") && f.status != DiffFileStatus::Renamed {
@@ -276,30 +251,30 @@ pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
                 }
             }
         } else if line.starts_with("rename from ") {
-            handle_rename_from(line, &mut current_file);
+            self.handle_rename_from(line);
         } else if line.starts_with("rename to ") {
             // The path is already captured from diff --git; status already set at rename from.
         } else if line.starts_with("Binary files ") {
-            if let Some(ref mut f) = current_file {
+            if let Some(ref mut f) = self.current_file {
                 f.is_binary = true;
             }
         } else if line.starts_with("@@") {
-            handle_hunk_header(
-                line,
-                &mut current_file,
-                &mut current_hunk,
-                &mut old_counter,
-                &mut new_counter,
-            );
-        } else if let Some(hunk) = &mut current_hunk {
-            handle_diff_content_line(line, hunk, &mut old_counter, &mut new_counter);
+            self.handle_hunk_header(line);
+        } else {
+            self.handle_diff_content_line(line);
         }
     }
+}
 
-    // Flush final file + hunk
-    flush_file(&mut current_file, &mut current_hunk, &mut files);
-
-    files
+/// Parse unified diff output (from `git diff HEAD` or `git show -m`).
+#[must_use]
+pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
+    let mut parser = DiffParser::default();
+    for line in diff_output.lines() {
+        parser.process_line(line);
+    }
+    parser.flush();
+    parser.files
 }
 
 /// Create a [`DiffFile`] for an untracked file (showing all lines as added).
