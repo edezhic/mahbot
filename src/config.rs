@@ -1035,110 +1035,16 @@ mod tests {
         assert_eq!(ConfigData::default(), ConfigData::STRUCT_FIELDS_DEFAULT);
     }
 
-    /// Verify that [`RoleConfig::normalize`] collapses empty and whitespace-only
-    /// optional string fields to `None`, and preserves non-empty values.
-    #[test]
-    fn role_config_normalize() {
-        // Non-empty values are preserved.
-        let mut rc = RoleConfig {
-            role: "engineer".into(),
-            model: Some("gpt-4".into()),
-            reasoning_effort: Some("high".into()),
-        };
-        rc.normalize();
-        assert_eq!(rc.model, Some("gpt-4".into()));
-        assert_eq!(rc.reasoning_effort, Some("high".into()));
-
-        // Empty string → None.
-        let mut rc = RoleConfig {
-            role: "engineer".into(),
-            model: Some(String::new()),
-            reasoning_effort: Some(String::new()),
-        };
-        rc.normalize();
-        assert_eq!(rc.model, None);
-        assert_eq!(rc.reasoning_effort, None);
-
-        // Whitespace-only → None.
-        let mut rc = RoleConfig {
-            role: "engineer".into(),
-            model: Some("   ".into()),
-            reasoning_effort: Some("  ".into()),
-        };
-        rc.normalize();
-        assert_eq!(rc.model, None);
-        assert_eq!(rc.reasoning_effort, None);
-
-        // Trimming preserves non-empty with whitespace.
-        let mut rc = RoleConfig {
-            role: "engineer".into(),
-            model: Some("  gpt-4  ".into()),
-            reasoning_effort: Some("  high  ".into()),
-        };
-        rc.normalize();
-        assert_eq!(rc.model, Some("gpt-4".into()));
-        assert_eq!(rc.reasoning_effort, Some("high".into()));
-
-        // Already None stays None.
-        let mut rc = RoleConfig {
-            role: "engineer".into(),
-            model: None,
-            reasoning_effort: None,
-        };
-        rc.normalize();
-        assert_eq!(rc.model, None);
-        assert_eq!(rc.reasoning_effort, None);
-    }
-
-    /// Verify that [`ModelRouting::normalize`] collapses empty and whitespace-only
-    /// `provider_order` to `None`.
-    #[test]
-    fn model_routing_normalize() {
-        // Non-empty value is preserved.
-        let mut mr = ModelRouting {
-            model: "gpt-4".into(),
-            provider_order: Some("OpenAi".into()),
-            allow_fallbacks: None,
-        };
-        mr.normalize();
-        assert_eq!(mr.provider_order, Some("OpenAi".into()));
-
-        // Empty string → None.
-        let mut mr = ModelRouting {
-            model: "gpt-4".into(),
-            provider_order: Some(String::new()),
-            allow_fallbacks: None,
-        };
-        mr.normalize();
-        assert_eq!(mr.provider_order, None);
-
-        // Whitespace-only → None.
-        let mut mr = ModelRouting {
-            model: "gpt-4".into(),
-            provider_order: Some("   ".into()),
-            allow_fallbacks: None,
-        };
-        mr.normalize();
-        assert_eq!(mr.provider_order, None);
-
-        // Trimming preserves non-empty with whitespace.
-        let mut mr = ModelRouting {
-            model: "gpt-4".into(),
-            provider_order: Some("  OpenAi  ".into()),
-            allow_fallbacks: None,
-        };
-        mr.normalize();
-        assert_eq!(mr.provider_order, Some("OpenAi".into()));
-
-        // Already None stays None.
-        let mut mr = ModelRouting {
-            model: "gpt-4".into(),
-            provider_order: None,
-            allow_fallbacks: None,
-        };
-        mr.normalize();
-        assert_eq!(mr.provider_order, None);
-    }
+    // NOTE: Per-struct normalize tests (`role_config_normalize`,
+    // `model_routing_normalize`) have been intentionally removed as
+    // redundant.  Both `normalize()` methods are one-line delegations to
+    // `non_empty()` with no conditional logic.  The `non_empty` / `trimmed_or_none`
+    // primitive is covered exhaustively by `trimmed_or_none_trims_whitespace`
+    // above, and the end-to-end integration through `normalize_entries()` is
+    // covered by `normalize_entries_works` below.  If a new normalization
+    // scenario is added, it should be added to the primitive test AND
+    // exercised through the integration test — there is no need for
+    // per-struct test duplication.
 
     /// Verify that [`ConfigData::normalize_entries`] applies `normalize()` to
     /// every entry in `per_role_configs` and `model_routings`.
