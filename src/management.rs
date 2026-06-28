@@ -20,6 +20,7 @@
 //! bounce back to ReadyForDevelopment; clean files proceed to Done via commit.
 
 use std::fmt::Write;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -688,6 +689,36 @@ async fn for_tickets_in_phase(phase: TicketPhase, ws_name: &str, mut action: imp
     }
 }
 
+/// Spawn background tasks for each ticket in the given phase.
+///
+/// Wraps [`for_tickets_in_phase`] with a `tokio::spawn` for each ticket, so
+/// each ticket is processed concurrently and independently. The ticket stays
+/// in its current phase until processing completes — transient failures cause
+/// a re-dispatch on the next poll cycle rather than a transition to `Failed`.
+///
+/// Raw `tokio::spawn` is used here instead of `spawn_dispatch` because:
+/// - There is no claim transition — the ticket stays in its phase until the
+///   operation succeeds, so transient failures are harmless (re-dispatched
+///   on the next poll cycle).
+/// - `spawn_dispatch`'s panic-recovery moves tickets to `Failed`, but the
+///   correct behavior here is to stay in the current phase for retry.
+/// - No `Arc` wrapping is needed because `Ticket` is moved by value into
+///   the spawned task.
+async fn spawn_for_each_ticket_in_phase<F, Fut>(phase: TicketPhase, ws: &Workspace, f: F)
+where
+    F: Fn(Ticket, Workspace) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    for_tickets_in_phase(phase, &ws.name, |ticket| {
+        let f = f.clone();
+        let ws = ws.clone();
+        tokio::spawn(async move {
+            f(ticket, ws).await;
+        });
+    })
+    .await;
+}
+
 /// Dispatch unassigned tickets in the given phase.
 ///
 /// Both DiagnosticsCheck and SanitationCheck use this pattern because the
@@ -786,11 +817,8 @@ async fn poll_round() -> anyhow::Result<()> {
         // After the sanitation agent approves, the ticket reaches SanitationPassed.
         // We commit the changes and transition to Done, following the same pattern
         // as the QaPassed→Done commit flow.
-        for_tickets_in_phase(TicketPhase::SanitationPassed, &ws.name, |ticket| {
-            let ws = ws.clone();
-            tokio::spawn(async move {
-                finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed).await;
-            });
+        spawn_for_each_ticket_in_phase(TicketPhase::SanitationPassed, ws, |ticket, ws| {
+            finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed)
         })
         .await;
 
@@ -803,11 +831,8 @@ async fn poll_round() -> anyhow::Result<()> {
         // Spawned via tokio::spawn to prevent git operations from blocking the poll loop.
         // The ticket stays in QaPassed until either the claim or the commit succeeds,
         // so re-dispatch is harmless.
-        for_tickets_in_phase(TicketPhase::QaPassed, &ws.name, |ticket| {
-            let ws = ws.clone();
-            tokio::spawn(async move {
-                handle_qa_passed(ticket, ws).await;
-            });
+        spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, ws, |ticket, ws| {
+            handle_qa_passed(ticket, ws)
         })
         .await;
 
@@ -903,18 +928,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         );
     }
 }
-
-// ── QA to Done (auto-commit) ───────────────────────────────────────────
-//
-// NOTE: finalize_ticket_from_phase takes `Ticket` by value. It is called
-// from `poll_round` via `tokio::spawn` (not `spawn_dispatch`) because:
-// - There is no claim transition — the ticket stays in QaPassed until
-//   commit succeeds, so transient failures are harmless (re-dispatched
-//   next poll cycle).
-// - spawn_dispatch's panic-recovery moves tickets to Failed, but the
-//   correct behavior here is to stay in QaPassed for retry.
-// - No Arc wrapping is needed because `Ticket` is moved by value into
-//   the spawned task.
 
 /// Determine whether to notify immediately or buffer the Done transition.
 ///
