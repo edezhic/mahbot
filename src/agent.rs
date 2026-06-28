@@ -246,8 +246,7 @@ impl Agent {
                 let (mut display_text, tool_calls, history_content) = match self.llm_call().await {
                     Ok(resp) => prepare_assistant_turn(resp),
                     Err(e) => {
-                        tracing::error!(iteration = iteration, error = %e, "LLM step failed");
-                        return Err(e);
+                        return Err(e.context(format!("LLM step failed at iteration {iteration}")));
                     }
                 };
 
