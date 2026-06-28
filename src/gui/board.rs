@@ -765,11 +765,13 @@ impl BoardState {
             if self.selected_loading {
                 let dialog = container(
                     column![
-                        text("Loading details...").size(16).color(theme::TEXT_MUTED),
+                        text("Loading details...")
+                            .size(16)
+                            .color(theme::TEXT_SECONDARY),
                         Space::new().height(12),
                         text("Fetching ticket information\u{2026}")
                             .size(13)
-                            .color(theme::TEXT_MUTED),
+                            .color(theme::TEXT_SECONDARY),
                     ]
                     .align_x(Alignment::Center),
                 )
