@@ -754,7 +754,7 @@ mod tests {
             ("!@#$%", ""),
         ];
         for (input, expected) in cases {
-            assert_eq!(sanitize_fts_query(input), expected, "input: {input:?}",);
+            assert_eq!(sanitize_fts_query(input), expected, "input: {input:?}");
         }
     }
 

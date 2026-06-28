@@ -2680,9 +2680,11 @@ mod tests {
     /// Idempotent across concurrent tests — all globals use OnceCell/OnceLock
     /// guards, so duplicate initialization is a harmless no-op.
     async fn init_management_test_stores() {
-        init_test_stores().await;
         // Ticket buffer — OnceLock ensures exactly-once initialization.
         static TICKET_BUF_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+        init_test_stores().await;
+
         TICKET_BUF_INIT.get_or_init(|| {
             crate::ticket_buffer::init_global();
         });
@@ -3144,9 +3146,8 @@ D  deleted.rs
     /// - All passed (Reviewer) → Reviewed
     /// - All passed (QA) → QaPassed
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn process_verdict_results_cases() {
-        init_management_test_stores().await;
-
         struct Case {
             name: &'static str,
             ws_suffix: &'static str,
@@ -3157,6 +3158,8 @@ D  deleted.rs
             expected_status: TicketPhase,
             expected_pipeline_reservation: bool,
         }
+
+        init_management_test_stores().await;
 
         let cases = vec![
             Case {
@@ -3287,8 +3290,6 @@ D  deleted.rs
     /// - `= CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → does NOT trip
     #[tokio::test]
     async fn circuit_breaker_comment_boundary() {
-        init_management_test_stores().await;
-
         struct Case {
             name: &'static str,
             ws_suffix: &'static str,
@@ -3297,6 +3298,8 @@ D  deleted.rs
             expected_trip: bool,
             expected_status: TicketPhase,
         }
+
+        init_management_test_stores().await;
 
         let cases = [
             Case {
@@ -3443,9 +3446,8 @@ D  deleted.rs
     /// - Partial fail → Planning with "blockers" summary
     /// - No verdicts → Planning with "no analysis" summary
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn handle_analyst_verdicts_cases() {
-        init_management_test_stores().await;
-
         struct Case {
             name: &'static str,
             ws_suffix: &'static str,
@@ -3453,6 +3455,8 @@ D  deleted.rs
             results: Vec<ParallelVerdict>,
             expected_comment_substring: &'static str,
         }
+
+        init_management_test_stores().await;
 
         let cases = vec![
             Case {

@@ -2361,7 +2361,7 @@ mod tests {
     fn make_file_with_hunks(path: &str, num_hunks: usize, lines_per_hunk: usize) -> DiffFile {
         let hunks = (0..num_hunks)
             .map(|_i| crate::diff_parse::DiffHunk {
-                header: format!("@@ -1,{} +1,{} @@", lines_per_hunk, lines_per_hunk),
+                header: format!("@@ -1,{lines_per_hunk} +1,{lines_per_hunk} @@"),
                 lines: (0..lines_per_hunk)
                     .map(|_| crate::diff_parse::DiffLine {
                         kind: crate::diff_parse::DiffLineKind::Added,
