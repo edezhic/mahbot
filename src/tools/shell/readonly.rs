@@ -879,6 +879,31 @@ mod tests {
         allowed: bool,
     }
 
+    /// Assert each case in a table-driven test.
+    fn run_cases(cases: &[Case]) {
+        for case in cases {
+            if case.allowed {
+                ok(case.command);
+            } else {
+                assert_rejected(case.command);
+            }
+        }
+    }
+
+    /// Assert all items in `items` are rejected when formatted with `template`.
+    fn assert_all_rejected(items: &[&str], template: impl Fn(&str) -> String) {
+        for &item in items {
+            assert_rejected(&template(item));
+        }
+    }
+
+    /// Assert all items in `items` are allowed when formatted with `template`.
+    fn assert_all_allowed(items: &[&str], template: impl Fn(&str) -> String) {
+        for &item in items {
+            ok(&template(item));
+        }
+    }
+
     // ── Empty / whitespace ──────────────────────────────────────────
 
     #[test]
@@ -898,13 +923,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Git allowlist ──────────────────────────────────────────────
@@ -914,9 +933,7 @@ mod tests {
     /// when entries are added or removed.
     #[test]
     fn all_git_safe_subcommands_allowed() {
-        for subcmd in GIT_SAFE_SUBCOMMANDS {
-            ok(&format!("git {subcmd}"));
-        }
+        assert_all_allowed(GIT_SAFE_SUBCOMMANDS, |subcmd| format!("git {subcmd}"));
     }
 
     #[test]
@@ -948,13 +965,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Git --bare flag (regression: was skipped as a git global flag) ─
@@ -988,13 +999,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Cargo allowlist ────────────────────────────────────────────
@@ -1042,13 +1047,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Unconditional rejections ──────────────────────────────────
@@ -1058,36 +1057,32 @@ mod tests {
     /// when entries are added or removed.
     #[test]
     fn all_mutating_commands_rejected() {
-        for cmd in MUTATING_COMMANDS {
-            assert_rejected(&format!("{cmd} arg"));
-        }
+        assert_all_rejected(MUTATING_COMMANDS, |cmd| format!("{cmd} arg"));
     }
 
     /// Tests that all git branch mutation flags are rejected via
     /// [`check_git_subcommand_mutation`].
     #[test]
     fn git_branch_mutation_flags_rejected() {
-        for flag in GIT_BRANCH_MUTATIONS {
-            assert_rejected(&format!("git branch {flag} feature"));
-        }
+        assert_all_rejected(GIT_BRANCH_MUTATIONS, |flag| {
+            format!("git branch {flag} feature")
+        });
     }
 
     /// Tests that all git tag mutation flags are rejected via
     /// [`check_git_subcommand_mutation`].
     #[test]
     fn git_tag_mutation_flags_rejected() {
-        for flag in GIT_TAG_MUTATIONS {
-            assert_rejected(&format!("git tag {flag} v1.0"));
-        }
+        assert_all_rejected(GIT_TAG_MUTATIONS, |flag| format!("git tag {flag} v1.0"));
     }
 
     /// Tests that all git remote mutation verbs are rejected via
     /// [`check_git_subcommand_mutation`].
     #[test]
     fn git_remote_mutation_verbs_rejected() {
-        for verb in GIT_REMOTE_MUTATIONS {
-            assert_rejected(&format!("git remote {verb} origin"));
-        }
+        assert_all_rejected(GIT_REMOTE_MUTATIONS, |verb| {
+            format!("git remote {verb} origin")
+        });
     }
 
     // ── Flag-dependent tests ──────────────────────────────────────
@@ -1171,13 +1166,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Chained commands ───────────────────────────────────────────
@@ -1207,13 +1196,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Redirect tests ─────────────────────────────────────────────
@@ -1306,13 +1289,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── mktemp (temp dir, allowed) ────────────────────────────────
@@ -1330,13 +1307,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Prefix stripping (P0) ──────────────────────────────────────
@@ -1443,13 +1414,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── Script interpreters & container tools: read-only usage (not blocked) ─
@@ -1485,13 +1450,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     // ── extract_git_subcommand unit tests ──────────────────────────
@@ -1637,13 +1596,7 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            if case.allowed {
-                ok(case.command);
-            } else {
-                assert_rejected(case.command);
-            }
-        }
+        run_cases(&cases);
     }
 
     #[test]
