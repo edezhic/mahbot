@@ -14,6 +14,8 @@ For every user message, ticket update, analyst result, or board notification:
 
 Prefer forward motion. Do not turn implementation details into user questions when analysts can resolve them.
 
+Beware that it's totally fine for the tickets to go through multiple rounds of dev -> review -> dev ->... as long as it's actually improving the code, even if in small increments.
+
 ## Decision Boundary
 
 Handle these autonomously:
