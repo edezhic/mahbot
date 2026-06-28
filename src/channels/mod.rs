@@ -1,5 +1,6 @@
 pub mod gui;
 pub mod telegram;
+use crate::chat_history::ChatHistoryInsert;
 use crate::tools::browser::BrowserTool;
 use crate::turso;
 use crate::util::MEDIA_MARKER_RE;
@@ -14,7 +15,7 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 
 /// Entry for a single chat message that should be both broadcast to the GUI
 /// dashboard and persisted to chat_history. Fields map directly to the
-/// [`crate::ChatEvent::Message`] and [`crate::chat_history::ChatHistoryStore::insert`] parameters.
+/// [`crate::ChatEvent::Message`] and [`ChatHistoryInsert`] parameters.
 #[derive(Debug, Clone)]
 struct BroadcastPersistEntry {
     user_name: String,
@@ -63,17 +64,17 @@ impl BroadcastPersistEntry {
 
         let store = crate::chat_history::store();
         let _ = store
-            .insert(
-                &message_id,
-                &self.user_name,
-                &self.channel_name,
-                db_role,
-                db_direction,
-                &self.content,
-                self.agent_role.as_deref(),
-                &self.workspace,
-                &timestamp,
-            )
+            .insert(&ChatHistoryInsert {
+                message_id: message_id.clone(),
+                user_name: self.user_name.clone(),
+                channel: self.channel_name.clone(),
+                role: db_role.to_string(),
+                direction: db_direction.to_string(),
+                content: self.content.clone(),
+                agent_role: self.agent_role.clone(),
+                workspace: self.workspace.clone(),
+                created_at: timestamp.clone(),
+            })
             .await;
     }
 }

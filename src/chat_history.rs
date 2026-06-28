@@ -35,6 +35,24 @@ CREATE INDEX IF NOT EXISTS idx_chat_history_channel ON chat_history(channel, cre
 CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);
 ";
 
+/// Parameters for inserting a chat history entry.
+///
+/// This struct bundles the 9 fields needed by [`ChatHistoryStore::insert`],
+/// replacing the previous positional-parameter signature. Owned `String` fields
+/// match the pattern established by [`LogEntry`](crate::logs::LogEntry).
+#[derive(Debug, Clone)]
+pub struct ChatHistoryInsert {
+    pub message_id: String,
+    pub user_name: String,
+    pub channel: String,
+    pub role: String,
+    pub direction: String,
+    pub content: String,
+    pub agent_role: Option<String>,
+    pub workspace: String,
+    pub created_at: String,
+}
+
 /// A single chat message record for history display.
 #[derive(Debug, Clone)]
 pub struct ChatHistoryEntry {
@@ -82,19 +100,7 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
 impl ChatHistoryStore {
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
     /// Silently ignores duplicate `message_id` values (UPSERT no-op).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert(
-        &self,
-        message_id: &str,
-        user_name: &str,
-        channel: &str,
-        role: &str,
-        direction: &str,
-        content: &str,
-        agent_role: Option<&str>,
-        workspace: &str,
-        created_at: &str,
-    ) -> Result<()> {
+    pub async fn insert(&self, entry: &ChatHistoryInsert) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO chat_history \
@@ -102,8 +108,15 @@ impl ChatHistoryStore {
                   content, agent_role, workspace, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 turso::params![
-                    message_id, user_name, channel, role, direction, content, agent_role,
-                    workspace, created_at,
+                    entry.message_id.clone(),
+                    entry.user_name.clone(),
+                    entry.channel.clone(),
+                    entry.role.clone(),
+                    entry.direction.clone(),
+                    entry.content.clone(),
+                    entry.agent_role.clone(),
+                    entry.workspace.clone(),
+                    entry.created_at.clone(),
                 ],
             )
             .await?;
@@ -220,9 +233,17 @@ mod tests {
 
         // Verify basic insert and load work.
         store
-            .insert(
-                "msg-1", "user", "test", "user", "user", "hello", None, "ws", "now",
-            )
+            .insert(&ChatHistoryInsert {
+                message_id: "msg-1".to_string(),
+                user_name: "user".to_string(),
+                channel: "test".to_string(),
+                role: "user".to_string(),
+                direction: "user".to_string(),
+                content: "hello".to_string(),
+                agent_role: None,
+                workspace: "ws".to_string(),
+                created_at: "now".to_string(),
+            })
             .await
             .expect("insert should succeed");
         let history = store
