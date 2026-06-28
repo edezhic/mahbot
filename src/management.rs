@@ -430,7 +430,7 @@ pub async fn run_management() {
 /// notification so the manager can investigate.
 fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let phase_info = phase.info();
-    let target_phase = phase_info.claim_target;
+    let active_phase = phase_info.active_phase;
 
     info!(
         ticket = %ticket.id,
@@ -484,7 +484,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                 .await;
             if let Err(e) = transition_ticket(
                 &ticket_for_failure,
-                target_phase,
+                active_phase,
                 TicketPhase::Failed,
                 NotifyPolicy::Notify,
                 None,
@@ -542,7 +542,7 @@ const QA_VI: VerifierInfo = VerifierInfo {
 /// match — adding any phase requires one row in that match.
 #[derive(Copy, Clone)]
 struct PollPhaseInfo {
-    claim_target: TicketPhase,
+    active_phase: TicketPhase,
     /// Whether this phase requires a clear pipeline (only one ticket at a
     /// time through development → review → QA).
     require_clear_pipeline: bool,
@@ -569,19 +569,19 @@ impl PollPhase {
     fn info(self) -> PollPhaseInfo {
         match self {
             Self::BacklogAnalysis => PollPhaseInfo {
-                claim_target: TicketPhase::Analysis,
+                active_phase: TicketPhase::Analysis,
                 require_clear_pipeline: false,
                 role_label: Role::Analyst.as_str(),
             },
             Self::EngineerDevelopment => PollPhaseInfo {
-                claim_target: TicketPhase::InDevelopment,
+                active_phase: TicketPhase::InDevelopment,
                 require_clear_pipeline: true,
                 role_label: Role::Engineer.as_str(),
             },
             Self::SanitationCheck => PollPhaseInfo {
-                claim_target: TicketPhase::InSanitation,
-                // Note: claim_target is consumed by spawn_dispatch's
-                // panic-recovery transition (target_phase → Failed).
+                active_phase: TicketPhase::InSanitation,
+                // Note: active_phase is consumed by spawn_dispatch's
+                // panic-recovery transition (active_phase → Failed).
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
                 // raw SQL in handle_qa_passed.
@@ -589,12 +589,12 @@ impl PollPhase {
                 role_label: Role::Sanitation.as_str(),
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
-                claim_target: TicketPhase::InDiagnostics,
+                active_phase: TicketPhase::InDiagnostics,
                 require_clear_pipeline: false,
                 role_label: DIAGNOSTICS_ROLE,
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
-                claim_target: vi.active_phase,
+                active_phase: vi.active_phase,
                 require_clear_pipeline: false,
                 role_label: vi.role.as_str(),
             },
@@ -602,7 +602,7 @@ impl PollPhase {
     }
 }
 
-/// Pipeline phases that use atomic source→claim_target claim transitions.
+/// Pipeline phases that use atomic source→active_phase claim transitions.
 ///
 /// Each tuple is `(source_phase, poll_phase)` — the `source_phase` is the
 /// expected current phase of the ticket before claiming, and `poll_phase`
@@ -711,7 +711,7 @@ async fn poll_round() -> anyhow::Result<()> {
             let ticket = match board
                 .claim_ticket_in_workspace(
                     source,
-                    info.claim_target,
+                    info.active_phase,
                     &ws.name,
                     info.require_clear_pipeline,
                 )
@@ -719,7 +719,7 @@ async fn poll_round() -> anyhow::Result<()> {
             {
                 Ok(Some(t)) => {
                     // Buffer the claim transition. The returned ticket already
-                    // has status = info.claim_target (from SQL RETURNING), so record
+                    // has status = info.active_phase (from SQL RETURNING), so record
                     // the transition from source.
                     ticket_buffer::push(&ws.name, &t.id, source, t.status);
                     t
