@@ -2028,7 +2028,19 @@ impl Dashboard {
             } else {
                 Some(Message::Navigation(*page))
             });
-            nav_col = nav_col.push(btn);
+            let tooltip_text = if disabled {
+                format!("Select a workspace to access {}", page.label())
+            } else {
+                page.label().to_string()
+            };
+            // Sidebar nav buttons use Position::Right to avoid clipping off the left edge
+            // of the 56px-wide sidebar container — Position::Top would overflow the narrow
+            // column. The adjacent maintainer/pause toggles below use Position::Top because
+            // they are positioned below the spacer and have more vertical room before
+            // reaching the sidebar top edge.
+            let nav_btn = tooltip(btn, text(tooltip_text).size(11), tooltip::Position::Right)
+                .style(theme::tooltip_style);
+            nav_col = nav_col.push(nav_btn);
         }
 
         // Spacer to push buttons to the bottom of the sidebar
@@ -2159,7 +2171,20 @@ impl Dashboard {
                 } else {
                     Some(Message::UpdateBot)
                 });
-            left_icons.push(update_btn.into());
+            let update_tooltip = if self.updating {
+                "Updating…"
+            } else {
+                "Update MahBot"
+            };
+            left_icons.push(
+                tooltip(
+                    update_btn,
+                    text(update_tooltip).size(11),
+                    tooltip::Position::Top,
+                )
+                .style(theme::tooltip_style)
+                .into(),
+            );
         }
 
         for page in Page::footer_pages() {
@@ -2188,7 +2213,11 @@ impl Dashboard {
                 .style(theme::button_text)
                 .padding(3)
                 .on_press(Message::Navigation(*page));
-            left_icons.push(btn.into());
+            left_icons.push(
+                tooltip(btn, text(page.label()).size(11), tooltip::Position::Top)
+                    .style(theme::tooltip_style)
+                    .into(),
+            );
         }
 
         // Git blocks — branch, sync, diff — after Settings,
