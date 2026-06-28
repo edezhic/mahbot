@@ -392,7 +392,6 @@ impl BoardState {
             }
             BoardMessage::ActionResult(Err(e)) => {
                 self.action_loading = None;
-                self.load_state.fail(e.clone());
                 Task::done(BoardMessage::Toast(super::ToastMessage::Error(e)))
             }
             BoardMessage::ToggleCommentExpand(i) => {
