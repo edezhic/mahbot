@@ -212,8 +212,11 @@ async fn dispatch_notification(
 ///
 /// Returns `Ok(())` if the transition was applied (ticket was still in expected
 /// phase). Returns `Err(String)` with a descriptive message if the ticket was
-/// moved externally or an error occurred. On failure, clears `assigned_to` so
-/// the poll loop can re-dispatch if needed.
+/// moved externally (phase mismatch) **or** a DB error occurred. On failure,
+/// does **not** clear `assigned_to` — doing so would either steal the new
+/// owner's assignment (phase mismatch) or orphan the ticket (DB error), and
+/// [`BoardStore::transition_to`] already handles agent cancellation on the
+/// success path.
 ///
 /// The `pipeline_reservation` parameter is forwarded to
 /// [`BoardStore::transition_to`]: pass `Some(true)` for bounce-back transitions
@@ -248,7 +251,6 @@ async fn transition_ticket(
                 error = %e,
                 "Failed to update ticket status",
             );
-            let _ = board().set_assigned_to(&ticket.id, None).await;
             Err(e.to_string())
         }
     }
