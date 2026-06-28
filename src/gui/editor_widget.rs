@@ -551,6 +551,18 @@ impl EditorBuffer {
         }
     }
 
+    /// Clamp the selection range to valid line boundaries.
+    /// Returns `None` when the start line is past the end of the buffer.
+    fn clamped_selection_range(&self) -> Option<(usize, usize, usize, usize)> {
+        let (sl, sc, el, ec) = self.selection_range();
+        let line_count = self.line_count();
+        if sl >= line_count {
+            return None;
+        }
+        let el = el.min(line_count.saturating_sub(1));
+        Some((sl, sc, el, ec))
+    }
+
     /// Delete the currently selected text and return the byte range that
     /// was removed. If there is no selection, returns `None`.
     fn delete_selection_get_range(&self) -> Option<(usize, usize)> {
@@ -763,12 +775,9 @@ impl EditorBuffer {
     fn do_indent(&self) {
         if self.has_selection.get() {
             // Multi-line indent: prepend a tab to each line in the selection.
-            let (sl, sc, el, ec) = self.selection_range();
-            let line_count = self.line_count();
-            if sl >= line_count {
+            let Some((sl, _sc, el, _ec)) = self.clamped_selection_range() else {
                 return;
-            }
-            let el = el.min(line_count.saturating_sub(1));
+            };
 
             self.edit_text(|text| {
                 let mut new_text = text.to_string();
@@ -794,7 +803,6 @@ impl EditorBuffer {
                     self.sel_col.set(anchor_col + 1);
                 }
             }
-            let _ = (sc, ec); // columns adjusted uniformly; range endpoints stay valid
         } else {
             let offset = line_col_to_byte_offset(
                 &self.text(),
@@ -816,12 +824,9 @@ impl EditorBuffer {
     /// line in the selection.
     fn do_unindent(&self) {
         if self.has_selection.get() {
-            let (sl, sc, el, ec) = self.selection_range();
-            let line_count = self.line_count();
-            if sl >= line_count {
+            let Some((sl, _sc, el, _ec)) = self.clamped_selection_range() else {
                 return;
-            }
-            let el = el.min(line_count.saturating_sub(1));
+            };
 
             let mut modified_lines: Vec<usize> = Vec::new();
             self.edit_text(|text| {
@@ -862,7 +867,6 @@ impl EditorBuffer {
                 self.sel_col
                     .set(adjust_col(anchor_line, self.sel_col.get()));
             }
-            let _ = (sc, ec);
         } else {
             let cl = self.cursor_line.get();
             let line_text = self
@@ -1152,20 +1156,18 @@ impl EditorBuffer {
             return; // No comment syntax for this language.
         };
 
-        // Determine which lines to operate on.
+        // Determine which lines to operate on.  The no-selection path uses the
+        // cursor line (already clamped by set_cursor_pos), so only the
+        // selection path needs explicit clamping.
         let (start_line, end_line) = if self.has_selection.get() {
-            let (sl, _sc, el, _ec) = self.selection_range();
+            let Some((sl, _sc, el, _ec)) = self.clamped_selection_range() else {
+                return;
+            };
             (sl, el)
         } else {
             let line = self.cursor_line.get();
             (line, line)
         };
-
-        let line_count = self.line_count();
-        if start_line >= line_count {
-            return;
-        }
-        let end_line = end_line.min(line_count.saturating_sub(1));
 
         let text = self.text();
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
