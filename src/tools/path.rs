@@ -258,11 +258,13 @@ fn is_mahbot_spill_shaped(path: &Path) -> bool {
         == Some(".agent")
 }
 
-/// Whether `path` is a mahbot spill file written under `$TEMP/.agent/`.
-fn is_mahbot_spill_file(path: &Path) -> bool {
-    if !is_mahbot_spill_shaped(path) {
-        return false;
-    }
+/// Whether the grandparent directory of `path` is an OS temp/scratch root.
+///
+/// This is the "on OS temp" half of the spill-file check: for a spill path
+/// like `/tmp/.agent/spill_ab12.txt`, the grandparent is `/tmp/`, which is
+/// an OS temp root.  The shape check (`.agent` parent + spill filename) is
+/// separate — see [`is_mahbot_spill_shaped`].
+fn is_grandparent_temp_root(path: &Path) -> bool {
     path.parent()
         .and_then(|p| p.parent())
         .is_some_and(is_os_temp_root)
@@ -275,12 +277,15 @@ fn is_mahbot_spill_file(path: &Path) -> bool {
 /// dependency caches, SDK headers, etc.).
 fn check_path_read_allowed(path: &str, workspace_root: &Path) -> anyhow::Result<()> {
     let path_buf = Path::new(path);
-    if is_mahbot_spill_shaped(path_buf) && !is_mahbot_spill_file(path_buf) {
+    let spill_shaped = is_mahbot_spill_shaped(path_buf);
+    let spill_on_temp = spill_shaped && is_grandparent_temp_root(path_buf);
+
+    if spill_shaped && !spill_on_temp {
         anyhow::bail!("Path not allowed by security policy: {path}");
     }
     if !is_path_safe_for_workspace(path, workspace_root)
         && !is_path_in_extra_allowed(path_buf)
-        && !is_mahbot_spill_file(path_buf)
+        && !spill_on_temp
     {
         anyhow::bail!("Path not allowed by security policy: {path}");
     }
