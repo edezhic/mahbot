@@ -162,6 +162,33 @@ enum NotifyPolicy {
     Buffer,
 }
 
+/// Dispatch a ticket transition notification, either immediately or buffered.
+///
+/// Called after a successful transition to handle the notification side-effect.
+/// `source` is the phase the ticket transitioned *from* (used for the buffer
+/// entry — given as an explicit parameter because the two callers have
+/// different sources: [`transition_ticket`] passes its `expected` parameter,
+/// while [`commit_and_transition_ticket_from`] passes its own `source`).
+///
+/// The `context` string is forwarded to [`resolve_ticket_workspace`] to
+/// distinguish callers in log messages.
+async fn dispatch_notification(
+    ticket: &Ticket,
+    target: TicketPhase,
+    source: TicketPhase,
+    notify: NotifyPolicy,
+    context: &'static str,
+) {
+    match notify {
+        NotifyPolicy::Notify => notify_ticket(ticket, target).await,
+        NotifyPolicy::Buffer => {
+            if let Some(ws) = resolve_ticket_workspace(ticket, context).await {
+                ticket_buffer::push(&ws.name, &ticket.id, source, target);
+            }
+        }
+    }
+}
+
 /// Transition a ticket to `target` phase if it's still in `expected` phase.
 ///
 /// Returns `Ok(())` if the transition was applied (ticket was still in expected
@@ -174,7 +201,8 @@ enum NotifyPolicy {
 /// (back to [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets
 /// priority re-dispatch over fresh tickets, or `None` for all other transitions.
 ///
-/// If `notify` is [`NotifyPolicy::Notify`], calls [`notify_ticket`] on success;
+/// If `notify` is [`NotifyPolicy::Notify`], delegates to [`dispatch_notification`]
+/// on success (which may enqueue a notification or buffer the transition);
 /// errors from notification are logged and discarded (not propagated).
 async fn transition_ticket(
     ticket: &Ticket,
@@ -188,13 +216,8 @@ async fn transition_ticket(
         .await
     {
         Ok(()) => {
-            if matches!(notify, NotifyPolicy::Notify) {
-                notify_ticket(ticket, target).await;
-            } else if let Some(ws) =
-                resolve_ticket_workspace(ticket, "cannot buffer transition").await
-            {
-                ticket_buffer::push(&ws.name, &ticket.id, ticket.status, target);
-            }
+            dispatch_notification(ticket, target, expected, notify, "cannot buffer transition")
+                .await;
 
             Ok(())
         }
@@ -1051,17 +1074,14 @@ async fn commit_and_transition_ticket_from(
             info!(ticket = %ticket.id, "Committed {short_hash}, moving to Done");
 
             let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-
-            match notify_policy {
-                NotifyPolicy::Notify => notify_ticket(ticket, TicketPhase::Done).await,
-                NotifyPolicy::Buffer => {
-                    if let Some(ws) =
-                        resolve_ticket_workspace(ticket, "cannot buffer Done transition").await
-                    {
-                        ticket_buffer::push(&ws.name, &ticket.id, source, TicketPhase::Done);
-                    }
-                }
-            }
+            dispatch_notification(
+                ticket,
+                TicketPhase::Done,
+                source,
+                notify_policy,
+                "cannot buffer Done transition",
+            )
+            .await;
         }
         Err(e) => {
             // tx is dropped → TxGuard::drop sets the dangling_tx flag,
