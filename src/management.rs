@@ -580,7 +580,7 @@ impl PollPhase {
                 // panic-recovery transition (active_phase → Failed).
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
-                // raw SQL in handle_qa_passed.
+                // claim_sanitation in handle_qa_passed.
                 require_clear_pipeline: false,
                 role_label: Role::Sanitation.as_str(),
             },
@@ -1140,57 +1140,10 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
         return;
     }
 
-    // Untracked files exist — claim this specific ticket to InSanitation.
-    //
-    // We use a raw SQL UPDATE instead of `transition_to()` because we need to
-    // atomically set both `status` AND `assigned_to` in a single statement.
-    // `transition_to` always clears `assigned_to = NULL`, but we need to set
-    // it to the session key to prevent the poll loop's InSanitation re-dispatch
-    // guard (assigned_to IS NULL) from firing a second agent during the yield
-    // between two separate calls.
-    //
-    // This is safe because `ticket` is owned (handle_qa_passed takes Ticket by
-    // value) and we already checked `untracked.is_empty()` — no other handler
-    // can race on this specific ticket id because the CAS on `status = 'qa_passed'`
-    // ensures at most one handler wins the transition. There is no running agent
-    // to cancel (the ticket is in QaPassed, a transitory handoff phase with no
-    // agent mid-execution), so the execute_and_cancel wrapper that `transition_to`
-    // uses is not needed here.
-    //
-    // WARNING: Do NOT copy this raw-SQL pattern for phases that DO have running
-    // agents. The execute_and_cancel wrapper in `transition_to` cancels agents
-    // for the claimed ticket before transitioning — without it, a stale agent
-    // would continue running with a now-stale phase reference. QaPassed is safe
-    // because it is a transitory handoff phase with no running agent.
-    let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
-    // Check the sanitation pipeline: reject the claim if another ticket is
-    // already in InSanitation or SanitationPassed in this workspace. This
-    // enforces the manager's requirement that sanitation is serialized per
-    // workspace — only one ticket at a time through the sanitation pipeline.
-    // We check only InSanitation/SanitationPassed (not the full
-    // PIPELINE_BLOCKING_STATUSES) because earlier pipeline phases like QaPassed
-    // should not block a new ticket from entering sanitation.
-    let rows = board()
-        .conn
-        .execute(
-            "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
-             WHERE id = ?4 AND status = ?5 \
-             AND NOT EXISTS (SELECT 1 FROM tickets t2 \
-               WHERE t2.workspace_name = (SELECT workspace_name FROM tickets WHERE id = ?4) \
-               AND t2.id != ?4 \
-               AND t2.status IN ('in_sanitation','sanitation_passed'))",
-            turso::params![
-                TicketPhase::InSanitation.as_ref(),
-                session_key.as_str(),
-                crate::turso::now(),
-                ticket.id.as_str(),
-                TicketPhase::QaPassed.as_ref(),
-            ],
-        )
-        .await;
-
-    let rows = match rows {
-        Ok(r) => r,
+    // Untracked files exist — claim this specific ticket to InSanitation
+    // via the dedicated claim_sanitation method (see BoardStore docs).
+    let claimed = match board().claim_sanitation(&ticket.id).await {
+        Ok(c) => c,
         Err(e) => {
             warn!(
                 ticket = %ticket.id,
@@ -1201,7 +1154,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
         }
     };
 
-    if rows == 0 {
+    if !claimed {
         debug!(
             ticket = %ticket.id,
             "QaPassed ticket moved externally — skipping sanitation dispatch",
@@ -1216,30 +1169,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
         TicketPhase::InSanitation,
     );
 
-    // Re-fetch ticket with updated status/comments before dispatch.
-    // By this point assigned_to is already set atomically in the same
-    // UPDATE that changed the status, so the poll loop's InSanitation
-    // re-dispatch guard (assigned_to IS NULL) will not fire for this ticket.
-    let updated = match board().get_ticket(&ticket.id).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            warn!(ticket = %ticket.id, "Ticket disappeared after transition — skipping");
-            // Ticket was deleted between CAS and re-fetch. Clear assigned_to so
-            // the poll loop doesn't think a running agent exists for a phantom ticket.
-            let _ = board().set_assigned_to(&ticket.id, None).await;
-            return;
-        }
-        Err(e) => {
-            warn!(ticket = %ticket.id, error = %e, "Failed to re-fetch ticket after transition");
-            // Re-fetch failed (DB error). The ticket is stuck in InSanitation with
-            // assigned_to set but no agent dispatched. Clear assigned_to to allow the
-            // poll loop to retry dispatching a sanitation agent on the next cycle.
-            let _ = board().set_assigned_to(&ticket.id, None).await;
-            return;
-        }
-    };
-
-    spawn_dispatch(PollPhase::SanitationCheck, updated, ws);
+    spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
 }
 
 /// Sanitation circuit breaker — trip if the ticket has accumulated too
@@ -3606,6 +3536,101 @@ D  deleted.rs
             status,
             TicketPhase::Done,
             "QA passed should eventually transition to Done"
+        );
+    }
+
+    /// handle_qa_passed with untracked files present should claim the ticket
+    /// to InSanitation and dispatch a sanitation agent. Creates a real git repo
+    /// with an untracked file to exercise the full claim path.
+    #[tokio::test]
+    async fn handle_qa_passed_untracked_files_to_insanitation() {
+        // Skip if git is not installed — the test cannot create a repo.
+        if !crate::diff_parse::git_is_installed().await {
+            eprintln!("git not installed — skipping git-dependent test");
+            return;
+        }
+
+        init_management_test_stores().await;
+
+        // Create a temp directory and init a git repo
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo_path = dir.path().to_path_buf();
+
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git config user.name");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git config user.email");
+
+        // Create a committed file
+        std::fs::write(repo_path.join("committed.txt"), b"hello").expect("write committed file");
+        let status = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["commit", "-m", "Initial"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git commit");
+        assert!(status.success());
+
+        // Create an untracked file
+        std::fs::write(repo_path.join("untracked.txt"), b"garbage").expect("write untracked file");
+
+        let ws = test_ws_named(repo_path.to_str().unwrap(), "qa_untracked");
+        let ticket_id = TicketBuilder::new(board(), ws.clone())
+            .title("QA Untracked")
+            .phase(TicketPhase::QaPassed)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+
+        handle_qa_passed(ticket, ws).await;
+
+        let status = board()
+            .get_ticket_status(&ticket_id)
+            .await
+            .expect("get_ticket_status")
+            .expect("ticket exists");
+        assert_eq!(
+            status,
+            TicketPhase::InSanitation,
+            "QA passed with untracked files should transition to InSanitation"
+        );
+
+        // Verify assigned_to is set to the sanitation session key
+        let ticket = board()
+            .get_ticket(&ticket_id)
+            .await
+            .expect("get_ticket")
+            .expect("ticket exists");
+        let expected_key =
+            crate::session::ticket_session_key(&ticket_id, crate::Role::Sanitation.as_str());
+        assert_eq!(
+            ticket.assigned_to.as_deref(),
+            Some(expected_key.as_str()),
+            "assigned_to should be set to sanitation session key"
         );
     }
 }

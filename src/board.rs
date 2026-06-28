@@ -1099,6 +1099,47 @@ impl BoardStore {
         Ok(rows > 0)
     }
 
+    /// Claim a QaPassed ticket for sanitation processing.
+    ///
+    /// Atomically transitions the ticket from [`TicketPhase::QaPassed`] to
+    /// [`TicketPhase::InSanitation`], sets `assigned_to` to the sanitation
+    /// session key, and enforces the per-workspace serialization invariant:
+    /// only one ticket at a time may be in [`TicketPhase::InSanitation`] or
+    /// [`TicketPhase::SanitationPassed`].
+    ///
+    /// Returns `Ok(true)` if the claim succeeded, `Ok(false)` if:
+    /// - The ticket is no longer in QaPassed (already claimed by another handler), or
+    /// - Another ticket is already in the sanitation pipeline for this workspace.
+    ///
+    /// Unlike [`transition_to`](Self::transition_to), this method does NOT
+    /// cancel registered agents — QaPassed is a transitory handoff phase
+    /// with no running agent, so cancellation is unnecessary.
+    pub async fn claim_sanitation(&self, id: &str) -> Result<bool> {
+        let now = turso::now();
+        let session_key = crate::session::ticket_session_key(id, crate::Role::Sanitation.as_str());
+        let sql = "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
+                    WHERE id = ?4 AND status = ?5 \
+                    AND NOT EXISTS (SELECT 1 FROM tickets t2 \
+                      WHERE t2.workspace_name = \
+                        (SELECT workspace_name FROM tickets WHERE id = ?4) \
+                      AND t2.id != ?4 \
+                      AND t2.status IN ('in_sanitation','sanitation_passed'))";
+        let rows = self
+            .conn
+            .execute(
+                sql,
+                turso::params![
+                    TicketPhase::InSanitation.as_ref(),
+                    session_key,
+                    now,
+                    id,
+                    TicketPhase::QaPassed.as_ref(),
+                ],
+            )
+            .await?;
+        Ok(rows > 0)
+    }
+
     /// Build the SQL, params, and action description for setting commit info.
     /// Shared by [`set_commit_info`](Self::set_commit_info) and
     /// [`set_commit_info_tx`](Self::set_commit_info_tx).
@@ -3866,6 +3907,166 @@ with a comment explaining why no agent is mid-execution in that state.\
                 );
             }
         }
+    }
+
+    // ── claim_sanitation tests ──
+
+    /// Table-driven tests for `claim_sanitation` covering success (QaPassed),
+    /// wrong-phase rejection, and assigned_to verification on successful claim.
+    #[tokio::test]
+    async fn test_claim_sanitation() {
+        struct Case {
+            name: &'static str,
+            phase: TicketPhase,
+            expected_claim: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "qa_passed succeeds",
+                phase: TicketPhase::QaPassed,
+                expected_claim: true,
+            },
+            Case {
+                name: "backlog (wrong phase) fails",
+                phase: TicketPhase::Backlog,
+                expected_claim: false,
+            },
+            Case {
+                name: "in_development (wrong phase) fails",
+                phase: TicketPhase::InDevelopment,
+                expected_claim: false,
+            },
+        ];
+
+        let (store, _tmp) = open_test_store().await;
+        let ws = test_ws_named("/ws", "ws");
+
+        for (i, case) in cases.iter().enumerate() {
+            let title = format!("san-claim-{i}");
+            let id = TicketBuilder::new(&store, ws.clone())
+                .title(title)
+                .phase(case.phase)
+                .create()
+                .await
+                .expect("create_ticket");
+
+            let claimed = store.claim_sanitation(&id).await.expect("claim_sanitation");
+            assert_eq!(
+                claimed, case.expected_claim,
+                "Case '{}': unexpected claim result",
+                case.name
+            );
+
+            if case.expected_claim {
+                let ticket = crate::util::test::expect_ticket(&store, &id).await;
+                assert_eq!(ticket.status, TicketPhase::InSanitation);
+                let expected_key =
+                    crate::session::ticket_session_key(&id, crate::Role::Sanitation.as_str());
+                assert_eq!(
+                    ticket.assigned_to.as_deref(),
+                    Some(expected_key.as_str()),
+                    "Case '{}': assigned_to should be set to sanitation session key",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claim_sanitation_workspace_serialization() {
+        let (store, _tmp) = open_test_store().await;
+        let ws = test_ws_named("/ws", "ws");
+
+        // First ticket in QaPassed
+        let first_id = TicketBuilder::new(&store, ws.clone())
+            .title("First")
+            .phase(TicketPhase::QaPassed)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        // Second ticket in QaPassed — same workspace
+        let second_id = TicketBuilder::new(&store, ws.clone())
+            .title("Second")
+            .phase(TicketPhase::QaPassed)
+            .create()
+            .await
+            .expect("create_ticket");
+
+        // Claim the first — should succeed
+        let first_claimed = store
+            .claim_sanitation(&first_id)
+            .await
+            .expect("first claim");
+        assert!(first_claimed, "first claim should succeed");
+
+        // Claim the second while first is in InSanitation — should fail (serialized)
+        let second_claimed = store
+            .claim_sanitation(&second_id)
+            .await
+            .expect("second claim");
+        assert!(
+            !second_claimed,
+            "second claim should be blocked while first ticket is in sanitation pipeline"
+        );
+
+        // Transition first ticket out of the sanitation pipeline entirely
+        // (simulating the real flow: SanitationPassed → auto-commit → Done).
+        // We transition directly to Done since SanitationPassed is also in the
+        // blocked set, so moving to SanitationPassed alone wouldn't clear it.
+        store
+            .transition_to(&first_id, None, TicketPhase::Done, None)
+            .await
+            .expect("transition first to Done (clears sanitation pipeline)");
+
+        // Now second claim should succeed
+        let second_claimed_retry = store
+            .claim_sanitation(&second_id)
+            .await
+            .expect("second claim retry");
+        assert!(
+            second_claimed_retry,
+            "second claim should succeed after pipeline clears"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_sanitation_cross_workspace_serialization() {
+        let (store, _tmp) = open_test_store().await;
+        let ws_a = test_ws_named("/ws_a", "ws_a");
+        let ws_b = test_ws_named("/ws_b", "ws_b");
+
+        // One ticket in each workspace, both in QaPassed
+        let id_a = TicketBuilder::new(&store, ws_a)
+            .title("Workspace A")
+            .phase(TicketPhase::QaPassed)
+            .create()
+            .await
+            .expect("create_ticket a");
+
+        let id_b = TicketBuilder::new(&store, ws_b)
+            .title("Workspace B")
+            .phase(TicketPhase::QaPassed)
+            .create()
+            .await
+            .expect("create_ticket b");
+
+        // Both should succeed independently (different workspaces)
+        let claimed_a = store.claim_sanitation(&id_a).await.expect("claim a");
+        assert!(claimed_a, "workspace A claim should succeed");
+
+        let claimed_b = store.claim_sanitation(&id_b).await.expect("claim b");
+        assert!(
+            claimed_b,
+            "workspace B claim should succeed independently of workspace A"
+        );
+
+        let ticket_a = crate::util::test::expect_ticket(&store, &id_a).await;
+        assert_eq!(ticket_a.status, TicketPhase::InSanitation);
+
+        let ticket_b = crate::util::test::expect_ticket(&store, &id_b).await;
+        assert_eq!(ticket_b.status, TicketPhase::InSanitation);
     }
 
     #[tokio::test]
