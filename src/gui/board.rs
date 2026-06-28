@@ -793,14 +793,115 @@ impl BoardState {
                 .into();
         };
 
-        let (badge_bg, badge_text) = theme::ticket_status_color(ticket.status);
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
+        let mut sections: Vec<Element<'_, BoardMessage>> = Vec::new();
+        sections.push(Self::render_header_metadata(ticket, is_action_disabled));
+
+        if let Some(el) = Self::render_commit_stats(
+            ticket,
+            self.commit_stats.as_ref(),
+            self.commit_stats_loading,
+        ) {
+            sections.push(el);
+        }
+
+        if let Some(el) = Self::render_description(ticket, self.description_md.as_deref()) {
+            sections.push(Space::new().height(8).into());
+            sections.push(el);
+        }
+
+        if let Some(el) = Self::render_comments(ticket, &self.expanded_comments, &self.comments_md)
+        {
+            sections.push(Space::new().height(12).into());
+            sections.push(
+                text("Comments:")
+                    .size(13)
+                    .color(theme::TEXT_SECONDARY)
+                    .into(),
+            );
+            sections.push(el);
+        }
+
+        scrollable(Column::from_vec(sections).spacing(4))
+            .height(Length::Fill)
+            .direction(theme::vertical_scrollbar())
+            .style(theme::scrollbar_style)
+            .into()
+    }
+
+    /// Render the modal header: title, ticket ID, status badge, action icons, and metadata lines.
+    fn render_header_metadata(
+        ticket: &Ticket,
+        is_action_disabled: bool,
+    ) -> Element<'_, BoardMessage> {
+        let (badge_bg, badge_text) = theme::ticket_status_color(ticket.status);
         let actions = Self::available_actions(ticket.status);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
-        let mut detail = column![
-            // Modal header row with title and close button
+        let reporter_display = if ticket.reporter.is_empty() {
+            "Legacy".to_string()
+        } else {
+            Role::from_str(&ticket.reporter).map_or_else(
+                |_| {
+                    let mut chars = ticket.reporter.chars();
+                    let first = chars.next().expect("non-empty checked above");
+                    first.to_uppercase().to_string() + chars.as_str()
+                },
+                |role| crate::role::role_info(&role).display_label.to_string(),
+            )
+        };
+        let created = theme::format_timestamp(&ticket.created_at);
+        let updated = theme::format_timestamp(&ticket.updated_at);
+
+        let meta_els: Vec<Element<'_, BoardMessage>> = vec![
+            text(format!("Created: {created}"))
+                .size(12)
+                .color(theme::TEXT_MUTED)
+                .into(),
+            text(" · ").size(12).color(theme::TEXT_MUTED).into(),
+            text(format!("Updated: {updated}"))
+                .size(12)
+                .color(theme::TEXT_MUTED)
+                .into(),
+            text(" · ").size(12).color(theme::TEXT_MUTED).into(),
+            text(format!("Reporter: {reporter_display}"))
+                .size(12)
+                .color(theme::TEXT_MUTED)
+                .into(),
+        ];
+
+        let mut secondary: Vec<String> = Vec::new();
+        if let Some(ref assignee) = ticket.assigned_to {
+            secondary.push(format!("Assigned: {assignee}"));
+        }
+        if !ticket.prerequisites.is_empty() {
+            secondary.push(format!(
+                "Prerequisites: {}",
+                ticket.prerequisites.join(", ")
+            ));
+        }
+        if let Some(ref supersedes) = ticket.supersedes {
+            secondary.push(format!("Supersedes: {supersedes}"));
+        }
+        if let Some(ref superseded_by) = ticket.superseded_by {
+            secondary.push(format!("Superseded by: {superseded_by}"));
+        }
+
+        let first_row: Element<'_, BoardMessage> =
+            Row::from_vec(meta_els).align_y(Alignment::Center).into();
+
+        let metadata_block: Element<'_, BoardMessage> = if secondary.is_empty() {
+            first_row
+        } else {
+            let second_row: Element<'_, BoardMessage> = text(secondary.join(" · "))
+                .size(12)
+                .color(theme::TEXT_MUTED)
+                .into();
+            column![first_row, second_row].spacing(2).into()
+        };
+
+        column![
             row![
                 text(&ticket.title)
                     .size(16)
@@ -816,10 +917,8 @@ impl BoardState {
                 .on_press(BoardMessage::CloseModal),
             ]
             .align_y(Alignment::Center),
-            // Ticket ID below title, matching board card layout
             text(&ticket.id).size(12).color(theme::TEXT_MUTED),
             Space::new().height(6),
-            // Status badge + action icons row
             row![
                 container(
                     text(ticket.status.display_name())
@@ -841,297 +940,253 @@ impl BoardState {
             .align_y(Alignment::Center)
             .spacing(8)
             .padding([4, 0]),
-            // Compact metadata header — inline with · separator
-            {
-                let reporter_display = if ticket.reporter.is_empty() {
-                    "Legacy".to_string()
-                } else {
-                    Role::from_str(&ticket.reporter).map_or_else(
-                        |_| {
-                            let mut chars = ticket.reporter.chars();
-                            let first = chars.next().expect("non-empty checked above");
-                            first.to_uppercase().to_string() + chars.as_str()
-                        },
-                        |role| crate::role::role_info(&role).display_label.to_string(),
-                    )
-                };
-                let created = theme::format_timestamp(&ticket.created_at);
-                let updated = theme::format_timestamp(&ticket.updated_at);
-
-                // Build the first row of metadata (always shown)
-                let meta_els: Vec<Element<'_, BoardMessage>> = vec![
-                    text(format!("Created: {created}"))
-                        .size(12)
-                        .color(theme::TEXT_MUTED)
-                        .into(),
-                    text(" · ").size(12).color(theme::TEXT_MUTED).into(),
-                    text(format!("Updated: {updated}"))
-                        .size(12)
-                        .color(theme::TEXT_MUTED)
-                        .into(),
-                    text(" · ").size(12).color(theme::TEXT_MUTED).into(),
-                    text(format!("Reporter: {reporter_display}"))
-                        .size(12)
-                        .color(theme::TEXT_MUTED)
-                        .into(),
-                ];
-
-                // Collect secondary fields for second inline row
-                let mut secondary: Vec<String> = Vec::new();
-                if let Some(ref assignee) = ticket.assigned_to {
-                    secondary.push(format!("Assigned: {assignee}"));
-                }
-                if !ticket.prerequisites.is_empty() {
-                    secondary.push(format!(
-                        "Prerequisites: {}",
-                        ticket.prerequisites.join(", ")
-                    ));
-                }
-                if let Some(ref supersedes) = ticket.supersedes {
-                    secondary.push(format!("Supersedes: {supersedes}"));
-                }
-                if let Some(ref superseded_by) = ticket.superseded_by {
-                    secondary.push(format!("Superseded by: {superseded_by}"));
-                }
-
-                let first_row: Element<'_, BoardMessage> =
-                    Row::from_vec(meta_els).align_y(Alignment::Center).into();
-
-                if secondary.is_empty() {
-                    first_row
-                } else {
-                    let second_row: Element<'_, BoardMessage> = text(secondary.join(" · "))
-                        .size(12)
-                        .color(theme::TEXT_MUTED)
-                        .into();
-                    column![first_row, second_row].spacing(2).into()
-                }
-            },
+            metadata_block,
         ]
-        .spacing(2);
+        .spacing(4)
+        .into()
+    }
 
-        // Commit stats section
-        if ticket.commit_hash.is_some() {
-            if self.commit_stats_loading {
-                detail = detail.push(Space::new().height(8));
-                detail = detail.push(
+    /// Render commit stats: summary header + per-file rows, or loading indicator.
+    /// Returns `None` when the ticket has no commit hash.
+    fn render_commit_stats<'a>(
+        ticket: &'a Ticket,
+        stats: Option<&'a CommitStats>,
+        loading: bool,
+    ) -> Option<Element<'a, BoardMessage>> {
+        let hash = ticket.commit_hash.as_ref()?;
+
+        if loading {
+            return Some(
+                column![
+                    Space::new().height(8),
                     text("Loading commit stats\u{2026}")
                         .size(12)
                         .color(theme::TEXT_MUTED),
-                );
-            } else if let Some(ref stats) = self.commit_stats {
-                // Summary header: commit hash + aggregate change stats
-                let total_additions: i64 = stats.files.iter().map(|f| f.additions).sum();
-                let total_deletions: i64 = stats.files.iter().map(|f| f.deletions).sum();
-                let file_count = stats.files.len();
-                let mut summary_parts: Vec<Element<'_, BoardMessage>> = Vec::new();
-                if let Some(ref hash) = ticket.commit_hash {
-                    summary_parts.push(
-                        text(format!("{hash:.8}"))
-                            .size(11)
-                            .color(theme::TEXT_MUTED)
-                            .into(),
-                    );
-                    summary_parts.push(Space::new().width(6).into());
-                }
-                summary_parts.push(
-                    text(format!(
-                        "{file_count} file{} changed",
-                        if file_count == 1 { "" } else { "s" }
-                    ))
-                    .size(11)
-                    .color(theme::TEXT_SECONDARY)
-                    .into(),
-                );
-                if total_additions > 0 {
-                    summary_parts.push(
-                        text(format!("+{total_additions}"))
-                            .size(11)
-                            .color(theme::STATUS_SUCCESS)
-                            .into(),
-                    );
-                }
-                if total_deletions > 0 {
-                    summary_parts.push(
-                        text(format!("\u{2212}{total_deletions}"))
-                            .size(11)
-                            .color(theme::STATUS_ERROR)
-                            .into(),
-                    );
-                }
-                let summary_header =
-                    container(row(summary_parts).spacing(4).align_y(Alignment::Center))
-                        .padding([4, 8])
-                        .width(Length::Fill);
-                detail = detail.push(summary_header);
-
-                // File stat rows — hide zero-valued sides
-                let mut file_col = Column::new().spacing(2);
-                for f in &stats.files {
-                    let mut row_parts: Vec<Element<'_, BoardMessage>> = vec![
-                        container(text(&f.path).size(11).font(theme::FONT_REGULAR))
-                            .width(Length::Fixed(400.0))
-                            .clip(true)
-                            .into(),
-                        Space::new().width(Length::Fill).into(),
-                    ];
-                    if f.additions > 0 {
-                        row_parts.push(
-                            text(format!("+{}", f.additions))
-                                .size(11)
-                                .font(theme::FONT_REGULAR)
-                                .color(theme::STATUS_SUCCESS)
-                                .into(),
-                        );
-                    }
-                    if f.additions > 0 && f.deletions > 0 {
-                        row_parts.push(Space::new().width(6).into());
-                    }
-                    if f.deletions > 0 {
-                        row_parts.push(
-                            text(format!("-{}", f.deletions))
-                                .size(11)
-                                .font(theme::FONT_REGULAR)
-                                .color(theme::STATUS_ERROR)
-                                .into(),
-                        );
-                    }
-                    let row = row(row_parts).align_y(Alignment::Center);
-                    file_col = file_col.push(row);
-                }
-
-                detail = detail.push(
-                    container(file_col)
-                        .padding([4, 8])
-                        .style(theme::surface_card_style),
-                );
-            }
-            // If loading is done but stats is None (error) → render nothing
+                ]
+                .spacing(4)
+                .into(),
+            );
         }
 
-        // Description
-        if !ticket.description.is_empty() {
-            detail = detail.push(Space::new().height(8));
-            let desc_md: Element<'_, BoardMessage> = if let Some(ref items) = self.description_md {
-                container(
-                    scrollable(
-                        iced_selection::markdown::view(items, theme::markdown_settings())
-                            .map(BoardMessage::LinkClicked),
-                    )
-                    .direction(theme::vertical_scrollbar())
-                    .style(theme::scrollbar_style),
+        let stats = stats?;
+
+        let total_additions: i64 = stats.files.iter().map(|f| f.additions).sum();
+        let total_deletions: i64 = stats.files.iter().map(|f| f.deletions).sum();
+        let file_count = stats.files.len();
+        let mut summary_parts: Vec<Element<'_, BoardMessage>> = Vec::new();
+        summary_parts.push(
+            text(format!("{hash:.8}"))
+                .size(11)
+                .color(theme::TEXT_MUTED)
+                .into(),
+        );
+        summary_parts.push(Space::new().width(6).into());
+        summary_parts.push(
+            text(format!(
+                "{file_count} file{} changed",
+                if file_count == 1 { "" } else { "s" }
+            ))
+            .size(11)
+            .color(theme::TEXT_SECONDARY)
+            .into(),
+        );
+        if total_additions > 0 {
+            summary_parts.push(
+                text(format!("+{total_additions}"))
+                    .size(11)
+                    .color(theme::STATUS_SUCCESS)
+                    .into(),
+            );
+        }
+        if total_deletions > 0 {
+            summary_parts.push(
+                text(format!("\u{2212}{total_deletions}"))
+                    .size(11)
+                    .color(theme::STATUS_ERROR)
+                    .into(),
+            );
+        }
+        let summary_header = container(row(summary_parts).spacing(4).align_y(Alignment::Center))
+            .padding([4, 8])
+            .width(Length::Fill);
+
+        // File stat rows — hide zero-valued sides
+        let mut file_col = Column::new().spacing(2);
+        for f in &stats.files {
+            let mut row_parts: Vec<Element<'_, BoardMessage>> = vec![
+                container(text(&f.path).size(11).font(theme::FONT_REGULAR))
+                    .width(Length::Fixed(400.0))
+                    .clip(true)
+                    .into(),
+                Space::new().width(Length::Fill).into(),
+            ];
+            if f.additions > 0 {
+                row_parts.push(
+                    text(format!("+{}", f.additions))
+                        .size(11)
+                        .font(theme::FONT_REGULAR)
+                        .color(theme::STATUS_SUCCESS)
+                        .into(),
+                );
+            }
+            if f.additions > 0 && f.deletions > 0 {
+                row_parts.push(Space::new().width(6).into());
+            }
+            if f.deletions > 0 {
+                row_parts.push(
+                    text(format!("-{}", f.deletions))
+                        .size(11)
+                        .font(theme::FONT_REGULAR)
+                        .color(theme::STATUS_ERROR)
+                        .into(),
+                );
+            }
+            let row = row(row_parts).align_y(Alignment::Center);
+            file_col = file_col.push(row);
+        }
+
+        Some(
+            column![
+                summary_header,
+                container(file_col)
+                    .padding([4, 8])
+                    .style(theme::surface_card_style),
+            ]
+            .spacing(4)
+            .into(),
+        )
+    }
+
+    /// Render the description section: markdown (if cached) or plain text.
+    /// Returns `None` when the ticket description is empty.
+    fn render_description<'a>(
+        ticket: &'a Ticket,
+        description_md: Option<&'a [markdown::Item]>,
+    ) -> Option<Element<'a, BoardMessage>> {
+        if ticket.description.is_empty() {
+            return None;
+        }
+
+        Some(if let Some(items) = description_md {
+            container(
+                scrollable(
+                    iced_selection::markdown::view(items, theme::markdown_settings())
+                        .map(BoardMessage::LinkClicked),
                 )
+                .direction(theme::vertical_scrollbar())
+                .style(theme::scrollbar_style),
+            )
+            .padding(8)
+            .style(theme::surface_card_style)
+            .into()
+        } else {
+            container(selectable_text(&ticket.description, theme::TEXT_PRIMARY).size(13))
                 .padding(8)
                 .style(theme::surface_card_style)
                 .into()
-            } else {
-                container(selectable_text(&ticket.description, theme::TEXT_PRIMARY).size(13))
-                    .padding(8)
-                    .style(theme::surface_card_style)
-                    .into()
-            };
-            detail = detail.push(desc_md);
+        })
+    }
+
+    /// Render the comments list: per-comment role badge, timestamp, content,
+    /// and diagnostics expand/collapse toggle.
+    /// Returns `None` when the ticket has no comments.
+    fn render_comments<'a>(
+        ticket: &'a Ticket,
+        expanded: &'a HashSet<usize>,
+        comments_md: &'a [(usize, Vec<markdown::Item>)],
+    ) -> Option<Element<'a, BoardMessage>> {
+        if ticket.comments.is_empty() {
+            return None;
         }
 
-        // Comments
-        if !ticket.comments.is_empty() {
-            detail = detail.push(Space::new().height(12));
-            detail = detail.push(text("Comments:").size(13).color(theme::TEXT_SECONDARY));
-            let mut cmt_col = Column::new().spacing(4);
-            for (i, comment) in ticket.comments.iter().enumerate().rev() {
-                let role_color = theme::role_badge_color(&comment.role).0;
+        let mut cmt_col = Column::new().spacing(4);
+        for (i, comment) in ticket.comments.iter().enumerate().rev() {
+            let role_color = theme::role_badge_color(&comment.role).0;
 
-                // For diagnostics comments, optionally show only the summary
-                let is_diag = comment.role == "diagnostics";
-                let is_expanded = self.expanded_comments.contains(&i);
+            // For diagnostics comments, optionally show only the summary
+            let is_diag = comment.role == "diagnostics";
+            let is_expanded = expanded.contains(&i);
 
-                let summary = if is_diag {
-                    comment
-                        .content
-                        .rfind("\n---\n")
-                        .map(|pos| &comment.content[pos + 5..])
-                } else {
-                    None
-                };
+            let summary = if is_diag {
+                comment
+                    .content
+                    .rfind("\n---\n")
+                    .map(|pos| &comment.content[pos + 5..])
+            } else {
+                None
+            };
 
-                let comment_content: Element<'_, BoardMessage> = if is_diag && !is_expanded {
-                    selectable_text(
-                        summary.unwrap_or(&comment.content).trim(),
-                        theme::TEXT_PRIMARY,
-                    )
+            let comment_content: Element<'_, BoardMessage> = if is_diag && !is_expanded {
+                selectable_text(
+                    summary.unwrap_or(&comment.content).trim(),
+                    theme::TEXT_PRIMARY,
+                )
+                .size(13)
+                .into()
+            } else if let Some((_, items)) = comments_md.iter().find(|(idx, _)| *idx == i) {
+                iced_selection::markdown::view(items, theme::markdown_settings())
+                    .map(BoardMessage::LinkClicked)
+            } else {
+                selectable_text(&comment.content, theme::TEXT_PRIMARY)
                     .size(13)
                     .into()
-                } else if let Some((_, items)) = self.comments_md.iter().find(|(idx, _)| *idx == i)
-                {
-                    iced_selection::markdown::view(items, theme::markdown_settings())
-                        .map(BoardMessage::LinkClicked)
-                } else {
-                    selectable_text(&comment.content, theme::TEXT_PRIMARY)
-                        .size(13)
-                        .into()
-                };
+            };
 
-                // Toggle button for diagnostics comments
-                let toggle_button: Option<Element<'_, BoardMessage>> = if is_diag {
-                    let (icon, label) = if is_expanded {
-                        (
-                            lucide::chevron_up::<iced::Theme, iced::Renderer>().size(12),
-                            " Collapse",
-                        )
-                    } else {
-                        (
-                            lucide::chevron_down::<iced::Theme, iced::Renderer>().size(12),
-                            " Show full output",
-                        )
-                    };
-                    Some(
-                        button(
-                            row![
-                                icon.color(theme::TEXT_SECONDARY),
-                                text(label).size(11).color(theme::TEXT_SECONDARY),
-                            ]
-                            .spacing(2)
-                            .align_y(Alignment::Center),
-                        )
-                        .style(theme::button_text)
-                        .on_press(BoardMessage::ToggleCommentExpand(i))
-                        .into(),
+            // Toggle button for diagnostics comments
+            let toggle_button: Option<Element<'_, BoardMessage>> = if is_diag {
+                let (icon, label) = if is_expanded {
+                    (
+                        lucide::chevron_up::<iced::Theme, iced::Renderer>().size(12),
+                        " Collapse",
                     )
                 } else {
-                    None
+                    (
+                        lucide::chevron_down::<iced::Theme, iced::Renderer>().size(12),
+                        " Show full output",
+                    )
                 };
+                Some(
+                    button(
+                        row![
+                            icon.color(theme::TEXT_SECONDARY),
+                            text(label).size(11).color(theme::TEXT_SECONDARY),
+                        ]
+                        .spacing(2)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(theme::button_text)
+                    .on_press(BoardMessage::ToggleCommentExpand(i))
+                    .into(),
+                )
+            } else {
+                None
+            };
 
-                let mut comment_col = Column::new().spacing(4);
-                comment_col = comment_col.push(
-                    row![
-                        container(text(&comment.role).size(11).color(role_color))
-                            .padding([1, 6])
-                            .style(move |t| theme::role_badge_pill_style(t, role_color)),
-                        Space::new().width(8),
-                        text(theme::format_timestamp(&comment.created_at))
-                            .size(10)
-                            .color(theme::TEXT_MUTED),
-                    ]
-                    .align_y(Alignment::Center),
-                );
-                comment_col = comment_col.push(comment_content);
-                if let Some(btn) = toggle_button {
-                    comment_col = comment_col.push(btn);
-                }
-
-                cmt_col = cmt_col.push(
-                    container(comment_col)
-                        .padding(8)
-                        .style(theme::surface_card_style),
-                );
+            let mut comment_col = Column::new().spacing(4);
+            comment_col = comment_col.push(
+                row![
+                    container(text(&comment.role).size(11).color(role_color))
+                        .padding([1, 6])
+                        .style(move |t| theme::role_badge_pill_style(t, role_color)),
+                    Space::new().width(8),
+                    text(theme::format_timestamp(&comment.created_at))
+                        .size(10)
+                        .color(theme::TEXT_MUTED),
+                ]
+                .align_y(Alignment::Center),
+            );
+            comment_col = comment_col.push(comment_content);
+            if let Some(btn) = toggle_button {
+                comment_col = comment_col.push(btn);
             }
-            detail = detail.push(cmt_col);
+
+            cmt_col = cmt_col.push(
+                container(comment_col)
+                    .padding(8)
+                    .style(theme::surface_card_style),
+            );
         }
 
-        scrollable(detail.spacing(4))
-            .height(Length::Fill)
-            .direction(theme::vertical_scrollbar())
-            .style(theme::scrollbar_style)
-            .into()
+        Some(cmt_col.into())
     }
 }
