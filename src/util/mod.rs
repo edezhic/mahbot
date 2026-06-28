@@ -40,7 +40,7 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
 /// mode, IMAGE markers are preserved (they're needed for vision API integration
 /// via `to_message_content()`), while all non-IMAGE markers (AUDIO, VIDEO, and
 /// any future marker kinds) are stripped from the content. This is enforced by
-/// a conditional closure in `channels::finish_enrichment` which mirrors the
+/// the marker-stripping logic at the end of `enrich_message` which mirrors the
 /// `parse_image_markers()` pattern. Adding a new marker kind to this regex will
 /// cause it to be automatically stripped in multimodal mode unless the closure
 /// is explicitly updated to preserve it.

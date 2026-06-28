@@ -364,59 +364,7 @@ async fn remove_temp_file(path: &std::path::Path) {
     let _ = tokio::fs::remove_file(path).await;
 }
 
-/// Apply enrichment post-processing: strip markers according to strategy
-/// and prepend text annotations. This is a pure function that takes the
-/// content (with any replacements already applied) and returns the final
-/// content string.
-fn finish_enrichment(
-    annotations: &[String],
-    strategy: &EnrichmentStrategy,
-    content: &str,
-) -> String {
-    // ── Strip markers ──
-    // In multimodal mode, IMAGE markers are preserved (needed for vision API
-    // integration via to_message_content); all other markers are stripped.
-    // In non-multimodal mode, all markers are stripped. The MEDIA_MARKER_RE
-    // is the single canonical source of truth for all media marker patterns.
-    //
-    // Note: using matches!() with a boolean guard means a future
-    // EnrichmentStrategy variant would silently default to marker-stripping
-    // (conservative behavior) rather than producing a compile error. This is
-    // intentional — stripping unknown markers is the safe default.
-    let keep_image = matches!(strategy, EnrichmentStrategy::Multimodal { .. });
-    let cleaned = MEDIA_MARKER_RE
-        .replace_all(content, |caps: &regex::Captures| {
-            if keep_image
-                && caps
-                    .name("kind")
-                    .expect("MEDIA_MARKER_RE: expected 'kind' group")
-                    .as_str()
-                    == "IMAGE"
-            {
-                caps.get(0).unwrap().as_str().to_string()
-            } else {
-                String::new()
-            }
-        })
-        .to_string();
-    let cleaned = cleaned.trim().to_string();
-
-    // ── Prepend annotations (if any) ──
-    if annotations.is_empty() {
-        cleaned
-    } else {
-        let prefix = annotations.join("\n");
-        if cleaned.is_empty() {
-            prefix
-        } else {
-            format!("{prefix}\n\n{cleaned}")
-        }
-    }
-}
-
-/// Enrich an inbound message according to the provided strategy.
-///
-/// Processes all media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`)
+/// Process all media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`)
 /// in a single pass. Each marker kind is handled according to the strategy:
 ///
 /// | Kind | Multimodal | NonMultimodal |
@@ -431,7 +379,8 @@ fn finish_enrichment(
 pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrategy) {
     let mut annotations: Vec<String> = Vec::new();
     let mut result = msg.content.clone();
-    // Only populated/used in Multimodal mode — always empty in NonMultimodal.
+    // Accumulates upload path annotations across the for-loop below.
+    // Only ever populated in Multimodal/IMAGE branch — always empty otherwise.
     let mut upload_annotations: Vec<String> = Vec::new();
 
     let uploads_dir = match strategy {
@@ -483,8 +432,8 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
             "VIDEO" => match strategy {
                 EnrichmentStrategy::Multimodal { .. } => {
                     // No native video support in chat completions — strip silently.
-                    // The marker will be stripped by finish_enrichment below
-                    // (all non-IMAGE markers are removed in multimodal mode).
+                    // The marker will be stripped by the marker-stripping logic
+                    // below (all non-IMAGE markers are removed in multimodal mode).
                     remove_temp_file(path_obj).await;
                 }
                 EnrichmentStrategy::NonMultimodal => {
@@ -496,7 +445,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
             // NOTE: If a new marker kind is added to MEDIA_MARKER_RE in
             // util/mod.rs, a corresponding arm MUST be added here for enrichment
             // behavior (transcription, annotation, etc.). The unified stripping
-            // in `finish_enrichment` handles marker removal: in multimodal mode,
+            // at the end of this function handles marker removal: in multimodal mode,
             // only IMAGE markers are preserved (all others are stripped); in
             // non-multimodal mode, all markers are stripped. The `_ =>` arm is
             // unreachable for well-formed markers (the regex only matches
@@ -509,15 +458,56 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
 
     // ── Multimodal-specific post-processing ──
     // Append upload path annotations so the model can reference saved files.
-    // Invariant: upload_annotations is only populated in Multimodal mode,
-    // when a local IMAGE file was successfully copied to the workspace uploads
-    // directory.
+    // `upload_annotations` accumulates across the for-loop; it is only ever
+    // populated in Multimodal mode when a local IMAGE file was successfully
+    // copied to the workspace uploads directory.
     if !upload_annotations.is_empty() {
         let annotation_block = upload_annotations.join("\n");
         let _ = write!(result, "\n\n{annotation_block}");
     }
 
-    msg.content = finish_enrichment(&annotations, strategy, &result);
+    // ── Marker stripping and annotation prepending ──
+    // Strip media markers from the enriched content. In multimodal mode,
+    // IMAGE markers are preserved (needed for vision API integration via
+    // to_message_content); all other markers are stripped. In non-multimodal
+    // mode, all markers are stripped. The MEDIA_MARKER_RE is the single
+    // canonical source of truth for all media marker patterns.
+    //
+    // Note: using matches!() with a boolean guard means a future
+    // EnrichmentStrategy variant would silently default to marker-stripping
+    // (conservative behavior) rather than producing a compile error. This is
+    // intentional — stripping unknown markers is the safe default.
+    let keep_image = matches!(strategy, EnrichmentStrategy::Multimodal { .. });
+    let cleaned = MEDIA_MARKER_RE
+        .replace_all(&result, |caps: &regex::Captures| {
+            if keep_image
+                && caps
+                    .name("kind")
+                    .expect("MEDIA_MARKER_RE: expected 'kind' group")
+                    .as_str()
+                    == "IMAGE"
+            {
+                caps.get(0).unwrap().as_str().to_string()
+            } else {
+                String::new()
+            }
+        })
+        .to_string();
+    let cleaned = cleaned.trim().to_string();
+
+    // ── Prepend text annotations (if any) ──
+    // These are accumulated text descriptions for non-multimodal image files,
+    // transcribed AUDIO content, and VIDEO annotations.
+    msg.content = if annotations.is_empty() {
+        cleaned
+    } else {
+        let prefix = annotations.join("\n");
+        if cleaned.is_empty() {
+            prefix
+        } else {
+            format!("{prefix}\n\n{cleaned}")
+        }
+    };
 }
 
 /// Transcribe a local image file into a text description.
