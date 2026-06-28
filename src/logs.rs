@@ -103,9 +103,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
 CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);";
 
 impl LogStore {
-    /// Open (or create) the log database at `db_path` and run schema migrations.
-    async fn open(db_path: &Path) -> anyhow::Result<Self> {
-        let conn = crate::turso::open_with_schema(db_path, LOGS_SCHEMA).await?;
+    /// Open (or create) the log database at `root/db/logs.db` and run schema migrations.
+    async fn open(root: &Path) -> anyhow::Result<Self> {
+        let conn = crate::turso::open_store(root, "logs", LOGS_SCHEMA).await?;
         Ok(Self { conn })
     }
 
@@ -325,7 +325,7 @@ fn row_to_entry(row: &Row) -> anyhow::Result<LogEntry> {
 pub async fn init_tracing(
     storage_root: &Path,
 ) -> anyhow::Result<(Arc<LogStore>, tokio::sync::broadcast::Sender<String>)> {
-    let store = LogStore::open(&storage_root.join("db/logs.db")).await?;
+    let store = LogStore::open(storage_root).await?;
     LOG_STORE
         .set(store.clone())
         .map_err(|_| anyhow::anyhow!("LOG_STORE already initialized"))?;
@@ -561,8 +561,7 @@ mod tests {
     /// Returns the store and a TempDir that must be held to prevent premature cleanup.
     async fn test_store() -> (Arc<LogStore>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("db/logs.db");
-        let store = Arc::new(LogStore::open(&db_path).await.unwrap());
+        let store = Arc::new(LogStore::open(dir.path()).await.unwrap());
         (store, dir)
     }
 
