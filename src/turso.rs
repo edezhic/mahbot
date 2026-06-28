@@ -430,6 +430,32 @@ impl Connection {
         Self::query_row_impl(&conn, sql, params, map).await
     }
 
+    /// Execute a query that returns zero or one row.
+    ///
+    /// Returns `Ok(Some(val))` if a row is found, `Ok(None)` when no row
+    /// matches (i.e. [`turso::Error::QueryReturnedNoRows`] is caught), or
+    /// `Err` if the query fails for another reason.
+    ///
+    /// This is a convenience wrapper around [`Self::query_row`] that
+    /// eliminates the common `match { Ok(val) => Ok(Some(val)),
+    /// Err(QueryReturnedNoRows) => Ok(None), Err(e) => Err(e.into()) }`
+    /// boilerplate.
+    pub async fn query_optional<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Option<T>>
+    where
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        match self.query_row(sql, params, map).await {
+            Ok(val) => Ok(Some(val)),
+            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Core query_row logic shared by [`Connection::query_row`] and
     /// [`TxGuard::query_row`].  Operates on an already-locked connection.
     /// Returns [`turso::Error::QueryReturnedNoRows`] when no row matches.
@@ -498,6 +524,37 @@ impl TxGuard<'_> {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         Connection::query_row_impl(&self.conn, sql, params, map).await
+    }
+
+    /// Execute a query that returns zero or one row.
+    ///
+    /// Returns `Ok(Some(val))` if a row is found, `Ok(None)` when no row
+    /// matches (i.e. [`turso::Error::QueryReturnedNoRows`] is caught), or
+    /// `Err` if the query fails for another reason.
+    ///
+    /// This is a convenience wrapper around [`Self::query_row`] that
+    /// eliminates the common `match { Ok(val) => Ok(Some(val)),
+    /// Err(QueryReturnedNoRows) => Ok(None), Err(e) => Err(e.into()) }`
+    /// boilerplate.
+    ///
+    /// **Note:** Added for API symmetry with [`Connection::query_optional`].
+    /// No existing callers use this method — it exists so that code working
+    /// inside a transaction has the same optional-row helper available
+    /// without switching back to the `Connection` interface.
+    pub async fn query_optional<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Option<T>>
+    where
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        match self.query_row(sql, params, map).await {
+            Ok(val) => Ok(Some(val)),
+            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Execute a query returning zero or more rows.

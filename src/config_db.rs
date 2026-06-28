@@ -307,9 +307,8 @@ impl ConfigStore {
     // Returns `None` if no row exists for the role.
     async fn get_role_config(&self, role: &str) -> Result<Option<RoleConfig>> {
         let role_owned = role.to_string();
-        match self
-            .conn
-            .query_row(
+        self.conn
+            .query_optional(
                 "SELECT model, reasoning_effort FROM config_role WHERE role = ?1",
                 turso::params![role],
                 |row| {
@@ -324,11 +323,6 @@ impl ConfigStore {
                 },
             )
             .await
-        {
-            Ok(rc) => Ok(Some(rc)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     // Upsert a role config row. Passing `None` for a field sets it to NULL.
@@ -366,9 +360,8 @@ impl ConfigStore {
     // Returns `None` if no row exists for the model.
     async fn get_model_routing(&self, model: &str) -> Result<Option<ModelRouting>> {
         let model_owned = model.to_string();
-        match self
-            .conn
-            .query_row(
+        self.conn
+            .query_optional(
                 "SELECT provider_order, allow_fallbacks FROM config_model_routing WHERE model = ?1",
                 turso::params![model],
                 |row| {
@@ -382,11 +375,6 @@ impl ConfigStore {
                 },
             )
             .await
-        {
-            Ok(mr) => Ok(Some(mr)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     // Upsert a model routing row.

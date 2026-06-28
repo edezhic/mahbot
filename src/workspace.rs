@@ -459,11 +459,9 @@ impl WorkspaceStore {
         params: impl turso::IntoParams + Send + 'static,
     ) -> Result<Option<Workspace>> {
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE {where_clause}");
-        match self.conn.query_row(&sql, params, workspace_from_row).await {
-            Ok(ws) => Ok(Some(ws)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        self.conn
+            .query_optional(&sql, params, workspace_from_row)
+            .await
     }
 
     /// Insert a new workspace and kick off analysis.
@@ -754,19 +752,13 @@ impl WorkspaceStore {
 
     /// Get a single context entry by workspace name and role.
     pub async fn get_context(&self, name: &str, role: &str) -> Result<Option<String>> {
-        match self
-            .conn
-            .query_row(
+        self.conn
+            .query_optional(
                 "SELECT content FROM workspace_contexts WHERE workspace_name = ?1 AND role = ?2",
                 turso::params![name, role],
                 |row| row.get::<String>(0),
             )
             .await
-        {
-            Ok(content) => Ok(Some(content)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// Upsert a single context entry for a workspace and role.

@@ -95,9 +95,8 @@ impl StatsStore {
     /// When multiple rows exist (e.g. multiple flush calls), uses the most
     /// recent row (`ORDER BY id DESC LIMIT 1`).
     pub async fn query_tool_usage(&self, agent_id: &str, tool_name: &str) -> Result<Option<i64>> {
-        match self
-            .conn
-            .query_row(
+        self.conn
+            .query_optional(
                 "SELECT call_count FROM tool_usage \
                  WHERE agent_id = ?1 AND tool_name = ?2 \
                  ORDER BY id DESC LIMIT 1",
@@ -105,11 +104,6 @@ impl StatsStore {
                 |row| row.get::<i64>(COL_TU_CALL_COUNT),
             )
             .await
-        {
-            Ok(count) => Ok(Some(count)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// Build a parameterized WHERE clause and params for tool error queries.
