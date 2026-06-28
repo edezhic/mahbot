@@ -263,28 +263,14 @@ impl ShellState {
                 .spawn_error
                 .as_deref()
                 .unwrap_or("Terminal unavailable");
-            container(
-                column![
-                    text("Terminal Error")
-                        .size(24)
-                        .color(theme::STATUS_ERROR)
-                        .font(theme::FONT_BOLD),
-                    Space::new().height(8),
-                    text(msg).size(14).color(theme::TEXT_SECONDARY),
-                ]
-                .align_x(Alignment::Center)
-                .spacing(16),
+            Self::centered_title_subtitle(
+                "Terminal Error",
+                theme::STATUS_ERROR,
+                msg,
+                14,
+                theme::TEXT_SECONDARY,
+                16,
             )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(8)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..Default::default()
-            })
-            .into()
         };
 
         column![tab_bar, terminal_area]
@@ -296,27 +282,46 @@ impl ShellState {
 
     /// Build a placeholder message when no workspace is selected.
     fn placeholder_view(msg: &str) -> Element<'_, ShellMessage> {
+        Self::centered_title_subtitle("Terminal", theme::ACCENT, msg, 13, theme::TEXT_MUTED, 4)
+    }
+
+    /// Build a centered title + subtitle message display.
+    ///
+    /// The layout wraps both texts in a centered container:
+    ///   <title>          — 24px bold
+    ///   8px spacer
+    ///   <subtitle>       — customizable size
+    ///
+    /// The `spacing` parameter controls the column gap between the two texts.
+    /// The 8px spacer is a fixed element between title and subtitle — the
+    /// total visual gap from title baseline to subtitle baseline is
+    /// the 8px spacer plus the column spacing above/below.
+    fn centered_title_subtitle<'a>(
+        title: &'a str,
+        title_color: iced::Color,
+        subtitle: &'a str,
+        subtitle_size: u32,
+        subtitle_color: iced::Color,
+        spacing: u32,
+    ) -> Element<'a, ShellMessage> {
         container(
             column![
-                text("Terminal")
+                text(title)
                     .size(24)
-                    .color(theme::ACCENT)
+                    .color(title_color)
                     .font(theme::FONT_BOLD),
                 Space::new().height(8),
-                text(msg).size(13).color(theme::TEXT_MUTED),
+                text(subtitle).size(subtitle_size).color(subtitle_color),
             ]
             .align_x(Alignment::Center)
-            .spacing(4),
+            .spacing(spacing),
         )
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(8)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_BASE)),
-            ..Default::default()
-        })
+        .style(theme::base_container_style)
         .into()
     }
 
