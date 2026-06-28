@@ -8,7 +8,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
-use std::time::Duration as StdDuration;
 use tracing::{debug, info, warn};
 
 global_store! {
@@ -25,7 +24,7 @@ global_store! {
 /// Logs per-ticket failures and continues — a ticket that was un-cancelled
 /// between the SELECT and UPDATE is harmlessly skipped.
 pub async fn run_archive_cancelled_loop() {
-    let interval = StdDuration::from_mins(5);
+    let interval = std::time::Duration::from_mins(5);
 
     loop {
         if !crate::shutdown::sleep_or_shutdown(interval).await {
