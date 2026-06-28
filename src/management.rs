@@ -1553,21 +1553,23 @@ fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
 /// [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
 #[allow(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
-    let claim = board().claim_diagnostics(&ticket.id).await;
-    if let Err(e) = &claim {
-        error!(
-            ticket = %ticket.id,
-            error = %e,
-            "Diagnostics claim error — bailing out",
-        );
-        return;
-    }
-    if !claim.unwrap() {
-        warn!(
-            ticket = %ticket.id,
-            "Diagnostics claim failed — ticket already claimed or moved out of InDiagnostics"
-        );
-        return;
+    match board().claim_diagnostics(&ticket.id).await {
+        Err(e) => {
+            error!(
+                ticket = %ticket.id,
+                error = %e,
+                "Diagnostics claim error — bailing out",
+            );
+            return;
+        }
+        Ok(false) => {
+            warn!(
+                ticket = %ticket.id,
+                "Diagnostics claim failed — ticket already claimed or moved out of InDiagnostics"
+            );
+            return;
+        }
+        Ok(true) => {}
     }
 
     // 1. Load diagnostics commands for this workspace.
