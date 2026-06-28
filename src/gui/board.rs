@@ -231,6 +231,28 @@ impl BoardState {
         icon_row
     }
 
+    /// Build a status badge pill for a ticket phase.
+    /// Used on ticket cards and in the modal detail header.
+    /// Derives badge colours from [`theme::ticket_status_color`].
+    fn status_badge<'a>(
+        phase: TicketPhase,
+        text_size: u32,
+        padding: [u16; 2],
+    ) -> Element<'a, BoardMessage> {
+        let (badge_bg, badge_text) = theme::ticket_status_color(phase);
+        container(text(phase.display_name()).size(text_size).color(badge_text))
+            .padding(padding)
+            .style(move |_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(badge_bg)),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..iced::Border::default()
+                },
+                ..container::Style::default()
+            })
+            .into()
+    }
+
     /// Compute how many of this ticket's prerequisites are still unfulfilled.
     /// A prerequisite is considered fulfilled if its ticket cannot be found in the
     /// loaded set (per manager clarification: missing = archived = fulfilled) or if
@@ -585,7 +607,6 @@ impl BoardState {
 
     /// Render a single ticket card: clickable title, ID, status badge, and action icons.
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
-        let (badge_bg, badge_text) = theme::ticket_status_color(ticket.status);
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
         let actions = Self::available_actions(ticket.status);
@@ -593,23 +614,7 @@ impl BoardState {
 
         let (unfulfilled_count, unfulfilled_ids) = self.unfulfilled_prereq_count(ticket);
 
-        let mut badge_row = row![
-            container(
-                text(ticket.status.display_name())
-                    .size(10)
-                    .color(badge_text),
-            )
-            .padding([1, 6])
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(badge_bg)),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..iced::Border::default()
-                },
-                ..container::Style::default()
-            }),
-        ]
-        .spacing(6);
+        let mut badge_row = row![Self::status_badge(ticket.status, 10, [1, 6]),].spacing(6);
 
         if unfulfilled_count > 0 {
             let tooltip_text = format!("Blocked by: {}", unfulfilled_ids.join(", "));
@@ -718,24 +723,37 @@ impl BoardState {
         self.selected_ticket.is_some() || self.selected_loading
     }
 
+    /// Build a centered dialog with a semi-transparent backdrop that closes on click.
+    /// Mirrors the pattern from `settings.rs::modal_with_backdrop` and `mod.rs::modal_overlay`.
+    fn centered_dialog<'a>(
+        content: impl Into<Element<'a, BoardMessage>>,
+        on_backdrop: BoardMessage,
+    ) -> Element<'a, BoardMessage> {
+        let backdrop = iced::widget::mouse_area(
+            container(text(""))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::BACKDROP_COLOR)),
+                    ..container::Style::default()
+                }),
+        )
+        .on_press(on_backdrop);
+
+        let centered = container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center);
+
+        iced::widget::stack([backdrop.into(), centered.into()]).into()
+    }
+
     /// Render the modal overlay for ticket detail.
     /// Includes the empty-case placeholder for `Stack` widget type stability.
     #[must_use]
     pub fn render_modal_overlay(&self) -> Element<'_, BoardMessage> {
         if self.selected_ticket.is_some() || self.selected_loading {
-            let backdrop = iced::widget::mouse_area(
-                container(text(""))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(|_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(iced::Color::from_rgba(
-                            0.0, 0.0, 0.0, 0.5,
-                        ))),
-                        ..container::Style::default()
-                    }),
-            )
-            .on_press(BoardMessage::CloseModal);
-
             if self.selected_loading {
                 let dialog = container(
                     column![
@@ -751,13 +769,7 @@ impl BoardState {
                 .padding(24)
                 .style(theme::dialog_container_style);
 
-                let centered = container(dialog)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Alignment::Center)
-                    .align_y(Alignment::Center);
-
-                iced::widget::stack([backdrop.into(), centered.into()]).into()
+                Self::centered_dialog(dialog, BoardMessage::CloseModal)
             } else {
                 let detail = self.modal_detail();
                 let dialog = container(detail)
@@ -765,13 +777,7 @@ impl BoardState {
                     .padding(24)
                     .style(theme::dialog_container_style);
 
-                let centered = container(dialog)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Alignment::Center)
-                    .align_y(Alignment::Center);
-
-                iced::widget::stack([backdrop.into(), centered.into()]).into()
+                Self::centered_dialog(dialog, BoardMessage::CloseModal)
             }
         } else {
             // Keep Stack widget type stable to prevent MouseArea state
@@ -835,7 +841,6 @@ impl BoardState {
         ticket: &Ticket,
         is_action_disabled: bool,
     ) -> Element<'_, BoardMessage> {
-        let (badge_bg, badge_text) = theme::ticket_status_color(ticket.status);
         let actions = Self::available_actions(ticket.status);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
@@ -920,20 +925,7 @@ impl BoardState {
             text(&ticket.id).size(12).color(theme::TEXT_MUTED),
             Space::new().height(6),
             row![
-                container(
-                    text(ticket.status.display_name())
-                        .size(12)
-                        .color(badge_text)
-                )
-                .padding([2, 8])
-                .style(move |_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(badge_bg)),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..iced::Border::default()
-                    },
-                    ..container::Style::default()
-                }),
+                Self::status_badge(ticket.status, 12, [2, 8]),
                 Space::new().width(Length::Fill),
                 icon_row,
             ]
