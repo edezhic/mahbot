@@ -712,6 +712,11 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // workspace field is correct.
     write_incoming_to_broadcast(&msg).await;
 
+    // Mirror GUI messages to the user's Telegram chats as blockquotes,
+    // so conversation history is readable from both surfaces. This runs
+    // before enrichment so the original user-typed text is preserved.
+    mahbot::channels::mirror_gui_message_to_telegram(&msg).await;
+
     // Personal workspaces do not support the Manager agent — no board
     // pipeline, no maintainer. If the role is Manager and we're in a
     // personal workspace, fall back to Analyst.
