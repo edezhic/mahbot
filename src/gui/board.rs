@@ -100,6 +100,8 @@ pub struct BoardState {
     commit_stats_generation: u64,
     /// Tracks which comment indices are expanded (for diagnostics collapse).
     expanded_comments: HashSet<usize>,
+    /// Stores the last detail-load error message for display in the modal.
+    detail_error: Option<String>,
 }
 
 impl BoardState {
@@ -117,12 +119,14 @@ impl BoardState {
             commit_stats_loading: false,
             commit_stats_generation: 0,
             expanded_comments: HashSet::new(),
+            detail_error: None,
         }
     }
 
     /// Reset all modal-related state fields (close detail modal).
     fn reset_modal(&mut self) {
         self.selected_ticket = None;
+        self.detail_error = None;
         self.description_md = None;
         self.comments_md.clear();
         self.expanded_comments.clear();
@@ -308,6 +312,7 @@ impl BoardState {
             }
             BoardMessage::OpenModal(id) => {
                 self.selected_loading = true;
+                self.detail_error = None;
                 Self::fetch_ticket(id)
             }
             BoardMessage::CloseModal | BoardMessage::Escape => {
@@ -316,6 +321,8 @@ impl BoardState {
             }
             BoardMessage::TicketDetails(ticket) => {
                 let ticket = *ticket;
+                // Defensively clear any stale error; if we got details, we're good.
+                self.detail_error = None;
                 // Cache parsed markdown for description and comments
                 self.description_md = if ticket.description.is_empty() {
                     None
@@ -350,7 +357,8 @@ impl BoardState {
                 }
             }
             BoardMessage::DetailError(e) => {
-                self.load_state.fail(e);
+                self.load_state.fail(e.clone());
+                self.detail_error = Some(e);
                 self.selected_loading = false;
                 Task::none()
             }
@@ -720,7 +728,7 @@ impl BoardState {
     /// Whether a ticket detail modal is currently open (or loading).
     #[must_use]
     pub const fn is_modal_open(&self) -> bool {
-        self.selected_ticket.is_some() || self.selected_loading
+        self.selected_ticket.is_some() || self.selected_loading || self.detail_error.is_some()
     }
 
     /// Build a centered dialog with a semi-transparent backdrop that closes on click.
@@ -753,7 +761,7 @@ impl BoardState {
     /// Includes the empty-case placeholder for `Stack` widget type stability.
     #[must_use]
     pub fn render_modal_overlay(&self) -> Element<'_, BoardMessage> {
-        if self.selected_ticket.is_some() || self.selected_loading {
+        if self.selected_ticket.is_some() || self.selected_loading || self.detail_error.is_some() {
             if self.selected_loading {
                 let dialog = container(
                     column![
@@ -762,6 +770,33 @@ impl BoardState {
                         text("Fetching ticket information\u{2026}")
                             .size(13)
                             .color(theme::TEXT_MUTED),
+                    ]
+                    .align_x(Alignment::Center),
+                )
+                .width(Length::Fixed(400.0))
+                .padding(24)
+                .style(theme::dialog_container_style);
+
+                Self::centered_dialog(dialog, BoardMessage::CloseModal)
+            } else if self.selected_ticket.is_none()
+                && let Some(ref err) = self.detail_error
+            {
+                let dialog = container(
+                    column![
+                        text("Failed to load ticket")
+                            .size(16)
+                            .color(theme::STATUS_ERROR),
+                        Space::new().height(12),
+                        text(err).size(13).color(theme::TEXT_SECONDARY),
+                        Space::new().height(16),
+                        button(
+                            text("Close")
+                                .size(13)
+                                .color(theme::TEXT_PRIMARY)
+                                .align_x(Alignment::Center),
+                        )
+                        .style(theme::button_secondary)
+                        .on_press(BoardMessage::CloseModal),
                     ]
                     .align_x(Alignment::Center),
                 )
