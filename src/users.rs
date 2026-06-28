@@ -536,35 +536,33 @@ pub(crate) mod test_util {
     use super::*;
 
     /// Initialize a test user store with known users and channel bindings.
-    /// Safe to call multiple times — only the first call sets the global store.
+    /// Safe to call multiple times — delegates to [`init_test_stores`] to
+    /// ensure all global stores are initialized, then supplements
+    /// USER_STORE with telegram-specific users and channel bindings.
     pub(crate) async fn init_test_store() {
-        if USER_STORE.get().is_some() {
-            return;
+        // Ensure all global stores are initialized (idempotent OnceCell).
+        crate::util::test::init_test_stores().await;
+
+        // Supplement USER_STORE with telegram-specific test users and
+        // bindings.  Both `add_user` (INSERT OR IGNORE) and `bind_channel`
+        // (INSERT OR REPLACE) are idempotent.
+        if let Some(store) = USER_STORE.get() {
+            store
+                .add_user("alice", Some("full"))
+                .await
+                .expect("failed to add alice to test USER_STORE");
+            store
+                .add_user("bob", None)
+                .await
+                .expect("failed to add bob to test USER_STORE");
+            store
+                .bind_channel("alice", "telegram", "alice")
+                .await
+                .expect("failed to bind alice telegram");
+            store
+                .bind_channel("bob", "telegram", "bob")
+                .await
+                .expect("failed to bind bob telegram");
         }
-        let dir = tempfile::TempDir::new().expect("Failed to create temp dir for test user store");
-        let store = UserStore::open(dir.path())
-            .await
-            .expect("Failed to open test user store");
-        store
-            .add_user("alice", Some("full"))
-            .await
-            .expect("Failed to add alice");
-        store
-            .add_user("bob", None)
-            .await
-            .expect("Failed to add bob");
-        // Bind alice to a Telegram @username
-        store
-            .bind_channel("alice", "telegram", "alice")
-            .await
-            .expect("Failed to bind alice telegram");
-        // Bind bob to a Telegram @username
-        store
-            .bind_channel("bob", "telegram", "bob")
-            .await
-            .expect("Failed to bind bob telegram");
-        // Leak the TempDir so the directory stays alive for the duration of tests.
-        let _ = Box::leak(Box::new(dir));
-        let _ = USER_STORE.set(store);
     }
 }

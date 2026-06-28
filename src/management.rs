@@ -65,9 +65,6 @@ const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 /// Marker appended when diagnostics fail (includes the failed-at label after it).
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
-/// Substring used by circuit breaker trip comments.
-const CIRCUIT_BREAKER_TRIP_MARKER: &str = "Circuit breaker";
-
 /// Role string for diagnostics comments — used both when posting diagnostics
 /// comments and in the circuit breaker filter. Must stay in sync between
 /// both sites to prevent silent miscounting on re-dispatch.
@@ -1707,7 +1704,7 @@ async fn trip_diagnostics_circuit_breaker_if_exceeded(ticket: &Ticket) -> bool {
         },
         |count| {
             format!(
-                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ {CIRCUIT_BREAKER_TRIP_MARKER}: {count} prior diagnostic \
+                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
                  failures. Failing ticket."
             )
         },
