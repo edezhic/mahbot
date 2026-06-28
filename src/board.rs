@@ -3590,11 +3590,14 @@ with a comment explaining why no agent is mid-execution in that state.\
     //
     // These tests verify that the `_tx` variants work correctly within an
     // outer transaction (commit → visible, rollback → invisible).
+    // Rollback assertions verify *absence* of the written data (None, 0, or
+    // the unchanged status) rather than checking for different wrong values.
     //
-    // Each pair (commit/rollback) shares an `_{name}_inner(should_commit: bool)`
-    // helper that uses a single set of test data values.  Rollback assertions
-    // verify *absence* of the written data rather than checking for different
-    // (wrong) values.
+    // Each commit/rollback pair shares a single `_{name}_inner(should_commit: bool)`
+    // helper and a consolidated test function that runs both cases in a loop.
+    // Labeled assertion messages distinguished by commit_label() preserve
+    // failure granularity.  This pattern (for-loop over [false, true]) mirrors
+    // the existing test_parse_prereqs precedent below.
 
     /// Shared helper: commit or rollback the given transaction.
     async fn commit_or_rollback(tx: TxGuard<'_>, should_commit: bool) {
@@ -3605,7 +3608,13 @@ with a comment explaining why no agent is mid-execution in that state.\
         }
     }
 
+    /// Human-readable label for assertion messages.
+    fn commit_label(should_commit: bool) -> &'static str {
+        if should_commit { "commit" } else { "rollback" }
+    }
+
     async fn set_commit_info_tx_inner(should_commit: bool) {
+        let label = commit_label(should_commit);
         let (store, _tmp, id) = setup().await;
 
         let tx = store.conn.begin_tx().await.unwrap();
@@ -3618,29 +3627,36 @@ with a comment explaining why no agent is mid-execution in that state.\
         if should_commit {
             assert_eq!(
                 ticket.commit_hash.as_deref(),
-                Some("abcdef0123456789abcdef0123456789abcd0123")
+                Some("abcdef0123456789abcdef0123456789abcd0123"),
+                "({label}) commit_hash",
             );
-            assert_eq!(ticket.lines_added, Some(10));
-            assert_eq!(ticket.lines_removed, Some(5));
+            assert_eq!(ticket.lines_added, Some(10), "({label}) lines_added");
+            assert_eq!(ticket.lines_removed, Some(5), "({label}) lines_removed");
         } else {
-            // After rollback, commit info should not be visible.
-            assert_eq!(ticket.commit_hash, None);
-            assert_eq!(ticket.lines_added, None);
-            assert_eq!(ticket.lines_removed, None);
+            assert_eq!(
+                ticket.commit_hash, None,
+                "({label}) commit_hash after rollback"
+            );
+            assert_eq!(
+                ticket.lines_added, None,
+                "({label}) lines_added after rollback"
+            );
+            assert_eq!(
+                ticket.lines_removed, None,
+                "({label}) lines_removed after rollback"
+            );
         }
     }
 
     #[tokio::test]
-    async fn test_set_commit_info_tx_commit() {
-        set_commit_info_tx_inner(true).await;
-    }
-
-    #[tokio::test]
-    async fn test_set_commit_info_tx_rollback() {
-        set_commit_info_tx_inner(false).await;
+    async fn test_set_commit_info_tx() {
+        for should_commit in [false, true] {
+            set_commit_info_tx_inner(should_commit).await;
+        }
     }
 
     async fn add_comment_tx_inner(should_commit: bool) {
+        let label = commit_label(should_commit);
         let (store, _tmp, id) = setup().await;
 
         let tx = store.conn.begin_tx().await.unwrap();
@@ -3651,25 +3667,26 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         let comments = store.get_comments(&id).await.expect("get comments");
         if should_commit {
-            assert_eq!(comments.len(), 1);
-            assert_eq!(comments[0].role, "system");
-            assert_eq!(comments[0].content, "transactional comment");
+            assert_eq!(comments.len(), 1, "({label}) comments.len");
+            assert_eq!(comments[0].role, "system", "({label}) comment role");
+            assert_eq!(
+                comments[0].content, "transactional comment",
+                "({label}) comment content"
+            );
         } else {
-            assert_eq!(comments.len(), 0);
+            assert_eq!(comments.len(), 0, "({label}) comments.len after rollback");
         }
     }
 
     #[tokio::test]
-    async fn test_add_comment_tx_commit() {
-        add_comment_tx_inner(true).await;
-    }
-
-    #[tokio::test]
-    async fn test_add_comment_tx_rollback() {
-        add_comment_tx_inner(false).await;
+    async fn test_add_comment_tx() {
+        for should_commit in [false, true] {
+            add_comment_tx_inner(should_commit).await;
+        }
     }
 
     async fn transition_to_tx_inner(should_commit: bool) {
+        let label = commit_label(should_commit);
         let (store, _tmp, id) = setup().await;
 
         // Start in QaPassed.
@@ -3692,23 +3709,25 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         let status = crate::util::test::expect_ticket_status(&store, &id).await;
         if should_commit {
-            assert_eq!(status, TicketPhase::Done);
+            assert_eq!(status, TicketPhase::Done, "({label}) status");
         } else {
-            assert_eq!(status, TicketPhase::QaPassed);
+            assert_eq!(
+                status,
+                TicketPhase::QaPassed,
+                "({label}) status after rollback"
+            );
         }
     }
 
     #[tokio::test]
-    async fn test_transition_to_tx_commit() {
-        transition_to_tx_inner(true).await;
-    }
-
-    #[tokio::test]
-    async fn test_transition_to_tx_rollback() {
-        transition_to_tx_inner(false).await;
+    async fn test_transition_to_tx() {
+        for should_commit in [false, true] {
+            transition_to_tx_inner(should_commit).await;
+        }
     }
 
     async fn transactional_triple_write_inner(should_commit: bool) {
+        let label = commit_label(should_commit);
         // Exercise the full pattern used by commit_and_transition_ticket:
         // all three _tx writes in one transaction → commit → all visible
         // (or rollback → none persist).
@@ -3742,27 +3761,35 @@ with a comment explaining why no agent is mid-execution in that state.\
             // All three changes should be visible.
             assert_eq!(
                 ticket.commit_hash.as_deref(),
-                Some("abcdef0123456789abcdef0123456789abcd0123")
+                Some("abcdef0123456789abcdef0123456789abcd0123"),
+                "({label}) commit_hash",
             );
-            assert_eq!(ticket.status, TicketPhase::Done);
-            assert_eq!(comments.len(), 1);
-            assert_eq!(comments[0].content, "triple write comment");
+            assert_eq!(ticket.status, TicketPhase::Done, "({label}) status");
+            assert_eq!(comments.len(), 1, "({label}) comments.len");
+            assert_eq!(
+                comments[0].content, "triple write comment",
+                "({label}) comment content"
+            );
         } else {
             // None of the three changes should be visible.
-            assert_eq!(ticket.commit_hash, None);
-            assert_eq!(ticket.status, TicketPhase::QaPassed);
-            assert_eq!(comments.len(), 0);
+            assert_eq!(
+                ticket.commit_hash, None,
+                "({label}) commit_hash after rollback"
+            );
+            assert_eq!(
+                ticket.status,
+                TicketPhase::QaPassed,
+                "({label}) status after rollback",
+            );
+            assert_eq!(comments.len(), 0, "({label}) comments.len after rollback");
         }
     }
 
     #[tokio::test]
-    async fn test_transactional_triple_write_commit() {
-        transactional_triple_write_inner(true).await;
-    }
-
-    #[tokio::test]
-    async fn test_transactional_triple_write_rollback() {
-        transactional_triple_write_inner(false).await;
+    async fn test_transactional_triple_write() {
+        for should_commit in [false, true] {
+            transactional_triple_write_inner(should_commit).await;
+        }
     }
 
     // ── parse_prereqs unit tests ──
