@@ -895,6 +895,23 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
     Ok(result)
 }
 
+/// Validate file content for size and binary content.
+///
+/// Returns `Ok(())` if the bytes pass size and null-byte checks,
+/// or `Err` with a user-facing error message.
+fn validate_file_content(bytes: &[u8]) -> Result<(), String> {
+    if (bytes.len() as u64) > MAX_FILE_SIZE {
+        return Err(format!(
+            "File too large ({} bytes, max {MAX_FILE_SIZE})",
+            bytes.len()
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err("Binary file detected (contains null bytes)".to_string());
+    }
+    Ok(())
+}
+
 /// Load a file's contents from disk with detection of indent style, line
 /// ending, and trailing newline.
 async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
@@ -931,14 +948,15 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
         }
     };
 
-    // Null-byte pre-check and UTF-8 validation for binary detection.
-    if bytes.contains(&0) {
+    // Size and binary content validation.
+    if let Err(e) = validate_file_content(&bytes) {
         return FileLoadMsg {
             path: full_path,
             r#gen,
-            result: Err("Binary file detected (contains null bytes)".to_string()),
+            result: Err(e),
         };
     }
+    // UTF-8 validation for binary detection.
     let text = match String::from_utf8(bytes.clone()) {
         Ok(t) => t,
         Err(_) => {
@@ -3730,43 +3748,15 @@ impl EditorState {
                 // Start the async read.
                 Task::perform(
                     async move {
-                        match tokio::fs::read_to_string(&path).await {
-                            Ok(text) => {
-                                // Apply size/binary checks matching load_file_data.
-                                let bytes = text.as_bytes();
-                                if (bytes.len() as u64) > MAX_FILE_SIZE {
-                                    EditorMessage::FileReloaded {
-                                        path,
-                                        result: Err(format!(
-                                            "File too large ({} bytes, max {MAX_FILE_SIZE})",
-                                            bytes.len()
-                                        )),
-                                        cursor_line: cursor.line,
-                                        cursor_col: cursor.column,
-                                    }
-                                } else if bytes.contains(&0) {
-                                    EditorMessage::FileReloaded {
-                                        path,
-                                        result: Err("Binary file detected (contains null bytes)"
-                                            .to_string()),
-                                        cursor_line: cursor.line,
-                                        cursor_col: cursor.column,
-                                    }
-                                } else {
-                                    EditorMessage::FileReloaded {
-                                        path,
-                                        result: Ok(text),
-                                        cursor_line: cursor.line,
-                                        cursor_col: cursor.column,
-                                    }
-                                }
-                            }
-                            Err(e) => EditorMessage::FileReloaded {
-                                path,
-                                result: Err(format!("Cannot read file: {e}")),
-                                cursor_line: cursor.line,
-                                cursor_col: cursor.column,
-                            },
+                        let result = match tokio::fs::read_to_string(&path).await {
+                            Ok(text) => validate_file_content(text.as_bytes()).map(|()| text),
+                            Err(e) => Err(format!("Cannot read file: {e}")),
+                        };
+                        EditorMessage::FileReloaded {
+                            path,
+                            result,
+                            cursor_line: cursor.line,
+                            cursor_col: cursor.column,
                         }
                     },
                     |msg| msg,
@@ -3914,7 +3904,7 @@ impl EditorState {
                     let loaded_text = if let Some(dirty) = record.dirty_content.clone() {
                         Some(dirty)
                     } else if let Ok(bytes) = tokio::fs::read(&file_path).await {
-                        if (bytes.len() as u64) <= MAX_FILE_SIZE && !bytes.contains(&0) {
+                        if validate_file_content(&bytes).is_ok() {
                             String::from_utf8(bytes).ok()
                         } else {
                             None
@@ -6312,6 +6302,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── validate_file_content ─────────────────────────────────────
+
+    #[test]
+    fn test_validate_file_content_empty() {
+        assert!(validate_file_content(b"").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_content_text() {
+        assert!(validate_file_content(b"hello world").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_content_unicode() {
+        assert!(validate_file_content("Привет мир 👋".as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_content_too_large() {
+        let big = vec![b'a'; (MAX_FILE_SIZE as usize) + 1];
+        let err = validate_file_content(&big).unwrap_err();
+        assert!(err.starts_with("File too large"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_validate_file_content_null_bytes() {
+        let bytes = b"hello\0world";
+        let err = validate_file_content(bytes).unwrap_err();
+        assert!(
+            err.starts_with("Binary file detected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_file_content_both_conditions_reports_size_first() {
+        let mut big_with_null = vec![b'a'; (MAX_FILE_SIZE as usize) + 1];
+        big_with_null.push(0);
+        let err = validate_file_content(&big_with_null).unwrap_err();
+        assert!(
+            err.starts_with("File too large"),
+            "size check should be reported before null-byte check: {err}"
+        );
     }
 
     #[test]
