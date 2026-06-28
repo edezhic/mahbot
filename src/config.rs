@@ -25,6 +25,11 @@ pub struct RoleConfig {
     pub reasoning_effort: Option<String>,
 }
 
+// NOTE: RoleConfig::upsert and ModelRouting::upsert are structurally identical
+// by design. The ~13 lines of shared find-or-push logic are below the abstraction
+// threshold — a trait, macro, or generic function would add more conceptual surface
+// area than the duplication it eliminates. Keep both methods direct and concrete.
+
 impl RoleConfig {
     /// Find-or-push: update a subset of fields on an existing entry matching
     /// `role`, or push a new entry (all fields defaulted to `None`).
@@ -1198,7 +1203,8 @@ mod tests {
 
     // ── ModelRouting upsert tests ────────────────────────────────
     //
-    // Same three-scenario structure as the RoleConfig test above.
+    // Same three-scenario structure as the RoleConfig test above (see the
+    // design note on `impl RoleConfig` for why these are duplicated).
 
     #[test]
     fn upsert_model_routing_fields() {
