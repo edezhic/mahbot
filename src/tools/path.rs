@@ -509,7 +509,7 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// escapes. The caller is responsible for that post-canonicalization validation
 /// (see [`resolve_read_target`] and [`resolve_write_target`]).
 #[must_use]
-pub(crate) fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
+fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
     if path.is_empty() {
         return true; // empty after trim → relative, safe
@@ -554,7 +554,7 @@ pub(crate) fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> b
 
 /// Resolve a user path segment against `workspace_root`.
 #[must_use]
-pub(crate) fn resolve_tool_path_with_base(path: &str, workspace_root: &Path) -> PathBuf {
+fn resolve_tool_path_with_base(path: &str, workspace_root: &Path) -> PathBuf {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "~" {
         return workspace_root.to_path_buf();
