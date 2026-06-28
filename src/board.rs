@@ -3190,7 +3190,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("setup");
 
         // Supersede it
-        let new_id = TicketBuilder::new(&store, ws)
+        let new_id = TicketBuilder::new(store, ws)
             .title("New title")
             .desc("New desc")
             .supersede(&old_id)
@@ -3198,7 +3198,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("supersede");
 
         // Old ticket is cancelled and points forward to the new ticket
-        let old = expect_ticket(&store, &old_id).await;
+        let old = expect_ticket(store, &old_id).await;
         assert_superseded_ticket(&old);
         assert_eq!(
             old.superseded_by.as_deref(),
@@ -3207,7 +3207,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
 
         // New ticket is in Backlog and links to old
-        let new = expect_ticket(&store, &new_id).await;
+        let new = expect_ticket(store, &new_id).await;
         assert_eq!(new.status, TicketPhase::Backlog);
         assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
         assert_eq!(new.title, "New title");
@@ -3220,13 +3220,13 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // Create ticket A (will be superseded) and ticket C (independent).
-        let a_id = TicketBuilder::new(&store, ws.clone())
+        let a_id = TicketBuilder::new(store, ws.clone())
             .title("A")
             .desc("old")
             .create()
             .await
             .expect("create A");
-        let c_id = TicketBuilder::new(&store, ws.clone())
+        let c_id = TicketBuilder::new(store, ws.clone())
             .title("C")
             .desc("other")
             .create()
@@ -3234,7 +3234,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("create C");
 
         // Create ticket B that depends on both A and C.
-        let b_id = TicketBuilder::new(&store, ws.clone())
+        let b_id = TicketBuilder::new(store, ws.clone())
             .title("B")
             .desc("dep on A and C")
             .prereqs(&[a_id.clone(), c_id.clone()])
@@ -3243,7 +3243,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("create B");
 
         // Create ticket D with no prerequisites — should be untouched.
-        let d_id = TicketBuilder::new(&store, ws.clone())
+        let d_id = TicketBuilder::new(store, ws.clone())
             .title("D")
             .desc("no deps")
             .create()
@@ -3251,7 +3251,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("create D");
 
         // Supersede A → A2.
-        let supersede_id = TicketBuilder::new(&store, ws)
+        let supersede_id = TicketBuilder::new(store, ws)
             .title("A2")
             .desc("refined")
             .supersede(&a_id)
@@ -3395,7 +3395,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
 
         // Verify old is cancelled
-        let old = expect_ticket(&store, &old_id).await;
+        let old = expect_ticket(store, &old_id).await;
         assert_superseded_ticket(&old);
     }
 
@@ -3417,17 +3417,17 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("cancel");
 
         // Superseding an already-cancelled ticket should work
-        let new_id = TicketBuilder::new(&store, ws)
+        let new_id = TicketBuilder::new(store, ws)
             .title("Refined")
             .supersede(&old_id)
             .await
             .expect("supersede already-cancelled");
 
-        let new = expect_ticket(&store, &new_id).await;
+        let new = expect_ticket(store, &new_id).await;
         assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
 
         // Old ticket should also be archived immediately.
-        let old = expect_ticket(&store, &old_id).await;
+        let old = expect_ticket(store, &old_id).await;
         assert_superseded_ticket(&old);
     }
 
@@ -4585,7 +4585,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // Create an old ticket first
-        let old_id = TicketBuilder::new(&store, ws.clone())
+        let old_id = TicketBuilder::new(store, ws.clone())
             .title("Old ticket")
             .desc("old desc")
             .phase(TicketPhase::Backlog)
@@ -4595,7 +4595,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Supersede it — new ticket gets supersedes = old_id, old ticket gets
         // superseded_by = new_id and is archived.
-        let new_id = TicketBuilder::new(&store, ws)
+        let new_id = TicketBuilder::new(store, ws)
             .title("New ticket")
             .desc("new desc")
             .supersede(&old_id)
@@ -4603,7 +4603,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("supersede");
 
         // Check the new ticket shows Supersedes
-        let new_ticket = expect_ticket(&store, &new_id).await;
+        let new_ticket = expect_ticket(store, &new_id).await;
         let new_display = new_ticket.detailed_display();
         assert!(
             new_display.contains(&format!("Supersedes: {old_id}")),
@@ -4611,7 +4611,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
 
         // Check the old ticket shows Superseded by + Archived
-        let old_ticket = expect_ticket(&store, &old_id).await;
+        let old_ticket = expect_ticket(store, &old_id).await;
         let old_display = old_ticket.detailed_display();
         assert!(
             old_display.contains(&format!("Superseded by: {new_id}")),
