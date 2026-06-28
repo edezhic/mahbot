@@ -636,8 +636,7 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 /// Run the given action for each ticket in `phase` for the named workspace.
 ///
 /// Lists tickets via [`BoardStore::list_tickets_in_phase`], iterates, and logs
-/// a structured error on failure. Replaces the identical 14-line match blocks
-/// that previously appeared for Diagnostics and QaPassed dispatch.
+/// a structured error on failure.
 async fn for_tickets_in_phase(phase: TicketPhase, ws_name: &str, mut action: impl FnMut(Ticket)) {
     match board().list_tickets_in_phase(phase, ws_name).await {
         Ok(tickets) => {
@@ -680,7 +679,7 @@ async fn dispatch_unassigned_in_phase(
 /// because claims are atomic per-workspace and `require_clear_pipeline` gates
 /// are checked within each workspace independently.
 async fn poll_round() -> anyhow::Result<()> {
-    let board = crate::board::store();
+    let board = board();
 
     let workspaces = match crate::workspace::store().list().await {
         Ok(ws_list) => ws_list,
