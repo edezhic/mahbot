@@ -17,7 +17,6 @@ crate::define_store! {
 }
 
 const SCHEMA: &str = "\
-DROP TABLE IF EXISTS tool_usage;
 CREATE TABLE IF NOT EXISTS tool_calls (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       TEXT NOT NULL,
