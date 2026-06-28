@@ -13,8 +13,9 @@ use iced::mouse::ScrollDelta;
 
 use super::highlight::{self, FileHighlights, HighlightLanguage};
 use super::text_rendering::{
-    GUTTER_FONT_SIZE, MAX_HIGHLIGHT_SIZE, compute_total_height, font_metrics, gutter_clip_rect,
-    iced_color_to_cosmic, push_or_merge, reshape_and_shape, text_area_rect, with_font_system,
+    GUTTER_FONT_SIZE, MAX_HIGHLIGHT_SIZE, compute_total_height, draw_highlight_background,
+    font_metrics, gutter_clip_rect, iced_color_to_cosmic, push_or_merge, reshape_and_shape,
+    text_area_rect, with_font_system,
 };
 use crate::util::UnwrapPoison;
 
@@ -2474,22 +2475,9 @@ where
                             ..cosmic_text::Cursor::default()
                         },
                     ) {
-                        let rect = Rectangle {
-                            x: text_x + hl.0,
-                            y: text_y + run.line_top,
-                            width: hl.1,
-                            height: run.line_height,
-                        };
-                        if let Some(clipped) = text_clip.intersection(&rect) {
-                            renderer.fill_quad(
-                                renderer::Quad {
-                                    bounds: clipped,
-                                    border: iced::Border::default(),
-                                    ..renderer::Quad::default()
-                                },
-                                color,
-                            );
-                        }
+                        draw_highlight_background(
+                            renderer, text_clip, text_x, text_y, &run, hl.0, hl.1, color,
+                        );
                     }
                     // Match may span multiple visual runs on soft-wrapped
                     // lines — don't break, continue checking all runs for
@@ -2522,22 +2510,16 @@ where
                             ..cosmic_text::Cursor::default()
                         },
                     ) {
-                        let rect = Rectangle {
-                            x: text_x + hl.0,
-                            y: text_y + run.line_top,
-                            width: hl.1,
-                            height: run.line_height,
-                        };
-                        if let Some(clipped) = text_clip.intersection(&rect) {
-                            renderer.fill_quad(
-                                renderer::Quad {
-                                    bounds: clipped,
-                                    border: iced::Border::default(),
-                                    ..renderer::Quad::default()
-                                },
-                                bracket_color,
-                            );
-                        }
+                        draw_highlight_background(
+                            renderer,
+                            text_clip,
+                            text_x,
+                            text_y,
+                            &run,
+                            hl.0,
+                            hl.1,
+                            bracket_color,
+                        );
                     }
                     break;
                 }
@@ -2578,22 +2560,16 @@ where
                         ..cosmic_text::Cursor::default()
                     },
                 ) {
-                    let sel_rect = Rectangle {
-                        x: text_x + highlight.0,
-                        y: text_y + run.line_top,
-                        width: highlight.1,
-                        height: run.line_height,
-                    };
-                    if let Some(clipped) = text_clip.intersection(&sel_rect) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: clipped,
-                                border: iced::Border::default(),
-                                ..renderer::Quad::default()
-                            },
-                            theme::ACCENT_DIM,
-                        );
-                    }
+                    draw_highlight_background(
+                        renderer,
+                        text_clip,
+                        text_x,
+                        text_y,
+                        &run,
+                        highlight.0,
+                        highlight.1,
+                        theme::ACCENT_DIM,
+                    );
                 }
             }
         }

@@ -7,6 +7,7 @@
 //! All items are `pub(crate)` except [`font_metrics`] which is `pub`.
 
 use iced::advanced::graphics::text::cosmic_text;
+use iced::advanced::renderer;
 use iced::{Color, Rectangle};
 
 use crate::util::UnwrapPoison;
@@ -148,6 +149,45 @@ pub(crate) fn gutter_clip_rect(
         y: bounds.y + padding,
         width: gutter_width,
         height: text_area_height,
+    }
+}
+
+// ── Highlight background rendering ────────────────────────────────
+
+/// Draw a highlighted background rectangle for a [`LayoutRun`] behind text,
+/// clipped to the text area.  Used by both the editor and diff widgets for
+/// selection, find-match, and bracket-matching highlights.
+///
+/// * `x_offset` / `width` — the highlight position and span returned by
+///   [`LayoutRun::highlight`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_highlight_background<Renderer>(
+    renderer: &mut Renderer,
+    text_clip: Rectangle,
+    text_x: f32,
+    text_y: f32,
+    run: &cosmic_text::LayoutRun,
+    x_offset: f32,
+    width: f32,
+    color: Color,
+) where
+    Renderer: iced::advanced::Renderer,
+{
+    let rect = Rectangle {
+        x: text_x + x_offset,
+        y: text_y + run.line_top,
+        width,
+        height: run.line_height,
+    };
+    if let Some(clipped) = text_clip.intersection(&rect) {
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: clipped,
+                border: iced::Border::default(),
+                ..renderer::Quad::default()
+            },
+            color,
+        );
     }
 }
 
