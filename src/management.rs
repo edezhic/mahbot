@@ -503,16 +503,12 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
 
 /// Verifier-specific metadata, embedded directly in the [`PollPhase::VerifierCheck`]
 /// variant and used as the parameter to [`dispatch_verifiers`]. Carries all
-/// information needed for dispatch (role, source phase, prompt paths, phase
-/// lifecycle) so no round-trip through [`PollPhase::info()`] is required.
+/// information needed for dispatch (role, prompt paths, phase lifecycle) so
+/// no round-trip through [`PollPhase::info()`] is required.
 #[derive(Copy, Clone)]
 struct VerifierInfo {
     role: Role,
     log_label: &'static str,
-    /// The ticket phase that triggers this verifier dispatch
-    /// (e.g. [`TicketPhase::DiagnosticsDone`] for reviewers,
-    /// [`TicketPhase::Reviewed`] for QA).
-    source: TicketPhase,
     success_phase: TicketPhase,
     /// The ticket phase during which this verifier is active — the phase
     /// a ticket must be in for the verifier to run (e.g.
@@ -525,7 +521,6 @@ struct VerifierInfo {
 const REVIEWER_VI: VerifierInfo = VerifierInfo {
     role: Role::Reviewer,
     log_label: "Reviewers",
-    source: TicketPhase::DiagnosticsDone,
     success_phase: TicketPhase::Reviewed,
     active_phase: TicketPhase::InReview,
     prompt_template: "review.md",
@@ -535,7 +530,6 @@ const REVIEWER_VI: VerifierInfo = VerifierInfo {
 const QA_VI: VerifierInfo = VerifierInfo {
     role: Role::Qa,
     log_label: "QA",
-    source: TicketPhase::Reviewed,
     success_phase: TicketPhase::QaPassed,
     active_phase: TicketPhase::InQa,
     prompt_template: "qa.md",
@@ -548,7 +542,6 @@ const QA_VI: VerifierInfo = VerifierInfo {
 /// match — adding any phase requires one row in that match.
 #[derive(Copy, Clone)]
 struct PollPhaseInfo {
-    source: TicketPhase,
     claim_target: TicketPhase,
     /// Whether this phase requires a clear pipeline (only one ticket at a
     /// time through development → review → QA).
@@ -561,8 +554,7 @@ struct PollPhaseInfo {
 ///
 /// Phase metadata lives in [`PollPhase::info()`] — a single match expression
 /// that returns all phase-specific data. The `VerifierCheck` variant carries
-/// its `VerifierInfo` inline, with the `source` phase encoded in the data
-/// rather than the variant identity (so reviewer and QA phases share one variant).
+/// its `VerifierInfo` inline (so reviewer and QA phases share one variant).
 #[derive(Copy, Clone)]
 enum PollPhase {
     BacklogAnalysis,
@@ -577,36 +569,31 @@ impl PollPhase {
     fn info(self) -> PollPhaseInfo {
         match self {
             Self::BacklogAnalysis => PollPhaseInfo {
-                source: TicketPhase::Backlog,
                 claim_target: TicketPhase::Analysis,
                 require_clear_pipeline: false,
                 role_label: Role::Analyst.as_str(),
             },
             Self::EngineerDevelopment => PollPhaseInfo {
-                source: TicketPhase::ReadyForDevelopment,
                 claim_target: TicketPhase::InDevelopment,
                 require_clear_pipeline: true,
                 role_label: Role::Engineer.as_str(),
             },
             Self::SanitationCheck => PollPhaseInfo {
-                source: TicketPhase::QaPassed,
                 claim_target: TicketPhase::InSanitation,
                 // Note: claim_target is consumed by spawn_dispatch's
-                // panic-recovery transition (target_phase → Failed); source is
-                // metadata-only since SanitationCheck is excluded from CLAIM_PHASES
-                // and the actual QaPassed→InSanitation transition happens via
+                // panic-recovery transition (target_phase → Failed).
+                // SanitationCheck is excluded from CLAIM_PHASES since the
+                // actual QaPassed→InSanitation transition happens via
                 // raw SQL in handle_qa_passed.
                 require_clear_pipeline: false,
                 role_label: Role::Sanitation.as_str(),
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
-                source: TicketPhase::InDiagnostics,
                 claim_target: TicketPhase::InDiagnostics,
                 require_clear_pipeline: false,
                 role_label: DIAGNOSTICS_ROLE,
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
-                source: vi.source,
                 claim_target: vi.active_phase,
                 require_clear_pipeline: false,
                 role_label: vi.role.as_str(),
@@ -616,6 +603,12 @@ impl PollPhase {
 }
 
 /// Pipeline phases that use atomic source→claim_target claim transitions.
+///
+/// Each tuple is `(source_phase, poll_phase)` — the `source_phase` is the
+/// expected current phase of the ticket before claiming, and `poll_phase`
+/// encodes the target phase and dispatch metadata. Encoding the source phase
+/// in the tuple rather than inside [`PollPhaseInfo`] eliminates a field with
+/// dual semantics (it was metadata-only for non-claim phases).
 ///
 /// DiagnosticsCheck and SanitationCheck are intentionally excluded — they
 /// keep the ticket in InDiagnostics/InSanitation while running and guard
@@ -628,11 +621,17 @@ impl PollPhase {
 /// Planning tickets require Manager judgment and are never picked up
 /// automatically — the Manager (or user) must manually advance or cancel
 /// them. This is by design, not an omission.
-const CLAIM_PHASES: &[PollPhase] = &[
-    PollPhase::BacklogAnalysis,
-    PollPhase::EngineerDevelopment,
-    PollPhase::VerifierCheck(REVIEWER_VI),
-    PollPhase::VerifierCheck(QA_VI),
+const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
+    (TicketPhase::Backlog, PollPhase::BacklogAnalysis),
+    (
+        TicketPhase::ReadyForDevelopment,
+        PollPhase::EngineerDevelopment,
+    ),
+    (
+        TicketPhase::DiagnosticsDone,
+        PollPhase::VerifierCheck(REVIEWER_VI),
+    ),
+    (TicketPhase::Reviewed, PollPhase::VerifierCheck(QA_VI)),
 ];
 
 /// Run the given action for each ticket in `phase` for the named workspace.
@@ -704,14 +703,14 @@ async fn poll_round() -> anyhow::Result<()> {
         // Diagnostics/QaPassed (which handle their own errors independently).
         // A DB-down workspace won't block other workspaces; a transient claim
         // failure won't generate log noise for every remaining phase.
-        for &phase in CLAIM_PHASES {
+        for &(source, phase) in CLAIM_PHASES {
             if ws.paused && matches!(phase, PollPhase::EngineerDevelopment) {
                 continue;
             }
             let info = phase.info();
             let ticket = match board
                 .claim_ticket_in_workspace(
-                    info.source,
+                    source,
                     info.claim_target,
                     &ws.name,
                     info.require_clear_pipeline,
@@ -721,8 +720,8 @@ async fn poll_round() -> anyhow::Result<()> {
                 Ok(Some(t)) => {
                     // Buffer the claim transition. The returned ticket already
                     // has status = info.claim_target (from SQL RETURNING), so record
-                    // the transition from info.source.
-                    ticket_buffer::push(&ws.name, &t.id, info.source, t.status);
+                    // the transition from source.
+                    ticket_buffer::push(&ws.name, &t.id, source, t.status);
                     t
                 }
                 Ok(None) => continue,
