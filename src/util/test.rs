@@ -82,6 +82,28 @@ pub async fn expect_ticket_status(store: &BoardStore, id: &str) -> TicketPhase {
         .expect("expected ticket status to exist")
 }
 
+/// Assert that a ticket has been superseded: its status is `Cancelled`,
+/// it has no assignee, and it is archived immediately.
+///
+/// This checks the minimum invariants set atomically by
+/// [`BoardStore::supersede_and_create`]. Individual tests MAY also assert
+/// additional fields (e.g. `superseded_by`) as needed.
+///
+/// # Panics
+///
+/// Panics if any of the assertions fail.
+pub fn assert_superseded_ticket(ticket: &Ticket) {
+    assert_eq!(ticket.status, TicketPhase::Cancelled);
+    assert!(
+        ticket.assigned_to.is_none(),
+        "superseded ticket should have no assignee"
+    );
+    assert!(
+        ticket.is_archived,
+        "superseded ticket should be archived immediately"
+    );
+}
+
 /// Builder for creating test tickets with common defaults.
 ///
 /// Defaults: `desc="desc"`, `phase=Backlog`, `prerequisites=[]`, `reporter="test"`,

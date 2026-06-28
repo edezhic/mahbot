@@ -1779,6 +1779,7 @@ mod tests {
     use crate::Role;
     use crate::Tool;
     use crate::util::test::TicketBuilder;
+    use crate::util::test::assert_superseded_ticket;
     use crate::util::test::expect_ticket;
     use crate::util::test::init_test_stores;
     use crate::workspace::test_ws;
@@ -3197,25 +3198,16 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("supersede");
 
         // Old ticket is cancelled and points forward to the new ticket
-        let old = store
-            .get_ticket(&old_id)
-            .await
-            .expect("get old")
-            .expect("old exists");
-        assert_eq!(old.status, TicketPhase::Cancelled);
-        assert!(old.assigned_to.is_none());
-        assert_eq!(old.superseded_by.as_deref(), Some(new_id.as_str()));
-        assert!(
-            old.is_archived,
-            "superseded ticket should be archived immediately"
+        let old = expect_ticket(&store, &old_id).await;
+        assert_superseded_ticket(&old);
+        assert_eq!(
+            old.superseded_by.as_deref(),
+            Some(new_id.as_str()),
+            "superseded ticket should point to the new ticket"
         );
 
         // New ticket is in Backlog and links to old
-        let new = store
-            .get_ticket(&new_id)
-            .await
-            .expect("get new")
-            .expect("new exists");
+        let new = expect_ticket(&store, &new_id).await;
         assert_eq!(new.status, TicketPhase::Backlog);
         assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
         assert_eq!(new.title, "New title");
@@ -3403,16 +3395,8 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
 
         // Verify old is cancelled
-        let old = store
-            .get_ticket(&old_id)
-            .await
-            .expect("get old")
-            .expect("old exists");
-        assert_eq!(old.status, TicketPhase::Cancelled);
-        assert!(
-            old.is_archived,
-            "superseded ticket should be archived immediately"
-        );
+        let old = expect_ticket(&store, &old_id).await;
+        assert_superseded_ticket(&old);
     }
 
     #[tokio::test]
@@ -3439,23 +3423,12 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("supersede already-cancelled");
 
-        let new = store
-            .get_ticket(&new_id)
-            .await
-            .expect("get new")
-            .expect("new exists");
+        let new = expect_ticket(&store, &new_id).await;
         assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
 
         // Old ticket should also be archived immediately.
-        let old = store
-            .get_ticket(&old_id)
-            .await
-            .expect("get old")
-            .expect("old exists");
-        assert!(
-            old.is_archived,
-            "superseded ticket should be archived immediately"
-        );
+        let old = expect_ticket(&store, &old_id).await;
+        assert_superseded_ticket(&old);
     }
 
     // ── set_commit_info ───────────────────────────────────────────────
