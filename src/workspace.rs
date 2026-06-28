@@ -69,61 +69,47 @@ CREATE TABLE IF NOT EXISTS editor_tabs (
     PRIMARY KEY (workspace_name, file_path)
 );";
 
-/// Column list for workspace SELECT queries.
-///
-/// The column order here must match the positional indices defined in
-/// [`COL_WS_NAME`] through [`COL_WS_DIAGNOSTICS_UPDATED_AT`], which are used
-/// in [`workspace_from_row`].
-///
-/// `discovery_generation` is intentionally excluded from this column list: it
-/// is read only via its own single-column SELECT in
-/// [`WorkspaceStore::get_discovery_generation`] and is never part of a workspace struct query.
-const WORKSPACE_COLUMNS: &str = "name, path, status, created_at, updated_at, \
-     maintenance, paused, maintainer_debounce_mins, maintainer_last_run_at, \
-     diagnostics, diagnostics_updated_at";
-
-/// Column-index constants for [`WORKSPACE_COLUMNS`].
-const COL_WS_NAME: usize = 0;
-const COL_WS_PATH: usize = 1;
-const COL_WS_STATUS: usize = 2;
-const COL_WS_CREATED_AT: usize = 3;
-const COL_WS_UPDATED_AT: usize = 4;
-const COL_WS_MAINTENANCE: usize = 5;
-const COL_WS_PAUSED: usize = 6;
-const COL_WS_MAINTAINER_DEBOUNCE_MINS: usize = 7;
-const COL_WS_MAINTAINER_LAST_RUN_AT: usize = 8;
-const COL_WS_DIAGNOSTICS: usize = 9;
-const COL_WS_DIAGNOSTICS_UPDATED_AT: usize = 10;
+// Column definitions for workspace SELECT queries.
+// Note: `discovery_generation` is intentionally excluded from this column list:
+// it is read only via its own single-column SELECT in
+// [`WorkspaceStore::get_discovery_generation`] and is never part of a workspace struct query.
+crate::columns! {
+    WORKSPACE_COLUMNS [WS] {
+        NAME                  => "name",
+        PATH                  => "path",
+        STATUS                => "status",
+        CREATED_AT            => "created_at",
+        UPDATED_AT            => "updated_at",
+        MAINTENANCE           => "maintenance",
+        PAUSED                => "paused",
+        MAINTAINER_DEBOUNCE_MINS => "maintainer_debounce_mins",
+        MAINTAINER_LAST_RUN_AT  => "maintainer_last_run_at",
+        DIAGNOSTICS           => "diagnostics",
+        DIAGNOSTICS_UPDATED_AT => "diagnostics_updated_at",
+    }
+}
 
 // ── Editor tab column constants ───────────────────────────────────────
 
-/// Column list for editor_tab SELECT queries.
-///
-/// The column order here must match the positional indices defined in
-/// [`COL_ET_FILE_PATH`] through [`COL_ET_DIRTY_CONTENT`], which are used
-/// in [`WorkspaceStore::load_editor_tabs`].
-const EDITOR_TAB_COLUMNS: &str = "file_path, tab_order, is_active, is_dirty, dirty_content";
-
-/// Column-index constants for [`EDITOR_TAB_COLUMNS`].
-const COL_ET_FILE_PATH: usize = 0;
-const COL_ET_TAB_ORDER: usize = 1;
-const COL_ET_IS_ACTIVE: usize = 2;
-const COL_ET_IS_DIRTY: usize = 3;
-const COL_ET_DIRTY_CONTENT: usize = 4;
+crate::columns! {
+    EDITOR_TAB_COLUMNS [ET] {
+        FILE_PATH    => "file_path",
+        TAB_ORDER    => "tab_order",
+        IS_ACTIVE    => "is_active",
+        IS_DIRTY     => "is_dirty",
+        DIRTY_CONTENT => "dirty_content",
+    }
+}
 
 // ── Workspace state list column constants ────────────────────────────
 
-/// Column list for lightweight workspace state queries (name + toggles).
-///
-/// The column order here must match the positional indices defined in
-/// [`COL_WSST_NAME`] through [`COL_WSST_MAINTENANCE`], which are used
-/// in [`WorkspaceStore::list_states`].
-const WS_STATE_COLUMNS: &str = "name, paused, maintenance";
-
-/// Column-index constants for [`WS_STATE_COLUMNS`].
-const COL_WSST_NAME: usize = 0;
-const COL_WSST_PAUSED: usize = 1;
-const COL_WSST_MAINTENANCE: usize = 2;
+crate::columns! {
+    WS_STATE_COLUMNS [WSST] {
+        NAME         => "name",
+        PAUSED       => "paused",
+        MAINTENANCE  => "maintenance",
+    }
+}
 
 /// Check the discovery generation counter: return `true` if the calling task
 /// is still the latest (OK to proceed), `false` if a newer [`WorkspaceStore::rediscover`] has
@@ -923,24 +909,6 @@ pub fn test_ws_named(path: &str, name: &str) -> Workspace {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    /// Column count matches highest index constant.
-    #[test]
-    fn workspace_columns_count_matches_column_constants() {
-        crate::assert_column_count!(WORKSPACE_COLUMNS, COL_WS_DIAGNOSTICS_UPDATED_AT);
-    }
-
-    /// Column count matches highest index constant.
-    #[test]
-    fn editor_tab_columns_count_matches_column_constants() {
-        crate::assert_column_count!(EDITOR_TAB_COLUMNS, COL_ET_DIRTY_CONTENT);
-    }
-
-    /// Column count matches highest index constant.
-    #[test]
-    fn ws_state_columns_count_matches_column_constants() {
-        crate::assert_column_count!(WS_STATE_COLUMNS, COL_WSST_MAINTENANCE);
-    }
 
     /// Open a temporary workspace store for testing.
     /// Returns (store, temp_dir). The temp_dir is kept alive for the lifetime

@@ -3,6 +3,7 @@
 pub mod html;
 pub mod http;
 pub mod json;
+pub mod macros;
 #[cfg(test)]
 pub mod test;
 pub mod tree_sitter;

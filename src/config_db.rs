@@ -45,23 +45,33 @@ CREATE TABLE IF NOT EXISTS config_model_routing (
 // ── Column index constants ──────────────────────────────────
 
 // config_kv table (2-column SELECT: key, value)
-const KV_COLUMNS: &str = "key, value";
-const COL_KV_KEY: usize = 0;
-const COL_KV_VALUE: usize = 1;
+crate::columns! {
+    KV_COLUMNS [KV] {
+        KEY   => "key",
+        VALUE => "value",
+    }
+}
 
 // config_role table (3-column SELECT: role, model, reasoning_effort)
-const ROLE_CONFIG_COLUMNS: &str = "role, model, reasoning_effort";
-const COL_RC_ROLE: usize = 0;
-const COL_RC_MODEL: usize = 1;
-const COL_RC_REASONING_EFFORT: usize = 2;
+crate::columns! {
+    ROLE_CONFIG_COLUMNS [RC] {
+        ROLE             => "role",
+        MODEL            => "model",
+        REASONING_EFFORT => "reasoning_effort",
+    }
+}
 
 // config_model_routing table (3-column SELECT: model, provider_order, allow_fallbacks)
-const MODEL_ROUTING_COLUMNS: &str = "model, provider_order, allow_fallbacks";
-const COL_MR_MODEL: usize = 0;
-const COL_MR_PROVIDER_ORDER: usize = 1;
-const COL_MR_ALLOW_FALLBACKS: usize = 2;
+crate::columns! {
+    MODEL_ROUTING_COLUMNS [MR] {
+        MODEL           => "model",
+        PROVIDER_ORDER  => "provider_order",
+        ALLOW_FALLBACKS => "allow_fallbacks",
+    }
+}
 
-// Test-only column constants (used by #[cfg(test)] query helpers)
+// Test-only column constants (used by #[cfg(test)] query helpers).
+// These are single-column SELECT constants not derived from any column-string.
 
 #[cfg(test)]
 const COL_KV_VALUE_SINGLE: usize = 0; // SELECT value FROM config_kv
@@ -890,21 +900,4 @@ mod tests {
             "model routings should be unchanged after rollback"
         );
     }
-}
-
-// ── Column index assertion tests ─────────────────────────────
-
-#[test]
-fn kv_columns_count_matches_column_constants() {
-    crate::assert_column_count!(KV_COLUMNS, COL_KV_VALUE);
-}
-
-#[test]
-fn role_config_columns_count_matches_column_constants() {
-    crate::assert_column_count!(ROLE_CONFIG_COLUMNS, COL_RC_REASONING_EFFORT);
-}
-
-#[test]
-fn model_routing_columns_count_matches_column_constants() {
-    crate::assert_column_count!(MODEL_ROUTING_COLUMNS, COL_MR_ALLOW_FALLBACKS);
 }

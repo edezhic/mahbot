@@ -33,23 +33,19 @@ pub struct LogEntry {
     pub workspace: String,
 }
 
-/// Column list for log SELECT queries.
-///
-/// The column order here must match the positional indices defined in
-/// [`COL_LOGS_TIMESTAMP`] through [`COL_LOGS_WORKSPACE`], which are used
-/// in [`row_to_entry`].
-const LOGS_COLUMNS: &str =
-    "timestamp, level, target, message, fields, agent_id, agent_role, workspace";
-
-/// Column-index constants for [`LOGS_COLUMNS`].
-const COL_LOGS_TIMESTAMP: usize = 0;
-const COL_LOGS_LEVEL: usize = 1;
-const COL_LOGS_TARGET: usize = 2;
-const COL_LOGS_MESSAGE: usize = 3;
-const COL_LOGS_FIELDS: usize = 4;
-const COL_LOGS_AGENT_ID: usize = 5;
-const COL_LOGS_AGENT_ROLE: usize = 6;
-const COL_LOGS_WORKSPACE: usize = 7;
+// Column definitions for `logs` SELECT queries.
+crate::columns! {
+    LOGS_COLUMNS [LOGS] {
+        TIMESTAMP   => "timestamp",
+        LEVEL       => "level",
+        TARGET      => "target",
+        MESSAGE     => "message",
+        FIELDS      => "fields",
+        AGENT_ID    => "agent_id",
+        AGENT_ROLE  => "agent_role",
+        WORKSPACE   => "workspace",
+    }
+}
 
 /// Turso-backed log store.
 #[derive(Clone, Debug)]
@@ -504,12 +500,6 @@ fn extract_agent_from_span(val: &serde_json::Value) -> (String, String, String) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Column count matches highest index constant.
-    #[test]
-    fn logs_columns_count_matches_column_constants() {
-        crate::assert_column_count!(LOGS_COLUMNS, COL_LOGS_WORKSPACE);
-    }
 
     #[test]
     fn test_parse_tracing_json_full() {

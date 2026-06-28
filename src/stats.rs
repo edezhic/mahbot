@@ -37,19 +37,16 @@ CREATE INDEX IF NOT EXISTS idx_tool_usage_role ON tool_usage(role);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_recorded_at ON tool_usage(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_workspace ON tool_usage(workspace);";
 
-/// Column list for tool error SELECT queries in [`StatsStore::query_tool_errors`].
-///
-/// The column order here must match the positional indices defined in
-/// [`COL_TE_TOOL_NAME`] through [`COL_TE_RECORDED_AT`].
-const TOOL_ERROR_COLUMNS: &str =
-    "tool_name, role, json_each.value AS error, workspace, recorded_at";
-
-/// Column-index constants for [`TOOL_ERROR_COLUMNS`].
-const COL_TE_TOOL_NAME: usize = 0;
-const COL_TE_ROLE: usize = 1;
-const COL_TE_ERROR: usize = 2;
-const COL_TE_WORKSPACE: usize = 3;
-const COL_TE_RECORDED_AT: usize = 4;
+// Column definitions for tool_error SELECT queries.
+crate::columns! {
+    TOOL_ERROR_COLUMNS [TE] {
+        TOOL_NAME    => "tool_name",
+        ROLE         => "role",
+        ERROR        => "json_each.value AS error",
+        WORKSPACE    => "workspace",
+        RECORDED_AT  => "recorded_at",
+    }
+}
 
 /// Column-index constant for the single-column SELECT in
 /// [`StatsStore::query_tool_usage`] (`call_count`).
@@ -271,15 +268,6 @@ impl StatsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Column count matches highest index constant.
-    ///
-    /// Note: [`COL_TU_CALL_COUNT`] and [`COL_TE_COUNT`] are single-column query
-    /// constants and are intentionally excluded from this assertion.
-    #[test]
-    fn tool_error_columns_count_matches_column_constants() {
-        crate::assert_column_count!(TOOL_ERROR_COLUMNS, COL_TE_RECORDED_AT);
-    }
 
     /// All 8 combinations of optional filters in [`ToolErrorQuery`].
     ///

@@ -10,38 +10,6 @@
 
 #![cfg(test)]
 
-/// Assert that a column-string constant has exactly `LAST + 1` entries.
-///
-/// Every `*_COLUMNS` string constant (used for `SELECT col1, col2, ...`)
-/// must stay in sync with the corresponding `COL_*` index constants.
-/// This macro verifies the structural invariant: the number of comma-separated
-/// entries in `$cols_str` must equal the highest `COL_*` index + 1.
-///
-/// # Example
-///
-/// ```ignore
-/// assert_column_count!(TICKET_COLUMNS, COL_TICKET_PIPELINE_RESERVATION);
-/// ```
-///
-/// # Panics
-///
-/// Panics if the entry count does not match `$last + 1`.
-#[macro_export]
-macro_rules! assert_column_count {
-    ($cols_str:expr, $last:expr) => {
-        let count = $cols_str.split(',').count();
-        assert_eq!(
-            $last + 1,
-            count,
-            "{} has {count} entries but {} ({}) + 1 = {}",
-            stringify!($cols_str),
-            stringify!($last),
-            $last,
-            $last + 1,
-        );
-    };
-}
-
 use crate::board::{BoardStore, Ticket, TicketPhase};
 use std::path::PathBuf;
 use std::sync::OnceLock;

@@ -55,17 +55,23 @@ CREATE TABLE IF NOT EXISTS user_channels (
 // ── Column index constants ──────────────────────────────────
 
 // users table (4-column SELECT: name, permissions, selected_workspace, selected_role)
-const USERS_COLUMNS: &str = "name, permissions, selected_workspace, selected_role";
-const COL_USERS_NAME: usize = 0;
-const COL_USERS_PERMISSIONS: usize = 1;
-const COL_USERS_SELECTED_WORKSPACE: usize = 2;
-const COL_USERS_SELECTED_ROLE: usize = 3;
+crate::columns! {
+    USERS_COLUMNS [USERS] {
+        NAME                => "name",
+        PERMISSIONS         => "permissions",
+        SELECTED_WORKSPACE  => "selected_workspace",
+        SELECTED_ROLE       => "selected_role",
+    }
+}
 
 // user_channels table (3-column SELECT: channel, identifier, reply_target)
-const USER_CHANNEL_COLUMNS: &str = "channel, identifier, reply_target";
-const COL_UC_CHANNEL: usize = 0;
-const COL_UC_IDENTIFIER: usize = 1;
-const COL_UC_REPLY_TARGET: usize = 2;
+crate::columns! {
+    USER_CHANNEL_COLUMNS [UC] {
+        CHANNEL      => "channel",
+        IDENTIFIER   => "identifier",
+        REPLY_TARGET => "reply_target",
+    }
+}
 
 impl UserStore {
     /// Open (or create) the users database at `root/db/users.db`.
@@ -524,17 +530,7 @@ pub fn is_personal_workspace(workspace_name: &str) -> bool {
     workspace_name.starts_with("personal:")
 }
 
-// ── Column index assertion tests ─────────────────────────────
-
-#[test]
-fn users_columns_count_matches_column_constants() {
-    crate::assert_column_count!(USERS_COLUMNS, COL_USERS_SELECTED_ROLE);
-}
-
-#[test]
-fn user_channel_columns_count_matches_column_constants() {
-    crate::assert_column_count!(USER_CHANNEL_COLUMNS, COL_UC_REPLY_TARGET);
-}
+// ── Column index assertion tests (removed: now enforced at compile time by the `columns!` macro)
 
 #[cfg(test)]
 pub(crate) mod test_util {

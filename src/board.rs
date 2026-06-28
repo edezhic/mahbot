@@ -84,50 +84,40 @@ const TICKETS_FTS_INDEX_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
 USING fts (title) WITH (tokenizer = 'ngram')";
 
-/// Column list for ticket SELECT/RETURNING queries.
-///
-/// The column order here must match the positional indices defined in
-/// [`COL_TICKET_ID`] through [`COL_TICKET_PIPELINE_RESERVATION`], which are used in
-/// [`BoardStore::ticket_from_row`].
-const TICKET_COLUMNS: &str = "id, title, description, status, assigned_to, \
-     workspace_name, created_at, updated_at, prerequisites, supersedes, \
-     superseded_by, commit_hash, lines_added, lines_removed, reporter, is_archived, \
-     pipeline_reservation";
+// Column definitions for ticket SELECT/RETURNING queries.
+crate::columns! {
+    TICKET_COLUMNS [TICKET] {
+        ID                     => "id",
+        TITLE                  => "title",
+        DESCRIPTION            => "description",
+        STATUS                 => "status",
+        ASSIGNED_TO            => "assigned_to",
+        WORKSPACE_NAME         => "workspace_name",
+        CREATED_AT             => "created_at",
+        UPDATED_AT             => "updated_at",
+        PREREQUISITES          => "prerequisites",
+        SUPERSEDES             => "supersedes",
+        SUPERSEDED_BY          => "superseded_by",
+        COMMIT_HASH            => "commit_hash",
+        LINES_ADDED            => "lines_added",
+        LINES_REMOVED          => "lines_removed",
+        REPORTER               => "reporter",
+        IS_ARCHIVED            => "is_archived",
+        PIPELINE_RESERVATION   => "pipeline_reservation",
+    }
+}
 
-/// Column-index constants for [`TICKET_COLUMNS`].
-const COL_TICKET_ID: usize = 0;
-const COL_TICKET_TITLE: usize = 1;
-const COL_TICKET_DESCRIPTION: usize = 2;
-const COL_TICKET_STATUS: usize = 3;
-const COL_TICKET_ASSIGNED_TO: usize = 4;
-const COL_TICKET_WORKSPACE_NAME: usize = 5;
-const COL_TICKET_CREATED_AT: usize = 6;
-const COL_TICKET_UPDATED_AT: usize = 7;
-const COL_TICKET_PREREQUISITES: usize = 8;
-const COL_TICKET_SUPERSEDES: usize = 9;
-const COL_TICKET_SUPERSEDED_BY: usize = 10;
-const COL_TICKET_COMMIT_HASH: usize = 11;
-const COL_TICKET_LINES_ADDED: usize = 12;
-const COL_TICKET_LINES_REMOVED: usize = 13;
-const COL_TICKET_REPORTER: usize = 14;
-const COL_TICKET_IS_ARCHIVED: usize = 15;
-const COL_TICKET_PIPELINE_RESERVATION: usize = 16;
-
-/// Column list for comment SELECT queries.
-///
-/// The column order here must match the positional indices defined in
-/// [`COL_COMMENT_ROLE`] through [`COL_COMMENT_CREATED_AT`], which are used in
-/// [`BoardStore::get_comments`] (see renumbered constants below).
-const COMMENT_COLUMNS: &str = "role, content, created_at";
-
-/// Column-index constants for [`COMMENT_COLUMNS`].
-///
-/// Note: `id` and `ticket_id` were removed from the SELECT (these fields
-/// are dead — never consumed by any production code). The remaining columns
-/// are renumbered from 0.
-const COL_COMMENT_ROLE: usize = 0;
-const COL_COMMENT_CONTENT: usize = 1;
-const COL_COMMENT_CREATED_AT: usize = 2;
+// Column definitions for comment SELECT queries.
+// Note: `id` and `ticket_id` were removed from the SELECT (these fields
+// are dead — never consumed by any production code). The remaining columns
+// are renumbered from 0.
+crate::columns! {
+    COMMENT_COLUMNS [COMMENT] {
+        ROLE       => "role",
+        CONTENT    => "content",
+        CREATED_AT => "created_at",
+    }
+}
 
 /// Statuses where a ticket occupies the dev/review/QA pipeline.
 ///
@@ -1872,18 +1862,6 @@ mod tests {
     use crate::workspace::test_ws_named;
     use strum::IntoEnumIterator;
     use tempfile::TempDir;
-
-    /// Column count matches highest index constant.
-    #[test]
-    fn ticket_columns_count_matches_column_constants() {
-        crate::assert_column_count!(TICKET_COLUMNS, COL_TICKET_PIPELINE_RESERVATION);
-    }
-
-    /// Column count matches highest index constant.
-    #[test]
-    fn comment_columns_count_matches_column_constants() {
-        crate::assert_column_count!(COMMENT_COLUMNS, COL_COMMENT_CREATED_AT);
-    }
 
     /// Open a test store and create a default ticket.
     /// Returns (store, temp_dir, ticket_id).

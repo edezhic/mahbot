@@ -81,6 +81,7 @@ fff-search = "0.9"
 
 # SHA256 checksum verification for model downloads
 sha2 = "0.10"
+paste = "1.0"
 
 # Embeddings
 tokenizers = "0.22"

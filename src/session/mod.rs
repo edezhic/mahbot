@@ -37,17 +37,23 @@ CREATE TABLE IF NOT EXISTS session_metadata (
 // ── Column index constants ──────────────────────────────────
 
 // Session messages (2-column SELECT: role, content)
-const SESSION_MESSAGE_COLUMNS: &str = "role, content";
-const COL_SM_ROLE: usize = 0;
-const COL_SM_CONTENT: usize = 1;
+crate::columns! {
+    SESSION_MESSAGE_COLUMNS [SM] {
+        ROLE    => "role",
+        CONTENT => "content",
+    }
+}
 
 // Session list with metadata (4-column SELECT: sm.session_key, sm.created_at,
 // sm.last_activity, COUNT(s.id))
-const SESSION_LIST_COLUMNS: &str = "sm.session_key, sm.created_at, sm.last_activity, COUNT(s.id)";
-const COL_SL_SESSION_KEY: usize = 0;
-const COL_SL_CREATED_AT: usize = 1;
-const COL_SL_LAST_ACTIVITY: usize = 2;
-const COL_SL_MESSAGE_COUNT: usize = 3;
+crate::columns! {
+    SESSION_LIST_COLUMNS [SL] {
+        SESSION_KEY    => "sm.session_key",
+        CREATED_AT     => "sm.created_at",
+        LAST_ACTIVITY  => "sm.last_activity",
+        MESSAGE_COUNT  => "COUNT(s.id)",
+    }
+}
 
 /// Session key prefixes for transient (background-only, non-user-facing) sessions.
 ///
@@ -692,16 +698,4 @@ pub(crate) fn decode_native_history_message(
     }
 
     None
-}
-
-// ── Column index assertion tests ─────────────────────────────
-
-#[test]
-fn session_message_columns_count_matches_column_constants() {
-    crate::assert_column_count!(SESSION_MESSAGE_COLUMNS, COL_SM_CONTENT);
-}
-
-#[test]
-fn session_list_columns_count_matches_column_constants() {
-    crate::assert_column_count!(SESSION_LIST_COLUMNS, COL_SL_MESSAGE_COUNT);
 }
