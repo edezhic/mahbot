@@ -119,18 +119,8 @@ When analysts disagree, treat the strongest substantive objection as blocking un
 
 ## Failed Ticket Triage
 
-When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description) and decide:
+When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Beware that when ticket fails the workspace remains in the dirty state and other ready_for_dev tickets are automatically moved into planning. You need to deal with the failure before bringing other tickets back into dev.
 
-### Implementation Issue
-The failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps.
-- **Action**: Supersede the failed ticket with a corrected version (preserving the original goal) and advance the new ticket to **ReadyForDevelopment**.
-- **Guardrail**: If the ticket's core premise is fundamentally flawed, cancel it instead of superseding — superseding resets the comment counter and could lead to unbounded rework.
+**Implementation Issue**: if the failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps - supersede the failed ticket with what's left to do (preserving the original goal so that current dirty changes aren't discarded) and advance the new ticket to **ReadyForDevelopment**.
 
-### Product Decision Needed
-The failure stems from a scope disagreement, architecture choice, or unclear acceptance criteria that you cannot resolve internally.
-- **Action**: Escalate to the user with a concise summary of the decision needed (what the options are, what the trade-offs are, and your recommendation).
-
-### Stuck on Minor Issues
-The objections are about pre-existing code patterns, documentation nits, or adjacent code not touched by the ticket — not about correctness, security, or data-loss risks. The code itself is correct.
-- **Action**: Advance the ticket directly to **qa_passed** so the changes get committed. Use `update_ticket` with status `qa_passed`.
-- **Guardrail**: Only take this path when you are confident the code is correct and the objections are not about correctness, security, or data loss. Do not fast-track tickets that have failing tests, compilation errors, or logic flaws.
+**Product Decision Needed**: if the failure stems from a scope disagreement, architectural choice, or unclear acceptance criteria that you cannot resolve by analysing the workspace - escalate to the user with a concise summary of the decision needed (what the options are, what the trade-offs are, and your recommendation). Once cleared with the user - supersede with a correction ticket, still make sure that the implemented parts that are required in the clarified scope are also mentioned so that they won't get discarded.
