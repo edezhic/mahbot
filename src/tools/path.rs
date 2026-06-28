@@ -573,101 +573,225 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // ── Path validation tests ──────────────────────────────────────────
+    // ── Path validation: is_path_safe_for_workspace ─────────────────────
 
     #[test]
-    fn path_traversal_edge_cases() {
-        let base = Path::new(".");
-        assert!(!is_path_safe_for_workspace("../etc/passwd", base));
-        assert!(!is_path_safe_for_workspace("foo/../etc/passwd", base));
-        assert!(is_path_safe_for_workspace("my..file.txt", base));
-        assert!(!is_path_safe_for_workspace(
-            "foo/..%2f..%2fetc/passwd",
-            base
-        ));
-    }
+    fn is_path_safe_for_workspace_all_cases() {
+        struct Case {
+            name: &'static str,
+            path: &'static str,
+            safe: bool,
+        }
 
-    #[test]
-    fn path_blocked_system_and_sensitive() {
+        // Most security invariants are workspace-independent and can be
+        // verified against a minimal "." base.
+        let dot_cases = [
+            Case {
+                name: "traversal_etc_passwd",
+                path: "../etc/passwd",
+                safe: false,
+            },
+            Case {
+                name: "traversal_via_foo",
+                path: "foo/../etc/passwd",
+                safe: false,
+            },
+            Case {
+                name: "my_dot_dot_file",
+                path: "my..file.txt",
+                safe: true,
+            },
+            Case {
+                name: "url_encoded_traversal",
+                path: "foo/..%2f..%2f/etc/passwd",
+                safe: false,
+            },
+            Case {
+                name: "null_byte",
+                path: "file\0.txt",
+                safe: false,
+            },
+            Case {
+                name: "proc_self_root",
+                path: "/proc/self/root/etc/passwd",
+                safe: false,
+            },
+            Case {
+                name: "docker_socket",
+                path: "/var/run/docker.sock",
+                safe: false,
+            },
+            Case {
+                name: "ssh_private_key",
+                path: "~/.ssh/id_rsa",
+                safe: false,
+            },
+            Case {
+                name: "gnupg_secret",
+                path: "~/.gnupg/secring.gpg",
+                safe: false,
+            },
+            Case {
+                name: "tilde_user_ssh",
+                path: "~root/.ssh/id_rsa",
+                safe: false,
+            },
+            Case {
+                name: "tilde_nobody",
+                path: "~nobody",
+                safe: false,
+            },
+            Case {
+                name: "root_slash",
+                path: "/",
+                safe: false,
+            },
+            Case {
+                name: "anything_absolute",
+                path: "/anything",
+                safe: false,
+            },
+            Case {
+                name: "absolute_tmp",
+                path: "/tmp",
+                safe: false,
+            },
+            Case {
+                name: "absolute_var_log",
+                path: "/var/log",
+                safe: false,
+            },
+            Case {
+                name: "whitespace_absolute",
+                path: "  /etc/passwd",
+                safe: false,
+            },
+            Case {
+                name: "tab_absolute",
+                path: "\t/etc/passwd",
+                safe: false,
+            },
+            Case {
+                name: "whitespace_tilde_user",
+                path: "  ~root/.ssh/id_rsa",
+                safe: false,
+            },
+            Case {
+                name: "whitespace_traversal",
+                path: "  ../foo",
+                safe: false,
+            },
+            Case {
+                name: "whitespace_only_empty",
+                path: "  ",
+                safe: true,
+            },
+            Case {
+                name: "bare_tilde",
+                path: "~",
+                safe: true,
+            },
+            Case {
+                name: "leading_whitespace_tilde",
+                path: "  ~",
+                safe: true,
+            },
+            Case {
+                name: "trailing_whitespace_tilde",
+                path: "~  ",
+                safe: true,
+            },
+            Case {
+                name: "both_whitespace_tilde",
+                path: "  ~  ",
+                safe: true,
+            },
+        ];
         let base = Path::new(".");
-        assert!(!is_path_safe_for_workspace("file\0.txt", base));
-        assert!(!is_path_safe_for_workspace(
-            "/proc/self/root/etc/passwd",
-            base
-        ));
-        assert!(!is_path_safe_for_workspace("/var/run/docker.sock", base));
-        assert!(!is_path_safe_for_workspace("~/.ssh/id_rsa", base));
-        assert!(!is_path_safe_for_workspace("~/.gnupg/secring.gpg", base));
-        assert!(!is_path_safe_for_workspace("~root/.ssh/id_rsa", base));
-        assert!(!is_path_safe_for_workspace("~nobody", base));
-    }
+        for case in &dot_cases {
+            assert_eq!(
+                is_path_safe_for_workspace(case.path, base),
+                case.safe,
+                "case: {}",
+                case.name
+            );
+        }
 
-    #[test]
-    fn path_blocks_absolute_and_whitespace_bypass() {
-        let base = Path::new(".");
-        assert!(!is_path_safe_for_workspace("/", base));
-        assert!(!is_path_safe_for_workspace("/anything", base));
-        assert!(!is_path_safe_for_workspace("/tmp", base));
-        assert!(!is_path_safe_for_workspace("/var/log", base));
-        // Leading whitespace bypasses (all three variants)
-        assert!(!is_path_safe_for_workspace("  /etc/passwd", base));
-        assert!(!is_path_safe_for_workspace("\t/etc/passwd", base));
-        assert!(!is_path_safe_for_workspace("  ~root/.ssh/id_rsa", base));
-        assert!(!is_path_safe_for_workspace("  ../foo", base));
-        // Whitespace-only paths are treated as empty (relative, safe)
-        assert!(is_path_safe_for_workspace("  ", base));
-
+        // Workspace-relative checks require a real TempDir.
         let tmp = TempDir::new().expect("tempdir");
-        let workspace = tmp.path().to_path_buf();
-        assert!(is_path_safe_for_workspace(
-            workspace.join("test.txt").to_str().unwrap(),
-            &workspace
-        ));
-        assert!(is_path_safe_for_workspace("relative.txt", &workspace));
-    }
+        let ws = tmp.path().to_path_buf();
 
-    #[test]
-    fn bare_tilde_accepted() {
-        // Bare ~ is shorthand for the workspace root — is_path_safe_for_workspace
-        // must accept it, matching resolve_tool_path_with_base's behaviour.
-        // Write operations are still protected by the post-canonicalization
-        // parent check in resolve_write_target (the parent of workspace root
-        // is outside the workspace).
-        let base = Path::new(".");
-        // Pathological: bare tilde with no workspace context
-        assert!(is_path_safe_for_workspace("~", base));
-        // Bare tilde with leading/trailing whitespace (trimmed before check)
-        assert!(is_path_safe_for_workspace("  ~", base));
-        assert!(is_path_safe_for_workspace("~  ", base));
-        assert!(is_path_safe_for_workspace("  ~  ", base));
+        // Absolute path inside the workspace (only expressible at runtime)
+        assert!(
+            is_path_safe_for_workspace(ws.join("test.txt").to_str().unwrap(), &ws),
+            "absolute path inside workspace should be safe"
+        );
 
-        let tmp = TempDir::new().expect("tempdir");
-        let workspace = tmp.path().to_path_buf();
-        assert!(is_path_safe_for_workspace("~", &workspace));
-    }
-
-    #[test]
-    fn path_allows_relative_and_blocks_absolute() {
-        let tmp = TempDir::new().expect("tempdir");
-        let workspace = tmp.path().to_path_buf();
-        assert!(is_path_safe_for_workspace("src/main.rs", &workspace));
-        assert!(is_path_safe_for_workspace(
-            "deep/nested/dir/file.txt",
-            &workspace
-        ));
-        assert!(is_path_safe_for_workspace(".gitignore", &workspace));
-        assert!(is_path_safe_for_workspace(".env", &workspace));
-        assert!(is_path_safe_for_workspace("", &workspace));
-        assert!(!is_path_safe_for_workspace("../etc/passwd", &workspace));
-        assert!(!is_path_safe_for_workspace(
-            "../../root/.ssh/id_rsa",
-            &workspace
-        ));
-        assert!(!is_path_safe_for_workspace(
-            "foo/../../../etc/shadow",
-            &workspace
-        ));
-        assert!(!is_path_safe_for_workspace("..", &workspace));
+        let ws_cases = [
+            Case {
+                name: "relative_in_workspace",
+                path: "relative.txt",
+                safe: true,
+            },
+            Case {
+                name: "relative_src_main",
+                path: "src/main.rs",
+                safe: true,
+            },
+            Case {
+                name: "relative_deep_nested",
+                path: "deep/nested/dir/file.txt",
+                safe: true,
+            },
+            Case {
+                name: "dot_gitignore",
+                path: ".gitignore",
+                safe: true,
+            },
+            Case {
+                name: "dot_env",
+                path: ".env",
+                safe: true,
+            },
+            Case {
+                name: "empty_string",
+                path: "",
+                safe: true,
+            },
+            Case {
+                name: "traversal_etc_passwd",
+                path: "../etc/passwd",
+                safe: false,
+            },
+            Case {
+                name: "double_traversal_ssh",
+                path: "../../root/.ssh/id_rsa",
+                safe: false,
+            },
+            Case {
+                name: "triple_traversal_shadow",
+                path: "foo/../../../etc/shadow",
+                safe: false,
+            },
+            Case {
+                name: "dot_dot_alone",
+                path: "..",
+                safe: false,
+            },
+            Case {
+                name: "bare_tilde_in_workspace",
+                path: "~",
+                safe: true,
+            },
+        ];
+        for case in &ws_cases {
+            assert_eq!(
+                is_path_safe_for_workspace(case.path, &ws),
+                case.safe,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     // ── is_path_under_allowed_temp tests ────────────────────────────────
@@ -684,7 +808,7 @@ mod tests {
         assert!(!is_path_under_allowed_temp(Path::new("/etc/passwd")));
     }
 
-    // ── check_path_read_allowed tests ──────────────────────────────────
+    // ── check_path_read_allowed: spill / extra-read ────────────────────
 
     #[test]
     fn check_path_read_allowed_var_tmp() {
@@ -697,17 +821,57 @@ mod tests {
     }
 
     #[test]
-    fn is_mahbot_spill_file_allows_temp_agent_spills() {
+    fn is_mahbot_spill_file_all_cases() {
+        struct Case {
+            name: &'static str,
+            path: String,
+            allowed: bool,
+        }
+
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
 
-        let spill = std::env::temp_dir().join(".agent/spill_ab12.txt");
-        assert!(
-            check_path_read_allowed(&spill.to_string_lossy(), &workspace).is_ok(),
-            "spill under current temp_dir should be allowed: {}",
-            spill.display()
-        );
+        let mut cases: Vec<Case> = Vec::new();
 
+        let spill = std::env::temp_dir().join(".agent/spill_ab12.txt");
+        cases.push(Case {
+            name: "temp_agent_spill",
+            path: spill.to_string_lossy().to_string(),
+            allowed: true,
+        });
+        let raw_log = std::env::temp_dir().join(".agent/12345_cargo_check.raw.log");
+        cases.push(Case {
+            name: "raw_log_spill",
+            path: raw_log.to_string_lossy().to_string(),
+            allowed: true,
+        });
+
+        let in_workspace = workspace.join(".agent/spill_ab12.txt");
+        cases.push(Case {
+            name: "workspace_spill_rejected",
+            path: in_workspace.to_string_lossy().to_string(),
+            allowed: false,
+        });
+        cases.push(Case {
+            name: "etc_passwd_rejected",
+            path: "/etc/passwd".to_string(),
+            allowed: false,
+        });
+
+        for case in &cases {
+            let result = check_path_read_allowed(&case.path, &workspace);
+            assert_eq!(
+                result.is_ok(),
+                case.allowed,
+                "case: {} — path: {}",
+                case.name,
+                case.path
+            );
+        }
+
+        // macOS per-user temp path (e.g. /var/folders/xx/yy/T/…) should be
+        // detected as a temp-root spill even when it doesn't match the active
+        // temp_dir() at-test-time (which may be /private/var/…).
         #[cfg(unix)]
         {
             let mac_spill = PathBuf::from("/var/folders/xx/yy/T/.agent/spill_cd34.txt");
@@ -717,25 +881,7 @@ mod tests {
             );
         }
 
-        let raw_log = std::env::temp_dir().join(".agent/12345_cargo_check.raw.log");
-        assert!(
-            check_path_read_allowed(&raw_log.to_string_lossy(), &workspace).is_ok(),
-            "raw.log spill should be allowed"
-        );
-    }
-
-    #[test]
-    fn is_mahbot_spill_file_rejects_workspace_and_system_paths() {
-        let tmp = TempDir::new().expect("tempdir");
-        let workspace = tmp.path().to_path_buf();
-
-        let in_workspace = workspace.join(".agent/spill_ab12.txt");
-        assert!(
-            check_path_read_allowed(&in_workspace.to_string_lossy(), &workspace).is_err(),
-            "workspace .agent spill should be rejected: {}",
-            in_workspace.display()
-        );
-
+        // Non-temp spill-shaped path outside the workspace must be rejected.
         #[cfg(unix)]
         {
             let outside = PathBuf::from("/usr/local/.agent/spill_ab12.txt");
@@ -744,11 +890,6 @@ mod tests {
                 "non-temp spill-shaped path should be rejected"
             );
         }
-
-        assert!(
-            check_path_read_allowed("/etc/passwd", &workspace).is_err(),
-            "/etc/passwd should be rejected"
-        );
     }
 
     // ── EXTRA_READ_ALLOWED tests ──────────────────────────────────────
@@ -764,55 +905,47 @@ mod tests {
         assert!(!dirs.is_empty(), "EXTRA_READ_ALLOWED should not be empty");
     }
 
-    /// No literal `~` path is ever stored in the allowlist — all `~`-prefixed
-    /// entries are expanded at init time (or skipped if `$HOME` is unset).
     #[test]
-    fn extra_allowed_no_literal_tilde() {
-        let dirs = &*EXTRA_READ_ALLOWED;
-        for dir in dirs {
-            let s = dir.to_string_lossy();
-            assert!(
-                !s.starts_with('~'),
-                "Literal tilde path should never be stored: {s}"
+    fn extra_allowed_all_cases() {
+        struct Case {
+            name: &'static str,
+            path: &'static str,
+            allowed: bool,
+        }
+
+        // Paths inside known dependency directories should match via
+        // is_path_in_extra_allowed.
+        let cases = [
+            Case {
+                name: "cargo_registry_tilde",
+                path: "~/.cargo/registry/src/some-crate/src/lib.rs",
+                allowed: true,
+            },
+            Case {
+                name: "system_python_site_packages",
+                path: "/usr/local/lib/python3.12/site-packages/requests/models.py",
+                allowed: true,
+            },
+        ];
+        for case in &cases {
+            assert_eq!(
+                is_path_in_extra_allowed(Path::new(case.path)),
+                case.allowed,
+                "case: {}",
+                case.name
             );
         }
-    }
 
-    /// `is_path_in_extra_allowed` matches `~`-prefixed user input against
-    /// the expanded allowlist entries. This simulates the pre-canonicalization
-    /// check in `resolve_read_target`.
-    #[test]
-    fn extra_allowed_tilde_input_matches() {
-        // Use a known-expanded path from the allowlist to construct a ~ variant
+        // Expanded home-dir path (requires $HOME at runtime)
         if let Ok(home) = std::env::var("HOME") {
-            // ~/.cargo/registry/src/ should be in the allowlist (expanded to $HOME/.cargo/registry/src/)
-            let tilde_input = "~/.cargo/registry/src/some-crate/src/lib.rs";
-            assert!(
-                is_path_in_extra_allowed(Path::new(tilde_input)),
-                "~-prefixed path should match expanded allowlist entry"
-            );
-
-            // Verify the expanded path also matches (post-canonicalization)
             let expanded = PathBuf::from(&home).join(".cargo/registry/src/some-crate/src/lib.rs");
             assert!(
                 is_path_in_extra_allowed(&expanded),
-                "Expanded path should match allowlist entry"
+                "expanded cargo registry path should match"
             );
         }
-    }
 
-    /// Verify prefix-matching semantics — a file inside a cargo registry
-    /// should match, while a sibling of the allowlist root should not.
-    #[test]
-    fn extra_allowed_prefix_matching() {
-        // File inside an allowed dependency tree should match
-        assert!(
-            is_path_in_extra_allowed(Path::new(
-                "/usr/local/lib/python3.12/site-packages/requests/models.py"
-            )),
-            "File under /usr/local/lib/ should match"
-        );
-        // Sibling of an allowed root should NOT match (prefix strictness)
+        // Prefix strictness: sibling of an allowed root should NOT match
         #[cfg(unix)]
         {
             assert!(
@@ -822,6 +955,15 @@ mod tests {
             assert!(
                 !is_path_in_extra_allowed(Path::new("/usr/local/lib64/foo")),
                 "Numeric suffix should not match"
+            );
+        }
+
+        // No literal tilde paths in the allowlist itself
+        for dir in &*EXTRA_READ_ALLOWED {
+            let s = dir.to_string_lossy();
+            assert!(
+                !s.starts_with('~'),
+                "Literal tilde path should never be stored: {s}"
             );
         }
     }
