@@ -841,6 +841,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct NormalizeCase {
+        name: &'static str,
+        input: serde_json::Value,
+        expected: serde_json::Value,
+    }
+
+    struct ResolveCase {
+        name: &'static str,
+        input: serde_json::Value,
+        expected: Option<&'static str>,
+    }
+
     // ── normalize_search_args ──────────────────────────────────────────
 
     /// Assert that normalizing `input` produces `expected`.
@@ -855,33 +867,28 @@ mod tests {
     /// and the invariant that an existing "query" blocks alias consumption.
     #[test]
     fn normalize_search_args_alias_mapping() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: serde_json::Value,
-        }
         let cases = [
-            Case {
+            NormalizeCase {
                 name: "pattern alias maps to query",
                 input: json!({"pattern": "foo"}),
                 expected: json!({"query": "foo"}),
             },
-            Case {
+            NormalizeCase {
                 name: "search alias maps to query",
                 input: json!({"search": "bar"}),
                 expected: json!({"query": "bar"}),
             },
-            Case {
+            NormalizeCase {
                 name: "search_term alias maps to query",
                 input: json!({"search_term": "baz"}),
                 expected: json!({"query": "baz"}),
             },
-            Case {
+            NormalizeCase {
                 name: "grep_search alias maps to query",
                 input: json!({"grep_search": "qux"}),
                 expected: json!({"query": "qux"}),
             },
-            Case {
+            NormalizeCase {
                 name: "pattern wins over other aliases",
                 input: json!({
                     "pattern": "from_pattern",
@@ -897,7 +904,7 @@ mod tests {
                     "grep_search": "from_grep_search",
                 }),
             },
-            Case {
+            NormalizeCase {
                 name: "search wins when pattern absent",
                 input: json!({
                     "search": "from_search",
@@ -909,7 +916,7 @@ mod tests {
                     "search_term": "from_search_term",
                 }),
             },
-            Case {
+            NormalizeCase {
                 name: "existing query blocks alias, alias stays as orphan",
                 input: json!({"query": "existing", "pattern": "alias"}),
                 expected: json!({"query": "existing", "pattern": "alias"}),
@@ -924,28 +931,23 @@ mod tests {
     /// mode inference and the orphan-key behavior when query already exists.
     #[test]
     fn normalize_search_args_file_pattern() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: serde_json::Value,
-        }
         let cases = [
-            Case {
+            NormalizeCase {
                 name: "file_pattern without existing mode sets mode=files",
                 input: json!({"file_pattern": "*.rs"}),
                 expected: json!({"query": "*.rs", "mode": "files"}),
             },
-            Case {
+            NormalizeCase {
                 name: "file_pattern preserves existing mode",
                 input: json!({"file_pattern": "main.rs", "mode": "grep"}),
                 expected: json!({"query": "main.rs", "mode": "grep"}),
             },
-            Case {
+            NormalizeCase {
                 name: "file_pattern orphaned when query already exists",
                 input: json!({"query": "already", "file_pattern": "other.rs"}),
                 expected: json!({"query": "already", "file_pattern": "other.rs"}),
             },
-            Case {
+            NormalizeCase {
                 name: "file_pattern blocked by prior alias",
                 input: json!({"pattern": "my_query", "file_pattern": "*.rs"}),
                 expected: json!({"query": "my_query", "file_pattern": "*.rs"}),
@@ -962,54 +964,49 @@ mod tests {
     /// values pass through unchanged.
     #[test]
     fn normalize_search_args_mode_mapping() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: serde_json::Value,
-        }
         let cases = [
             // ── plain_text ──────────────────────────────────────────────
-            Case {
+            NormalizeCase {
                 name: "plain_text sets mode=grep and grep_mode=plain_text",
                 input: json!({"mode": "plain_text"}),
                 expected: json!({"mode": "grep", "grep_mode": "plain_text"}),
             },
-            Case {
+            NormalizeCase {
                 name: "plain_text does not overwrite existing grep_mode",
                 input: json!({"mode": "plain_text", "grep_mode": "fuzzy"}),
                 expected: json!({"mode": "grep", "grep_mode": "fuzzy"}),
             },
             // ── regex ───────────────────────────────────────────────────
-            Case {
+            NormalizeCase {
                 name: "regex sets mode=grep and grep_mode=regex",
                 input: json!({"mode": "regex"}),
                 expected: json!({"mode": "grep", "grep_mode": "regex"}),
             },
             // ── content ─────────────────────────────────────────────────
-            Case {
+            NormalizeCase {
                 name: "content sets mode=grep without grep_mode",
                 input: json!({"mode": "content"}),
                 expected: json!({"mode": "grep"}),
             },
             // ── code ────────────────────────────────────────────────────
-            Case {
+            NormalizeCase {
                 name: "code sets mode=grep and grep_mode=fuzzy",
                 input: json!({"mode": "code"}),
                 expected: json!({"mode": "grep", "grep_mode": "fuzzy"}),
             },
-            Case {
+            NormalizeCase {
                 name: "code does not overwrite existing grep_mode",
                 input: json!({"mode": "code", "grep_mode": "regex"}),
                 expected: json!({"mode": "grep", "grep_mode": "regex"}),
             },
             // ── files (pass-through) ────────────────────────────────────
-            Case {
+            NormalizeCase {
                 name: "files mode unchanged",
                 input: json!({"mode": "files", "query": "lib.rs"}),
                 expected: json!({"mode": "files", "query": "lib.rs"}),
             },
             // ── unknown (pass-through) ──────────────────────────────────
-            Case {
+            NormalizeCase {
                 name: "unknown mode passes through unchanged",
                 input: json!({"mode": "unknown_value"}),
                 expected: json!({"mode": "unknown_value"}),
@@ -1028,11 +1025,6 @@ mod tests {
     /// leaves it unchanged rather than rewriting the original "exact".
     #[test]
     fn normalize_search_args_grep_mode_mapping() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: serde_json::Value,
-        }
         let cases = [
             // ════════════════════════════════════════════════════════════
             // Double-mapping: mode remapping runs BEFORE grep_mode
@@ -1041,29 +1033,29 @@ mod tests {
             // grep_mode remapping sees the already-valid "plain_text"
             // and leaves it — it does NOT re-process the original "exact".
             // ════════════════════════════════════════════════════════════
-            Case {
+            NormalizeCase {
                 name: "plain_text mode + exact grep_mode — mode remaps first, grep_mode sees already-valid plain_text",
                 input: json!({"mode": "plain_text", "grep_mode": "exact"}),
                 expected: json!({"mode": "grep", "grep_mode": "plain_text"}),
             },
             // ── exact → plain_text ──────────────────────────────────────
-            Case {
+            NormalizeCase {
                 name: "exact grep_mode remapped to plain_text",
                 input: json!({"grep_mode": "exact"}),
                 expected: json!({"grep_mode": "plain_text"}),
             },
             // ── files → mode=files with grep_mode removed ──────────────
-            Case {
+            NormalizeCase {
                 name: "files grep_mode promotes mode to files and removes grep_mode",
                 input: json!({"grep_mode": "files"}),
                 expected: json!({"mode": "files"}),
             },
-            Case {
+            NormalizeCase {
                 name: "files grep_mode with existing mode=files is fine",
                 input: json!({"mode": "files", "grep_mode": "files"}),
                 expected: json!({"mode": "files"}),
             },
-            Case {
+            NormalizeCase {
                 name: "files grep_mode overrides non-files mode to files",
                 input: json!({"mode": "grep", "grep_mode": "files"}),
                 expected: json!({"mode": "files"}),
@@ -1077,33 +1069,28 @@ mod tests {
     /// Edge cases: non-object values and empty objects pass through unchanged.
     #[test]
     fn normalize_search_args_edge_cases() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: serde_json::Value,
-        }
         let cases = [
-            Case {
+            NormalizeCase {
                 name: "non-object string passes through unchanged",
                 input: json!("string_value"),
                 expected: json!("string_value"),
             },
-            Case {
+            NormalizeCase {
                 name: "non-object number passes through unchanged",
                 input: json!(42),
                 expected: json!(42),
             },
-            Case {
+            NormalizeCase {
                 name: "non-object null passes through unchanged",
                 input: json!(null),
                 expected: json!(null),
             },
-            Case {
+            NormalizeCase {
                 name: "non-object array passes through unchanged",
                 input: json!([1, 2, 3]),
                 expected: json!([1, 2, 3]),
             },
-            Case {
+            NormalizeCase {
                 name: "empty object stays unchanged",
                 input: json!({}),
                 expected: json!({}),
@@ -1173,35 +1160,30 @@ mod tests {
     /// and grep_search is intentionally excluded from resolve_query.
     #[test]
     fn resolve_query_alias_priority() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: Option<&'static str>,
-        }
         let cases = [
             // ── Individual aliases ──────────────────────────────────────
-            Case {
+            ResolveCase {
                 name: "pattern alias resolves to query",
                 input: json!({"pattern": "struct Foo"}),
                 expected: Some("struct Foo"),
             },
-            Case {
+            ResolveCase {
                 name: "search alias resolves to query",
                 input: json!({"search": "bar"}),
                 expected: Some("bar"),
             },
-            Case {
+            ResolveCase {
                 name: "search_term alias resolves to query",
                 input: json!({"search_term": "baz"}),
                 expected: Some("baz"),
             },
-            Case {
+            ResolveCase {
                 name: "grep_search is NOT recognized by resolve_query",
                 input: json!({"grep_search": "qux"}),
                 expected: None,
             },
             // ── Priority ────────────────────────────────────────────────
-            Case {
+            ResolveCase {
                 name: "canonical query overrides all aliases",
                 input: json!({
                     "query": "primary",
@@ -1211,7 +1193,7 @@ mod tests {
                 }),
                 expected: Some("primary"),
             },
-            Case {
+            ResolveCase {
                 name: "pattern overrides search and search_term",
                 input: json!({
                     "pattern": "from_pattern",
@@ -1220,7 +1202,7 @@ mod tests {
                 }),
                 expected: Some("from_pattern"),
             },
-            Case {
+            ResolveCase {
                 name: "search overrides search_term",
                 input: json!({
                     "search": "from_search",
@@ -1238,28 +1220,23 @@ mod tests {
     /// trailing-slash enforcement and empty/root suppression.
     #[test]
     fn resolve_query_path_constraint() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: Option<&'static str>,
-        }
         let cases = [
-            Case {
+            ResolveCase {
                 name: "path gets trailing slash",
                 input: json!({"path": "src"}),
                 expected: Some("src/"),
             },
-            Case {
+            ResolveCase {
                 name: "path with trailing slash deduplicated",
                 input: json!({"path": "src/"}),
                 expected: Some("src/"),
             },
-            Case {
+            ResolveCase {
                 name: "empty path returns None",
                 input: json!({"path": ""}),
                 expected: None,
             },
-            Case {
+            ResolveCase {
                 name: "root path returns None",
                 input: json!({"path": "/"}),
                 expected: None,
@@ -1274,33 +1251,28 @@ mod tests {
     /// glob prefix addition, leading-dot/asterisk stripping, empty suppression.
     #[test]
     fn resolve_query_ext_constraint() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: Option<&'static str>,
-        }
         let cases = [
-            Case {
+            ResolveCase {
                 name: "ext gets glob prefix",
                 input: json!({"ext": "rs"}),
                 expected: Some("*.rs"),
             },
-            Case {
+            ResolveCase {
                 name: "leading dot stripped from ext",
                 input: json!({"ext": ".rs"}),
                 expected: Some("*.rs"),
             },
-            Case {
+            ResolveCase {
                 name: "leading asterisk stripped from ext",
                 input: json!({"ext": "*.rs"}),
                 expected: Some("*.rs"),
             },
-            Case {
+            ResolveCase {
                 name: "multiple leading asterisks stripped from ext",
                 input: json!({"ext": "**.rs"}),
                 expected: Some("*.rs"),
             },
-            Case {
+            ResolveCase {
                 name: "empty ext returns None",
                 input: json!({"ext": ""}),
                 expected: None,
@@ -1314,50 +1286,45 @@ mod tests {
     /// Table-driven test for constraint combinations and empty-query behavior.
     #[test]
     fn resolve_query_combinations_and_empty() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: Option<&'static str>,
-        }
         let cases = [
             // ── Constraint combinations ─────────────────────────────────
-            Case {
+            ResolveCase {
                 name: "query with path constraint",
                 input: json!({"query": "foo", "path": "src"}),
                 expected: Some("foo src/"),
             },
-            Case {
+            ResolveCase {
                 name: "query with ext constraint",
                 input: json!({"query": "foo", "ext": "rs"}),
                 expected: Some("foo *.rs"),
             },
-            Case {
+            ResolveCase {
                 name: "query with path and ext constraints",
                 input: json!({"query": "foo", "path": "src", "ext": "rs"}),
                 expected: Some("foo src/ *.rs"),
             },
-            Case {
+            ResolveCase {
                 name: "path and ext without explicit query",
                 input: json!({"path": "src", "ext": "rs"}),
                 expected: Some("src/ *.rs"),
             },
             // ── Empty query behavior ────────────────────────────────────
-            Case {
+            ResolveCase {
                 name: "no query components returns None",
                 input: json!({}),
                 expected: None,
             },
-            Case {
+            ResolveCase {
                 name: "explicit empty query string returns None",
                 input: json!({"query": ""}),
                 expected: None,
             },
-            Case {
+            ResolveCase {
                 name: "empty query with path returns path constraint only",
                 input: json!({"query": "", "path": "src"}),
                 expected: Some("src/"),
             },
-            Case {
+            ResolveCase {
                 name: "empty query with ext returns ext constraint only",
                 input: json!({"query": "", "ext": "rs"}),
                 expected: Some("*.rs"),
@@ -1371,23 +1338,18 @@ mod tests {
     /// Non-string values are silently ignored (filtered by get_opt_str).
     #[test]
     fn resolve_query_non_string_values() {
-        struct Case {
-            name: &'static str,
-            input: serde_json::Value,
-            expected: Option<&'static str>,
-        }
         let cases = [
-            Case {
+            ResolveCase {
                 name: "non-string query returns None",
                 input: json!({"query": 42}),
                 expected: None,
             },
-            Case {
+            ResolveCase {
                 name: "non-string path silently skipped, query still resolves",
                 input: json!({"query": "foo", "path": 42}),
                 expected: Some("foo"),
             },
-            Case {
+            ResolveCase {
                 name: "non-string ext silently skipped, query still resolves",
                 input: json!({"query": "foo", "ext": true}),
                 expected: Some("foo"),
