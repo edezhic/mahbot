@@ -2055,11 +2055,10 @@ impl EditorState {
             return Task::none();
         }
         self.active_tab_index = idx;
-        let mut tasks = vec![self.scroll_to_active_tab()];
-        if let Some(save_task) = self.save_current_tabs() {
-            tasks.push(save_task);
-        }
-        Task::batch(tasks)
+        Task::batch(vec![
+            self.scroll_to_active_tab(),
+            self.save_current_tabs().unwrap_or(Task::none()),
+        ])
     }
 
     /// Switch to the tab one step in the given direction, wrapping around.
@@ -4099,11 +4098,10 @@ impl EditorState {
                     }
                 }
 
-                let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-                tasks.push(self.scroll_to_active_tab());
-                if let Some(save_task) = self.save_current_tabs() {
-                    tasks.push(save_task);
-                }
+                let tasks = vec![
+                    self.scroll_to_active_tab(),
+                    self.save_current_tabs().unwrap_or(Task::none()),
+                ];
                 Task::batch(tasks)
             }
             Err(e) => {
@@ -4164,9 +4162,7 @@ impl EditorState {
                         if !self.tabs.is_empty() {
                             tasks.push(self.scroll_to_active_tab());
                         }
-                        if let Some(save_task) = self.save_current_tabs() {
-                            tasks.push(save_task);
-                        }
+                        tasks.push(self.save_current_tabs().unwrap_or(Task::none()));
                         return Task::batch(tasks);
                     }
                 }
