@@ -18,7 +18,7 @@ use mahbot::channels::{
     write_incoming_to_broadcast,
 };
 use mahbot::config::CONFIG;
-use mahbot::extraction::{decode_action, decode_callback, is_action, is_callback};
+use mahbot::extraction::{decode_action, decode_callback};
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::is_start_command;
 use mahbot::manager_queue;
@@ -475,14 +475,14 @@ async fn handle_messages(mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>) {
 
         // Handle dynamic option callbacks — route directly to Manager
         // session, bypassing the user's currently active role.
-        if is_callback(&msg.content) {
+        if decode_callback(&msg.content).is_some() {
             spawn(handle_option_callback(msg));
             continue;
         }
 
         // Handle action callbacks (__act__ prefix) — route to inline handler
         // that updates config / clears session without involving the Manager agent.
-        if is_action(&msg.content) {
+        if decode_action(&msg.content).is_some() {
             handle_action_callback(msg).await;
             continue;
         }

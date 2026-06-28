@@ -107,15 +107,6 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
 /// Callback data prefix for dynamic option buttons.
 pub(crate) const CALLBACK_PREFIX: &str = "__opt__";
 
-/// Check whether `content` begins with `CALLBACK_PREFIX`.
-///
-/// Fast prefix-only check — useful as an early filter before calling
-/// [`decode_callback`].
-#[must_use]
-pub fn is_callback(content: &str) -> bool {
-    content.starts_with(CALLBACK_PREFIX)
-}
-
 /// Decode callback data from inline keyboard interactions.
 ///
 /// Returns `(ticket_id, label)` on success (`ticket_id` is `None` when the
@@ -125,8 +116,8 @@ pub fn is_callback(content: &str) -> bool {
 /// # Format contract
 ///
 /// The callback data uses `|` as a delimiter between the optional ticket-id
-/// and the label.  Both join and split therefore assume that neither
-/// `ticket_id` nor `label` may contain a `|` character.
+/// and the label.  The join and split therefore assume that `ticket_id` must
+/// not contain `|`; the label may contain `|`.
 ///
 /// **Examples:**
 /// - `__opt__ticket-id|Label` → `(Some("ticket-id"), "Label")`
@@ -146,15 +137,6 @@ pub fn decode_callback(content: &str) -> Option<(Option<String>, String)> {
 
 /// Callback data prefix for action callbacks (e.g., model selection, clear session).
 pub(crate) const ACTION_PREFIX: &str = "__act__";
-
-/// Check whether `content` begins with `ACTION_PREFIX`.
-///
-/// Fast prefix-only check — useful as an early filter before calling
-/// [`decode_action`].
-#[must_use]
-pub fn is_action(content: &str) -> bool {
-    content.starts_with(ACTION_PREFIX)
-}
 
 /// Decode action callback data.
 ///
@@ -184,60 +166,7 @@ pub fn decode_action(content: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod callback_tests {
-    use super::{decode_action, decode_callback, is_action, is_callback};
-
-    // ── is_callback ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_is_callback() {
-        struct Case {
-            name: &'static str,
-            input: &'static str,
-            expected: bool,
-        }
-
-        let cases = [
-            Case {
-                name: "matches prefix",
-                input: "__opt__ticket123|Label",
-                expected: true,
-            },
-            Case {
-                name: "matches prefix only pipe",
-                input: "__opt__|Label",
-                expected: true,
-            },
-            Case {
-                name: "bare label no pipe",
-                input: "__opt__bare",
-                expected: true,
-            },
-            Case {
-                name: "rejects wrong prefix",
-                input: "not_opt_something",
-                expected: false,
-            },
-            Case {
-                name: "rejects empty",
-                input: "",
-                expected: false,
-            },
-            Case {
-                name: "rejects similar prefix",
-                input: "__op__ticket|Label",
-                expected: false,
-            },
-        ];
-
-        for case in &cases {
-            assert_eq!(
-                is_callback(case.input),
-                case.expected,
-                "case: {}",
-                case.name
-            );
-        }
-    }
+    use super::{decode_action, decode_callback};
 
     // ── decode_callback ───────────────────────────────────────────────────
 
@@ -297,54 +226,6 @@ mod callback_tests {
                 .expected
                 .map(|(tid, lbl)| (tid.map(String::from), lbl.to_string()));
             assert_eq!(result, expected, "case: {}", case.name);
-        }
-    }
-
-    // ── is_action ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_is_action() {
-        struct Case {
-            name: &'static str,
-            input: &'static str,
-            expected: bool,
-        }
-
-        let cases = [
-            Case {
-                name: "matches prefix with payload",
-                input: "__act__set_image_model|model-name",
-                expected: true,
-            },
-            Case {
-                name: "matches prefix empty with pipe",
-                input: "__act__clear_session|",
-                expected: true,
-            },
-            Case {
-                name: "matches prefix bare",
-                input: "__act__clear_session",
-                expected: true,
-            },
-            Case {
-                name: "rejects wrong prefix",
-                input: "not_act_something",
-                expected: false,
-            },
-            Case {
-                name: "rejects empty",
-                input: "",
-                expected: false,
-            },
-            Case {
-                name: "rejects similar prefix",
-                input: "__ac__something",
-                expected: false,
-            },
-        ];
-
-        for case in &cases {
-            assert_eq!(is_action(case.input), case.expected, "case: {}", case.name);
         }
     }
 
