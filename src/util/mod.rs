@@ -61,12 +61,15 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
 /// Current Unix timestamp in milliseconds since the epoch.
 ///
 /// Returns `0` if the system clock is set before the Unix epoch (January 1, 1970).
+///
+/// Returns `u64` — sufficient for timestamps up to ~500 million years from now.
 #[must_use]
-pub(crate) fn unix_millis() -> u128 {
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis()
+        .as_millis() as u64
 }
 
 /// Produce a short human-readable summary of tool arguments.
