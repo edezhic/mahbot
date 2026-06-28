@@ -1,7 +1,7 @@
 //! Logs dashboard page — live log viewing with streaming, filters, pagination,
 //! plus a Tool Failures tab for browsing tool error entries.
 
-#![allow(clippy::too_many_lines, clippy::manual_let_else)]
+#![allow(clippy::manual_let_else)]
 
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
@@ -266,6 +266,7 @@ impl LogsState {
         Subscription::batch([stream_sub, window::frames().map(LogMessage::AnimTick)])
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: LogMessage, log_store: &LogStore) -> Task<LogMessage> {
         match msg {
             LogMessage::Refreshed(entries, total, ws_opts) => {
@@ -538,6 +539,7 @@ impl LogsState {
     }
 
     /// Render the shared filter bar: role picklist, workspace picklist, search input.
+    #[allow(clippy::too_many_lines)]
     fn shared_filter_bar(&self) -> Element<'_, LogMessage> {
         let search_input: Element<'_, LogMessage> = if self.focus_search {
             container(
@@ -747,6 +749,7 @@ impl LogsState {
         base.into()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_log_entry(entry: &LogEntry, fade_progress: f32) -> Element<'_, LogMessage> {
         let (level_color, level_bg) = theme::log_level_color(&entry.level);
         let role_color = if entry.agent_role.is_empty() {

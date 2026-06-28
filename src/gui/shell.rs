@@ -6,8 +6,6 @@
 //! A right-click context menu on the terminal area offers Clear (Ctrl+L)
 //! and Select All (viewport-only visual selection).
 
-#![allow(clippy::too_many_lines)]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -416,6 +414,7 @@ impl ShellState {
 
     // ── Update ───────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: ShellMessage) -> Task<ShellMessage> {
         match msg {
             ShellMessage::WorkspaceSelected(name, path) => {

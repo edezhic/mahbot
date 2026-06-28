@@ -1,10 +1,6 @@
 //! Sessions dashboard page — view and manage conversation sessions.
 
-#![allow(
-    clippy::too_many_lines,
-    clippy::match_same_arms,
-    clippy::manual_let_else
-)]
+#![allow(clippy::match_same_arms, clippy::manual_let_else)]
 
 use crate::ChatMessage;
 use crate::session::{DecodedNativeHistoryMessage, SessionMetadata, decode_native_history_message};
@@ -146,6 +142,7 @@ impl SessionsState {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
         match msg {
             SessionsMessage::AnimTick(instant) => {
@@ -299,6 +296,7 @@ impl SessionsState {
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_transcript<'a>(
         messages: &'a [ChatMessage],
         md_items: &'a [Vec<markdown::Item>],
@@ -885,6 +883,7 @@ impl SessionsState {
             .into()
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 

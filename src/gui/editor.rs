@@ -10,11 +10,7 @@
 //! Tree keyboard navigation: when tree is focused, Arrow Up/Down navigate
 //! entries, Enter opens files or expands directories, Escape exits focus.
 
-#![allow(
-    clippy::too_many_lines,
-    clippy::match_same_arms,
-    clippy::manual_let_else
-)]
+#![allow(clippy::match_same_arms, clippy::manual_let_else)]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1359,6 +1355,7 @@ async fn load_git_ignore(
 /// 2. Initialises the search engine if needed.
 /// 3. Runs `picker.grep()` on the blocking thread pool.
 /// 4. Extracts owned data from `GrepResult` while holding the picker lock.
+#[allow(clippy::too_many_lines)]
 async fn run_global_search(
     ws_path: String,
     ws_name: String,
@@ -1758,6 +1755,7 @@ impl EditorState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn subscription(&self) -> Subscription<EditorMessage> {
         let mut subs: Vec<Subscription<EditorMessage>> = Vec::new();
         if self.selected_workspace_name.is_some() {
@@ -3771,6 +3769,7 @@ impl EditorState {
     // ── Extracted handler methods ────────────────────────────────────
 
     /// Handle workspace selection — initializes file tree, loads tabs, sets up workspace.
+    #[allow(clippy::too_many_lines)]
     fn workspace_selected(&mut self, name: &str, path: Option<&str>) -> Task<EditorMessage> {
         // Accept personal workspaces when a path is provided.
         if name.is_empty() && path.is_none() {
@@ -4450,6 +4449,7 @@ impl EditorState {
         Task::none()
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, EditorMessage> {
         // ── No workspace selected — placeholder ──────────────────────
         if self.selected_workspace_name.is_none() {
@@ -4740,6 +4740,7 @@ impl EditorState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_dir_node<'a>(
         &'a self,
         node: &'a widgets::TreeNode,
@@ -4973,6 +4974,7 @@ impl EditorState {
         col.height(Length::Fill).into()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn build_tab_bar(&self) -> Element<'_, EditorMessage> {
         let mut tab_buttons: Vec<Element<'_, EditorMessage>> = Vec::new();
 
@@ -5358,6 +5360,7 @@ impl EditorState {
         Self::overlay_dialog(dialog, EditorMessage::Escape, 0.4)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'static, EditorMessage> {
         let search_input: iced::widget::TextInput<'_, EditorMessage> =
             text_input("Search across workspace…", &gs.query)
@@ -6856,6 +6859,7 @@ mod tests {
 
     // ── Git status porcelain parsing tests ─────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_parse_git_status_porcelain() {
         struct Case {
@@ -7459,6 +7463,7 @@ mod tests {
 
     // ── Tree arrow-key navigation tests ─────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_tree_nav_left_right() {
         struct Case {

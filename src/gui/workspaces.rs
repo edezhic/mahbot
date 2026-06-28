@@ -1,6 +1,6 @@
 //! Workspaces dashboard page.
 
-#![allow(clippy::too_many_lines, clippy::match_same_arms)]
+#![allow(clippy::match_same_arms)]
 
 use crate::Workspace;
 
@@ -123,6 +123,7 @@ impl WorkspacesState {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: WorkspacesMessage) -> Task<WorkspacesMessage> {
         match msg {
             WorkspacesMessage::Refreshed(ws_list) => {

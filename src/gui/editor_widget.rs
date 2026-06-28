@@ -2,7 +2,7 @@
 //! management. Intended as a drop-in replacement for `text_editor::Content`
 //! in the editor.rs codebase.
 
-#![allow(clippy::too_many_lines, clippy::match_same_arms)]
+#![allow(clippy::match_same_arms)]
 
 use std::cell::{Cell, RefCell};
 
@@ -2270,7 +2270,7 @@ where
         widget::tree::Tag::of::<EditorWidgetState>()
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn layout(
         &mut self,
         tree: &mut Tree,
@@ -2658,6 +2658,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -3352,6 +3353,7 @@ const fn is_action_cursor_movement(action: &EditorAction) -> bool {
 /// `text` field (dead key / IME / AltGr composition). Only used for
 /// distinguishing AltGr from shortcuts on non-macOS — character insertion
 /// itself is handled in `on_event`.
+#[allow(clippy::too_many_lines)]
 fn map_key_to_action(
     key: &key::Key,
     modifiers: keyboard::Modifiers,

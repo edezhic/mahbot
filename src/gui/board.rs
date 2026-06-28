@@ -1,7 +1,5 @@
 //! Board dashboard page — ticket management.
 
-#![allow(clippy::too_many_lines)]
-
 use std::collections::HashSet;
 use std::str::FromStr;
 
@@ -300,6 +298,7 @@ impl BoardState {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: BoardMessage) -> Task<BoardMessage> {
         match msg {
             BoardMessage::Refreshed(tickets) => {
@@ -613,6 +612,7 @@ impl BoardState {
     }
 
     /// Render a single ticket card: clickable title, ID, status badge, and action icons.
+    #[allow(clippy::too_many_lines)]
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
@@ -976,6 +976,7 @@ impl BoardState {
 
     /// Render commit stats: summary header + per-file rows, or loading indicator.
     /// Returns `None` when the ticket has no commit hash.
+    #[allow(clippy::too_many_lines)]
     fn render_commit_stats<'a>(
         ticket: &'a Ticket,
         stats: Option<&'a CommitStats>,

@@ -7,7 +7,7 @@
 //! Also manages workspaces and users (formerly separate pages), with
 //! modal dialogs for add operations.
 
-#![allow(clippy::from_iter_instead_of_collect, clippy::too_many_lines)]
+#![allow(clippy::from_iter_instead_of_collect)]
 
 use crate::Role;
 use crate::Workspace;
@@ -75,6 +75,7 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut O
 /// is shown as the sole entry so it remains visible.
 /// Accepts a `target` to build the correct parameterized `SettingsMessage::ModelPicker`
 /// values internally, avoiding the need for callers to pass closures.
+#[allow(clippy::too_many_lines)]
 fn model_picker_list<'a>(
     target: ModelPickerTarget,
     models_field: Option<&'a str>,
@@ -385,6 +386,7 @@ impl SettingsState {
         self.add_user_adding = false;
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
             // ── Config field edits ─────────────────────────────
@@ -688,6 +690,7 @@ impl SettingsState {
 
     /// Render the workspaces section for the Settings page. No inner
     /// scrollable — rows expand the outer Settings scrollable naturally.
+    #[allow(clippy::too_many_lines)]
     fn workspaces_section(&self) -> Element<'_, SettingsMessage> {
         let ws = &self.workspaces_state;
 
@@ -1030,6 +1033,7 @@ impl SettingsState {
     }
 
     /// Render the users section for the Settings page.
+    #[allow(clippy::too_many_lines)]
     fn users_section(&self, active_user: Option<&str>) -> Element<'_, SettingsMessage> {
         let us = &self.users_state;
 

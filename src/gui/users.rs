@@ -1,7 +1,5 @@
 //! Users dashboard page — manage user preferences.
 
-#![allow(clippy::too_many_lines)]
-
 use crate::users::{FieldUpdate, UserRecord, UserStore};
 
 use iced::Task;
@@ -115,6 +113,7 @@ impl UsersState {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: UsersMessage) -> Task<UsersMessage> {
         match msg {
             UsersMessage::Refreshed(users, ws_options) => {

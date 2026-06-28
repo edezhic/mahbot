@@ -10,7 +10,7 @@
 //! the diff to just that file; click again to show all files.
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
-#![allow(clippy::too_many_lines, clippy::manual_let_else)]
+#![allow(clippy::manual_let_else)]
 
 use super::diff_widget::{self, ADDED_COLOR, DiffBufferWidget, DiffFileBuffer, REMOVED_COLOR};
 use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
@@ -300,6 +300,7 @@ impl DiffState {
         iced::Subscription::batch(subs)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: DiffMessage) -> Task<DiffMessage> {
         match msg {
             DiffMessage::WorkspaceSelected(name, path_override) => {
@@ -836,6 +837,7 @@ impl DiffState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, DiffMessage> {
         let has_changes = !self.diff_files.is_empty();
         let show_commit_bar =
@@ -1082,6 +1084,7 @@ impl DiffState {
         col.into()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_file_node<'a>(
         &'a self,
         node: &'a widgets::TreeNode,
@@ -1208,6 +1211,7 @@ impl DiffState {
 
     /// Return the diff content panel: file headers, binary/too-large placeholders,
     /// truncation warnings, and per-file [`DiffBufferWidget`]s interleaved.
+    #[allow(clippy::too_many_lines)]
     fn build_diff_content(&self) -> Element<'_, DiffMessage> {
         if self.diff_files.is_empty() {
             return container(
@@ -1401,6 +1405,7 @@ async fn resolve_workspace_path(
 /// Load the diff, compute per-file highlights, and return enhanced DiffFiles.
 /// `ws_path_override` is used for personal workspaces that don't exist in
 /// workspaces.db — when provided, it's used directly as the filesystem path.
+#[allow(clippy::too_many_lines)]
 async fn load_diff(
     ws_name: String,
     ws_path_override: Option<String>,
@@ -2071,6 +2076,7 @@ mod tests {
 
     // ── TreeNavEnter tests ──────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_tree_nav_enter() {
         struct Case {
