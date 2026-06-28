@@ -463,6 +463,137 @@ impl HomeState {
         }
     }
 
+    /// Replace an optimistic placeholder with a confirmed pipeline message.
+    ///
+    /// If `optimistic_id` matches a locally-inserted optimistic message
+    /// (`is_optimistic && message_id == optimistic_id`), swaps in the real
+    /// [`ChatMessage`], marks the canonical ID as seen, clears `sending`,
+    /// and returns `Some(snap_task)` so the caller can early-return.
+    /// Returns `None` when no replacement was performed.
+    #[allow(clippy::too_many_arguments)]
+    fn replace_optimistic(
+        &mut self,
+        optimistic_id: Option<&String>,
+        message_id: &str,
+        user_name: &str,
+        content: &str,
+        direction: ChatDirection,
+        agent_role: Option<&String>,
+        reply_markup: Option<&serde_json::Value>,
+    ) -> Option<Task<HomeMessage>> {
+        if let Some(opt_id) = optimistic_id {
+            if let Some(pos) = self
+                .messages
+                .iter()
+                .position(|m| m.is_optimistic && m.message_id == *opt_id)
+            {
+                self.messages[pos] = build_chat_message(
+                    message_id.to_string(),
+                    user_name.to_string(),
+                    content.to_string(),
+                    direction,
+                    agent_role.cloned(),
+                    reply_markup,
+                );
+                // Track the canonical ID for dedup — the optimistic ID was
+                // never added to seen_ids.
+                self.seen_ids.insert(message_id.to_string());
+                // User's own message confirmed by pipeline — clear sending
+                // so the button re-enables.
+                self.sending = false;
+                return Some(self.maybe_snap());
+            }
+        }
+        None
+    }
+
+    /// Try to deduplicate a message by its ID.
+    ///
+    /// Returns `true` if the message was already seen (caller should bail).
+    /// Inserts fresh IDs into `seen_ids` and prunes the set (keeping the
+    /// most recent 200 IDs) when it exceeds [`DEDUP_PRUNE_THRESHOLD`].
+    fn try_dedup(&mut self, message_id: &str) -> bool {
+        if self.seen_ids.contains(message_id) {
+            return true;
+        }
+        self.seen_ids.insert(message_id.to_string());
+
+        if self.seen_ids.len() > DEDUP_PRUNE_THRESHOLD {
+            let retain: HashSet<String> = self
+                .messages
+                .iter()
+                .rev()
+                .take(200)
+                .map(|m| m.message_id.clone())
+                .collect();
+            self.seen_ids.retain(|id| retain.contains(id));
+        }
+        false
+    }
+
+    /// Update typing/sending state based on message direction and sender.
+    ///
+    /// * **Agent** responses for the selected user → clear both `typing`
+    ///   and `sending` (the agent has replied).
+    /// * **User** message echo for the selected user → clear `sending`
+    ///   only (re-enables the send button). Does **not** clear `typing`
+    ///   — the typing indicator persists until an agent response arrives.
+    ///
+    /// # Known limitation
+    ///
+    /// No workspace guard here (unlike the display filter in
+    /// [`append_message`](Self::append_message)) — an invisible agent
+    /// response from workspace B could prematurely clear typing/sending
+    /// for workspace A.  A follow-up ticket should add a workspace guard.
+    fn update_sending_state(&mut self, direction: ChatDirection, user_name: &str) {
+        if direction == ChatDirection::Agent && Some(user_name) == self.selected_user.as_deref() {
+            self.typing = false;
+            self.sending = false;
+        }
+
+        if direction == ChatDirection::User && Some(user_name) == self.selected_user.as_deref() {
+            self.sending = false;
+        }
+    }
+
+    /// Append a chat message if it belongs to the selected user + workspace.
+    ///
+    /// Does nothing when `user_name` is not the selected user, or when
+    /// `workspace` does not match [`resolve_workspace_name()`](Self::resolve_workspace_name).
+    /// Takes ownership of the string fields so the caller avoids extra
+    /// clones on the common (append) path.
+    ///
+    /// The caller should call [`maybe_snap()`](Self::maybe_snap)
+    /// unconditionally after this (snap is always safe when nothing was
+    /// appended).
+    #[allow(clippy::too_many_arguments)]
+    fn append_message(
+        &mut self,
+        user_name: String,
+        workspace: &str,
+        message_id: String,
+        content: String,
+        direction: ChatDirection,
+        agent_role: Option<String>,
+        reply_markup: Option<&serde_json::Value>,
+    ) {
+        if Some(user_name.as_str()) != self.selected_user.as_deref() {
+            return;
+        }
+        if Some(workspace) != self.resolve_workspace_name().as_deref() {
+            return;
+        }
+
+        self.messages.push(build_chat_message(
+            message_id,
+            user_name,
+            content,
+            direction,
+            agent_role,
+            reply_markup,
+        ));
+    }
+
     pub fn view(&self) -> Element<'_, HomeMessage> {
         // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
@@ -1022,103 +1153,37 @@ impl HomeState {
                     optimistic_id,
                     reply_markup,
                 } => {
-                    // Replace optimistic placeholder if this event's
-                    // optimistic_id matches a locally-inserted optimistic
-                    // message.  The pipeline confirmation carries the
-                    // GUI-generated ID so the Home page can swap in the real
-                    // message (with the canonical message_id for dedup).
-                    if let Some(ref opt_id) = optimistic_id {
-                        if let Some(pos) = self
-                            .messages
-                            .iter()
-                            .position(|m| m.is_optimistic && m.message_id == *opt_id)
-                        {
-                            self.messages[pos] = build_chat_message(
-                                message_id.clone(),
-                                user_name,
-                                content,
-                                direction,
-                                agent_role,
-                                reply_markup.as_ref(),
-                            );
-                            // Track the canonical ID for dedup — the
-                            // optimistic ID was never added to seen_ids.
-                            self.seen_ids.insert(message_id);
-                            // User's own message confirmed by pipeline —
-                            // clear sending so the button re-enables.
-                            self.sending = false;
-                            return self.maybe_snap();
-                        }
+                    // 1. Replace optimistic placeholder if present.
+                    if let Some(task) = self.replace_optimistic(
+                        optimistic_id.as_ref(),
+                        &message_id,
+                        &user_name,
+                        &content,
+                        direction,
+                        agent_role.as_ref(),
+                        reply_markup.as_ref(),
+                    ) {
+                        return task;
                     }
 
-                    // Deduplicate.
-                    if self.seen_ids.contains(&message_id) {
+                    // 2. Deduplicate against already-seen IDs.
+                    if self.try_dedup(&message_id) {
                         return Task::none();
                     }
-                    self.seen_ids.insert(message_id.clone());
 
-                    // Prune dedup set if too large.
-                    if self.seen_ids.len() > DEDUP_PRUNE_THRESHOLD {
-                        let retain: HashSet<String> = self
-                            .messages
-                            .iter()
-                            .rev()
-                            .take(200)
-                            .map(|m| m.message_id.clone())
-                            .collect();
-                        self.seen_ids.retain(|id| retain.contains(id));
-                    }
+                    // 3. Clear sending/typing state based on direction and sender.
+                    self.update_sending_state(direction, &user_name);
 
-                    // Clear typing indicator and re-enable send button when
-                    // the *selected* user receives an agent response.  Guard
-                    // by sender to avoid prematurely clearing typing due to
-                    // agent messages for other users.  No workspace guard here
-                    // (unlike the message display filter below) — this means an
-                    // invisible agent response from workspace B could
-                    // prematurely clear typing/sending for workspace A.  Known
-                    // limitation; a follow-up ticket should add a workspace
-                    // guard here too.
-                    if direction == ChatDirection::Agent
-                        && Some(&user_name) == self.selected_user.as_ref()
-                    {
-                        self.typing = false;
-                        self.sending = false;
-                    }
-
-                    // Clear sending on the user's own message echo so the
-                    // send button re-enables immediately rather than waiting
-                    // for an agent response.  Do NOT clear typing — the
-                    // typing indicator should persist until the agent starts
-                    // responding (handled by Typing events and the Agent-
-                    // direction check above).
-                    if direction == ChatDirection::User
-                        && Some(&user_name) == self.selected_user.as_ref()
-                    {
-                        self.sending = false;
-                    }
-
-                    // Show messages for the selected user AND workspace only.
-                    // The previous `|| direction == ChatDirection::Agent`
-                    // fallback was removed — it passed ALL agent messages
-                    // regardless of sender, and with the workspace filter gone
-                    // (fix #2), that would flood the chat with cross-user
-                    // messages.  Workspace is now re-filtered (fix #3)
-                    // to prevent cross-workspace interleaving.
-                    // Agent responses carry `user_name == user` (set by
-                    // GuiChannel::send), so `user_name == selected_user` catches
-                    // both user messages and agent responses correctly.
-                    if Some(&user_name) == self.selected_user.as_ref()
-                        && Some(&workspace) == self.resolve_workspace_name().as_ref()
-                    {
-                        self.messages.push(build_chat_message(
-                            message_id,
-                            user_name,
-                            content,
-                            direction,
-                            agent_role,
-                            reply_markup.as_ref(),
-                        ));
-                    }
+                    // 4. Append the message (filtered by selected user + workspace).
+                    self.append_message(
+                        user_name,
+                        &workspace,
+                        message_id,
+                        content,
+                        direction,
+                        agent_role,
+                        reply_markup.as_ref(),
+                    );
 
                     self.maybe_snap()
                 }
@@ -1448,4 +1513,313 @@ fn typing_tick() -> impl futures_util::Stream<Item = HomeMessage> {
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    fn make_home_state(user: &str, workspace: &str) -> HomeState {
+        let mut state = HomeState::new();
+        state.selected_user = Some(user.to_string());
+        state.selected_workspace = Some(workspace.to_string());
+        state
+    }
+
+    fn make_msg(
+        message_id: &str,
+        user_name: &str,
+        content: &str,
+        direction: ChatDirection,
+        agent_role: Option<&str>,
+        is_optimistic: bool,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: None,
+            message_id: message_id.to_string(),
+            user_name: user_name.to_string(),
+            content: content.to_string(),
+            direction,
+            agent_role: agent_role.map(String::from),
+            md_items: Vec::new(),
+            is_optimistic,
+            reply_buttons: Vec::new(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // replace_optimistic
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_replace_optimistic_found() {
+        let mut state = make_home_state("alice", "ws1");
+        state.messages.push(make_msg(
+            "opt-1",
+            "alice",
+            "(placeholder)",
+            ChatDirection::User,
+            None,
+            true,
+        ));
+
+        let task = state.replace_optimistic(
+            Some(&"opt-1".to_string()),
+            "real-42",
+            "alice",
+            "Hello!",
+            ChatDirection::User,
+            None,
+            None,
+        );
+
+        assert!(task.is_some(), "expected Some(task) for found optimistic");
+        assert_eq!(state.messages.len(), 1);
+        let replaced = &state.messages[0];
+        assert_eq!(replaced.message_id, "real-42");
+        assert_eq!(replaced.content, "Hello!");
+        assert!(!replaced.is_optimistic, "should no longer be optimistic");
+        assert!(
+            state.seen_ids.contains("real-42"),
+            "seen_ids should track canonical ID"
+        );
+        assert!(!state.sending, "sending should be cleared");
+    }
+
+    #[test]
+    fn test_replace_optimistic_not_found() {
+        let mut state = make_home_state("alice", "ws1");
+        state.messages.push(make_msg(
+            "opt-1",
+            "alice",
+            "(placeholder)",
+            ChatDirection::User,
+            None,
+            true,
+        ));
+
+        // optimistic_id does not match any message
+        let task = state.replace_optimistic(
+            Some(&"wrong-opt".to_string()),
+            "real-42",
+            "alice",
+            "Hello!",
+            ChatDirection::User,
+            None,
+            None,
+        );
+
+        assert!(task.is_none(), "expected None when no optimistic match");
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(
+            state.messages[0].message_id, "opt-1",
+            "original should be untouched"
+        );
+    }
+
+    #[test]
+    fn test_replace_optimistic_no_opt_id() {
+        let mut state = make_home_state("alice", "ws1");
+
+        let task = state.replace_optimistic(
+            None,
+            "real-42",
+            "alice",
+            "Hello!",
+            ChatDirection::User,
+            None,
+            None,
+        );
+
+        assert!(task.is_none(), "expected None when optimistic_id is None");
+    }
+
+    // ------------------------------------------------------------------
+    // try_dedup
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_try_dedup_fresh() {
+        let mut state = make_home_state("alice", "ws1");
+        assert!(!state.try_dedup("msg-1"), "fresh ID should return false");
+        assert!(state.seen_ids.contains("msg-1"), "fresh ID should be added");
+    }
+
+    #[test]
+    fn test_try_dedup_duplicate() {
+        let mut state = make_home_state("alice", "ws1");
+        state.seen_ids.insert("msg-1".to_string());
+        assert!(state.try_dedup("msg-1"), "duplicate should return true");
+    }
+
+    #[test]
+    fn test_try_dedup_pruning() {
+        let mut state = make_home_state("alice", "ws1");
+        // Add 500 IDs.
+        for i in 0..DEDUP_PRUNE_THRESHOLD {
+            state.seen_ids.insert(format!("old-{i}"));
+        }
+        // Push 200 messages so there is a retain pool.
+        for i in 0..200u32 {
+            state.messages.push(make_msg(
+                &format!("old-{i}"),
+                "alice",
+                "",
+                ChatDirection::User,
+                None,
+                false,
+            ));
+        }
+        // Add one more (breaches the threshold).
+        state.seen_ids.insert("extra".to_string());
+        assert_eq!(state.seen_ids.len(), 501);
+
+        // Calling try_dedup on a fresh ID triggers pruning.
+        assert!(!state.try_dedup("fresh"));
+
+        // After pruning, seen_ids only has the 200 message IDs.
+        // "fresh" and "extra" are dropped because they are not in messages.
+        assert_eq!(state.seen_ids.len(), 200);
+        assert!(!state.seen_ids.contains("fresh"));
+        assert!(!state.seen_ids.contains("extra"));
+        // An ID that is in messages is retained.
+        assert!(state.seen_ids.contains("old-0"));
+        assert!(state.seen_ids.contains("old-199"));
+    }
+
+    // ------------------------------------------------------------------
+    // update_sending_state
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_update_sending_state_agent_match() {
+        let mut state = make_home_state("alice", "ws1");
+        state.sending = true;
+        state.typing = true;
+
+        state.update_sending_state(ChatDirection::Agent, "alice");
+
+        assert!(!state.sending, "agent response should clear sending");
+        assert!(!state.typing, "agent response should clear typing");
+    }
+
+    #[test]
+    fn test_update_sending_state_user_match() {
+        let mut state = make_home_state("alice", "ws1");
+        state.sending = true;
+        state.typing = true;
+
+        state.update_sending_state(ChatDirection::User, "alice");
+
+        assert!(!state.sending, "user echo should clear sending");
+        assert!(state.typing, "user echo should NOT clear typing");
+    }
+
+    #[test]
+    fn test_update_sending_state_no_match() {
+        let mut state = make_home_state("alice", "ws1");
+        state.sending = true;
+        state.typing = true;
+
+        state.update_sending_state(ChatDirection::Agent, "bob");
+
+        assert!(
+            state.sending,
+            "other user's agent msg should not clear sending"
+        );
+        assert!(
+            state.typing,
+            "other user's agent msg should not clear typing"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // append_message
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_append_message_match() {
+        let mut state = make_home_state("alice", "ws1");
+        assert_eq!(state.messages.len(), 0);
+
+        state.append_message(
+            "alice".to_string(),
+            "ws1",
+            "msg-1".to_string(),
+            "Hello!".to_string(),
+            ChatDirection::User,
+            None,
+            None,
+        );
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].message_id, "msg-1");
+        assert_eq!(state.messages[0].content, "Hello!");
+        assert_eq!(state.messages[0].user_name, "alice");
+    }
+
+    #[test]
+    fn test_append_message_no_match_user() {
+        let mut state = make_home_state("alice", "ws1");
+
+        state.append_message(
+            "bob".to_string(),
+            "ws1",
+            "msg-1".to_string(),
+            "Hello!".to_string(),
+            ChatDirection::User,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            state.messages.len(),
+            0,
+            "bob's message should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_append_message_no_match_workspace() {
+        let mut state = make_home_state("alice", "ws1");
+
+        state.append_message(
+            "alice".to_string(),
+            "ws2",
+            "msg-1".to_string(),
+            "Hello!".to_string(),
+            ChatDirection::User,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            state.messages.len(),
+            0,
+            "ws2 message should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_append_message_agent_response() {
+        let mut state = make_home_state("alice", "ws1");
+
+        state.append_message(
+            "alice".to_string(),
+            "ws1",
+            "msg-agent".to_string(),
+            "Agent answer".to_string(),
+            ChatDirection::Agent,
+            Some("engineer".to_string()),
+            None,
+        );
+
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].direction, ChatDirection::Agent);
+        assert_eq!(state.messages[0].agent_role.as_deref(), Some("engineer"),);
+    }
 }
