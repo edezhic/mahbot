@@ -248,55 +248,28 @@ pub async fn init_test_stores() {
         // ticket_buffer is sync — lightweight allocation, no DB I/O.
         crate::ticket_buffer::init_global();
 
-        crate::session::SESSIONS
-            .set(
-                SessionStore::open(test_root())
-                    .await
-                    .expect("failed to create SessionStore for tests"),
-            )
-            .expect("SESSIONS already initialized by another path");
-        crate::board::BOARD
-            .set(
-                BoardStore::open(test_root())
-                    .await
-                    .expect("failed to create BoardStore for tests"),
-            )
-            .expect("BOARD already initialized by another path");
-        crate::workspace::WORKSPACES
-            .set(
-                WorkspaceStore::open(test_root())
-                    .await
-                    .expect("failed to create WorkspaceStore for tests"),
-            )
-            .expect("WORKSPACES already initialized by another path");
-        crate::users::USER_STORE
-            .set(
-                UserStore::open(test_root())
-                    .await
-                    .expect("failed to create UserStore for tests"),
-            )
-            .expect("USER_STORE already initialized by another path");
-        crate::config_db::CONFIG_STORE
-            .set(
-                ConfigStore::open(test_root())
-                    .await
-                    .expect("failed to create ConfigStore for tests"),
-            )
-            .expect("CONFIG_STORE already initialized by another path");
-        crate::stats::STATS_STORE
-            .set(
-                StatsStore::open(test_root())
-                    .await
-                    .expect("failed to create StatsStore for tests"),
-            )
-            .expect("STATS_STORE already initialized by another path");
-        crate::chat_history::CHAT_HISTORY
-            .set(
-                ChatHistoryStore::open(test_root())
-                    .await
-                    .expect("failed to create ChatHistoryStore for tests"),
-            )
-            .expect("CHAT_HISTORY already initialized by another path");
+        macro_rules! init_test_store {
+            ($cell:expr, $store:ty) => {
+                $cell
+                    .set(<$store>::open(test_root()).await.expect(concat!(
+                        "failed to create ",
+                        stringify!($store),
+                        " for tests"
+                    )))
+                    .expect(concat!(
+                        stringify!($cell),
+                        " already initialized by another path"
+                    ));
+            };
+        }
+
+        init_test_store!(crate::session::SESSIONS, SessionStore);
+        init_test_store!(crate::board::BOARD, BoardStore);
+        init_test_store!(crate::workspace::WORKSPACES, WorkspaceStore);
+        init_test_store!(crate::users::USER_STORE, UserStore);
+        init_test_store!(crate::config_db::CONFIG_STORE, ConfigStore);
+        init_test_store!(crate::stats::STATS_STORE, StatsStore);
+        init_test_store!(crate::chat_history::CHAT_HISTORY, ChatHistoryStore);
     })
     .await;
 }
