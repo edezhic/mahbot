@@ -4401,11 +4401,6 @@ impl EditorState {
             None => return Task::none(),
         };
 
-        // Double-check: also discard if state has a newer generation.
-        if state.search_gen != r#gen {
-            return Task::none();
-        }
-
         if let Some(err) = error {
             state.status = GlobalSearchStatus::Error(err);
             state.results.clear();
