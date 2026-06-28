@@ -400,6 +400,12 @@ enum TreeNavDirection {
     Down,
 }
 
+/// Direction for switching tabs.
+enum TabDirection {
+    Next,
+    Prev,
+}
+
 /// Data returned from the async file load operation.
 #[derive(Debug, Clone)]
 pub struct FileLoadData {
@@ -2032,6 +2038,22 @@ impl EditorState {
         Task::batch(tasks)
     }
 
+    /// Switch to the tab one step in the given direction, wrapping around.
+    /// Returns `Task::none()` if a modal overlay is active or if there is
+    /// only one tab.
+    fn switch_tab_relative(&mut self, direction: &TabDirection) -> Task<EditorMessage> {
+        if self.modal_overlay_blocks_editor_shortcuts() || self.tabs.len() <= 1 {
+            return Task::none();
+        }
+        let delta: isize = match direction {
+            TabDirection::Next => 1,
+            TabDirection::Prev => -1,
+        };
+        let new_idx = ((self.active_tab_index.cast_signed() + delta)
+            .rem_euclid(self.tabs.len().cast_signed())) as usize;
+        self.scroll_to_tab(new_idx)
+    }
+
     /// Collect all file paths from the workspace's directory entries for
     /// quick-open filtering. Walks all expanded and known directories.
     /// Called each time QuickOpen is opened to pick up newly expanded dirs.
@@ -3199,31 +3221,8 @@ impl EditorState {
             }
 
             // ── Tab switching ─────────────────────────────────────────
-            EditorMessage::TabSwitchNext => {
-                if self.modal_overlay_blocks_editor_shortcuts() {
-                    return Task::none();
-                }
-                if self.tabs.len() > 1 {
-                    let new_idx = (self.active_tab_index + 1) % self.tabs.len();
-                    return self.scroll_to_tab(new_idx);
-                }
-                Task::none()
-            }
-
-            EditorMessage::TabSwitchPrev => {
-                if self.modal_overlay_blocks_editor_shortcuts() {
-                    return Task::none();
-                }
-                if self.tabs.len() > 1 {
-                    let new_idx = if self.active_tab_index == 0 {
-                        self.tabs.len() - 1
-                    } else {
-                        self.active_tab_index - 1
-                    };
-                    return self.scroll_to_tab(new_idx);
-                }
-                Task::none()
-            }
+            EditorMessage::TabSwitchNext => self.switch_tab_relative(&TabDirection::Next),
+            EditorMessage::TabSwitchPrev => self.switch_tab_relative(&TabDirection::Prev),
 
             EditorMessage::CloseActiveTab => {
                 if self.modal_overlay_blocks_editor_shortcuts() {
