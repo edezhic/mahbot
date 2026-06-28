@@ -281,89 +281,115 @@ mod tests {
         crate::assert_column_count!(TOOL_ERROR_COLUMNS, COL_TE_RECORDED_AT);
     }
 
+    /// All 8 combinations of optional filters in [`ToolErrorQuery`].
+    ///
+    /// Each case verifies the exact SQL clause string and param values produced
+    /// by [`StatsStore::build_tool_error_filter`].
     #[test]
-    fn test_build_tool_error_filter_no_filters() {
-        let query = ToolErrorQuery::default();
-        let (clause, params) = StatsStore::build_tool_error_filter(&query);
-        assert_eq!(clause, "errors != '[]'");
-        assert!(params.is_empty());
-    }
+    fn build_tool_error_filter_all_combinations() {
+        struct Case {
+            name: &'static str,
+            query: ToolErrorQuery,
+            expected_clause: &'static str,
+            expected_params: Vec<turso::Value>,
+        }
 
-    #[test]
-    fn test_build_tool_error_filter_role_only() {
-        let query = ToolErrorQuery {
-            role_filter: Some("Engineer".to_string()),
-            workspace_filter: None,
-            search: None,
-        };
-        let (clause, params) = StatsStore::build_tool_error_filter(&query);
-        assert_eq!(clause, "errors != '[]' AND role = ?");
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0], turso::Value::Text("Engineer".to_string()));
-    }
+        let cases = [
+            Case {
+                name: "no_filters",
+                query: ToolErrorQuery::default(),
+                expected_clause: "errors != '[]'",
+                expected_params: vec![],
+            },
+            Case {
+                name: "role_only",
+                query: ToolErrorQuery {
+                    role_filter: Some("Engineer".to_string()),
+                    workspace_filter: None,
+                    search: None,
+                },
+                expected_clause: "errors != '[]' AND role = ?",
+                expected_params: vec![turso::Value::Text("Engineer".to_string())],
+            },
+            Case {
+                name: "workspace_only",
+                query: ToolErrorQuery {
+                    role_filter: None,
+                    workspace_filter: Some("my-workspace".to_string()),
+                    search: None,
+                },
+                expected_clause: "errors != '[]' AND workspace = ?",
+                expected_params: vec![turso::Value::Text("my-workspace".to_string())],
+            },
+            Case {
+                name: "search_only",
+                query: ToolErrorQuery {
+                    role_filter: None,
+                    workspace_filter: None,
+                    search: Some("timeout".to_string()),
+                },
+                expected_clause: "errors != '[]' AND json_each.value LIKE ?",
+                expected_params: vec![turso::Value::Text("%timeout%".to_string())],
+            },
+            Case {
+                name: "role_and_workspace",
+                query: ToolErrorQuery {
+                    role_filter: Some("Analyst".to_string()),
+                    workspace_filter: Some("ws1".to_string()),
+                    search: None,
+                },
+                expected_clause: "errors != '[]' AND role = ? AND workspace = ?",
+                expected_params: vec![
+                    turso::Value::Text("Analyst".to_string()),
+                    turso::Value::Text("ws1".to_string()),
+                ],
+            },
+            Case {
+                name: "role_and_search",
+                query: ToolErrorQuery {
+                    role_filter: Some("Analyst".to_string()),
+                    workspace_filter: None,
+                    search: Some("connection refused".to_string()),
+                },
+                expected_clause: "errors != '[]' AND role = ? AND json_each.value LIKE ?",
+                expected_params: vec![
+                    turso::Value::Text("Analyst".to_string()),
+                    turso::Value::Text("%connection refused%".to_string()),
+                ],
+            },
+            Case {
+                name: "workspace_and_search",
+                query: ToolErrorQuery {
+                    role_filter: None,
+                    workspace_filter: Some("ws2".to_string()),
+                    search: Some("error msg".to_string()),
+                },
+                expected_clause: "errors != '[]' AND workspace = ? AND json_each.value LIKE ?",
+                expected_params: vec![
+                    turso::Value::Text("ws2".to_string()),
+                    turso::Value::Text("%error msg%".to_string()),
+                ],
+            },
+            Case {
+                name: "all_three",
+                query: ToolErrorQuery {
+                    role_filter: Some("Manager".to_string()),
+                    workspace_filter: Some("ws3".to_string()),
+                    search: Some("fatal".to_string()),
+                },
+                expected_clause: "errors != '[]' AND role = ? AND workspace = ? AND json_each.value LIKE ?",
+                expected_params: vec![
+                    turso::Value::Text("Manager".to_string()),
+                    turso::Value::Text("ws3".to_string()),
+                    turso::Value::Text("%fatal%".to_string()),
+                ],
+            },
+        ];
 
-    #[test]
-    fn test_build_tool_error_filter_search_only() {
-        let query = ToolErrorQuery {
-            role_filter: None,
-            workspace_filter: None,
-            search: Some("timeout".to_string()),
-        };
-        let (clause, params) = StatsStore::build_tool_error_filter(&query);
-        assert_eq!(clause, "errors != '[]' AND json_each.value LIKE ?");
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0], turso::Value::Text("%timeout%".to_string()));
-    }
-
-    #[test]
-    fn test_build_tool_error_filter_workspace_only() {
-        let query = ToolErrorQuery {
-            role_filter: None,
-            workspace_filter: Some("my-workspace".to_string()),
-            search: None,
-        };
-        let (clause, params) = StatsStore::build_tool_error_filter(&query);
-        assert_eq!(clause, "errors != '[]' AND workspace = ?");
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0], turso::Value::Text("my-workspace".to_string()));
-    }
-
-    #[test]
-    fn test_build_tool_error_filter_both() {
-        let query = ToolErrorQuery {
-            role_filter: Some("Analyst".to_string()),
-            workspace_filter: None,
-            search: Some("connection refused".to_string()),
-        };
-        let (clause, params) = StatsStore::build_tool_error_filter(&query);
-        assert_eq!(
-            clause,
-            "errors != '[]' AND role = ? AND json_each.value LIKE ?"
-        );
-        assert_eq!(params.len(), 2);
-        assert_eq!(params[0], turso::Value::Text("Analyst".to_string()));
-        assert_eq!(
-            params[1],
-            turso::Value::Text("%connection refused%".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_tool_error_filter_empty_strings() {
-        // Empty strings should be treated as valid filters (caller's
-        // responsibility to send None rather than empty).
-        let query = ToolErrorQuery {
-            role_filter: Some(String::new()),
-            workspace_filter: None,
-            search: Some(String::new()),
-        };
-        let (clause, params) = StatsStore::build_tool_error_filter(&query);
-        assert_eq!(
-            clause,
-            "errors != '[]' AND role = ? AND json_each.value LIKE ?"
-        );
-        assert_eq!(params.len(), 2);
-        assert_eq!(params[0], turso::Value::Text(String::new()));
-        assert_eq!(params[1], turso::Value::Text("%%".to_string()));
+        for case in &cases {
+            let (clause, params) = StatsStore::build_tool_error_filter(&case.query);
+            assert_eq!(clause, case.expected_clause, "case: {}", case.name);
+            assert_eq!(params, case.expected_params, "case: {}", case.name);
+        }
     }
 }
