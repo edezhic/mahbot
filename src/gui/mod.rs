@@ -42,6 +42,8 @@ use iced::widget::{Column, Row, button, column, container, row, scrollable, text
 use iced::window;
 use iced::{Alignment, Element, Length, Task};
 
+use self::context_menu::ContextMenu;
+
 use iced_fonts::lucide;
 
 use widgets::PickOption;
@@ -1505,8 +1507,25 @@ impl Dashboard {
         let content = match self.page {
             Page::Home => {
                 let home_view = self.home_state.view().map(Message::Home);
-                let clear_enabled = self.home_state.can_clear_chat();
-                let sidebar = ticket_sidebar(&self.board_state, clear_enabled);
+                let sidebar = ticket_sidebar(&self.board_state);
+                // Wrap chat area in a right-click context menu with "Clear chat" option.
+                let home_view: Element<'_, Message> = ContextMenu::new(
+                    home_view,
+                    vec![(
+                        "Clear chat".into(),
+                        Message::Home(home::HomeMessage::ClearChat),
+                    )],
+                )
+                .into();
+                // Wrap sidebar in a right-click context menu with "Archive done & cancelled" option.
+                let sidebar: Element<'_, Message> = ContextMenu::new(
+                    sidebar,
+                    vec![(
+                        "Archive done & cancelled".into(),
+                        Message::Board(board::BoardMessage::ArchiveAllCompleted),
+                    )],
+                )
+                .into();
                 let base = row![
                     container(home_view).width(Length::FillPortion(7)),
                     container(sidebar).width(Length::FillPortion(3))
@@ -1785,9 +1804,9 @@ fn render_branch_modal<'a>(
 // ── Ticket sidebar (Home page, right side) ────────────────────────
 
 /// Ticket sidebar shown on the right side of the Home page.
-/// Displays all non-archived tickets grouped by status, with a
-/// batch-archive button for completed tickets.
-fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Element<'_, Message> {
+/// Displays all non-archived tickets grouped by status. A right-click
+/// context menu on this panel offers "Archive done & cancelled".
+fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     let (pending, pipeline, completed) = board::BoardState::partition_tickets(&board_state.tickets);
 
     // Split pipeline into "pinned" (actively working) and "ready"
@@ -1804,52 +1823,7 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
         .copied()
         .collect();
 
-    let has_completed = !completed.is_empty();
     let is_empty = pending.is_empty() && pipeline.is_empty() && completed.is_empty();
-
-    // Header row: Clear button (replaces "Tickets" title) + archive button
-    let clear_icon = lucide::eraser::<iced::Theme, iced::Renderer>()
-        .size(14)
-        .color(if clear_enabled {
-            theme::TEXT_MUTED
-        } else {
-            theme::TEXT_FAINT
-        });
-    let clear_btn = tooltip(
-        button(clear_icon)
-            .on_press_maybe(if clear_enabled {
-                Some(Message::Home(home::HomeMessage::ClearChat))
-            } else {
-                None
-            })
-            .padding(4)
-            .style(theme::button_text),
-        text("Clear chat").size(11),
-        tooltip::Position::Bottom,
-    )
-    .style(theme::tooltip_style);
-    let archive_icon = lucide::archive::<iced::Theme, iced::Renderer>()
-        .size(12)
-        .color(if has_completed {
-            theme::TEXT_SECONDARY
-        } else {
-            theme::TEXT_FAINT
-        });
-    let archive_btn = tooltip(
-        button(archive_icon)
-            .on_press_maybe(if has_completed {
-                Some(Message::Board(board::BoardMessage::ArchiveAllCompleted))
-            } else {
-                None
-            })
-            .padding(4)
-            .style(theme::button_text),
-        text("Archive done & cancelled").size(11),
-        tooltip::Position::Top,
-    )
-    .style(theme::tooltip_style);
-    let header =
-        row![clear_btn, Space::new().width(Length::Fill), archive_btn].align_y(Alignment::Center);
 
     // Body: loading, empty, or ticket groups
     let body: Element<'_, Message> = if !board_state.load_state.has_loaded() {
@@ -1889,7 +1863,7 @@ fn ticket_sidebar(board_state: &board::BoardState, clear_enabled: bool) -> Eleme
             .into()
     };
 
-    let content = column![header, Space::new().height(8), body].spacing(0);
+    let content = column![Space::new().height(8), body].spacing(0);
 
     container(content)
         .padding([8, 12])

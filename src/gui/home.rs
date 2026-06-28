@@ -360,11 +360,6 @@ impl HomeState {
         self.refresh_history()
     }
 
-    /// Whether the clear-chat action is available (requires both user and workspace).
-    pub(crate) fn can_clear_chat(&self) -> bool {
-        self.selected_user.is_some() && self.selected_workspace.is_some()
-    }
-
     /// Load users for the user picker.
     pub fn load_users(&self) -> Task<HomeMessage> {
         Task::perform(
