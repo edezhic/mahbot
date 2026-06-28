@@ -521,8 +521,6 @@ pub fn is_personal_workspace(workspace_name: &str) -> bool {
     workspace_name.starts_with("personal:")
 }
 
-// ── Column index assertion tests (removed: now enforced at compile time by the `columns!` macro)
-
 #[cfg(test)]
 pub(crate) mod test_util {
     use super::*;
