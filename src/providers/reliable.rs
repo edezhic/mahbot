@@ -37,7 +37,7 @@ impl ErrorClass {
     }
 }
 
-/// Hint arrays used by [`classify_err`] sub-functions.
+/// Hint arrays used by [`classify_by_status_code`] and [`classify_fallback`].
 const CTX_HINTS: &[&str] = &[
     "exceeds the context window",
     "exceeds the available context size",
@@ -113,12 +113,26 @@ fn classify_fallback(lower: &str) -> ErrorClass {
 
 /// Dispatch by HTTP status code using [`is_non_retryable_4xx`].
 ///
+/// Body-text hints for context-window and tool-schema errors are checked
+/// **before** status-based classification — they indicate permanent errors
+/// regardless of HTTP status code (e.g., a 429 with context-window body text
+/// is non-retryable, not a transient rate limit).
+///
 /// Accepts an optional status code parsed from the error:
 /// - `None` → falls through to [`classify_fallback`]
 /// - `Some(4xx)` where [`is_non_retryable_4xx`] returns `true` → [`NonRetryable`](ErrorClass::NonRetryable)
 /// - any other status (408, 429, 5xx, 3xx, etc.) → falls through to [`classify_fallback`]
 #[inline]
 fn classify_by_status_code(status: Option<u16>, lower: &str) -> ErrorClass {
+    // Context window and tool schema body hints are checked before
+    // status-based classification because they indicate permanent errors
+    // regardless of HTTP status code.
+    if CTX_HINTS.iter().any(|h| lower.contains(h)) {
+        return ErrorClass::NonRetryable;
+    }
+    if TOOL_SCHEMA_HINTS.iter().any(|h| lower.contains(h)) {
+        return ErrorClass::ToolSchemaError;
+    }
     if status.is_some_and(is_non_retryable_4xx) {
         ErrorClass::NonRetryable
     } else {
@@ -140,31 +154,21 @@ fn is_non_retryable_4xx(code: u16) -> bool {
 /// Classify an error into one of the [`ErrorClass`] variants.
 ///
 /// ## Cascade Order
-/// 1. **Common** (before if-let): context window exceeded → `NonRetryable`,
-///    tool schema validation → `ToolSchemaError` — these beat all status-based
-///    classification regardless of error structure
-/// 2. **Typed path** (downcast to [`ProviderError`] succeeds): dispatch on
-///    structured status code via [`classify_by_status_code`] — 4xx codes other
-///    than 408 and 429 are [`NonRetryable`](ErrorClass::NonRetryable), else
-///    [`classify_fallback`] ([`classify_by_status_code`])
-/// 3. **Transport typed path** (downcast to [`reqwest::Error`] succeeds): dispatch
+/// 1. **Typed path** (downcast to [`ProviderError`] succeeds): dispatch on
+///    structured status code via [`classify_by_status_code`] — which checks
+///    context-window/tool-schema body-text hints, then 4xx codes other than
+///    408 and 429 as [`NonRetryable`](ErrorClass::NonRetryable), else
+///    [`classify_fallback`]
+/// 2. **Transport typed path** (downcast to [`reqwest::Error`] succeeds): dispatch
 ///    using typed `is_timeout()`, `is_connect()`, `is_builder()`, `is_redirect()`,
 ///    `is_status()` via [`classify_transport_err`] — avoids string-matching transport
 ///    error messages
-/// 4. **String-fallback path** (no structured wrapper): extract HTTP status from
+/// 3. **String-fallback path** (no structured wrapper): extract HTTP status from
 ///    string via [`crate::util::http::extract_http_status`], then dispatch via
 ///    [`classify_by_status_code`]
 fn classify_err(err: &anyhow::Error) -> ErrorClass {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
-
-    // ── Common: context window and tool schema beat all status-based checks ──
-    if CTX_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::NonRetryable;
-    }
-    if TOOL_SCHEMA_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::ToolSchemaError;
-    }
 
     // ── Typed path: extract from structured ProviderError ──
     if let Some(provider_err) = err.downcast_ref::<ProviderError>() {
