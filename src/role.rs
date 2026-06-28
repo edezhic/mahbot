@@ -309,11 +309,15 @@ impl Role {
         let firecrawl_key = CONFIG.firecrawl_key();
         let exa_key = CONFIG.exa_key();
         match CONFIG.web_search_provider().as_deref() {
-            Some(p) if p.eq_ignore_ascii_case("firecrawl") && firecrawl_key.is_some() => {
-                tools.push(Box::new(WebSearchTool::new(firecrawl_key.unwrap())));
+            Some(p) if p.eq_ignore_ascii_case("firecrawl") => {
+                if let Some(key) = firecrawl_key {
+                    tools.push(Box::new(WebSearchTool::new(key)));
+                }
             }
-            Some(p) if p.eq_ignore_ascii_case("exa") && exa_key.is_some() => {
-                tools.push(Box::new(ExaSearchTool::new(exa_key.unwrap())));
+            Some(p) if p.eq_ignore_ascii_case("exa") => {
+                if let Some(key) = exa_key {
+                    tools.push(Box::new(ExaSearchTool::new(key)));
+                }
             }
             Some(other) => {
                 tracing::warn!("Unknown web_search_provider: {other}");
