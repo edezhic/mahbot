@@ -214,6 +214,9 @@ pub enum HomeMessage {
     /// callback payload (prefixed `__opt__`), routed through `GUI_MESSAGE_TX` into
     /// the pipeline where `handle_option_callback()` processes it.
     InlineButtonClicked(String),
+    /// Keyboard modifiers changed (shift, ctrl, alt, etc.).
+    /// Used to track shift state for shift+click selection in the text editor.
+    ModifiersChanged(keyboard::Modifiers),
 }
 
 /// Maximum undo/redo entries for the chat input.
@@ -329,6 +332,10 @@ pub struct HomeState {
     pagination_gen: u64,
     /// Undo/redo stack for the chat input text editor.
     undo_stack: UndoStack,
+    /// Current keyboard modifiers (shift, ctrl, alt, etc.).
+    /// Updated from `ModifiersChanged` events. Used to detect shift+click
+    /// for extending text selection.
+    modifiers: keyboard::Modifiers,
 }
 
 impl HomeState {
@@ -351,6 +358,7 @@ impl HomeState {
             loading_older: false,
             pagination_gen: 0,
             undo_stack: UndoStack::new(),
+            modifiers: keyboard::Modifiers::empty(),
         }
     }
 
@@ -902,30 +910,46 @@ impl HomeState {
         ];
 
         // Keyboard shortcuts: Cmd+Z → undo, Cmd+Shift+Z → redo.
+        // Also track modifier changes for shift+click text selection.
         subs.push(keyboard::listen().filter_map(|event| {
             use keyboard::Event;
-            let Event::KeyPressed {
-                key,
-                modifiers,
-                physical_key,
-                ..
-            } = event
-            else {
-                return None;
-            };
-            let km = super::detect_keyboard_mods(modifiers);
-            // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
-            if km.is_platform_mod
-                && !km.is_emacs_ctrl
-                && !km.altgr_active
-                && key.to_latin(physical_key) == Some('z')
-            {
-                if modifiers.shift() {
-                    return Some(HomeMessage::Redo);
+            match event {
+                Event::ModifiersChanged(modifiers) => {
+                    Some(HomeMessage::ModifiersChanged(modifiers))
                 }
-                return Some(HomeMessage::Undo);
+                Event::KeyPressed {
+                    key,
+                    modifiers,
+                    physical_key,
+                    ..
+                } => {
+                    let km = super::detect_keyboard_mods(modifiers);
+                    // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
+                    if km.is_platform_mod
+                        && !km.is_emacs_ctrl
+                        && !km.altgr_active
+                        && key.to_latin(physical_key) == Some('z')
+                    {
+                        if modifiers.shift() {
+                            return Some(HomeMessage::Redo);
+                        }
+                        return Some(HomeMessage::Undo);
+                    }
+                    None
+                }
+                Event::KeyReleased { .. } => None,
             }
-            None
+        }));
+
+        // Reset keyboard modifiers when the window loses focus, preventing
+        // stale shift/ctrl/alt state from affecting the editor if the user
+        // presses a modifier, switches apps, releases it, and returns.
+        subs.push(iced::window::events().filter_map(|(_id, event)| {
+            if matches!(event, iced::window::Event::Unfocused) {
+                Some(HomeMessage::ModifiersChanged(keyboard::Modifiers::empty()))
+            } else {
+                None
+            }
         }));
 
         iced::Subscription::batch(subs)
@@ -977,11 +1001,25 @@ impl HomeState {
                 }
             }
             HomeMessage::InputChanged(action) => {
+                // When shift is held and the user clicks, convert to a Drag action
+                // which extends the selection anchored at the current cursor position
+                // (shift+click selection semantics).
+                let action = match action {
+                    text_editor::Action::Click(pos) if self.modifiers.shift() => {
+                        text_editor::Action::Drag(pos)
+                    }
+                    other => other,
+                };
+
                 // Snapshot before edit actions for undo/redo.
                 if action.is_edit() {
                     self.undo_stack.snap_before_edit(&self.editor_content);
                 }
                 self.editor_content.perform(action);
+                Task::none()
+            }
+            HomeMessage::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
                 Task::none()
             }
             HomeMessage::Undo => {
@@ -1819,5 +1857,70 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].direction, ChatDirection::Agent);
         assert_eq!(state.messages[0].agent_role.as_deref(), Some("engineer"),);
+    }
+
+    // ------------------------------------------------------------------
+    // ModifiersChanged + shift+click
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_modifiers_changed_updates_state() {
+        let mut state = make_home_state("alice", "ws1");
+
+        // Default is empty modifiers
+        assert!(!state.modifiers.shift());
+
+        // Simulate Shift pressed
+        let shift_mods = keyboard::Modifiers::SHIFT;
+        let _task = state.update(HomeMessage::ModifiersChanged(shift_mods));
+
+        assert!(state.modifiers.shift());
+
+        // Simulate reset via Unfocused (empty modifiers)
+        let _task = state.update(HomeMessage::ModifiersChanged(keyboard::Modifiers::empty()));
+
+        assert!(!state.modifiers.shift());
+    }
+
+    #[test]
+    fn test_shift_click_converts_to_drag() {
+        use iced::Point;
+
+        let mut state = make_home_state("alice", "ws1");
+        state.editor_content = text_editor::Content::with_text("hello world");
+
+        // Click somewhere to position cursor. Even without a font system,
+        // hit-testing at (0,0) on non-empty text typically resolves to
+        // the first cursor position (line 0, col 0).
+        state
+            .editor_content
+            .perform(text_editor::Action::Click(Point { x: 0.0, y: 0.0 }));
+
+        let cursor_before = state.editor_content.cursor();
+        // Click clears selection
+        assert!(
+            cursor_before.selection.is_none(),
+            "Click should clear selection"
+        );
+
+        // Now hold Shift
+        state.modifiers = keyboard::Modifiers::SHIFT;
+
+        // Dispatch a Click at a different position — should be converted to Drag
+        let _task = state.update(HomeMessage::InputChanged(text_editor::Action::Click(
+            Point { x: 100.0, y: 0.0 },
+        )));
+
+        let cursor_after = state.editor_content.cursor();
+
+        // Drag anchors selection at current cursor when none exists. Even if
+        // hit-testing at (100, 0) yields the same or no position, the selection
+        // should now be Some — verifying the Click→Drag conversion happened.
+        assert!(
+            cursor_after.selection.is_some(),
+            "shift+click should create selection via Action::Drag conversion; \
+             got selection={:?}",
+            cursor_after.selection
+        );
     }
 }
