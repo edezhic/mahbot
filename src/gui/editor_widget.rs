@@ -2926,6 +2926,8 @@ where
                                     clipboard.read(iced::advanced::clipboard::Kind::Standard)
                                 {
                                     shell.publish(EditorAction::Paste(text));
+                                    shell.invalidate_layout();
+                                    shell.request_redraw();
                                 }
                                 return;
                             }
@@ -3188,6 +3190,7 @@ where
                                 let c = committed.chars().next().unwrap();
                                 if !c.is_control() {
                                     shell.publish(EditorAction::Insert(c));
+                                    shell.invalidate_layout();
                                     shell.request_redraw();
                                     return;
                                 }
@@ -3204,6 +3207,7 @@ where
                                 // Multi-codepoint grapheme clusters (emoji
                                 // ZWJ sequences, flags, etc.) use Paste.
                                 shell.publish(EditorAction::Paste(committed.to_string()));
+                                shell.invalidate_layout();
                                 shell.request_redraw();
                                 return;
                             }
@@ -3222,12 +3226,10 @@ where
                         state.last_blink = std::time::Instant::now();
                     }
                     shell.publish(action.clone());
-                    // After a cursor-movement action, invalidate layout so the
-                    // auto-scroll logic in layout() runs and adjusts the scroll
-                    // offset to bring the cursor into view.
-                    if is_cursor_move {
-                        shell.invalidate_layout();
-                    }
+                    // Invalidate layout after any action so the auto-scroll
+                    // logic in layout() runs and adjusts the scroll offset to
+                    // bring the cursor into view if it moved off-screen.
+                    shell.invalidate_layout();
                     // Request redraw so the cursor blink state is refreshed
                     // after any keystroke (cursor moves and blink resets).
                     shell.request_redraw();
@@ -3253,6 +3255,7 @@ where
                         } else {
                             shell.publish(EditorAction::Paste(committed.clone()));
                         }
+                        shell.invalidate_layout();
                         shell.request_redraw();
                     }
                     // Preedit rendering is deferred (no on-the-spot display).
