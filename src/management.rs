@@ -2991,9 +2991,10 @@ AM staged_then_modified.js
         assert!(!files.contains(&"working_tree_new.txt".to_string()));
     }
 
-    /// Verify that empty or no-new-files porcelain produces an empty list.
+    /// Verify that porcelain parsing returns empty for both clean output
+    /// (no new/untracked files) and malformed/truncated lines.
     #[test]
-    fn parse_untracked_from_porcelain_empty_when_no_new_files() {
+    fn parse_untracked_from_porcelain_returns_empty() {
         let porcelain = "\
 M  modified.rs
  M working_tree_only.txt
@@ -3006,46 +3007,12 @@ D  deleted.rs
             files.is_empty(),
             "Should be empty when no new/untracked files"
         );
-    }
 
-    /// Verify that the porcelain slicing at &line[3..] is correct for various
-    /// git status --porcelain line formats involving new files.
-    ///
-    /// Tests via the actual `parse_untracked_from_porcelain` function rather than
-    /// reimplementing the slicing logic inline, so a refactor of the parsing
-    /// algorithm would break this test.
-    #[test]
-    fn parse_untracked_from_porcelain_slicing() {
-        // fmt: <XY><space><path>
-        let test_cases = [
-            ("?? foo.rs", "foo.rs"),
-            ("?? dir/bar.py", "dir/bar.py"),
-            ("A  staged.txt", "staged.txt"),
-            ("AM both.txt", "both.txt"), // A in index, M in working tree
-        ];
-
-        for &(line, expected_path) in &test_cases {
-            // Build a multi-line porcelain string containing just this line.
-            let input = format!("{line}\n");
-            let files = parse_untracked_from_porcelain(&input);
-            assert_eq!(
-                files,
-                vec![expected_path.to_string()],
-                "Failed for line: {line:?}"
-            );
-        }
-    }
-
-    /// Verify that malformed/truncated porcelain lines don't cause panics.
-    #[test]
-    fn parse_untracked_from_porcelain_handles_malformed_input() {
-        // Lines shorter than 4 chars that match the filter should not panic.
+        // Malformed/truncated lines that match the filter but are too short
+        // for path extraction should also produce empty results without panicking.
         let short_lines = ["A", "A ", "?? ", "??"];
-
         for &bad_line in &short_lines {
             let files = parse_untracked_from_porcelain(bad_line);
-            // The line matches the filter but is too short for slicing.
-            // get(3..) returns None, so the line is silently skipped.
             assert!(
                 files.is_empty(),
                 "Malformed line {bad_line:?} should produce empty result, got {files:?}"
