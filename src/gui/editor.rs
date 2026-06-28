@@ -1922,6 +1922,12 @@ impl EditorState {
         }
     }
 
+    /// Returns the `(index, path)` of the active tab, or `None` if no tab is open.
+    fn active_tab(&self) -> Option<(usize, String)> {
+        let idx = self.active_tab_idx()?;
+        Some((idx, self.tabs[idx].path.clone()))
+    }
+
     /// Returns `true` when the find/replace bar is open on the active tab.
     fn is_find_bar_open(&self) -> bool {
         self.active_tab_idx()
@@ -2223,10 +2229,9 @@ impl EditorState {
     /// `is_redo` selects which operation: `false` for undo,
     /// `true` for redo.
     fn apply_undo_or_redo(&mut self, is_redo: bool) -> Task<EditorMessage> {
-        let Some(idx) = self.active_tab_idx() else {
+        let Some((idx, path)) = self.active_tab() else {
             return Task::none();
         };
-        let path = self.tabs[idx].path.clone();
         let snapshot = self.tab_contents.get_mut(&path).and_then(|tab_data| {
             let mut stack = tab_data.undo_stack.borrow_mut();
             if is_redo {
@@ -2437,10 +2442,9 @@ impl EditorState {
                 self.pending_enter_dir = None;
                 self.rename_target = None;
 
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((idx, path)) = self.active_tab() else {
                     return Task::none();
                 };
-                let path = self.tabs[idx].path.clone();
                 let is_edit = matches!(
                     action,
                     super::editor_widget::EditorAction::Insert(_)
@@ -2578,17 +2582,14 @@ impl EditorState {
                 {
                     return Task::none();
                 }
-                if self.active_tab_idx().is_some() {
+                if let Some((_, path)) = self.active_tab() {
                     if self.goto_line_input.is_some() {
                         self.goto_line_input = None;
                         return Task::none();
                     }
                     // Close find bar when opening go-to-line.
-                    if let Some(idx) = self.active_tab_idx() {
-                        let path = self.tabs[idx].path.clone();
-                        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-                            tab_data.find_replace_state = None;
-                        }
+                    if let Some(tab_data) = self.tab_contents.get_mut(&path) {
+                        tab_data.find_replace_state = None;
                     }
                     self.goto_line_input = Some(String::new());
                     return iced::widget::operation::focus::<EditorMessage>(Id::new(
@@ -2614,10 +2615,9 @@ impl EditorState {
                     Ok(n) if n > 0 => n.saturating_sub(1), // convert 1-based to 0-based
                     _ => return Task::none(),
                 };
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((_, path)) = self.active_tab() else {
                     return Task::none();
                 };
-                let path = self.tabs[idx].path.clone();
                 if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                     let max_line = tab_data.content.line_count();
                     let line = line_num.min(max_line.saturating_sub(1));
@@ -3367,10 +3367,9 @@ impl EditorState {
                 if self.modal_overlay_blocks_editor_shortcuts() {
                     return Task::none();
                 }
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((_, path)) = self.active_tab() else {
                     return Task::none();
                 };
-                let path = self.tabs[idx].path.clone();
                 if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                     if tab_data.find_replace_state.is_none() {
                         // Open find bar with current selection as default query.
@@ -3401,10 +3400,9 @@ impl EditorState {
             }
 
             EditorMessage::FindQueryInput(query) => {
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((_, path)) = self.active_tab() else {
                     return Task::none();
                 };
-                let path = self.tabs[idx].path.clone();
                 if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                     if let Some(ref mut state) = tab_data.find_replace_state {
                         state.query = query;
@@ -3418,10 +3416,9 @@ impl EditorState {
             }
 
             EditorMessage::FindReplaceInput(replace) => {
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((_, path)) = self.active_tab() else {
                     return Task::none();
                 };
-                let path = self.tabs[idx].path.clone();
                 if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                     if let Some(ref mut state) = tab_data.find_replace_state {
                         state.replace = replace;
@@ -3441,10 +3438,9 @@ impl EditorState {
             }
 
             EditorMessage::FindReplace => {
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((idx, path)) = self.active_tab() else {
                     return Task::none();
                 };
-                let path = self.tabs[idx].path.clone();
                 if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                     if let Some(ref state) = tab_data.find_replace_state {
                         if let Some(range) = state.matches.get(state.current_match_idx) {
@@ -3517,10 +3513,9 @@ impl EditorState {
             EditorMessage::FindReplaceAll => self.find_replace_all(),
 
             EditorMessage::FindToggleCaseSensitivity => {
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((_, path)) = self.active_tab() else {
                     return Task::none();
                 };
-                let path = self.tabs[idx].path.clone();
                 if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                     if let Some(ref mut state) = tab_data.find_replace_state {
                         state.case_sensitive = !state.case_sensitive;
@@ -3682,14 +3677,13 @@ impl EditorState {
             }
 
             EditorMessage::CheckFileChanges => {
-                let Some(idx) = self.active_tab_idx() else {
+                let Some((idx, path)) = self.active_tab() else {
                     return Task::none();
                 };
                 // Only auto-refresh tabs that are not dirty.
                 if self.tabs[idx].is_dirty {
                     return Task::none();
                 }
-                let path = self.tabs[idx].path.clone();
 
                 let current_mtime = if let Ok(meta) = std::fs::metadata(&path) {
                     meta.modified().ok()
@@ -4281,8 +4275,7 @@ impl EditorState {
         }
 
         // Close find bar on active tab next, if open.
-        if let Some(idx) = self.active_tab_idx() {
-            let path = self.tabs[idx].path.clone();
+        if let Some((_, path)) = self.active_tab() {
             if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                 if tab_data.find_replace_state.is_some() {
                     tab_data.find_replace_state = None;
@@ -4316,8 +4309,7 @@ impl EditorState {
             return Task::none();
         }
         // Close find bar and go-to-line when opening global search.
-        if let Some(idx) = self.active_tab_idx() {
-            let path = self.tabs[idx].path.clone();
+        if let Some((_, path)) = self.active_tab() {
             if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                 tab_data.find_replace_state = None;
             }
@@ -4426,10 +4418,9 @@ impl EditorState {
 
     /// Handle FindReplaceAll — replaces all matches in the active buffer.
     fn find_replace_all(&mut self) -> Task<EditorMessage> {
-        let Some(idx) = self.active_tab_idx() else {
+        let Some((idx, path)) = self.active_tab() else {
             return Task::none();
         };
-        let path = self.tabs[idx].path.clone();
         let mut toast = None;
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if let Some(ref state) = tab_data.find_replace_state {
@@ -4473,10 +4464,9 @@ impl EditorState {
     /// Navigate to the next or previous find match in the active tab.
     /// Returns silently if there is no active tab, no find state, or no matches.
     fn navigate_find_match(&mut self, direction: &FindDirection) {
-        let Some(idx) = self.active_tab_idx() else {
+        let Some((_, path)) = self.active_tab() else {
             return;
         };
-        let path = self.tabs[idx].path.clone();
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if let Some(ref mut state) = tab_data.find_replace_state {
                 if !state.matches.is_empty() {
