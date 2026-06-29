@@ -1801,7 +1801,7 @@ fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
 /// Write pre-scrubbed output to a random spill file.
 /// Caller is responsible for scrubbing credentials before calling this function.
 fn spill_output(output: &str) -> Option<std::path::PathBuf> {
-    let filename = format!("spill_{:04x}.txt", rand::random::<u16>());
+    let filename = crate::tools::path::format_spill_filename();
     write_to_spill(output, &filename)
 }
 

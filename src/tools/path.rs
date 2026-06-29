@@ -227,18 +227,25 @@ fn is_os_temp_root(path: &Path) -> bool {
     false
 }
 
+/// Format a spill filename with a random 4-digit hex identifier.
+pub(crate) fn format_spill_filename() -> String {
+    format!("spill_{:04x}.txt", rand::random::<u16>())
+}
+
+/// Check if a filename matches the spill file naming convention
+/// (`spill_XXXX.txt` where XXXX is a 4-digit hex number).
+pub(crate) fn is_spill_filename(name: &str) -> bool {
+    name.strip_prefix("spill_")
+        .and_then(|s| s.strip_suffix(".txt"))
+        .is_some_and(|hex| hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// Whether `path` is a mahbot shell spill/raw log under an OS temp directory.
 fn is_mahbot_spill_filename(name: &str) -> bool {
     if name.ends_with(".raw.log") {
         return true;
     }
-    let Some(hex) = name
-        .strip_prefix("spill_")
-        .and_then(|s| s.strip_suffix(".txt"))
-    else {
-        return false;
-    };
-    hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit())
+    is_spill_filename(name)
 }
 
 /// Whether `path` has the spill filename and `.agent` parent layout (ignoring temp root).
