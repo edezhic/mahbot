@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use tracing::warn;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 /// Result of a successful `git commit` — the full hash and line stats.
 #[derive(Debug, Clone)]
@@ -905,27 +905,18 @@ pub async fn run_git_commit_message(repo_path: &Path) -> Result<String, String> 
     Ok(out.trim().to_string())
 }
 
-/// List untracked/new files in the working tree by running `git status --porcelain`.
+/// List untracked/new files in the working tree.
 ///
-/// Delegates to [`parse_untracked_from_porcelain`] for the actual parsing logic.
+/// Delegates to [`run_git_status`] to run `git status --porcelain`, then passes
+/// the output to [`parse_untracked_from_porcelain`] for parsing.
+///
 /// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
 /// including `A ` clean staged and `AM` staged+modified).
 pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>> {
-    use tokio::process::Command;
-
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo_path)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git status --porcelain failed: {stderr}");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_untracked_from_porcelain(&stdout))
+    let porcelain = run_git_status(repo_path)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    Ok(parse_untracked_from_porcelain(&porcelain))
 }
 
 /// Parse untracked/new file paths from `git status --porcelain` output.
