@@ -1259,20 +1259,51 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 /// Record a sanitation failure: add a system comment for the circuit breaker
 /// and clear assigned_to so the ticket can be re-dispatched.
 async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
-    let _ = board()
-        .add_comment(
+    let tx = match board().conn.begin_tx().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Failed to begin transaction for sanitation failure \
+                 — ticket may be stuck in InSanitation",
+            );
+            return;
+        }
+    };
+
+    let outcome: anyhow::Result<()> = async {
+        BoardStore::add_comment_tx(
+            &tx,
             ticket_id,
             SYSTEM_ROLE,
             &format!("{SANITATION_FAILED_PREFIX} — {reason}"),
         )
-        .await;
-    if let Err(e) = board().set_assigned_to(ticket_id, None).await {
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "Failed to clear assigned_to after sanitation failure \
-             — ticket may be stuck in InSanitation",
-        );
+        .await?;
+        BoardStore::set_assigned_to_tx(&tx, ticket_id, None).await?;
+        Ok(())
+    }
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            if let Err(e) = tx.commit().await {
+                warn!(
+                    ticket = %ticket_id,
+                    error = %e,
+                    "Failed to commit sanitation failure transaction \
+                     — ticket may be stuck in InSanitation",
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Failed to record sanitation failure (comment + clear assigned_to) \
+                 — ticket may be stuck in InSanitation",
+            );
+        }
     }
 }
 
@@ -1803,10 +1834,45 @@ async fn record_verdict_comments(
     role_str: &str,
     filter: VerdictFilter,
 ) {
-    for (i, r) in results.iter().enumerate() {
-        let role_label = format!("{role_str}_{}", i + 1);
-        if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-            let _ = board().add_comment(ticket_id, &role_label, &comment).await;
+    let tx = match board().conn.begin_tx().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Failed to begin transaction for verdict comments",
+            );
+            return;
+        }
+    };
+
+    let outcome: anyhow::Result<()> = async {
+        for (i, r) in results.iter().enumerate() {
+            let role_label = format!("{role_str}_{}", i + 1);
+            if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
+                BoardStore::add_comment_tx(&tx, ticket_id, &role_label, &comment).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            if let Err(e) = tx.commit().await {
+                warn!(
+                    ticket = %ticket_id,
+                    error = %e,
+                    "Failed to commit verdict comments transaction",
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Failed to record verdict comments — rolling back",
+            );
         }
     }
 }

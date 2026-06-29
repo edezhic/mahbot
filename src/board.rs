@@ -1125,6 +1125,34 @@ impl BoardStore {
         self.execute_and_cancel(id, prepared).await
     }
 
+    /// Transactional variant of [`set_assigned_to`](Self::set_assigned_to) —
+    /// uses an existing transaction instead of opening its own.
+    /// Does NOT cancel registered agents — the caller is responsible
+    /// for cancelling stale agents **before** beginning the transaction
+    /// when a cancel is needed (e.g., via `AGENT_REGISTRY.cancel_by_ticket_id`).
+    /// This is safe for post-agent operations (e.g., clearing assignment
+    /// after an agent has already finished) where no cancel is needed.
+    pub(crate) async fn set_assigned_to_tx(
+        tx: &TxGuard<'_>,
+        id: &str,
+        assigned_to: Option<&str>,
+    ) -> Result<()> {
+        let action = if assigned_to.is_some() {
+            "set assigned_to"
+        } else {
+            "clear assigned_to"
+        };
+        let prepared = Self::update_tickets_with_updated_at(
+            "assigned_to = ?1",
+            vec![Value::from(assigned_to)],
+            action.to_string(),
+            id,
+        );
+        let rows = tx.execute(&prepared.sql, prepared.params).await?;
+        Self::ensure_ticket_found(rows, id, &prepared.action)?;
+        Ok(())
+    }
+
     /// Atomically claim a ticket for diagnostics execution.
     ///
     /// Sets `assigned_to = 'diagnostics'` only when the ticket is unassigned
