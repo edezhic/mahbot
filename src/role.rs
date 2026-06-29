@@ -315,7 +315,7 @@ impl Role {
         };
         
         // Manager does not need the web search tool as he is expected to use ask with analysts for that
-        if matches!(self.role, Role::Manager) {
+        if matches!(self, Role::Manager) {
         	    return tools;
         }
 
