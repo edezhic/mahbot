@@ -63,15 +63,6 @@ crate::columns! {
     }
 }
 
-// ── SQL statement constants ──────────────────────────────────
-
-/// UPSERT a key-value pair in config_kv.
-const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value";
-
-/// Delete a key-value pair from config_kv by key. Succeeds even if the key does not exist.
-const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
-
 // ── Shared row-parsing helpers ──────────────────────────────────
 
 /// Parse a `RoleConfig` from a `config_role` row.
@@ -103,12 +94,18 @@ impl ConfigStore {
 
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
-        self.exec(UPSERT_KV_SQL, turso::params![key, value]).await
+        self.exec(
+            "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            turso::params![key, value],
+        )
+        .await
     }
 
     /// Delete a key-value pair. Succeeds even if the key does not exist.
     pub async fn delete_kv(&self, key: &str) -> Result<()> {
-        self.exec(DELETE_KV_SQL, turso::params![key]).await
+        self.exec("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
+            .await
     }
 
     /// Get all key-value pairs.
@@ -238,8 +235,12 @@ impl ConfigStore {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        tx.execute(UPSERT_KV_SQL, turso::params![key, value])
-            .await?;
+        tx.execute(
+            "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            turso::params![key, value],
+        )
+        .await?;
         Ok(())
     }
 
@@ -247,7 +248,8 @@ impl ConfigStore {
     /// Like [`delete_kv`] but executes on the supplied [`turso::TxGuard`].
     /// Succeeds even if the key does not exist.
     pub(crate) async fn delete_kv_tx(&self, tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
-        tx.execute(DELETE_KV_SQL, turso::params![key]).await?;
+        tx.execute("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
+            .await?;
         Ok(())
     }
 
