@@ -853,7 +853,7 @@ impl BoardState {
             sections.push(el);
         }
 
-        scrollable(Column::from_vec(sections).spacing(4))
+        scrollable(Column::from_vec(sections).spacing(4).width(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
             .direction(theme::vertical_scrollbar())
@@ -1091,9 +1091,11 @@ impl BoardState {
                     markdown::view(items, theme::markdown_settings())
                         .map(BoardMessage::LinkClicked),
                 )
+                .width(Length::Fill)
                 .direction(theme::vertical_scrollbar())
                 .style(theme::scrollbar_style),
             )
+            .width(Length::Fill)
             .padding(8)
             .style(theme::surface_card_style)
             .into()
@@ -1199,6 +1201,7 @@ impl BoardState {
 
             cmt_col = cmt_col.push(
                 container(comment_col)
+                    .width(Length::Fill)
                     .padding(8)
                     .style(theme::surface_card_style),
             );
