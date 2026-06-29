@@ -1245,6 +1245,9 @@ impl BoardStore {
     /// ticket phase (unlike `set_assigned_to`, which cancels running agents). Non-negative line counts are
     /// enforced by debug assertions; the caller is responsible for providing
     /// valid values in production.
+    ///
+    /// Delegates to [`set_commit_info_tx`](Self::set_commit_info_tx) within a
+    /// fresh transaction, matching the pattern used by [`add_comment`](Self::add_comment).
     pub async fn set_commit_info(
         &self,
         id: &str,
@@ -1252,9 +1255,9 @@ impl BoardStore {
         lines_added: i64,
         lines_removed: i64,
     ) -> Result<()> {
-        let prepared = Self::build_set_commit_info_sql(id, hash, lines_added, lines_removed);
-        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, id, &prepared.action)?;
+        let tx = self.conn.begin_tx().await?;
+        Self::set_commit_info_tx(&tx, id, hash, lines_added, lines_removed).await?;
+        tx.commit().await?;
         Ok(())
     }
 
