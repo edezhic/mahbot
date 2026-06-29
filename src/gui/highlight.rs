@@ -572,9 +572,9 @@ impl HighlightLanguage {
             .expect("HighlightLanguage variant should have a valid extension mapping");
         let query = match self {
             HighlightLanguage::Rust => RUST_HIGHLIGHT_QUERY,
-            HighlightLanguage::JavaScript => JAVASCRIPT_HIGHLIGHT_QUERY,
-            HighlightLanguage::TypeScript => TYPESCRIPT_HIGHLIGHT_QUERY,
-            HighlightLanguage::TSX => TSX_HIGHLIGHT_QUERY,
+            HighlightLanguage::JavaScript
+            | HighlightLanguage::TypeScript
+            | HighlightLanguage::TSX => JS_LIKE_HIGHLIGHT_QUERY,
             HighlightLanguage::Python => PYTHON_HIGHLIGHT_QUERY,
             HighlightLanguage::Json => JSON_HIGHLIGHTS_QUERY,
             HighlightLanguage::Toml => TOML_HIGHLIGHTS_QUERY,
@@ -675,43 +675,7 @@ const RUST_HIGHLIGHT_QUERY: &str = r#"
 ] @operator
 "#;
 
-const JAVASCRIPT_HIGHLIGHT_QUERY: &str = r"
-;; Functions
-(function_declaration name: (identifier) @function)
-(method_definition name: (property_identifier) @function)
-(arrow_function) @function
-(generator_function_declaration name: (identifier) @function)
-
-;; Strings
-(string) @string
-(template_string) @string
-
-;; Comments
-(comment) @comment
-
-;; Numbers
-(number) @number
-";
-
-const TYPESCRIPT_HIGHLIGHT_QUERY: &str = r"
-;; Functions
-(function_declaration name: (identifier) @function)
-(method_definition name: (property_identifier) @function)
-(arrow_function) @function
-(generator_function_declaration name: (identifier) @function)
-
-;; Strings
-(string) @string
-(template_string) @string
-
-;; Comments
-(comment) @comment
-
-;; Numbers
-(number) @number
-";
-
-const TSX_HIGHLIGHT_QUERY: &str = r"
+const JS_LIKE_HIGHLIGHT_QUERY: &str = r"
 ;; Functions
 (function_declaration name: (identifier) @function)
 (method_definition name: (property_identifier) @function)
