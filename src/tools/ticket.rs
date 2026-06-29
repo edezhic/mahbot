@@ -394,6 +394,7 @@ async fn guard_not_pipeline_blocking(
 mod tests {
     use super::*;
     use crate::util::test::TicketBuilder;
+    use crate::util::test::make_ticket;
     use crate::workspace::test_ws;
     use serde_json::json;
 
@@ -444,11 +445,13 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = TicketBuilder::new(store, test_ws("/ws"))
-            .title("Test")
-            .create()
-            .await
-            .expect("create");
+        let id = make_ticket(
+            store,
+            test_ws("/ws"),
+            "Test",
+            crate::board::TicketPhase::Backlog,
+        )
+        .await;
 
         let tool = UpdateTicketTool;
         let ws = test_ws("/tmp");
@@ -472,21 +475,9 @@ mod tests {
         let store = crate::board::store();
         let ws = test_ws("/tmp_ws");
 
-        let _id_a = TicketBuilder::new(store, ws.clone())
-            .title("A")
-            .create()
-            .await
-            .expect("create");
-        let id_b = TicketBuilder::new(store, ws.clone())
-            .title("B")
-            .create()
-            .await
-            .expect("create");
-        let id_c = TicketBuilder::new(store, ws.clone())
-            .title("C")
-            .create()
-            .await
-            .expect("create");
+        let _id_a = make_ticket(store, ws.clone(), "A", crate::board::TicketPhase::Backlog).await;
+        let id_b = make_ticket(store, ws.clone(), "B", crate::board::TicketPhase::Backlog).await;
+        let id_c = make_ticket(store, ws.clone(), "C", crate::board::TicketPhase::Backlog).await;
         // Transition C to 'done' and B to 'cancelled'
         store
             .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done, None)
@@ -619,11 +610,13 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = TicketBuilder::new(store, test_ws("/ws"))
-            .title("Test")
-            .create()
-            .await
-            .expect("create");
+        let id = make_ticket(
+            store,
+            test_ws("/ws"),
+            "Test",
+            crate::board::TicketPhase::Backlog,
+        )
+        .await;
 
         let tool = UpdateTicketTool;
         let ws = test_ws("/tmp");

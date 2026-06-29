@@ -78,6 +78,43 @@ macro_rules! open_test_store {
     }};
 }
 
+/// Convenience helper to create a test ticket with just a title and phase.
+///
+/// Reduces the common boilerplate:
+/// ```ignore
+/// let id = TicketBuilder::new(&store, ws)
+///     .title("My Ticket")
+///     .phase(TicketPhase::Backlog)
+///     .create()
+///     .await
+///     .expect("create my ticket");
+/// ```
+/// to:
+/// ```ignore
+/// let id = make_ticket(&store, ws, "My Ticket", TicketPhase::Backlog).await;
+/// ```
+///
+/// For tickets that need `.desc()`, `.prereqs()`, `.reporter()`, `.embedding()`,
+/// or `.supersede()`, use [`TicketBuilder`] directly.
+///
+/// # Panics
+///
+/// Panics if the ticket cannot be created. The panic message includes the title
+/// and phase for debugging.
+pub(crate) async fn make_ticket(
+    store: &BoardStore,
+    ws: crate::Workspace,
+    title: &str,
+    phase: TicketPhase,
+) -> String {
+    TicketBuilder::new(store, ws)
+        .title(title)
+        .phase(phase)
+        .create()
+        .await
+        .unwrap_or_else(|e| panic!("make_ticket({title}, {phase}) failed: {e}"))
+}
+
 /// Fetch a ticket by ID, panicking if the DB query fails or the ticket
 /// does not exist.
 ///
