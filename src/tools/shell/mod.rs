@@ -2136,6 +2136,7 @@ mod tests {
         check_shell_output(cases);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn tool_profile_cases() {
         // Specific tool profile tests — consolidated table.

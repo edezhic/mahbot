@@ -1200,6 +1200,7 @@ mod tests {
         line_has_class_in_range(&fh, 2, HighlightClass::String, 20, 24, "inline code");
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_distribute_byte_spans() {
         // Table-driven test consolidating 4 distribute_byte_spans tests.

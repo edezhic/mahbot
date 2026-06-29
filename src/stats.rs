@@ -232,6 +232,7 @@ mod tests {
     ///
     /// Each case verifies the exact SQL clause string and param values produced
     /// by [`StatsStore::build_tool_error_filter`].
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn build_tool_error_filter_all_combinations() {
         struct Case {
@@ -342,6 +343,7 @@ mod tests {
 
     /// Integration test: write per-call records via flush_batch, then verify
     /// they can be read back via query_tool_usage and query_tool_errors.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn flush_and_query_round_trip() {
         let (store, _tmp) = crate::open_test_store!(StatsStore, "stats");

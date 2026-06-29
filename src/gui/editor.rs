@@ -6375,7 +6375,7 @@ mod tests {
 
     #[test]
     fn test_validate_file_content_too_large() {
-        let big = vec![b'a'; (MAX_FILE_SIZE as usize) + 1];
+        let big = vec![b'a'; usize::try_from(MAX_FILE_SIZE).unwrap() + 1];
         let err = validate_file_content(&big).unwrap_err();
         assert!(err.starts_with("File too large"), "unexpected error: {err}");
     }
@@ -6392,7 +6392,7 @@ mod tests {
 
     #[test]
     fn test_validate_file_content_both_conditions_reports_size_first() {
-        let mut big_with_null = vec![b'a'; (MAX_FILE_SIZE as usize) + 1];
+        let mut big_with_null = vec![b'a'; usize::try_from(MAX_FILE_SIZE).unwrap() + 1];
         big_with_null.push(0);
         let err = validate_file_content(&big_with_null).unwrap_err();
         assert!(

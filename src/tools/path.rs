@@ -587,6 +587,7 @@ mod tests {
 
     // ── Path validation: is_path_safe_for_workspace ─────────────────────
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn is_path_safe_for_workspace_all_cases() {
         struct Case {
