@@ -531,7 +531,7 @@ fn check_segment(segment: &str) -> Result<(), String> {
                 "use `dd` without `of=` to output to stdout.",
             );
         }
-        "curl" if has_output_flag(trimmed) => {
+        "curl" if has_curl_output_flag(trimmed) => {
             return reject(
                 trimmed,
                 "`curl` with output flags (`-o`, `--output`, `-O`, `--remote-name`) is not allowed.",
@@ -783,8 +783,8 @@ fn has_dd_of(command: &str) -> bool {
     command.split_whitespace().any(|p| p.starts_with("of="))
 }
 
-/// Check if curl/wget has output flags.
-fn has_output_flag(command: &str) -> bool {
+/// Check if curl has output flags.
+fn has_curl_output_flag(command: &str) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     parts
         .iter()
