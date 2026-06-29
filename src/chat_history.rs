@@ -96,6 +96,17 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
     })
 }
 
+/// Parse rows into [`ChatHistoryEntry`], then reverse for chronological order.
+/// Shared helper for `load_for_user` and `load_older_for_user`.
+fn rows_to_history_entries(rows: Vec<Row>) -> Result<Vec<ChatHistoryEntry>> {
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        entries.push(chat_history_entry_from_row(&row)?);
+    }
+    entries.reverse();
+    Ok(entries)
+}
+
 impl ChatHistoryStore {
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
     /// Silently ignores duplicate `message_id` values (UPSERT no-op).
@@ -143,12 +154,7 @@ impl ChatHistoryStore {
                 turso::params![user_name, workspace, HISTORY_LIMIT],
             )
             .await?;
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(chat_history_entry_from_row(&row)?);
-        }
-        entries.reverse();
-        Ok(entries)
+        rows_to_history_entries(rows)
     }
 
     /// Load messages older than `before_id` for a user + workspace pair.
@@ -174,13 +180,7 @@ impl ChatHistoryStore {
                 turso::params![user_name, workspace, before_id, limit],
             )
             .await?;
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(chat_history_entry_from_row(&row)?);
-        }
-        // Reverse for chronological display order.
-        entries.reverse();
-        Ok(entries)
+        rows_to_history_entries(rows)
     }
 
     /// Delete all chat history entries for a specific user + workspace pair.
