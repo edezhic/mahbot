@@ -1099,7 +1099,7 @@ impl BoardState {
         Some(if let Some(items) = description_md {
             container(
                 scrollable(
-                    iced_selection::markdown::view(items, theme::markdown_settings())
+                    markdown::view(items, theme::markdown_settings())
                         .map(BoardMessage::LinkClicked),
                 )
                 .direction(theme::vertical_scrollbar())
@@ -1153,8 +1153,7 @@ impl BoardState {
                 .size(13)
                 .into()
             } else if let Some((_, items)) = comments_md.iter().find(|(idx, _)| *idx == i) {
-                iced_selection::markdown::view(items, theme::markdown_settings())
-                    .map(BoardMessage::LinkClicked)
+                markdown::view(items, theme::markdown_settings()).map(BoardMessage::LinkClicked)
             } else {
                 selectable_text(&comment.content, theme::TEXT_PRIMARY)
                     .size(13)
