@@ -191,8 +191,6 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 /// Used directly by [`dispatch_engineer`] and by [`dispatch_parallel_with_guard`]
 /// (which wraps the guard + dispatch + post-check skeleton shared by
 /// [`dispatch_backlog_analysts`] and [`dispatch_verifiers`]).
-/// Formerly all three callers used this directly; the parallel-dispatch callers
-/// now go through the helper for structural consistency.
 /// Diagnostics uses a separate circuit breaker (see [`run_circuit_breaker`]).
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
