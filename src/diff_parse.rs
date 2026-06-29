@@ -993,7 +993,7 @@ pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
             if path.is_empty() {
                 None
             } else {
-                Some(path.to_string())
+                Some(unquote_c_style(path).unwrap_or_else(|| path.to_string()))
             }
         })
         .collect()
@@ -1529,7 +1529,8 @@ index abc123..def456 100644
     // ── parse_untracked_from_porcelain — git porcelain parsing ──
 
     /// Verify that `parse_untracked_from_porcelain` correctly extracts untracked
-    /// and staged-as-new file paths from git porcelain output.
+    /// and staged-as-new file paths from git porcelain output, including C-quoted
+    /// paths with special characters (tab, double-quote, non-ASCII).
     #[test]
     fn parse_untracked_from_porcelain_extracts_new_files() {
         let porcelain = "\
@@ -1542,17 +1543,25 @@ A  staged_new.js
 ?? temp.log
 AM staged_then_modified.js
  A working_tree_new.txt
+?? \"file\\tname.rs\"
+A  \"staged\\\"file.js\"
+?? \"file\\\\backslash.rs\"
 ";
 
         let files = parse_untracked_from_porcelain(porcelain);
 
-        assert_eq!(files.len(), 6);
+        assert_eq!(files.len(), 9);
         assert!(files.contains(&"new_file.rs".to_string()));
         assert!(files.contains(&"another_new.py".to_string()));
         assert!(files.contains(&"staged_new.js".to_string()));
         assert!(files.contains(&"dir/untracked.txt".to_string()));
         assert!(files.contains(&"temp.log".to_string()));
         assert!(files.contains(&"staged_then_modified.js".to_string()));
+        // C-quoted paths should be properly unquoted:
+        assert!(files.contains(&"file\tname.rs".to_string()));
+        assert!(files.contains(&"staged\"file.js".to_string()));
+        // Backslash in filename (\\) unquotes to single backslash:
+        assert!(files.contains(&"file\\backslash.rs".to_string()));
         // These should be excluded:
         assert!(!files.contains(&"modified.rs".to_string()));
         assert!(!files.contains(&"working_tree_only.txt".to_string()));
