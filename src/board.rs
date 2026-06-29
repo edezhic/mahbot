@@ -645,7 +645,7 @@ impl BoardStore {
     /// to point to the new ID. All writes happen in a single transaction
     /// via `begin_tx()` + parameterized queries.
     ///
-    /// After commit, any running agent on the superseded ticket is cancelled.
+    /// Before commit, any running agent on the superseded ticket is cancelled.
     ///
     /// # Errors
     ///
@@ -715,6 +715,14 @@ impl BoardStore {
 
         Self::rewire_dependents(&tx, supersede_id, &new_id, &params.workspace_name).await?;
 
+        // Cancel agents on the superseded ticket BEFORE the transaction commits.
+        // If the process crashes between commit and cancellation, the superseded
+        // ticket is Cancelled in the database but its agents remain registered and
+        // keep running (orphaned agents on a cancelled ticket). Cancelling first
+        // flips the trade-off: if the commit subsequently fails, agents were
+        // cancelled unnecessarily but will be re-registered on re-dispatch.
+        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
+
         tx.commit().await?;
 
         crate::ticket_buffer::push(
@@ -723,8 +731,6 @@ impl BoardStore {
             old_status,
             TicketPhase::Cancelled,
         );
-
-        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
 
         Ok(new_id)
     }
@@ -986,7 +992,9 @@ impl BoardStore {
 
     /// Transactional variant of [`transition_to`](Self::transition_to) —
     /// uses an existing transaction instead of `self.conn.execute()`.
-    /// Does NOT cancel registered agents (caller does that after `tx.commit()`).
+    /// Does NOT cancel registered agents — the caller is responsible for
+    /// cancelling agents **before** beginning the transaction (or at least
+    /// before `tx.commit()`) to avoid orphaned agents on crash.
     pub(crate) async fn transition_to_tx(
         tx: &TxGuard<'_>,
         id: &str,
@@ -1023,7 +1031,7 @@ impl BoardStore {
     /// - **`set_commit_info`** — pure metadata, does not cancel agents.
     /// - **`claim_diagnostics`** — returns `Result<bool>` (conditional success),
     ///   only cancels on successful claim.
-    /// - **`supersede_and_create`** — runs inside a transaction, cancels after
+    /// - **`supersede_and_create`** — runs inside a transaction, cancels before
     ///   commit via a different pattern.
     /// - **`batch_set_archived`** — batch operation on many tickets, handles
     ///   zero-affected-rows gracefully (no error).

@@ -1075,6 +1075,14 @@ async fn commit_and_transition_ticket_from(
 
     let phase_label = source.as_ref();
 
+    // Cancel agents BEFORE the transaction to avoid orphaned in-memory agents
+    // if the process crashes after the commit succeeds but before cancellation
+    // reaches the agent registry. If the transaction subsequently fails and the
+    // ticket is re-dispatched on the next poll cycle, the cancelled agents are
+    // simply re-registered — wasted work is preferable to orphaned agents on a
+    // Done ticket (which crash-recovery cannot rescue).
+    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
+
     let tx = match board().conn.begin_tx().await {
         Ok(tx) => tx,
         Err(e) => {
@@ -1114,9 +1122,6 @@ async fn commit_and_transition_ticket_from(
                 );
                 return;
             }
-
-            // In-memory side-effects happen after the transaction commits.
-            crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
             info!(ticket = %ticket.id, "Committed {short_hash}, moving to Done");
 
