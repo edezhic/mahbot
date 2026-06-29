@@ -112,8 +112,7 @@ impl ConfigStore {
 
     /// Delete a key-value pair. Succeeds even if the key does not exist.
     pub async fn delete_kv(&self, key: &str) -> Result<()> {
-        self.exec("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
-            .await
+        self.exec_delete("config_kv", "key", key).await
     }
 
     /// Get all key-value pairs.
@@ -266,6 +265,20 @@ impl ConfigStore {
         self.conn.execute(sql, params).await?;
         Ok(())
     }
+
+    /// Delete a row from the given table by its primary-key column.
+    ///
+    /// # Safety
+    ///
+    /// `table` and `pk_col` are always compile-time string literals supplied by the caller;
+    /// they are never user-provided, so the `format!` injection is benign.
+    async fn exec_delete(&self, table: &str, pk_col: &str, key: &str) -> Result<()> {
+        self.exec(
+            &format!("DELETE FROM {table} WHERE {pk_col} = ?1"),
+            turso::params![key],
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -314,11 +327,7 @@ impl ConfigStore {
 
     // Delete a role config row. Succeeds even if the role does not exist.
     async fn delete_role_config(&self, role: &str) -> Result<()> {
-        self.exec(
-            "DELETE FROM config_role WHERE role = ?1",
-            turso::params![role],
-        )
-        .await
+        self.exec_delete("config_role", "role", role).await
     }
 
     // Get the model routing config for a model.
@@ -356,11 +365,8 @@ impl ConfigStore {
 
     // Delete a model routing row. Succeeds even if the model does not exist.
     async fn delete_model_routing(&self, model: &str) -> Result<()> {
-        self.exec(
-            "DELETE FROM config_model_routing WHERE model = ?1",
-            turso::params![model],
-        )
-        .await
+        self.exec_delete("config_model_routing", "model", model)
+            .await
     }
 }
 
