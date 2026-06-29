@@ -33,7 +33,7 @@ use crate::board::{BOARD, BoardStore, Ticket, TicketComment, TicketPhase};
 use crate::diff_parse::list_untracked_files;
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
-use crate::role::DIAGNOSTICS_ROLE;
+use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
 use crate::session::ticket_session_key;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
@@ -68,6 +68,14 @@ const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
 /// sanitation loops before tripping.
 const _: () = assert!(SANITATION_CIRCUIT_BREAKER_THRESHOLD < CIRCUIT_BREAKER_COMMENT_THRESHOLD);
 
+/// Compile-time invariant: the diagnostics circuit breaker must also always
+/// trip before the general comment-count breaker, otherwise a ticket could
+/// accumulate `CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments during repeated
+/// diagnostics loops before tripping. This is a conservative approximation
+/// because the general breaker counts all comments (not just diagnostics), but
+/// it guarantees that diagnostics-only chatter cannot bypass the general breaker.
+const _: () = assert!(DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD < CIRCUIT_BREAKER_COMMENT_THRESHOLD);
+
 /// Prefix for all auto-diagnostics comments on tickets.
 const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 /// Comment-formatting constant — appended to the diagnostics comment body when
@@ -96,12 +104,12 @@ fn board() -> &'static BoardStore {
 
 // ── Circuit breaker helper functions ──────────────────────────────────────────
 
-/// Count only sanitation-failure system comments (role == "system", content
+/// Count only sanitation-failure system comments (role == `SYSTEM_ROLE`, content
 /// contains [`SANITATION_FAILED_PREFIX`]). Used by the sanitation circuit breaker.
 fn count_sanitation_failures(comments: &[TicketComment]) -> usize {
     comments
         .iter()
-        .filter(|c| c.role == "system" && c.content.contains(SANITATION_FAILED_PREFIX))
+        .filter(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_PREFIX))
         .count()
 }
 
@@ -518,7 +526,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             let _ = board()
                 .add_comment(
                     &ticket_for_failure.id,
-                    "system",
+                    SYSTEM_ROLE,
                     &format!("❌ Dispatch panicked: {msg}"),
                 )
                 .await;
@@ -1104,7 +1112,7 @@ async fn commit_and_transition_ticket_from(
             commit_info.lines_removed,
         )
         .await?;
-        BoardStore::add_comment_tx(&tx, &ticket.id, "system", &comment).await?;
+        BoardStore::add_comment_tx(&tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
         BoardStore::transition_to_tx(&tx, &ticket.id, Some(source), TicketPhase::Done, None)
             .await?;
         Ok(())
@@ -1267,7 +1275,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     // proper sibling ticket drainage (moving other ReadyForDevelopment tickets
     // to Planning), and consistent failure handling with the general breaker.
     //
-    // Counts system comments where role == "system" and content contains
+    // Counts system comments where role == `SYSTEM_ROLE` and content contains
     // "Sanitation failed".
     //
     // Separate from the general comment-count circuit breaker so that
@@ -1344,7 +1352,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         let _ = board()
             .add_comment(
                 &ticket.id,
-                "system",
+                SYSTEM_ROLE,
                 &format!("{SANITATION_FAILED_PREFIX} — agent returned no output"),
             )
             .await;
@@ -1371,7 +1379,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             let _ = board()
                 .add_comment(
                     &ticket.id,
-                    "system",
+                    SYSTEM_ROLE,
                     &format!("{SANITATION_FAILED_PREFIX} — verdict extraction error: {e}"),
                 )
                 .await;
@@ -1434,7 +1442,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         let _ = board()
             .add_comment(
                 &ticket.id,
-                "system",
+                SYSTEM_ROLE,
                 &format!(
                     "{SANITATION_FAILED_PREFIX} — garbage files: {count}",
                     count = verdict.garbage_files.len(),
@@ -1865,7 +1873,7 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
         potential_blockers,
         missing_analysis,
     );
-    let _ = board().add_comment(&ticket.id, "system", &summary).await;
+    let _ = board().add_comment(&ticket.id, SYSTEM_ROLE, &summary).await;
 
     let extracted_count = total - missing_analysis;
     let passing_count = lgtm + minor_issues;
@@ -1968,7 +1976,7 @@ fn build_analyst_summary(
 /// Each domain-specific breaker naturally excludes its trip comment:
 ///
 /// * **Diagnostics breaker** — filters comments by role `"diagnostics"`,
-///   but trip comments always use role `"system"` (set by this function).
+///   but trip comments always use role `SYSTEM_ROLE` (set by this function).
 /// * **Sanitation breaker** — filters comments by content containing
 ///   `"Sanitation failed"`, but trip comments use different text.
 /// * **General breaker** — counts all comments (`len`); it prevents
@@ -2031,7 +2039,7 @@ async fn run_circuit_breaker(
     );
 
     let _ = board()
-        .add_comment(&ticket.id, "system", &comment_text(count))
+        .add_comment(&ticket.id, SYSTEM_ROLE, &comment_text(count))
         .await;
 
     if let Err(e) = transition_ticket(
@@ -2107,7 +2115,7 @@ async fn run_circuit_breaker(
         }
 
         let _ = board()
-            .add_comment(&other.id, "system", &planning_move_comment)
+            .add_comment(&other.id, SYSTEM_ROLE, &planning_move_comment)
             .await;
     }
 
@@ -2156,7 +2164,7 @@ async fn process_verdict_results(
         let _ = board()
             .add_comment(
                 &ticket.id,
-                "system",
+                SYSTEM_ROLE,
                 &format!(
                     "❌ All {label} agents failed to produce verdicts — \
                      ticket marked as Failed.",
@@ -2344,7 +2352,7 @@ mod tests {
 
         // Add a comment to ticket A so the circuit breaker has something to count.
         board()
-            .add_comment(&trip_id, "system", "Some comment")
+            .add_comment(&trip_id, SYSTEM_ROLE, "Some comment")
             .await
             .expect("add_comment to A");
 
@@ -2417,7 +2425,7 @@ mod tests {
                 .expect("get_comments for B");
             let comment = comments
                 .iter()
-                .find(|c| c.role == "system")
+                .find(|c| c.role == SYSTEM_ROLE)
                 .expect("ticket B should have a system comment");
 
             assert!(
@@ -2758,7 +2766,7 @@ mod tests {
 
         // Add a comment mimicking the actual failure path
         let _ = board()
-            .add_comment(&ticket_id, "system", "❌ Test failure detail")
+            .add_comment(&ticket_id, SYSTEM_ROLE, "❌ Test failure detail")
             .await;
 
         let ticket = board()
@@ -2830,7 +2838,7 @@ mod tests {
             let _ = board()
                 .add_comment(
                     &ticket_id,
-                    "system",
+                    SYSTEM_ROLE,
                     &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
                 )
                 .await;
@@ -2862,7 +2870,7 @@ mod tests {
         let _ = board()
             .add_comment(
                 &ticket_id,
-                "system",
+                SYSTEM_ROLE,
                 &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
             )
             .await;
@@ -2873,7 +2881,7 @@ mod tests {
         let _ = board()
             .add_comment(
                 &ticket_id,
-                "system",
+                SYSTEM_ROLE,
                 &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
             )
             .await;
@@ -3386,7 +3394,7 @@ mod tests {
                 comments.len(),
             );
 
-            let system = comments.iter().find(|c| c.role == "system");
+            let system = comments.iter().find(|c| c.role == SYSTEM_ROLE);
             assert!(
                 system.is_some(),
                 "case {}: system summary comment should exist",
