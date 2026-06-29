@@ -210,11 +210,11 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     let mut tasks = JoinSet::<()>::new();
     let shutdown_token = mahbot::shutdown::shutdown_token();
 
-    tasks.spawn(cleanup_loop_task("Session cleanup", |cutoff| async move {
+    tasks.spawn(run_cleanup_loop("Session cleanup", |cutoff| async move {
         mahbot::session::cleanup_old_transient_sessions(&cutoff).await
     }));
 
-    tasks.spawn(cleanup_loop_task("Log cleanup", {
+    tasks.spawn(run_cleanup_loop("Log cleanup", {
         let store = log_store;
         move |cutoff| {
             let store = store.clone();
@@ -246,14 +246,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     let rx = init_message_pipeline(&mut tasks, &shutdown_token);
 
-    // `handle_messages` runs unconditionally. When no channels are registered,
+    // `run_message_dispatch_loop` runs unconditionally. When no channels are registered,
     // tx is never cloned into a listener, rx is dropped, and the handler exits
     // gracefully (rx.recv() returns `None` immediately).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
         "message-handler",
-        handle_messages(rx),
+        run_message_dispatch_loop(rx),
     );
 
     spawn_cancellable(
@@ -281,14 +281,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
 /// Initialize the message pipeline: creates the shared mpsc channel,
 /// broadcast channel, channel registry, and spawns Telegram + GUI
-/// channel listeners. Returns the receiver half for [`handle_messages`].
+/// channel listeners. Returns the receiver half for [`run_message_dispatch_loop`].
 fn init_message_pipeline(
     tasks: &mut JoinSet<()>,
     cancel: &CancellationToken,
 ) -> tokio::sync::mpsc::Receiver<ChannelMessage> {
     // Create the shared message channel before any channel listeners are
     // spawned. All channels push into the same tx; rx is consumed by the
-    // single `handle_messages` consumer. `ChannelMessage.source_channel`
+    // single `run_message_dispatch_loop` consumer. `ChannelMessage.source_channel`
     // disambiguates origins.
     let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(100);
 
@@ -443,7 +443,7 @@ fn main() -> Result<()> {
 }
 
 /// Background cleanup loop adapter — runs every 10 minutes until cancelled.
-async fn cleanup_loop_task<F, Fut>(label: &'static str, cleanup: F)
+async fn run_cleanup_loop<F, Fut>(label: &'static str, cleanup: F)
 where
     F: Fn(String) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<u64>> + Send,
@@ -461,7 +461,7 @@ where
     }
 }
 
-async fn handle_messages(mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>) {
+async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>) {
     let shutdown_token = mahbot::shutdown::shutdown_token();
 
     loop {
