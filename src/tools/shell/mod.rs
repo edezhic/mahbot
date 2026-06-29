@@ -1868,24 +1868,7 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
-    /// Mutex serializing env-var-modifying tests to prevent thread-safety
-    /// issues with `std::env::set_var` (which is `unsafe` in Rust 2024).
-    ///
-    /// ## Cross-module coordination
-    ///
-    /// `self_update.rs` has its own `ENV_LOCK` — the two locks are independent.
-    /// A shell test that reads `CARGO_HOME` (under this lock) could theoretically
-    /// race with a `self_update` test that writes it (under the other lock).
-    /// To mitigate this, tests that call into code reading `$CARGO_HOME` (via
-    /// `extra_shell_path_prefixes`) hold this lock during the read, while
-    /// write tests in both modules hold their respective locks for minimal
-    /// durations. The race window is negligible in practice since env var
-    /// accesses are instantaneous, but the lock pattern documents the
-    /// synchronization boundary.
-    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
+    use crate::util::test::env_lock;
 
     // ── Table-driven test helpers ─────────────────────────────────────
     // These helpers reduce boilerplate for process_shell_output and
@@ -2392,16 +2375,16 @@ mod tests {
     /// [`SAFE_ENV_VARS`] with baseline values (CWE-200). Verify by running
     /// `env` through the built command.
     ///
-    /// Acquires [`ENV_LOCK`] because `build_shell_command` → `resolved_shell_path`
-    /// → `extra_shell_path_prefixes` reads `$CARGO_HOME` from the environment,
-    /// which concurrent tests in `self_update.rs` may write under their own lock.
+    /// Acquires the shared [`env_lock()`] because `build_shell_command` →
+    /// `resolved_shell_path` → `extra_shell_path_prefixes` reads `$CARGO_HOME`
+    /// from the environment.
     #[cfg(unix)]
     #[tokio::test]
     async fn build_shell_command_isolates_environment() {
         let tmp = TempDir::new().expect("tempdir");
-        // Acquire ENV_LOCK while building the command since extra_shell_path_prefixes
-        // reads $CARGO_HOME — concurrent self_update tests write it under a different
-        // lock, so holding our own prevents the theoretical data race.
+        // Acquire env_lock while building the command since extra_shell_path_prefixes
+        // reads $CARGO_HOME — concurrent tests in other modules may write it, so
+        // holding the shared lock prevents the theoretical data race.
         let mut cmd = {
             let _guard = env_lock().lock().unwrap();
             build_shell_command("env", tmp.path())
@@ -2716,15 +2699,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolved_shell_path_includes_cargo_home_when_set() {
-        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        // SAFETY: Shared env_lock serializes all env writes across the crate.
         let _guard = env_lock().lock().unwrap();
 
-        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        // SAFETY: Protected by the shared env_lock.
         unsafe {
             std::env::set_var("CARGO_HOME", "/custom/cargo");
         }
         let path = resolved_shell_path();
-        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        // SAFETY: Protected by the shared env_lock.
         unsafe {
             std::env::remove_var("CARGO_HOME");
         }
@@ -2748,16 +2731,16 @@ mod tests {
             return;
         };
 
-        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        // SAFETY: Shared env_lock serializes all env writes across the crate.
         let _guard = env_lock().lock().unwrap();
 
         let default_cargo_home = dirs.home_dir().join(".cargo").to_string_lossy().to_string();
-        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        // SAFETY: Protected by the shared env_lock.
         unsafe {
             std::env::set_var("CARGO_HOME", &default_cargo_home);
         }
         let path = resolved_shell_path();
-        // SAFETY: ENV_LOCK serializes all env writes in this module.
+        // SAFETY: Protected by the shared env_lock.
         unsafe {
             std::env::remove_var("CARGO_HOME");
         }

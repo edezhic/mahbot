@@ -986,19 +986,15 @@ mod tests {
 
     // ── New function tests ─────────────────────────────────────────────────
 
-    /// Mutex serializing env-var-modifying tests to prevent thread-safety
-    /// issues with `std::env::set_var` (which is `unsafe` in Rust 2024).
-    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
+    use crate::util::test::env_lock;
 
     #[test]
     fn test_resolve_cargo_bin_path_cargo_home() {
+        // SAFETY: Serialized via shared env_lock — no concurrent env access.
         let _guard = env_lock().lock().unwrap();
 
         // Scenario 1: CARGO_HOME is set to a custom path.
-        // SAFETY: Serialized via ENV_LOCK — no concurrent env access.
+        // SAFETY: Serialized via shared env_lock — no concurrent env access.
         unsafe {
             std::env::set_var("CARGO_HOME", "/custom/cargo");
         }

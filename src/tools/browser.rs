@@ -859,6 +859,7 @@ fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::test::env_lock;
 
     #[test]
     fn url_validation_rejects_bad_urls() {
@@ -1150,12 +1151,12 @@ mod tests {
 
     #[test]
     fn ensure_browser_env_sets_home_when_missing() {
+        let _guard = env_lock().lock().unwrap();
         let original_home = std::env::var_os("HOME");
         unsafe { std::env::remove_var("HOME") };
 
         let mut cmd = Command::new("true");
         ensure_browser_env(&mut cmd);
-        // Function completes without panic.
 
         if let Some(home) = original_home {
             unsafe { std::env::set_var("HOME", home) };
@@ -1164,6 +1165,7 @@ mod tests {
 
     #[test]
     fn ensure_browser_env_sets_chromium_flags() {
+        let _guard = env_lock().lock().unwrap();
         let original = std::env::var_os("CHROMIUM_FLAGS");
         unsafe { std::env::remove_var("CHROMIUM_FLAGS") };
 

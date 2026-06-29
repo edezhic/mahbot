@@ -23,6 +23,16 @@ use std::sync::OnceLock;
 /// for the process lifetime.
 static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
+/// Mutex serializing env-var-modifying tests to prevent thread-safety
+/// issues with `std::env::set_var` (which is `unsafe` in Rust 2024).
+///
+/// All test modules that modify environment variables should use this
+/// shared lock to prevent data races between concurrent tests.
+pub fn env_lock() -> &'static std::sync::Mutex<()> {
+    static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 fn test_root() -> &'static PathBuf {
     TEST_ROOT.get_or_init(|| {
         let tmp = tempfile::TempDir::new().expect("failed to create test temp dir");
