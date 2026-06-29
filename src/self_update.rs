@@ -309,46 +309,6 @@ pub fn is_update_available() -> bool {
 
 // ── Update mutex ──────────────────────────────────────────────────────────
 
-/// Checkpoint all Turso database stores before hard process termination.
-///
-/// `std::process::exit(0)` bypasses Rust destructors, so Turso WAL connections
-/// are never properly closed. Without this explicit checkpoint, pending WAL
-/// writes are silently lost and `.tshm` coordination files are left inconsistent.
-///
-/// Skips stores that haven't been initialized yet. Logs and swallows per-store
-/// errors to avoid blocking the update flow.
-async fn checkpoint_all_databases() {
-    let stores: [(&str, Option<&crate::turso::Connection>); 8] = [
-        ("board", crate::board::BOARD.get().map(|s| &s.conn)),
-        ("sessions", crate::session::SESSIONS.get().map(|s| &s.conn)),
-        (
-            "workspaces",
-            crate::workspace::WORKSPACES.get().map(|s| &s.conn),
-        ),
-        (
-            "chat_history",
-            crate::chat_history::CHAT_HISTORY.get().map(|s| &s.conn),
-        ),
-        ("stats", crate::stats::STATS_STORE.get().map(|s| &s.conn)),
-        (
-            "config_db",
-            crate::config_db::CONFIG_STORE.get().map(|s| &s.conn),
-        ),
-        ("users", crate::users::USER_STORE.get().map(|s| &s.conn)),
-        ("logs", crate::logs::LOG_STORE.get().map(|s| &s.conn)),
-    ];
-
-    for (name, conn_opt) in &stores {
-        let Some(conn) = conn_opt else {
-            continue;
-        };
-        match conn.checkpoint().await {
-            Ok(()) => info!(db = %name, "Database WAL checkpointed"),
-            Err(e) => warn!(error = %e, db = %name, "Failed to checkpoint database WAL"),
-        }
-    }
-}
-
 /// Global mutex ensuring only one update runs at a time.
 /// A second trigger while an update is in progress gets an immediate error
 /// via [`try_lock`](Mutex::try_lock).
@@ -514,7 +474,7 @@ pub async fn execute_update() -> Result<()> {
     //     `exit(0)` below bypasses Rust destructors, so Turso connections are
     //     never properly closed. Without this checkpoint, pending WAL writes are
     //     silently lost (e.g., archived tickets reappear after restart).
-    checkpoint_all_databases().await;
+    crate::checkpoint::checkpoint_all_databases().await;
 
     // 15. Exit — spawn succeeded.
     std::process::exit(0);

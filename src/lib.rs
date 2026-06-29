@@ -14,6 +14,7 @@ pub mod agent;
 pub mod board;
 pub mod channels;
 pub mod chat_history;
+pub mod checkpoint;
 pub mod config;
 pub mod config_db;
 pub mod debug;

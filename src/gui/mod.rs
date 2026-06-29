@@ -200,6 +200,8 @@ pub enum Message {
     ToggleMaintenance,
     /// Result of a per-workspace maintenance toggle DB write.
     ToggleMaintenanceResult(Result<(), String>, String, bool),
+    /// WAL checkpoint complete — safe to exit now.
+    CheckpointAndExit,
     /// Periodic refresh of workspace paused/maintenance state from DB.
     WorkspaceStatesRefreshed(HashMap<String, bool>, HashMap<String, bool>),
     /// No-op — produced by refresh helpers on transient DB errors to avoid
@@ -512,7 +514,9 @@ impl Dashboard {
             self.selected_workspace_name.as_deref(),
             self.selected_user_name.as_deref(),
         );
-        iced::exit()
+        Task::perform(crate::checkpoint::checkpoint_all_databases(), |()| {
+            Message::CheckpointAndExit
+        })
     }
 
     /// Window title with page name.
@@ -855,6 +859,7 @@ impl Dashboard {
                 }
             }
             Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
+            Message::CheckpointAndExit => iced::exit(),
             Message::WindowEvent(_id, event) => {
                 match event {
                     window::Event::Resized(new_size) => self.last_size = new_size,

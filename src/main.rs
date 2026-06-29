@@ -272,6 +272,10 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         }
     });
 
+    // Periodic WAL checkpoint as defense-in-depth against data loss from
+    // crashes or missed shutdown-path checkpoints.
+    mahbot::checkpoint::spawn_auto_checkpoint_loop(&mut tasks, &shutdown_token);
+
     // Store handles so shutdown_after_dashboard can await completion.
     {
         let mut guard = BACKGROUND_TASKS.lock().unwrap_poison();
