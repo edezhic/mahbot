@@ -148,11 +148,9 @@ impl ConfigStore {
                 role_config_from_row,
             )
             .await?;
-        let mut configs = Vec::new();
-        for row in rows {
-            configs.push(row?);
-        }
-        Ok(configs)
+        Ok(rows
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     // ── config_model_routing ──────────────────────────────────
@@ -167,11 +165,9 @@ impl ConfigStore {
                 model_routing_from_row,
             )
             .await?;
-        let mut routings = Vec::new();
-        for row in rows {
-            routings.push(row?);
-        }
-        Ok(routings)
+        Ok(rows
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     // ── batch save (role configs + model routings) ──────────────

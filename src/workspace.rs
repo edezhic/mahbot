@@ -503,11 +503,9 @@ impl WorkspaceStore {
                 workspace_from_row,
             )
             .await?;
-        let mut workspaces = Vec::new();
-        for row in rows {
-            workspaces.push(row?);
-        }
-        Ok(workspaces)
+        Ok(rows
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Lightweight fetch of only name, paused, and maintenance columns.

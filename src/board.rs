@@ -1751,13 +1751,9 @@ impl BoardStore {
             })
             .await
         {
-            Ok(items) => {
-                let mut results = Vec::new();
-                for item in items {
-                    results.push(item?);
-                }
-                Ok(results)
-            }
+            Ok(items) => Ok(items
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()?),
             Err(e) => {
                 tracing::warn!(
                     query = %sanitized,
