@@ -341,25 +341,14 @@ impl Tool for AddCommentTool {
     }
 }
 
-/// Returns a comma-separated string of all valid [`TicketPhase`] variant names.
-///
-/// Used in parse-error messages across ticket tools to give agents an
-/// actionable list of accepted status strings.
-fn valid_phases_string() -> String {
-    <TicketPhase as strum::IntoEnumIterator>::iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Parse a status string into a [`TicketPhase`], returning a user-friendly
 /// error message listing all valid phases on failure.
 fn parse_ticket_phase(s: &str) -> Result<TicketPhase> {
     s.parse::<TicketPhase>().map_err(|_| {
-        anyhow::anyhow!(
-            "Invalid status '{s}'. Valid statuses: {}",
-            valid_phases_string()
-        )
+        let valid: Vec<String> = <TicketPhase as strum::IntoEnumIterator>::iter()
+            .map(|p| p.to_string())
+            .collect();
+        anyhow::anyhow!("Invalid status '{s}'. Valid statuses: {}", valid.join(", "))
     })
 }
 
