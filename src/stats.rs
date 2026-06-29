@@ -129,18 +129,13 @@ impl StatsStore {
     pub async fn count_tool_errors(&self, query: &ToolErrorQuery) -> Result<usize> {
         let (where_clause, params) = Self::build_tool_error_filter(query);
         let sql = format!("SELECT COUNT(*) FROM tool_calls WHERE {where_clause}");
-        let rows = self
-            .conn
-            .query(&sql, turso::params_from_iter(params))
-            .await?;
-        let count = match rows.into_iter().next() {
-            Some(row) => match row.get_value(0)? {
-                turso::Value::Integer(n) => usize::try_from(n).unwrap_or(0),
-                _ => 0,
-            },
-            None => 0,
-        };
-        Ok(count)
+        self.conn
+            .query_optional(&sql, turso::params_from_iter(params), |row| {
+                row.get::<i64>(0)
+            })
+            .await
+            .map(|opt| opt.unwrap_or(0))
+            .map(|n: i64| usize::try_from(n).unwrap_or(0))
     }
 
     /// Query tool call error entries with optional filters and pagination.

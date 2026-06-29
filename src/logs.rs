@@ -177,15 +177,10 @@ impl LogStore {
     async fn count_matching(&self, filters: &LogQuery) -> Result<usize, ::turso::Error> {
         let (where_sql, values) = build_where_clause(filters);
         let sql = format!("SELECT COUNT(*) FROM logs {where_sql}");
-        let rows = self.conn.query(&sql, values).await?;
-        let count = match rows.into_iter().next() {
-            Some(row) => match row.get_value(0)? {
-                Value::Integer(n) => usize::try_from(n).unwrap_or(0),
-                _ => 0,
-            },
-            None => 0,
-        };
-        Ok(count)
+        self.conn
+            .query_row(&sql, values, |row| row.get::<i64>(0))
+            .await
+            .map(|n| usize::try_from(n).unwrap_or(0))
     }
 
     /// Delete log entries matching a given `level` whose `timestamp` is older than the given
