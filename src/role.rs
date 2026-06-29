@@ -249,18 +249,38 @@ use crate::tools::{
 };
 
 impl Role {
+    /// Core read/search/read-only-shell tools for inspector-style roles
+    /// (Analyst, QA, Reviewer, Discovery, Sanitation).
+    fn readonly_core_tools() -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(ReadTool),
+            Box::new(SearchTool),
+            Box::new(ShellTool::new(ShellMode::ReadOnly)),
+        ]
+    }
+
+    /// Core full-shell/read/edit/search tools for full-access roles
+    /// (Engineer, Coder).
+    fn full_core_tools() -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(ShellTool::new(ShellMode::Full)),
+            Box::new(ReadTool),
+            Box::new(EditTool),
+            Box::new(SearchTool),
+        ]
+    }
+
     /// Build the tool set for this role.
     #[must_use]
     pub fn tools(&self) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
-                vec![
-                    Box::new(ShellTool::new(ShellMode::Full)),
-                    Box::new(ReadTool),
-                    Box::new(EditTool),
-                    Box::new(SearchTool),
-                    Box::new(AskTool::new(vec![Role::Analyst, Role::Coder], None)),
-                ]
+                let mut t = Self::full_core_tools();
+                t.push(Box::new(AskTool::new(
+                    vec![Role::Analyst, Role::Coder],
+                    None,
+                )));
+                t
             }
             Role::Manager => {
                 vec![
@@ -273,27 +293,13 @@ impl Role {
                 ]
             }
             Role::Analyst => {
-                vec![
-                    Box::new(ReadTool),
-                    Box::new(SearchTool),
-                    Box::new(BrowserTool::default()),
-                    Box::new(ShellTool::new(ShellMode::ReadOnly)),
-                ]
+                let mut t = Self::readonly_core_tools();
+                t.push(Box::new(BrowserTool::default()));
+                t
             }
-            Role::Coder => {
-                vec![
-                    Box::new(ShellTool::new(ShellMode::Full)),
-                    Box::new(ReadTool),
-                    Box::new(EditTool),
-                    Box::new(SearchTool),
-                ]
-            }
+            Role::Coder => Self::full_core_tools(),
             Role::Qa | Role::Reviewer | Role::Discovery | Role::Sanitation => {
-                vec![
-                    Box::new(ReadTool),
-                    Box::new(SearchTool),
-                    Box::new(ShellTool::new(ShellMode::ReadOnly)),
-                ]
+                Self::readonly_core_tools()
             }
             Role::Artist => {
                 vec![
