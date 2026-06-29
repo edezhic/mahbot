@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::task::spawn;
 use tracing::{debug, error, info, warn};
 
+use std::borrow::Cow;
 use std::future::Future;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -63,13 +64,13 @@ async fn enrich_message_for_role(msg: &mut ChannelMessage, role: Role, ws: &Work
 
     // Link enrichment always runs, regardless of modality.
     let enriched = mahbot::channels::enrich_links(&msg.content).await;
-    if enriched != msg.content {
+    if let Cow::Owned(s) = enriched {
         tracing::info!(
             channel = %msg.source_channel,
             user_name = %msg.user_name,
             "Link enricher: prepended URL summaries to message"
         );
-        msg.content = enriched;
+        msg.content = s;
     }
 }
 

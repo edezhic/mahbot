@@ -6,6 +6,7 @@ use crate::turso;
 use crate::util::MEDIA_MARKER_RE;
 use crate::{ChannelMessage, ChatDirection, SendMessage};
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::LazyLock;
@@ -551,16 +552,16 @@ fn extract_urls(text: &str) -> Vec<String> {
 /// If no URLs are found, the original message is returned unchanged.
 /// Links are fetched concurrently using the shared `BrowserTool` — each URL
 /// gets its own isolated session tab that is closed after text extraction.
-pub async fn enrich_links(content: &str) -> String {
+pub async fn enrich_links(content: &str) -> Cow<'_, str> {
     let urls = extract_urls(content);
     if urls.is_empty() {
-        return content.to_string();
+        return Cow::Borrowed(content);
     }
 
     // Check chrome-use availability once before spawning concurrent work.
     if !BrowserTool::is_available().await {
         tracing::debug!("chrome-use not available, skipping link enrichment");
-        return content.to_string();
+        return Cow::Borrowed(content);
     }
 
     // Fetch all URLs concurrently.
@@ -602,11 +603,11 @@ pub async fn enrich_links(content: &str) -> String {
     }
 
     if enrichments.is_empty() {
-        return content.to_string();
+        return Cow::Borrowed(content);
     }
 
     let prefix = enrichments.join("\n\n");
-    format!("{prefix}\n\n{content}")
+    Cow::Owned(format!("{prefix}\n\n{content}"))
 }
 
 /// Mirror a GUI-originated user message to the user's Telegram chat(s)
@@ -734,6 +735,15 @@ mod tests {
     fn extract_urls_handles_urls_in_parens() {
         let urls = extract_urls("(https://example.com) and [https://test.org]");
         assert_eq!(urls, vec!["https://example.com", "https://test.org"]);
+    }
+
+    #[tokio::test]
+    async fn enrich_links_returns_borrowed_when_no_urls() {
+        let content = "Hello, this is a plain message without any URLs.";
+        let result = enrich_links(content).await;
+        // No URLs → should borrow the input, not allocate a new String.
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result.as_ref(), content);
     }
 
     // ── Enrichment strategy tests ─────────────────────────────────────
