@@ -99,7 +99,7 @@ impl ExaSearchTool {
                 .cache_result(
                     title.clone(),
                     result.url.clone(),
-                    result.text.as_deref().unwrap_or_default().to_string(),
+                    result.text.clone().unwrap_or_default(),
                 )
                 .await;
 

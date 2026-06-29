@@ -6110,11 +6110,7 @@ impl EditorState {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         };
-        let ws_path = self
-            .selected_workspace_path
-            .as_deref()
-            .unwrap_or_default()
-            .to_string();
+        let ws_path = self.selected_workspace_path.clone().unwrap_or_default();
         let r#gen = self.generation.wrapping_add(1);
         self.generation = r#gen;
         // Register the generation so DirExpanded handler accepts the result.

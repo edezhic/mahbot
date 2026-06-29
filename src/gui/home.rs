@@ -1045,11 +1045,7 @@ impl HomeState {
                     reply_target: sender.clone(),
                     content: callback_data,
                     source_channel: "gui".to_string(),
-                    workspace: self
-                        .selected_workspace
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_string(),
+                    workspace: self.selected_workspace.clone().unwrap_or_default(),
                     message_id: Some(crate::generate_id()),
                     callback_query_id: None,
                 };
@@ -1460,11 +1456,7 @@ impl HomeState {
             reply_target: sender,
             content,
             source_channel: "gui".to_string(),
-            workspace: self
-                .selected_workspace
-                .as_deref()
-                .unwrap_or_default()
-                .to_string(),
+            workspace: self.selected_workspace.clone().unwrap_or_default(),
             message_id: optimistic_id,
             callback_query_id: None,
         };

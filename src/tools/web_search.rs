@@ -113,7 +113,7 @@ impl WebSearchTool {
                 .cache_result(
                     title.clone(),
                     result.url.clone(),
-                    result.markdown.as_deref().unwrap_or_default().to_string(),
+                    result.markdown.clone().unwrap_or_default(),
                 )
                 .await;
 

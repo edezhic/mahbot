@@ -341,7 +341,7 @@ pub fn unquote_c_style(raw: &str) -> Option<String> {
 /// Non-UTF-8 bytes produced by octal escapes are handled via
 /// `String::from_utf8_lossy` — pragmatic for macOS where non-UTF-8 paths
 /// are filesystem-impossible.
-pub fn unescape_c_style(input: &str) -> Option<String> {
+fn unescape_c_style(input: &str) -> Option<String> {
     let mut result = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i: usize = 0;

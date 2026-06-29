@@ -536,11 +536,7 @@ impl DiffState {
                     return Task::none();
                 }
                 self.committing = true;
-                let ws_name = self
-                    .selected_workspace_name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_string();
+                let ws_name = self.selected_workspace_name.clone().unwrap_or_default();
                 let ws_path_for_commit = self.personal_workspace_path.clone();
                 Task::perform(
                     async move {

@@ -1713,7 +1713,7 @@ fn verdict_passes(verdict: Option<&crate::Verdict>) -> bool {
 /// Format a Verdict's critique and issues into a comment body string
 /// using bullet-list style: critique followed by "Issues:\n- item1\n- item2".
 fn format_verdict_body(verdict: &crate::Verdict) -> String {
-    let mut text = verdict.critique.as_deref().unwrap_or_default().to_string();
+    let mut text = verdict.critique.clone().unwrap_or_default();
     if !verdict.issues_detected.is_empty() {
         if !text.is_empty() {
             text.push_str("\n\n");
