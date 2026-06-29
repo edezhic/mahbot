@@ -2330,11 +2330,7 @@ mod tests {
             .await
             .expect("transition_to");
 
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         // Call with wrong phase — guard should reject immediately
         assert!(
@@ -2393,11 +2389,7 @@ mod tests {
             .expect("add_comment to A");
 
         // Fetch ticket A and trip the circuit breaker with threshold 0.
-        let ticket_a = board()
-            .get_ticket(&trip_id)
-            .await
-            .expect("get_ticket A")
-            .expect("ticket A exists");
+        let ticket_a = expect_ticket(board(), &trip_id).await;
 
         let tripped = run_circuit_breaker(
             &ticket_a,
@@ -2413,11 +2405,7 @@ mod tests {
 
         // ── Verify ticket A is Failed ──
         {
-            let ticket_a = board()
-                .get_ticket(&trip_id)
-                .await
-                .expect("get_ticket A")
-                .expect("ticket A exists");
+            let ticket_a = expect_ticket(board(), &trip_id).await;
             assert_eq!(
                 ticket_a.status,
                 TicketPhase::Failed,
@@ -2427,11 +2415,7 @@ mod tests {
 
         // ── Verify ticket B (same workspace) is Planning ──
         {
-            let ticket_b = board()
-                .get_ticket(&victim_id)
-                .await
-                .expect("get_ticket B")
-                .expect("ticket B exists");
+            let ticket_b = expect_ticket(board(), &victim_id).await;
             assert_eq!(
                 ticket_b.status,
                 TicketPhase::Planning,
@@ -2441,11 +2425,7 @@ mod tests {
 
         // ── Verify ticket C (different workspace) is still ReadyForDevelopment ──
         {
-            let ticket_c = board()
-                .get_ticket(&other_ws_id)
-                .await
-                .expect("get_ticket C")
-                .expect("ticket C exists");
+            let ticket_c = expect_ticket(board(), &other_ws_id).await;
             assert_eq!(
                 ticket_c.status,
                 TicketPhase::ReadyForDevelopment,
@@ -2639,6 +2619,29 @@ mod tests {
         create_test_workspace(&ws_name, &ws_path).await
     }
 
+    /// Shorthand for [`init_management_test_stores`] + [`test_ws_named`] +
+    /// [`TicketBuilder`].
+    ///
+    /// Creates an in-memory workspace (no DB insertion) with the given `path`
+    /// and `name`, creates a ticket with `title` and starting `phase`, and
+    /// returns `(workspace, ticket_id)`.
+    async fn setup_ticket(
+        ws_path: &str,
+        ws_name: &str,
+        title: &str,
+        phase: TicketPhase,
+    ) -> (crate::Workspace, String) {
+        init_management_test_stores().await;
+        let ws = test_ws_named(ws_path, ws_name);
+        let ticket_id = TicketBuilder::new(board(), ws.clone())
+            .title(title)
+            .phase(phase)
+            .create()
+            .await
+            .expect("create_ticket");
+        (ws, ticket_id)
+    }
+
     /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
     /// via `transition_ticket_to_done`: the first one buffers, the last one
     /// notifies and drains the buffer.
@@ -2661,11 +2664,7 @@ mod tests {
             .await
             .expect("create ticket B");
 
-        let ticket_a = board()
-            .get_ticket(&first_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket A exists");
+        let ticket_a = expect_ticket(board(), &first_id).await;
 
         // Transition ticket A — ticket B is still QaPassed (active), so Buffer
         transition_ticket_to_done(
@@ -2689,11 +2688,7 @@ mod tests {
         );
 
         // Transition ticket B — no more active tickets, should Notify and drain
-        let ticket_b = board()
-            .get_ticket(&second_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket B exists");
+        let ticket_b = expect_ticket(board(), &second_id).await;
         transition_ticket_to_done(
             &ticket_b,
             TicketPhase::QaPassed,
@@ -2764,11 +2759,7 @@ mod tests {
                 .create()
                 .await
                 .expect("create_ticket");
-            let ticket = board()
-                .get_ticket(&ticket_id)
-                .await
-                .expect("get_ticket")
-                .expect("ticket exists");
+            let ticket = expect_ticket(board(), &ticket_id).await;
 
             transition_ticket(&ticket, case.source, case.target, case.policy, None)
                 .await
@@ -2805,11 +2796,7 @@ mod tests {
             .add_comment(&ticket_id, SYSTEM_ROLE, "❌ Test failure detail")
             .await;
 
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         // Transition to Failed with Notify — must not panic
         transition_ticket(
@@ -2837,11 +2824,7 @@ mod tests {
             .await
             .expect("create_ticket");
 
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         // Transition from Backlog to Analysis with Notify — must not panic
         transition_ticket(
@@ -2860,14 +2843,13 @@ mod tests {
     /// Verify that the sanitation circuit breaker counting logic works correctly.
     #[tokio::test]
     async fn sanitation_breaker_counts_failures() {
-        init_management_test_stores().await;
-        let ws = test_ws_named("/tmp/test", "san_breaker_test");
-        let ticket_id = TicketBuilder::new(board(), ws)
-            .title("Sanitation Breaker Test")
-            .phase(TicketPhase::InSanitation)
-            .create()
-            .await
-            .expect("create ticket");
+        let (ws, ticket_id) = setup_ticket(
+            "/tmp/test",
+            "san_breaker_test",
+            "Sanitation Breaker Test",
+            TicketPhase::InSanitation,
+        )
+        .await;
 
         // Add 2 sanitation failure comments (below threshold of 3).
         for _ in 0..2 {
@@ -2880,11 +2862,7 @@ mod tests {
                 .await;
         }
 
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         // Should NOT trip (2 <= 3)
         assert!(
@@ -2925,11 +2903,7 @@ mod tests {
         // Now with 4 failures, should trip (4 > 3).
         // Re-fetch ticket with fresh comments (run_circuit_breaker fetches comments
         // from DB internally, so we just need the ticket id).
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         let tripped = run_circuit_breaker(
             &ticket,
@@ -2943,11 +2917,7 @@ mod tests {
         assert!(tripped, "Should trip with 4 failures (threshold: 3, 4 > 3)");
 
         // Verify the ticket is now Failed
-        let status = board()
-            .get_ticket_status(&ticket_id)
-            .await
-            .expect("get_ticket_status")
-            .expect("ticket exists");
+        let status = expect_ticket_status(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::Failed,
@@ -3207,15 +3177,8 @@ mod tests {
     /// phase mismatch before the breaker is called.
     #[tokio::test]
     async fn circuit_breaker_guard_prevents_retrip() {
-        init_management_test_stores().await;
-
-        let ws = test_ws_named("/tmp/test", "cb_guard");
-        let ticket_id = TicketBuilder::new(board(), ws)
-            .title("CB Guard")
-            .phase(TicketPhase::InReview)
-            .create()
-            .await
-            .expect("create_ticket");
+        let (ws, ticket_id) =
+            setup_ticket("/tmp/test", "cb_guard", "CB Guard", TicketPhase::InReview).await;
 
         for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
             board()
@@ -3225,11 +3188,7 @@ mod tests {
         }
 
         // Trip the breaker
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         let tripped = run_circuit_breaker(
             &ticket,
@@ -3242,11 +3201,7 @@ mod tests {
         .await;
         assert!(tripped, "breaker should trip");
 
-        let status = board()
-            .get_ticket_status(&ticket_id)
-            .await
-            .expect("get_ticket_status")
-            .expect("ticket exists");
+        let status = expect_ticket_status(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::Failed,
@@ -3269,11 +3224,7 @@ mod tests {
 
         // Phase guard prevents a second trip: the ticket is now Failed, not
         // InReview, so is_ticket_in_phase rejects it before the breaker runs.
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         let guarded = guard_phase_and_circuit_breaker(&ticket, TicketPhase::InReview, "test").await;
         assert!(
@@ -3281,11 +3232,7 @@ mod tests {
             "phase guard must reject re-trip (ticket is now Failed)"
         );
 
-        let status = board()
-            .get_ticket_status(&ticket_id)
-            .await
-            .expect("get_ticket_status")
-            .expect("ticket exists");
+        let status = expect_ticket_status(board(), &ticket_id).await;
         assert_eq!(status, TicketPhase::Failed, "ticket must remain Failed");
     }
 
@@ -3458,31 +3405,21 @@ mod tests {
     /// This test validates the graceful non-git fallback path.
     #[tokio::test]
     async fn handle_qa_passed_no_git_to_done() {
-        init_management_test_stores().await;
-
         // Use a path that cannot be a git repo regardless of the test
         // environment's current working directory.
-        let ws = test_ws_named("/nonexistent/mahbot-test-qa-no-git", "qa_no_git");
-        let ticket_id = TicketBuilder::new(board(), ws.clone())
-            .title("QA No Git")
-            .phase(TicketPhase::QaPassed)
-            .create()
-            .await
-            .expect("create_ticket");
+        let (ws, ticket_id) = setup_ticket(
+            "/nonexistent/mahbot-test-qa-no-git",
+            "qa_no_git",
+            "QA No Git",
+            TicketPhase::QaPassed,
+        )
+        .await;
 
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         handle_qa_passed(ticket, ws).await;
 
-        let status = board()
-            .get_ticket_status(&ticket_id)
-            .await
-            .expect("get_ticket_status")
-            .expect("ticket exists");
+        let status = expect_ticket_status(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::Done,
@@ -3501,35 +3438,25 @@ mod tests {
             return;
         }
 
-        init_management_test_stores().await;
-
         // Create a temp directory and init a git repo
         let (_dir, repo_path) = crate::util::test::init_temp_repo();
 
         // Create an untracked file
         std::fs::write(repo_path.join("untracked.txt"), b"garbage").expect("write untracked file");
 
-        let ws = test_ws_named(repo_path.to_str().unwrap(), "qa_untracked");
-        let ticket_id = TicketBuilder::new(board(), ws.clone())
-            .title("QA Untracked")
-            .phase(TicketPhase::QaPassed)
-            .create()
-            .await
-            .expect("create_ticket");
+        let (ws, ticket_id) = setup_ticket(
+            repo_path.to_str().unwrap(),
+            "qa_untracked",
+            "QA Untracked",
+            TicketPhase::QaPassed,
+        )
+        .await;
 
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
         handle_qa_passed(ticket, ws).await;
 
-        let status = board()
-            .get_ticket_status(&ticket_id)
-            .await
-            .expect("get_ticket_status")
-            .expect("ticket exists");
+        let status = expect_ticket_status(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::InSanitation,
@@ -3537,11 +3464,7 @@ mod tests {
         );
 
         // Verify assigned_to is set to the sanitation session key
-        let ticket = board()
-            .get_ticket(&ticket_id)
-            .await
-            .expect("get_ticket")
-            .expect("ticket exists");
+        let ticket = expect_ticket(board(), &ticket_id).await;
         let expected_key =
             crate::session::ticket_session_key(&ticket_id, crate::Role::Sanitation.as_str());
         assert_eq!(
