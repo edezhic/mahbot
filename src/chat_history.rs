@@ -69,7 +69,6 @@ pub struct ChatHistoryEntry {
 const HISTORY_LIMIT: i64 = 100;
 
 // Column definitions for `chat_history` SELECT queries.
-// The column order here matches the `COL_CH_*` index constants generated below.
 crate::columns! {
     CHAT_HISTORY_COLUMNS [CH] {
         ID          => "id",
