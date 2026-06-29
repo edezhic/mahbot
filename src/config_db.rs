@@ -103,18 +103,12 @@ impl ConfigStore {
 
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute(UPSERT_KV_SQL, turso::params![key, value])
-            .await?;
-        Ok(())
+        self.exec(UPSERT_KV_SQL, turso::params![key, value]).await
     }
 
     /// Delete a key-value pair. Succeeds even if the key does not exist.
     pub async fn delete_kv(&self, key: &str) -> Result<()> {
-        self.conn
-            .execute(DELETE_KV_SQL, turso::params![key])
-            .await?;
-        Ok(())
+        self.exec(DELETE_KV_SQL, turso::params![key]).await
     }
 
     /// Get all key-value pairs.
@@ -256,6 +250,12 @@ impl ConfigStore {
         tx.execute(DELETE_KV_SQL, turso::params![key]).await?;
         Ok(())
     }
+
+    /// Execute a SQL statement and discard the row count.
+    async fn exec(&self, sql: &str, params: impl turso::IntoParams + Send + 'static) -> Result<()> {
+        self.conn.execute(sql, params).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -297,28 +297,24 @@ impl ConfigStore {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO config_role (role, model, reasoning_effort) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(role) DO UPDATE SET \
-                     model = excluded.model, \
-                     reasoning_effort = excluded.reasoning_effort",
-                turso::params![role, model, reasoning_effort],
-            )
-            .await?;
-        Ok(())
+        self.exec(
+            "INSERT INTO config_role (role, model, reasoning_effort) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(role) DO UPDATE SET \
+                 model = excluded.model, \
+                 reasoning_effort = excluded.reasoning_effort",
+            turso::params![role, model, reasoning_effort],
+        )
+        .await
     }
 
     // Delete a role config row. Succeeds even if the role does not exist.
     async fn delete_role_config(&self, role: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM config_role WHERE role = ?1",
-                turso::params![role],
-            )
-            .await?;
-        Ok(())
+        self.exec(
+            "DELETE FROM config_role WHERE role = ?1",
+            turso::params![role],
+        )
+        .await
     }
 
     // Get the model routing config for a model.
@@ -343,28 +339,24 @@ impl ConfigStore {
         allow_fallbacks: Option<bool>,
     ) -> Result<()> {
         let allow_fallbacks_int = allow_fallbacks.map(i32::from);
-        self.conn
-            .execute(
-                "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(model) DO UPDATE SET \
-                     provider_order = excluded.provider_order, \
-                     allow_fallbacks = excluded.allow_fallbacks",
-                turso::params![model, provider_order, allow_fallbacks_int],
-            )
-            .await?;
-        Ok(())
+        self.exec(
+            "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(model) DO UPDATE SET \
+                 provider_order = excluded.provider_order, \
+                 allow_fallbacks = excluded.allow_fallbacks",
+            turso::params![model, provider_order, allow_fallbacks_int],
+        )
+        .await
     }
 
     // Delete a model routing row. Succeeds even if the model does not exist.
     async fn delete_model_routing(&self, model: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM config_model_routing WHERE model = ?1",
-                turso::params![model],
-            )
-            .await?;
-        Ok(())
+        self.exec(
+            "DELETE FROM config_model_routing WHERE model = ?1",
+            turso::params![model],
+        )
+        .await
     }
 }
 
