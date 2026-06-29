@@ -509,7 +509,7 @@ impl Connection {
     /// Safe to call even if the database is not in WAL mode — non-WAL databases
     /// treat this as a no-op.
     pub async fn checkpoint(&self) -> anyhow::Result<()> {
-        self.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        self.query("PRAGMA wal_checkpoint(TRUNCATE);", ())
             .await
             .context("Failed to checkpoint WAL")?;
         Ok(())
