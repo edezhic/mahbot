@@ -2843,7 +2843,7 @@ mod tests {
     /// Verify that the sanitation circuit breaker counting logic works correctly.
     #[tokio::test]
     async fn sanitation_breaker_counts_failures() {
-        let (ws, ticket_id) = setup_ticket(
+        let (_, ticket_id) = setup_ticket(
             "/tmp/test",
             "san_breaker_test",
             "Sanitation Breaker Test",
@@ -3177,7 +3177,7 @@ mod tests {
     /// phase mismatch before the breaker is called.
     #[tokio::test]
     async fn circuit_breaker_guard_prevents_retrip() {
-        let (ws, ticket_id) =
+        let (_, ticket_id) =
             setup_ticket("/tmp/test", "cb_guard", "CB Guard", TicketPhase::InReview).await;
 
         for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
