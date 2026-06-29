@@ -1,6 +1,6 @@
 [package]
 name = "mahbot"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["edezhic <edezhic@gmail.com>"]
 description = "An autonomous agentic engineering system that manages software development through role separation, subagents, and deterministic diagnostics."
 edition = "2024"
