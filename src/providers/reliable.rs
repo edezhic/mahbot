@@ -87,14 +87,13 @@ fn classify_fallback(lower: &str) -> ErrorClass {
     if AUTH_HINTS.iter().any(|h| lower.contains(h)) {
         return ErrorClass::NonRetryable;
     }
-    // Model not found / invalid — composite check to catch variants like
+    // Model not found — composite check to catch variants like
     // "model 'xyz' is unknown" alongside "model unknown".
     if lower.contains("model")
         && (lower.contains("not found")
             || lower.contains("unknown")
             || lower.contains("unsupported")
-            || lower.contains("does not exist")
-            || lower.contains("invalid"))
+            || lower.contains("does not exist"))
     {
         return ErrorClass::NonRetryable;
     }
@@ -598,10 +597,6 @@ mod tests {
 
         // 429 with billing/quota body signals → non-retryable
         // (caught by BILLING_HINTS in classify_fallback, not by status code)
-        assert!(matches!(
-            classify_err(&make_structured(429, "insufficient balance")),
-            ErrorClass::NonRetryable
-        ));
         assert_eq!(
             classify_err(&make_structured(429, "insufficient balance")),
             ErrorClass::NonRetryable
@@ -665,6 +660,16 @@ mod tests {
         assert_eq!(
             classify_err(&make_structured(429, "error code 1113")),
             ErrorClass::NonRetryable
+        );
+
+        // OpenRouter 502 "invalid response" → NOT NonRetryable
+        // (the word "invalid" alone does not imply a bad model id)
+        assert_eq!(
+            classify_err(&make_structured(
+                502,
+                "Your chosen model is down or we received an invalid response from it"
+            )),
+            ErrorClass::Retryable
         );
     }
 
