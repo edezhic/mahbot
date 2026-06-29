@@ -2098,83 +2098,107 @@ mod tests {
         assert_eq!(tickets.len(), 0);
     }
 
+    /// Verify that `reset_inflight_tickets` correctly transitions each in-flight
+    /// ticket phase back to its ready state, and that non-inflight phases (e.g.
+    /// Backlog) are left untouched.
     #[tokio::test]
-    async fn test_reset_inflight_tickets_new() {
-        let (store, _tmp) = open_test_store().await;
-
-        let ticket1 = TicketBuilder::new(&store, test_ws_named("/ws", "ws"))
-            .title("Test")
-            .create()
-            .await
-            .expect("create");
-        let ticket2 = TicketBuilder::new(&store, test_ws_named("/ws", "ws"))
-            .title("Test")
-            .create()
-            .await
-            .expect("create");
-
-        store.reset_inflight_tickets().await.expect("reset");
-
-        // All new tickets stay Backlog (only in-flight tickets are affected by reset)
-        for id in [&ticket1, &ticket2] {
-            let t = store
-                .get_ticket(id)
-                .await
-                .expect("get")
-                .expect("should exist");
-            assert_eq!(
-                t.status,
-                TicketPhase::Backlog,
-                "new tickets stay backlog (not in any inflight phase)"
-            );
-            assert!(t.assigned_to.is_none(), "assigned_to should be cleared");
+    async fn test_reset_inflight_tickets() {
+        /// A single reset transition case.
+        struct Case {
+            name: &'static str,
+            /// Unique suffix for workspace names (isolates cases).
+            suffix: &'static str,
+            /// The phase the ticket starts in.
+            start: TicketPhase,
+            /// The expected phase after reset.
+            expected: TicketPhase,
+            /// Expected pipeline_reservation after reset.
+            reservation: bool,
         }
-    }
 
-    #[tokio::test]
-    async fn test_reset_inflight_tickets_sets_reservation() {
+        let cases = [
+            Case {
+                name: "Backlog unaffected (not an inflight phase)",
+                suffix: "a",
+                start: TicketPhase::Backlog,
+                expected: TicketPhase::Backlog,
+                reservation: false,
+            },
+            Case {
+                name: "Analysis → Backlog (no reservation)",
+                suffix: "b",
+                start: TicketPhase::Analysis,
+                expected: TicketPhase::Backlog,
+                reservation: false,
+            },
+            Case {
+                name: "InDevelopment → ReadyForDevelopment (reservation=1)",
+                suffix: "c",
+                start: TicketPhase::InDevelopment,
+                expected: TicketPhase::ReadyForDevelopment,
+                reservation: true,
+            },
+            Case {
+                name: "InDiagnostics → ReadyForDevelopment (reservation=1)",
+                suffix: "d",
+                start: TicketPhase::InDiagnostics,
+                expected: TicketPhase::ReadyForDevelopment,
+                reservation: true,
+            },
+            Case {
+                name: "InSanitation → QaPassed (reservation=1)",
+                suffix: "e",
+                start: TicketPhase::InSanitation,
+                expected: TicketPhase::QaPassed,
+                reservation: true,
+            },
+            Case {
+                name: "InQa → Reviewed (no reservation)",
+                suffix: "f",
+                start: TicketPhase::InQa,
+                expected: TicketPhase::Reviewed,
+                reservation: false,
+            },
+            Case {
+                name: "InReview → DiagnosticsDone (no reservation)",
+                suffix: "g",
+                start: TicketPhase::InReview,
+                expected: TicketPhase::DiagnosticsDone,
+                reservation: false,
+            },
+        ];
+
         let (store, _tmp) = open_test_store().await;
-        let ws = test_ws_named("/ws", "ws");
 
-        // Create tickets in InDevelopment and Analysis (both reset targets)
-        let in_dev_id = TicketBuilder::new(&store, ws.clone())
-            .title("InDev")
-            .phase(TicketPhase::InDevelopment)
-            .create()
-            .await
-            .expect("create InDevelopment ticket");
-        let analysis_id = TicketBuilder::new(&store, ws)
-            .title("Analysis")
-            .phase(TicketPhase::Analysis)
-            .create()
-            .await
-            .expect("create Analysis ticket");
+        for case in &cases {
+            let ws = test_ws_named(&format!("/{}", case.suffix), case.suffix);
 
-        store.reset_inflight_tickets().await.expect("reset");
+            let id = TicketBuilder::new(&store, ws)
+                .title(case.name)
+                .phase(case.start)
+                .create()
+                .await
+                .expect("create ticket");
 
-        // InDevelopment → ReadyForDevelopment with reservation=1
-        let t = expect_ticket(&store, &in_dev_id).await;
-        assert_eq!(
-            t.status,
-            TicketPhase::ReadyForDevelopment,
-            "InDevelopment should reset to ReadyForDevelopment"
-        );
-        assert!(
-            t.pipeline_reservation,
-            "InDevelopment reset should set pipeline_reservation = 1"
-        );
+            store.reset_inflight_tickets().await.expect("reset");
 
-        // Analysis → Backlog with reservation=0 (Analysis is not a pipeline blocker)
-        let t = expect_ticket(&store, &analysis_id).await;
-        assert_eq!(
-            t.status,
-            TicketPhase::Backlog,
-            "Analysis should reset to Backlog"
-        );
-        assert!(
-            !t.pipeline_reservation,
-            "Analysis reset should NOT set pipeline_reservation"
-        );
+            let t = expect_ticket(&store, &id).await;
+            assert_eq!(
+                t.status, case.expected,
+                "Case '{}': unexpected status after reset",
+                case.name,
+            );
+            assert_eq!(
+                t.pipeline_reservation, case.reservation,
+                "Case '{}': unexpected pipeline_reservation after reset",
+                case.name,
+            );
+            assert!(
+                t.assigned_to.is_none(),
+                "Case '{}': assigned_to should be NULL after reset",
+                case.name,
+            );
+        }
     }
 
     #[tokio::test]
