@@ -3804,36 +3804,32 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// pre-assignment rejection, wrong-phase rejection, and idempotency.
     #[tokio::test]
     async fn test_claim_diagnostics() {
-        #[allow(clippy::struct_excessive_bools)]
+        enum Scenario {
+            /// Ticket is unassigned and in InDiagnostics — claim should succeed.
+            Success,
+            /// Ticket is already assigned — claim should fail.
+            AlreadyAssigned,
+            /// Ticket is in a different phase — claim should fail.
+            WrongPhase,
+        }
+
         struct Case {
             name: &'static str,
-            move_to_diagnostics: bool,
-            pre_assigned: bool,
-            expected_claim: bool,
-            check_idempotent: bool,
+            scenario: Scenario,
         }
 
         let cases = [
             Case {
                 name: "unassigned in diagnostics succeeds",
-                move_to_diagnostics: true,
-                pre_assigned: false,
-                expected_claim: true,
-                check_idempotent: true,
+                scenario: Scenario::Success,
             },
             Case {
                 name: "already assigned fails",
-                move_to_diagnostics: true,
-                pre_assigned: true,
-                expected_claim: false,
-                check_idempotent: false,
+                scenario: Scenario::AlreadyAssigned,
             },
             Case {
                 name: "wrong phase fails",
-                move_to_diagnostics: false,
-                pre_assigned: false,
-                expected_claim: false,
-                check_idempotent: false,
+                scenario: Scenario::WrongPhase,
             },
         ];
 
@@ -3844,13 +3840,13 @@ with a comment explaining why no agent is mid-execution in that state.\
             let title = format!("claim-{i}");
             let id = make_ticket(&store, ws.clone(), &title, TicketPhase::Backlog).await;
 
-            if case.move_to_diagnostics {
+            if matches!(case.scenario, Scenario::Success | Scenario::AlreadyAssigned) {
                 store
                     .transition_to(&id, None, TicketPhase::InDiagnostics, None)
                     .await
                     .expect("transition to InDiagnostics");
             }
-            if case.pre_assigned {
+            if matches!(case.scenario, Scenario::AlreadyAssigned) {
                 store
                     .set_assigned_to(&id, Some("diagnostics"))
                     .await
@@ -3861,35 +3857,37 @@ with a comment explaining why no agent is mid-execution in that state.\
                 .claim_diagnostics(&id)
                 .await
                 .expect("claim_diagnostics");
-            assert_eq!(
-                claimed, case.expected_claim,
-                "Case '{}': unexpected claim result",
-                case.name
-            );
 
-            if case.expected_claim {
-                let ticket = crate::util::test::expect_ticket(&store, &id).await;
-                assert_eq!(
-                    ticket.assigned_to.as_deref(),
-                    Some("diagnostics"),
-                    "Case '{}': assignee should be set",
-                    case.name
-                );
-                assert_eq!(
-                    ticket.status,
-                    TicketPhase::InDiagnostics,
-                    "Case '{}': status should remain InDiagnostics",
-                    case.name
-                );
-            }
+            match case.scenario {
+                Scenario::Success => {
+                    assert!(claimed, "Case '{}': expected claim to succeed", case.name);
 
-            if case.check_idempotent {
-                let second = store.claim_diagnostics(&id).await.expect("second claim");
-                assert!(
-                    !second,
-                    "Case '{}': second claim should return false (idempotent)",
-                    case.name
-                );
+                    // Verify post-claim state.
+                    let ticket = crate::util::test::expect_ticket(&store, &id).await;
+                    assert_eq!(
+                        ticket.assigned_to.as_deref(),
+                        Some("diagnostics"),
+                        "Case '{}': assignee should be set",
+                        case.name
+                    );
+                    assert_eq!(
+                        ticket.status,
+                        TicketPhase::InDiagnostics,
+                        "Case '{}': status should remain InDiagnostics",
+                        case.name
+                    );
+
+                    // Verify idempotency (second claim returns false).
+                    let second = store.claim_diagnostics(&id).await.expect("second claim");
+                    assert!(
+                        !second,
+                        "Case '{}': second claim should return false (idempotent)",
+                        case.name
+                    );
+                }
+                Scenario::AlreadyAssigned | Scenario::WrongPhase => {
+                    assert!(!claimed, "Case '{}': expected claim to fail", case.name);
+                }
             }
         }
     }
