@@ -4206,8 +4206,9 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// [`columns!`] macro ensures single-sourcing of [`TICKET_COLUMNS`]
     /// and [`COL_TICKET_*`], so column-order drift between them is
     /// structurally impossible. This test still exercises the full
-    /// `ticket_from_row` deserialization path, including `turso::FromRow`
-    /// field mapping and default-value handling.
+    /// `ticket_from_row` deserialization path, including manual
+    /// field-by-field extraction via `row.get::<Type>(COL_TICKET_*)`
+    /// and default-value handling.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_ticket_roundtrip_all_fields() {
