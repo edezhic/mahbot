@@ -20,7 +20,6 @@
 //! bounce back to ReadyForDevelopment; clean files proceed to Done via commit.
 
 use std::fmt::Write;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -1079,6 +1078,58 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
     }
 }
 
+/// Begin a transaction, run `work`, and commit on success.
+///
+/// On any failure (begin transaction fails, `work` returns an error, or commit
+/// fails), logs a `warn!` with the provided `action_label` context and returns
+/// `Err`. On success, returns `Ok(())`.
+///
+/// When `work` returns an error, the transaction is rolled back automatically
+/// via [`crate::turso::TxGuard::drop`].
+///
+/// `action_label` accepts any `&str` including dynamic temporaries from
+/// `format!` — it is intentionally not `&'static str` to allow callers to
+/// include dynamic context (e.g. phase transitions, short hashes) in log
+/// messages. Use a verb phrase for natural reading (e.g. "record sanitation
+/// failure", "write verdict comments") rather than a bare noun.
+async fn with_tx(
+    ticket_id: &str,
+    action_label: &str,
+    work: impl AsyncFnOnce(&crate::turso::TxGuard<'_>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let tx = match board().conn.begin_tx().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Failed to begin transaction for {action_label}",
+            );
+            return Err(anyhow::anyhow!("{e:#}"));
+        }
+    };
+
+    if let Err(e) = work(&tx).await {
+        warn!(
+            ticket = %ticket_id,
+            error = %e,
+            "{action_label}: transaction rolled back",
+        );
+        return Err(anyhow::anyhow!("{e:#}"));
+    }
+
+    if let Err(e) = tx.commit().await {
+        warn!(
+            ticket = %ticket_id,
+            error = %e,
+            "Failed to commit transaction for {action_label}",
+        );
+        return Err(anyhow::anyhow!("{e:#}"));
+    }
+
+    Ok(())
+}
+
 /// After a successful `git commit`, persist the metadata and transition the
 /// ticket to Done atomically within a single DB transaction.
 ///
@@ -1106,68 +1157,45 @@ async fn commit_and_transition_ticket_from(
     // Done ticket (which crash-recovery cannot rescue).
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
-    let tx = match board().conn.begin_tx().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to begin transaction — staying in {phase_label} for retry",
-            );
-            return;
-        }
-    };
-
-    let outcome: anyhow::Result<()> = async {
-        BoardStore::set_commit_info_tx(
-            &tx,
-            &ticket.id,
-            &commit_info.hash,
-            commit_info.lines_added,
-            commit_info.lines_removed,
-        )
-        .await?;
-        BoardStore::add_comment_tx(&tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
-        BoardStore::transition_to_tx(&tx, &ticket.id, Some(source), TicketPhase::Done, None)
-            .await?;
-        Ok(())
-    }
-    .await;
-
-    match outcome {
-        Ok(()) => {
-            if let Err(e) = tx.commit().await {
-                error!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Commit succeeded ({short_hash}) but DB transaction commit failed — \
-                     ticket stays in {phase_label} for retry, orphan commit in repo",
-                );
-                return;
-            }
-
-            info!(ticket = %ticket.id, "Committed {short_hash}, moving to Done");
-
-            let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-            dispatch_notification(
-                ticket,
-                TicketPhase::Done,
-                source,
-                notify_policy,
-                "cannot buffer Done transition",
+    if with_tx(
+        &ticket.id,
+        &format!("finalize Done transition from {phase_label} ({short_hash})"),
+        async |tx| {
+            BoardStore::set_commit_info_tx(
+                tx,
+                &ticket.id,
+                &commit_info.hash,
+                commit_info.lines_added,
+                commit_info.lines_removed,
             )
-            .await;
-        }
-        Err(e) => {
-            // tx is dropped → TxGuard::drop sets the dangling_tx flag,
-            // triggering a rollback on the next write attempt.
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to finalize Done transition — transaction rolled back, \
-                 ticket stays in {phase_label} for retry",
-            );
-        }
+            .await?;
+            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
+            BoardStore::transition_to_tx(tx, &ticket.id, Some(source), TicketPhase::Done, None)
+                .await?;
+            Ok(())
+        },
+    )
+    .await
+    .is_ok()
+    {
+        info!(ticket = %ticket.id, "Committed {short_hash}, moving to Done");
+
+        let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
+        dispatch_notification(
+            ticket,
+            TicketPhase::Done,
+            source,
+            notify_policy,
+            "cannot buffer Done transition",
+        )
+        .await;
+    } else {
+        warn!(
+            ticket = %ticket.id,
+            short_hash,
+            "Commit was written to git but board transaction failed — \
+             orphan commit in repo, will retry on next poll cycle",
+        );
     }
 }
 
@@ -1259,52 +1287,13 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 /// Record a sanitation failure: add a system comment for the circuit breaker
 /// and clear assigned_to so the ticket can be re-dispatched.
 async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
-    let tx = match board().conn.begin_tx().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            warn!(
-                ticket = %ticket_id,
-                error = %e,
-                "Failed to begin transaction for sanitation failure \
-                 — ticket may be stuck in InSanitation",
-            );
-            return;
-        }
-    };
-
-    let outcome: anyhow::Result<()> = async {
-        BoardStore::add_comment_tx(
-            &tx,
-            ticket_id,
-            SYSTEM_ROLE,
-            &format!("{SANITATION_FAILED_PREFIX} — {reason}"),
-        )
-        .await?;
-        BoardStore::set_assigned_to_tx(&tx, ticket_id, None).await?;
+    let reason_str = format!("{SANITATION_FAILED_PREFIX} — {reason}");
+    let _ = with_tx(ticket_id, "record sanitation failure", async |tx| {
+        BoardStore::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, &reason_str).await?;
+        BoardStore::set_assigned_to_tx(tx, ticket_id, None).await?;
         Ok(())
-    }
+    })
     .await;
-
-    match outcome {
-        Ok(()) => {
-            if let Err(e) = tx.commit().await {
-                warn!(
-                    ticket = %ticket_id,
-                    error = %e,
-                    "Failed to commit sanitation failure transaction \
-                     — ticket may be stuck in InSanitation",
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                ticket = %ticket_id,
-                error = %e,
-                "Failed to record sanitation failure (comment + clear assigned_to) \
-                 — ticket may be stuck in InSanitation",
-            );
-        }
-    }
 }
 
 /// Run the sanitation agent to inspect new/untracked files in the workspace.
@@ -1834,47 +1823,16 @@ async fn record_verdict_comments(
     role_str: &str,
     filter: VerdictFilter,
 ) {
-    let tx = match board().conn.begin_tx().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            warn!(
-                ticket = %ticket_id,
-                error = %e,
-                "Failed to begin transaction for verdict comments",
-            );
-            return;
-        }
-    };
-
-    let outcome: anyhow::Result<()> = async {
+    let _ = with_tx(ticket_id, "write verdict comments", async |tx| {
         for (i, r) in results.iter().enumerate() {
             let role_label = format!("{role_str}_{}", i + 1);
             if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-                BoardStore::add_comment_tx(&tx, ticket_id, &role_label, &comment).await?;
+                BoardStore::add_comment_tx(tx, ticket_id, &role_label, &comment).await?;
             }
         }
         Ok(())
-    }
+    })
     .await;
-
-    match outcome {
-        Ok(()) => {
-            if let Err(e) = tx.commit().await {
-                warn!(
-                    ticket = %ticket_id,
-                    error = %e,
-                    "Failed to commit verdict comments transaction",
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                ticket = %ticket_id,
-                error = %e,
-                "Failed to record verdict comments — rolling back",
-            );
-        }
-    }
 }
 
 /// Shared orchestration skeleton for dispatch functions that spawn parallel
