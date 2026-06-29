@@ -325,3 +325,53 @@ pub async fn init_test_stores() {
     })
     .await;
 }
+
+/// Create a temporary directory initialized as a git repository with a
+/// committed file named `test.txt` (containing `"line1\nline2\nline3\n"`)
+/// and a single commit titled `"Initial commit"`.
+///
+/// The returned [`TempDir`](tempfile::TempDir) MUST be kept alive (bound to
+/// `_dir` or similar) for the returned [`PathBuf`] to remain valid.
+///
+/// # Panics
+///
+/// Panics if `git` is not available, or if any git command fails.
+pub(crate) fn init_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let repo_path = dir.path().to_path_buf();
+
+    // git init
+    let status = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_path)
+        .status()
+        .expect("git init");
+    assert!(status.success());
+
+    // Set user config (required for commit)
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@test.com")] {
+        let status = std::process::Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git config");
+        assert!(status.success());
+    }
+
+    // Create a file and make initial commit
+    std::fs::write(repo_path.join("test.txt"), b"line1\nline2\nline3\n").expect("write test file");
+    let status = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&repo_path)
+        .status()
+        .expect("git add");
+    assert!(status.success());
+    let status = std::process::Command::new("git")
+        .args(["commit", "-m", "Initial commit"])
+        .current_dir(&repo_path)
+        .status()
+        .expect("git commit");
+    assert!(status.success());
+
+    (dir, repo_path)
+}

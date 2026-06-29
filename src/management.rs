@@ -3473,41 +3473,7 @@ mod tests {
         init_management_test_stores().await;
 
         // Create a temp directory and init a git repo
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let repo_path = dir.path().to_path_buf();
-
-        let status = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git init");
-        assert!(status.success());
-
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git config user.name");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git config user.email");
-
-        // Create a committed file
-        std::fs::write(repo_path.join("committed.txt"), b"hello").expect("write committed file");
-        let status = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git add");
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["commit", "-m", "Initial"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git commit");
-        assert!(status.success());
+        let (_dir, repo_path) = crate::util::test::init_temp_repo();
 
         // Create an untracked file
         std::fs::write(repo_path.join("untracked.txt"), b"garbage").expect("write untracked file");

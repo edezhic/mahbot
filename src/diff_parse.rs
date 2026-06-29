@@ -953,6 +953,7 @@ pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::test::init_temp_repo;
 
     #[test]
     fn test_parse_simple_diff() {
@@ -1348,48 +1349,6 @@ index abc123..def456 100644
     }
 
     // ── Integration tests for run_git_* functions ────────────────
-
-    /// Helper: create a temp directory, init git, add a file, and commit.
-    fn init_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let repo_path = dir.path().to_path_buf();
-
-        // git init
-        let status = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git init");
-        assert!(status.success());
-
-        // Set user config (required for commit)
-        for (key, value) in [("user.name", "Test"), ("user.email", "test@test.com")] {
-            let status = std::process::Command::new("git")
-                .args(["config", key, value])
-                .current_dir(&repo_path)
-                .status()
-                .expect("git config");
-            assert!(status.success());
-        }
-
-        // Create a file and make initial commit
-        std::fs::write(repo_path.join("test.txt"), b"line1\nline2\nline3\n")
-            .expect("write test file");
-        let status = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git add");
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["commit", "-m", "Initial commit"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git commit");
-        assert!(status.success());
-
-        (dir, repo_path)
-    }
 
     #[tokio::test]
     async fn test_run_git_current_branch_default() {
