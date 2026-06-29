@@ -230,7 +230,7 @@ async fn dispatch_notification(
 /// Transition a ticket to `target` phase if it's still in `expected` phase.
 ///
 /// Returns `Ok(())` if the transition was applied (ticket was still in expected
-/// phase). Returns `Err(String)` with a descriptive message if the ticket was
+/// phase). Returns `Err(anyhow::Error)` with a descriptive message if the ticket was
 /// moved externally (phase mismatch) **or** a DB error occurred. On failure,
 /// does **not** clear `assigned_to` — doing so would either steal the new
 /// owner's assignment (phase mismatch) or orphan the ticket (DB error), and
@@ -251,7 +251,7 @@ async fn transition_ticket(
     target: TicketPhase,
     notify: NotifyPolicy,
     pipeline_reservation: Option<bool>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     match board()
         .transition_to(&ticket.id, Some(expected), target, pipeline_reservation)
         .await
@@ -270,7 +270,7 @@ async fn transition_ticket(
                 error = %e,
                 "Failed to update ticket status",
             );
-            Err(e.to_string())
+            Err(e)
         }
     }
 }
