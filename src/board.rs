@@ -484,6 +484,16 @@ struct AddCommentSql {
     update_params: Vec<turso::Value>,
 }
 
+/// Bundles a SQL mutation statement with its parameters and a human-readable
+/// action description. Returned by [`BoardStore::build_transition_sql`] and
+/// [`BoardStore::build_set_commit_info_sql`]; also accepted by
+/// [`BoardStore::execute_and_cancel`].
+struct PreparedUpdate {
+    sql: String,
+    params: Vec<turso::Value>,
+    action: String,
+}
+
 impl BoardStore {
     /// Post-open FTS index setup.
     async fn after_open(&self) -> anyhow::Result<()> {
@@ -917,7 +927,7 @@ impl BoardStore {
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
         reservation: Option<bool>,
-    ) -> (String, Vec<turso::Value>, String) {
+    ) -> PreparedUpdate {
         let now = turso::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
         let action = match reservation {
@@ -938,7 +948,11 @@ impl BoardStore {
             Value::from(guard),
             Value::from(reservation),
         ];
-        (sql.to_string(), params, action)
+        PreparedUpdate {
+            sql: sql.to_string(),
+            params,
+            action,
+        }
     }
 
     /// Update the status of a ticket, optionally guarded by an expected phase.
@@ -985,9 +999,8 @@ impl BoardStore {
         target_phase: TicketPhase,
         reservation: Option<bool>,
     ) -> Result<()> {
-        let (sql, params, action) =
-            Self::build_transition_sql(id, expected_phase, target_phase, reservation);
-        self.execute_and_cancel(&sql, params, id, &action).await
+        let prepared = Self::build_transition_sql(id, expected_phase, target_phase, reservation);
+        self.execute_and_cancel(id, prepared).await
     }
 
     /// Transactional variant of [`transition_to`](Self::transition_to) —
@@ -1002,10 +1015,9 @@ impl BoardStore {
         target_phase: TicketPhase,
         reservation: Option<bool>,
     ) -> Result<()> {
-        let (sql, params, action) =
-            Self::build_transition_sql(id, expected_phase, target_phase, reservation);
-        let rows = tx.execute(&sql, params).await?;
-        Self::ensure_ticket_found(rows, id, &action)?;
+        let prepared = Self::build_transition_sql(id, expected_phase, target_phase, reservation);
+        let rows = tx.execute(&prepared.sql, prepared.params).await?;
+        Self::ensure_ticket_found(rows, id, &prepared.action)?;
         Ok(())
     }
 
@@ -1035,15 +1047,9 @@ impl BoardStore {
     ///   commit via a different pattern.
     /// - **`batch_set_archived`** — batch operation on many tickets, handles
     ///   zero-affected-rows gracefully (no error).
-    async fn execute_and_cancel(
-        &self,
-        sql: &str,
-        params: impl turso::IntoParams + Send + 'static,
-        id: &str,
-        action: &str,
-    ) -> Result<()> {
-        let rows = self.conn.execute(sql, params).await?;
-        Self::ensure_ticket_found(rows, id, action)?;
+    async fn execute_and_cancel(&self, id: &str, prepared: PreparedUpdate) -> Result<()> {
+        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
+        Self::ensure_ticket_found(rows, id, &prepared.action)?;
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(id);
         Ok(())
     }
@@ -1065,13 +1071,12 @@ impl BoardStore {
         } else {
             "clear assigned_to"
         };
-        self.execute_and_cancel(
-            "UPDATE tickets SET assigned_to = ?1, updated_at = ?2 WHERE id = ?3",
-            turso::params![assigned_to, now, id],
-            id,
-            action,
-        )
-        .await
+        let prepared = PreparedUpdate {
+            sql: "UPDATE tickets SET assigned_to = ?1, updated_at = ?2 WHERE id = ?3".to_string(),
+            params: vec![Value::from(assigned_to), Value::from(now), Value::from(id)],
+            action: action.to_string(),
+        };
+        self.execute_and_cancel(id, prepared).await
     }
 
     /// Atomically claim a ticket for diagnostics execution.
@@ -1166,7 +1171,7 @@ impl BoardStore {
         hash: &str,
         lines_added: i64,
         lines_removed: i64,
-    ) -> (String, Vec<turso::Value>, String) {
+    ) -> PreparedUpdate {
         debug_assert!(
             lines_added >= 0,
             "lines_added must be non-negative: {lines_added}"
@@ -1187,7 +1192,11 @@ impl BoardStore {
             Value::from(now),
             Value::from(id),
         ];
-        (sql, params, "set commit info".to_string())
+        PreparedUpdate {
+            sql,
+            params,
+            action: "set commit info".to_string(),
+        }
     }
 
     /// Record commit metadata on a ticket.
@@ -1203,10 +1212,9 @@ impl BoardStore {
         lines_added: i64,
         lines_removed: i64,
     ) -> Result<()> {
-        let (sql, params, action) =
-            Self::build_set_commit_info_sql(id, hash, lines_added, lines_removed);
-        let rows = self.conn.execute(&sql, params).await?;
-        Self::ensure_ticket_found(rows, id, &action)?;
+        let prepared = Self::build_set_commit_info_sql(id, hash, lines_added, lines_removed);
+        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
+        Self::ensure_ticket_found(rows, id, &prepared.action)?;
         Ok(())
     }
 
@@ -1220,10 +1228,9 @@ impl BoardStore {
         lines_added: i64,
         lines_removed: i64,
     ) -> Result<()> {
-        let (sql, params, action) =
-            Self::build_set_commit_info_sql(id, hash, lines_added, lines_removed);
-        let rows = tx.execute(&sql, params).await?;
-        Self::ensure_ticket_found(rows, id, &action)?;
+        let prepared = Self::build_set_commit_info_sql(id, hash, lines_added, lines_removed);
+        let rows = tx.execute(&prepared.sql, prepared.params).await?;
+        Self::ensure_ticket_found(rows, id, &prepared.action)?;
         Ok(())
     }
 
@@ -1598,14 +1605,14 @@ impl BoardStore {
     /// ticket is intentionally allowed to resolve stale assignments.
     pub async fn set_archived(&self, id: &str) -> Result<()> {
         let now = turso::now();
-        self.execute_and_cancel(
-            "UPDATE tickets SET is_archived = 1, assigned_to = NULL, updated_at = ?1 \
-             WHERE id = ?2",
-            turso::params![now, id],
-            id,
-            "set archived",
-        )
-        .await
+        let prepared = PreparedUpdate {
+            sql: "UPDATE tickets SET is_archived = 1, assigned_to = NULL, updated_at = ?1 \
+                   WHERE id = ?2"
+                .to_string(),
+            params: vec![Value::from(now), Value::from(id)],
+            action: "set archived".to_string(),
+        };
+        self.execute_and_cancel(id, prepared).await
     }
 
     pub async fn archive_stale_cancelled(&self, hours: i64) -> Result<u64> {
