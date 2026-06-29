@@ -294,7 +294,7 @@ pub struct SendMessage {
 pub trait Channel: Send + Sync {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Return a reference to `self` as `&dyn Any` for downcasting.
     ///
