@@ -3578,33 +3578,30 @@ with a comment explaining why no agent is mid-execution in that state.\
     //
     // Each commit/rollback pair shares a single `_{name}_inner(should_commit: bool)`
     // helper and a consolidated test function that runs both cases in a loop.
-    // Labeled assertion messages distinguished by commit_label() preserve
-    // failure granularity.  This pattern (for-loop over [false, true]) mirrors
-    // the existing test_parse_prereqs precedent below.
+    // commit_or_rollback returns a label string for assertion messages,
+    // preserving failure granularity.  This pattern (for-loop over [false, true])
+    // mirrors the existing test_parse_prereqs precedent below.
 
-    /// Shared helper: commit or rollback the given transaction.
-    async fn commit_or_rollback(tx: TxGuard<'_>, should_commit: bool) {
+    /// Commit or rollback the given transaction, returning a label string
+    /// ("commit" / "rollback") for use in assertion messages.
+    async fn commit_or_rollback(tx: TxGuard<'_>, should_commit: bool) -> &'static str {
+        let label = if should_commit { "commit" } else { "rollback" };
         if should_commit {
             tx.commit().await.unwrap();
         } else {
             tx.rollback().await.unwrap();
         }
-    }
-
-    /// Human-readable label for assertion messages.
-    fn commit_label(should_commit: bool) -> &'static str {
-        if should_commit { "commit" } else { "rollback" }
+        label
     }
 
     async fn set_commit_info_tx_inner(should_commit: bool) {
-        let label = commit_label(should_commit);
         let (store, _tmp, id) = setup().await;
 
         let tx = store.conn.begin_tx().await.unwrap();
         BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
             .await
             .expect("set_commit_info_tx");
-        commit_or_rollback(tx, should_commit).await;
+        let label = commit_or_rollback(tx, should_commit).await;
 
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         if should_commit {
@@ -3639,14 +3636,13 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     async fn add_comment_tx_inner(should_commit: bool) {
-        let label = commit_label(should_commit);
         let (store, _tmp, id) = setup().await;
 
         let tx = store.conn.begin_tx().await.unwrap();
         BoardStore::add_comment_tx(&tx, &id, "system", "transactional comment")
             .await
             .expect("add_comment_tx");
-        commit_or_rollback(tx, should_commit).await;
+        let label = commit_or_rollback(tx, should_commit).await;
 
         let comments = store.get_comments(&id).await.expect("get comments");
         if should_commit {
@@ -3669,7 +3665,6 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     async fn transition_to_tx_inner(should_commit: bool) {
-        let label = commit_label(should_commit);
         let (store, _tmp, id) = setup().await;
 
         // Start in QaPassed.
@@ -3688,7 +3683,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         )
         .await
         .expect("transition_to_tx");
-        commit_or_rollback(tx, should_commit).await;
+        let label = commit_or_rollback(tx, should_commit).await;
 
         let status = crate::util::test::expect_ticket_status(&store, &id).await;
         if should_commit {
@@ -3710,7 +3705,6 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     async fn transactional_triple_write_inner(should_commit: bool) {
-        let label = commit_label(should_commit);
         // Exercise the full pattern used by commit_and_transition_ticket:
         // all three _tx writes in one transaction → commit → all visible
         // (or rollback → none persist).
@@ -3736,7 +3730,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         )
         .await
         .unwrap();
-        commit_or_rollback(tx, should_commit).await;
+        let label = commit_or_rollback(tx, should_commit).await;
 
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         let comments = store.get_comments(&id).await.expect("get comments");
