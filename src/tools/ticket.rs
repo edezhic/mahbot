@@ -113,28 +113,21 @@ impl Tool for CreateTicketTool {
             format!(" with prerequisites: {}", prerequisites.join(", "))
         };
 
+        let params = self.build_params(
+            ws,
+            title,
+            description,
+            &prerequisites,
+            embedding_bytes.as_ref(),
+        );
         if let Some(supersede_id) = supersede_id {
             guard_not_pipeline_blocking(store, &supersede_id).await?;
 
-            let params = self.build_params(
-                ws,
-                title,
-                description,
-                &prerequisites,
-                embedding_bytes.as_ref(),
-            );
             let id = store.supersede_and_create(&supersede_id, &params).await?;
             Ok(format!(
                 "Superseded {supersede_id} → created ticket {id}: {title}{prereq_note}"
             ))
         } else {
-            let params = self.build_params(
-                ws,
-                title,
-                description,
-                &prerequisites,
-                embedding_bytes.as_ref(),
-            );
             let id = store.create_ticket(&params).await?;
             Ok(format!("Created ticket {id}: {title}{prereq_note}"))
         }
