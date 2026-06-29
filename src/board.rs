@@ -1810,18 +1810,19 @@ impl BoardStore {
     }
 }
 
-/// Returns a reference to the global [`BoardStore`] singleton.
+/// Open a [`BoardStore`] in a fresh temp directory (no global CONFIG dependency).
 ///
-/// Open a BoardStore in a fresh temp directory (no global CONFIG dependency).
+/// Thin wrapper around [`crate::open_test_store!`] that avoids touching the 34+
+/// call sites inside `self::tests`.  Delegates to the shared macro so the
+/// actual boilerplate lives in one place.
 ///
-/// Placed outside `mod tests` so that test code in sibling modules
-/// (e.g., `tools::search_archived_tickets`) can reuse it without
-/// duplicating the setup logic.
+/// Kept outside `mod tests` so that sibling modules (e.g.
+/// `tools::search_archived_tickets`) can call it as
+/// `crate::board::open_test_store().await`.  New code should prefer the macro
+/// directly.
 #[cfg(test)]
 pub(crate) async fn open_test_store() -> (BoardStore, tempfile::TempDir) {
-    let tmp = tempfile::TempDir::new().expect("temp dir");
-    let store = BoardStore::open(tmp.path()).await.expect("open store");
-    (store, tmp)
+    crate::open_test_store!(BoardStore, "board")
 }
 
 #[cfg(test)]

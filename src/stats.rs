@@ -353,8 +353,7 @@ mod tests {
     /// they can be read back via query_tool_usage and query_tool_errors.
     #[tokio::test]
     async fn flush_and_query_round_trip() {
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let store = StatsStore::open(tmp.path()).await.expect("open store");
+        let (store, _tmp) = crate::open_test_store!(StatsStore, "stats");
 
         let records = vec![
             crate::ToolCallRecord {

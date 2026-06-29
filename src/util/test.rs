@@ -34,6 +34,47 @@ fn test_root() -> &'static PathBuf {
     })
 }
 
+/// Open a temporary store for testing.
+///
+/// Creates a temporary directory and opens the given store inside it.
+/// Returns `(store, TempDir)`.  The `TempDir` MUST be held for the store's
+/// lifetime (typically bound to `_tmp` / `_dir` in the calling test).
+///
+/// `store_name` is used in the panic message if opening the store fails,
+/// so it should be a human-readable identifier (e.g. `"workspace"`, `"board"`).
+///
+/// This is a macro (not a generic function) because Rust's type system cannot
+/// express the lifetime relationship between a closure argument and the future
+/// returned by `async fn open(path: &Path) -> Result<T>` — the future captures
+/// a borrow of the argument, which would require higher-ranked lifetime bounds
+/// that `FnOnce` / `AsyncFnOnce` cannot express in the current edition without
+/// boxing.
+///
+/// # Panics
+///
+/// Panics if the temporary directory cannot be created, or if opening the
+/// store fails.
+#[macro_export]
+macro_rules! open_test_store {
+    ($store:ty) => {{
+        let tmp = ::tempfile::TempDir::new().expect("temp dir for test store");
+        let store = <$store>::open(tmp.path())
+            .await
+            .unwrap_or_else(|e| ::std::panic!("failed to open test store: {e:?}"));
+        (store, tmp)
+    }};
+    ($store:ty, $store_name:expr) => {{
+        let tmp = ::tempfile::TempDir::new().expect("temp dir for test store");
+        let store = <$store>::open(tmp.path()).await.unwrap_or_else(|e| {
+            ::std::panic!(
+                "failed to open test {store_name} store: {e:?}",
+                store_name = $store_name
+            )
+        });
+        (store, tmp)
+    }};
+}
+
 /// Fetch a ticket by ID, panicking if the DB query fails or the ticket
 /// does not exist.
 ///

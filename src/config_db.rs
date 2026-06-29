@@ -403,9 +403,7 @@ mod tests {
     use tempfile::TempDir;
 
     async fn setup() -> (ConfigStore, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let store = ConfigStore::open(dir.path()).await.unwrap();
-        (store, dir)
+        crate::open_test_store!(ConfigStore, "config")
     }
 
     // ── config_role lifecycle ──────────────────────────────────

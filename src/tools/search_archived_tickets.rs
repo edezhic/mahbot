@@ -135,13 +135,14 @@ impl SearchArchivedTicketsTool {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::open_test_store;
+    use crate::board::BoardStore;
+    use crate::open_test_store;
 
     /// Test that the tool-layer fts_search wrapper correctly converts
     /// f64 scores from the board to f32.
     #[tokio::test]
     async fn test_fts_search_returns_floats() {
-        let (store, _tmp) = open_test_store().await;
+        let (store, _tmp) = open_test_store!(BoardStore, "board");
         // Create and archive a ticket so FTS has something to find
         let ws = crate::workspace::test_ws("ws");
         let id = crate::util::test::TicketBuilder::new(&store, ws)
@@ -164,7 +165,7 @@ mod tests {
     /// Test that format_results formats real ticket data correctly.
     #[tokio::test]
     async fn test_format_results_formats_correctly() {
-        let (store, _tmp) = open_test_store().await;
+        let (store, _tmp) = open_test_store!(BoardStore, "board");
         let ws = crate::workspace::test_ws("ws");
         let id_a = crate::util::test::TicketBuilder::new(&store, ws.clone())
             .title("Alpha ticket")

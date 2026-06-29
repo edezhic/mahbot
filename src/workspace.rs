@@ -908,11 +908,7 @@ mod tests {
     /// Returns (store, temp_dir). The temp_dir is kept alive for the lifetime
     /// of the store (~ the test function).
     async fn test_store() -> (WorkspaceStore, TempDir) {
-        let tmp = TempDir::new().expect("temp dir");
-        let store = WorkspaceStore::open(tmp.path())
-            .await
-            .expect("open workspace store");
-        (store, tmp)
+        crate::open_test_store!(WorkspaceStore, "workspace")
     }
 
     /// Helper: insert a workspace row directly with full control over fields,

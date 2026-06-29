@@ -205,11 +205,7 @@ mod tests {
     use tempfile::TempDir;
 
     async fn test_setup() -> (ChatHistoryStore, TempDir) {
-        let tmp = TempDir::new().expect("failed to create test temp dir");
-        let store = ChatHistoryStore::open(tmp.path())
-            .await
-            .expect("ChatHistoryStore::open should succeed on fresh database");
-        (store, tmp)
+        crate::open_test_store!(ChatHistoryStore, "chat_history")
     }
 
     #[tokio::test]

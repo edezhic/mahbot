@@ -587,9 +587,8 @@ mod tests {
     /// Create a temporary LogStore for tests.
     /// Returns the store and a TempDir that must be held to prevent premature cleanup.
     async fn test_store() -> (Arc<LogStore>, tempfile::TempDir) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(LogStore::open(dir.path()).await.unwrap());
-        (store, dir)
+        let (store, dir) = crate::open_test_store!(LogStore, "log");
+        (Arc::new(store), dir)
     }
 
     // Helper to seed log entries in tests
