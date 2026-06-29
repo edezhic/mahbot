@@ -66,6 +66,40 @@ pub fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::ParseError>
 /// listed here.
 pub const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];
 
+/// Canonical list of all database store names, alphabetically ordered.
+///
+/// This is the **single source of truth** for which store databases exist.
+/// Each entry matches the `db_name` parameter in the corresponding
+/// [`define_store!`](crate::define_store!) invocation (or the equivalent
+/// manual open path for `logs`).
+///
+/// Used by:
+/// - [`checkpoint_all_databases`] — iterates all stores for WAL checkpointing.
+/// - `mahbot debug` — validates `--db` argument values.
+///
+/// When adding a new store, add its canonical name here to ensure it is
+/// picked up by checkpointing and the debug CLI.
+///
+/// # Naming
+///
+/// These are the `db_name` values (the part before `.db` in filenames like
+/// `board.db`, `sessions.db`), **not** the Rust static variable names
+/// (e.g., `BOARD`, `SESSIONS`).  Use `db_name` from the store's
+/// [`define_store!`](crate::define_store!) invocation.
+///
+/// See the test `all_store_names_appear_in_checkpoint` which verifies that every
+/// name listed here appears in [`checkpoint_all_databases`]'s store array.
+pub const ALL_STORE_NAMES: &[&str] = &[
+    "board",
+    "chat_history",
+    "config",
+    "logs",
+    "sessions",
+    "stats",
+    "users",
+    "workspaces",
+];
+
 /// Create [`turso::core::DatabaseOpts`] with all experimental features enabled.
 ///
 /// This is the **single source of truth** for which experimental features are active.

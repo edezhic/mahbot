@@ -23,20 +23,16 @@ use anyhow::{Context, Result, bail};
 use turso::core::{Database, IO, OpenFlags, PlatformIO};
 use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabaseConfig};
 
+use crate::turso::ALL_STORE_NAMES;
+
 /// Row limit per query to prevent unbounded output.
 const ROW_LIMIT: usize = 10_000;
 
 /// Valid `--db` argument values.
-const VALID_DB_NAMES: &[&str] = &[
-    "board",
-    "sessions",
-    "logs",
-    "workspaces",
-    "users",
-    "stats",
-    "config",
-    "chat_history",
-];
+///
+/// Derived from the canonical [`ALL_STORE_NAMES`] constant in `turso.rs`.
+/// Any store added there is automatically available in the debug CLI.
+const VALID_DB_NAMES: &[&str] = ALL_STORE_NAMES;
 
 /// Mutation keywords blocked by the read-only validator.
 /// Case-insensitive whole-word match (not substring).
@@ -336,9 +332,8 @@ fn print_truncation_row(column_count: usize) {
 
 fn print_usage() {
     eprintln!("Usage: mahbot debug --db <name> \"SQL query\"");
-    eprintln!(
-        "  --db <name>  board | sessions | logs | workspaces | users | stats | config | chat_history | all"
-    );
+    let names = ALL_STORE_NAMES.join(" | ");
+    eprintln!("  --db <name>  {names} | all");
     eprintln!("  SQL query    read-only SQL, quoted as a single argument");
     eprintln!();
     eprintln!("Examples:");

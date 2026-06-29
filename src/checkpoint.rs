@@ -36,6 +36,22 @@
 
 use tracing::{error, info, warn};
 
+/// Store names that [`checkpoint_all_databases`] iterates over.
+///
+/// Must stay in sync with [`crate::turso::ALL_STORE_NAMES`] — every store in
+/// the canonical list must appear here to ensure WAL frames are flushed on
+/// hard exit.  The test `all_store_names_appear_in_checkpoint` enforces this.
+pub(crate) const CHECKPOINT_STORE_NAMES: &[&str] = &[
+    "board",
+    "sessions",
+    "workspaces",
+    "chat_history",
+    "stats",
+    "config",
+    "users",
+    "logs",
+];
+
 /// Checkpoint all Turso database stores before hard process termination.
 ///
 /// `std::process::exit(0)` bypasses Rust destructors, so Turso WAL connections
@@ -46,23 +62,38 @@ use tracing::{error, info, warn};
 /// errors to avoid blocking shutdown.
 pub async fn checkpoint_all_databases() {
     let stores: [(&str, Option<&crate::turso::Connection>); 8] = [
-        ("board", crate::board::BOARD.get().map(|s| &s.conn)),
-        ("sessions", crate::session::SESSIONS.get().map(|s| &s.conn)),
         (
-            "workspaces",
+            CHECKPOINT_STORE_NAMES[0],
+            crate::board::BOARD.get().map(|s| &s.conn),
+        ),
+        (
+            CHECKPOINT_STORE_NAMES[1],
+            crate::session::SESSIONS.get().map(|s| &s.conn),
+        ),
+        (
+            CHECKPOINT_STORE_NAMES[2],
             crate::workspace::WORKSPACES.get().map(|s| &s.conn),
         ),
         (
-            "chat_history",
+            CHECKPOINT_STORE_NAMES[3],
             crate::chat_history::CHAT_HISTORY.get().map(|s| &s.conn),
         ),
-        ("stats", crate::stats::STATS_STORE.get().map(|s| &s.conn)),
         (
-            "config_db",
+            CHECKPOINT_STORE_NAMES[4],
+            crate::stats::STATS_STORE.get().map(|s| &s.conn),
+        ),
+        (
+            CHECKPOINT_STORE_NAMES[5],
             crate::config_db::CONFIG_STORE.get().map(|s| &s.conn),
         ),
-        ("users", crate::users::USER_STORE.get().map(|s| &s.conn)),
-        ("logs", crate::logs::LOG_STORE.get().map(|s| &s.conn)),
+        (
+            CHECKPOINT_STORE_NAMES[6],
+            crate::users::USER_STORE.get().map(|s| &s.conn),
+        ),
+        (
+            CHECKPOINT_STORE_NAMES[7],
+            crate::logs::LOG_STORE.get().map(|s| &s.conn),
+        ),
     ];
 
     for (name, conn_opt) in &stores {
@@ -168,5 +199,28 @@ mod tests {
             AUTO_CHECKPOINT_INTERVAL <= Duration::from_secs(600),
             "auto-checkpoint interval should be at most 10 minutes"
         );
+    }
+
+    /// Verify that every name in [`crate::turso::ALL_STORE_NAMES`] appears in
+    /// [`super::CHECKPOINT_STORE_NAMES`], which is the array that
+    /// [`checkpoint_all_databases`] iterates over.
+    ///
+    /// If this test fails, a store was added to [`crate::turso::ALL_STORE_NAMES`]
+    /// but forgotten in [`checkpoint_all_databases`].  Missing stores are silently
+    /// skipped during checkpointing, meaning their WAL frames are never flushed
+    /// — leading to data loss on hard process exit (self-update restart, signal
+    /// without cleanup).
+    #[test]
+    fn all_store_names_appear_in_checkpoint() {
+        let checkpoint_stores = super::CHECKPOINT_STORE_NAMES;
+
+        for name in crate::turso::ALL_STORE_NAMES {
+            assert!(
+                checkpoint_stores.contains(name),
+                "store '{name}' is in ALL_STORE_NAMES but missing from \
+                 checkpoint_all_databases — WAL frames for this store will \
+                 never be flushed on hard exit, causing data loss"
+            );
+        }
     }
 }
