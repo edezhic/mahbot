@@ -3505,6 +3505,23 @@ with a comment explaining why no agent is mid-execution in that state.\
         label
     }
 
+    // ── Transactional test macro ─────────────────────────────────
+    //
+    // Generates a `#[tokio::test]` wrapper that calls a `_inner` function
+    // with both `false` and `true` for `should_commit`, exercising the
+    // commit and rollback paths of the _tx functions.
+
+    macro_rules! transaction_test {
+        ($name:ident, $inner:ident) => {
+            #[tokio::test]
+            async fn $name() {
+                for should_commit in [false, true] {
+                    $inner(should_commit).await;
+                }
+            }
+        };
+    }
+
     async fn set_commit_info_tx_inner(should_commit: bool) {
         let (store, _tmp, id) = setup().await;
 
@@ -3539,12 +3556,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         }
     }
 
-    #[tokio::test]
-    async fn test_set_commit_info_tx() {
-        for should_commit in [false, true] {
-            set_commit_info_tx_inner(should_commit).await;
-        }
-    }
+    transaction_test!(test_set_commit_info_tx, set_commit_info_tx_inner);
 
     async fn add_comment_tx_inner(should_commit: bool) {
         let (store, _tmp, id) = setup().await;
@@ -3568,12 +3580,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         }
     }
 
-    #[tokio::test]
-    async fn test_add_comment_tx() {
-        for should_commit in [false, true] {
-            add_comment_tx_inner(should_commit).await;
-        }
-    }
+    transaction_test!(test_add_comment_tx, add_comment_tx_inner);
 
     async fn transition_to_tx_inner(should_commit: bool) {
         let (store, _tmp, id) = setup().await;
@@ -3608,12 +3615,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         }
     }
 
-    #[tokio::test]
-    async fn test_transition_to_tx() {
-        for should_commit in [false, true] {
-            transition_to_tx_inner(should_commit).await;
-        }
-    }
+    transaction_test!(test_transition_to_tx, transition_to_tx_inner);
 
     async fn transactional_triple_write_inner(should_commit: bool) {
         // Exercise the full pattern used by commit_and_transition_ticket:
@@ -3673,12 +3675,10 @@ with a comment explaining why no agent is mid-execution in that state.\
         }
     }
 
-    #[tokio::test]
-    async fn test_transactional_triple_write() {
-        for should_commit in [false, true] {
-            transactional_triple_write_inner(should_commit).await;
-        }
-    }
+    transaction_test!(
+        test_transactional_triple_write,
+        transactional_triple_write_inner
+    );
 
     // ── parse_prereqs unit tests ──
 
