@@ -79,7 +79,6 @@ pub struct SessionMetadata {
     pub message_count: usize,
 }
 
-/// Turso-backed session store.
 /// Parse an RFC 3339 timestamp string, falling back to `Utc::now()` on failure.
 ///
 /// Logs a warning with the field name, the raw value, and the parse error
