@@ -196,7 +196,7 @@ mod tests {
             "auto-checkpoint interval should be at least 30 seconds"
         );
         assert!(
-            AUTO_CHECKPOINT_INTERVAL <= Duration::from_secs(600),
+            AUTO_CHECKPOINT_INTERVAL <= Duration::from_mins(10),
             "auto-checkpoint interval should be at most 10 minutes"
         );
     }

@@ -2147,7 +2147,7 @@ mod tests {
 
         for case in &cases {
             let result = parse_models(case.input);
-            let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
+            let expected: Vec<String> = case.expected.iter().map(ToString::to_string).collect();
             assert_eq!(result, expected, "case: {}", case.name);
         }
     }

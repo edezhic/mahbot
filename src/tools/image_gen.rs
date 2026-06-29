@@ -303,52 +303,59 @@ mod tests {
     fn test_extract_response_parts_variants() {
         // Table-driven tests covering normal variants of extract_response_parts.
         //
-        // Each case is:
-        //   (image_url, text_content, expected_image_data, expected_text_content, label)
-        //
         // - Empty text content → None (empty-string guard in extract_response_parts).
-        let cases: Vec<(Option<&str>, Option<&str>, Option<&str>, Option<&str>, &str)> = vec![
-            (
-                Some("data:image/png;base64,abc123"),
-                Some("Here is your generated image"),
-                Some("data:image/png;base64,abc123"),
-                Some("Here is your generated image"),
-                "image_and_text",
-            ),
-            (
-                Some("data:image/png;base64,def456"),
-                None,
-                Some("data:image/png;base64,def456"),
-                None,
-                "image_only",
-            ),
-            (
-                None,
-                Some("Just text, no image"),
-                None,
-                Some("Just text, no image"),
-                "text_only",
-            ),
-            (
-                Some("data:image/png;base64,ghi789"),
-                Some(""),
-                Some("data:image/png;base64,ghi789"),
-                None,
-                "empty_content — empty text yields None",
-            ),
+        struct Case {
+            image_url: Option<&'static str>,
+            text_content: Option<&'static str>,
+            expected_image_data: Option<&'static str>,
+            expected_text_content: Option<&'static str>,
+            label: &'static str,
+        }
+
+        let cases: Vec<Case> = vec![
+            Case {
+                image_url: Some("data:image/png;base64,abc123"),
+                text_content: Some("Here is your generated image"),
+                expected_image_data: Some("data:image/png;base64,abc123"),
+                expected_text_content: Some("Here is your generated image"),
+                label: "image_and_text",
+            },
+            Case {
+                image_url: Some("data:image/png;base64,def456"),
+                text_content: None,
+                expected_image_data: Some("data:image/png;base64,def456"),
+                expected_text_content: None,
+                label: "image_only",
+            },
+            Case {
+                image_url: None,
+                text_content: Some("Just text, no image"),
+                expected_image_data: None,
+                expected_text_content: Some("Just text, no image"),
+                label: "text_only",
+            },
+            Case {
+                image_url: Some("data:image/png;base64,ghi789"),
+                text_content: Some(""),
+                expected_image_data: Some("data:image/png;base64,ghi789"),
+                expected_text_content: None,
+                label: "empty_content — empty text yields None",
+            },
         ];
-        for (img_url, text, exp_img, exp_text, label) in &cases {
-            let body = make_response(*img_url, *text);
+        for case in &cases {
+            let body = make_response(case.image_url, case.text_content);
             let result = extract_response_parts(&body);
             assert_eq!(
                 result.image_data,
-                (*exp_img).map(|s| s.to_string()),
-                "{label}: image_data mismatch",
+                case.expected_image_data.map(ToString::to_string),
+                "{}: image_data mismatch",
+                case.label,
             );
             assert_eq!(
                 result.text_content,
-                (*exp_text).map(|s| s.to_string()),
-                "{label}: text_content mismatch",
+                case.expected_text_content.map(ToString::to_string),
+                "{}: text_content mismatch",
+                case.label,
             );
         }
     }
