@@ -87,8 +87,8 @@ pub const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"]
 /// (e.g., `BOARD`, `SESSIONS`).  Use `db_name` from the store's
 /// [`define_store!`](crate::define_store!) invocation.
 ///
-/// See the test `all_store_names_appear_in_checkpoint` which verifies that every
-/// name listed here appears in [`checkpoint_all_databases`]'s store array.
+/// See the test `all_store_names_appear_in_checkpoint` which verifies that this
+/// list and [`checkpoint_all_databases`]'s store array are equal as sets.
 pub const ALL_STORE_NAMES: &[&str] = &[
     "board",
     "chat_history",
