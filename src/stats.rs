@@ -50,10 +50,6 @@ crate::columns! {
     }
 }
 
-/// Column-index constants for the single-column SELECTs.
-const COL_TU_COUNT: usize = 0;
-const COL_TE_COUNT: usize = 0;
-
 /// A single tool error entry queried from the DB.
 #[derive(Debug, Clone)]
 pub struct ToolErrorEntry {
@@ -90,7 +86,7 @@ impl StatsStore {
                 "SELECT COUNT(*) FROM tool_calls \
                  WHERE agent_id = ?1 AND tool_name = ?2",
                 turso::params![agent_id, tool_name],
-                |row| row.get::<i64>(COL_TU_COUNT),
+                |row| row.get::<i64>(0),
             )
             .await
             .map(|opt| opt.unwrap_or(0))
@@ -138,7 +134,7 @@ impl StatsStore {
             .query(&sql, turso::params_from_iter(params))
             .await?;
         let count = match rows.into_iter().next() {
-            Some(row) => match row.get_value(COL_TE_COUNT)? {
+            Some(row) => match row.get_value(0)? {
                 turso::Value::Integer(n) => usize::try_from(n).unwrap_or(0),
                 _ => 0,
             },

@@ -68,12 +68,6 @@ crate::columns! {
     }
 }
 
-/// Column-index constant for the single-column dynamic SELECT in [`get_user_column`].
-const COL_USERS_COLUMN_VALUE: usize = 0;
-
-/// Column-index constant for the single-column SELECT in [`resolve_user_by_channel`].
-const COL_UC_USER_NAME: usize = 0;
-
 impl UserStore {
     /// Auto-create the admin user if this is a fresh database.
     async fn ensure_admin_user(&self) -> Result<()> {
@@ -139,7 +133,7 @@ impl UserStore {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(COL_USERS_COLUMN_VALUE)?),
+            Some(row) => Ok(row.get::<Option<String>>(0)?),
             None => Ok(None),
         }
     }
@@ -224,7 +218,7 @@ impl UserStore {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(Some(row.get::<String>(COL_UC_USER_NAME)?)),
+            Some(row) => Ok(Some(row.get::<String>(0)?)),
             None => Ok(None),
         }
     }

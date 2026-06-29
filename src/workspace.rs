@@ -104,16 +104,6 @@ crate::columns! {
     }
 }
 
-/// Column-index constant for the single-column SELECT in [`get_diagnostics`].
-/// NOTE: distinct from [`COL_WS_DIAGNOSTICS`] (index 9 in WORKSPACE_COLUMNS).
-const COL_WS_DIAG_VALUE: usize = 0;
-
-/// Column-index constant for the single-column SELECT in [`get_discovery_generation`].
-const COL_WS_DISCOVERY_GEN: usize = 0;
-
-/// Column-index constant for the single-column SELECT in [`get_context`].
-const COL_WC_CONTENT: usize = 0;
-
 /// Check the discovery generation counter: return `true` if the calling task
 /// is still the latest (OK to proceed), `false` if a newer [`WorkspaceStore::rediscover`] has
 /// been triggered (stale — do not proceed).
@@ -675,7 +665,7 @@ impl WorkspaceStore {
             .query_row(
                 "SELECT diagnostics FROM workspaces WHERE name = ?1",
                 turso::params![name],
-                |row| row.get::<Option<String>>(COL_WS_DIAG_VALUE),
+                |row| row.get::<Option<String>>(0),
             )
             .await
         {
@@ -711,7 +701,7 @@ impl WorkspaceStore {
             .query_row(
                 "SELECT discovery_generation FROM workspaces WHERE name = ?1",
                 turso::params![name],
-                |row| row.get(COL_WS_DISCOVERY_GEN),
+                |row| row.get(0),
             )
             .await
             .map_err(Into::into)
@@ -754,7 +744,7 @@ impl WorkspaceStore {
             .query_optional(
                 "SELECT content FROM workspace_contexts WHERE workspace_name = ?1 AND role = ?2",
                 turso::params![name, role],
-                |row| row.get::<String>(COL_WC_CONTENT),
+                |row| row.get::<String>(0),
             )
             .await
     }

@@ -63,22 +63,6 @@ crate::columns! {
     }
 }
 
-// Test-only column constants (used by #[cfg(test)] query helpers).
-// These are single-column SELECT constants not derived from any column-string.
-
-#[cfg(test)]
-const COL_KV_VALUE_SINGLE: usize = 0; // SELECT value FROM config_kv
-
-#[cfg(test)]
-const COL_RC_TEST_MODEL: usize = 0; // SELECT model FROM config_role (in get_role_config)
-#[cfg(test)]
-const COL_RC_TEST_REASONING_EFFORT: usize = 1;
-
-#[cfg(test)]
-const COL_MR_TEST_PROVIDER_ORDER: usize = 0; // SELECT provider_order FROM config_model_routing
-#[cfg(test)]
-const COL_MR_TEST_ALLOW_FALLBACKS: usize = 1;
-
 // ── SQL statement constants ──────────────────────────────────
 
 /// UPSERT a key-value pair in config_kv.
@@ -279,7 +263,7 @@ impl ConfigStore {
             .query_row(
                 "SELECT value FROM config_kv WHERE key = ?1",
                 turso::params![key],
-                |row| row.get_value(COL_KV_VALUE_SINGLE),
+                |row| row.get_value(0),
             )
             .await
         {
@@ -299,9 +283,8 @@ impl ConfigStore {
                 "SELECT model, reasoning_effort FROM config_role WHERE role = ?1",
                 turso::params![role],
                 |row| {
-                    let model = row.get::<Option<String>>(COL_RC_TEST_MODEL)?;
-                    let reasoning_effort =
-                        row.get::<Option<String>>(COL_RC_TEST_REASONING_EFFORT)?;
+                    let model = row.get::<Option<String>>(0)?;
+                    let reasoning_effort = row.get::<Option<String>>(1)?;
                     Ok::<RoleConfig, ::turso::Error>(RoleConfig {
                         role: role_owned,
                         model,
@@ -352,8 +335,8 @@ impl ConfigStore {
                 "SELECT provider_order, allow_fallbacks FROM config_model_routing WHERE model = ?1",
                 turso::params![model],
                 |row| {
-                    let provider_order = row.get::<Option<String>>(COL_MR_TEST_PROVIDER_ORDER)?;
-                    let allow_fallbacks = row.get::<Option<bool>>(COL_MR_TEST_ALLOW_FALLBACKS)?;
+                    let provider_order = row.get::<Option<String>>(0)?;
+                    let allow_fallbacks = row.get::<Option<bool>>(1)?;
                     Ok::<ModelRouting, ::turso::Error>(ModelRouting {
                         model: model_owned,
                         provider_order,
