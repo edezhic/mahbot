@@ -2499,11 +2499,7 @@ mod tests {
 
         // ── FailingOnly with all-passing verdicts ──
         // Should produce 0 comments (nothing to write).
-        let passing_verdict = crate::Verdict {
-            score: REVIEW_QA_THRESHOLD, // 9/10 — passes
-            critique: None,
-            issues_detected: vec![],
-        };
+        let passing_verdict = pass_verdict();
         let results = vec![ParallelVerdict {
             response: "Looks good.".into(),
             verdict: Some(passing_verdict),
@@ -2528,11 +2524,7 @@ mod tests {
 
         // ── FailingOnly with a failing verdict ──
         // Should produce 1 comment.
-        let failing = crate::Verdict {
-            score: 3, // below threshold
-            critique: Some("Missing error handling.".into()),
-            issues_detected: vec!["No timeout check".into()],
-        };
+        let failing = fail_verdict();
         let results = vec![ParallelVerdict {
             response: "Has issues.".into(),
             verdict: Some(failing),
