@@ -56,13 +56,6 @@ fn test_root() -> &'static PathBuf {
 /// store fails.
 #[macro_export]
 macro_rules! open_test_store {
-    ($store:ty) => {{
-        let tmp = ::tempfile::TempDir::new().expect("temp dir for test store");
-        let store = <$store>::open(tmp.path())
-            .await
-            .unwrap_or_else(|e| ::std::panic!("failed to open test store: {e:?}"));
-        (store, tmp)
-    }};
     ($store:ty, $store_name:expr) => {{
         let tmp = ::tempfile::TempDir::new().expect("temp dir for test store");
         let store = <$store>::open(tmp.path()).await.unwrap_or_else(|e| {
