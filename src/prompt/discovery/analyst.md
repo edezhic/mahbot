@@ -3,7 +3,7 @@ Generate a workspace context summary for the ANALYST role.
 Explore this workspace and capture a research and navigation map for investigating questions about this project.
 
 Cover:
-- Source layout and where different kinds of code live
+- Workspace layout and where different kinds of sources live
 - Documentation, config, and test locations
 - Useful search terms and patterns for finding related code quickly
 - How to trace a feature or behavior through the codebase

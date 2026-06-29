@@ -65,9 +65,7 @@ Other harnesses efficiency heavily relies on huge discrepancy between subscripti
 
 ### 4. Agentic engineering harness, built in
 
-Instead of bolting skills, subagents, and review onto a chat UI, MahBot ships the harness:
-
-- **Multi-role agents** — Manager, Engineer, Analyst, Coder, Reviewer, QA, Discovery, Maintainer, Artist (see `src/role.rs`)
+- **Multi-role agents** — Manager, Engineer, Analyst, Coder, Reviewer, QA, Discovery, Maintainer, Artist
 - **Subagents** — `ask` spawns Analyst/Coder work in isolated context; Manager gets async results via a serialized queue
 - **Persistent state** — Turso-backed sessions, tickets, workspace context, chat history, tool stats
 - **Workspace discovery** — per-role codebase summaries + auto-detected diagnostics commands
@@ -118,6 +116,10 @@ Rust **2024**, native **Iced** dashboard, **Tokio** async. Single-instance lock;
 - Telegram bot token — remote chat on the same agent backend
 
 **Defaults (configurable):** per-role models via OpenRouter; image/video generation and transcription models in settings. See `src/config.rs` and the dashboard **Settings** page.
+
+## Known issues
+
+This is beta quality software. It has already processed thousands of tickets on it's own codebase and improving every day, and I already prefer it over Cursor + GPT 5.5 xhigh despite having expiring credits left there. However, it heavily uses Turso which is in beta itself and multiple times the board DB got corrupted, fff-search seems to reindex workspaces way more than required, chrome-use is a somewhat questionable choice, and most likely there are still some bugs left. Nevertheless, it's already very much usable with the default configs.
 
 ## License
 
