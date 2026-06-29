@@ -211,9 +211,7 @@ enum NotifyPolicy {
 ///
 /// Called after a successful transition to handle the notification side-effect.
 /// `source` is the phase the ticket transitioned *from* (used for the buffer
-/// entry — given as an explicit parameter because the two callers have
-/// different sources: [`transition_ticket`] passes its `expected` parameter,
-/// while [`commit_and_transition_ticket_from`] passes its own `source`).
+/// entry).
 ///
 /// The `log_label` string is forwarded to [`resolve_ticket_workspace`] to
 /// distinguish callers in log messages.
@@ -234,9 +232,9 @@ async fn dispatch_notification(
     }
 }
 
-/// Transition a ticket to `target` phase if it's still in `expected` phase.
+/// Transition a ticket to `target` phase if it's still in `source` phase.
 ///
-/// Returns `Ok(())` if the transition was applied (ticket was still in expected
+/// Returns `Ok(())` if the transition was applied (ticket was still in source
 /// phase). Returns `Err(anyhow::Error)` with a descriptive message if the ticket was
 /// moved externally (phase mismatch) **or** a DB error occurred. On failure,
 /// does **not** clear `assigned_to` — doing so would either steal the new
@@ -254,25 +252,24 @@ async fn dispatch_notification(
 /// errors from notification are logged and discarded (not propagated).
 async fn transition_ticket(
     ticket: &Ticket,
-    expected: TicketPhase,
+    source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
     pipeline_reservation: Option<bool>,
 ) -> anyhow::Result<()> {
     match board()
-        .transition_to(&ticket.id, Some(expected), target, pipeline_reservation)
+        .transition_to(&ticket.id, Some(source), target, pipeline_reservation)
         .await
     {
         Ok(()) => {
-            dispatch_notification(ticket, target, expected, notify, "cannot buffer transition")
-                .await;
+            dispatch_notification(ticket, target, source, notify, "cannot buffer transition").await;
 
             Ok(())
         }
         Err(e) => {
             debug!(
                 ticket = %ticket.id,
-                expected = %expected,
+                source = %source,
                 target = %target,
                 error = %e,
                 "Failed to update ticket status",
