@@ -34,6 +34,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Embedding, Module};
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -566,6 +567,39 @@ impl Layer {
     }
 }
 
+// ── Weight-loading helpers for `Embedder::load` ─────────────────────
+
+/// Load a quantized matrix-multiply weight tensor from a GGUF file.
+fn load_qmatmul(
+    content: &gguf_file::Content,
+    file: &mut File,
+    prefix: &str,
+    name: &str,
+    device: &Device,
+) -> Result<QMatMul> {
+    QMatMul::from_qtensor(
+        content
+            .tensor(file, &format!("{prefix}.{name}.weight"), device)
+            .with_context(|| format!("Failed to load {prefix}.{name}.weight"))?,
+    )
+    .with_context(|| format!("Failed to create QMatMul for {name}"))
+}
+
+/// Load and dequantize a norm weight tensor from a GGUF file.
+fn load_norm(
+    content: &gguf_file::Content,
+    file: &mut File,
+    prefix: &str,
+    name: &str,
+    device: &Device,
+) -> Result<Tensor> {
+    content
+        .tensor(file, &format!("{prefix}.{name}.weight"), device)
+        .with_context(|| format!("Failed to load {prefix}.{name}.weight"))?
+        .dequantize(device)
+        .with_context(|| format!("Failed to dequantize {name}"))
+}
+
 // ── Embedder ─────────────────────────────────────────────────────────
 
 /// The embedding model: EuroBERT encoder + tokenizer + pooling.
@@ -669,66 +703,15 @@ impl Embedder {
         for i in 0..n_layers {
             let prefix = format!("blk.{i}");
 
-            let attn_q = QMatMul::from_qtensor(
-                content
-                    .tensor(&mut file, &format!("{prefix}.attn_q.weight"), &device)
-                    .with_context(|| format!("Failed to load {prefix}.attn_q.weight"))?,
-            )
-            .context("Failed to create QMatMul for attn_q")?;
-
-            let attn_k = QMatMul::from_qtensor(
-                content
-                    .tensor(&mut file, &format!("{prefix}.attn_k.weight"), &device)
-                    .with_context(|| format!("Failed to load {prefix}.attn_k.weight"))?,
-            )
-            .context("Failed to create QMatMul for attn_k")?;
-
-            let attn_v = QMatMul::from_qtensor(
-                content
-                    .tensor(&mut file, &format!("{prefix}.attn_v.weight"), &device)
-                    .with_context(|| format!("Failed to load {prefix}.attn_v.weight"))?,
-            )
-            .context("Failed to create QMatMul for attn_v")?;
-
-            let attn_o = QMatMul::from_qtensor(
-                content
-                    .tensor(&mut file, &format!("{prefix}.attn_output.weight"), &device)
-                    .with_context(|| format!("Failed to load {prefix}.attn_output.weight"))?,
-            )
-            .context("Failed to create QMatMul for attn_o")?;
-
-            let attn_norm = content
-                .tensor(&mut file, &format!("{prefix}.attn_norm.weight"), &device)
-                .with_context(|| format!("Failed to load {prefix}.attn_norm.weight"))?
-                .dequantize(&device)
-                .context("Failed to dequantize attn_norm")?;
-
-            let ffn_gate = QMatMul::from_qtensor(
-                content
-                    .tensor(&mut file, &format!("{prefix}.ffn_gate.weight"), &device)
-                    .with_context(|| format!("Failed to load {prefix}.ffn_gate.weight"))?,
-            )
-            .context("Failed to create QMatMul for ffn_gate")?;
-
-            let ffn_up = QMatMul::from_qtensor(
-                content
-                    .tensor(&mut file, &format!("{prefix}.ffn_up.weight"), &device)
-                    .with_context(|| format!("Failed to load {prefix}.ffn_up.weight"))?,
-            )
-            .context("Failed to create QMatMul for ffn_up")?;
-
-            let ffn_down = QMatMul::from_qtensor(
-                content
-                    .tensor(&mut file, &format!("{prefix}.ffn_down.weight"), &device)
-                    .with_context(|| format!("Failed to load {prefix}.ffn_down.weight"))?,
-            )
-            .context("Failed to create QMatMul for ffn_down")?;
-
-            let ffn_norm = content
-                .tensor(&mut file, &format!("{prefix}.ffn_norm.weight"), &device)
-                .with_context(|| format!("Failed to load {prefix}.ffn_norm.weight"))?
-                .dequantize(&device)
-                .context("Failed to dequantize ffn_norm")?;
+            let attn_q = load_qmatmul(&content, &mut file, &prefix, "attn_q", &device)?;
+            let attn_k = load_qmatmul(&content, &mut file, &prefix, "attn_k", &device)?;
+            let attn_v = load_qmatmul(&content, &mut file, &prefix, "attn_v", &device)?;
+            let attn_o = load_qmatmul(&content, &mut file, &prefix, "attn_output", &device)?;
+            let attn_norm = load_norm(&content, &mut file, &prefix, "attn_norm", &device)?;
+            let ffn_gate = load_qmatmul(&content, &mut file, &prefix, "ffn_gate", &device)?;
+            let ffn_up = load_qmatmul(&content, &mut file, &prefix, "ffn_up", &device)?;
+            let ffn_down = load_qmatmul(&content, &mut file, &prefix, "ffn_down", &device)?;
+            let ffn_norm = load_norm(&content, &mut file, &prefix, "ffn_norm", &device)?;
 
             layers.push(Layer {
                 attn_q,
