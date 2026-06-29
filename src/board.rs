@@ -1024,43 +1024,20 @@ impl BoardStore {
         }
     }
 
-    /// Update the status of a ticket, optionally guarded by an expected phase.
-    ///
-    /// When `expected_phase` is [`Some`], the UPDATE includes `AND status = ?` in
-    /// the WHERE clause — the call only succeeds when the ticket exists and its
-    /// current phase matches. This provides CAS-style atomicity for phase
-    /// transitions (e.g. Backlog→InDevelopment) and prevents
-    /// concurrent-modification races.
-    ///
-    /// When `expected_phase` is [`None`], the transition is unconditional — any
-    /// ticket matching the ID is updated, regardless of its current status.
-    /// This is appropriate when the caller is the authority on the new status
-    /// (e.g. GUI manual override).
-    ///
-    /// In both cases the method clears `assigned_to` (sets to `NULL`) and cancels
-    /// any running agents on this ticket.
+    /// Update ticket status, optionally guarded by an expected phase for CAS-style
+    /// atomicity. Always clears `assigned_to` and cancels running agents.
     ///
     /// # Note on [`pipeline_reservation`](Ticket::pipeline_reservation)
     ///
-    /// When `reservation` is `None` (the common case), the
-    /// [`pipeline_reservation`](Ticket::pipeline_reservation) column is left
-    /// untouched. This is deliberate so that:
-    /// - Bounce-back transitions (diagnostics/review/QA failure → ReadyForDevelopment)
-    ///   can set the reservation atomically by passing `Some(true)`.
-    /// - Manual transitions (GUI/UpdateTicketTool) to terminal phases
-    ///   leave stale reservations inert — the claim and blocker queries filter by
-    ///   status, so a cancelled/planning/failed ticket with reservation=1 is harmless.
-    ///
-    /// When `reservation` is `Some(value)`, the column is set to the given boolean
-    /// in the same UPDATE statement. This is needed for crash/restart recovery and
-    /// rework priority to avoid a race where a ticket is claimed between the
-    /// transition and a subsequent separate call to set the reservation.
+    /// When `reservation` is `None`, the column is left untouched so bounce-back
+    /// transitions can set it atomically, and manual transitions leave stale
+    /// reservations inert (claim/blocker queries filter by status). When
+    /// `Some(value)`, it's set in the same UPDATE to avoid a race on crash/restart
+    /// recovery or rework priority.
     ///
     /// # Errors
     ///
-    /// Returns an error when the UPDATE matched 0 rows (ticket does not exist, or
-    /// exists but is not in `expected_phase` when a guard is active) or when a
-    /// database error occurs.
+    /// Returns an error when the UPDATE matched 0 rows or a database error occurs.
     pub async fn transition_to(
         &self,
         id: &str,
