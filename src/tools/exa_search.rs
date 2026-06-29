@@ -109,8 +109,9 @@ impl Tool for ExaSearchTool {
         WebSearchCache::parameters_schema()
     }
 
+    /// Preserve full search results — don't truncate with default 5K limit.
     fn format_output(&self, output: &str) -> String {
-        WebSearchCache::format_output(output)
+        output.to_string()
     }
 
     fn side_effects(&self, _args: &serde_json::Value) -> bool {

@@ -135,13 +135,6 @@ impl WebSearchCache {
         })
     }
 
-    /// Bypass default truncation to preserve full search results and
-    /// expanded article content.
-    #[must_use]
-    pub(crate) fn format_output(output: &str) -> String {
-        output.to_string()
-    }
-
     /// Web search tools have no workspace side effects.
     pub(crate) const fn side_effects() -> bool {
         false
@@ -219,12 +212,6 @@ mod tests {
         assert!(schema.get("oneOf").is_some());
         assert!(schema["properties"]["query"]["type"] == "string");
         assert!(schema["properties"]["expand"]["type"] == "integer");
-    }
-
-    #[test]
-    fn test_format_output_passthrough() {
-        let input = "hello world";
-        assert_eq!(WebSearchCache::format_output(input), input);
     }
 
     #[test]
