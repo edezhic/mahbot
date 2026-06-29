@@ -54,7 +54,11 @@ pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+            // chunks_exact(4) guarantees every yielded chunk is exactly 4 bytes,
+            // so try_into() is infallible here.
+            let arr: [u8; 4] = chunk
+                .try_into()
+                .expect("chunks_exact(4) yields 4-byte chunks");
             f32::from_le_bytes(arr)
         })
         .collect()
