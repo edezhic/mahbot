@@ -90,7 +90,6 @@ fn model_routing_from_row(row: &turso::Row) -> Result<ModelRouting, ::turso::Err
 }
 
 /// Parse a `(key, value)` pair from a `config_kv` row.
-#[cfg(test)]
 fn kv_from_row(row: &turso::Row) -> Result<(String, String), ::turso::Error> {
     let key = row.get::<String>(COL_KV_KEY)?;
     let value = row.get::<String>(COL_KV_VALUE)?;
@@ -119,19 +118,15 @@ impl ConfigStore {
     pub async fn get_all_kv(&self) -> Result<Vec<(String, String)>> {
         let rows = self
             .conn
-            .query(
+            .query_map(
                 &format!("SELECT {KV_COLUMNS} FROM config_kv ORDER BY key"),
                 turso::params![],
+                kv_from_row,
             )
             .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.get::<String>(COL_KV_KEY)?,
-                    row.get::<String>(COL_KV_VALUE)?,
-                ))
-            })
-            .collect()
+        Ok(rows
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     // ── config_role ──────────────────────────────────────────
