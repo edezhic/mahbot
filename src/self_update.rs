@@ -29,6 +29,7 @@
 //! `env!("CARGO_MANIFEST_DIR")`.
 
 use anyhow::{Context, Result, anyhow};
+#[cfg(test)]
 use directories::UserDirs;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -570,28 +571,13 @@ pub async fn notify_admin(message: &str, target: Option<&String>) {
 
 // ── Cargo bin path resolution and installation ───────────────────────────
 
-/// Resolve the cargo binary install path.
+/// Resolve the path to the `mahbot` binary in the cargo bin directory.
 ///
-/// Resolution order:
-/// 1. `$CARGO_HOME/bin/mahbot{EXE_SUFFIX}` if `CARGO_HOME` environment variable is set.
-/// 2. `~/.cargo/bin/mahbot{EXE_SUFFIX}` using `directories::UserDirs`
-///    (following the same resolution order as the shell tool's
-///    `extra_shell_path_prefixes`).
-/// 3. `None` — no home directory or cargo home available (extremely unusual,
-///    e.g., containerized environments without a home dir).
+/// Delegates to [`crate::util::cargo_bin_dir`] for directory resolution,
+/// then appends the platform-specific executable name.
 fn resolve_cargo_bin_path() -> Option<PathBuf> {
     let exe_name = format!("mahbot{}", std::env::consts::EXE_SUFFIX);
-
-    // Check $CARGO_HOME first.
-    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
-        && !cargo_home.is_empty()
-    {
-        return Some(PathBuf::from(cargo_home).join("bin").join(&exe_name));
-    }
-
-    // Fall back to ~/.cargo/bin via UserDirs.
-    let dirs = UserDirs::new()?;
-    Some(dirs.home_dir().join(".cargo").join("bin").join(exe_name))
+    Some(crate::util::cargo_bin_dir()?.join(exe_name))
 }
 
 /// Format an admin-facing notification for a copy-to-cargo-bin failure.

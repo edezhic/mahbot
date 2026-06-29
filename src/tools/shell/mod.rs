@@ -314,34 +314,36 @@ impl ShellTool {
 /// (`cargo`, Homebrew, npm global bins, etc.) resolve without reading the
 /// parent process `PATH`.
 ///
-/// # `$CARGO_HOME` handling
+/// Always includes the cargo bin directory (via `$CARGO_HOME/bin` if set,
+/// else `~/.cargo/bin`) plus commonly expected system tool directories.
 ///
-/// Checks `$CARGO_HOME` first (if set and non-empty) so users with a non-default
-/// `CARGO_HOME` get their cargo-installed tools visible. Always adds
-/// `~/.cargo/bin` via `UserDirs` as a fallback for default installs. When both
-/// point to the same directory, deduplication in [`prepend_path_entries`] handles
-/// it — the belt-and-suspenders approach ensures tools installed via either path
-/// are found.
+/// # `$CARGO_HOME` belt-and-suspenders
 ///
-/// This follows the same resolution order as
-/// [`crate::self_update::resolve_cargo_bin_path`].
+/// When `$CARGO_HOME` is explicitly set, both `$CARGO_HOME/bin` (from
+/// [`crate::util::cargo_bin_dir`]) AND `~/.cargo/bin` are added, so users
+/// with a non-default `CARGO_HOME` still have their cargo-installed tools
+/// found. Deduplication in [`prepend_path_entries`] handles the case when
+/// both point to the same directory.
 #[cfg(unix)]
 fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     let mut v = Vec::new();
 
-    // Check $CARGO_HOME first — users with a non-default CARGO_HOME
-    // need $CARGO_HOME/bin in PATH for cargo-installed tools.
-    // Dedup with ~/.cargo/bin is handled by prepend_path_entries.
-    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
-        && !cargo_home.is_empty()
-    {
-        v.push(PathBuf::from(cargo_home).join("bin"));
+    // cargo_bin_dir() returns $CARGO_HOME/bin if CARGO_HOME is set,
+    // else ~/.cargo/bin.
+    if let Some(dir) = crate::util::cargo_bin_dir() {
+        v.push(dir);
     }
 
+    // Belt-and-suspenders: when CARGO_HOME is explicitly set, also add
+    // ~/.cargo/bin so both paths are covered. Dedup by prepend_path_entries.
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
+        && !cargo_home.is_empty()
+        && let Some(dirs) = UserDirs::new() {
+            v.push(dirs.home_dir().join(".cargo").join("bin"));
+        }
+
     if let Some(dirs) = UserDirs::new() {
-        let home = dirs.home_dir();
-        v.push(home.join(".cargo").join("bin"));
-        v.push(home.join(".npm-global").join("bin"));
+        v.push(dirs.home_dir().join(".npm-global").join("bin"));
     }
     #[cfg(target_os = "macos")]
     {
@@ -354,24 +356,34 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
 /// Extra `PATH` entries prepended for shell subprocesses so developer tools
 /// (`cargo`, etc.) resolve without reading the parent process `PATH`.
 ///
-/// # `$CARGO_HOME` handling
+/// Always includes the cargo bin directory (via `$CARGO_HOME/bin` if set,
+/// else `~/.cargo/bin`).
 ///
-/// Same belt-and-suspenders approach as the unix variant: checks `$CARGO_HOME`
-/// first, then adds `~/.cargo/bin` via `UserDirs`.
+/// # `$CARGO_HOME` belt-and-suspenders
+///
+/// When `$CARGO_HOME` is explicitly set, both `$CARGO_HOME/bin` (from
+/// [`crate::util::cargo_bin_dir`]) AND `~/.cargo/bin` are added. Same approach
+/// as the Unix variant.
 #[cfg(windows)]
 fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     let mut v = Vec::new();
 
-    // Check $CARGO_HOME first.
+    // cargo_bin_dir() returns $CARGO_HOME/bin if CARGO_HOME is set,
+    // else ~/.cargo/bin.
+    if let Some(dir) = crate::util::cargo_bin_dir() {
+        v.push(dir);
+    }
+
+    // Belt-and-suspenders: when CARGO_HOME is explicitly set, also add
+    // ~/.cargo/bin so both paths are covered.
     if let Ok(cargo_home) = std::env::var("CARGO_HOME")
         && !cargo_home.is_empty()
     {
-        v.push(PathBuf::from(cargo_home).join("bin"));
+        if let Some(dirs) = UserDirs::new() {
+            v.push(dirs.home_dir().join(".cargo").join("bin"));
+        }
     }
 
-    if let Some(dirs) = UserDirs::new() {
-        v.push(dirs.home_dir().join(".cargo").join("bin"));
-    }
     v
 }
 

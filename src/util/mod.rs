@@ -9,9 +9,11 @@ pub mod macros;
 pub mod test;
 pub mod tree_sitter;
 
+use directories::UserDirs;
 use regex::Regex;
 use regex::RegexBuilder;
 use serde::de::DeserializeOwned;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -405,6 +407,24 @@ pub fn scrub_credentials(input: &str) -> String {
             }
         })
         .to_string()
+}
+
+/// Resolve the cargo bin directory.
+///
+/// Resolution order:
+/// 1. `$CARGO_HOME/bin` if `CARGO_HOME` environment variable is set and non-empty.
+/// 2. `~/.cargo/bin` using `directories::UserDirs`.
+/// 3. `None` — no home directory available.
+#[must_use]
+pub(crate) fn cargo_bin_dir() -> Option<PathBuf> {
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
+        && !cargo_home.is_empty()
+    {
+        return Some(PathBuf::from(cargo_home).join("bin"));
+    }
+
+    let dirs = UserDirs::new()?;
+    Some(dirs.home_dir().join(".cargo").join("bin"))
 }
 
 #[cfg(test)]
