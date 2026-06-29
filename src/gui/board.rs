@@ -866,6 +866,7 @@ impl BoardState {
         }
 
         scrollable(Column::from_vec(sections).spacing(4))
+            .width(Length::Fill)
             .height(Length::Fill)
             .direction(theme::vertical_scrollbar())
             .style(theme::scrollbar_style)
