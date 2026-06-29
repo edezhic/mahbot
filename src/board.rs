@@ -3209,8 +3209,6 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_count_by_status_excludes_archived() {
         let (store, _tmp) = open_test_store().await;
-        let _ws = test_ws_named("/ws", "ws");
-
         // Create a ticket and set it to Done.
         let id = TicketBuilder::new(&store, test_ws_named("/ws", "ws"))
             .title("Test")
