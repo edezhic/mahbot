@@ -940,9 +940,57 @@ impl BoardStore {
             .await
     }
 
+    /// Build a [`PreparedUpdate`] for an `UPDATE tickets` statement, appending
+    /// `updated_at = ?N` and `WHERE id = ?M` as the last two parameters.
+    ///
+    /// Callers provide the SET-clause-specific columns (without `updated_at` or
+    /// `WHERE`) together with their parameter values.  The helper appends the
+    /// current timestamp and the ticket id as the final parameters, keeping the
+    /// parameter ordering consistent across all `UPDATE tickets` producers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let prep = Self::update_tickets_with_updated_at(
+    ///     "assigned_to = ?1",
+    ///     vec![Value::from("user-123")],
+    ///     "set assigned_to",
+    ///     "ticket-456",
+    /// );
+    /// // SQL:  "UPDATE tickets SET assigned_to = ?1, updated_at = ?2 WHERE id = ?3"
+    /// // params: [user-123, now, ticket-456]
+    /// ```
+    fn update_tickets_with_updated_at(
+        set_clause: &str,
+        set_params: Vec<turso::Value>,
+        action: String,
+        id: &str,
+    ) -> PreparedUpdate {
+        let now = turso::now();
+        let sql = format!(
+            "UPDATE tickets SET {set_clause}, updated_at = ?{u} WHERE id = ?{w}",
+            u = set_params.len() + 1,
+            w = set_params.len() + 2,
+        );
+        let mut params = set_params;
+        params.push(Value::from(now));
+        params.push(Value::from(id));
+        PreparedUpdate {
+            sql,
+            params,
+            action,
+        }
+    }
+
     /// Build the SQL, params, and action description for a ticket status
     /// transition. Shared by [`transition_to`](Self::transition_to) and
     /// [`transition_to_tx`](Self::transition_to_tx).
+    ///
+    /// Note: this does **not** use [`Self::update_tickets_with_updated_at`]
+    /// because it has extra SET columns (`assigned_to = NULL`,
+    /// `pipeline_reservation = COALESCE(?5, pipeline_reservation)`) and an
+    /// additional WHERE condition (`AND (?4 IS NULL OR status = ?4)`) that
+    /// don't fit the helper's fixed pattern.
     fn build_transition_sql(
         id: &str,
         expected_phase: Option<TicketPhase>,
@@ -1086,17 +1134,17 @@ impl BoardStore {
     /// no-op. For clear operations, this ensures no stale agent remains bound to
     /// a now-unassigned ticket.
     pub async fn set_assigned_to(&self, id: &str, assigned_to: Option<&str>) -> Result<()> {
-        let now = turso::now();
         let action = if assigned_to.is_some() {
             "set assigned_to"
         } else {
             "clear assigned_to"
         };
-        let prepared = PreparedUpdate {
-            sql: "UPDATE tickets SET assigned_to = ?1, updated_at = ?2 WHERE id = ?3".to_string(),
-            params: vec![Value::from(assigned_to), Value::from(now), Value::from(id)],
-            action: action.to_string(),
-        };
+        let prepared = Self::update_tickets_with_updated_at(
+            "assigned_to = ?1",
+            vec![Value::from(assigned_to)],
+            action.to_string(),
+            id,
+        );
         self.execute_and_cancel(id, prepared).await
     }
 
@@ -1202,22 +1250,16 @@ impl BoardStore {
             "lines_removed must be non-negative: {lines_removed}"
         );
 
-        let now = turso::now();
-        let sql = "UPDATE tickets SET commit_hash = ?1, lines_added = ?2, lines_removed = ?3, \
-                    updated_at = ?4 WHERE id = ?5"
-            .to_string();
-        let params: Vec<turso::Value> = vec![
-            Value::from(hash),
-            Value::from(lines_added),
-            Value::from(lines_removed),
-            Value::from(now),
-            Value::from(id),
-        ];
-        PreparedUpdate {
-            sql,
-            params,
-            action: "set commit info".to_string(),
-        }
+        Self::update_tickets_with_updated_at(
+            "commit_hash = ?1, lines_added = ?2, lines_removed = ?3",
+            vec![
+                Value::from(hash),
+                Value::from(lines_added),
+                Value::from(lines_removed),
+            ],
+            "set commit info".to_string(),
+            id,
+        )
     }
 
     /// Record commit metadata on a ticket.
@@ -1650,14 +1692,12 @@ impl BoardStore {
     /// already clears the assignee, and a single-ticket archive on an assigned
     /// ticket is intentionally allowed to resolve stale assignments.
     pub async fn set_archived(&self, id: &str) -> Result<()> {
-        let now = turso::now();
-        let prepared = PreparedUpdate {
-            sql: "UPDATE tickets SET is_archived = 1, assigned_to = NULL, updated_at = ?1 \
-                   WHERE id = ?2"
-                .to_string(),
-            params: vec![Value::from(now), Value::from(id)],
-            action: "set archived".to_string(),
-        };
+        let prepared = Self::update_tickets_with_updated_at(
+            "is_archived = 1, assigned_to = NULL",
+            vec![],
+            "set archived".to_string(),
+            id,
+        );
         self.execute_and_cancel(id, prepared).await
     }
 
