@@ -97,17 +97,17 @@ fn kv_from_row(row: &turso::Row) -> Result<(String, String), ::turso::Error> {
     Ok((key, value))
 }
 
+// ── Shared UPSERT SQL (reused by `set_kv` and `set_kv_tx`) ────────
+
+const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
 impl ConfigStore {
     // ── config_kv ────────────────────────────────────────────
 
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
-        self.exec(
-            "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            turso::params![key, value],
-        )
-        .await
+        self.exec(UPSERT_KV_SQL, turso::params![key, value]).await
     }
 
     /// Delete a key-value pair. Succeeds even if the key does not exist.
@@ -242,12 +242,8 @@ impl ConfigStore {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        tx.execute(
-            "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            turso::params![key, value],
-        )
-        .await?;
+        tx.execute(UPSERT_KV_SQL, turso::params![key, value])
+            .await?;
         Ok(())
     }
 
