@@ -72,6 +72,32 @@ const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) 
 /// Delete a key-value pair from config_kv by key. Succeeds even if the key does not exist.
 const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
+// ── Shared row-parsing helpers ──────────────────────────────────
+
+/// Parse a `RoleConfig` from a `config_role` row.
+fn role_config_from_row(row: &turso::Row) -> Result<RoleConfig, ::turso::Error> {
+    let role = row.get::<String>(COL_RC_ROLE)?;
+    let model = row.get::<Option<String>>(COL_RC_MODEL)?;
+    let reasoning_effort = row.get::<Option<String>>(COL_RC_REASONING_EFFORT)?;
+    Ok(RoleConfig {
+        role,
+        model,
+        reasoning_effort,
+    })
+}
+
+/// Parse a `ModelRouting` from a `config_model_routing` row.
+fn model_routing_from_row(row: &turso::Row) -> Result<ModelRouting, ::turso::Error> {
+    let model = row.get::<String>(COL_MR_MODEL)?;
+    let provider_order = row.get::<Option<String>>(COL_MR_PROVIDER_ORDER)?;
+    let allow_fallbacks = row.get::<Option<bool>>(COL_MR_ALLOW_FALLBACKS)?;
+    Ok(ModelRouting {
+        model,
+        provider_order,
+        allow_fallbacks,
+    })
+}
+
 impl ConfigStore {
     /// Begin a transaction that serializes all subsequent operations until
     /// committed or rolled back. The returned guard keeps the connection locked.
@@ -122,23 +148,17 @@ impl ConfigStore {
     pub async fn get_all_role_configs(&self) -> Result<Vec<RoleConfig>> {
         let rows = self
             .conn
-            .query(
+            .query_map(
                 &format!("SELECT {ROLE_CONFIG_COLUMNS} FROM config_role ORDER BY role"),
                 turso::params![],
+                role_config_from_row,
             )
             .await?;
-        rows.into_iter()
-            .map(|row| {
-                let role = row.get::<String>(COL_RC_ROLE)?;
-                let model = row.get::<Option<String>>(COL_RC_MODEL)?;
-                let reasoning_effort = row.get::<Option<String>>(COL_RC_REASONING_EFFORT)?;
-                Ok(RoleConfig {
-                    role,
-                    model,
-                    reasoning_effort,
-                })
-            })
-            .collect()
+        let mut configs = Vec::new();
+        for row in rows {
+            configs.push(row?);
+        }
+        Ok(configs)
     }
 
     // ── config_model_routing ──────────────────────────────────
@@ -147,23 +167,17 @@ impl ConfigStore {
     pub async fn get_all_model_routings(&self) -> Result<Vec<ModelRouting>> {
         let rows = self
             .conn
-            .query(
+            .query_map(
                 &format!("SELECT {MODEL_ROUTING_COLUMNS} FROM config_model_routing ORDER BY model"),
                 turso::params![],
+                model_routing_from_row,
             )
             .await?;
-        rows.into_iter()
-            .map(|row| {
-                let model = row.get::<String>(COL_MR_MODEL)?;
-                let provider_order = row.get::<Option<String>>(COL_MR_PROVIDER_ORDER)?;
-                let allow_fallbacks = row.get::<Option<bool>>(COL_MR_ALLOW_FALLBACKS)?;
-                Ok(ModelRouting {
-                    model,
-                    provider_order,
-                    allow_fallbacks,
-                })
-            })
-            .collect()
+        let mut routings = Vec::new();
+        for row in rows {
+            routings.push(row?);
+        }
+        Ok(routings)
     }
 
     // ── batch save (role configs + model routings) ──────────────
@@ -281,16 +295,7 @@ impl ConfigStore {
             .query_optional(
                 &format!("SELECT {ROLE_CONFIG_COLUMNS} FROM config_role WHERE role = ?1"),
                 turso::params![role],
-                |row| {
-                    let role = row.get::<String>(COL_RC_ROLE)?;
-                    let model = row.get::<Option<String>>(COL_RC_MODEL)?;
-                    let reasoning_effort = row.get::<Option<String>>(COL_RC_REASONING_EFFORT)?;
-                    Ok::<RoleConfig, ::turso::Error>(RoleConfig {
-                        role,
-                        model,
-                        reasoning_effort,
-                    })
-                },
+                role_config_from_row,
             )
             .await
     }
@@ -335,16 +340,7 @@ impl ConfigStore {
                     "SELECT {MODEL_ROUTING_COLUMNS} FROM config_model_routing WHERE model = ?1"
                 ),
                 turso::params![model],
-                |row| {
-                    let model = row.get::<String>(COL_MR_MODEL)?;
-                    let provider_order = row.get::<Option<String>>(COL_MR_PROVIDER_ORDER)?;
-                    let allow_fallbacks = row.get::<Option<bool>>(COL_MR_ALLOW_FALLBACKS)?;
-                    Ok::<ModelRouting, ::turso::Error>(ModelRouting {
-                        model,
-                        provider_order,
-                        allow_fallbacks,
-                    })
-                },
+                model_routing_from_row,
             )
             .await
     }
