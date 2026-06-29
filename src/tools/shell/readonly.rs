@@ -484,6 +484,56 @@ fn reject(cmd: &str, why: &str, suggestion: &str) -> Result<(), String> {
 /// Scratch-file mutators allowed when all explicit path args are under temp.
 const SCRATCH_MUTATORS: &[&str] = &["tee", "touch", "mkdir"];
 
+/// A flag-dependent command check: if the command's first word matches `verb`
+/// and the `predicate` returns true, the command is rejected with the given message.
+struct FlagCheck {
+    verb: &'static str,
+    predicate: fn(&str) -> bool,
+    rejection: &'static str,
+    suggestion: &'static str,
+}
+
+/// Flag-dependent checks: reject commands that use mutation flags.
+/// Each entry tests a specific verb + predicate combination.
+const FLAG_CHECKS: &[FlagCheck] = &[
+    FlagCheck {
+        verb: "sed",
+        predicate: sed_has_flag_i,
+        rejection: "`sed -i` is not allowed — it modifies files in-place.",
+        suggestion: "use `sed` without `-i` to output to stdout, e.g. `sed 's/a/b/' file`.",
+    },
+    FlagCheck {
+        verb: "awk",
+        predicate: has_inplace,
+        rejection: "`awk -i inplace` is not allowed — it modifies files in-place.",
+        suggestion: "use `awk` without `-i inplace` to output to stdout.",
+    },
+    FlagCheck {
+        verb: "dd",
+        predicate: has_dd_of,
+        rejection: "`dd of=...` is not allowed — it writes to a file.",
+        suggestion: "use `dd` without `of=` to output to stdout.",
+    },
+    FlagCheck {
+        verb: "curl",
+        predicate: has_curl_output_flag,
+        rejection: "`curl` with output flags (`-o`, `--output`, `-O`, `--remote-name`) is not allowed.",
+        suggestion: "use `curl` without output flags to display content in stdout.",
+    },
+    FlagCheck {
+        verb: "tar",
+        predicate: is_not_tar_list_only,
+        rejection: "`tar` is only allowed with `-t`/`--list` (list) mode.",
+        suggestion: "use `tar -tf archive.tar` to list contents.",
+    },
+    FlagCheck {
+        verb: "base64",
+        predicate: has_base64_decode_output,
+        rejection: "`base64 -d` with `-o` is not allowed — it writes decoded output to a file.",
+        suggestion: "use `base64 -d` without `-o` to output to stdout.",
+    },
+];
+
 /// Non-flag arguments from a command segment (after canonicalization).
 fn non_flag_path_args(segment: &str) -> Vec<String> {
     let canonical = super::canonical_command(segment);
@@ -554,52 +604,12 @@ fn check_segment(segment: &str) -> Result<(), String> {
     }
 
     // Flag-dependent checks: reject commands that use mutation flags.
-    // Every guarded arm returns early; the `_ => {}` fallthrough leads to the
-    // trailing `Ok(())` for the allow case.
-    match first_word {
-        "sed" if has_flag(trimmed, "i") => {
-            return reject(
-                trimmed,
-                "`sed -i` is not allowed — it modifies files in-place.",
-                "use `sed` without `-i` to output to stdout, e.g. `sed 's/a/b/' file`.",
-            );
+    // Iterates the FLAG_CHECKS table; the first matching entry returns early,
+    // otherwise falls through to `Ok(())` for the allow case.
+    for check in FLAG_CHECKS {
+        if first_word == check.verb && (check.predicate)(trimmed) {
+            return reject(trimmed, check.rejection, check.suggestion);
         }
-        "awk" if has_inplace(trimmed) => {
-            return reject(
-                trimmed,
-                "`awk -i inplace` is not allowed — it modifies files in-place.",
-                "use `awk` without `-i inplace` to output to stdout.",
-            );
-        }
-        "dd" if has_dd_of(trimmed) => {
-            return reject(
-                trimmed,
-                "`dd of=...` is not allowed — it writes to a file.",
-                "use `dd` without `of=` to output to stdout.",
-            );
-        }
-        "curl" if has_curl_output_flag(trimmed) => {
-            return reject(
-                trimmed,
-                "`curl` with output flags (`-o`, `--output`, `-O`, `--remote-name`) is not allowed.",
-                "use `curl` without output flags to display content in stdout.",
-            );
-        }
-        "tar" if !is_tar_list_only(trimmed) => {
-            return reject(
-                trimmed,
-                "`tar` is only allowed with `-t`/`--list` (list) mode.",
-                "use `tar -tf archive.tar` to list contents.",
-            );
-        }
-        "base64" if has_base64_decode_output(trimmed) => {
-            return reject(
-                trimmed,
-                "`base64 -d` with `-o` is not allowed — it writes decoded output to a file.",
-                "use `base64 -d` without `-o` to output to stdout.",
-            );
-        }
-        _ => {}
     }
 
     Ok(())
@@ -809,6 +819,11 @@ fn has_flag(command: &str, flag: &str) -> bool {
     false
 }
 
+/// Check if a `sed` command has the `-i` flag (in-place edit).
+fn sed_has_flag_i(command: &str) -> bool {
+    has_flag(command, "i")
+}
+
 /// Check if `awk -i inplace` is present.
 fn has_inplace(command: &str) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
@@ -860,6 +875,11 @@ fn is_tar_list_only(command: &str) -> bool {
     }
     // No operation flag found — reject (conservative)
     false
+}
+
+/// Check if `tar` is NOT in list-only mode (i.e., will extract/create).
+fn is_not_tar_list_only(command: &str) -> bool {
+    !is_tar_list_only(command)
 }
 
 /// Check if `base64` has both decode flag (`-d`/`--decode`) and output flag
