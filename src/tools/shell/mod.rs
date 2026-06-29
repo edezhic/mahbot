@@ -107,27 +107,27 @@ fn apply_safe_env(cmd: &mut tokio::process::Command) {
 /// [`SAFE_ENV_VARS`] only — no parent-process environment is inherited. This
 /// prevents leaking API keys and other secrets into subprocesses (CWE-200).
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
+    // Platform-specific shell selection and arguments.
     #[cfg(not(target_os = "windows"))]
-    {
-        let mut process = tokio::process::Command::new("sh");
-        process.arg("-c").arg(command).current_dir(workspace_root);
-        apply_safe_env(&mut process);
-        process
-    }
+    let mut process = {
+        let mut p = tokio::process::Command::new("sh");
+        p.arg("-c").arg(command);
+        p
+    };
 
     #[cfg(target_os = "windows")]
-    {
+    let mut process = {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        let mut process = tokio::process::Command::new("cmd.exe");
-        process
-            .arg("/C")
-            .arg(command)
-            .current_dir(workspace_root)
-            .creation_flags(CREATE_NO_WINDOW);
-        apply_safe_env(&mut process);
-        process
-    }
+        let mut p = tokio::process::Command::new("cmd.exe");
+        p.arg("/C").arg(command).creation_flags(CREATE_NO_WINDOW);
+        p
+    };
+
+    // Shared setup: set working directory and sanitize the environment.
+    process.current_dir(workspace_root);
+    apply_safe_env(&mut process);
+    process
 }
 
 /// Outcome of a timed shell subprocess run.
