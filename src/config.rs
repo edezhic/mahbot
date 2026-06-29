@@ -108,8 +108,10 @@ impl ModelRouting {
 ///    [`ConfigData::string_fields()`], and [`ConfigData::set_string_field()`] from this list.  The compiler
 ///    enforces that every field on [`ConfigData`] is present in `STRUCT_FIELDS_DEFAULT`,
 ///    so forgetting this step is a compile error.
-/// 3. **Typed accessor** — write a typed accessor on [`ConfigReload`] (see
-///    "String config accessors" below) so that the public API stays uniform.
+/// 3. **Typed accessor** — automatically generated. The `string_config_fields!` macro
+///    produces typed accessor methods on [`ConfigReload`] based on each field's
+///    annotation (`non_empty`, `or(DEFAULT)`, or `list_or(...)`) — no manual
+///    accessor code is needed.
 ///
 /// ## All `Option<String>` fields must be in the macro
 ///
@@ -739,7 +741,6 @@ pub async fn reload_from_db() -> Result<()> {
 /// 4. On success: write to DB, reload CONFIG, swap singletons
 /// 5. If Telegram token changed: hot-reload the listener
 pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
-    // Validate
     validate_config(&config)?;
 
     // Capture old Telegram token BEFORE we mutate DB so we can detect
@@ -759,7 +760,6 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // If this fails, nothing has changed — CONFIG, PROVIDER, and DB are untouched.
     crate::providers::warmup_provider_from_config(&config).await?;
 
-    // ── Persist to DB ─────────────────────────────────────────
     let store = crate::config_db::store();
 
     // Write all KV pairs, per-role configs, AND per-model routings inside a
@@ -778,7 +778,6 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    // ── Commit to runtime ─────────────────────────────────────
     // Warmup succeeded above — now persist runtime config and swap singletons.
     //
     // Apply the same normalisation + sorting that reload_from_db's read path
@@ -786,13 +785,11 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // path produced the data.
     config.finalize();
 
-    // Capture the new token before swapping so we can detect changes below.
     let new_token = config.telegram_bot_token.clone();
     CONFIG.swap(config);
     tracing::info!("Config saved and swapped into runtime");
     crate::providers::recreate_all().await?;
 
-    // ── Hot-reload Telegram listener if token changed ─────────
     // Do this AFTER the DB and CONFIG have been updated so the
     // running listener reflects the persisted state.
     if new_token != old_token {
