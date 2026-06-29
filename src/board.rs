@@ -1,7 +1,7 @@
 //! Ticket/board system — Turso-backed task management.
 
 use crate::role::DIAGNOSTICS_ROLE;
-use crate::turso::{self, TxGuard, Value, params_from_iter};
+use crate::turso::{self, IntoParams, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use serde::Serialize;
@@ -880,14 +880,35 @@ impl BoardStore {
         }
     }
 
-    /// Get a ticket by id.
-    pub async fn get_ticket(&self, id: &str) -> Result<Option<Ticket>> {
-        let sql = format!("SELECT {TICKET_COLUMNS} FROM tickets WHERE id = ?1");
-        let rows = self.conn.query(&sql, turso::params![id]).await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(self.ticket_from_row(&row, true).await?)),
-            None => Ok(None),
+    /// Select tickets matching a SQL suffix (everything after `FROM tickets`),
+    /// parsing each row via [`ticket_from_row`](Self::ticket_from_row).
+    ///
+    /// This is the shared building block for all `SELECT {TICKET_COLUMNS}` queries.
+    /// Accepts the full suffix — typically starting with `WHERE` and optionally
+    /// including `ORDER BY`, `LIMIT`, etc. — and forwards `params` directly to
+    /// the underlying query so callers can use `turso::params![]` without conversions.
+    async fn select_tickets(
+        &self,
+        suffix: &str,
+        params: impl IntoParams + Send + 'static,
+        load_comments: bool,
+    ) -> Result<Vec<Ticket>> {
+        let sql = format!("SELECT {TICKET_COLUMNS} FROM tickets {suffix}");
+        let rows = self.conn.query(&sql, params).await?;
+        let mut tickets = Vec::with_capacity(rows.len());
+        for row in rows {
+            tickets.push(self.ticket_from_row(&row, load_comments).await?);
         }
+        Ok(tickets)
+    }
+
+    /// Get a ticket by id, loading its comments.
+    pub async fn get_ticket(&self, id: &str) -> Result<Option<Ticket>> {
+        Ok(self
+            .select_tickets("WHERE id = ?1", turso::params![id], true)
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// Get a ticket's status phase by id — lightweight, no comments loaded.
@@ -1536,23 +1557,16 @@ impl BoardStore {
         workspace_name: Option<&str>,
         status_filter: Option<TicketPhase>,
     ) -> Result<Vec<Ticket>> {
-        let sql = format!(
-            "SELECT {TICKET_COLUMNS} FROM tickets \
-             WHERE (?1 IS NULL OR workspace_name = ?1) \
-               AND (?2 IS NULL OR status = ?2) \
-               AND is_archived = 0 \
-             ORDER BY created_at DESC"
-        );
         let status_str: Option<&str> = status_filter.as_ref().map(TicketPhase::as_ref);
-        let rows = self
-            .conn
-            .query(&sql, turso::params![workspace_name, status_str])
-            .await?;
-        let mut tickets = Vec::new();
-        for row in rows {
-            tickets.push(self.ticket_from_row(&row, false).await?);
-        }
-        Ok(tickets)
+        self.select_tickets(
+            "WHERE (?1 IS NULL OR workspace_name = ?1) \
+             AND (?2 IS NULL OR status = ?2) \
+             AND is_archived = 0 \
+             ORDER BY created_at DESC",
+            turso::params![workspace_name, status_str],
+            false,
+        )
+        .await
     }
 
     /// Count how many tickets have the given status, optionally filtered by workspace.
