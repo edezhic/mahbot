@@ -417,56 +417,63 @@ mod tests {
         score: u8,
         #[serde(default)]
         critique: String,
+        #[serde(default)]
+        issues: Vec<String>,
     }
 
     // ── parse_fenced_json tests ──────────────────────────────────────────
 
     #[test]
-    fn parse_fenced_json_with_json_tag() {
-        let text = "Based on the analysis, here's my verdict:\n\n```json\n{\"score\": 8, \"critique\": \"Looks good\"}\n```";
-        let result: TestVerdict = parse_fenced_json(text).unwrap();
-        assert_eq!(result.score, 8);
-        assert_eq!(result.critique, "Looks good");
-    }
-
-    #[test]
-    fn parse_fenced_json_bare_fence() {
-        let text = "```\n{\"score\": 7, \"critique\": \"Some issues\"}\n```";
-        let result: TestVerdict = parse_fenced_json(text).unwrap();
-        assert_eq!(result.score, 7);
-        assert_eq!(result.critique, "Some issues");
-    }
-
-    #[test]
-    fn parse_fenced_json_unfenced() {
-        #[derive(serde::Deserialize, Debug, PartialEq)]
-        struct TestVerdict {
-            score: u8,
-            critique: String,
-            issues: Vec<String>,
+    fn parse_fenced_json_valid_inputs() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected_score: u8,
+            expected_critique: &'static str,
         }
 
-        let text = r#"{"score": 10, "critique": "Perfect", "issues": []}"#;
-        let result: TestVerdict = parse_fenced_json(text).unwrap();
-        assert_eq!(result.score, 10);
-        assert!(result.issues.is_empty());
-    }
+        let cases = [
+            Case {
+                name: "json-tagged fence",
+                input: "Based on the analysis, here's my verdict:\n\n```json\n{\"score\": 8, \"critique\": \"Looks good\"}\n```",
+                expected_score: 8,
+                expected_critique: "Looks good",
+            },
+            Case {
+                name: "bare fence",
+                input: "```\n{\"score\": 7, \"critique\": \"Some issues\"}\n```",
+                expected_score: 7,
+                expected_critique: "Some issues",
+            },
+            Case {
+                name: "unfenced",
+                input: r#"{"score": 10, "critique": "Perfect", "issues": []}"#,
+                expected_score: 10,
+                expected_critique: "Perfect",
+            },
+            Case {
+                name: "commentary before fence",
+                input: "I have reviewed the code.\n\n```json\n{\"score\": 6, \"critique\": \"Needs improvement\"}\n```\n\nOverall, acceptable.",
+                expected_score: 6,
+                expected_critique: "Needs improvement",
+            },
+            Case {
+                name: "multiple fences uses first json",
+                input: "```json\n{\"score\": 9}\n```\n\nSome text\n\n```\n{\"score\": 5}\n```",
+                expected_score: 9,
+                expected_critique: "",
+            },
+        ];
 
-    #[test]
-    fn parse_fenced_json_commentary_before_fence() {
-        // LLM prefaces with commentary, then outputs fenced JSON
-        let text = "I have reviewed the code.\n\n```json\n{\"score\": 6, \"critique\": \"Needs improvement\"}\n```\n\nOverall, acceptable.";
-        let result: TestVerdict = parse_fenced_json(text).unwrap();
-        assert_eq!(result.score, 6);
-        assert_eq!(result.critique, "Needs improvement");
-    }
-
-    #[test]
-    fn parse_fenced_json_multiple_fences_uses_first_json() {
-        let text = "```json\n{\"score\": 9}\n```\n\nSome text\n\n```\n{\"score\": 5}\n```";
-        let result: TestVerdict = parse_fenced_json(text).unwrap();
-        // Should parse the first ```json block
-        assert_eq!(result.score, 9);
+        for case in &cases {
+            let result: TestVerdict = parse_fenced_json(case.input).unwrap();
+            assert_eq!(result.score, case.expected_score, "case: {}", case.name);
+            assert_eq!(
+                result.critique, case.expected_critique,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     #[test]
