@@ -23,6 +23,7 @@ struct IncomingAttachment {
     file_size: Option<u64>,
     caption: Option<String>,
     kind: IncomingAttachmentKind,
+    mime_type: Option<String>,
 }
 
 /// The kind of incoming attachment (document vs photo).
@@ -279,18 +280,21 @@ fn format_sender_label(from: &serde_json::Value) -> String {
 /// Build the user-facing content string for an incoming attachment.
 ///
 /// Photos with a recognized image extension use `[IMAGE:/path]` so the
-/// multimodal pipeline can validate vision capability. Voice and audio
-/// messages use `[AUDIO:/path]`. Other attachment types use
+/// multimodal pipeline can validate vision capability.  When the extension
+/// is not recognized the optional `mime_type` is consulted as a secondary
+/// signal (e.g. Document + no extension + "image/jpeg" → still `[IMAGE:]`).
+/// Voice and audio messages use `[AUDIO:/path]`. Other attachment types use
 /// `[Document: name] /path`.
 fn format_attachment_content(
     kind: IncomingAttachmentKind,
     local_filename: &str,
     local_path: &Path,
+    mime_type: Option<&str>,
 ) -> String {
+    let is_image =
+        is_image_extension(local_path) || mime_type.is_some_and(|m| m.starts_with("image/"));
     match kind {
-        IncomingAttachmentKind::Photo | IncomingAttachmentKind::Document
-            if is_image_extension(local_path) =>
-        {
+        IncomingAttachmentKind::Photo | IncomingAttachmentKind::Document if is_image => {
             format!("[IMAGE:{}]", local_path.display())
         }
         IncomingAttachmentKind::Voice => {
@@ -974,12 +978,17 @@ impl TelegramChannel {
             .get("caption")
             .and_then(serde_json::Value::as_str)
             .map(String::from);
+        let mime_type = sub_obj
+            .get("mime_type")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
         Some(IncomingAttachment {
             file_id,
             file_name,
             file_size,
             caption,
             kind,
+            mime_type,
         })
     }
 
@@ -1038,7 +1047,10 @@ impl TelegramChannel {
         let local_filename = if let Some(name) = &attachment.file_name {
             name.clone()
         } else {
-            let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
+            let ext = Path::new(&tg_file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg");
             format!("photo_{}_{}.{ext}", ctx.chat_id, ctx.message_id)
         };
 
@@ -1048,7 +1060,12 @@ impl TelegramChannel {
             return None;
         }
 
-        let mut content = format_attachment_content(attachment.kind, &local_filename, &local_path);
+        let mut content = format_attachment_content(
+            attachment.kind,
+            &local_filename,
+            &local_path,
+            attachment.mime_type.as_deref(),
+        );
         if let Some(caption) = &attachment.caption
             && !caption.is_empty()
         {
@@ -2295,13 +2312,14 @@ mod tests {
     async fn parse_attachment_metadata() {
         // Document with all fields
         let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-            "document": {"file_id": "BQ", "file_name": "report.pdf", "file_size": 12345}
+            "document": {"file_id": "BQ", "file_name": "report.pdf", "file_size": 12345, "mime_type": "application/pdf"}
         }))
         .unwrap();
         assert_eq!(att.kind, IncomingAttachmentKind::Document);
         assert_eq!(att.file_id, "BQ");
         assert_eq!(att.file_name.as_deref(), Some("report.pdf"));
         assert_eq!(att.file_size, Some(12345));
+        assert_eq!(att.mime_type.as_deref(), Some("application/pdf"));
         assert!(att.caption.is_none());
         // Photo (picks largest by file_size)
         let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
@@ -2330,6 +2348,13 @@ mod tests {
         assert_eq!(att.file_id, "doc_no_name");
         assert!(att.file_name.is_none());
         assert!(att.file_size.is_none());
+        // Document with mime_type extraction
+        let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
+            "document": {"file_id": "img_doc", "mime_type": "image/png"}
+        }))
+        .unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Document);
+        assert_eq!(att.mime_type.as_deref(), Some("image/png"));
         // Voice message
         let att = TelegramChannel::parse_attachment_metadata(
             &serde_json::json!({"voice": {"file_id": "v", "duration": 5}}),
@@ -2366,6 +2391,7 @@ mod tests {
             IncomingAttachmentKind::Photo,
             "photo.jpg",
             std::path::Path::new("/tmp/workspace/photo.jpg"),
+            None,
         );
         assert_eq!(c, "[IMAGE:/tmp/workspace/photo.jpg]");
         // document → [Document: name] /path
@@ -2373,6 +2399,7 @@ mod tests {
             IncomingAttachmentKind::Document,
             "report.pdf",
             std::path::Path::new("/tmp/workspace/report.pdf"),
+            None,
         );
         assert_eq!(c, "[Document: report.pdf] /tmp/workspace/report.pdf");
         assert!(!c.contains("[IMAGE:"));
@@ -2381,6 +2408,7 @@ mod tests {
             IncomingAttachmentKind::Photo,
             "notes.md",
             std::path::Path::new("/tmp/workspace/notes.md"),
+            None,
         );
         assert!(!c.contains("[IMAGE:"));
         assert!(c.starts_with("[Document:"));
@@ -2398,6 +2426,7 @@ mod tests {
                 IncomingAttachmentKind::Photo,
                 filename,
                 std::path::Path::new(path),
+                None,
             );
             assert!(
                 !c.contains("[IMAGE:"),
@@ -2415,9 +2444,26 @@ mod tests {
                 IncomingAttachmentKind::Photo,
                 &filename,
                 std::path::Path::new(&format!("/tmp/workspace/{filename}")),
+                None,
             );
             assert!(c.starts_with("[IMAGE:"), "{ext}: should get [IMAGE:]");
         }
+        // Document kind + .jpg extension → [IMAGE:] (not [Document:])
+        let c = format_attachment_content(
+            IncomingAttachmentKind::Document,
+            "image.jpg",
+            std::path::Path::new("/tmp/workspace/image.jpg"),
+            None,
+        );
+        assert_eq!(c, "[IMAGE:/tmp/workspace/image.jpg]");
+        // Document kind + no extension + mime_type "image/jpeg" → [IMAGE:] (mime fallback)
+        let c = format_attachment_content(
+            IncomingAttachmentKind::Document,
+            "image_no_ext",
+            std::path::Path::new("/tmp/workspace/image_no_ext"),
+            Some("image/jpeg"),
+        );
+        assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]");
     }
 
     #[tokio::test]

@@ -2993,18 +2993,23 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert_eq!(claimed3.id, c);
     }
 
+    async fn assert_archive_empty_db(store: &BoardStore) {
+        let count = store
+            .archive_stale_cancelled(1)
+            .await
+            .expect("archive_stale_cancelled");
+        assert_eq!(count, 0, "Empty DB stale archive should return 0");
+        let count = store
+            .archive_all_done_and_cancelled(None)
+            .await
+            .expect("archive_all_done_and_cancelled");
+        assert_eq!(count, 0, "Empty DB all archive should return 0");
+    }
+
     #[tokio::test]
     async fn test_archive_stale_cancelled() {
         let (store, _tmp) = open_test_store().await;
-
-        // Empty DB returns 0
-        {
-            let count = store
-                .archive_stale_cancelled(1)
-                .await
-                .expect("archive_stale_cancelled");
-            assert_eq!(count, 0, "Empty DB should return 0");
-        }
+        assert_archive_empty_db(&store).await;
 
         let ws = test_ws_named("/ws", "ws");
 
@@ -3093,15 +3098,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_archive_all_done_and_cancelled() {
         let (store, _tmp) = open_test_store().await;
-
-        // Empty DB returns 0
-        {
-            let count = store
-                .archive_all_done_and_cancelled(None)
-                .await
-                .expect("archive_all_done_and_cancelled");
-            assert_eq!(count, 0, "Empty DB should return 0");
-        }
+        assert_archive_empty_db(&store).await;
 
         let ws = test_ws_named("/ws", "ws");
 
