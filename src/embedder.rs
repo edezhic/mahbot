@@ -1072,10 +1072,12 @@ mod tests {
     }
 
     #[test]
-    fn test_embedder_init() {
+    fn test_embedding_produces_unit_vectors() {
         let Some(emb) = test_embedder() else {
             return; // Skip if no model available
         };
+
+        // embed_documents with single input
         let v = emb.embed_documents(&["hello world"]).unwrap();
         assert_eq!(v.len(), 1);
         // jina-embeddings-v5 produces 768-dimensional vectors
@@ -1086,11 +1088,8 @@ mod tests {
             (norm - 1.0).abs() < 1e-5,
             "expected unit vector, got norm={norm}"
         );
-    }
 
-    #[test]
-    fn test_embed_documents() {
-        let Some(emb) = test_embedder() else { return };
+        // embed_documents with multiple inputs
         let docs = &["first document", "second document about something"];
         let v = emb.embed_documents(docs).unwrap();
         assert_eq!(v.len(), 2);
@@ -1102,14 +1101,16 @@ mod tests {
                 "expected unit vector, got norm={norm}"
             );
         }
-    }
 
-    #[test]
-    fn test_embed_queries() {
-        let Some(emb) = test_embedder() else { return };
+        // embed_queries
         let v = emb.embed_queries(&["what is rust?"]).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].len(), 768);
+        let norm: f32 = v[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "expected unit vector, got norm={norm}"
+        );
     }
 
     #[test]
