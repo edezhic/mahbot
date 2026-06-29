@@ -798,10 +798,10 @@ impl BoardStore {
     ///
     /// Note that a reserved ReadyForDevelopment ticket (one with
     /// `pipeline_reservation = 1`) is **not** treated as a pipeline blocker for
-    /// the purpose of this claim. This asymmetry with
-    /// `has_pipeline_blocker_for_workspace` (a test-only query that treats
-    /// reserved ReadyForDevelopment as a blocker) is intentional: the claim
-    /// subquery orders by `pipeline_reservation DESC` and clears reservation
+    /// the purpose of this claim. This differs from
+    /// [`has_pipeline_blocker_for_workspace`] (a test-only query that requires
+    /// `pipeline_reservation = 1` for ReadyForDevelopment tickets) because the
+    /// claim subquery orders by `pipeline_reservation DESC` and clears reservation
     /// on claim, so a reserved ticket at ReadyForDevelopment will be claimed
     /// before any other ticket at the same phase — no pipeline blocking needed.
     ///
@@ -1300,12 +1300,64 @@ impl BoardStore {
         Ok(())
     }
 
+    /// Shared implementation for checking if a workspace has active tickets.
+    ///
+    /// Returns `true` if any ticket in the workspace has a pipeline-blocking
+    /// status ([`PIPELINE_BLOCKING_STATUSES`]), or a
+    /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket
+    /// (optionally filtered by `pipeline_reservation`), optionally excluding a
+    /// specific ticket ID.
+    ///
+    /// Both [`has_pipeline_blocker_for_workspace`] and
+    /// [`has_active_tickets_excluding`] delegate to this helper.
+    ///
+    /// # Parameters
+    ///
+    /// * `workspace_name` — The workspace to check.
+    /// * `require_reservation` — When `true`, only `ReadyForDevelopment` tickets
+    ///   with `pipeline_reservation = 1` count as active (used by the test-only
+    ///   pipeline-blocker query). When `false`, all `ReadyForDevelopment` tickets
+    ///   count regardless of reservation.
+    /// * `exclude_ticket_id` — When `Some(id)`, that ticket is excluded from
+    ///   the check (e.g., when checking if other active tickets remain after one
+    ///   ticket completes). When `None`, no exclusion is applied.
+    ///
+    /// Excludes archived tickets — the only statuses that ever get archived are
+    /// `Done` and `Cancelled`, neither of which appears in
+    /// `PIPELINE_BLOCKING_STATUSES`, so this is a defensive consistency measure.
+    async fn has_active_tickets_internal(
+        &self,
+        workspace_name: &str,
+        require_reservation: bool,
+        exclude_ticket_id: Option<&str>,
+    ) -> Result<bool> {
+        let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_STATUSES);
+        let reservation_clause = if require_reservation {
+            " AND pipeline_reservation = 1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT 1 FROM tickets WHERE \
+             (status IN ({blocker_sql}) OR (status = '{rfd}'{reservation_clause})) \
+             AND workspace_name = ?1 AND is_archived = 0 \
+             AND (?2 IS NULL OR id != ?2) LIMIT 1",
+            rfd = TicketPhase::ReadyForDevelopment.as_ref(),
+        );
+        let rows = self
+            .conn
+            .query(&sql, turso::params![workspace_name, exclude_ticket_id])
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
     /// Returns true if the given workspace has any ticket with a pipeline-blocking
     /// status (dev/review/QA), OR any reserved ReadyForDevelopment ticket that
     /// was bounced back and is awaiting rework. Used by the maintainer to avoid
     /// scanning codebases that are actively being changed or about to be changed by rework.
-    /// Check if the workspace has any active tickets (pipeline-blocking or
-    /// reserved ReadyForDevelopment).
+    ///
+    /// Delegates to [`has_active_tickets_internal`] with
+    /// `require_reservation = true` and no exclusion filter.
     ///
     /// Only used in tests — retained for coverage of the pipeline-blocker query.
     ///
@@ -1319,19 +1371,8 @@ impl BoardStore {
     /// `PIPELINE_BLOCKING_STATUSES`, so this is a defensive consistency measure.
     #[cfg(test)]
     pub async fn has_pipeline_blocker_for_workspace(&self, workspace_name: &str) -> Result<bool> {
-        let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_STATUSES);
-        let sql = format!(
-            "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR \
-              (status = '{}' AND pipeline_reservation = 1)) \
-             AND workspace_name = ?1 AND is_archived = 0 LIMIT 1",
-            TicketPhase::ReadyForDevelopment.as_ref()
-        );
-        let rows = self
-            .conn
-            .query(&sql, turso::params![workspace_name])
-            .await?;
-        Ok(!rows.is_empty())
+        self.has_active_tickets_internal(workspace_name, true, None)
+            .await
     }
 
     /// Check if the workspace has any active tickets other than the excluded one.
@@ -1342,9 +1383,10 @@ impl BoardStore {
     /// considered active to suppress Done notifications until the pipeline is
     /// fully drained).
     ///
-    /// This differs from `has_pipeline_blocker_for_workspace` (a test-only query)
-    /// which only counts `ReadyForDevelopment` tickets with
-    /// `pipeline_reservation = 1`.
+    /// Delegates to [`has_active_tickets_internal`] with
+    /// `require_reservation = false`. The test-only
+    /// [`has_pipeline_blocker_for_workspace`] uses `require_reservation = true`,
+    /// requiring `pipeline_reservation = 1` for `ReadyForDevelopment` tickets.
     ///
     /// Non-active statuses (not matched by the query): `Done`, `Cancelled`,
     /// `Failed`, `Backlog`, `Analysis`, `Planning`.
@@ -1363,18 +1405,8 @@ impl BoardStore {
         workspace_name: &str,
         exclude_ticket_id: &str,
     ) -> Result<bool> {
-        let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_STATUSES);
-        let sql = format!(
-            "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR status = '{}') \
-             AND id != ?1 AND workspace_name = ?2 AND is_archived = 0 LIMIT 1",
-            TicketPhase::ReadyForDevelopment.as_ref()
-        );
-        let rows = self
-            .conn
-            .query(&sql, turso::params![exclude_ticket_id, workspace_name])
-            .await?;
-        Ok(!rows.is_empty())
+        self.has_active_tickets_internal(workspace_name, false, Some(exclude_ticket_id))
+            .await
     }
 
     /// Build the SQL and params for adding a comment.
@@ -2254,7 +2286,8 @@ mod tests {
     ///
     /// Active tickets include all ReadyForDevelopment tickets regardless of
     /// `pipeline_reservation`, unlike [`has_pipeline_blocker_for_workspace`] which
-    /// requires reservation=1. This is intentional — unstarted backlog tickets
+    /// uses `require_reservation = true` (requires reservation=1). This is
+    /// intentional — unstarted backlog tickets
     /// are considered active to suppress Done notifications until the pipeline
     /// is fully drained.
     #[allow(clippy::too_many_lines)]
