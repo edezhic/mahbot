@@ -2630,9 +2630,12 @@ mod tests {
     /// Shorthand for [`init_management_test_stores`] + [`create_test_workspace`]
     /// with a generated `ws_{suffix}` / `/tmp/test_{suffix}` name/path.
     ///
+    /// Creates a **DB-backed** workspace (inserted into the test DB), unlike
+    /// [`setup_ticket`] which returns an in-memory workspace.
+    ///
     /// Each test must pass a unique `suffix` to avoid UNIQUE constraint
     /// and cross-test pollution on the shared ticket buffer.
-    async fn setup_ticket_to_done_test(suffix: &str) -> crate::Workspace {
+    async fn setup_db_workspace(suffix: &str) -> crate::Workspace {
         init_management_test_stores().await;
 
         let ws_name = format!("ws_{suffix}");
@@ -2668,7 +2671,7 @@ mod tests {
     /// notifies and drains the buffer.
     #[tokio::test]
     async fn transition_ticket_to_done_buffer_and_notify() {
-        let ws = setup_ticket_to_done_test("drains_buffer").await;
+        let ws = setup_db_workspace("drains_buffer").await;
 
         // Two QaPassed tickets in the same workspace
         let first_id = TicketBuilder::new(board(), ws.clone())
@@ -2804,7 +2807,7 @@ mod tests {
     /// Catches asset-loading or DB panics in the notification path.
     #[tokio::test]
     async fn notify_ticket_failed_transition_does_not_panic() {
-        let ws = setup_ticket_to_done_test("failed_notify_test").await;
+        let ws = setup_db_workspace("failed_notify_test").await;
 
         let ticket_id = TicketBuilder::new(board(), ws)
             .title("Failed Notify Test")
@@ -2836,7 +2839,7 @@ mod tests {
     /// this path exercises that the conditional guard works.
     #[tokio::test]
     async fn notify_ticket_non_failed_transition_does_not_panic() {
-        let ws = setup_ticket_to_done_test("non_failed_notify_test").await;
+        let ws = setup_db_workspace("non_failed_notify_test").await;
 
         let ticket_id = TicketBuilder::new(board(), ws)
             .title("Non-Failed Notify Test")
