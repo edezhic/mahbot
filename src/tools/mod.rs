@@ -404,14 +404,39 @@ mod tests {
     #[test]
     // ── media_marker coverage ────────────────────────────────────────
     fn all_media_tools_implement_media_marker() {
-        assert!(
-            ImageGenTool.media_marker().is_some(),
-            "ImageGenTool should return Some from media_marker()"
-        );
-        assert!(
-            VideoGenTool.media_marker().is_some(),
-            "VideoGenTool should return Some from media_marker()"
-        );
+        // Each media-generation tool must return Some from media_marker()
+        let tools: [(&str, Box<dyn Tool>); 2] = [
+            ("ImageGenTool", Box::new(ImageGenTool)),
+            ("VideoGenTool", Box::new(VideoGenTool)),
+        ];
+        for (name, tool) in &tools {
+            let marker = tool.media_marker();
+            assert!(
+                marker.is_some(),
+                "{name} should return Some from media_marker()"
+            );
+            let marker = marker.unwrap();
+            // Validate format: `[KIND:` where KIND is uppercase letters
+            assert!(
+                marker.starts_with('['),
+                "{name} marker {marker:?} should start with '['"
+            );
+            assert!(
+                marker.ends_with(':'),
+                "{name} marker {marker:?} should end with ':'"
+            );
+            let kind = &marker[1..marker.len() - 1]; // strip [ and :
+            assert!(
+                !kind.is_empty() && kind.chars().all(|c| c.is_uppercase()),
+                "{name} marker kind {kind:?} should be non-empty uppercase letters"
+            );
+            // Validate against the canonical MEDIA_MARKER_RE pattern
+            let full_marker = format!("{marker}/some/path]");
+            assert!(
+                crate::util::MEDIA_MARKER_RE.is_match(&full_marker),
+                "{name} marker + path should match MEDIA_MARKER_RE, got: {full_marker:?}"
+            );
+        }
     }
 
     // ── PATH_ALIAS_KEYS regression tests ──────────────────────────────

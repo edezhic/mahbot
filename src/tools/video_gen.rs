@@ -24,13 +24,6 @@ impl Tool for VideoGenTool {
         Some("[VIDEO:")
     }
 
-    fn format_output(&self, output: &str) -> String {
-        let prefix = self
-            .media_marker()
-            .expect("VideoGenTool always has a media marker");
-        format!("{prefix}{output}]")
-    }
-
     fn parameters_schema(&self) -> serde_json::Value {
         super::tool_params_schema(
             &json!({
@@ -257,6 +250,10 @@ impl Tool for VideoGenTool {
         // ── Step 4: Save to workspace/generated/ ────────────────────────
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
 
-        Ok(output_path.to_string_lossy().to_string())
+        let path_str = output_path.to_string_lossy();
+        let marker_prefix = self
+            .media_marker()
+            .expect("VideoGenTool always has a media marker");
+        Ok(format!("{marker_prefix}{path_str}]"))
     }
 }
