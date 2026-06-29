@@ -1,4 +1,4 @@
-//! Shared `reqwest::Client` construction with timeouts and graceful fallback.
+//! Shared `reqwest::Client` construction with configurable timeouts.
 //!
 //! All call sites that need an HTTP client should use this helper instead of
 //! building one from scratch.  `reqwest::Client` is designed to be created once
@@ -238,24 +238,20 @@ pub fn media_http_client() -> &'static reqwest::Client {
 /// Build a configured `reqwest::Client` with the given request `timeout` and a
 /// 10-second connection timeout.
 ///
-/// # Graceful fallback
+/// # Panics
 ///
-/// If the builder fails (e.g. TLS/OpenSSL initialization issue), we log a
-/// warning and fall back to [`reqwest::Client::new()`], which uses reqwest's
-/// built-in defaults (including a 30-second request timeout but **no**
-/// connection timeout).
+/// Panics if `reqwest::Client::builder()` fails (typically a TLS
+/// initialization failure).  TLS failure is non-recoverable — if the
+/// system's TLS stack is broken, nothing will work — so the process
+/// should stop immediately rather than silently producing wrong
+/// behaviour at runtime.
 #[must_use]
 pub fn build_http_client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                "Failed to build custom HTTP client: {error}; falling back to Client::new()"
-            );
-            reqwest::Client::new()
-        })
+        .expect("Failed to build HTTP client (TLS initialization failure)")
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
