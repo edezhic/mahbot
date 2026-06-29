@@ -277,16 +277,16 @@ impl ConfigStore {
     // Get the role config overrides for a role.
     // Returns `None` if no row exists for the role.
     async fn get_role_config(&self, role: &str) -> Result<Option<RoleConfig>> {
-        let role_owned = role.to_string();
         self.conn
             .query_optional(
-                "SELECT model, reasoning_effort FROM config_role WHERE role = ?1",
+                &format!("SELECT {ROLE_CONFIG_COLUMNS} FROM config_role WHERE role = ?1"),
                 turso::params![role],
                 |row| {
-                    let model = row.get::<Option<String>>(0)?;
-                    let reasoning_effort = row.get::<Option<String>>(1)?;
+                    let role = row.get::<String>(COL_RC_ROLE)?;
+                    let model = row.get::<Option<String>>(COL_RC_MODEL)?;
+                    let reasoning_effort = row.get::<Option<String>>(COL_RC_REASONING_EFFORT)?;
                     Ok::<RoleConfig, ::turso::Error>(RoleConfig {
-                        role: role_owned,
+                        role,
                         model,
                         reasoning_effort,
                     })
@@ -329,16 +329,18 @@ impl ConfigStore {
     // Get the model routing config for a model.
     // Returns `None` if no row exists for the model.
     async fn get_model_routing(&self, model: &str) -> Result<Option<ModelRouting>> {
-        let model_owned = model.to_string();
         self.conn
             .query_optional(
-                "SELECT provider_order, allow_fallbacks FROM config_model_routing WHERE model = ?1",
+                &format!(
+                    "SELECT {MODEL_ROUTING_COLUMNS} FROM config_model_routing WHERE model = ?1"
+                ),
                 turso::params![model],
                 |row| {
-                    let provider_order = row.get::<Option<String>>(0)?;
-                    let allow_fallbacks = row.get::<Option<bool>>(1)?;
+                    let model = row.get::<String>(COL_MR_MODEL)?;
+                    let provider_order = row.get::<Option<String>>(COL_MR_PROVIDER_ORDER)?;
+                    let allow_fallbacks = row.get::<Option<bool>>(COL_MR_ALLOW_FALLBACKS)?;
                     Ok::<ModelRouting, ::turso::Error>(ModelRouting {
-                        model: model_owned,
+                        model,
                         provider_order,
                         allow_fallbacks,
                     })
