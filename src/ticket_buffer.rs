@@ -62,8 +62,8 @@ pub fn push(workspace_name: &str, id: &str, old_status: TicketPhase, new_status:
     }
     deque.push_back(Entry {
         id: id.to_string(),
-        old_status: old_status.as_ref().to_string(),
-        new_status: new_status.as_ref().to_string(),
+        old_status: old_status.to_string(),
+        new_status: new_status.to_string(),
     });
 }
 
