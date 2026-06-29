@@ -883,9 +883,16 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         format!("New feedback to address:\n{}", feedback.join("\n---\n"))
     };
 
-    let _ = board()
+    if let Err(e) = board()
         .set_assigned_to(&ticket.id, Some(&session_key))
-        .await;
+        .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to set assigned_to for engineer — stale agent not cancelled",
+        );
+    }
 
     let (_agent, response) =
         run_agent(session_key, Role::Engineer, &ws, Some(&ticket), &message).await;
@@ -1352,7 +1359,14 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
                 &format!("{SANITATION_FAILED_PREFIX} — agent returned no output"),
             )
             .await;
-        let _ = board().set_assigned_to(&ticket.id, None).await;
+        if let Err(e) = board().set_assigned_to(&ticket.id, None).await {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to clear assigned_to after sanitation agent failure — \
+                 ticket may be stuck in InSanitation",
+            );
+        }
         return;
     };
 
@@ -1379,7 +1393,14 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
                     &format!("{SANITATION_FAILED_PREFIX} — verdict extraction error: {e}"),
                 )
                 .await;
-            let _ = board().set_assigned_to(&ticket.id, None).await;
+            if let Err(e) = board().set_assigned_to(&ticket.id, None).await {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to clear assigned_to after verdict extraction error — \
+                     ticket may be stuck in InSanitation",
+                );
+            }
             return;
         }
     };
