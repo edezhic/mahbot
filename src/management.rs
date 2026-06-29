@@ -1271,9 +1271,9 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     // Sanitation circuit breaker — trip if the ticket has accumulated too
     // many consecutive sanitation failures.
     //
-    // Delegates to run_circuit_breaker to ensure fresh comment fetching,
-    // proper sibling ticket drainage (moving other ReadyForDevelopment tickets
-    // to Planning), and consistent failure handling with the general breaker.
+    // Delegates to run_circuit_breaker which calls
+    // drain_ready_for_development_siblings to move other ReadyForDevelopment
+    // tickets to Planning, and consistent failure handling with the general breaker.
     //
     // Counts system comments where role == `SYSTEM_ROLE` and content contains
     // "Sanitation failed".
@@ -1958,6 +1958,69 @@ fn build_analyst_summary(
 
 // ── Shared Circuit Breaker ──────────────────────────────
 
+/// After a ticket fails via circuit breaker, move all other ReadyForDevelopment
+/// tickets in the same workspace to Planning so the Manager can triage the
+/// failure without new tickets auto-starting.
+async fn drain_ready_for_development_siblings(ticket: &Ticket) {
+    let other_tickets = match board()
+        .list_tickets_in_phase(TicketPhase::ReadyForDevelopment, &ticket.workspace_name)
+        .await
+    {
+        Ok(tickets) => tickets,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                workspace = %ticket.workspace_name,
+                error = %e,
+                "Failed to list ReadyForDevelopment tickets for moving to planning \
+                 — breaker trip proceeds without moving siblings",
+            );
+            return;
+        }
+    };
+
+    let planning_move_comment = format!(
+        "Moved to planning due to circuit breaker trip on {}: {}. Re-advance to ReadyForDevelopment after Manager resolves the failure.",
+        ticket.id, ticket.title,
+    );
+
+    // There is a small race window: between listing ReadyForDevelopment
+    // tickets here and transitioning them individually, a concurrent poll
+    // cycle could claim one. This is rare in practice (dispatch tasks spawn
+    // after the claim loop completes) and the CAS guard in transition_to
+    // handles the transition gracefully.
+    //
+    // Filter out the tripped ticket: defense-in-depth. The tripped ticket
+    // was already transitioned to Failed by the caller before this function
+    // runs and shouldn't appear in the ReadyForDevelopment results, but the
+    // filter keeps us safe if a concurrent race or future refactor changes
+    // the timing.
+    for other in other_tickets.iter().filter(|t| t.id != ticket.id) {
+        // If the transition fails (e.g., ticket was already claimed or moved
+        // externally), skip it and continue with the remaining tickets.
+        if let Err(e) = transition_ticket(
+            other,
+            TicketPhase::ReadyForDevelopment,
+            TicketPhase::Planning,
+            NotifyPolicy::Buffer,
+            None,
+        )
+        .await
+        {
+            debug!(
+                other_ticket = %other.id,
+                error = %e,
+                "Failed to move other ReadyForDevelopment ticket to planning — likely raced by external move",
+            );
+            continue;
+        }
+
+        let _ = board()
+            .add_comment(&other.id, SYSTEM_ROLE, &planning_move_comment)
+            .await;
+    }
+}
+
 /// Shared circuit breaker skeleton: fetch comments, count, compare to threshold,
 /// add a system comment (first, for crash-safety), then transition to
 /// [`TicketPhase::Failed`].
@@ -2059,65 +2122,7 @@ async fn run_circuit_breaker(
         return true;
     }
 
-    // Move all other ReadyForDevelopment tickets in the same workspace to
-    // Planning to prevent them from auto-starting while the Manager triages
-    // the failure.
-    //
-    // There is a small race window: between listing ReadyForDevelopment
-    // tickets here and transitioning them individually, a concurrent poll
-    // cycle could claim one. This is rare in practice (dispatch tasks spawn
-    // after the claim loop completes) and the CAS guard in transition_to
-    // handles the transition gracefully.
-    let other_tickets = match board()
-        .list_tickets_in_phase(TicketPhase::ReadyForDevelopment, &ticket.workspace_name)
-        .await
-    {
-        Ok(tickets) => tickets,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                workspace = %ticket.workspace_name,
-                error = %e,
-                "Failed to list ReadyForDevelopment tickets for moving to planning \
-                 — breaker trip proceeds without moving siblings",
-            );
-            return true;
-        }
-    };
-
-    let planning_move_comment = format!(
-        "Moved to planning due to circuit breaker trip on {}: {}. Re-advance to ReadyForDevelopment after Manager resolves the failure.",
-        ticket.id, ticket.title,
-    );
-
-    // Filter out the tripped ticket: defense-in-depth. The tripped ticket
-    // was already transitioned to Failed above and shouldn't appear in the
-    // ReadyForDevelopment results, but the filter keeps us safe if a
-    // concurrent race or future refactor changes the timing.
-    for other in other_tickets.iter().filter(|t| t.id != ticket.id) {
-        // If the transition fails (e.g., ticket was already claimed or moved
-        // externally), skip it and continue with the remaining tickets.
-        if let Err(e) = transition_ticket(
-            other,
-            TicketPhase::ReadyForDevelopment,
-            TicketPhase::Planning,
-            NotifyPolicy::Buffer,
-            None,
-        )
-        .await
-        {
-            debug!(
-                other_ticket = %other.id,
-                error = %e,
-                "Failed to move other ReadyForDevelopment ticket to planning — likely raced by external move",
-            );
-            continue;
-        }
-
-        let _ = board()
-            .add_comment(&other.id, SYSTEM_ROLE, &planning_move_comment)
-            .await;
-    }
+    drain_ready_for_development_siblings(ticket).await;
 
     true
 }
