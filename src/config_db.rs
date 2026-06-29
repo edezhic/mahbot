@@ -89,6 +89,14 @@ fn model_routing_from_row(row: &turso::Row) -> Result<ModelRouting, ::turso::Err
     })
 }
 
+/// Parse a `(key, value)` pair from a `config_kv` row.
+#[cfg(test)]
+fn kv_from_row(row: &turso::Row) -> Result<(String, String), ::turso::Error> {
+    let key = row.get::<String>(COL_KV_KEY)?;
+    let value = row.get::<String>(COL_KV_VALUE)?;
+    Ok((key, value))
+}
+
 impl ConfigStore {
     // ── config_kv ────────────────────────────────────────────
 
@@ -264,20 +272,14 @@ impl ConfigStore {
 impl ConfigStore {
     // Get a single key-value pair by key. Returns `None` if not found.
     async fn get_kv(&self, key: &str) -> Result<Option<String>> {
-        match self
-            .conn
-            .query_row(
-                "SELECT value FROM config_kv WHERE key = ?1",
+        self.conn
+            .query_optional(
+                &format!("SELECT {KV_COLUMNS} FROM config_kv WHERE key = ?1"),
                 turso::params![key],
-                |row| row.get_value(0),
+                kv_from_row,
             )
             .await
-        {
-            Ok(turso::Value::Text(v)) => Ok(Some(v)),
-            Ok(turso::Value::Null) | Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Ok(other) => anyhow::bail!("unexpected value type for key '{key}': {other:?}"),
-            Err(e) => Err(e.into()),
-        }
+            .map(|opt| opt.map(|(_key, value)| value))
     }
 
     // Get the role config overrides for a role.
