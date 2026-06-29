@@ -316,182 +316,174 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_chat_completions_url_already_has_suffix() {
-        assert_eq!(
-            ensure_chat_completions_url("https://api.example.com/v1/chat/completions"),
-            "https://api.example.com/v1/chat/completions",
-        );
-    }
+    fn url_roundtrips() {
+        // Cases exercise both ensure_chat_completions_url and ensure_base_url
+        // on the same input (they are string-based inverses).
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected_chat: &'static str,
+            expected_base: &'static str,
+        }
 
-    #[test]
-    fn ensure_chat_completions_url_no_suffix() {
-        assert_eq!(
-            ensure_chat_completions_url("https://api.example.com/v1"),
-            "https://api.example.com/v1/chat/completions",
-        );
-    }
+        let cases = [
+            Case {
+                name: "already_has_suffix",
+                input: "https://api.example.com/v1/chat/completions",
+                expected_chat: "https://api.example.com/v1/chat/completions",
+                expected_base: "https://api.example.com/v1",
+            },
+            Case {
+                name: "no_suffix",
+                input: "https://api.example.com/v1",
+                expected_chat: "https://api.example.com/v1/chat/completions",
+                expected_base: "https://api.example.com/v1",
+            },
+            Case {
+                name: "trailing_slash",
+                input: "https://api.example.com/v1/",
+                expected_chat: "https://api.example.com/v1/chat/completions",
+                expected_base: "https://api.example.com/v1",
+            },
+            Case {
+                // Multiple trailing slashes are collapsed by trim_end_matches('/').
+                name: "double_trailing_slash",
+                input: "https://api.example.com/v1//",
+                expected_chat: "https://api.example.com/v1/chat/completions",
+                expected_base: "https://api.example.com/v1",
+            },
+            Case {
+                name: "trailing_slash_before_suffix",
+                input: "https://api.example.com/v1/chat/completions/",
+                expected_chat: "https://api.example.com/v1/chat/completions",
+                expected_base: "https://api.example.com/v1",
+            },
+            // Edge case: URL where /chat/completions appears in the domain, not a path segment.
+            // This is a shared limitation of both helpers — they operate on strings, not URL
+            // components. We document the current behaviour rather than asserting correctness.
+            Case {
+                name: "domain_containing_chat_completions",
+                input: "https://chat.completions.com/api",
+                expected_chat: "https://chat.completions.com/api/chat/completions",
+                expected_base: "https://chat.completions.com/api",
+            },
+        ];
 
-    #[test]
-    fn ensure_chat_completions_url_trailing_slash() {
-        assert_eq!(
-            ensure_chat_completions_url("https://api.example.com/v1/"),
-            "https://api.example.com/v1/chat/completions",
-        );
-    }
+        for c in &cases {
+            assert_eq!(
+                ensure_chat_completions_url(c.input),
+                c.expected_chat,
+                "case '{}': ensure_chat_completions_url({:?})",
+                c.name,
+                c.input,
+            );
+            assert_eq!(
+                ensure_base_url(c.input),
+                c.expected_base,
+                "case '{}': ensure_base_url({:?})",
+                c.name,
+                c.input,
+            );
+        }
 
-    #[test]
-    fn ensure_chat_completions_url_double_trailing_slash() {
-        assert_eq!(
-            ensure_chat_completions_url("https://api.example.com/v1//"),
-            "https://api.example.com/v1/chat/completions",
-            "multiple trailing slashes are collapsed by trim_end_matches('/')",
-        );
-    }
-
-    #[test]
-    fn ensure_base_url_already_clean() {
-        assert_eq!(
-            ensure_base_url("https://api.example.com/v1"),
-            "https://api.example.com/v1",
-        );
-    }
-
-    #[test]
-    fn ensure_base_url_strips_chat_completions() {
-        assert_eq!(
-            ensure_base_url("https://api.example.com/v1/chat/completions"),
-            "https://api.example.com/v1",
-        );
-    }
-
-    #[test]
-    fn ensure_base_url_trailing_slash() {
-        assert_eq!(
-            ensure_base_url("https://api.example.com/v1/"),
-            "https://api.example.com/v1",
-        );
-    }
-
-    #[test]
-    fn ensure_base_url_trailing_slash_before_suffix() {
-        assert_eq!(
-            ensure_base_url("https://api.example.com/v1/chat/completions/"),
-            "https://api.example.com/v1",
-        );
-    }
-
-    #[test]
-    fn roundtrip_base_to_chat_to_base() {
-        let cases = &[
+        // Roundtrip property: base -> chat -> base and chat -> base -> chat
+        // should both be identity.
+        let roundtrip_inputs = &[
             "https://api.example.com/v1",
             "https://api.example.com/v1/",
             "https://api.example.com/v1/chat/completions",
             "https://api.example.com/v1/chat/completions/",
         ];
-        for &url in cases {
+        for &url in roundtrip_inputs {
             let base = ensure_base_url(url);
             let chat = ensure_chat_completions_url(&base);
             let roundtripped = ensure_base_url(&chat);
             assert_eq!(
                 roundtripped, base,
-                "roundtrip(ensure_base_url -> ensure_chat_completions_url -> ensure_base_url) \
-                 should be identity for input '{url}'",
+                "roundtrip(base->chat->base) should be identity for '{url}'",
             );
-        }
-    }
 
-    #[test]
-    fn roundtrip_chat_to_base_to_chat() {
-        let cases = &[
-            "https://api.example.com/v1",
-            "https://api.example.com/v1/",
-            "https://api.example.com/v1/chat/completions",
-            "https://api.example.com/v1/chat/completions/",
-        ];
-        for &url in cases {
             let chat = ensure_chat_completions_url(url);
             let base = ensure_base_url(&chat);
             let roundtripped = ensure_chat_completions_url(&base);
             assert_eq!(
                 roundtripped, chat,
-                "roundtrip(ensure_chat_completions_url -> ensure_base_url -> \
-                 ensure_chat_completions_url) should be identity for input '{url}'",
+                "roundtrip(chat->base->chat) should be identity for '{url}'",
             );
         }
     }
 
     #[test]
-    fn domain_name_containing_slash_chat_completions() {
-        // Edge case: URL where /chat/completions appears in the domain, not a path segment.
-        // This is a shared limitation of both helpers — they operate on strings, not URL components.
-        // We document the current behaviour rather than asserting correctness.
-        let url = "https://chat.completions.com/api";
-        let chat = ensure_chat_completions_url(url);
-        // trim_end_matches does not match '/chat/completions' here because the path
-        // is '/api', not '/chat/completions'. The domain contains 'chat.completions.com'
-        // but there's no '/chat/completions' at the end.
-        assert_eq!(chat, "https://chat.completions.com/api/chat/completions");
+    fn provider_routing() {
+        struct Case {
+            name: &'static str,
+            order: &'static str,
+            allow_fallbacks: bool,
+            expected: Option<serde_json::Value>,
+        }
 
-        let base = ensure_base_url(url);
-        // Same reasoning — '/chat/completions' is not a suffix.
-        assert_eq!(base, "https://chat.completions.com/api");
-    }
+        let cases = [
+            Case {
+                name: "single_provider",
+                order: "openai",
+                allow_fallbacks: false,
+                expected: Some(serde_json::json!({
+                    "order": ["openai"],
+                    "allow_fallbacks": false,
+                })),
+            },
+            Case {
+                name: "multiple_providers",
+                order: "openai, anthropic, google",
+                allow_fallbacks: true,
+                expected: Some(serde_json::json!({
+                    "order": ["openai", "anthropic", "google"],
+                    "allow_fallbacks": true,
+                })),
+            },
+            Case {
+                name: "whitespace_only_yields_none",
+                order: "  , ,  ",
+                allow_fallbacks: false,
+                expected: None,
+            },
+            Case {
+                name: "empty_string_yields_none",
+                order: "",
+                allow_fallbacks: true,
+                expected: None,
+            },
+            Case {
+                name: "leading_trailing_whitespace",
+                order: "  openai  ",
+                allow_fallbacks: false,
+                expected: Some(serde_json::json!({
+                    "order": ["openai"],
+                    "allow_fallbacks": false,
+                })),
+            },
+            // Transcription call sites pass a single provider slug; the
+            // split/trim/filter cycle must leave it unchanged.
+            Case {
+                name: "single_slug_survives_split",
+                order: "google-gemini",
+                allow_fallbacks: false,
+                expected: Some(serde_json::json!({
+                    "order": ["google-gemini"],
+                    "allow_fallbacks": false,
+                })),
+            },
+        ];
 
-    // ── provider_routing_json tests ─────────────────────────────
-
-    #[test]
-    fn routing_single_provider() {
-        assert_eq!(
-            provider_routing_json("openai", false),
-            Some(serde_json::json!({
-                "order": ["openai"],
-                "allow_fallbacks": false,
-            })),
-        );
-    }
-
-    #[test]
-    fn routing_multiple_providers() {
-        assert_eq!(
-            provider_routing_json("openai, anthropic, google", true),
-            Some(serde_json::json!({
-                "order": ["openai", "anthropic", "google"],
-                "allow_fallbacks": true,
-            })),
-        );
-    }
-
-    #[test]
-    fn routing_whitespace_only_yields_none() {
-        assert_eq!(provider_routing_json("  , ,  ", false), None);
-    }
-
-    #[test]
-    fn routing_empty_string_yields_none() {
-        assert_eq!(provider_routing_json("", true), None);
-    }
-
-    #[test]
-    fn routing_leading_trailing_whitespace() {
-        assert_eq!(
-            provider_routing_json("  openai  ", false),
-            Some(serde_json::json!({
-                "order": ["openai"],
-                "allow_fallbacks": false,
-            })),
-        );
-    }
-
-    #[test]
-    fn routing_single_slug_survives_split() {
-        // Transcription call sites pass a single provider slug; the
-        // split/trim/filter cycle must leave it unchanged.
-        assert_eq!(
-            provider_routing_json("google-gemini", false),
-            Some(serde_json::json!({
-                "order": ["google-gemini"],
-                "allow_fallbacks": false,
-            })),
-        );
+        for c in &cases {
+            assert_eq!(
+                provider_routing_json(c.order, c.allow_fallbacks),
+                c.expected,
+                "case '{}': provider_routing_json({:?}, {})",
+                c.name,
+                c.order,
+                c.allow_fallbacks,
+            );
+        }
     }
 }
