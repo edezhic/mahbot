@@ -366,15 +366,10 @@ where
         };
 
         // ── 1. Draw per-line background tints (behind text) ─────────
-        // Use the same pattern as gutter: only draw background for the
-        // first visual run of each logical line.
-        let mut last_bg_line = usize::MAX;
+        // Draw a background rectangle for every visual line, including
+        // wrapped continuation lines. (Unlike the gutter section below,
+        // backgrounds must cover the full visible span.)
         for run in buffer_for_draw.layout_runs() {
-            if run.line_i == last_bg_line {
-                continue; // wrapped continuation — already drawn
-            }
-            last_bg_line = run.line_i;
-
             if run.line_i >= self.data.line_kinds.len() {
                 continue;
             }

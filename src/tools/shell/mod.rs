@@ -338,9 +338,10 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     // ~/.cargo/bin so both paths are covered. Dedup by prepend_path_entries.
     if let Ok(cargo_home) = std::env::var("CARGO_HOME")
         && !cargo_home.is_empty()
-        && let Some(dirs) = UserDirs::new() {
-            v.push(dirs.home_dir().join(".cargo").join("bin"));
-        }
+        && let Some(dirs) = UserDirs::new()
+    {
+        v.push(dirs.home_dir().join(".cargo").join("bin"));
+    }
 
     if let Some(dirs) = UserDirs::new() {
         v.push(dirs.home_dir().join(".npm-global").join("bin"));
