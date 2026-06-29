@@ -491,25 +491,11 @@ const SCRATCH_MUTATORS: &[&str] = &["tee", "touch", "mkdir"];
 fn non_flag_path_args(segment: &str) -> Vec<String> {
     let canonical = super::canonical_command(segment);
     let parts: Vec<&str> = canonical.split_whitespace().collect();
-    if parts.len() <= 1 {
-        return vec![];
+    if parts.len() > 1 {
+        vec![parts[1].to_string()]
+    } else {
+        vec![]
     }
-    let mut paths = Vec::new();
-    let mut i = 1;
-    while i < parts.len() {
-        let p = parts[i];
-        if p == "-p" {
-            i += 1;
-            continue;
-        }
-        if p.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        paths.push(p.to_string());
-        i += 1;
-    }
-    paths
 }
 
 /// True when every explicit path argument is an absolute path under allowed temp.
