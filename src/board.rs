@@ -1123,17 +1123,21 @@ impl BoardStore {
     pub async fn claim_sanitation(&self, id: &str) -> Result<bool> {
         let now = turso::now();
         let session_key = crate::session::ticket_session_key(id, crate::Role::Sanitation.as_str());
-        let sql = "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
-                    WHERE id = ?4 AND status = ?5 \
-                    AND NOT EXISTS (SELECT 1 FROM tickets t2 \
-                      WHERE t2.workspace_name = \
-                        (SELECT workspace_name FROM tickets WHERE id = ?4) \
-                      AND t2.id != ?4 \
-                      AND t2.status IN ('in_sanitation','sanitation_passed'))";
+        let blocker =
+            status_list_sql_fragment(&[TicketPhase::InSanitation, TicketPhase::SanitationPassed]);
+        let sql = format!(
+            "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = ?5 \
+             AND NOT EXISTS (SELECT 1 FROM tickets t2 \
+               WHERE t2.workspace_name = \
+                 (SELECT workspace_name FROM tickets WHERE id = ?4) \
+               AND t2.id != ?4 \
+               AND t2.status IN ({blocker}))"
+        );
         let rows = self
             .conn
             .execute(
-                sql,
+                &sql,
                 turso::params![
                     TicketPhase::InSanitation.as_ref(),
                     session_key,
