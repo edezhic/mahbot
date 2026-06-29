@@ -4202,9 +4202,12 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// `pipeline_reservation` via its SQL `DEFAULT 0`) survives the
     /// SELECT → `ticket_from_row` deserialization path.
     ///
-    /// Catches silent field mapping bugs where [`TICKET_COLUMNS`] column order
-    /// drifts from the [`COL_TICKET_*`] integer constants — the same class of
-    /// bug that previously caused the stale doc comment on this module.
+    /// Serves as a regression test for ticket deserialization — the
+    /// [`columns!`] macro ensures single-sourcing of [`TICKET_COLUMNS`]
+    /// and [`COL_TICKET_*`], so column-order drift between them is
+    /// structurally impossible. This test still exercises the full
+    /// `ticket_from_row` deserialization path, including `turso::FromRow`
+    /// field mapping and default-value handling.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_ticket_roundtrip_all_fields() {
