@@ -878,7 +878,6 @@ pub fn test_ws_named(path: &str, name: &str) -> Workspace {
     Workspace {
         name: name.to_string(),
         path: path.to_string(),
-        maintainer_debounce_mins: 5,
         ..Default::default()
     }
 }

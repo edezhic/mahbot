@@ -180,7 +180,6 @@ impl Workspace {
         Self {
             name: dir_name(&stored),
             path: stored.to_string_lossy().to_string(),
-            maintainer_debounce_mins: 5,
             ..Default::default()
         }
     }
