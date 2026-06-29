@@ -27,6 +27,26 @@ impl CreateTicketTool {
             reporter: reporter.into(),
         }
     }
+
+    /// Build a [`TicketParams`] from the shared fields used by both creation branches.
+    fn build_params(
+        &self,
+        ws: &Workspace,
+        title: &str,
+        description: &str,
+        prerequisites: &[String],
+        embedding_bytes: Option<&Vec<u8>>,
+    ) -> TicketParams {
+        TicketParams {
+            title: title.to_string(),
+            description: description.to_string(),
+            workspace_name: ws.name.clone(),
+            phase: TicketPhase::Backlog,
+            prerequisites: prerequisites.to_vec(),
+            reporter: self.reporter.clone(),
+            embedding: embedding_bytes.cloned(),
+        }
+    }
 }
 
 #[async_trait]
@@ -96,35 +116,26 @@ impl Tool for CreateTicketTool {
         if let Some(supersede_id) = supersede_id {
             guard_not_pipeline_blocking(store, &supersede_id).await?;
 
-            let id = store
-                .supersede_and_create(
-                    &supersede_id,
-                    &TicketParams {
-                        title: title.to_string(),
-                        description: description.to_string(),
-                        workspace_name: ws.name.clone(),
-                        phase: TicketPhase::Backlog,
-                        prerequisites: prerequisites.clone(),
-                        reporter: self.reporter.clone(),
-                        embedding: embedding_bytes.clone(),
-                    },
-                )
-                .await?;
+            let params = self.build_params(
+                ws,
+                title,
+                description,
+                &prerequisites,
+                embedding_bytes.as_ref(),
+            );
+            let id = store.supersede_and_create(&supersede_id, &params).await?;
             Ok(format!(
                 "Superseded {supersede_id} → created ticket {id}: {title}{prereq_note}"
             ))
         } else {
-            let id = store
-                .create_ticket(&TicketParams {
-                    title: title.to_string(),
-                    description: description.to_string(),
-                    workspace_name: ws.name.clone(),
-                    phase: TicketPhase::Backlog,
-                    prerequisites: prerequisites.clone(),
-                    reporter: self.reporter.clone(),
-                    embedding: embedding_bytes.clone(),
-                })
-                .await?;
+            let params = self.build_params(
+                ws,
+                title,
+                description,
+                &prerequisites,
+                embedding_bytes.as_ref(),
+            );
+            let id = store.create_ticket(&params).await?;
             Ok(format!("Created ticket {id}: {title}{prereq_note}"))
         }
     }
