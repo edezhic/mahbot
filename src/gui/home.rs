@@ -4,11 +4,7 @@
 //! with the Home page workspace picker), and chat with MahBot agents in real time
 //! with full markdown rendering and typing indicators.
 
-#![allow(
-    clippy::too_many_lines,
-    clippy::match_same_arms,
-    clippy::manual_let_else
-)]
+#![allow(clippy::too_many_lines)]
 
 use crate::ChatDirection;
 use crate::Role;
@@ -76,15 +72,13 @@ fn parse_inline_keyboard(reply_markup: Option<&serde_json::Value>) -> Vec<Inline
     let Some(markup) = reply_markup else {
         return Vec::new();
     };
-    let rows = match markup.get("inline_keyboard").and_then(|v| v.as_array()) {
-        Some(rows) => rows,
-        None => return Vec::new(),
+    let Some(rows) = markup.get("inline_keyboard").and_then(|v| v.as_array()) else {
+        return Vec::new();
     };
     let mut buttons = Vec::new();
     for row in rows {
-        let row_buttons = match row.as_array() {
-            Some(btns) => btns,
-            None => continue,
+        let Some(row_buttons) = row.as_array() else {
+            continue;
         };
         for btn in row_buttons {
             let text = btn.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -956,6 +950,10 @@ impl HomeState {
     }
 
     pub fn update(&mut self, msg: HomeMessage) -> Task<HomeMessage> {
+        // Allow match_same_arms on the entire update() match block: many variants
+        // return Task::none() as intercepted/intermediate messages. Narrowing to
+        // individual arms would require auditing every no-op each time one changes.
+        #[allow(clippy::match_same_arms)]
         match msg {
             HomeMessage::UserSelected(user) => {
                 if self.selected_user.as_deref() == Some(&user) {
@@ -1507,15 +1505,14 @@ fn chat_stream_producer() -> impl futures_util::Stream<Item = HomeMessage> {
     iced::stream::channel(
         16,
         move |mut output: iced::futures::channel::mpsc::Sender<HomeMessage>| async move {
-            let rx = match crate::CHAT_BROADCAST.get().and_then(|tx| {
+            let Some(rx) = crate::CHAT_BROADCAST.get().and_then(|tx| {
                 if tx.receiver_count() > 100 {
                     None
                 } else {
                     Some(tx.subscribe())
                 }
-            }) {
-                Some(rx) => rx,
-                None => return,
+            }) else {
+                return;
             };
 
             let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);

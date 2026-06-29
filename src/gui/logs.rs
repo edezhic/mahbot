@@ -1,8 +1,6 @@
 //! Logs dashboard page — live log viewing with streaming, filters, pagination,
 //! plus a Tool Failures tab for browsing tool error entries.
 
-#![allow(clippy::manual_let_else)]
-
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use iced::widget::{
@@ -33,15 +31,14 @@ fn log_stream_producer() -> impl futures_util::Stream<Item = LogMessage> {
     iced::stream::channel(
         1,
         move |mut output: iced::futures::channel::mpsc::Sender<LogMessage>| async move {
-            let rx = match super::LOG_BROADCAST.get().and_then(|tx| {
+            let Some(rx) = super::LOG_BROADCAST.get().and_then(|tx| {
                 if tx.receiver_count() > 100 {
                     None
                 } else {
                     Some(tx.subscribe())
                 }
-            }) {
-                Some(rx) => rx,
-                None => return,
+            }) else {
+                return;
             };
 
             let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);

@@ -10,8 +10,6 @@
 //! Tree keyboard navigation: when tree is focused, Arrow Up/Down navigate
 //! entries, Enter opens files or expands directories, Escape exits focus.
 
-#![allow(clippy::match_same_arms, clippy::manual_let_else)]
-
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -953,15 +951,12 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
         };
     }
     // UTF-8 validation for binary detection.
-    let text = match String::from_utf8(bytes.clone()) {
-        Ok(t) => t,
-        Err(_) => {
-            return FileLoadMsg {
-                path: full_path,
-                r#gen,
-                result: Err("Binary file detected (invalid UTF-8)".to_string()),
-            };
-        }
+    let Ok(text) = String::from_utf8(bytes.clone()) else {
+        return FileLoadMsg {
+            path: full_path,
+            r#gen,
+            result: Err("Binary file detected (invalid UTF-8)".to_string()),
+        };
     };
 
     let data = FileLoadData {
@@ -1686,9 +1681,8 @@ impl EditorState {
         let needs_async_load = !self.dir_entries.contains_key(path);
 
         if needs_async_load {
-            let task = match self.load_dir_async(path, label) {
-                Some(t) => t,
-                None => return Task::none(),
+            let Some(task) = self.load_dir_async(path, label) else {
+                return Task::none();
             };
             self.pending_enter_dir = Some(path.to_string());
             // Rebuild tree for the expanded-but-still-loading state.
@@ -2293,6 +2287,10 @@ impl EditorState {
 
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
+        // Allow match_same_arms on the entire update() match block: many variants
+        // return Task::none() as their side-effect-free result. Narrowing to
+        // individual arms would require auditing every no-op each time one changes.
+        #[allow(clippy::match_same_arms)]
         match msg {
             EditorMessage::WorkspaceSelected(ref name, ref path) => {
                 self.workspace_selected(name, path.as_deref())
@@ -2382,9 +2380,9 @@ impl EditorState {
 
             EditorMessage::RevealInFinder(path) => Self::perform_reveal_in_finder(path),
 
-            EditorMessage::CopyRelativePath(path) => iced::clipboard::write(path),
-
-            EditorMessage::CopyAbsolutePath(path) => iced::clipboard::write(path),
+            EditorMessage::CopyRelativePath(path) | EditorMessage::CopyAbsolutePath(path) => {
+                iced::clipboard::write(path)
+            }
 
             EditorMessage::ConfirmDelete => self.confirm_delete(),
 
@@ -3011,9 +3009,8 @@ impl EditorState {
             return Task::none();
         }
 
-        let state = match &mut self.active_modal {
-            Some(ModalKind::GlobalSearch(s)) => s,
-            _ => return Task::none(),
+        let Some(ModalKind::GlobalSearch(state)) = &mut self.active_modal else {
+            return Task::none();
         };
 
         if let Some(err) = error {
@@ -3363,9 +3360,8 @@ impl EditorState {
 
     /// Handle global search input — updates query and triggers async search.
     fn global_search_input(&mut self, query: String) -> Task<EditorMessage> {
-        let state = match &mut self.active_modal {
-            Some(ModalKind::GlobalSearch(s)) => s,
-            _ => return Task::none(),
+        let Some(ModalKind::GlobalSearch(state)) = &mut self.active_modal else {
+            return Task::none();
         };
         state.query.clone_from(&query);
 
@@ -3401,9 +3397,8 @@ impl EditorState {
 
     /// Handle global search select — opens the selected file at the matching line.
     fn global_search_select(&mut self, idx: usize) -> Task<EditorMessage> {
-        let state = match &self.active_modal {
-            Some(ModalKind::GlobalSearch(s)) => s,
-            _ => return Task::none(),
+        let Some(ModalKind::GlobalSearch(state)) = &self.active_modal else {
+            return Task::none();
         };
         let Some(match_result) = state.results.get(idx) else {
             return Task::none();

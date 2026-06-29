@@ -1,7 +1,5 @@
 //! Workspaces dashboard page.
 
-#![allow(clippy::match_same_arms)]
-
 use crate::Workspace;
 
 use iced::Task;
@@ -125,6 +123,10 @@ impl WorkspacesState {
 
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: WorkspacesMessage) -> Task<WorkspacesMessage> {
+        // Allow match_same_arms: separate error variants that happen to share the
+        // same error-handling body after initial processing (e.g. logging variant
+        // info). Narrowing per-arm would duplicate the handler across variants.
+        #[allow(clippy::match_same_arms)]
         match msg {
             WorkspacesMessage::Refreshed(ws_list) => {
                 self.workspaces = ws_list;

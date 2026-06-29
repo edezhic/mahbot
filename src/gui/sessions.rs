@@ -1,7 +1,5 @@
 //! Sessions dashboard page — view and manage conversation sessions.
 
-#![allow(clippy::match_same_arms, clippy::manual_let_else)]
-
 use crate::ChatMessage;
 use crate::session::{DecodedNativeHistoryMessage, SessionMetadata, decode_native_history_message};
 
@@ -205,9 +203,8 @@ impl SessionsState {
                 if self.messages_refreshing {
                     return Task::none();
                 }
-                let key = match self.selected_session.clone() {
-                    Some(k) => k,
-                    None => return Task::none(),
+                let Some(key) = self.selected_session.clone() else {
+                    return Task::none();
                 };
                 self.messages_refreshing = true;
                 Task::perform(

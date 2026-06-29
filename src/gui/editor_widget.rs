@@ -2,8 +2,6 @@
 //! management. Intended as a drop-in replacement for `text_editor::Content`
 //! in the editor.rs codebase.
 
-#![allow(clippy::match_same_arms)]
-
 use std::cell::{Cell, RefCell};
 
 use cosmic_text::Scroll;
@@ -1599,8 +1597,7 @@ pub fn line_comment_prefix(
     // Fallback: match by extension for languages not in HighlightLanguage.
     if let Some(ext) = ext {
         return match ext {
-            "yaml" | "yml" => Some("#"),
-            "dockerfile" | "makefile" | "mak" | "cmake" => Some("#"),
+            "yaml" | "yml" | "dockerfile" | "makefile" | "mak" | "cmake" => Some("#"),
             _ => None,
         };
     }
@@ -3497,15 +3494,14 @@ fn map_key_to_action(
     match key {
         key::Key::Named(named) => {
             match (named, platform_mod, shift, alt) {
-                // Platform mod + Up/Down → jump to document start/end
-                (key::Named::ArrowUp, true, s, false) => {
+                // Platform mod + Up/Home → document start
+                (key::Named::ArrowUp | key::Named::Home, true, s, false) => {
                     Some(EditorAction::MoveDocStart { select: s })
                 }
-                (key::Named::ArrowDown, true, s, false) => {
+                // Platform mod + Down/End → document end
+                (key::Named::ArrowDown | key::Named::End, true, s, false) => {
                     Some(EditorAction::MoveDocEnd { select: s })
                 }
-
-                // Navigation (no modifiers) / Navigation + Shift
                 (key::Named::ArrowLeft, false, s, false) => {
                     Some(EditorAction::MoveLeft { select: s })
                 }
@@ -3546,11 +3542,6 @@ fn map_key_to_action(
                 (key::Named::ArrowRight, true, s, false) => {
                     Some(EditorAction::MoveEnd { select: s })
                 }
-                // Platform mod + Home/End → document start/end
-                (key::Named::Home, true, s, false) => {
-                    Some(EditorAction::MoveDocStart { select: s })
-                }
-                (key::Named::End, true, s, false) => Some(EditorAction::MoveDocEnd { select: s }),
 
                 // Delete/Backspace
                 (key::Named::Backspace, false, false, false) => Some(EditorAction::Backspace),

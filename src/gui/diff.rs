@@ -10,8 +10,6 @@
 //! the diff to just that file; click again to show all files.
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
-#![allow(clippy::manual_let_else)]
-
 use super::diff_widget::{self, ADDED_COLOR, DiffBufferWidget, DiffFileBuffer, REMOVED_COLOR};
 use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
 use super::text_rendering::MAX_HIGHLIGHT_SIZE;
@@ -1448,9 +1446,8 @@ async fn load_diff(
             if !full.is_file() {
                 continue;
             }
-            let meta = match tokio::fs::metadata(&full).await {
-                Ok(m) => m,
-                Err(_) => continue,
+            let Ok(meta) = tokio::fs::metadata(&full).await else {
+                continue;
             };
             if meta.len() > MAX_UNTRACKED_SIZE {
                 parsed.push(crate::diff_parse::DiffFile::placeholder(
@@ -1460,9 +1457,8 @@ async fn load_diff(
                 ));
                 continue;
             }
-            let content = match tokio::fs::read(&full).await {
-                Ok(c) => c,
-                Err(_) => continue,
+            let Ok(content) = tokio::fs::read(&full).await else {
+                continue;
             };
             if content.contains(&0) {
                 parsed.push(crate::diff_parse::DiffFile::placeholder(
