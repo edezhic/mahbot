@@ -313,6 +313,11 @@ impl Role {
                 ]
             }
         };
+        
+        // Manager does not need the web search tool as he is expected to use ask with analysts for that
+        if matches!(self.role, Role::Manager) {
+        	    return tools;
+        }
 
         // ── Web search provider dispatch ──────────────────────
         // Exactly one web_search tool is registered, depending on config.
