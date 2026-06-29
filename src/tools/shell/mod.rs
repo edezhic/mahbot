@@ -1007,6 +1007,16 @@ fn finish_shell_output(
     elapsed: Duration,
     full_output_for_spill: Option<&str>,
 ) -> String {
+    // Defense-in-depth: scrub credentials before any further processing so
+    // that both the inline `combined` output and the spill-file content are
+    // consistently sanitized, regardless of which spill path is taken.
+    // Double-scrubbing is idempotent because the redacted marker (*[REDACTED])
+    // does not match the credential regex pattern. The agent layer also scrubs
+    // shell output downstream (sanitize_success_tool_output) — this ensures
+    // the function is internally consistent even if called outside the agent
+    // dispatch loop.
+    combined = scrub_credentials(&combined);
+
     if elapsed.as_secs_f64() >= 1.0 {
         let _ = write!(combined, "\n[took {:.1}s]", elapsed.as_secs_f64());
     }
@@ -3211,5 +3221,60 @@ mod tests {
         let (result, pre) = apply_line_truncation(output, &p);
         assert_eq!(result, output, "not enough lines to truncate");
         assert_eq!(pre, None);
+    }
+
+    // ── finish_shell_output credential scrubbing tests ────────────────
+
+    #[test]
+    fn finish_shell_output_scrubs_combined_inline() {
+        // Path 2: no pre-truncation spill, output below threshold
+        // → combined returned directly. Credentials must be scrubbed.
+        let result =
+            finish_shell_output("API_KEY=abcdefghijklmnop".to_string(), Duration::ZERO, None);
+        assert!(!result.contains("abcdefghijklmnop"));
+        assert!(result.contains("abcd*[REDACTED]"));
+    }
+
+    #[test]
+    fn finish_shell_output_scrubs_combined_in_pre_truncation_path() {
+        // Path 1: pre-truncation output exceeds spill threshold.
+        // Combined output with credentials must be scrubbed even though
+        // the spill file takes the `pre` content (which is also scrubbed).
+        let combined = "SECRET=wxyz1234abcdefgh".to_string();
+        let pre = "x".repeat(SPILL_THRESHOLD_BYTES + 1);
+        let result = finish_shell_output(combined, Duration::ZERO, Some(&pre));
+        assert!(!result.contains("wxyz1234abcdefgh"));
+        assert!(result.contains("wxyz*[REDACTED]"));
+        // Should include a spill header referencing the saved file
+        assert!(result.contains("[Output saved to"));
+    }
+
+    #[test]
+    fn finish_shell_output_preserves_clean_output() {
+        let result = finish_shell_output("no credentials here".to_string(), Duration::ZERO, None);
+        assert_eq!(result, "no credentials here");
+    }
+
+    #[test]
+    fn finish_shell_output_appends_elapsed_timing_after_scrub() {
+        // Elapsed timing (≥1s) is appended AFTER credential scrubbing.
+        let result = finish_shell_output(
+            "API_KEY=abcdefghijklmnop".to_string(),
+            Duration::from_secs(5),
+            None,
+        );
+        // Credentials should be scrubbed
+        assert!(!result.contains("abcdefghijklmnop"));
+        // Timing should still be appended
+        assert!(result.contains("[took 5.0s]"));
+    }
+
+    #[test]
+    fn finish_shell_output_idempotent_scrub() {
+        // Double-scrubbing is idempotent: already-scrubbed content
+        // (*[REDACTED] does not match the credential regex).
+        let already_scrubbed = "API_KEY=abcd*[REDACTED]".to_string();
+        let result = finish_shell_output(already_scrubbed.clone(), Duration::ZERO, None);
+        assert_eq!(result, already_scrubbed);
     }
 }

@@ -38,6 +38,7 @@ use crate::session::ticket_session_key;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::util::panic_message;
+use crate::util::scrub_credentials;
 use crate::{Role, Tool, Workspace};
 
 /// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
@@ -1581,7 +1582,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 } else {
                     output
                 };
-                comment.push_str(&display);
+                comment.push_str(&scrub_credentials(&display));
 
                 if failed {
                     all_passed = false;
