@@ -645,15 +645,27 @@ pub async fn run_git_show(
         Err(_) => Ok(None),
     }
 }
-/// Run a git command and return stdout as string.
-pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("git")
+/// Run a git command without any interpretation of the exit code.
+///
+/// Shared by [`run_git_command`] and [`git_has_commits`] to avoid
+/// duplicating the spawn + output + decode pattern. Returns the raw
+/// [`std::process::Output`] so each caller can interpret the exit
+/// status as appropriate.
+async fn run_git_raw(repo_path: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    tokio::process::Command::new("git")
         .args(args)
         .current_dir(repo_path)
         .env("LC_ALL", "C")
         .output()
         .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
+        .map_err(|e| format!("Failed to run git: {e}"))
+}
+
+/// Run a git command and return stdout as string on success.
+///
+/// Returns an error if git exits with a non-zero status.
+pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
+    let output = run_git_raw(repo_path, args).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -851,12 +863,7 @@ pub async fn git_is_installed() -> bool {
 
 /// Check if a git repo has any commits.
 pub async fn git_has_commits(repo_path: &Path) -> Result<bool, String> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-list", "-n", "1", "HEAD"])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
+    let output = run_git_raw(repo_path, &["rev-list", "-n", "1", "HEAD"]).await?;
 
     // If the command fails, there are no commits or something is wrong
     if !output.status.success() {
@@ -1391,6 +1398,30 @@ index abc123..def456 100644
     }
 
     // ── Integration tests for run_git_* functions ────────────────
+
+    #[tokio::test]
+    async fn test_git_has_commits_true() {
+        let (_dir, repo_path) = init_temp_repo();
+        let has = git_has_commits(&repo_path).await.expect("git_has_commits");
+        assert!(has, "repo with initial commit should have commits");
+    }
+
+    #[tokio::test]
+    async fn test_git_has_commits_false() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo_path = dir.path().to_path_buf();
+
+        // `git init` without any commit — empty repo
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        let has = git_has_commits(&repo_path).await.expect("git_has_commits");
+        assert!(!has, "empty repo should not have commits");
+    }
 
     #[tokio::test]
     async fn test_run_git_current_branch_default() {
