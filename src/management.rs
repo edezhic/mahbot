@@ -129,6 +129,28 @@ fn sanitation_breaker_comment(count: usize) -> String {
     )
 }
 
+/// Count prior diagnostics failure comments (role == `DIAGNOSTICS_ROLE`, content
+/// starts with [`DIAGNOSTICS_COMMENT_PREFIX`] and contains [`DIAGNOSTICS_FAILED_MARKER`]).
+/// Used by the diagnostics circuit breaker.
+fn count_diagnostics_failures(comments: &[TicketComment]) -> usize {
+    comments
+        .iter()
+        .filter(|c| {
+            c.role == DIAGNOSTICS_ROLE
+                && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
+                && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
+        })
+        .count()
+}
+
+/// Format the circuit-breaker trip comment for diagnostics failures.
+fn diagnostics_breaker_comment(count: usize) -> String {
+    format!(
+        "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
+         failures. Failing ticket."
+    )
+}
+
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
 /// Returns `false` if the ticket was moved externally or an error occurred.
 #[must_use]
@@ -1542,22 +1564,8 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         &ticket,
         TicketPhase::InDiagnostics,
         DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
-        |comments| {
-            comments
-                .iter()
-                .filter(|c| {
-                    c.role == DIAGNOSTICS_ROLE
-                        && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
-                        && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
-                })
-                .count()
-        },
-        |count| {
-            format!(
-                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
-                 failures. Failing ticket."
-            )
-        },
+        count_diagnostics_failures,
+        diagnostics_breaker_comment,
         "Diagnostics",
     )
     .await
