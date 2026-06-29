@@ -1105,197 +1105,168 @@ mod tests {
         }
     }
 
-    // ── RoleConfig upsert tests ──────────────────────────────
+    // ── Upsert three-scenario test macro ─────────────────────────
     //
-    // Each test exercises both configurable fields on the struct.
-    // Every sub-case covers the same three scenarios (documented inline)
-    // for each field independently, with field-prefixed assertion messages
-    // to disambiguate failures.
+    // Generates the three scenario blocks (updates_existing,
+    // pushes_new_entry, can_set_none) for a type that has an `upsert`
+    // function and a corresponding test-helper constructor.  Eliminates
+    // the ~180-line structural duplication that existed when each test
+    // had hand-written blocks.
+
+    macro_rules! test_upsert_three_scenarios {
+        (
+            $helper:ident,       // role_config or model_routing
+            $upsert:path,        // RoleConfig::upsert or ModelRouting::upsert
+            $key:expr,           // "engineer" or "gpt-4"
+            $key_accessor:ident, // .role (RoleConfig) or .model (ModelRouting)
+            $field_a:ident,      // model / provider_order
+            $field_b:ident,      // reasoning_effort / allow_fallbacks
+            $start_a:expr,       // (field_a_val, field_b_val) for updates_existing A
+            $start_b:expr,       // (field_a_val, field_b_val) for updates_existing B
+            $update_a:expr,      // value to assign to $field_a when updating
+            $update_b:expr,      // value to assign to $field_b when updating
+            $new_a:expr,         // value to assign to $field_a on fresh entry
+            $new_b:expr,         // value to assign to $field_b on fresh entry
+            $none_start:expr,    // (field_a_val, field_b_val) for can_set_none
+        ) => {
+            // 1. updates_existing — existing entry, upsert sets one field,
+            //    the other field is preserved unchanged
+            {
+                let (a, b) = $start_a;
+                let mut items = vec![$helper($key, a, b)];
+                $upsert(&mut items, $key, |item| item.$field_a = $update_a);
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0].$field_a, $update_a,
+                    concat!("[", stringify!($field_a), "] target field updated")
+                );
+                assert_eq!(
+                    items[0].$field_b,
+                    b.map(Into::into),
+                    concat!("[", stringify!($field_a), "] other field preserved")
+                );
+            }
+            {
+                let (a, b) = $start_b;
+                let mut items = vec![$helper($key, a, b)];
+                $upsert(&mut items, $key, |item| item.$field_b = $update_b);
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0].$field_b, $update_b,
+                    concat!("[", stringify!($field_b), "] target field updated")
+                );
+                assert_eq!(
+                    items[0].$field_a,
+                    a.map(Into::into),
+                    concat!("[", stringify!($field_b), "] other field preserved")
+                );
+            }
+
+            // 2. pushes_new_entry — empty vec, new entry is pushed with the
+            //    target field set and the other field None
+            {
+                let mut items = vec![];
+                $upsert(&mut items, $key, |item| item.$field_a = $new_a);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].$key_accessor, $key);
+                assert_eq!(
+                    items[0].$field_a, $new_a,
+                    concat!("[", stringify!($field_a), "] set on new entry")
+                );
+                assert_eq!(items[0].$field_b, None);
+            }
+            {
+                let mut items = vec![];
+                $upsert(&mut items, $key, |item| item.$field_b = $new_b);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].$key_accessor, $key);
+                assert_eq!(
+                    items[0].$field_b, $new_b,
+                    concat!("[", stringify!($field_b), "] set on new entry")
+                );
+                assert_eq!(items[0].$field_a, None);
+            }
+
+            // 3. can_set_none — existing entry has both fields set to non-None;
+            //    clearing one field via None leaves the other field unchanged
+            {
+                let (a, b) = $none_start;
+                let mut items = vec![$helper($key, a, b)];
+                $upsert(&mut items, $key, |item| item.$field_a = None);
+                assert_eq!(
+                    items[0].$field_a, None,
+                    concat!("[", stringify!($field_a), "] cleared to None")
+                );
+                assert_eq!(
+                    items[0].$field_b,
+                    b.map(Into::into),
+                    concat!(
+                        "[",
+                        stringify!($field_a),
+                        "] other field preserved when clearing"
+                    )
+                );
+            }
+            {
+                let (a, b) = $none_start;
+                let mut items = vec![$helper($key, a, b)];
+                $upsert(&mut items, $key, |item| item.$field_b = None);
+                assert_eq!(
+                    items[0].$field_b, None,
+                    concat!("[", stringify!($field_b), "] cleared to None")
+                );
+                assert_eq!(
+                    items[0].$field_a,
+                    a.map(Into::into),
+                    concat!(
+                        "[",
+                        stringify!($field_b),
+                        "] other field preserved when clearing"
+                    )
+                );
+            }
+        };
+    }
+
+    // ── RoleConfig upsert tests ──────────────────────────────
 
     #[test]
     fn upsert_role_config_fields() {
-        // 1. updates_existing — existing entry, upsert sets one field,
-        //    the other field is preserved unchanged
-        {
-            let mut c = vec![role_config("engineer", Some("old"), Some("high"))];
-            RoleConfig::upsert(&mut c, "engineer", |c| c.model = Some("new".into()));
-            assert_eq!(c.len(), 1);
-            assert_eq!(
-                c[0].model,
-                Some("new".into()),
-                "[model] target field updated"
-            );
-            assert_eq!(
-                c[0].reasoning_effort,
-                Some("high".into()),
-                "[model] other field preserved"
-            );
-        }
-        {
-            let mut c = vec![role_config("engineer", Some("gpt-4"), Some("low"))];
-            RoleConfig::upsert(&mut c, "engineer", |c| {
-                c.reasoning_effort = Some("high".into());
-            });
-            assert_eq!(c.len(), 1);
-            assert_eq!(
-                c[0].reasoning_effort,
-                Some("high".into()),
-                "[reasoning_effort] target field updated"
-            );
-            assert_eq!(
-                c[0].model,
-                Some("gpt-4".into()),
-                "[reasoning_effort] other field preserved"
-            );
-        }
-
-        // 2. pushes_new_entry — empty vec, new entry is pushed with the
-        //    target field set and the other field None
-        {
-            let mut c = vec![];
-            RoleConfig::upsert(&mut c, "engineer", |c| c.model = Some("gpt-4".into()));
-            assert_eq!(c.len(), 1);
-            assert_eq!(c[0].role, "engineer");
-            assert_eq!(c[0].model, Some("gpt-4".into()), "[model] set on new entry");
-            assert_eq!(c[0].reasoning_effort, None);
-        }
-        {
-            let mut c = vec![];
-            RoleConfig::upsert(&mut c, "engineer", |c| {
-                c.reasoning_effort = Some("high".into());
-            });
-            assert_eq!(c.len(), 1);
-            assert_eq!(c[0].role, "engineer");
-            assert_eq!(
-                c[0].reasoning_effort,
-                Some("high".into()),
-                "[reasoning_effort] set on new entry"
-            );
-            assert_eq!(c[0].model, None);
-        }
-
-        // 3. can_set_none — existing entry has both fields set to non-None;
-        //    clearing one field via None leaves the other field unchanged
-        {
-            let mut c = vec![role_config("engineer", Some("gpt-4"), Some("high"))];
-            RoleConfig::upsert(&mut c, "engineer", |c| c.model = None);
-            assert_eq!(c[0].model, None, "[model] cleared to None");
-            assert_eq!(
-                c[0].reasoning_effort,
-                Some("high".into()),
-                "[model] other field preserved when clearing"
-            );
-        }
-        {
-            let mut c = vec![role_config("engineer", Some("gpt-4"), Some("high"))];
-            RoleConfig::upsert(&mut c, "engineer", |c| c.reasoning_effort = None);
-            assert_eq!(
-                c[0].reasoning_effort, None,
-                "[reasoning_effort] cleared to None"
-            );
-            assert_eq!(
-                c[0].model,
-                Some("gpt-4".into()),
-                "[reasoning_effort] other field preserved when clearing"
-            );
+        test_upsert_three_scenarios! {
+            role_config,
+            RoleConfig::upsert,
+            "engineer",
+            role,
+            model,
+            reasoning_effort,
+            (Some("old"), Some("high")),
+            (Some("gpt-4"), Some("low")),
+            Some("new".into()),
+            Some("high".into()),
+            Some("gpt-4".into()),
+            Some("high".into()),
+            (Some("gpt-4"), Some("high")),
         }
     }
 
-    // ── ModelRouting upsert tests ────────────────────────────────
-    //
-    // Same three-scenario structure as the RoleConfig test above (see the
-    // design note on `impl RoleConfig` for why these are duplicated).
+    // ── ModelRouting upsert tests ────────────────────────────
 
     #[test]
     fn upsert_model_routing_fields() {
-        // 1. updates_existing
-        {
-            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut r, "gpt-4", |mr| {
-                mr.provider_order = Some("Anthropic".into());
-            });
-            assert_eq!(r.len(), 1);
-            assert_eq!(
-                r[0].provider_order,
-                Some("Anthropic".into()),
-                "[provider_order] target field updated"
-            );
-            assert_eq!(
-                r[0].allow_fallbacks,
-                Some(true),
-                "[provider_order] other field preserved"
-            );
-        }
-        {
-            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut r, "gpt-4", |mr| mr.allow_fallbacks = Some(false));
-            assert_eq!(r.len(), 1);
-            assert_eq!(
-                r[0].allow_fallbacks,
-                Some(false),
-                "[allow_fallbacks] target field updated"
-            );
-            assert_eq!(
-                r[0].provider_order,
-                Some("OpenAi".into()),
-                "[allow_fallbacks] other field preserved"
-            );
-        }
-
-        // 2. pushes_new_entry
-        {
-            let mut r = vec![];
-            ModelRouting::upsert(&mut r, "gpt-4", |mr| {
-                mr.provider_order = Some("OpenAi".into());
-            });
-            assert_eq!(r.len(), 1);
-            assert_eq!(r[0].model, "gpt-4");
-            assert_eq!(
-                r[0].provider_order,
-                Some("OpenAi".into()),
-                "[provider_order] set on new entry"
-            );
-            assert_eq!(r[0].allow_fallbacks, None);
-        }
-        {
-            let mut r = vec![];
-            ModelRouting::upsert(&mut r, "gpt-4", |mr| mr.allow_fallbacks = Some(false));
-            assert_eq!(r.len(), 1);
-            assert_eq!(r[0].model, "gpt-4");
-            assert_eq!(
-                r[0].allow_fallbacks,
-                Some(false),
-                "[allow_fallbacks] set on new entry"
-            );
-            assert_eq!(r[0].provider_order, None);
-        }
-
-        // 3. can_set_none — both fields start non-None to verify preservation
-        {
-            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut r, "gpt-4", |mr| mr.provider_order = None);
-            assert_eq!(
-                r[0].provider_order, None,
-                "[provider_order] cleared to None"
-            );
-            assert_eq!(
-                r[0].allow_fallbacks,
-                Some(true),
-                "[provider_order] other field preserved when clearing"
-            );
-        }
-        {
-            let mut r = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut r, "gpt-4", |mr| mr.allow_fallbacks = None);
-            assert_eq!(
-                r[0].allow_fallbacks, None,
-                "[allow_fallbacks] cleared to None"
-            );
-            assert_eq!(
-                r[0].provider_order,
-                Some("OpenAi".into()),
-                "[allow_fallbacks] other field preserved when clearing"
-            );
+        test_upsert_three_scenarios! {
+            model_routing,
+            ModelRouting::upsert,
+            "gpt-4",
+            model,
+            provider_order,
+            allow_fallbacks,
+            (Some("OpenAi"), Some(true)),
+            (Some("OpenAi"), Some(true)),
+            Some("Anthropic".into()),
+            Some(false),
+            Some("OpenAi".into()),
+            Some(false),
+            (Some("OpenAi"), Some(true)),
         }
     }
 
