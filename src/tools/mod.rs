@@ -404,19 +404,14 @@ mod tests {
     #[test]
     // ── media_marker coverage ────────────────────────────────────────
     fn all_media_tools_implement_media_marker() {
-        /// Assert that a tool returns Some from media_marker().
-        macro_rules! assert_media_marker {
-            ($tool:expr) => {
-                assert!(
-                    $tool.media_marker().is_some(),
-                    "{} should return Some from media_marker()",
-                    $tool.name(),
-                );
-            };
-        }
-
-        assert_media_marker!(ImageGenTool);
-        assert_media_marker!(VideoGenTool);
+        assert!(
+            ImageGenTool.media_marker().is_some(),
+            "ImageGenTool should return Some from media_marker()"
+        );
+        assert!(
+            VideoGenTool.media_marker().is_some(),
+            "VideoGenTool should return Some from media_marker()"
+        );
     }
 
     // ── PATH_ALIAS_KEYS regression tests ──────────────────────────────
