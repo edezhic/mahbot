@@ -116,6 +116,7 @@ libc = "0.2"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security"] }
 
 [dev-dependencies]
+http = "1.4"
 tempfile = "3"
 
 [profile.dev]

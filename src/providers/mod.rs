@@ -6,7 +6,6 @@
 
 pub mod compatible;
 pub mod compatible_streaming;
-pub mod error;
 pub mod reasoning_roundtrip;
 pub mod reliable;
 pub mod transcribe;

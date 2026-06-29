@@ -3,9 +3,9 @@
 //! This module provides a single implementation that works for all of them.
 
 use crate::providers::compatible_streaming::drain_sse_into_channel;
-use crate::providers::error::ProviderError;
 use crate::providers::reasoning_roundtrip;
 use crate::providers::{ensure_chat_completions_url, provider_routing_json};
+use crate::util::error::HttpError;
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     MessageRole, Provider, ProviderUsage, Reasoning, StreamError, StreamEvent, StreamResult,
@@ -647,8 +647,8 @@ impl Provider for OpenAiCompatibleProvider {
             })?;
 
         if !response.status().is_success() {
-            let provider_err = ProviderError::from_response(response, &self.name).await;
-            return Err(anyhow::Error::from(provider_err));
+            let http_err = HttpError::from_response(response, &self.name).await;
+            return Err(anyhow::Error::from(http_err));
         }
 
         let body = crate::shutdown::race_shutdown(response.text())
@@ -718,9 +718,9 @@ impl Provider for OpenAiCompatibleProvider {
             };
 
             if !response.status().is_success() {
-                let provider_err = ProviderError::from_response(response, &provider_name).await;
+                let http_err = HttpError::from_response(response, &provider_name).await;
                 let _ = tx
-                    .send(Err(StreamError::Provider(provider_err.to_string())))
+                    .send(Err(StreamError::Provider(http_err.to_string())))
                     .await;
                 return;
             }

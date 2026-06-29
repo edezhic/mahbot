@@ -157,11 +157,6 @@ impl Tool for VideoGenTool {
         }
 
         let videos_url = format!("{api_base}/videos");
-        // 402 credit detection uses the shared extract_http_status helper
-        // which parses status codes from check_response's error format:
-        // "{error_context} API error ({status}): {preview}".  If that format
-        // changes, the shared helper must be updated accordingly — this
-        // coupling is documented in src/util/http.rs.
         let submit_body: serde_json::Value = match crate::util::http::post_json_to_provider(
             &videos_url,
             &body,
@@ -171,7 +166,10 @@ impl Tool for VideoGenTool {
         {
             Ok(v) => v,
             Err(e) => {
-                if crate::util::http::extract_http_status(&e.to_string()) == Some(402) {
+                if e.downcast_ref::<crate::util::error::HttpError>()
+                    .map(|e| e.status)
+                    == Some(402)
+                {
                     anyhow::bail!(
                         "Insufficient OpenRouter credits for video generation (HTTP 402). \
                              Please add credits to your OpenRouter account and try again."

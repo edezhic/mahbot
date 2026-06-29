@@ -50,23 +50,18 @@ pub fn bearer_auth_header() -> Option<String> {
 /// the typed `reqwest::Error` chain is not always preserved by the caller.
 ///
 /// Used by:
-/// - [`classify_err`](crate::providers::reliable) (string-fallback error path)
-/// - [`VideoGenTool`](crate::tools::video_gen::VideoGenTool) (402 credit detection)
-///
-/// Both consumers depend on the error format produced by [`check_response`]:
-/// `"{error_context} API error ({status}): {preview}"`.
-/// This shared extractor centralises the string-based status parsing so
-/// that format changes only need updating in one place.
+/// - [`classify_err`](crate::providers::reliable) (string-fallback error path for
+///   errors that arrive without a [`HttpError`](super::error::HttpError) wrapper)
 ///
 /// # Limitations
 ///
 /// - May produce false positives if error messages contain other 400-500
 ///   range numbers (e.g. a field value of 400).  This is an accepted risk
 ///   shared by all string-parsing approaches.
-/// - A more robust solution would refactor `check_response` to return a
-///   typed `ProviderError` with a structured status code — this is a
-///   future improvement left for when the error handling infrastructure
-///   is revisited more broadly.
+/// - Primary use case (re-parsing [`check_response`] string errors) has been
+///   eliminated — [`check_response`] now returns a typed
+///   [`HttpError`](super::error::HttpError) directly.  This function
+///   remains as a general-purpose fallback for genuinely string-only errors.
 #[must_use]
 pub(crate) fn extract_http_status(msg: &str) -> Option<u16> {
     msg.split(|c: char| !c.is_ascii_digit())
@@ -78,20 +73,13 @@ pub(crate) fn extract_http_status(msg: &str) -> Option<u16> {
 ///
 /// If the status is 2xx the response is returned unmodified for further
 /// processing (body reading, parsing, etc.).  On non-2xx the response body is
-/// consumed, truncated to 500 characters, and included in the error message.
-///
-/// # Error format
-///
-/// `"{error_context} API error ({status}): {preview}"`
-///
-/// **Important:** Both [`extract_http_status`] and callers that parse status
-/// codes from this error format (e.g. [`VideoGenTool`](crate::tools::video_gen::VideoGenTool))
-/// depend on exactly this format.  Any format change will silently break
-/// those consumers.
+/// consumed, truncated to 500 characters, and wrapped in a
+/// [`HttpError`](super::error::HttpError) that preserves the status
+/// code and body as typed fields (accessible via `err.downcast_ref`).
 ///
 /// # Errors
 ///
-/// - Non-2xx status: the formatted error described above.
+/// - Non-2xx status: returns the response body as a [`HttpError`](super::error::HttpError).
 async fn check_response(
     response: reqwest::Response,
     error_context: &str,
@@ -103,7 +91,12 @@ async fn check_response(
             "failed to read response body".to_string()
         });
         let preview = crate::util::truncate(&error_text, 500);
-        anyhow::bail!("{error_context} API error ({status}): {preview}");
+        return Err(anyhow::Error::from(super::error::HttpError::new(
+            status.as_u16(),
+            error_context,
+            preview,
+            None,
+        )));
     }
     Ok(response)
 }
@@ -141,9 +134,8 @@ pub(crate) fn parse_json_response(
 /// # Errors
 ///
 /// - Transport errors: `"{error_context} request failed: {err}"`
-/// - Non-2xx status: `"{error_context} API error ({status}): {preview}"` (first 500 chars)
-/// - JSON parse failure: includes the raw response body length and a preview in
-///   the error message for easier debugging.
+/// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
+/// - JSON parse failure: includes the raw response body length and a preview in the error message for easier debugging.
 pub async fn post_json_to_provider(
     url: &str,
     body: &serde_json::Value,
@@ -182,7 +174,7 @@ pub async fn post_json_to_provider(
 /// # Errors
 ///
 /// - Transport errors: `"{error_context} request failed: {err}"`
-/// - Non-2xx status: `"{error_context} API error ({status}): {preview}"` (first 500 chars)
+/// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
 /// - JSON parse failure: includes the raw response body length and a preview in
 ///   the error message for easier debugging.
 pub async fn get_json_from_provider(
@@ -220,7 +212,7 @@ pub async fn get_json_from_provider(
 /// # Errors
 ///
 /// - Transport errors: `"{error_context} request failed: {err}"`
-/// - Non-2xx status: `"{error_context} API error ({status}): {preview}"` (first 500 chars)
+/// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
 /// - Body read failure: `"{error_context} failed to read response body: {err}"`
 pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::Result<Vec<u8>> {
     let auth = bearer_auth_header()
@@ -388,5 +380,73 @@ mod tests {
             Some(400),
             "400 as part of identifier — accepted false positive"
         );
+    }
+
+    #[tokio::test]
+    async fn check_response_returns_http_error_on_non_2xx() {
+        // Construct a mock HTTP response with a non-2xx status using
+        // http::Response::builder() + the unconditional From impl on reqwest::Response.
+        let http_resp = http::Response::builder()
+            .status(402)
+            .body("Insufficient credits: please top up your account".to_string())
+            .unwrap();
+        let resp = reqwest::Response::from(http_resp);
+
+        let result = check_response(resp, "Video generation submission").await;
+        assert!(result.is_err(), "expected error for 402 status");
+
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<crate::util::error::HttpError>()
+                .map(|e| e.status),
+            Some(402),
+        );
+    }
+
+    #[tokio::test]
+    async fn check_response_truncates_long_body() {
+        // Verify that bodies longer than 500 chars are truncated.
+        let long_body = "x".repeat(1000);
+        let http_resp = http::Response::builder()
+            .status(400)
+            .body(long_body.clone())
+            .unwrap();
+        let resp = reqwest::Response::from(http_resp);
+
+        let result = check_response(resp, "test").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let http_err = err.downcast_ref::<crate::util::error::HttpError>().unwrap();
+
+        // The body should be truncated to 500 Unicode chars + "…" (1 char, 3 bytes).
+        assert!(
+            http_err.body.len() <= 503,
+            "body should be truncated, got {} bytes",
+            http_err.body.len()
+        );
+        assert!(
+            http_err.body.len() < long_body.len(),
+            "truncated body ({}) should be shorter than original ({})",
+            http_err.body.len(),
+            long_body.len(),
+        );
+        assert!(
+            http_err.body.ends_with('…'),
+            "truncated body should end with ellipsis"
+        );
+        assert_eq!(http_err.status, 400);
+    }
+
+    #[tokio::test]
+    async fn check_response_returns_ok_on_2xx() {
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(r#"{"ok": true}"#.to_string())
+            .unwrap();
+        let resp = reqwest::Response::from(http_resp);
+
+        let result = check_response(resp, "test").await;
+        assert!(result.is_ok(), "expected success for 200 status");
     }
 }

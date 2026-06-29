@@ -1,5 +1,6 @@
 //! Utility modules for shared helper functions.
 
+pub mod error;
 pub mod html;
 pub mod http;
 pub mod json;

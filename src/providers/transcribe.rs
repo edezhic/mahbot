@@ -64,8 +64,9 @@ impl ImageTranscriber {
             body["provider"] = routing;
         }
 
-        // NOTE: This helper switches from `ProviderError` to `anyhow::bail` for
-        // non-2xx responses.  This is safe because the error is caught by
+        // NOTE: `post_json_to_provider` returns non-2xx responses as typed
+        // [`HttpError`](crate::util::error::HttpError) (accessible via
+        // `downcast_ref`).  This is safe because the error is caught by
         // `handle_non_multimodal_image` (in channels/mod.rs) which logs a
         // warning and falls back to a generic annotation — it never reaches
         // the retry logic in the provider layer.
@@ -136,10 +137,10 @@ impl AudioTranscriber {
         let base = crate::providers::ensure_base_url(&self.inner.api_url);
         let url = format!("{base}/audio/transcriptions");
 
-        // NOTE: post_json_to_provider switches from ProviderError to anyhow::bail
-        // for non-2xx responses. This is safe because the caller
-        // (transcribe_audio_marker in channels/mod.rs) catches all errors and
-        // falls back to "[Audio: ...]" — it never reaches the retry logic in the
+        // NOTE: `post_json_to_provider` returns non-2xx responses as typed
+        // [`HttpError`](crate::util::error::HttpError). This is safe because
+        // the caller (transcribe_audio_marker in channels/mod.rs) catches all errors
+        // and falls back to "[Audio: ...]" — it never reaches the retry logic in the
         // provider layer.
         let json =
             crate::util::http::post_json_to_provider(&url, &body, "audio transcription").await?;

@@ -1,5 +1,5 @@
 use super::Provider;
-use crate::providers::error::ProviderError;
+use crate::util::error::HttpError;
 use crate::util::http::extract_http_status;
 use crate::{ChatRequest, ChatResponse, StreamEvent, StreamResult};
 use async_trait::async_trait;
@@ -154,7 +154,7 @@ fn is_non_retryable_4xx(code: u16) -> bool {
 /// Classify an error into one of the [`ErrorClass`] variants.
 ///
 /// ## Cascade Order
-/// 1. **Typed path** (downcast to [`ProviderError`] succeeds): dispatch on
+/// 1. **Typed path** (downcast to [`HttpError`] succeeds): dispatch on
 ///    structured status code via [`classify_by_status_code`] — which checks
 ///    context-window/tool-schema body-text hints, then 4xx codes other than
 ///    408 and 429 as [`NonRetryable`](ErrorClass::NonRetryable), else
@@ -170,9 +170,9 @@ fn classify_err(err: &anyhow::Error) -> ErrorClass {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
 
-    // ── Typed path: extract from structured ProviderError ──
-    if let Some(provider_err) = err.downcast_ref::<ProviderError>() {
-        return classify_by_status_code(Some(provider_err.status), &lower);
+    // ── Typed path: extract from structured HttpError ──
+    if let Some(http_err) = err.downcast_ref::<HttpError>() {
+        return classify_by_status_code(Some(http_err.status), &lower);
     }
 
     // ── Transport error typed path: extract from reqwest::Error ──
@@ -215,18 +215,18 @@ fn classify_transport_err(transport_err: &reqwest::Error, lower: &str) -> ErrorC
 
 /// Try to extract a Retry-After value (in milliseconds) from an error.
 ///
-/// Extracts from the typed [`ProviderError::retry_after_ms`] field when the
-/// error wraps a [`ProviderError`]. Returns `None` for non-structured errors
+/// Extracts from the typed [`HttpError::retry_after_ms`] field when the
+/// error wraps a [`HttpError`]. Returns `None` for non-structured errors
 /// (transport errors, JSON parse errors, etc.) since those never carry a
 /// Retry-After value.
 ///
 /// **Note for future providers**: if a new [`Provider`] implementation returns
-/// errors with Retry-After information that do NOT wrap [`ProviderError`],
+/// errors with Retry-After information that do NOT wrap [`HttpError`],
 /// a string-based fallback path may need to be added here.
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
-    // ── Typed path: extract from structured ProviderError ──
-    if let Some(provider_err) = err.downcast_ref::<ProviderError>() {
-        return provider_err.retry_after_ms;
+    // ── Typed path: extract from structured HttpError ──
+    if let Some(http_err) = err.downcast_ref::<HttpError>() {
+        return http_err.retry_after_ms;
     }
     None
 }
@@ -553,30 +553,30 @@ mod tests {
     #[test]
     fn backoff_and_retry_after() {
         // ── parse_retry_after_ms unit tests ──
-        let with_retry = ProviderError::new(429, "test", "rate limited", Some(5000));
+        let with_retry = HttpError::new(429, "test", "rate limited", Some(5000));
         assert_eq!(
             parse_retry_after_ms(&anyhow::Error::from(with_retry)),
             Some(5000)
         );
 
-        let no_retry = ProviderError::new(429, "test", "rate limit", None);
+        let no_retry = HttpError::new(429, "test", "rate limit", None);
         assert_eq!(parse_retry_after_ms(&anyhow::Error::from(no_retry)), None);
 
         // ── compute_backoff: respects retry-after ──
         let structured =
-            anyhow::Error::from(ProviderError::new(429, "test", "rate limited", Some(3_000)));
+            anyhow::Error::from(HttpError::new(429, "test", "rate limited", Some(3_000)));
         assert_eq!(ReliableProvider::compute_backoff(500, &structured), 3_000);
 
         // ── compute_backoff: clamps retry-after to MAX_BACKOFF (30s) ──
         let with_long_retry =
-            anyhow::Error::from(ProviderError::new(429, "test", "rate limit", Some(120_000)));
+            anyhow::Error::from(HttpError::new(429, "test", "rate limit", Some(120_000)));
         assert_eq!(
             ReliableProvider::compute_backoff(500, &with_long_retry),
             30_000
         );
 
         // ── compute_backoff: jittered fallback when no retry-after ──
-        let no_header = anyhow::Error::from(ProviderError::new(500, "test", "error", None));
+        let no_header = anyhow::Error::from(HttpError::new(500, "test", "error", None));
         let backoff = ReliableProvider::compute_backoff(500, &no_header);
         assert!(
             (375..625).contains(&backoff),
@@ -586,9 +586,9 @@ mod tests {
 
     #[test]
     fn classify_err_typed_path() {
-        // ── ProviderError typed path for classify_err ──
+        // ── HttpError typed path for classify_err ──
         let make_structured = |status: u16, body: &str| -> anyhow::Error {
-            anyhow::Error::from(ProviderError::new(status, "test", body, None))
+            anyhow::Error::from(HttpError::new(status, "test", body, None))
         };
 
         // 429 transient rate limit → retryable (falls through to
