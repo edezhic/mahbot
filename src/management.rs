@@ -1258,6 +1258,26 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
 }
 
+/// Record a sanitation failure: add a system comment for the circuit breaker
+/// and clear assigned_to so the ticket can be re-dispatched.
+async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
+    let _ = board()
+        .add_comment(
+            ticket_id,
+            SYSTEM_ROLE,
+            &format!("{SANITATION_FAILED_PREFIX} — {reason}"),
+        )
+        .await;
+    if let Err(e) = board().set_assigned_to(ticket_id, None).await {
+        warn!(
+            ticket = %ticket_id,
+            error = %e,
+            "Failed to clear assigned_to after sanitation failure \
+             — ticket may be stuck in InSanitation",
+        );
+    }
+}
+
 /// Run the sanitation agent to inspect new/untracked files in the workspace.
 ///
 /// Called by [`PollPhase::SanitationCheck`] via [`spawn_dispatch`]. Runs a
@@ -1366,21 +1386,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             ticket = %ticket.id,
             "Sanitation agent returned no output — clearing assigned_to for retry"
         );
-        let _ = board()
-            .add_comment(
-                &ticket.id,
-                SYSTEM_ROLE,
-                &format!("{SANITATION_FAILED_PREFIX} — agent returned no output"),
-            )
-            .await;
-        if let Err(e) = board().set_assigned_to(&ticket.id, None).await {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to clear assigned_to after sanitation agent failure — \
-                 ticket may be stuck in InSanitation",
-            );
-        }
+        record_sanitation_failure(&ticket.id, "agent returned no output").await;
         return;
     };
 
@@ -1398,23 +1404,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
                 error = %e,
                 "Failed to extract sanitation verdict — clearing assigned_to for retry"
             );
-            // Record the failure as a system comment so the circuit breaker
-            // can detect repeated extraction failures.
-            let _ = board()
-                .add_comment(
-                    &ticket.id,
-                    SYSTEM_ROLE,
-                    &format!("{SANITATION_FAILED_PREFIX} — verdict extraction error: {e}"),
-                )
-                .await;
-            if let Err(e) = board().set_assigned_to(&ticket.id, None).await {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to clear assigned_to after verdict extraction error — \
-                     ticket may be stuck in InSanitation",
-                );
-            }
+            record_sanitation_failure(&ticket.id, format!("verdict extraction error: {e}")).await;
             return;
         }
     };
