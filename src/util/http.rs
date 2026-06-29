@@ -123,6 +123,28 @@ pub(crate) fn parse_json_response(
     })
 }
 
+/// Shared request boilerplate for provider API calls.
+///
+/// Extracts the Bearer auth header (from [`bearer_auth_header()`]), gets the
+/// shared HTTP client (from [`media_http_client()`]), uses `build_request` to
+/// construct the request, sends it, and checks the response status.  The
+/// Authorization header is injected automatically — the closure only needs to
+/// set the HTTP method, URL, and optional body.
+async fn provider_request(
+    error_context: &str,
+    build_request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
+) -> anyhow::Result<reqwest::Response> {
+    let auth = bearer_auth_header()
+        .ok_or_else(|| anyhow::anyhow!("{error_context}: provider API key is not configured"))?;
+    let client = media_http_client();
+    let response = build_request(client)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
+    check_response(response, error_context).await
+}
+
 /// POST JSON to a provider endpoint, check the status, and parse the response
 /// as JSON.
 ///
@@ -141,19 +163,7 @@ pub async fn post_json_to_provider(
     body: &serde_json::Value,
     error_context: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let auth = bearer_auth_header()
-        .ok_or_else(|| anyhow::anyhow!("{error_context}: provider API key is not configured"))?;
-    let client = media_http_client();
-
-    let response = client
-        .post(url)
-        .header("Authorization", &auth)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
-
-    let response = check_response(response, error_context).await?;
+    let response = provider_request(error_context, |client| client.post(url).json(body)).await?;
 
     let body_text = response
         .text()
@@ -181,18 +191,7 @@ pub async fn get_json_from_provider(
     url: &str,
     error_context: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let auth = bearer_auth_header()
-        .ok_or_else(|| anyhow::anyhow!("{error_context}: provider API key is not configured"))?;
-    let client = media_http_client();
-
-    let response = client
-        .get(url)
-        .header("Authorization", &auth)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
-
-    let response = check_response(response, error_context).await?;
+    let response = provider_request(error_context, |client| client.get(url)).await?;
 
     let body_text = response
         .text()
@@ -215,18 +214,7 @@ pub async fn get_json_from_provider(
 /// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
 /// - Body read failure: `"{error_context} failed to read response body: {err}"`
 pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::Result<Vec<u8>> {
-    let auth = bearer_auth_header()
-        .ok_or_else(|| anyhow::anyhow!("{error_context}: provider API key is not configured"))?;
-    let client = media_http_client();
-
-    let response = client
-        .get(url)
-        .header("Authorization", &auth)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("{error_context} request failed: {e}"))?;
-
-    let response = check_response(response, error_context).await?;
+    let response = provider_request(error_context, |client| client.get(url)).await?;
 
     response
         .bytes()
