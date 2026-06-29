@@ -165,14 +165,12 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 /// Returns `true` when it's safe for the caller to proceed. Returns `false`
 /// when the ticket has moved, been failed — the caller should bail out immediately.
 ///
-/// Used by all agent-spawning dispatch functions
-/// ([`dispatch_backlog_analysts`], [`dispatch_engineer`], [`dispatch_verifiers`])
-/// for structural consistency. Previously, verifiers intentionally omitted this
-/// pre-agent check — churned tickets got one last review cycle before the
-/// circuit breaker could trip. Adding the pre-agent guard saves LLM credits
-/// by failing tickets with excessive churn before verifier agents run, at the
-/// cost of removing that last-chance review cycle. Diagnostics uses a separate
-/// circuit breaker (see [`run_circuit_breaker`]).
+/// Used directly by [`dispatch_engineer`] and by [`dispatch_parallel_with_guard`]
+/// (which wraps the guard + dispatch + post-check skeleton shared by
+/// [`dispatch_backlog_analysts`] and [`dispatch_verifiers`]).
+/// Formerly all three callers used this directly; the parallel-dispatch callers
+/// now go through the helper for structural consistency.
+/// Diagnostics uses a separate circuit breaker (see [`run_circuit_breaker`]).
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
     ticket: &Ticket,
@@ -1804,6 +1802,38 @@ async fn record_verdict_comments(
     }
 }
 
+// ── Parallel agent helpers ──────────────────────────────────────────
+
+/// Shared orchestration skeleton for dispatch functions that spawn parallel
+/// agents and then process results via extraction.
+///
+/// 1. Runs [`guard_phase_and_circuit_breaker`] (phase check + circuit breaker)
+/// 2. Spawns agents via [`run_parallel_with_extraction`]
+/// 3. Runs a post-dispatch phase check (guard against race conditions)
+///
+/// Returns `None` if either guard failed — the caller should bail out.
+/// Returns `Some(results)` when it's safe to process the verdicts.
+///
+/// Used by [`dispatch_backlog_analysts`] and [`dispatch_verifiers`].
+async fn dispatch_parallel_with_guard(
+    ticket: &Arc<Ticket>,
+    ws: &Workspace,
+    guard_phase: TicketPhase,
+    guard_label: &str,
+    role: Role,
+    prompt: &str,
+    extraction_prompt: &str,
+) -> Option<Vec<ParallelVerdict>> {
+    if !guard_phase_and_circuit_breaker(ticket, guard_phase, guard_label).await {
+        return None;
+    }
+    let results = run_parallel_with_extraction(ticket, ws, role, prompt, extraction_prompt).await;
+    if !is_ticket_in_phase(&ticket.id, guard_phase).await {
+        return None;
+    }
+    Some(results)
+}
+
 // ── Backlog Analysis ──────────────────────────────────────────────────
 
 /// Spawn 3 parallel analyst agents to research a backlog ticket.
@@ -1815,22 +1845,23 @@ async fn record_verdict_comments(
 /// trips the comment-count circuit breaker (which may transition the ticket to
 /// Failed for Manager triage). Returns `false` when the caller should abort.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
-    if !guard_phase_and_circuit_breaker(&ticket, TicketPhase::Analysis, "Analysts").await {
-        return;
-    }
-
     let message = load_prompt("analyze.md");
     let extraction_prompt = load_prompt("extraction/analyst.md");
-    let parallel_results =
-        run_parallel_with_extraction(&ticket, &ws, Role::Analyst, &message, &extraction_prompt)
-            .await;
-
-    // Post-run check still needed for race conditions during agent execution.
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
+    let Some(results) = dispatch_parallel_with_guard(
+        &ticket,
+        &ws,
+        TicketPhase::Analysis,
+        "Analysts",
+        Role::Analyst,
+        &message,
+        &extraction_prompt,
+    )
+    .await
+    else {
         return;
-    }
+    };
 
-    handle_analyst_verdicts(&ticket, &parallel_results).await;
+    handle_analyst_verdicts(&ticket, &results).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -2234,12 +2265,6 @@ async fn process_verdict_results(
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs [`PARALLEL_AGENT_COUNT`] parallel verifiers of the given role, and processes the verdicts.
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
-    // Pre-agent guard: check phase and trip circuit breaker early to
-    // avoid wasting LLM API calls on tickets with excessive churn.
-    if !guard_phase_and_circuit_breaker(&ticket, vi.active_phase, vi.log_label).await {
-        return;
-    }
-
     let engineer_response = ticket
         .comments
         .iter()
@@ -2254,13 +2279,19 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     );
 
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
-    let results =
-        run_parallel_with_extraction(&ticket, &ws, vi.role, &prompt, &extraction_prompt).await;
-
-    // Post-run check still needed for race conditions during agent execution.
-    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
+    let Some(results) = dispatch_parallel_with_guard(
+        &ticket,
+        &ws,
+        vi.active_phase,
+        vi.log_label,
+        vi.role,
+        &prompt,
+        &extraction_prompt,
+    )
+    .await
+    else {
         return;
-    }
+    };
 
     process_verdict_results(&ticket, &results, vi).await;
 }
