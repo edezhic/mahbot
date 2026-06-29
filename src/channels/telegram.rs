@@ -1,3 +1,4 @@
+use crate::util::TELEGRAM_MEDIA_MARKER_RE;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
@@ -208,11 +209,9 @@ struct AttachmentMeta {
 impl TelegramAttachmentKind {
     fn from_marker(marker: &str) -> Option<Self> {
         match marker.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "IMAGE" => Some(Self::Image),
             "VIDEO" => Some(Self::Video),
             "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
             _ => None,
         }
     }
@@ -350,65 +349,42 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     })
 }
 
-fn find_matching_close(s: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
+/// Parse `[KIND:path]` media markers from a message, returning cleaned text
+/// (with markers removed) and extracted attachments.
+///
+/// Uses the case-insensitive [`TELEGRAM_MEDIA_MARKER_RE`] to match markers.
+/// Unknown or unrecognized markers are left intact in the cleaned text.
 fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0;
+    let mut attachments: Vec<TelegramAttachment> = Vec::new();
 
-    while cursor < message.len() {
-        let Some(open_rel) = message[cursor..].find('[') else {
-            cleaned.push_str(&message[cursor..]);
-            break;
-        };
+    let cleaned = TELEGRAM_MEDIA_MARKER_RE
+        .replace_all(message, |caps: &regex::Captures| {
+            let kind_str = caps
+                .name("kind")
+                .expect("TELEGRAM_MEDIA_MARKER_RE: expected 'kind' group")
+                .as_str();
+            let path = caps
+                .name("path")
+                .expect("TELEGRAM_MEDIA_MARKER_RE: expected 'path' group")
+                .as_str()
+                .trim();
 
-        let open = cursor + open_rel;
-        cleaned.push_str(&message[cursor..open]);
-
-        let Some(close_rel) = find_matching_close(&message[open + 1..]) else {
-            cleaned.push_str(&message[open..]);
-            break;
-        };
-
-        let close = open + 1 + close_rel;
-        let marker = &message[open + 1..close];
-
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let kind = TelegramAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
+            // Preserve markers with whitespace-only paths (e.g. `[IMAGE: ]`)
+            // as original text, mirroring the old hand-rolled parser's behavior
+            // where `target.is_empty()` after trim caused the marker to be kept.
+            if path.is_empty() {
+                return caps.get(0).unwrap().as_str().to_string();
             }
-            Some(TelegramAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
 
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[open..=close]);
-        }
-
-        cursor = close + 1;
-    }
+            if let Some(kind) = TelegramAttachmentKind::from_marker(kind_str) {
+                attachments.push(TelegramAttachment {
+                    kind,
+                    target: path.to_string(),
+                });
+            }
+            String::new()
+        })
+        .to_string();
 
     (cleaned.trim().to_string(), attachments)
 }
@@ -2026,16 +2002,22 @@ mod tests {
     #[tokio::test]
     async fn parse_attachment_markers_tests() {
         let (cleaned, att) = parse_attachment_markers(
-            "Here are files [IMAGE:/tmp/a.png] and [DOCUMENT:https://example.com/a.pdf]",
+            "Here are files [IMAGE:/tmp/a.png] and [AUDIO:/tmp/voice.ogg]",
         );
         assert_eq!(cleaned, "Here are files  and");
         assert_eq!(att.len(), 2);
         assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
-        assert_eq!(att[1].kind, TelegramAttachmentKind::Document);
+        assert_eq!(att[1].kind, TelegramAttachmentKind::Audio);
         // invalid markers kept as text
         let (cleaned, att) = parse_attachment_markers("Report [UNKNOWN:/tmp/a.bin]");
         assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
         assert!(att.is_empty());
+        // case-insensitive matching
+        let (cleaned, att) = parse_attachment_markers("[image:path.png] and [VIDEO:/tmp/vid.mp4]");
+        assert_eq!(cleaned, "and");
+        assert_eq!(att.len(), 2);
+        assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
+        assert_eq!(att[1].kind, TelegramAttachmentKind::Video);
     }
 
     #[tokio::test]

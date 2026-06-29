@@ -470,8 +470,10 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     // Strip media markers from the enriched content. In multimodal mode,
     // IMAGE markers are preserved (needed for vision API integration via
     // to_message_content); all other markers are stripped. In non-multimodal
-    // mode, all markers are stripped. The MEDIA_MARKER_RE is the single
-    // canonical source of truth for all media marker patterns.
+    // mode, all markers are stripped. The MEDIA_MARKER_PATTERN constant in
+    // util/mod.rs is the single canonical source of truth for the marker
+    // pattern; both MEDIA_MARKER_RE (case-sensitive) and TELEGRAM_MEDIA_MARKER_RE
+    // (case-insensitive) are built from it to stay in sync.
     //
     // Note: using matches!() with a boolean guard means a future
     // EnrichmentStrategy variant would silently default to marker-stripping

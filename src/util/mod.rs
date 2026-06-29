@@ -9,6 +9,7 @@ pub mod test;
 pub mod tree_sitter;
 
 use regex::Regex;
+use regex::RegexBuilder;
 use serde::de::DeserializeOwned;
 use std::sync::LazyLock;
 
@@ -33,6 +34,13 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
     }
 }
 
+/// The regex pattern for `[KIND:path]` media markers.
+///
+/// This is the single source of truth for the marker pattern. Both the case-sensitive
+/// [`MEDIA_MARKER_RE`] and the case-insensitive [`TELEGRAM_MEDIA_MARKER_RE`] are built
+/// from this constant, so adding a new marker kind here automatically keeps both in sync.
+const MEDIA_MARKER_PATTERN: &str = r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]]+)\]";
+
 /// Matches `[IMAGE:path]`, `[AUDIO:path]`, or `[VIDEO:path]` markers in message content.
 /// Path must be non-empty (uses `+` quantifier).
 ///
@@ -44,9 +52,17 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
 /// `parse_image_markers()` pattern. Adding a new marker kind to this regex will
 /// cause it to be automatically stripped in multimodal mode unless the closure
 /// is explicitly updated to preserve it.
-pub(crate) static MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]]+)\]")
-        .expect("MEDIA_MARKER_RE must compile")
+pub(crate) static MEDIA_MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(MEDIA_MARKER_PATTERN).expect("MEDIA_MARKER_RE must compile"));
+
+/// Case-insensitive variant of [`MEDIA_MARKER_RE`] used by `telegram.rs` to
+/// accept `[image:...]`, `[Image:...]`, etc. Built from the same
+/// [`MEDIA_MARKER_PATTERN`] constant to stay in sync.
+pub(crate) static TELEGRAM_MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    RegexBuilder::new(MEDIA_MARKER_PATTERN)
+        .case_insensitive(true)
+        .build()
+        .expect("TELEGRAM_MEDIA_MARKER_RE must compile")
 });
 
 /// Truncate a string to `max_chars` Unicode characters, appending "…" if truncated.
