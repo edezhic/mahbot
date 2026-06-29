@@ -152,7 +152,7 @@ fn extend_past_open_tag(text: &str, pos: usize) -> Option<usize> {
     None
 }
 
-fn extract_sender_username(message: &serde_json::Value) -> String {
+fn extract_sender_user_name(message: &serde_json::Value) -> String {
     message
         .get("from")
         .and_then(|from| from.get("username"))
@@ -463,7 +463,7 @@ async fn resolve_authorized_sender(
     sender_source: &serde_json::Value,
     chat_source: &serde_json::Value,
 ) -> Option<(String, String, String)> {
-    let username = extract_sender_username(sender_source);
+    let username = extract_sender_user_name(sender_source);
     // Look up the canonical user name via user_channels binding
     let canonical_user = crate::users::resolve_user_by_channel("telegram", &username).await?;
     let (chat_id, reply_target) = extract_chat_context(chat_source)?;
@@ -771,7 +771,7 @@ impl TelegramChannel {
         else {
             tracing::debug!(
                 "Telegram: ignoring message from unknown user '{}'",
-                extract_sender_username(message)
+                extract_sender_user_name(message)
             );
             return None;
         };
@@ -2219,15 +2219,16 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // extract_sender_username tests
+    // extract_sender_user_name tests
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_extract_sender_username() {
-        let username =
-            extract_sender_username(&serde_json::json!({"from": {"id": 123, "username": "alice"}}));
+    fn test_extract_sender_user_name() {
+        let username = extract_sender_user_name(
+            &serde_json::json!({"from": {"id": 123, "username": "alice"}}),
+        );
         assert_eq!(username, "alice");
-        let username = extract_sender_username(&serde_json::json!({"from": {"id": 42}}));
+        let username = extract_sender_user_name(&serde_json::json!({"from": {"id": 42}}));
         assert_eq!(username, "unknown");
     }
 
