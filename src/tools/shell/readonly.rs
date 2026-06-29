@@ -95,10 +95,6 @@ const MUTATING_COMMANDS: &[&str] = &[
 ];
 
 /// Safe git subcommands (read-only inspection).
-///
-/// Note: "stash list" is safe but intentionally excluded from this list — it is
-/// fast-tracked in `check_git_segment` via a string-contains early return before
-/// the const array is consulted.
 const GIT_SAFE_SUBCOMMANDS: &[&str] = &[
     "status",
     "log",
@@ -150,6 +146,7 @@ const GIT_SAFE_SUBCOMMANDS: &[&str] = &[
     "remote",
     "branch",
     "tag",
+    "stash list",
 ];
 
 /// Safe cargo subcommands.
@@ -651,11 +648,6 @@ const GIT_REMOTE_MUTATIONS: &[&str] = &[
 
 fn check_git_segment(segment: &str) -> Result<(), String> {
     let trimmed = segment.trim();
-
-    // Special case: `git stash list` is safe
-    if trimmed.contains("stash list") {
-        return Ok(());
-    }
 
     // Extract the git subcommand by skipping "git" and global flags
     let subcommand = extract_git_subcommand(trimmed);
