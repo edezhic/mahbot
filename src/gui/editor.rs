@@ -2287,10 +2287,6 @@ impl EditorState {
 
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
-        // Allow match_same_arms on the entire update() match block: many variants
-        // return Task::none() as their side-effect-free result. Narrowing to
-        // individual arms would require auditing every no-op each time one changes.
-        #[allow(clippy::match_same_arms)]
         match msg {
             EditorMessage::WorkspaceSelected(ref name, ref path) => {
                 self.workspace_selected(name, path.as_deref())
@@ -2420,8 +2416,6 @@ impl EditorState {
                 rename_gen,
             ),
 
-            EditorMessage::RevealDone => Task::none(),
-
             // ── Quick-open file picker ────────────────────────────────
             EditorMessage::QuickOpenToggle => self.quick_open_toggle(),
 
@@ -2493,7 +2487,7 @@ impl EditorState {
                 cursor_col,
             } => self.file_reloaded(path, result, cursor_line, cursor_col),
 
-            EditorMessage::Toast(_) => Task::none(),
+            EditorMessage::RevealDone | EditorMessage::Toast(_) => Task::none(),
         }
     }
 
