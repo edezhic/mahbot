@@ -181,12 +181,76 @@ const CARGO_SAFE_SUBCOMMANDS: &[&str] = &[
 // ── Redirect detection ───────────────────────────────────────────────────
 
 /// Remove heredoc bodies so redirect operators inside them are not scanned.
+///
+/// # Security invariant
+///
+/// This function MUST distinguish `<<` outside quotes (real heredoc) from `<<`
+/// inside quotes (literal text).  Failure to do so creates a false-negative
+/// security bypass: a quoted `<<` causes everything after it (including real
+/// redirect operators) to be removed from the scan string, making
+/// [`has_disallowed_redirect`] miss the redirect.
+///
+/// # Known limitation (pre-existing, not addressed here)
+///
+/// - Heredoc bodies that contain the delimiter within quotes are not detected
+///   (the body-skipping loop checks for literal delimiter matches).  In a real
+///   shell, a quoted delimiter in the body does NOT terminate the heredoc.
+///   This can produce false negatives (allowing a dangerous redirect inside a
+///   heredoc body whose delimiter appears inside quotes earlier in the body),
+///   but such multi-line engineered inputs are unlikely in practice.
 fn strip_heredoc_bodies(command: &str) -> String {
     let mut out = String::new();
     let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
     let chars: Vec<(usize, char)> = command.char_indices().collect();
 
     while i < chars.len() {
+        // ── Escape tracking ────────────────────────────────────────
+        // Must come before quote state tracking so escaped quotes
+        // (`\'`, `\"`) don't toggle in_single/in_double.  The
+        // `!in_single` guard means backslash is treated as escape both
+        // outside quotes and inside double quotes (inside double quotes,
+        // `\` should only escape `\`, `$`, `` ` ``, `"`, and newline,
+        // but treating any backslash as escape is a safe over-approximation:
+        // the escaped char is preserved in output and skipped for quote
+        // state / heredoc detection; at worst it causes a false negative
+        // (missed redirect) which is acceptable for a best-effort layer).
+        // Inside single quotes, backslash is always literal.
+        //
+        // When a character is escaped, we still push it to the output
+        // (to preserve the command string for redirect scanning), but we
+        // skip quote-state tracking and heredoc detection for it.
+        // This mirrors the philosophy of [`has_disallowed_redirect`]'s
+        // escape handling: over-escaping is safe (false negative = allow,
+        // which is acceptable for this best-effort safety layer).
+        if escaped {
+            escaped = false;
+            out.push(chars[i].1);
+            i += 1;
+            continue;
+        }
+        if chars[i].1 == '\\' && !in_single {
+            escaped = true;
+            out.push(chars[i].1);
+            i += 1;
+            continue;
+        }
+
+        // ── Quote state tracking ───────────────────────────────────
+        // [`check_outside_quotes`] returns `false` both for quote
+        // characters (`'`, `"`) and for characters inside quotes.
+        // When inside quotes, we push the character to output and
+        // skip heredoc detection — `<<` inside quotes is literal text,
+        // not a heredoc start.
+        if !super::check_outside_quotes(chars[i].1, &mut in_single, &mut in_double) {
+            out.push(chars[i].1);
+            i += 1;
+            continue;
+        }
+
+        // ── Heredoc detection (only outside quotes) ────────────────
         if i + 1 < chars.len() && chars[i].1 == '<' && chars[i + 1].1 == '<' {
             out.push(' ');
             i += 2;
@@ -1285,6 +1349,107 @@ mod tests {
             },
             Case {
                 command: "echo '> /tmp/foo",
+                allowed: true,
+            },
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Heredoc quote-state tracking ────────────────────────────
+
+    /// Tests that `<<` inside quotes is not treated as a heredoc start
+    /// (fix for mahbot-73).  Without quote-state tracking in
+    /// [`strip_heredoc_bodies`], a quoted `<<` would cause everything
+    /// after it — including real unquoted redirect operators — to be
+    /// stripped from the redirect scan string, creating a false-negative
+    /// security bypass.
+    #[test]
+    fn heredoc_quote_state() {
+        let cases = [
+            // Primary bug scenario: `<<` inside single quotes followed by
+            // a real redirect on the same line.  strip_heredoc_bodies must
+            // NOT strip `> output.txt` because `<<` is inside quotes.
+            Case {
+                command: "echo '<<EOF' > output.txt",
+                allowed: false,
+            },
+            // Same with double quotes
+            Case {
+                command: "echo \"<<EOF\" > output.txt",
+                allowed: false,
+            },
+            // Quoted << without redirect — should be allowed regardless
+            Case {
+                command: "echo '<<EOF'",
+                allowed: true,
+            },
+            Case {
+                command: "echo \"<<EOF\"",
+                allowed: true,
+            },
+            // <<- with dash inside single quotes, redirect follows
+            Case {
+                command: "echo '<<-EOF' > output.txt",
+                allowed: false,
+            },
+            // No-redirect variant: quoted << with no redirect (just text)
+            Case {
+                command: "echo 'before <<EOF after'",
+                allowed: true,
+            },
+            Case {
+                command: "echo \"before <<EOF after\"",
+                allowed: true,
+            },
+            // Backslash-escaped << (double-escape): `\<\<` prevents heredoc
+            // detection because both `<` characters are escaped individually
+            // by their respective backslashes, so neither participates in
+            // `<<` detection.  The redirect after them is a real unquoted
+            // redirect and must be rejected.
+            Case {
+                command: "echo \\<\\<file > /etc/output",
+                allowed: false,
+            },
+            // Backslash-escaped << (single-escape): `\<<` prevents heredoc
+            // detection because the first `<` is escaped and consumed
+            // without participating in `<<` detection; the remaining
+            // single `<` is insufficient to form `<<`.  Distinct code
+            // path from double-escape — tests the standalone `<` fallthrough.
+            Case {
+                command: "echo \\<<EOF > /etc/output",
+                allowed: false,
+            },
+            // Escaped single quote: `\'` produces literal `'` without
+            // toggling quote state.  Without escape tracking, `check_outside_quotes`
+            // would see `'` and toggle in_single, causing subsequent redirect
+            // operators to be treated as inside quotes and skipped.
+            // This test validates that escape tracking prevents that false
+            // negative by using a non-temp redirect target.
+            Case {
+                command: "echo \\'hello > /etc/output",
+                allowed: false,
+            },
+            // Nested quotes: single-quoted string inside double quotes.
+            // The inner single quotes are literal (shell rule: single
+            // quotes have no special meaning inside double quotes),
+            // so `<<` is inside the double-quote context and must not
+            // trigger heredoc detection.  Tests that check_outside_quotes
+            // correctly handles nesting: `"` toggles in_double, then
+            // `'` is literal (no toggle because in_double=true).
+            Case {
+                command: "echo \"'<<EOF'\" > /etc/output",
+                allowed: false,
+            },
+            // Existing real heredoc behaviors still work:
+            // heredoc with redirect to temp
+            Case {
+                command: "cat > /tmp/test_match.rs << 'EOF'\nfn test() { match x { \"a\" => 1, _ => 0 } }\nEOF",
+                allowed: true,
+            },
+            // Real heredoc with no redirect
+            Case {
+                command: "cat <<EOF\nbody\nEOF",
                 allowed: true,
             },
         ];
