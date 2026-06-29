@@ -33,8 +33,10 @@ impl ErrorClass {
     }
 }
 
-/// Hint arrays used by [`classify_by_status_code`] and [`classify_fallback`].
-const CTX_HINTS: &[&str] = &[
+/// Body-text hints that indicate permanent (non-retryable) errors
+/// regardless of HTTP status code — checked by [`classify_by_status_code`]
+/// before status-based classification.
+const NON_RETRYABLE_HINTS: &[&str] = &[
     "exceeds the context window",
     "exceeds the available context size",
     "context window of this model",
@@ -45,16 +47,10 @@ const CTX_HINTS: &[&str] = &[
     "prompt is too long",
     "input is too long",
     "prompt exceeds max length",
-];
-
-const TOOL_SCHEMA_HINTS: &[&str] = &[
     "tool call validation failed",
     "which was not in request",
     "not found in tool list",
     "invalid_tool_call",
-];
-
-const AUTH_HINTS: &[&str] = &[
     "invalid api key",
     "incorrect api key",
     "missing api key",
@@ -66,13 +62,6 @@ const AUTH_HINTS: &[&str] = &[
     "permission denied",
     "access denied",
     "invalid token",
-];
-
-/// Billing / quota exhaustion patterns in 429 response bodies.
-/// Providers return 429 for both transient rate limits and permanent
-/// billing errors; these body signals disambiguate the latter as
-/// non-retryable (retrying won't resolve an empty account balance).
-const BILLING_HINTS: &[&str] = &[
     "insufficient balance",
     "insufficient_quota",
     "quota exhausted",
@@ -85,9 +74,9 @@ const BILLING_HINTS: &[&str] = &[
 /// to a default of retryable.
 ///
 /// This function is only called from [`classify_by_status_code`] after all
-/// body-text hint categories (context-window, billing/quota, tool-schema,
-/// auth) have already been checked and returned no match. It handles the
-/// model-not-found composite pattern and other non-status-code signals.
+/// non-retryable body-text hints have already been checked and returned no
+/// match. It handles the model-not-found composite pattern and other
+/// non-status-code signals.
 fn classify_fallback(lower: &str) -> ErrorClass {
     // Model not found — composite check to catch variants like
     // "model 'xyz' is unknown" alongside "model unknown".
@@ -104,10 +93,10 @@ fn classify_fallback(lower: &str) -> ErrorClass {
 
 /// Dispatch by HTTP status code using [`is_non_retryable_4xx`].
 ///
-/// Body-text hints for context-window, billing/quota, tool-schema, and auth
-/// errors are checked **before** status-based classification — they indicate
-/// permanent errors regardless of HTTP status code (e.g., a 429 with
-/// context-window body text is non-retryable, not a transient rate limit).
+/// Body-text hints for permanent (non-retryable) errors are checked **before**
+/// status-based classification — they indicate permanent errors regardless of
+/// HTTP status code (e.g., a 429 with context-window body text is non-retryable,
+/// not a transient rate limit).
 ///
 /// Accepts an optional status code parsed from the error:
 /// - `None` → falls through to [`classify_fallback`]
@@ -115,19 +104,10 @@ fn classify_fallback(lower: &str) -> ErrorClass {
 /// - any other status (408, 429, 5xx, 3xx, etc.) → falls through to [`classify_fallback`]
 #[inline]
 fn classify_by_status_code(status: Option<u16>, lower: &str) -> ErrorClass {
-    // Body-text hints for context window, billing/quota, tool schema, and
-    // auth errors are checked before status-based classification — they
-    // indicate permanent errors regardless of HTTP status code.
-    if CTX_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::NonRetryable;
-    }
-    if BILLING_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::NonRetryable;
-    }
-    if TOOL_SCHEMA_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::NonRetryable;
-    }
-    if AUTH_HINTS.iter().any(|h| lower.contains(h)) {
+    // Non-retryable body-text hints are checked before status-based
+    // classification — they indicate permanent errors regardless of
+    // HTTP status code.
+    if NON_RETRYABLE_HINTS.iter().any(|h| lower.contains(h)) {
         return ErrorClass::NonRetryable;
     }
     if status.is_some_and(is_non_retryable_4xx) {
@@ -153,7 +133,7 @@ fn is_non_retryable_4xx(code: u16) -> bool {
 /// ## Cascade Order
 /// 1. **Typed path** (downcast to [`HttpError`] succeeds): dispatch on
 ///    structured status code via [`classify_by_status_code`] — which checks
-///    context-window/tool-schema body-text hints, then 4xx codes other than
+///    non-retryable body-text hints, then 4xx codes other than
 ///    408 and 429 as [`NonRetryable`](ErrorClass::NonRetryable), else
 ///    [`classify_fallback`]
 /// 2. **Transport typed path** (downcast to [`reqwest::Error`] succeeds): dispatch
@@ -602,7 +582,7 @@ mod tests {
         ));
 
         // 429 with billing/quota body signals → non-retryable
-        // (caught by BILLING_HINTS in classify_by_status_code, not by status code)
+        // (caught by NON_RETRYABLE_HINTS in classify_by_status_code, not by status code)
         assert_eq!(
             classify_err(&make_structured(429, "insufficient balance")),
             ErrorClass::NonRetryable
@@ -662,7 +642,7 @@ mod tests {
         ));
 
         // ZhipuAI billing error code 1113 → NonRetryable
-        // (caught by BILLING_HINTS in classify_by_status_code)
+        // (caught by NON_RETRYABLE_HINTS in classify_by_status_code)
         assert_eq!(
             classify_err(&make_structured(429, "error code 1113")),
             ErrorClass::NonRetryable
