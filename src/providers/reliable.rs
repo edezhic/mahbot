@@ -19,12 +19,9 @@ use reqwest;
 enum ErrorClass {
     /// A transient error that may resolve with retries (timeouts, 5xx, etc.).
     Retryable,
-    /// A non-retryable client error (auth, invalid model, billing/quota exhausted, etc.).
+    /// A non-retryable client error (auth, invalid model, billing/quota exhausted,
+    /// tool schema validation failure, etc.).
     NonRetryable,
-    /// Tool schema validation error — non-retryable; the tool name doesn't
-    /// match the registered schema, so retrying the same request will
-    /// produce the same error.
-    ToolSchemaError,
 }
 
 impl ErrorClass {
@@ -32,7 +29,6 @@ impl ErrorClass {
         match self {
             Self::Retryable => "retryable",
             Self::NonRetryable => "non_retryable",
-            Self::ToolSchemaError => "tool_schema_error",
         }
     }
 }
@@ -131,7 +127,7 @@ fn classify_by_status_code(status: Option<u16>, lower: &str) -> ErrorClass {
         return ErrorClass::NonRetryable;
     }
     if TOOL_SCHEMA_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::ToolSchemaError;
+        return ErrorClass::NonRetryable;
     }
     if status.is_some_and(is_non_retryable_4xx) {
         ErrorClass::NonRetryable
@@ -342,9 +338,7 @@ impl Provider for ReliableProvider {
                         backoff_ms = backoff_ms.saturating_mul(2);
                     } else {
                         let log_msg = match class {
-                            ErrorClass::NonRetryable | ErrorClass::ToolSchemaError => {
-                                "Non-retryable error, aborting"
-                            }
+                            ErrorClass::NonRetryable => "Non-retryable error, aborting",
                             ErrorClass::Retryable => "Exhausted retries",
                         };
                         tracing::warn!(
@@ -648,10 +642,10 @@ mod tests {
             ErrorClass::NonRetryable
         ));
 
-        // Tool schema error → ToolSchemaError (body text analysis)
+        // Tool schema error → NonRetryable (body text analysis)
         assert!(matches!(
             classify_err(&make_structured(400, "tool call validation failed")),
-            ErrorClass::ToolSchemaError
+            ErrorClass::NonRetryable
         ));
 
         // Auth patterns in body → NonRetryable (classify_fallback)
@@ -791,8 +785,8 @@ mod tests {
 
     #[test]
     fn tool_schema_error_detection() {
-        use ErrorClass::ToolSchemaError;
-        // Detects various tool schema error patterns
+        use ErrorClass::NonRetryable;
+        // Detects various tool schema error patterns as NonRetryable
         for msg in [
             r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'recall' which was not in request"}}"#,
             "tool 'search' which was not in request",
@@ -800,26 +794,19 @@ mod tests {
             "invalid_tool_call: no matching function",
         ] {
             assert!(
-                matches!(classify_err(&anyhow::anyhow!("{msg}")), ToolSchemaError),
+                matches!(classify_err(&anyhow::anyhow!("{msg}")), NonRetryable),
                 "should detect: {msg}"
             );
         }
-        // Ignores unrelated errors
-        for msg in ["invalid api key", "model not found"] {
-            assert!(
-                !matches!(classify_err(&anyhow::anyhow!("{msg}")), ToolSchemaError),
-                "should ignore: {msg}"
-            );
-        }
-        // Pure 400 without tool-schema keywords → NonRetryable (not ToolSchemaError)
+        // Pure 400 without tool-schema keywords → also NonRetryable (via is_non_retryable_4xx)
         assert!(
-            !matches!(
+            matches!(
                 classify_err(&anyhow::anyhow!(
                     "400 Bad Request: invalid api key provided"
                 )),
-                ToolSchemaError
+                NonRetryable
             ),
-            "pure 400 should not be ToolSchemaError"
+            "pure 400 should be NonRetryable"
         );
     }
 
