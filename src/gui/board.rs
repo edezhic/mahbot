@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use crate::Role;
 use crate::board::{Ticket, TicketPhase, UNBLOCKING_STATUSES};
+use crate::diff_parse::parse_numstat_lines;
 
 use iced::widget::{
     Column, Row, Space, button, column, container, markdown, row, scrollable, text, tooltip,
@@ -502,16 +503,21 @@ impl BoardState {
         ws_path: &str,
         commit_hash: &str,
     ) -> Result<CommitStats, anyhow::Error> {
-        // Detect merge commits with `git cat-file -t`
+        // Detect merge commits: `git rev-list --parents -n 1 <hash>` outputs
+        // `<hash> <parent>` for non-merge, or `<hash> <parent1> <parent2> ...` for merges.
         let is_merge = match tokio::process::Command::new("git")
-            .args(["cat-file", "-t", commit_hash])
+            .args(["rev-list", "--parents", "-n", "1", commit_hash])
             .current_dir(ws_path)
             .env("LC_ALL", "C")
             .output()
             .await
         {
-            Ok(output) => output.stdout.trim_ascii_end() == b"commit",
-            Err(_) => false, // if cat-file fails, assume non-merge
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let parts: Vec<&str> = stdout.split_whitespace().collect();
+                parts.len() > 2 // hash + parent1 + parent2... = merge
+            }
+            Err(_) => false, // if rev-list fails, assume non-merge
         };
 
         let mut cmd = tokio::process::Command::new("git");
@@ -533,29 +539,11 @@ impl BoardState {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut files: Vec<FileStat> = Vec::new();
 
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+        for (additions, deletions, path) in parse_numstat_lines(&stdout) {
+            // Skip binary files (represented as -1, -1)
+            if additions < 0 || deletions < 0 {
                 continue;
             }
-            // Format: <additions>\t<deletions>\t<path>
-            let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() != 3 {
-                continue;
-            }
-
-            let additions_str = parts[0];
-            let deletions_str = parts[1];
-            let path = parts[2].to_string();
-
-            // Binary files: displayed as "-\t-\t<path>"
-            if additions_str == "-" && deletions_str == "-" {
-                continue; // skip binary files
-            }
-
-            let additions: i64 = additions_str.parse().unwrap_or(0);
-            let deletions: i64 = deletions_str.parse().unwrap_or(0);
-
             // Skip rename-only (0 additions, 0 deletions)
             if additions == 0 && deletions == 0 {
                 continue;
