@@ -765,7 +765,7 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // Write all KV pairs, per-role configs, AND per-model routings inside a
     // single transaction so a crash between writes doesn't leave inconsistent
     // partial state on restart.
-    let tx = store.begin_tx().await?;
+    let tx = store.conn.begin_tx().await?;
     for (key, value) in config.string_fields() {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
             store.set_kv_tx(&tx, key, v).await?;

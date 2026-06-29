@@ -99,12 +99,6 @@ fn model_routing_from_row(row: &turso::Row) -> Result<ModelRouting, ::turso::Err
 }
 
 impl ConfigStore {
-    /// Begin a transaction that serializes all subsequent operations until
-    /// committed or rolled back. The returned guard keeps the connection locked.
-    pub async fn begin_tx(&self) -> Result<turso::TxGuard<'_>> {
-        Ok(self.conn.begin_tx().await?)
-    }
-
     // ── config_kv ────────────────────────────────────────────
 
     /// Upsert a key-value pair.
@@ -195,7 +189,7 @@ impl ConfigStore {
         role_configs: &[RoleConfig],
         model_routings: &[ModelRouting],
     ) -> Result<()> {
-        let tx = self.begin_tx().await?;
+        let tx = self.conn.begin_tx().await?;
         self.save_role_and_routing_configs_tx(&tx, role_configs, model_routings)
             .await?;
         tx.commit().await?;
