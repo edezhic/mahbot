@@ -398,7 +398,6 @@ async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
         return;
     };
 
-    // Build a single-line transition log for this ticket.
     let transition_log = format!(
         "[{}] {}: {} → {}",
         ticket.reporter,
@@ -884,7 +883,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    // Gather all new comments since the last engineer run
     let last_eng_pos = ticket
         .comments
         .iter()
@@ -1041,7 +1039,6 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
         return;
     }
 
-    // Check for working tree changes
     let has_changes = match crate::diff_parse::run_git_status(repo_path).await {
         Ok(output) => !output.trim().is_empty(),
         Err(e) => {
@@ -1434,7 +1431,6 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             "Sanitation passed — transitioning to SanitationPassed",
         );
 
-        // Add a comment summarizing the sanitation check.
         let comment = if verdict.garbage_files.is_empty() {
             format!(
                 "🧹 Sanitation passed: {rationale}",
