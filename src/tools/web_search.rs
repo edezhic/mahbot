@@ -2,7 +2,7 @@ use crate::Tool;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::web_search_shared::WebSearchCache;
+use super::web_search_shared::{WebSearchCache, check_search_error};
 
 // ── Firecrawl API types ─────────────────────────────────────────────────────────
 
@@ -77,23 +77,7 @@ impl WebSearchTool {
             .send()
             .await?;
 
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_else(|e| {
-                tracing::warn!(?e, "Failed to read response body");
-                String::new()
-            });
-
-            // Firecrawl returns structured JSON errors with a clean error message.
-            // Try to extract it for a better error message.
-            if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)
-                && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str())
-            {
-                anyhow::bail!("search failed: {error_msg}");
-            }
-
-            anyhow::bail!("search failed with status {status}: {body}");
-        }
+        let res = check_search_error(res).await?;
 
         let search_resp = res.json::<SearchResponse>().await?;
 
@@ -104,6 +88,9 @@ impl WebSearchTool {
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!("Search results for: {query}"));
 
+        // When changing result formatting here, also check
+        // `src/tools/exa_search.rs` — the Exa loop follows the same pattern
+        // but differs in fields (no `description`, uses `text` vs `markdown`).
         for (i, result) in search_resp.data.web.iter().enumerate() {
             let title = result.title.as_deref().unwrap_or("(no title)").to_string();
             let description = result.description.as_deref().unwrap_or("");

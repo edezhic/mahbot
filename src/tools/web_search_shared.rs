@@ -2,7 +2,8 @@
 //!
 //! Both [`WebSearchTool`](super::web_search::WebSearchTool) and
 //! [`ExaSearchTool`](super::exa_search::ExaSearchTool) use this to avoid
-//! duplicating the identical cache, argument-validation, and schema logic.
+//! duplicating the identical cache, argument-validation, schema, and HTTP
+//! error-handling logic.
 
 use serde_json::Value;
 use serde_json::json;
@@ -75,9 +76,43 @@ impl WebSearchCache {
     pub(crate) fn next_counter(&self) -> u64 {
         self.next_id.load(Ordering::Relaxed)
     }
+}
 
-    // ── Shared Tool trait helpers ────────────────────────────────────
+// ── Shared HTTP error handling ─────────────────────────────────────────
 
+/// Check a web search API response for HTTP errors and extract structured
+/// JSON error messages when available.
+///
+/// Both Firecrawl and Exa return structured JSON errors — this reads the
+/// response body, tries to extract an `"error"` field, and bails with a
+/// descriptive message.  Returns the response on success (2xx) so the
+/// caller can continue processing it.
+pub(crate) async fn check_search_error(
+    response: reqwest::Response,
+) -> anyhow::Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_else(|e| {
+        tracing::warn!(?e, "Failed to read search response body");
+        String::new()
+    });
+
+    // APIs return structured JSON errors — try to extract for a better message.
+    if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)
+        && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str())
+    {
+        anyhow::bail!("search failed: {error_msg}");
+    }
+
+    anyhow::bail!("search failed with status {status}: {body}");
+}
+
+// ── Shared Tool trait helpers ────────────────────────────────────
+
+impl WebSearchCache {
     /// JSON schema for the `web_search` tool parameters.
     #[must_use]
     pub(crate) fn parameters_schema() -> Value {

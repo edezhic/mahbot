@@ -2,7 +2,7 @@ use crate::Tool;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::web_search_shared::WebSearchCache;
+use super::web_search_shared::{WebSearchCache, check_search_error};
 
 // ── Exa API types ─────────────────────────────────────────────────────────
 
@@ -65,22 +65,7 @@ impl ExaSearchTool {
             .send()
             .await?;
 
-        if !res.status().is_success() {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_else(|e| {
-                tracing::warn!(?e, "Failed to read response body");
-                String::new()
-            });
-
-            // Exa returns structured JSON errors — try to extract for a better error message.
-            if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)
-                && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str())
-            {
-                anyhow::bail!("search failed: {error_msg}");
-            }
-
-            anyhow::bail!("search failed with status {status}: {body}");
-        }
+        let res = check_search_error(res).await?;
 
         let search_resp = res.json::<ExaSearchResponse>().await?;
 
@@ -91,6 +76,9 @@ impl ExaSearchTool {
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!("Search results for: {query}"));
 
+        // When changing result formatting here, also check
+        // `src/tools/web_search.rs` — the Firecrawl loop follows the same
+        // pattern but includes a `description` field and uses `markdown`.
         for (i, result) in search_resp.results.iter().enumerate() {
             let title = result.title.as_deref().unwrap_or("(no title)").to_string();
 
