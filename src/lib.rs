@@ -543,7 +543,7 @@ pub struct Verdict {
 }
 
 /// Result of a sanitation agent's file inspection.
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SanitationVerdict {
     /// Whether the ticket passes sanitation (`true` = clean, `false` = garbage detected).
     pub pass: bool,

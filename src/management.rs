@@ -1326,14 +1326,8 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
 /// single sanitation agent with tools to inspect files and determine whether
 /// they are legitimate project files or intermediate garbage.
 ///
-/// After the agent completes, extracts a structured [`SanitationVerdict`]:
-/// - If **clean** (pass = true): transitions to [`TicketPhase::SanitationPassed`]
-///   (transitory handoff before auto-commit).
-/// - If **garbage detected** (pass = false): adds a comment listing the offending
-///   files and transitions the ticket to [`TicketPhase::ReadyForDevelopment`] with a
-///   pipeline reservation (via [`transition_ticket`]), matching the existing review/QA
-///   failure pattern.
-#[allow(clippy::too_many_lines)]
+/// After the agent completes, extracts a structured [`SanitationVerdict`] and
+/// delegates to [`handle_sanitation_verdict`] for pass/fail processing.
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
 
@@ -1438,8 +1432,22 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         }
     };
 
+    handle_sanitation_verdict(&ticket, verdict).await;
+}
+
+/// Process the result of a sanitation agent inspection.
+///
+/// Called by [`dispatch_sanitation`] after the agent completes and the
+/// [`SanitationVerdict`] has been extracted.
+///
+/// - If **clean** (pass = true): transitions to [`TicketPhase::SanitationPassed`]
+///   (transitory handoff before auto-commit).
+/// - If **garbage detected** (pass = false): adds a comment listing the offending
+///   files and transitions the ticket to [`TicketPhase::ReadyForDevelopment`] with a
+///   pipeline reservation (via [`transition_ticket`]), matching the existing review/QA
+///   failure pattern.
+async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVerdict) {
     if verdict.pass {
-        // Clean — transition to SanitationPassed for auto-commit.
         info!(
             ticket = %ticket.id,
             "Sanitation passed — transitioning to SanitationPassed",
@@ -1461,7 +1469,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             .await;
 
         if let Err(e) = transition_ticket(
-            &ticket,
+            ticket,
             TicketPhase::InSanitation,
             TicketPhase::SanitationPassed,
             NotifyPolicy::Buffer,
@@ -1470,7 +1478,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         .await
         {
             warn_transition_failed(
-                &ticket,
+                ticket,
                 TicketPhase::InSanitation,
                 TicketPhase::SanitationPassed,
                 "Sanitation",
@@ -1479,7 +1487,6 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             );
         }
     } else {
-        // Garbage detected — bounce back to development with details.
         let garbage_list = verdict.garbage_files.join("\n- ");
         let comment = format!(
             "🗑️ Sanitation failed — garbage files detected:\n- {garbage_list}\n\nRationale: {rationale}
@@ -1503,7 +1510,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             )
             .await;
 
-        bounce_back_to_development(&ticket, TicketPhase::InSanitation, "Sanitation").await;
+        bounce_back_to_development(ticket, TicketPhase::InSanitation, "Sanitation").await;
     }
 }
 
@@ -3381,6 +3388,97 @@ mod tests {
             ticket.assigned_to.as_deref(),
             Some(expected_key.as_str()),
             "assigned_to should be set to sanitation session key"
+        );
+    }
+
+    // ── handle_sanitation_verdict — verdict processing ──────────────────
+
+    /// Verify both branches of `handle_sanitation_verdict`:
+    /// - pass=true → SanitationPassed with a sanitation comment
+    /// - pass=false → ReadyForDevelopment with pipeline reservation,
+    ///   a sanitation comment, and a system circuit-breaker comment
+    #[tokio::test]
+    async fn handle_sanitation_verdict_cases() {
+        init_management_test_stores().await;
+
+        // Case 1: pass=true → SanitationPassed
+        let ws_pass = test_ws_named("/tmp/test", "sv_pass");
+        let pass_id = make_ticket(board(), ws_pass, "SV Pass", TicketPhase::InSanitation).await;
+        let ticket_pass = expect_ticket(board(), &pass_id).await;
+
+        let pass_verdict = crate::SanitationVerdict {
+            pass: true,
+            garbage_files: vec![],
+            rationale: "All files are legitimate project files.".into(),
+        };
+
+        handle_sanitation_verdict(&ticket_pass, pass_verdict).await;
+
+        let status = expect_ticket_phase(board(), &pass_id).await;
+        assert_eq!(
+            status,
+            TicketPhase::SanitationPassed,
+            "pass=true should transition to SanitationPassed, got {:?}",
+            status,
+        );
+
+        // Verify a sanitation comment was added
+        let comments = board().get_comments(&pass_id).await.expect("get_comments");
+        let has_sanitation_comment = comments.iter().any(|c| c.role == Role::Sanitation.as_str());
+        assert!(
+            has_sanitation_comment,
+            "pass=true should add a sanitation comment",
+        );
+
+        // No system comment (only added in fail path)
+        let has_system_comment = comments.iter().any(|c| c.role == SYSTEM_ROLE);
+        assert!(
+            !has_system_comment,
+            "pass=true should not add a system comment",
+        );
+
+        // Case 2: pass=false → ReadyForDevelopment with pipeline reservation
+        let ws_fail = test_ws_named("/tmp/test", "sv_fail");
+        let fail_id = make_ticket(board(), ws_fail, "SV Fail", TicketPhase::InSanitation).await;
+        let ticket_fail = expect_ticket(board(), &fail_id).await;
+
+        let fail_verdict = crate::SanitationVerdict {
+            pass: false,
+            garbage_files: vec!["node_modules/".into(), "tmp/scratch.js".into()],
+            rationale: "These are intermediate build artifacts.".into(),
+        };
+
+        handle_sanitation_verdict(&ticket_fail, fail_verdict).await;
+
+        let ticket = expect_ticket(board(), &fail_id).await;
+        assert_eq!(
+            ticket.phase,
+            TicketPhase::ReadyForDevelopment,
+            "pass=false should bounce back to ReadyForDevelopment, got {:?}",
+            ticket.phase,
+        );
+        assert!(
+            ticket.pipeline_reservation,
+            "pass=false should set pipeline_reservation=true",
+        );
+
+        // Verify a sanitation comment was added about the garbage files
+        let comments = board().get_comments(&fail_id).await.expect("get_comments");
+        let has_garbage_comment = comments
+            .iter()
+            .any(|c| c.role == Role::Sanitation.as_str() && c.content.contains("node_modules/"));
+        assert!(
+            has_garbage_comment,
+            "pass=false should have a sanitation comment mentioning garbage files",
+        );
+
+        // Verify a system comment with SANITATION_FAILED_PREFIX was added
+        let has_system_breaker = comments
+            .iter()
+            .any(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_PREFIX));
+        assert!(
+            has_system_breaker,
+            "pass=false should have a system comment with the circuit breaker prefix",
         );
     }
 }
