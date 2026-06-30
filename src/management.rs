@@ -609,28 +609,13 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             );
             // Best-effort transition: the ticket may have been moved
             // externally while the dispatch was running.
-            let _ = board()
-                .add_comment(
-                    &ticket_for_failure.id,
-                    SYSTEM_ROLE,
-                    &format!("❌ Dispatch panicked: {msg}"),
-                )
-                .await;
-            if let Err(e) = transition_ticket(
+            transition_ticket_to_failed(
                 &ticket_for_failure,
                 active_phase,
-                TicketPhase::Failed,
-                NotifyPolicy::Notify,
-                None,
+                &format!("❌ Dispatch panicked: {msg}"),
+                "dispatch panic",
             )
-            .await
-            {
-                warn!(
-                    ticket = %ticket_for_failure.id,
-                    error = %e,
-                    "Failed to transition ticket to Failed after dispatch panic",
-                );
-            }
+            .await;
         }
     });
 }
@@ -1086,6 +1071,36 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, reason:
             error = %e,
             "{phase_label} passed but transition to Done failed",
         );
+    }
+}
+
+async fn transition_ticket_to_failed(
+    ticket: &Ticket,
+    source: TicketPhase,
+    comment: &str,
+    context_label: &str,
+) -> bool {
+    let _ = board().add_comment(&ticket.id, SYSTEM_ROLE, comment).await;
+
+    match transition_ticket(
+        ticket,
+        source,
+        TicketPhase::Failed,
+        NotifyPolicy::Notify,
+        None,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "{context_label} — transition to Failed failed",
+                context_label = context_label,
+            );
+            false
+        }
     }
 }
 
@@ -2217,28 +2232,16 @@ async fn run_circuit_breaker(
         "Circuit breaker tripped at {count}/{threshold} ({log_label}) — failing ticket"
     );
 
-    let _ = board()
-        .add_comment(&ticket.id, SYSTEM_ROLE, &comment_text(count))
-        .await;
-
-    if let Err(e) = transition_ticket(
+    if transition_ticket_to_failed(
         ticket,
         expected_phase,
-        TicketPhase::Failed,
-        NotifyPolicy::Notify,
-        None,
+        &comment_text(count),
+        "Circuit breaker",
     )
     .await
     {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Circuit breaker tripped but transition to Failed failed",
-        );
-        return true;
+        drain_ready_for_development_siblings(ticket).await;
     }
-
-    drain_ready_for_development_siblings(ticket).await;
 
     true
 }
@@ -2301,34 +2304,17 @@ async fn process_verdict_results(
     // Priority 1: all agents failed to produce verdicts — terminal failure.
     let all_failed = results.iter().all(|r| r.verdict.is_none());
     if all_failed {
-        let _ = board()
-            .add_comment(
-                &ticket.id,
-                SYSTEM_ROLE,
-                &format!(
-                    "❌ All {label} agents failed to produce verdicts — \
-                     ticket marked as Failed.",
-                    label = verifier.log_label,
-                ),
-            )
-            .await;
-        if let Err(e) = transition_ticket(
+        transition_ticket_to_failed(
             ticket,
             verifier.active_phase,
-            TicketPhase::Failed,
-            NotifyPolicy::Notify,
-            None,
-        )
-        .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                role = %verifier.log_label,
-                "All {label} agents failed but transition to Failed also failed",
+            &format!(
+                "❌ All {label} agents failed to produce verdicts — \
+                 ticket marked as Failed.",
                 label = verifier.log_label,
-            );
-        }
+            ),
+            verifier.log_label,
+        )
+        .await;
         return;
     }
 
