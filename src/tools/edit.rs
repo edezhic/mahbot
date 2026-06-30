@@ -67,7 +67,6 @@ impl Tool for EditTool {
                 let resolved_target =
                     super::path::resolve_write_target(ws.as_path(), &path, true).await?;
 
-                // Refuse to overwrite an existing file in write mode
                 if tokio::fs::try_exists(&resolved_target)
                     .await
                     .map_err(|e| anyhow::anyhow!("Cannot verify whether {path} exists: {e}"))?
@@ -461,7 +460,6 @@ fn find_ws_insensitive(content: &str, old_string: &str) -> anyhow::Result<Option
         return Ok(None);
     }
 
-    // Find the first occurrence
     let Some(norm_pos) = norm_content.find(&norm_old) else {
         return Ok(None);
     };

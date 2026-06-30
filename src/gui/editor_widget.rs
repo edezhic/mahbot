@@ -1224,9 +1224,7 @@ impl EditorBuffer {
             // If cursor is on/near the opening bracket → jump to close.
             // If cursor is on/near the closing bracket → jump to open.
             let ((ol, oc), (close_l, close_c)) = pair;
-            // Check if cursor is at or just after the opening bracket.
             let at_open = cl == ol && (cc == oc || cc == oc + 1 || (cc > 0 && cc - 1 == oc));
-            // Check if cursor is at the closing bracket position.
             let at_close = cl == close_l && cc == close_c;
 
             if at_open {

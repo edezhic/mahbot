@@ -359,10 +359,8 @@ impl SearchTool {
 
         let context_lines = super::get_usize(args, "context_lines", 0);
 
-        // Parse the query (extracts constraints + pattern)
         let fff_query = parse_grep_query(query);
 
-        // Build grep options
         let grep_opts = GrepSearchOptions {
             mode: grep_mode,
             smart_case: !case_sensitive,
@@ -378,7 +376,6 @@ impl SearchTool {
             abort_signal: None,
         };
 
-        // Lock the picker and perform grep
         let guard = handle.picker.read().unwrap();
         let Some(picker) = guard.as_ref() else {
             anyhow::bail!("Search engine not yet initialized.")
@@ -420,7 +417,6 @@ impl SearchTool {
             }
             last_file_index = Some(grep_match.file_index);
 
-            // Context before
             let ctx_before_count = grep_match.context_before.len();
             for (i, ctx_line) in grep_match.context_before.iter().enumerate() {
                 let offset_back = (ctx_before_count - i) as u64;
@@ -428,14 +424,12 @@ impl SearchTool {
                 let _ = writeln!(output, "{rel_path}-{line_num}-{ctx_line}");
             }
 
-            // The match line itself
             let _ = writeln!(
                 output,
                 "{rel_path}:{}:{}",
                 grep_match.line_number, grep_match.line_content
             );
 
-            // Context after
             for (i, ctx_line) in grep_match.context_after.iter().enumerate() {
                 let line_num = grep_match.line_number + (i + 1) as u64;
                 let _ = writeln!(output, "{rel_path}-{line_num}-{ctx_line}");

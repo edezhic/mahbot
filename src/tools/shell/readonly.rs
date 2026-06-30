@@ -675,7 +675,6 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         );
     }
 
-    // Check if the subcommand is safe
     let mut matched_safe = "";
     for safe in GIT_SAFE_SUBCOMMANDS {
         if subcommand == *safe || subcommand.starts_with(&format!("{safe} ")) {
@@ -767,10 +766,8 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Extract base subcommand (first word)
     let base = subcommand.split_whitespace().next().unwrap_or("");
 
-    // Check if the subcommand is in the safe list
     let is_safe = CARGO_SAFE_SUBCOMMANDS.contains(&base);
 
     if !is_safe {

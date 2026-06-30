@@ -1212,14 +1212,12 @@ impl TelegramChannel {
         for (index, chunk) in chunks.iter().enumerate() {
             let text = wrap_chunk(chunk, index, chunks.len());
 
-            // Attach the inline keyboard only to the last chunk.
             let chunk_reply_markup = if index == chunks.len() - 1 {
                 reply_markup.clone()
             } else {
                 None
             };
 
-            // Try HTML first, fall back to plain text on failure.
             if let Err((html_status, html_err)) = self
                 .send_single_message(
                     chat_id,

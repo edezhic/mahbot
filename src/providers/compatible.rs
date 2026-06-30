@@ -524,7 +524,6 @@ impl OpenAiCompatibleProvider {
 #[must_use]
 pub(crate) fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|parse_err| {
-        // Attempt JSON repair before falling back to empty object
         if let Ok(repaired) = jsonrepair_rs::jsonrepair(arguments)
             && let Ok(value) = serde_json::from_str(&repaired)
         {
