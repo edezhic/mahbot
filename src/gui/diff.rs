@@ -444,11 +444,17 @@ impl DiffState {
 
                 let msg_ws = ws_name.clone();
                 let msg_hash = hash.clone();
+                let msg_hash_for_git = hash.clone();
                 let msg_task = Task::perform(
                     async move {
                         let ws_path = resolve_workspace_path(&msg_ws, None).await;
                         match ws_path {
-                            Ok(path) => crate::diff_parse::run_git_commit_message(&path).await.ok(),
+                            Ok(path) => crate::diff_parse::run_git_commit_message(
+                                &path,
+                                Some(&msg_hash_for_git),
+                            )
+                            .await
+                            .ok(),
                             Err(_) => None,
                         }
                     },

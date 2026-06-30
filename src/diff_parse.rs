@@ -952,8 +952,18 @@ pub async fn run_git_sync(repo_path: &Path) -> Result<String, String> {
 }
 
 /// Get the last commit's message via `git log -1 --format=%s`.
-pub async fn run_git_commit_message(repo_path: &Path) -> Result<String, String> {
-    let out = run_git_command(repo_path, &["log", "-1", "--format=%s"]).await?;
+///
+/// If `commit_hash` is `Some`, get the message for that specific commit
+/// instead of HEAD.
+pub async fn run_git_commit_message(
+    repo_path: &Path,
+    commit_hash: Option<&str>,
+) -> Result<String, String> {
+    let mut args = vec!["log", "-1", "--format=%s"];
+    if let Some(hash) = commit_hash {
+        args.push(hash);
+    }
+    let out = run_git_command(repo_path, &args).await?;
     Ok(out.trim().to_string())
 }
 
@@ -1509,10 +1519,47 @@ index abc123..def456 100644
     #[tokio::test]
     async fn test_run_git_commit_message() {
         let (_dir, repo_path) = init_temp_repo();
-        let msg = run_git_commit_message(&repo_path)
+
+        // Without hash — should return HEAD's message
+        let msg = run_git_commit_message(&repo_path, None)
             .await
-            .expect("commit message");
+            .expect("commit message without hash");
         assert_eq!(msg, "Initial commit");
+
+        // Create a second commit
+        std::fs::write(repo_path.join("test.txt"), b"line1\nline2\n").expect("write test file");
+        let status = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["commit", "-m", "Second commit"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git commit");
+        assert!(status.success());
+
+        // Get the second commit's hash
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .expect("git rev-parse");
+        let second_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // With hash — should return that commit's message
+        let msg = run_git_commit_message(&repo_path, Some(&second_hash))
+            .await
+            .expect("commit message with hash");
+        assert_eq!(msg, "Second commit");
+
+        // Without hash should now return HEAD (second commit)
+        let msg = run_git_commit_message(&repo_path, None)
+            .await
+            .expect("commit message without hash");
+        assert_eq!(msg, "Second commit");
     }
 
     #[tokio::test]
