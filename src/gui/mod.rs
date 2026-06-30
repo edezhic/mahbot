@@ -1819,12 +1819,12 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     // but the sidebar separates them visually.
     let pinned: Vec<&Ticket> = pipeline
         .iter()
-        .filter(|t| t.status != TicketPhase::ReadyForDevelopment)
+        .filter(|t| t.phase != TicketPhase::ReadyForDevelopment)
         .copied()
         .collect();
     let ready: Vec<&Ticket> = pipeline
         .iter()
-        .filter(|t| t.status == TicketPhase::ReadyForDevelopment)
+        .filter(|t| t.phase == TicketPhase::ReadyForDevelopment)
         .copied()
         .collect();
 

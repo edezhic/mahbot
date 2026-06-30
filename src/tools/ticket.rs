@@ -237,7 +237,7 @@ impl Tool for ListTicketsTool {
         // Default: exclude unblocking phases. When an explicit status filter
         // is provided, respect it as-is.
         if status_filter.is_none() {
-            tickets.retain(|t| !t.status.is_unblocking());
+            tickets.retain(|t| !t.phase.is_unblocking());
         }
 
         if tickets.is_empty() {
@@ -411,7 +411,7 @@ mod tests {
             .await
             .expect("get_ticket")
             .expect("ticket exists");
-        assert_eq!(ticket.status, TicketPhase::InQa);
+        assert_eq!(ticket.phase, TicketPhase::InQa);
     }
 
     #[tokio::test]

@@ -305,7 +305,7 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     let tickets = board.list_all_tickets(Some(&ws.name), None).await.ok()?;
     let active: Vec<_> = tickets
         .into_iter()
-        .filter(|t| !t.is_archived && !t.status.is_unblocking())
+        .filter(|t| !t.is_archived && !t.phase.is_unblocking())
         .collect();
     if active.is_empty() {
         return None;

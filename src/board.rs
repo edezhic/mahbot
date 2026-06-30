@@ -231,7 +231,8 @@ pub struct Ticket {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub status: TicketPhase,
+    #[serde(rename = "status")]
+    pub phase: TicketPhase,
     pub assigned_to: Option<String>,
     pub workspace_name: String,
     pub created_at: String,
@@ -268,11 +269,11 @@ pub struct Ticket {
 impl Ticket {
     /// Short single-line display for listing tickets in agent-facing output.
     ///
-    /// Returns `"  [{reporter}] [{status}] {id}: {title}"` (note the leading
+    /// Returns `"  [{reporter}] [{phase}] {id}: {title}"` (note the leading
     /// two-space indent for alignment within a multi-line block). The trailing
     /// newline is omitted — callers add it via `writeln!` or equivalent.
     ///
-    /// The `{status}` field uses the snake_case Display representation from
+    /// The `{phase}` field uses the snake_case Display representation from
     /// [`TicketPhase`] (e.g. `"in_development"`), which is the canonical form
     /// for agent-facing output. For user-facing labels with spaces instead of
     /// underscores, use [`TicketPhase::display_name()`] directly.
@@ -283,12 +284,12 @@ impl Ticket {
     ///   `<current-ticket>` block for system messages — intentionally different
     ///   format and should not be unified.
     /// - `search_archived_tickets` format omits the reporter field
-    ///   (`"  [{status}] {id}: {title}"`) — intentionally different.
+    ///   (`"  [{phase}] {id}: {title}"`) — intentionally different.
     #[must_use]
     pub fn short_display(&self) -> String {
         format!(
             "  [{}] [{}] {}: {}",
-            self.reporter, self.status, self.id, self.title
+            self.reporter, self.phase, self.id, self.title
         )
     }
 
@@ -298,7 +299,7 @@ impl Ticket {
     /// The output includes these fields (when present):
     ///
     /// - Ticket ID, Title, Description
-    /// - Status (snake_case — e.g. `ready_for_development`)
+    /// - Phase (snake_case — e.g. `ready_for_development`)
     /// - Reporter, Workspace, Created, Updated
     /// - Supersedes, Superseded by, Prerequisites (conditionally when non-empty)
     /// - Archived flag (conditionally when `true`)
@@ -333,7 +334,7 @@ impl Ticket {
             "Ticket: {id}\n\
              Title: {title}\n\
              Description: {description}\n\
-             Status: {status}\n\
+             Phase: {phase}\n\
              Reporter: {reporter}\n\
              Workspace: {workspace}\n\
              Created: {created}\n\
@@ -341,7 +342,7 @@ impl Ticket {
             id = self.id,
             title = self.title,
             description = self.description,
-            status = self.status,
+            phase = self.phase,
             reporter = self.reporter,
             workspace = self.workspace_name,
             created = self.created_at,
@@ -772,7 +773,7 @@ impl BoardStore {
             id,
             title: row.get(COL_TICKET_TITLE)?,
             description: row.get(COL_TICKET_DESCRIPTION)?,
-            status: row
+            phase: row
                 .get::<String>(COL_TICKET_STATUS)?
                 .parse::<TicketPhase>()?,
             assigned_to: row.get(COL_TICKET_ASSIGNED_TO)?,
@@ -2079,7 +2080,7 @@ mod tests {
             .expect("update");
 
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(ticket.status, TicketPhase::DiagnosticsDone);
+        assert_eq!(ticket.phase, TicketPhase::DiagnosticsDone);
         assert!(
             ticket.assigned_to.is_none(),
             "assigned_to should be cleared after unconditional transition"
@@ -2104,7 +2105,7 @@ mod tests {
             "guarded transition with wrong phase should fail"
         );
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(ticket.status, TicketPhase::Backlog);
+        assert_eq!(ticket.phase, TicketPhase::Backlog);
 
         // Correct expected phase — should succeed.
         store
@@ -2117,7 +2118,7 @@ mod tests {
             .await
             .expect("guarded transition with correct phase should succeed");
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(ticket.status, TicketPhase::InDevelopment);
+        assert_eq!(ticket.phase, TicketPhase::InDevelopment);
     }
 
     #[tokio::test]
@@ -2245,7 +2246,7 @@ mod tests {
 
             let t = expect_ticket(&store, &id).await;
             assert_eq!(
-                t.status, case.expected,
+                t.phase, case.expected,
                 "Case '{}': unexpected status after reset",
                 case.name,
             );
@@ -2323,7 +2324,7 @@ mod tests {
         // because the pipeline is blocked. Verify the fresh ticket remains untouched.
         let fresh = expect_ticket(&store, &fresh_id).await;
         assert_eq!(
-            fresh.status,
+            fresh.phase,
             TicketPhase::ReadyForDevelopment,
             "Fresh ticket should still be at ReadyForDevelopment"
         );
@@ -2575,7 +2576,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("should claim ticket from ws_a");
         assert_eq!(claimed_a.id, id_a);
         assert_eq!(claimed_a.workspace_name, "workspace_a");
-        assert_eq!(claimed_a.status, TicketPhase::InDevelopment);
+        assert_eq!(claimed_a.phase, TicketPhase::InDevelopment);
         assert!(claimed_a.assigned_to.is_none());
 
         // Claim from workspace A again — should return None (no more backlog tickets)
@@ -2715,7 +2716,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                 let claimed = claimed.expect("should claim ticket");
                 assert_eq!(claimed.id, id, "Case '{}': wrong ticket id", case.name);
                 assert_eq!(
-                    claimed.status,
+                    claimed.phase,
                     TicketPhase::InDevelopment,
                     "Case '{}': wrong status after claim",
                     case.name
@@ -3065,21 +3066,21 @@ with a comment explaining why no agent is mid-execution in that state.\
             old_cancelled.is_archived,
             "old cancelled ticket should be archived"
         );
-        assert_eq!(old_cancelled.status, TicketPhase::Cancelled);
+        assert_eq!(old_cancelled.phase, TicketPhase::Cancelled);
 
         let fresh_cancelled = crate::util::test::expect_ticket(&store, &fresh_cancelled_id).await;
         assert!(
             !fresh_cancelled.is_archived,
             "fresh cancelled ticket should NOT be archived"
         );
-        assert_eq!(fresh_cancelled.status, TicketPhase::Cancelled);
+        assert_eq!(fresh_cancelled.phase, TicketPhase::Cancelled);
 
         let old_backlog = crate::util::test::expect_ticket(&store, &old_backlog_id).await;
         assert!(
             !old_backlog.is_archived,
             "old non-cancelled ticket should NOT be archived"
         );
-        assert_eq!(old_backlog.status, TicketPhase::Backlog);
+        assert_eq!(old_backlog.phase, TicketPhase::Backlog);
     }
 
     #[tokio::test]
@@ -3121,21 +3122,21 @@ with a comment explaining why no agent is mid-execution in that state.\
         // Assert
         let done_ticket = crate::util::test::expect_ticket(&store, &done_id).await;
         assert!(done_ticket.is_archived, "Done ticket should be archived");
-        assert_eq!(done_ticket.status, TicketPhase::Done);
+        assert_eq!(done_ticket.phase, TicketPhase::Done);
 
         let cancelled_ticket = crate::util::test::expect_ticket(&store, &cancelled_id).await;
         assert!(
             cancelled_ticket.is_archived,
             "Cancelled ticket should be archived"
         );
-        assert_eq!(cancelled_ticket.status, TicketPhase::Cancelled);
+        assert_eq!(cancelled_ticket.phase, TicketPhase::Cancelled);
 
         let backlog_ticket = crate::util::test::expect_ticket(&store, &backlog_id).await;
         assert!(
             !backlog_ticket.is_archived,
             "Backlog ticket should NOT be archived"
         );
-        assert_eq!(backlog_ticket.status, TicketPhase::Backlog);
+        assert_eq!(backlog_ticket.phase, TicketPhase::Backlog);
     }
 
     #[tokio::test]
@@ -3176,15 +3177,15 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ticket1 = crate::util::test::expect_ticket(&store, &id1).await;
         assert!(ticket1.is_archived, "ws1 ticket should be archived");
         assert_eq!(
-            ticket1.status,
+            ticket1.phase,
             TicketPhase::Done,
-            "ws1 status should remain Done"
+            "ws1 phase should remain Done"
         );
 
         let ticket2 = crate::util::test::expect_ticket(&store, &id2).await;
         assert!(!ticket2.is_archived, "ws2 ticket should NOT be archived");
         assert_eq!(
-            ticket2.status,
+            ticket2.phase,
             TicketPhase::Done,
             "ws2 ticket should remain Done"
         );
@@ -3293,7 +3294,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // New ticket is in Backlog and links to old
         let new = expect_ticket(store, &new_id).await;
-        assert_eq!(new.status, TicketPhase::Backlog);
+        assert_eq!(new.phase, TicketPhase::Backlog);
         assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
         assert_eq!(new.title, "New title");
     }
@@ -3680,12 +3681,12 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         let status = crate::util::test::expect_ticket_phase(&store, &id).await;
         if should_commit {
-            assert_eq!(status, TicketPhase::Done, "({label}) status");
+            assert_eq!(status, TicketPhase::Done, "({label}) phase");
         } else {
             assert_eq!(
                 status,
                 TicketPhase::QaPassed,
-                "({label}) status after rollback"
+                "({label}) phase after rollback"
             );
         }
     }
@@ -3729,7 +3730,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                 Some("abcdef0123456789abcdef0123456789abcd0123"),
                 "({label}) commit_hash",
             );
-            assert_eq!(ticket.status, TicketPhase::Done, "({label}) status");
+            assert_eq!(ticket.phase, TicketPhase::Done, "({label}) phase");
             assert_eq!(comments.len(), 1, "({label}) comments.len");
             assert_eq!(
                 comments[0].content, "triple write comment",
@@ -3742,9 +3743,9 @@ with a comment explaining why no agent is mid-execution in that state.\
                 "({label}) commit_hash after rollback"
             );
             assert_eq!(
-                ticket.status,
+                ticket.phase,
                 TicketPhase::QaPassed,
-                "({label}) status after rollback",
+                "({label}) phase after rollback",
             );
             assert_eq!(comments.len(), 0, "({label}) comments.len after rollback");
         }
@@ -3946,9 +3947,9 @@ with a comment explaining why no agent is mid-execution in that state.\
                         case.name
                     );
                     assert_eq!(
-                        ticket.status,
+                        ticket.phase,
                         TicketPhase::InDiagnostics,
-                        "Case '{}': status should remain InDiagnostics",
+                        "Case '{}': phase should remain InDiagnostics",
                         case.name
                     );
 
@@ -4013,7 +4014,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
             if case.expected_claim {
                 let ticket = crate::util::test::expect_ticket(&store, &id).await;
-                assert_eq!(ticket.status, TicketPhase::InSanitation);
+                assert_eq!(ticket.phase, TicketPhase::InSanitation);
                 let expected_key =
                     crate::session::ticket_session_key(&id, crate::Role::Sanitation.as_str());
                 assert_eq!(
@@ -4095,10 +4096,10 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
 
         let ticket_a = crate::util::test::expect_ticket(&store, &id_a).await;
-        assert_eq!(ticket_a.status, TicketPhase::InSanitation);
+        assert_eq!(ticket_a.phase, TicketPhase::InSanitation);
 
         let ticket_b = crate::util::test::expect_ticket(&store, &id_b).await;
-        assert_eq!(ticket_b.status, TicketPhase::InSanitation);
+        assert_eq!(ticket_b.phase, TicketPhase::InSanitation);
     }
 
     #[tokio::test]
@@ -4181,7 +4182,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             fresh.description, "Roundtrip description",
             "fresh description"
         );
-        assert_eq!(fresh.status, TicketPhase::Backlog, "fresh status");
+        assert_eq!(fresh.phase, TicketPhase::Backlog, "fresh phase");
         assert!(
             fresh.assigned_to.is_none(),
             "fresh ticket should have no assigned_to"
@@ -4261,7 +4262,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             ticket.description, "Roundtrip description",
             "description mismatch",
         );
-        assert_eq!(ticket.status, TicketPhase::Backlog, "status mismatch");
+        assert_eq!(ticket.phase, TicketPhase::Backlog, "phase mismatch");
         assert_eq!(
             ticket.assigned_to.as_deref(),
             Some("test_assignee"),
@@ -4481,8 +4482,8 @@ with a comment explaining why no agent is mid-execution in that state.\
             "should contain description"
         );
         assert!(
-            display.contains("Status: in_development"),
-            "should use snake_case status"
+            display.contains("Phase: in_development"),
+            "should use snake_case phase"
         );
         assert!(
             display.contains("Reporter: manager"),

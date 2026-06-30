@@ -268,7 +268,7 @@ impl BoardState {
         let status_map: std::collections::HashMap<&str, TicketPhase> = self
             .tickets
             .iter()
-            .map(|t| (t.id.as_str(), t.status))
+            .map(|t| (t.id.as_str(), t.phase))
             .collect();
         let mut unfulfilled_ids = Vec::new();
         for prereq_id in &ticket.prerequisites {
@@ -571,7 +571,7 @@ impl BoardState {
             if ticket.is_archived {
                 continue; // hidden from board
             }
-            match ticket.status {
+            match ticket.phase {
                 TicketPhase::Backlog
                 | TicketPhase::Analysis
                 | TicketPhase::Planning
@@ -604,12 +604,12 @@ impl BoardState {
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
-        let actions = Self::available_actions(ticket.status);
+        let actions = Self::available_actions(ticket.phase);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
         let (unfulfilled_count, unfulfilled_ids) = self.unfulfilled_prereq_count(ticket);
 
-        let mut badge_row = row![Self::status_badge(ticket.status, 10, [1, 6]),].spacing(6);
+        let mut badge_row = row![Self::status_badge(ticket.phase, 10, [1, 6]),].spacing(6);
 
         if unfulfilled_count > 0 {
             let tooltip_text = format!("Blocked by: {}", unfulfilled_ids.join(", "));
@@ -658,8 +658,7 @@ impl BoardState {
         badge_row = badge_row.push(icon_row);
 
         // Per-ticket archive button for done/cancelled tickets
-        if matches!(ticket.status, TicketPhase::Done | TicketPhase::Cancelled)
-            && !ticket.is_archived
+        if matches!(ticket.phase, TicketPhase::Done | TicketPhase::Cancelled) && !ticket.is_archived
         {
             let archive_btn = button(
                 lucide::archive::<iced::Theme, iced::Renderer>()
@@ -866,7 +865,7 @@ impl BoardState {
         ticket: &Ticket,
         is_action_disabled: bool,
     ) -> Element<'_, BoardMessage> {
-        let actions = Self::available_actions(ticket.status);
+        let actions = Self::available_actions(ticket.phase);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
         let reporter_display = if ticket.reporter.is_empty() {
@@ -950,7 +949,7 @@ impl BoardState {
             text(&ticket.id).size(12).color(theme::TEXT_MUTED),
             Space::new().height(6),
             row![
-                Self::status_badge(ticket.status, 12, [2, 8]),
+                Self::status_badge(ticket.phase, 12, [2, 8]),
                 Space::new().width(Length::Fill),
                 icon_row,
             ]

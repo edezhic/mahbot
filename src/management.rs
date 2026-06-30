@@ -402,7 +402,7 @@ async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
         "[{}] {}: {} → {}",
         ticket.reporter,
         ticket.id,
-        ticket.status,
+        ticket.phase,
         status.as_ref()
     );
 
@@ -812,7 +812,7 @@ async fn poll_round() -> anyhow::Result<()> {
                     // Buffer the claim transition. The returned ticket already
                     // has status = info.active_phase (from SQL RETURNING), so record
                     // the transition from source.
-                    ticket_buffer::push(&ws.name, &t.id, source, t.status);
+                    ticket_buffer::push(&ws.name, &t.id, source, t.phase);
                     t
                 }
                 Ok(None) => continue,
@@ -2471,7 +2471,7 @@ mod tests {
         {
             let ticket_a = expect_ticket(board(), &trip_id).await;
             assert_eq!(
-                ticket_a.status,
+                ticket_a.phase,
                 TicketPhase::Failed,
                 "tripped ticket A should be Failed"
             );
@@ -2481,7 +2481,7 @@ mod tests {
         {
             let ticket_b = expect_ticket(board(), &victim_id).await;
             assert_eq!(
-                ticket_b.status,
+                ticket_b.phase,
                 TicketPhase::Planning,
                 "other ReadyForDevelopment ticket B in same workspace should be Planning"
             );
@@ -2491,7 +2491,7 @@ mod tests {
         {
             let ticket_c = expect_ticket(board(), &other_ws_id).await;
             assert_eq!(
-                ticket_c.status,
+                ticket_c.phase,
                 TicketPhase::ReadyForDevelopment,
                 "ticket C in different workspace must not be moved"
             );
@@ -2742,7 +2742,7 @@ mod tests {
                 .await
                 .expect("get_ticket")
                 .unwrap_or_else(|| panic!("ticket {label} exists"));
-            assert_eq!(t.status, TicketPhase::Done, "Ticket {label} should be Done");
+            assert_eq!(t.phase, TicketPhase::Done, "Ticket {label} should be Done");
         }
 
         // No entries should remain for this workspace (the Notify path on
@@ -3100,9 +3100,9 @@ mod tests {
 
             let ticket = expect_ticket(board(), &ticket_id).await;
             assert_eq!(
-                ticket.status, case.expected_status,
+                ticket.phase, case.expected_status,
                 "case {}: expected status {:?}, got {:?}",
-                case.name, case.expected_status, ticket.status,
+                case.name, case.expected_status, ticket.phase,
             );
             assert_eq!(
                 ticket.pipeline_reservation, case.expected_pipeline_reservation,

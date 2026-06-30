@@ -174,7 +174,7 @@ pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
 ///
 /// Panics if any of the assertions fail.
 pub fn assert_superseded_ticket(ticket: &Ticket) {
-    assert_eq!(ticket.status, TicketPhase::Cancelled);
+    assert_eq!(ticket.phase, TicketPhase::Cancelled);
     assert!(
         ticket.assigned_to.is_none(),
         "superseded ticket should have no assignee"
