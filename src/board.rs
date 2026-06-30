@@ -4458,7 +4458,6 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     /// `detailed_display` with comments (role labels, content) and multiple
     /// prerequisites joined by comma+space.
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_detailed_display_with_content() {
         let (store, _tmp) = open_test_store().await;
