@@ -498,7 +498,7 @@ struct AddCommentSql {
 /// Bundles a SQL mutation statement with its parameters and a human-readable
 /// action description. Returned by [`BoardStore::build_transition_sql`] and
 /// [`BoardStore::build_set_commit_info_sql`]; also accepted by
-/// [`BoardStore::execute_and_cancel`] and
+/// [`BoardStore::execute_and_cancel`], [`BoardStore::execute_update`], and
 /// [`BoardStore::execute_prepared_tx`].
 struct PreparedUpdate {
     sql: String,
@@ -1084,7 +1084,7 @@ impl BoardStore {
     /// affected a row, and return success.
     ///
     /// This is the transactional counterpart of
-    /// [`execute_and_cancel`](Self::execute_and_cancel) — it skips agent
+    /// [`execute_update`](Self::execute_update) — it skips agent
     /// cancellation because the caller manages transaction lifecycle and must
     /// cancel agents before starting the transaction when needed.
     ///
@@ -1101,6 +1101,20 @@ impl BoardStore {
         Ok(())
     }
 
+    /// Execute a prepared UPDATE and verify it affected a row.
+    ///
+    /// This is the non-transactional counterpart of
+    /// [`execute_prepared_tx`](Self::execute_prepared_tx) — it skips agent
+    /// cancellation. Use [`execute_and_cancel`](Self::execute_and_cancel) when
+    /// agent cancellation is needed.
+    ///
+    /// Used by [`set_commit_info`](Self::set_commit_info).
+    async fn execute_update(&self, id: &str, prepared: PreparedUpdate) -> Result<()> {
+        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
+        Self::ensure_ticket_found(rows, id, &prepared.action)?;
+        Ok(())
+    }
+
     /// Execute a mutation SQL, verify it affected a row, then cancel any agent
     /// registered on the ticket.
     ///
@@ -1113,7 +1127,7 @@ impl BoardStore {
     /// # When NOT to use
     ///
     /// Do **not** use this helper for methods with different semantics:
-    /// - **`set_commit_info`** — pure metadata, does not cancel agents.
+    /// - **`execute_update`** — for updates that should not cancel agents.
     /// - **`claim_diagnostics`** — returns `Result<bool>` (conditional success),
     ///   only cancels on successful claim.
     /// - **`supersede_and_create`** — runs inside a transaction, cancels before
@@ -1121,8 +1135,7 @@ impl BoardStore {
     /// - **`batch_set_archived`** — batch operation on many tickets, handles
     ///   zero-affected-rows gracefully (no error).
     async fn execute_and_cancel(&self, id: &str, prepared: PreparedUpdate) -> Result<()> {
-        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, id, &prepared.action)?;
+        self.execute_update(id, prepared).await?;
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(id);
         Ok(())
     }
@@ -1294,8 +1307,7 @@ impl BoardStore {
     /// valid values in production.
     ///
     /// Executes the UPDATE directly (no transaction wrapper needed for a single
-    /// write), matching the pattern used by [`transition_to`](Self::transition_to)
-    /// and [`set_assigned_to`](Self::set_assigned_to). For callers that need to
+    /// write) via the [`execute_update`](Self::execute_update) helper. For callers that need to
     /// participate in an outer transaction (e.g. `commit_and_transition_ticket_from`
     /// in management.rs), use [`set_commit_info_tx`](Self::set_commit_info_tx)
     /// instead.
@@ -1307,9 +1319,7 @@ impl BoardStore {
         lines_removed: i64,
     ) -> Result<()> {
         let prepared = Self::build_set_commit_info_sql(id, hash, lines_added, lines_removed);
-        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, id, &prepared.action)?;
-        Ok(())
+        self.execute_update(id, prepared).await
     }
 
     /// Transactional variant of [`set_commit_info`](Self::set_commit_info) —
