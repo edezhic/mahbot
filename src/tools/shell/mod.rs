@@ -48,6 +48,14 @@ pub(super) const SHELL_PREFIXES: &[&str] = &[
     "eval",
 ];
 
+/// Corresponding entries in [`SHELL_PREFIXES`] that do NOT forward their
+/// arguments as a command — they change shell state internally. These are
+/// excluded from delegation-based tests because they don't execute their
+/// arguments.
+#[cfg(test)]
+pub(super) const NON_DELEGATING_PREFIXES: &[&str] =
+    &["cd", "pushd", "popd", "export", "source", "."];
+
 /// Git global flags that may appear between `git` and its subcommand.
 ///
 /// **IMPORTANT**: Only include flags that take a space-separated value argument.

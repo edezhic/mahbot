@@ -908,7 +908,7 @@ fn has_cargo_fmt_check(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::shell::SHELL_PREFIXES;
+    use crate::tools::shell::{NON_DELEGATING_PREFIXES, SHELL_PREFIXES};
 
     fn ok(cmd: &str) {
         assert!(
@@ -1491,17 +1491,15 @@ mod tests {
         ];
 
         for prefix in SHELL_PREFIXES {
-            match *prefix {
-                "cd" | "pushd" | "popd" | "export" | "source" | "." => {}
-                _ => {
-                    for case in &cases {
-                        let cmd = format!("{prefix} {}", case.command);
-                        if case.allowed {
-                            ok(&cmd);
-                        } else {
-                            assert_rejected(&cmd);
-                        }
-                    }
+            if NON_DELEGATING_PREFIXES.contains(prefix) {
+                continue;
+            }
+            for case in &cases {
+                let cmd = format!("{prefix} {}", case.command);
+                if case.allowed {
+                    ok(&cmd);
+                } else {
+                    assert_rejected(&cmd);
                 }
             }
         }
