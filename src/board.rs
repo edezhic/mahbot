@@ -423,8 +423,8 @@ impl TicketPhase {
     /// Delegates to `TRANSITORY_HANDOFF_PHASES` so the transitory handoff set can never
     /// accidentally diverge from the definition used in coverage tests.
     #[must_use]
-    pub fn is_transitory_handoff(self) -> bool {
-        TRANSITORY_HANDOFF_PHASES.contains(&self)
+    pub fn is_transitory_handoff(&self) -> bool {
+        TRANSITORY_HANDOFF_PHASES.contains(self)
     }
 
     /// Returns `true` for phases that unblock dependent tickets.
@@ -435,8 +435,8 @@ impl TicketPhase {
     /// therefore not unblocking — a failed ticket permanently blocks its
     /// dependents and remains visible in active views for manual triage.
     #[must_use]
-    pub fn is_unblocking(self) -> bool {
-        UNBLOCKING_STATUSES.contains(&self)
+    pub fn is_unblocking(&self) -> bool {
+        UNBLOCKING_STATUSES.contains(self)
     }
 
     /// Returns `true` if the ticket is in a pipeline-blocking phase.
@@ -446,8 +446,8 @@ impl TicketPhase {
     /// update, add_comment) should refuse to modify them to prevent
     /// race conditions with running agents.
     #[must_use]
-    pub fn is_pipeline_blocking(self) -> bool {
-        PIPELINE_BLOCKING_STATUSES.contains(&self)
+    pub fn is_pipeline_blocking(&self) -> bool {
+        PIPELINE_BLOCKING_STATUSES.contains(self)
     }
 
     /// Human-readable display label with spaces instead of underscores
@@ -459,7 +459,7 @@ impl TicketPhase {
     /// keep `as_ref()` for tool output, SQL fragments, and agent-facing text
     /// where agents expect the snake_case status string.
     #[must_use]
-    pub fn display_name(self) -> String {
+    pub fn display_name(&self) -> String {
         self.as_ref().replace('_', " ")
     }
 }
