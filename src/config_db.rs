@@ -100,6 +100,7 @@ fn kv_from_row(row: &turso::Row) -> Result<(String, String), ::turso::Error> {
 
 const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
      ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
 impl ConfigStore {
     // ── config_kv ────────────────────────────────────────────
@@ -111,7 +112,7 @@ impl ConfigStore {
 
     /// Delete a key-value pair. Succeeds even if the key does not exist.
     pub async fn delete_kv(&self, key: &str) -> Result<()> {
-        self.exec_delete("config_kv", "key", key).await
+        self.exec(DELETE_KV_SQL, turso::params![key]).await
     }
 
     /// Get all key-value pairs.
@@ -222,8 +223,7 @@ impl ConfigStore {
     /// Like [`delete_kv`] but executes on the supplied [`turso::TxGuard`].
     /// Succeeds even if the key does not exist.
     pub(crate) async fn delete_kv_tx(tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
-        tx.execute("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
-            .await?;
+        tx.execute(DELETE_KV_SQL, turso::params![key]).await?;
         Ok(())
     }
 
@@ -231,20 +231,6 @@ impl ConfigStore {
     async fn exec(&self, sql: &str, params: impl turso::IntoParams + Send + 'static) -> Result<()> {
         self.conn.execute(sql, params).await?;
         Ok(())
-    }
-
-    /// Delete a row from the given table by its primary-key column.
-    ///
-    /// # Safety
-    ///
-    /// `table` and `pk_col` are always compile-time string literals supplied by the caller;
-    /// they are never user-provided, so the `format!` injection is benign.
-    async fn exec_delete(&self, table: &str, pk_col: &str, key: &str) -> Result<()> {
-        self.exec(
-            &format!("DELETE FROM {table} WHERE {pk_col} = ?1"),
-            turso::params![key],
-        )
-        .await
     }
 
     /// Execute a read-only query with a row mapper, collecting all results into
