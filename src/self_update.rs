@@ -378,7 +378,7 @@ pub async fn execute_update() -> Result<()> {
     // 3. Notify: build started.
     notify_admin(
         "🔄 Update started — building from source…",
-        admin_target.as_ref(),
+        admin_target.as_deref(),
     )
     .await;
 
@@ -401,7 +401,7 @@ pub async fn execute_update() -> Result<()> {
     let cargo_bin_path = resolve_cargo_bin_path();
 
     // 5. Run cargo build.
-    run_cargo_build(manifest_dir, admin_target.as_ref()).await?;
+    run_cargo_build(manifest_dir, admin_target.as_deref()).await?;
 
     // 6. self_replace — swap the running binary with the newly built one.
     self_replace::self_replace(&binary_path)
@@ -415,16 +415,16 @@ pub async fn execute_update() -> Result<()> {
     let spawn_path = resolve_spawn_path(
         &binary_path,
         cargo_bin_path.as_deref(),
-        admin_target.as_ref(),
+        admin_target.as_deref(),
     )
     .await?;
 
     // 8. Notify: build complete, restarting.
-    notify_admin("✅ Build complete. Restarting…", admin_target.as_ref()).await;
+    notify_admin("✅ Build complete. Restarting…", admin_target.as_deref()).await;
 
     // 9. Notify: starting new instance (MUST be before step 10 shutdown —
     //    Telegram channel must still be live for this notification).
-    notify_admin("🔄 Starting new instance…", admin_target.as_ref()).await;
+    notify_admin("🔄 Starting new instance…", admin_target.as_deref()).await;
 
     // 10. Shutdown: cancel all agents, close browser sessions, signal shutdown.
     crate::registry::AGENT_REGISTRY.shutdown_all();
@@ -438,7 +438,7 @@ pub async fn execute_update() -> Result<()> {
     //     On macOS, posix_spawn triggers asynchronous Gatekeeper code signature
     //     validation. Spawning before deletion guarantees the spawn target is
     //     never deleted during or before the child's startup window.
-    if let Err(e) = spawn_new_instance_from(&spawn_path, admin_target.as_ref()).await {
+    if let Err(e) = spawn_new_instance_from(&spawn_path, admin_target.as_deref()).await {
         // Spawn failed — re-acquire the lock since the process stays alive.
         if let Err(lock_err) = reacquire_instance_lock().await {
             error!(%lock_err, "Failed to re-acquire instance lock after spawn failure");
@@ -485,7 +485,7 @@ pub async fn execute_update() -> Result<()> {
 
 /// Run `cargo build --release` with a 30-minute timeout.
 /// On failure, notifies admin and returns an error.
-async fn run_cargo_build(manifest_dir: &Path, admin_target: Option<&String>) -> Result<()> {
+async fn run_cargo_build(manifest_dir: &Path, admin_target: Option<&str>) -> Result<()> {
     info!(
         "Starting cargo build --release in {}",
         manifest_dir.display()
@@ -546,7 +546,7 @@ pub async fn resolve_admin_telegram_target() -> Option<String> {
 }
 
 /// Send a notification to the admin user via Telegram.
-pub async fn notify_admin(message: &str, target: Option<&String>) {
+pub async fn notify_admin(message: &str, target: Option<&str>) {
     let Some(recipient) = target else {
         return;
     };
@@ -558,7 +558,7 @@ pub async fn notify_admin(message: &str, target: Option<&String>) {
 
     let reply = crate::SendMessage {
         content: message.to_string(),
-        recipient: recipient.clone(),
+        recipient: recipient.to_string(),
         reply_markup: None,
         agent_role: None,
         workspace: String::new(),
@@ -607,7 +607,7 @@ fn stale_binary_notification(reason: &str, source: &Path, dest: &Path) -> String
 async fn copy_to_cargo_bin(
     source: &Path,
     dest: &Path,
-    admin_target: Option<&String>,
+    admin_target: Option<&str>,
 ) -> Option<PathBuf> {
     // Create parent directory if it doesn't exist.
     if let Some(parent) = dest.parent()
@@ -765,7 +765,7 @@ fn is_executable(path: &Path) -> bool {
 async fn resolve_spawn_path(
     built_binary: &Path,
     cargo_bin: Option<&Path>,
-    admin_target: Option<&String>,
+    admin_target: Option<&str>,
 ) -> Result<PathBuf> {
     let current_exe = std::env::current_exe()
         .context("Failed to resolve current_exe() for spawn path resolution")?;
@@ -823,7 +823,7 @@ async fn resolve_spawn_path(
 /// the child's startup window (see deletion safety in [`execute_update`]).
 /// Deleting the spawn target while Gatekeeper is validating its code signature
 /// causes `syspolicyd` to SIGKILL the child.
-async fn spawn_new_instance_from(binary_path: &Path, admin_target: Option<&String>) -> Result<()> {
+async fn spawn_new_instance_from(binary_path: &Path, admin_target: Option<&str>) -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
 
     info!(

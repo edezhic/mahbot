@@ -509,12 +509,12 @@ impl HomeState {
     #[allow(clippy::too_many_arguments)]
     fn replace_optimistic(
         &mut self,
-        optimistic_id: Option<&String>,
+        optimistic_id: Option<&str>,
         message_id: &str,
         user_name: &str,
         content: &str,
         direction: ChatDirection,
-        agent_role: Option<&String>,
+        agent_role: Option<&str>,
         reply_markup: Option<&serde_json::Value>,
     ) -> Option<Task<HomeMessage>> {
         if let Some(opt_id) = optimistic_id {
@@ -528,7 +528,7 @@ impl HomeState {
                     user_name.to_string(),
                     content.to_string(),
                     direction,
-                    agent_role.cloned(),
+                    agent_role.map(std::string::ToString::to_string),
                     reply_markup,
                 );
                 // Track the canonical ID for dedup — the optimistic ID was
@@ -1185,12 +1185,12 @@ impl HomeState {
                 } => {
                     // 1. Replace optimistic placeholder if present.
                     if let Some(task) = self.replace_optimistic(
-                        optimistic_id.as_ref(),
+                        optimistic_id.as_deref(),
                         &message_id,
                         &user_name,
                         &content,
                         direction,
-                        agent_role.as_ref(),
+                        agent_role.as_deref(),
                         reply_markup.as_ref(),
                     ) {
                         return task;
@@ -1593,7 +1593,7 @@ mod tests {
         ));
 
         let task = state.replace_optimistic(
-            Some(&"opt-1".to_string()),
+            Some("opt-1"),
             "real-42",
             "alice",
             "Hello!",
@@ -1629,7 +1629,7 @@ mod tests {
 
         // optimistic_id does not match any message
         let task = state.replace_optimistic(
-            Some(&"wrong-opt".to_string()),
+            Some("wrong-opt"),
             "real-42",
             "alice",
             "Hello!",

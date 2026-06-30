@@ -344,7 +344,7 @@ macro_rules! string_config_fields {
         pub fn $field(&self) -> Vec<String> {
             let guard = self.read();
             resolve_list_or(
-                guard.$field.as_ref(),
+                guard.$field.as_deref(),
                 guard.$fallback.clone(),
                 $default,
             )
@@ -452,7 +452,7 @@ fn resolve_or(val: Option<String>, fallback: &str) -> String {
 /// value of `fallback_field` (or `default_value`) is returned.
 #[must_use]
 fn resolve_list_or(
-    list_field: Option<&String>,
+    list_field: Option<&str>,
     fallback_field: Option<String>,
     default_value: &str,
 ) -> Vec<String> {

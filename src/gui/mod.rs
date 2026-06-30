@@ -1359,7 +1359,7 @@ impl Dashboard {
         // guards against this in normal operation, but guard for db
         // inconsistency).  Personal workspaces get their resolved path.
         let (editor_name, editor_path) =
-            resolve_dashboard_workspace_path(name, ws_path.as_ref(), personal_path.as_ref());
+            resolve_dashboard_workspace_path(name, ws_path.as_deref(), personal_path.as_deref());
         let editor_task: Task<Message> = Task::done(editor::EditorMessage::WorkspaceSelected(
             editor_name,
             editor_path,
@@ -1378,7 +1378,7 @@ impl Dashboard {
                 .map(Message::DiffModal);
 
         let (shell_name, shell_path) =
-            resolve_dashboard_workspace_path(name, ws_path.as_ref(), personal_path.as_ref());
+            resolve_dashboard_workspace_path(name, ws_path.as_deref(), personal_path.as_deref());
         let shell_task: Task<Message> = Task::done(shell::ShellMessage::WorkspaceSelected(
             shell_name, shell_path,
         ))
@@ -2614,13 +2614,13 @@ fn open_url(url: &str) {
 /// DB inconsistency).
 fn resolve_dashboard_workspace_path(
     name: &str,
-    ws_path: Option<&String>,
-    personal_path: Option<&String>,
+    ws_path: Option<&str>,
+    personal_path: Option<&str>,
 ) -> (String, Option<String>) {
     if let Some(p) = ws_path {
-        (name.to_string(), Some(p.clone()))
+        (name.to_string(), Some(p.to_string()))
     } else if let Some(p) = personal_path {
-        (name.to_string(), Some(p.clone()))
+        (name.to_string(), Some(p.to_string()))
     } else if name.is_empty() {
         (String::new(), None)
     } else {

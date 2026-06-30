@@ -189,7 +189,8 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     let admin_target = mahbot::self_update::resolve_admin_telegram_target().await;
     tokio::spawn(async move {
-        mahbot::self_update::notify_admin("✅ MahBot is back online.", admin_target.as_ref()).await;
+        mahbot::self_update::notify_admin("✅ MahBot is back online.", admin_target.as_deref())
+            .await;
     });
 
     Ok(())
