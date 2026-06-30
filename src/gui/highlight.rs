@@ -282,7 +282,7 @@ pub(crate) fn distribute_byte_spans(
     use std::collections::BTreeSet;
 
     // Compute byte offsets of each line start (and the past-end sentinel).
-    let mut line_starts: Vec<usize> = Vec::with_capacity(source.lines().count() + 1);
+    let mut line_starts: Vec<usize> = Vec::new();
     let mut pos = 0;
     line_starts.push(0);
     for ch in source.bytes() {
