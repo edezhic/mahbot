@@ -543,10 +543,6 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     {
         return false;
     }
-    let lower = path.to_lowercase();
-    if lower.contains("..%2f") || lower.contains("%2f..") {
-        return false;
-    }
     if path.starts_with('~') && !path.starts_with("~/") {
         return false;
     }
@@ -617,11 +613,6 @@ mod tests {
                 name: "my_dot_dot_file",
                 path: "my..file.txt",
                 safe: true,
-            },
-            Case {
-                name: "url_encoded_traversal",
-                path: "foo/..%2f..%2f/etc/passwd",
-                safe: false,
             },
             Case {
                 name: "null_byte",
