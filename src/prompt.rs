@@ -20,18 +20,21 @@ pub(crate) static TEMPLATE_RE: LazyLock<Regex> =
 
 /// Load a prompt template from embedded assets.
 ///
-/// # Panics
-/// Panics if the prompt file is not found
-/// (the asset was not embedded or the asset key is misspelled).
+/// Returns the prompt content on success.
+/// On failure (missing embedded asset), logs a warning and returns a
+/// distinctive fallback string so callers don't panic at runtime.
 #[must_use]
 pub(crate) fn load_prompt(asset_key: &str) -> String {
-    let file = PromptAssets::get(asset_key).unwrap_or_else(|| {
-        panic!(
+    if let Some(file) = PromptAssets::get(asset_key) {
+        String::from_utf8_lossy(file.data.as_ref()).into_owned()
+    } else {
+        tracing::warn!(
+            asset_key = %asset_key,
             "Embedded prompt '{asset_key}' not found. \
              Create the file at src/prompt/{asset_key} and rebuild."
-        )
-    });
-    String::from_utf8_lossy(file.data.as_ref()).into_owned()
+        );
+        format!("[PROMPT MISSING: src/prompt/{asset_key}]")
+    }
 }
 
 // Utils
@@ -378,5 +381,38 @@ mod tests {
                  Add a meaningful description for the tool '{name}'.",
             );
         }
+    }
+
+    #[test]
+    fn all_prompt_assets_load_without_panic() {
+        // Every embedded prompt asset must load successfully and return
+        // non-empty content.  This is the regression guard for switching
+        // load_prompt from panic → warning+fallback: if an asset key is
+        // ever deleted or renamed, this test catches it during development
+        // instead of letting a silent [PROMPT MISSING: …] placeholder slip
+        // into production.
+        for asset_key in PromptAssets::iter() {
+            let content = load_prompt(&asset_key);
+            assert!(
+                !content.trim().is_empty(),
+                "Prompt asset '{asset_key}' is empty or whitespace-only.\n\
+                 Each embedded prompt file must contain meaningful content.",
+            );
+            // The fallback placeholder must never appear in real assets.
+            assert!(
+                !content.starts_with("[PROMPT MISSING:"),
+                "Prompt asset '{asset_key}' returned fallback string instead of real content.\n\
+                 This should never happen — the asset exists in the embedded index.",
+            );
+        }
+    }
+
+    #[test]
+    fn load_prompt_missing_asset_returns_fallback() {
+        let result = load_prompt("this_file_does_not_exist.md");
+        assert_eq!(
+            result,
+            "[PROMPT MISSING: src/prompt/this_file_does_not_exist.md]",
+        );
     }
 }

@@ -230,8 +230,8 @@ impl Role {
 
     /// Conversation compaction prompt for this role, loaded from embedded prompt files.
     ///
-    /// # Panics
-    /// Panics if the summarization prompt asset is missing.
+    /// Falls back to a `[PROMPT MISSING: …]` placeholder if the summarization
+    /// prompt asset is missing (see [`load_prompt`]).
     #[must_use]
     pub fn summary_prompt(&self) -> String {
         crate::prompt::load_prompt(&format!("summarize/{}.md", self.as_str()))
