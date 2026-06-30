@@ -13,7 +13,7 @@ pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image-preview";
 const DEFAULT_VIDEO_GEN_MODEL: &str = "google/veo-3.1-lite";
 pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
-pub(crate) const DEFAULT_AUDIO_TRANSCRIPTION_MODEL: &str = "xiaomi/mimo-v2.5";
+pub(crate) const DEFAULT_AUDIO_TRANSCRIPTION_MODEL: &str = "openai/whisper-large-v3-turbo";
 
 // ── Named config structs ───────────────────────────────────────────
 

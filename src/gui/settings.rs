@@ -1697,7 +1697,7 @@ impl SettingsState {
                 ),
                 config_text_input(
                     "Audio Model",
-                    "xiaomi/mimo-v2.5",
+                    "openai/whisper-large-v3-turbo",
                     self.config
                         .audio_transcription_model
                         .as_deref()
