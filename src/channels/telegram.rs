@@ -1,3 +1,4 @@
+use crate::extraction::ACTION_PREFIX;
 use crate::util::TELEGRAM_MEDIA_MARKER_RE;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::{Channel, ChannelMessage, SendMessage};
@@ -730,8 +731,7 @@ impl TelegramChannel {
 
     /// Parse a `callback_query` update into a `ChannelMessage`.
     /// The callback data becomes the message content.
-    async fn parse_callback_query(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let cq = update.get("callback_query")?;
+    async fn parse_callback_query(&self, cq: &serde_json::Value) -> Option<ChannelMessage> {
         let data = cq.get("data").and_then(serde_json::Value::as_str)?;
         let msg = cq.get("message")?;
         let callback_query_id = cq
@@ -1494,22 +1494,20 @@ impl TelegramChannel {
 
         for update in updates {
             // Check for callback_query first — it has a different structure
-            if update.get("callback_query").is_some() {
-                let cq_id = update["callback_query"]["id"]
-                    .as_str()
-                    .map(ToString::to_string);
-                let cq_data = update["callback_query"]["data"].as_str().unwrap_or("");
+            if let Some(cq) = update.get("callback_query") {
+                let cq_id = cq["id"].as_str().map(ToString::to_string);
+                let cq_data = cq["data"].as_str().unwrap_or("");
 
                 // For __act__ callbacks, do NOT answer early — the action handler
                 // (handle_action_callback in main.rs) will answer with the appropriate
                 // toast text. For __opt__ and other callbacks, dismiss the spinner now.
-                if !cq_data.starts_with("__act__")
+                if !cq_data.starts_with(ACTION_PREFIX)
                     && let Some(ref id) = cq_id
                 {
                     self.answer_callback_query(id, None).await;
                 }
 
-                let Some(msg) = self.parse_callback_query(&update).await else {
+                let Some(msg) = self.parse_callback_query(cq).await else {
                     continue;
                 };
                 if tx.send(msg).await.is_err() {
@@ -2099,7 +2097,121 @@ mod tests {
         assert_eq!(msg.user_name, "alice");
         assert_eq!(msg.reply_target, "-100200300:789");
         assert_eq!(msg.content, "hello from topic");
-    } // ── Message splitting tests ─────────────────────────────────────
+    }
+
+    /// Helper: create a callback_query sub-object for testing.
+    /// Overrides are applied as top-level keys on the callback_query.
+    fn test_callback_query(overrides: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut cq = serde_json::json!({
+            "id": "12345",
+            "data": "set_model|gpt-4",
+            "from": { "id": 555, "username": "alice" },
+            "message": {
+                "message_id": 100,
+                "chat": { "id": -100_200_300 },
+                "date": 1700000000
+            }
+        });
+        let obj = cq.as_object_mut().unwrap();
+        for (key, value) in overrides {
+            obj.insert(key.to_string(), value.clone());
+        }
+        cq
+    }
+
+    #[tokio::test]
+    async fn parse_callback_query_returns_message_with_extracted_fields() {
+        let ch = test_channel().await;
+        let cq = test_callback_query(&[]);
+
+        let msg = ch
+            .parse_callback_query(&cq)
+            .await
+            .expect("callback query should parse with valid user");
+
+        assert_eq!(msg.user_name, "alice");
+        assert_eq!(msg.reply_target, "-100200300");
+        assert_eq!(msg.content, "set_model|gpt-4");
+        assert_eq!(msg.source_channel, "telegram");
+        assert_eq!(msg.callback_query_id.as_deref(), Some("12345"));
+    }
+
+    #[tokio::test]
+    async fn parse_callback_query_returns_none_when_data_missing() {
+        let ch = test_channel().await;
+        let cq = test_callback_query(&[("data", serde_json::Value::Null)]);
+
+        assert!(
+            ch.parse_callback_query(&cq).await.is_none(),
+            "callback query without data should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_callback_query_returns_none_when_message_missing() {
+        let ch = test_channel().await;
+        let cq = test_callback_query(&[("message", serde_json::Value::Null)]);
+
+        assert!(
+            ch.parse_callback_query(&cq).await.is_none(),
+            "callback query without message should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_callback_query_returns_none_for_unauthorized_user() {
+        let ch = test_channel().await;
+        let cq = test_callback_query(&[(
+            "from",
+            serde_json::json!({ "id": 999, "username": "unknown_user" }),
+        )]);
+
+        assert!(
+            ch.parse_callback_query(&cq).await.is_none(),
+            "callback query from an unknown user should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_callback_query_preserves_data_question_mark_semantics() {
+        // The ? guard in parse_callback_query only rejects when data is
+        // absent or null — NOT when it's present but empty. This is distinct
+        // from process_updates which uses unwrap_or("") for the ACK check.
+        // An empty-string data value produces a ChannelMessage with empty content.
+        let ch = test_channel().await;
+        let cq = test_callback_query(&[("data", serde_json::Value::String(String::new()))]);
+
+        let msg = ch
+            .parse_callback_query(&cq)
+            .await
+            .expect("empty-string data is valid — ? only rejects null/absent");
+
+        assert_eq!(msg.content, "", "empty-string data becomes empty content");
+        assert_eq!(msg.callback_query_id.as_deref(), Some("12345"));
+    }
+
+    #[tokio::test]
+    async fn parse_callback_query_accepts_null_id() {
+        // A null/absent callback_query_id should still produce a valid message
+        // (the field becomes None rather than Some). This is distinct from
+        // missing data which causes rejection.
+        let ch = test_channel().await;
+        let cq = test_callback_query(&[("id", serde_json::Value::Null)]);
+
+        let msg = ch
+            .parse_callback_query(&cq)
+            .await
+            .expect("null id should not prevent parsing");
+
+        assert!(
+            msg.callback_query_id.is_none(),
+            "null id → callback_query_id is None"
+        );
+        assert_eq!(
+            msg.content, "set_model|gpt-4",
+            "data should still be extracted"
+        );
+    }
 
     #[test]
     fn telegram_message_splitting() {
