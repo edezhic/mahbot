@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use tracing::warn;
 
+use crate::tools::shell::apply_safe_env;
+
 use anyhow::Result;
 
 /// Result of a successful `git commit` — the full hash and line stats.
@@ -645,21 +647,44 @@ pub async fn run_git_show(
         Err(_) => Ok(None),
     }
 }
+/// Create a [`tokio::process::Command`] for `git` with a sanitized environment.
+///
+/// The subprocess environment is cleared and re-populated with only safe
+/// environment variables (see [`apply_safe_env`]) to prevent credential
+/// leakage (CWE-200). This is the only entry point for production git
+/// subprocess creation in this module — all callers must use this helper.
+///
+/// Callers should add further configuration (args, current_dir, stdio, etc.)
+/// and then spawn or execute the command.
+fn git_command() -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("git");
+    apply_safe_env(&mut cmd);
+    cmd
+}
+
 /// Run a git command without any interpretation of the exit code.
 ///
 /// Shared by [`run_git_command`] and [`git_has_commits`] to avoid
 /// duplicating the spawn + output + decode pattern. Returns the raw
 /// [`std::process::Output`] so each caller can interpret the exit
 /// status as appropriate.
+///
+/// **Environment sanitization**: The subprocess environment is cleared
+/// and re-populated with only a safe set of environment variables
+/// (see [`apply_safe_env`] for details). This prevents leaking API keys
+/// and other secrets into child processes (CWE-200), but it also means
+/// variables like `SSH_AUTH_SOCK` and `GIT_SSH_COMMAND` are **not**
+/// inherited. This is consistent with the shell tool's behavior — use
+/// SSH config (`~/.ssh/config`) for SSH-based git remotes rather than
+/// environment variables.
 pub(crate) async fn run_git_raw(
     repo_path: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .env("LC_ALL", "C")
-        .output()
+    let mut cmd = git_command();
+    cmd.args(args).current_dir(repo_path);
+    cmd.env("LC_ALL", "C");
+    cmd.output()
         .await
         .map_err(|e| format!("Failed to run git: {e}"))
 }
@@ -690,12 +715,13 @@ pub async fn run_git_check_ignore(
 ) -> Result<HashSet<String>, String> {
     use std::process::Stdio;
 
-    let mut child = tokio::process::Command::new("git")
-        .args(["check-ignore", "--stdin"])
+    let mut cmd = git_command();
+    cmd.args(["check-ignore", "--stdin"])
         .current_dir(repo_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn git check-ignore: {e}"))?;
 
@@ -857,11 +883,9 @@ async fn parse_numstat(repo_path: &Path, args: &[&str]) -> Result<(i64, i64), St
 
 /// Check if git is installed.
 pub async fn git_is_installed() -> bool {
-    tokio::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .await
-        .is_ok_and(|o| o.status.success())
+    let mut cmd = git_command();
+    cmd.arg("--version");
+    cmd.output().await.is_ok_and(|o| o.status.success())
 }
 
 /// Check if a git repo has any commits.

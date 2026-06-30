@@ -18,6 +18,7 @@
 
 use crate::Role;
 use crate::Workspace;
+use crate::tools::shell::apply_safe_env;
 use crate::turso::{self, TxGuard};
 use anyhow::Result;
 use serde::Serialize;
@@ -409,13 +410,10 @@ async fn init_personal_workspace_dir(name: &str) {
         );
     }
     // Try git init; non-fatal on failure.
-    match tokio::process::Command::new("git")
-        .arg("init")
-        .arg("-q")
-        .current_dir(&path)
-        .output()
-        .await
-    {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("init").arg("-q").current_dir(&path);
+    apply_safe_env(&mut cmd);
+    match cmd.output().await {
         Ok(o) if o.status.success() => {}
         Ok(_) => warn!(
             path = %path.display(),

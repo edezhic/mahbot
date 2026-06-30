@@ -93,7 +93,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
-fn apply_safe_env(cmd: &mut tokio::process::Command) {
+pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
     cmd.env_clear();
     for &name in SAFE_ENV_VARS {
         if let Some(value) = baseline_env_value(name) {
