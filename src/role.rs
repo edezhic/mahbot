@@ -317,14 +317,22 @@ impl Role {
             }
         };
 
-        // Manager does not need the web search tool as he is expected to use ask with analysts for that
-        if matches!(self, Role::Manager) {
-            return tools;
+        // Manager does not need the web search tool as he is expected to
+        // use ask with analysts for that.
+        if !matches!(self, Role::Manager) {
+            Self::add_web_search_tool(&mut tools);
         }
 
-        // ── Web search provider dispatch ──────────────────────
-        // Exactly one web_search tool is registered, depending on config.
-        // Auto-selection: Firecrawl wins ties (both keys set, no preference).
+        tools
+    }
+
+    /// Appends a web search tool based on the current configuration.
+    ///
+    /// Exactly one web search tool is registered, depending on config.
+    /// Auto-selection: Firecrawl wins ties (both keys set, no preference).
+    /// The caller is responsible for skipping this for Manager (who is
+    /// expected to delegate web searches to analysts via [`AskTool`]).
+    fn add_web_search_tool(tools: &mut Vec<Box<dyn Tool>>) {
         let firecrawl_key = CONFIG.firecrawl_key();
         let exa_key = CONFIG.exa_key();
         match CONFIG.web_search_provider().as_deref() {
@@ -349,8 +357,6 @@ impl Role {
                 }
             }
         }
-
-        tools
     }
 }
 
