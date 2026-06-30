@@ -994,7 +994,7 @@ pub async fn run_git_commit_message(
 /// List untracked/new files in the working tree.
 ///
 /// Delegates to [`run_git_status`] to run `git status --porcelain`, then passes
-/// the output to [`parse_untracked_from_porcelain`] for parsing.
+/// the output to [`parse_new_files_from_porcelain`] for parsing.
 ///
 /// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
 /// including `A ` clean staged and `AM` staged+modified).
@@ -1002,10 +1002,10 @@ pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>
     let porcelain = run_git_status(repo_path)
         .await
         .map_err(anyhow::Error::msg)?;
-    Ok(parse_untracked_from_porcelain(&porcelain))
+    Ok(parse_new_files_from_porcelain(&porcelain))
 }
 
-/// Parse untracked/new file paths from `git status --porcelain` output.
+/// Parse new/added file paths from `git status --porcelain` output.
 ///
 /// Returns file paths for entries where the index status indicates a new file:
 /// - `??` — untracked file
@@ -1018,11 +1018,45 @@ pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>
 ///
 /// Excludes ` A` (not tracked, added only to working tree — this is a file
 /// that exists but is not tracked by git; it falls under `??` instead).
+///
+/// To parse only truly untracked files (those prefixed with `?? `), use
+/// [`parse_untracked_from_porcelain`] instead.
+#[must_use]
+pub(crate) fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter(|line| line.starts_with("?? ") || line.starts_with('A'))
+        // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
+        // we guard with `get()` to prevent panics on malformed input.
+        .filter_map(|line| {
+            let path = line.get(3..)?;
+            if path.is_empty() {
+                None
+            } else {
+                Some(unquote_c_style(path).unwrap_or_else(|| path.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// Parse only truly untracked file paths from `git status --porcelain` output.
+///
+/// Returns file paths for entries where the porcelain status is `?? ` (untracked
+/// file not in the index). Unlike [`parse_new_files_from_porcelain`], this does
+/// *not* include staged-as-new (`A `) files — it only catches entries starting
+/// with `?? `.
+///
+/// Use this when you only want files that are truly untracked and do not want
+/// overlap with staged-as-new files that might already be present from a
+/// `git diff HEAD` parse.
+///
+/// Path safety: uses `get(3..)` instead of direct indexing to avoid panics on
+/// malformed input (empty lines, truncated porcelain entries).
 #[must_use]
 pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
     porcelain
         .lines()
-        .filter(|line| line.starts_with("?? ") || line.starts_with('A'))
+        .filter(|line| line.starts_with("?? "))
         // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
         // we guard with `get()` to prevent panics on malformed input.
         .filter_map(|line| {
@@ -1600,13 +1634,13 @@ index abc123..def456 100644
         );
     }
 
-    // ── parse_untracked_from_porcelain — git porcelain parsing ──
+    // ── parse_new_files_from_porcelain — combined untracked + staged-as-new ──
 
-    /// Verify that `parse_untracked_from_porcelain` correctly extracts untracked
+    /// Verify that `parse_new_files_from_porcelain` correctly extracts untracked
     /// and staged-as-new file paths from git porcelain output, including C-quoted
     /// paths with special characters (tab, double-quote, non-ASCII).
     #[test]
-    fn parse_untracked_from_porcelain_extracts_new_files() {
+    fn parse_new_files_from_porcelain_extracts_new_files() {
         let porcelain = "\
 ?? new_file.rs
 M  modified.rs
@@ -1622,7 +1656,7 @@ A  \"staged\\\"file.js\"
 ?? \"file\\\\backslash.rs\"
 ";
 
-        let files = parse_untracked_from_porcelain(porcelain);
+        let files = parse_new_files_from_porcelain(porcelain);
 
         assert_eq!(files.len(), 9);
         assert!(files.contains(&"new_file.rs".to_string()));
@@ -1645,7 +1679,7 @@ A  \"staged\\\"file.js\"
     /// Verify that porcelain parsing returns empty for both clean output
     /// (no new/untracked files) and malformed/truncated lines.
     #[test]
-    fn parse_untracked_from_porcelain_returns_empty() {
+    fn parse_new_files_from_porcelain_returns_empty() {
         let porcelain = "\
 M  modified.rs
  M working_tree_only.txt
@@ -1653,7 +1687,7 @@ D  deleted.rs
  A working_tree_new.txt
 ";
 
-        let files = parse_untracked_from_porcelain(porcelain);
+        let files = parse_new_files_from_porcelain(porcelain);
         assert!(
             files.is_empty(),
             "Should be empty when no new/untracked files"
@@ -1663,12 +1697,81 @@ D  deleted.rs
         // for path extraction should also produce empty results without panicking.
         let short_lines = ["A", "A ", "?? ", "??"];
         for &bad_line in &short_lines {
-            let files = parse_untracked_from_porcelain(bad_line);
+            let files = parse_new_files_from_porcelain(bad_line);
             assert!(
                 files.is_empty(),
                 "Malformed line {bad_line:?} should produce empty result, got {files:?}"
             );
         }
+
+        // Also test the ??-only variant with the same short lines.
+        for &bad_line in &short_lines {
+            let files = parse_untracked_from_porcelain(bad_line);
+            assert!(
+                files.is_empty(),
+                "Malformed line {bad_line:?} should produce empty result from ??-only parser, got {files:?}"
+            );
+        }
+    }
+
+    // ── parse_untracked_from_porcelain — ??-only untracked parsing ──
+
+    /// Verify that `parse_untracked_from_porcelain` catches only `?? ` (truly
+    /// untracked) entries and excludes `A ` (staged-as-new) files.
+    #[test]
+    fn parse_untracked_from_porcelain_returns_only_untracked() {
+        let porcelain = "\
+?? new_file.rs
+M  modified.rs
+?? another_new.py
+A  staged_new.js
+?? dir/untracked.txt
+ M working_tree_only.txt
+?? temp.log
+AM staged_then_modified.js
+ A working_tree_new.txt
+?? \"file\\tname.rs\"
+A  \"staged\\\"file.js\"
+?? \"file\\\\backslash.rs\"
+";
+
+        let files = parse_untracked_from_porcelain(porcelain);
+
+        // Should include only ??-prefixed entries (6 total)
+        assert_eq!(files.len(), 6);
+        assert!(files.contains(&"new_file.rs".to_string()));
+        assert!(files.contains(&"another_new.py".to_string()));
+        assert!(files.contains(&"dir/untracked.txt".to_string()));
+        assert!(files.contains(&"temp.log".to_string()));
+        // C-quoted paths should be properly unquoted:
+        assert!(files.contains(&"file\tname.rs".to_string()));
+        assert!(files.contains(&"file\\backslash.rs".to_string()));
+        // These should be excluded:
+        assert!(!files.contains(&"staged_new.js".to_string()));
+        assert!(!files.contains(&"staged_then_modified.js".to_string()));
+        assert!(!files.contains(&"modified.rs".to_string()));
+        assert!(!files.contains(&"working_tree_only.txt".to_string()));
+        assert!(!files.contains(&"working_tree_new.txt".to_string()));
+        assert!(!files.contains(&"staged\"file.js".to_string()));
+    }
+
+    /// Verify that `parse_untracked_from_porcelain` returns empty for output
+    /// containing only staged-as-new or modified files (no ?? entries).
+    #[test]
+    fn parse_untracked_from_porcelain_no_untracked() {
+        let porcelain = "\
+M  modified.rs
+A  staged_new.js
+ M working_tree_only.txt
+AM staged_then_modified.js
+ A working_tree_new.txt
+";
+
+        let files = parse_untracked_from_porcelain(porcelain);
+        assert!(
+            files.is_empty(),
+            "Should be empty when no `?? ` entries present"
+        );
     }
 
     // ── parse_numstat_lines — numstat line parsing ──
