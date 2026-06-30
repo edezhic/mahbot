@@ -1018,6 +1018,29 @@ pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>
     Ok(parse_new_files_from_porcelain(&porcelain))
 }
 
+/// Shared helper for parsing file paths from `git status --porcelain` output.
+///
+/// Iterates over lines, applies `predicate` to select relevant entries, then
+/// extracts the path portion (starting at index 3 after the 2-char status
+/// prefix and space). Guarded with `get(3..)` to avoid panics on malformed
+/// input (empty lines, truncated porcelain entries).
+fn parse_porcelain_paths(porcelain: &str, predicate: impl FnMut(&&str) -> bool) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter(predicate)
+        // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
+        // we guard with `get()` to prevent panics on malformed input.
+        .filter_map(|line| {
+            let path = line.get(3..)?;
+            if path.is_empty() {
+                None
+            } else {
+                Some(unquote_c_style(path).unwrap_or_else(|| path.to_string()))
+            }
+        })
+        .collect()
+}
+
 /// Parse new/added file paths from `git status --porcelain` output.
 ///
 /// Returns file paths for entries where the index status indicates a new file:
@@ -1036,20 +1059,9 @@ pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>
 /// [`parse_untracked_from_porcelain`] instead.
 #[must_use]
 pub(crate) fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
-    porcelain
-        .lines()
-        .filter(|line| line.starts_with("?? ") || line.starts_with('A'))
-        // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
-        // we guard with `get()` to prevent panics on malformed input.
-        .filter_map(|line| {
-            let path = line.get(3..)?;
-            if path.is_empty() {
-                None
-            } else {
-                Some(unquote_c_style(path).unwrap_or_else(|| path.to_string()))
-            }
-        })
-        .collect()
+    parse_porcelain_paths(porcelain, |line| {
+        line.starts_with("?? ") || line.starts_with('A')
+    })
 }
 
 /// Parse only truly untracked file paths from `git status --porcelain` output.
@@ -1062,25 +1074,9 @@ pub(crate) fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
 /// Use this when you only want files that are truly untracked and do not want
 /// overlap with staged-as-new files that might already be present from a
 /// `git diff HEAD` parse.
-///
-/// Path safety: uses `get(3..)` instead of direct indexing to avoid panics on
-/// malformed input (empty lines, truncated porcelain entries).
 #[must_use]
 pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
-    porcelain
-        .lines()
-        .filter(|line| line.starts_with("?? "))
-        // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
-        // we guard with `get()` to prevent panics on malformed input.
-        .filter_map(|line| {
-            let path = line.get(3..)?;
-            if path.is_empty() {
-                None
-            } else {
-                Some(unquote_c_style(path).unwrap_or_else(|| path.to_string()))
-            }
-        })
-        .collect()
+    parse_porcelain_paths(porcelain, |line| line.starts_with("?? "))
 }
 
 #[cfg(test)]
