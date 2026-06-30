@@ -1515,22 +1515,22 @@ fn apply_profile_pipeline(
     // acceptable since credentials should never appear in output.
     let stderr = scrub_credentials(stderr);
 
+    // Local closure capturing the trailing combine_output arguments (stderr,
+    // exit_code, keep_stderr) to reduce repetition across all call sites.
+    let combine =
+        |output: &str| combine_output(output, &stderr, exit_code, profile.keep_stderr.as_ref());
+
     // Stage 1: try JSON preview — early-return path; scrub credentials on
     // array element serializations which include raw values.
     if let Some(json_preview) = try_json_preview(output) {
         let json_preview = scrub_credentials(&json_preview);
-        return combine_output(
-            &json_preview,
-            &stderr,
-            exit_code,
-            profile.keep_stderr.as_ref(),
-        );
+        return combine(&json_preview);
     }
 
     // Stage 2: short-circuit on success patterns — skip for chained commands
     // to avoid suppressing output from later segments (e.g., `cargo build && echo done`).
     if !is_chained && let Some(msg) = match_short_circuit(output, &profile.short_circuits) {
-        return combine_output(msg, &stderr, exit_code, profile.keep_stderr.as_ref());
+        return combine(msg);
     }
 
     let mut processed = output.to_string();
@@ -1564,12 +1564,7 @@ fn apply_profile_pipeline(
     {
         let exit_note = if exit_code == 0 { "" } else { " (failed)" };
         let secs = elapsed.as_secs_f64();
-        return combine_output(
-            &format!("{msg}{exit_note} ({secs:.1}s)"),
-            &stderr,
-            exit_code,
-            profile.keep_stderr.as_ref(),
-        );
+        return combine(&format!("{msg}{exit_note} ({secs:.1}s)"));
     }
 
     // Stage 8: output transform — replaces processed output before combine/finish.
@@ -1582,7 +1577,7 @@ fn apply_profile_pipeline(
         processed = transform(&processed, exit_code);
     }
 
-    let combined = combine_output(&processed, &stderr, exit_code, profile.keep_stderr.as_ref());
+    let combined = combine(&processed);
     finish_shell_output(combined, elapsed, pre_head_tail.as_deref())
 }
 
