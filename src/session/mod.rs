@@ -90,8 +90,7 @@ fn parse_ts_or_now(s: &str, label: &str) -> DateTime<Utc> {
             field = %label,
             value = %s,
             error = %e,
-            "Failed to parse session {}, falling back to Utc::now()",
-            label,
+            "Failed to parse timestamp {label}, falling back to Utc::now()",
         );
         Utc::now()
     })
