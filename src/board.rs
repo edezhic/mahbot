@@ -1914,6 +1914,7 @@ mod tests {
     use super::*;
     use crate::Role;
     use crate::Tool;
+    use crate::role::DIAGNOSTICS_ROLE;
     use crate::role::SYSTEM_ROLE;
     use crate::util::test::TicketBuilder;
     use crate::util::test::assert_superseded_ticket;
@@ -3846,7 +3847,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             }
             if matches!(case.scenario, Scenario::AlreadyAssigned) {
                 store
-                    .set_assigned_to(&id, Some("diagnostics"))
+                    .set_assigned_to(&id, Some(DIAGNOSTICS_ROLE))
                     .await
                     .expect("set_assigned_to");
             }
@@ -3864,7 +3865,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                     let ticket = crate::util::test::expect_ticket(&store, &id).await;
                     assert_eq!(
                         ticket.assigned_to.as_deref(),
-                        Some("diagnostics"),
+                        Some(DIAGNOSTICS_ROLE),
                         "Case '{}': assignee should be set",
                         case.name
                     );
@@ -4030,11 +4031,11 @@ with a comment explaining why no agent is mid-execution in that state.\
         let (store, _tmp, id) = setup().await;
 
         store
-            .set_assigned_to(&id, Some("diagnostics"))
+            .set_assigned_to(&id, Some(DIAGNOSTICS_ROLE))
             .await
             .expect("set_assigned_to");
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(ticket.assigned_to.as_deref(), Some("diagnostics"));
+        assert_eq!(ticket.assigned_to.as_deref(), Some(DIAGNOSTICS_ROLE));
 
         store
             .set_assigned_to(&id, None)
