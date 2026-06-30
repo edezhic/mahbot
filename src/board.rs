@@ -1914,6 +1914,7 @@ mod tests {
     use super::*;
     use crate::Role;
     use crate::Tool;
+    use crate::role::SYSTEM_ROLE;
     use crate::util::test::TicketBuilder;
     use crate::util::test::assert_superseded_ticket;
     use crate::util::test::expect_ticket;
@@ -3559,7 +3560,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let (store, _tmp, id) = setup().await;
 
         let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::add_comment_tx(&tx, &id, "system", "transactional comment")
+        BoardStore::add_comment_tx(&tx, &id, SYSTEM_ROLE, "transactional comment")
             .await
             .expect("add_comment_tx");
         let label = commit_or_rollback(tx, should_commit).await;
@@ -3567,7 +3568,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let comments = store.get_comments(&id).await.expect("get comments");
         if should_commit {
             assert_eq!(comments.len(), 1, "({label}) comments.len");
-            assert_eq!(comments[0].role, "system", "({label}) comment role");
+            assert_eq!(comments[0].role, SYSTEM_ROLE, "({label}) comment role");
             assert_eq!(
                 comments[0].content, "transactional comment",
                 "({label}) comment content"
@@ -3628,7 +3629,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
             .await
             .unwrap();
-        BoardStore::add_comment_tx(&tx, &id, "system", "triple write comment")
+        BoardStore::add_comment_tx(&tx, &id, SYSTEM_ROLE, "triple write comment")
             .await
             .unwrap();
         BoardStore::transition_to_tx(
