@@ -2385,6 +2385,42 @@ mod tests {
         );
     }
 
+    /// Assert that [`BoardStore::has_active_tickets_excluding`] returns the
+    /// expected value. Supports both static and formatted messages.
+    async fn assert_active_excluding(
+        store: &BoardStore,
+        ws_name: &str,
+        exclude_id: &str,
+        expected: bool,
+        msg: impl std::fmt::Display,
+    ) {
+        assert_eq!(
+            store
+                .has_active_tickets_excluding(ws_name, exclude_id)
+                .await
+                .expect("check"),
+            expected,
+            "{msg}"
+        );
+    }
+
+    /// Create 5 tickets in non-active phases under workspace "ws_non" (/ws_non),
+    /// returning their IDs.
+    ///
+    /// Non-active phases covered: Done, Cancelled, Failed, Planning, Backlog.
+    /// Note: Analysis is also filtered out by the SQL query but is intentionally
+    /// omitted here — it has its own dedicated test coverage elsewhere.
+    async fn create_non_active_tickets(store: &BoardStore) -> Vec<String> {
+        let ws = test_ws_named("/ws_non", "ws_non");
+        vec![
+            make_ticket(store, ws.clone(), "Done", TicketPhase::Done).await,
+            make_ticket(store, ws.clone(), "Cancelled", TicketPhase::Cancelled).await,
+            make_ticket(store, ws.clone(), "Failed", TicketPhase::Failed).await,
+            make_ticket(store, ws.clone(), "Planning", TicketPhase::Planning).await,
+            make_ticket(store, ws, "Backlog", TicketPhase::Backlog).await,
+        ]
+    }
+
     /// Verify that [`BoardStore::has_active_tickets_excluding`] correctly identifies
     /// active tickets (PIPELINE_BLOCKING_STATUSES + ReadyForDevelopment) per workspace,
     /// excluding a specified ticket ID.
@@ -2395,7 +2431,6 @@ mod tests {
     /// intentional — unstarted backlog tickets
     /// are considered active to suppress Done notifications until the pipeline
     /// is fully drained.
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_has_active_tickets_excluding() {
         let (store, _tmp) = open_test_store().await;
@@ -2408,96 +2443,87 @@ mod tests {
         let cancelled_id = make_ticket(&store, ws, "Cancelled", TicketPhase::Cancelled).await;
 
         // All non-excluded active tickets are found
-        assert!(
-            store
-                .has_active_tickets_excluding("ws", &done_id)
-                .await
-                .expect("check"),
-            "Should find active tickets (RFD + InDev) when excluding Done"
-        );
+        assert_active_excluding(
+            &store,
+            "ws",
+            &done_id,
+            true,
+            "Should find active tickets (RFD + InDev) when excluding Done",
+        )
+        .await;
 
         // Excluding an active ticket still finds another active ticket
-        assert!(
-            store
-                .has_active_tickets_excluding("ws", &rfd_id)
-                .await
-                .expect("check"),
-            "Should find InDev as active when excluding RFD"
-        );
-        assert!(
-            store
-                .has_active_tickets_excluding("ws", &in_dev_id)
-                .await
-                .expect("check"),
-            "Should find RFD as active when excluding InDev"
-        );
+        assert_active_excluding(
+            &store,
+            "ws",
+            &rfd_id,
+            true,
+            "Should find InDev as active when excluding RFD",
+        )
+        .await;
+        assert_active_excluding(
+            &store,
+            "ws",
+            &in_dev_id,
+            true,
+            "Should find RFD as active when excluding InDev",
+        )
+        .await;
 
-        // Excluding all active tickets leaves only Done + Cancelled (non-active)
-        // We have 2 active (RFD, InDev) and 2 non-active (Done, Cancelled).
-        let non_active_ids = [&done_id, &cancelled_id];
-        for exclude in &non_active_ids {
-            assert!(
-                store
-                    .has_active_tickets_excluding("ws", exclude)
-                    .await
-                    .expect("check"),
-                "Non-active exclusion should still find active tickets"
-            );
+        // Non-active (Done, Cancelled) exclusion should still find active tickets
+        for exclude in [&done_id, &cancelled_id] {
+            assert_active_excluding(
+                &store,
+                "ws",
+                exclude,
+                true,
+                "Non-active exclusion should still find active tickets",
+            )
+            .await;
         }
 
         // ReadyForDevelopment without reservation counts as active
         // (rfd_id already has no reservation — it was created with default)
-        assert!(
-            store
-                .has_active_tickets_excluding("ws", "nonexistent")
-                .await
-                .expect("check"),
-            "Should find active tickets for nonexistent exclude ID"
-        );
+        assert_active_excluding(
+            &store,
+            "ws",
+            "nonexistent",
+            true,
+            "Should find active tickets for nonexistent exclude ID",
+        )
+        .await;
 
         // Different workspace — no tickets
-        assert!(
-            !store
-                .has_active_tickets_excluding("other_ws", &rfd_id)
-                .await
-                .expect("check"),
-            "Should not find active tickets in unrelated workspace"
-        );
+        assert_active_excluding(
+            &store,
+            "other_ws",
+            &rfd_id,
+            false,
+            "Should not find active tickets in unrelated workspace",
+        )
+        .await;
 
         // Workspace with only non-active tickets — Done, Cancelled, Failed, Planning, Backlog
-        let ws_non = test_ws_named("/ws_non", "ws_non");
-        let non_active_done = make_ticket(&store, ws_non.clone(), "Done", TicketPhase::Done).await;
-        let non_active_cancelled =
-            make_ticket(&store, ws_non.clone(), "Cancelled", TicketPhase::Cancelled).await;
-        let non_active_failed =
-            make_ticket(&store, ws_non.clone(), "Failed", TicketPhase::Failed).await;
-        let non_active_planning =
-            make_ticket(&store, ws_non.clone(), "Planning", TicketPhase::Planning).await;
-        let non_active_backlog = make_ticket(&store, ws_non, "Backlog", TicketPhase::Backlog).await;
-
-        for exclude in [
-            &non_active_done,
-            &non_active_cancelled,
-            &non_active_failed,
-            &non_active_planning,
-            &non_active_backlog,
-        ] {
-            assert!(
-                !store
-                    .has_active_tickets_excluding("ws_non", exclude)
-                    .await
-                    .expect("check"),
-                "Workspace with only non-active tickets should have no active tickets (excluded {exclude})",
-            );
+        let non_active_ids = create_non_active_tickets(&store).await;
+        for exclude in &non_active_ids {
+            assert_active_excluding(
+                &store,
+                "ws_non",
+                exclude,
+                false,
+                format!("Workspace with only non-active tickets should have no active tickets (excluded {exclude})"),
+            )
+            .await;
         }
         // Excluding a nonexistent ID in a non-active-only workspace also returns false
-        assert!(
-            !store
-                .has_active_tickets_excluding("ws_non", "nonexistent")
-                .await
-                .expect("check"),
+        assert_active_excluding(
+            &store,
+            "ws_non",
+            "nonexistent",
+            false,
             "No active tickets for nonexistent exclude ID in non-active-only workspace",
-        );
+        )
+        .await;
     }
 
     /// Verify that every non-transitory pipeline-blocking phase has a reset transition.
