@@ -246,7 +246,7 @@ pub enum Message {
     CloseBranchModal,
     /// Branch search query changed.
     BranchQueryChanged(String),
-    /// Result of `run_git_list_branches`.
+    /// Result of listing local branches.
     GitListBranches(Result<Vec<String>, String>),
     /// Result of `run_git_sync`.
     GitSyncResult(Result<String, String>),
@@ -254,11 +254,11 @@ pub enum Message {
     GitSync,
     /// Switch to a branch.
     GitSwitch(String),
-    /// Result of `run_git_switch_branch`.
+    /// Result of switching to a branch.
     GitSwitchResult(Result<(), String>),
     /// Create a new branch from the value in `new_branch_name`.
     GitCreate,
-    /// Result of `run_git_create_branch`.
+    /// Result of creating a new branch.
     GitCreateBranchResult(Result<(), String>),
     /// The new-branch name input changed.
     NewBranchNameChanged(String),
@@ -935,7 +935,12 @@ impl Dashboard {
                         match ws_path {
                             Some(path) => {
                                 let path = std::path::PathBuf::from(path);
-                                crate::diff_parse::run_git_list_branches(&path).await
+                                let out = crate::diff_parse::run_git_command(
+                                    &path,
+                                    &["branch", "--format=%(refname:short)"],
+                                )
+                                .await?;
+                                Ok(out.lines().map(ToString::to_string).collect())
                             }
                             None => Ok(Vec::new()),
                         }
@@ -1002,7 +1007,12 @@ impl Dashboard {
                     match ws_path {
                         Some(path) => {
                             let path = std::path::PathBuf::from(path);
-                            crate::diff_parse::run_git_switch_branch(&path, &branch_clone).await
+                            crate::diff_parse::run_git_command(
+                                &path,
+                                &["switch", branch_clone.as_str()],
+                            )
+                            .await?;
+                            Ok(())
                         }
                         None => Err("No workspace path".to_string()),
                     }
@@ -1038,7 +1048,12 @@ impl Dashboard {
                     match ws_path {
                         Some(path) => {
                             let path = std::path::PathBuf::from(path);
-                            crate::diff_parse::run_git_create_branch(&path, &branch_clone).await
+                            crate::diff_parse::run_git_command(
+                                &path,
+                                &["switch", "-c", branch_clone.as_str()],
+                            )
+                            .await?;
+                            Ok(())
                         }
                         None => Err("No workspace path".to_string()),
                     }

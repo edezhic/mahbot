@@ -941,24 +941,6 @@ pub async fn run_git_diff_stats(repo_path: &Path) -> Result<(i64, i64), String> 
     parse_numstat(repo_path, &["diff", "--numstat", "HEAD"]).await
 }
 
-/// List all local branches (short ref names).
-pub async fn run_git_list_branches(repo_path: &Path) -> Result<Vec<String>, String> {
-    let out = run_git_command(repo_path, &["branch", "--format=%(refname:short)"]).await?;
-    Ok(out.lines().map(ToString::to_string).collect())
-}
-
-/// Switch to an existing branch via `git switch {branch}`.
-pub async fn run_git_switch_branch(repo_path: &Path, branch: &str) -> Result<(), String> {
-    run_git_command(repo_path, &["switch", branch]).await?;
-    Ok(())
-}
-
-/// Create and switch to a new branch via `git switch -c {branch}`.
-pub async fn run_git_create_branch(repo_path: &Path, branch: &str) -> Result<(), String> {
-    run_git_command(repo_path, &["switch", "-c", branch]).await?;
-    Ok(())
-}
-
 /// Sync with remote: `git pull --ff-only` then `git push`.
 ///
 /// Returns the combined output of both commands.
@@ -1536,9 +1518,10 @@ index abc123..def456 100644
     #[tokio::test]
     async fn test_run_git_list_branches_single() {
         let (_dir, repo_path) = init_temp_repo();
-        let branches = run_git_list_branches(&repo_path)
+        let out = run_git_command(&repo_path, &["branch", "--format=%(refname:short)"])
             .await
             .expect("list branches");
+        let branches: Vec<String> = out.lines().map(ToString::to_string).collect();
         assert_eq!(branches.len(), 1, "single branch in new repo");
     }
 
@@ -1551,7 +1534,7 @@ index abc123..def456 100644
             .expect("current branch");
 
         // Create and switch to a new branch
-        run_git_create_branch(&repo_path, "feature/test")
+        run_git_command(&repo_path, &["switch", "-c", "feature/test"])
             .await
             .expect("create branch");
         // Verify we're on the new branch
@@ -1560,12 +1543,13 @@ index abc123..def456 100644
             .expect("current branch");
         assert_eq!(current, "feature/test");
         // Verify it appears in the branch list
-        let branches = run_git_list_branches(&repo_path)
+        let out = run_git_command(&repo_path, &["branch", "--format=%(refname:short)"])
             .await
             .expect("list branches");
+        let branches: Vec<String> = out.lines().map(ToString::to_string).collect();
         assert!(branches.contains(&"feature/test".to_string()));
         // Switch back to the default branch
-        run_git_switch_branch(&repo_path, &default_branch)
+        run_git_command(&repo_path, &["switch", default_branch.as_str()])
             .await
             .expect("switch back");
         let switched = run_git_current_branch(&repo_path)
