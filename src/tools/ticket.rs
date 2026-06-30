@@ -164,7 +164,7 @@ impl Tool for UpdateTicketTool {
         let ticket_id = super::get_str(&args, "ticket_id")?;
         let new_status = super::get_str(&args, "status")?;
 
-        let parsed_status = new_status.parse::<TicketPhase>()?;
+        let parsed_phase = new_status.parse::<TicketPhase>()?;
 
         let store = crate::board::store();
 
@@ -172,7 +172,7 @@ impl Tool for UpdateTicketTool {
         guard_not_pipeline_blocking(store, ticket_id).await?;
 
         store
-            .transition_to(ticket_id, None, parsed_status, None)
+            .transition_to(ticket_id, None, parsed_phase, None)
             .await?;
 
         Ok(format!(

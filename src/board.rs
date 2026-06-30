@@ -701,7 +701,7 @@ impl BoardStore {
             params.workspace_name,
         );
         let status_str: String = row.get(1)?;
-        let old_status: TicketPhase = status_str.parse()?;
+        let old_phase: TicketPhase = status_str.parse()?;
 
         let now = turso::now();
         let cancelled_rows = tx
@@ -735,7 +735,7 @@ impl BoardStore {
         crate::ticket_buffer::push(
             &params.workspace_name,
             supersede_id,
-            old_status,
+            old_phase,
             TicketPhase::Cancelled,
         );
 
@@ -1636,7 +1636,7 @@ impl BoardStore {
     /// callers that pass a terminal status will not see archived tickets in the count.
     pub async fn count_by_status(
         &self,
-        status: TicketPhase,
+        phase: TicketPhase,
         workspace_name: Option<&str>,
     ) -> Result<i64> {
         self.conn
@@ -1645,7 +1645,7 @@ impl BoardStore {
                  WHERE status = ?1 \
                    AND (?2 IS NULL OR workspace_name = ?2) \
                    AND is_archived = 0",
-                turso::params![status.as_ref(), workspace_name],
+                turso::params![phase.as_ref(), workspace_name],
                 |row| row.get(0),
             )
             .await
@@ -1944,16 +1944,16 @@ mod tests {
         )
         .await;
 
-        let status = crate::util::test::expect_ticket_phase(&store, &id).await;
-        assert_eq!(status, TicketPhase::Planning);
+        let phase = crate::util::test::expect_ticket_phase(&store, &id).await;
+        assert_eq!(phase, TicketPhase::Planning);
 
         // After transition, reflects new status.
         store
             .transition_to(&id, None, TicketPhase::ReadyForDevelopment, None)
             .await
             .expect("set");
-        let status = crate::util::test::expect_ticket_phase(&store, &id).await;
-        assert_eq!(status, TicketPhase::ReadyForDevelopment);
+        let phase = crate::util::test::expect_ticket_phase(&store, &id).await;
+        assert_eq!(phase, TicketPhase::ReadyForDevelopment);
     }
 
     #[test]
@@ -3611,12 +3611,12 @@ with a comment explaining why no agent is mid-execution in that state.\
         .expect("transition_to_tx");
         let label = commit_or_rollback(tx, should_commit).await;
 
-        let status = crate::util::test::expect_ticket_phase(&store, &id).await;
+        let phase = crate::util::test::expect_ticket_phase(&store, &id).await;
         if should_commit {
-            assert_eq!(status, TicketPhase::Done, "({label}) phase");
+            assert_eq!(phase, TicketPhase::Done, "({label}) phase");
         } else {
             assert_eq!(
-                status,
+                phase,
                 TicketPhase::QaPassed,
                 "({label}) phase after rollback"
             );

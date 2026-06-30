@@ -86,11 +86,11 @@ pub async fn run_maintainer_loop() {
             // so the maintainer resumes creating tickets as soon as the pre-dev pipeline drops below 5,
             // even if other tickets are in development/review/QA.
             if let Some(board) = crate::board::BOARD.get() {
-                let count_status = |status: TicketPhase| async move {
-                    match board.count_by_status(status, Some(&ws.name)).await {
+                let count_status = |phase: TicketPhase| async move {
+                    match board.count_by_status(phase, Some(&ws.name)).await {
                         Ok(c) => c,
                         Err(e) => {
-                            warn!(workspace = %ws.name, %status, error = %e, "Maintainer: failed to count tickets");
+                            warn!(workspace = %ws.name, %phase, error = %e, "Maintainer: failed to count tickets");
                             0
                         }
                     }

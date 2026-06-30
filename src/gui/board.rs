@@ -158,8 +158,8 @@ impl BoardState {
     }
 
     /// Status transition actions (ported from Board.tsx `availableActions`)
-    fn available_actions(status: TicketPhase) -> Vec<(&'static str, TicketPhase)> {
-        match status {
+    fn available_actions(phase: TicketPhase) -> Vec<(&'static str, TicketPhase)> {
+        match phase {
             TicketPhase::ReadyForDevelopment => vec![
                 ("⏸ Pause", TicketPhase::Planning),
                 ("🛑 Cancel", TicketPhase::Cancelled),

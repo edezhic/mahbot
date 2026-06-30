@@ -151,11 +151,11 @@ pub async fn expect_ticket(store: &BoardStore, id: &str) -> Ticket {
 ///
 /// Replaces the common test boilerplate:
 /// ```ignore
-/// let status = store.get_ticket_phase(&id).await.expect("query").expect("exists");
+/// let phase = store.get_ticket_phase(&id).await.expect("query").expect("exists");
 /// ```
 /// with the more concise:
 /// ```ignore
-/// let status = expect_ticket_phase(&store, &id).await;
+/// let phase = expect_ticket_phase(&store, &id).await;
 /// ```
 ///
 /// # Panics

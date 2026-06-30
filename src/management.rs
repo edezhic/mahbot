@@ -155,13 +155,13 @@ fn diagnostics_breaker_comment(count: usize) -> String {
 #[must_use]
 async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> bool {
     match board().get_ticket_phase(ticket_id).await {
-        Ok(Some(status)) => {
-            let ok = status == expected_phase;
+        Ok(Some(phase)) => {
+            let ok = phase == expected_phase;
             if !ok {
                 debug!(
                     ticket = %ticket_id,
                     expected_phase = %expected_phase,
-                    actual = %status,
+                    actual = %phase,
                     "Ticket moved externally — bailing out",
                 );
             }
@@ -444,7 +444,7 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 ///
 /// # Invariant: failure comment before Failed transition
 ///
-/// When `status == TicketPhase::Failed`, the warning template loads
+/// When `phase == TicketPhase::Failed`, the warning template loads
 /// failure-specific details from the **latest comment** on the ticket (via
 /// [`BoardStore::get_comments`]). Every code path that transitions a ticket to
 /// `Failed` MUST write a relevant comment first — otherwise the warning will
@@ -460,7 +460,7 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 /// — it would either break context continuity or nuke user conversation history.
 ///
 /// Never panics — errors are logged and discarded.
-async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
+async fn notify_ticket(ticket: &Ticket, phase: TicketPhase) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
             ticket = %ticket.id,
@@ -475,7 +475,7 @@ async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
         ticket.reporter,
         ticket.id,
         ticket.phase,
-        status.as_ref()
+        phase.as_ref()
     );
 
     // Drain buffered non-critical transitions before rendering the
@@ -492,13 +492,13 @@ async fn notify_ticket(ticket: &Ticket, status: TicketPhase) {
         &[
             ("{{ticket_id}}", &ticket.id),
             ("{{ticket_title}}", &ticket.title),
-            ("{{ticket_status}}", status.as_ref()),
+            ("{{ticket_status}}", phase.as_ref()),
             ("{{transition_log}}", &transition_log),
             ("{{ticket_updates}}", &drained),
         ],
     );
 
-    if status == TicketPhase::Failed {
+    if phase == TicketPhase::Failed {
         let failure_details = match board().get_comments(&ticket.id).await {
             Ok(comments) => comments.last().map_or_else(
                 || "No failure details available.".to_string(),
@@ -2896,9 +2896,9 @@ mod tests {
         assert!(tripped, "Should trip with 4 failures (threshold: 3, 4 > 3)");
 
         // Verify the ticket is now Failed
-        let status = expect_ticket_phase(board(), &ticket_id).await;
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
-            status,
+            phase,
             TicketPhase::Failed,
             "Circuit breaker should transition to Failed"
         );
@@ -2981,7 +2981,7 @@ mod tests {
             phase: TicketPhase,
             results: Vec<ParallelVerdict>,
             vi: VerifierInfo,
-            expected_status: TicketPhase,
+            expected_phase: TicketPhase,
             expected_pipeline_reservation: bool,
         }
 
@@ -2995,7 +2995,7 @@ mod tests {
                 phase: TicketPhase::InReview,
                 results: vec![no_verdict(); 3],
                 vi: REVIEWER_VI,
-                expected_status: TicketPhase::Failed,
+                expected_phase: TicketPhase::Failed,
                 expected_pipeline_reservation: false,
             },
             Case {
@@ -3009,7 +3009,7 @@ mod tests {
                     pass_result("Looks fine."),
                 ],
                 vi: REVIEWER_VI,
-                expected_status: TicketPhase::ReadyForDevelopment,
+                expected_phase: TicketPhase::ReadyForDevelopment,
                 expected_pipeline_reservation: true,
             },
             Case {
@@ -3023,7 +3023,7 @@ mod tests {
                     pass_result("OK."),
                 ],
                 vi: REVIEWER_VI,
-                expected_status: TicketPhase::Reviewed,
+                expected_phase: TicketPhase::Reviewed,
                 expected_pipeline_reservation: false,
             },
             Case {
@@ -3037,7 +3037,7 @@ mod tests {
                     pass_result("Good."),
                 ],
                 vi: QA_VI,
-                expected_status: TicketPhase::QaPassed,
+                expected_phase: TicketPhase::QaPassed,
                 expected_pipeline_reservation: false,
             },
         ];
@@ -3052,9 +3052,9 @@ mod tests {
 
             let ticket = expect_ticket(board(), &ticket_id).await;
             assert_eq!(
-                ticket.phase, case.expected_status,
-                "case {}: expected status {:?}, got {:?}",
-                case.name, case.expected_status, ticket.phase,
+                ticket.phase, case.expected_phase,
+                "case {}: expected phase {:?}, got {:?}",
+                case.name, case.expected_phase, ticket.phase,
             );
             assert_eq!(
                 ticket.pipeline_reservation, case.expected_pipeline_reservation,
@@ -3077,7 +3077,7 @@ mod tests {
             title: &'static str,
             comment_count: usize,
             expected_trip: bool,
-            expected_status: TicketPhase,
+            expected_phase: TicketPhase,
         }
 
         init_management_test_stores().await;
@@ -3089,7 +3089,7 @@ mod tests {
                 title: "CB Threshold",
                 comment_count: CIRCUIT_BREAKER_COMMENT_THRESHOLD + 1,
                 expected_trip: true,
-                expected_status: TicketPhase::Failed,
+                expected_phase: TicketPhase::Failed,
             },
             Case {
                 name: "= threshold does not trip",
@@ -3097,7 +3097,7 @@ mod tests {
                 title: "CB No Trip",
                 comment_count: CIRCUIT_BREAKER_COMMENT_THRESHOLD,
                 expected_trip: false,
-                expected_status: TicketPhase::InReview,
+                expected_phase: TicketPhase::InReview,
             },
         ];
 
@@ -3129,11 +3129,11 @@ mod tests {
                 case.name, case.expected_trip, tripped,
             );
 
-            let status = expect_ticket_phase(board(), &ticket_id).await;
+            let phase = expect_ticket_phase(board(), &ticket_id).await;
             assert_eq!(
-                status, case.expected_status,
-                "case {}: expected status {:?}, got {:?}",
-                case.name, case.expected_status, status,
+                phase, case.expected_phase,
+                "case {}: expected phase {:?}, got {:?}",
+                case.name, case.expected_phase, phase,
             );
         }
     }
@@ -3176,9 +3176,9 @@ mod tests {
         .await;
         assert!(tripped, "breaker should trip");
 
-        let status = expect_ticket_phase(board(), &ticket_id).await;
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
-            status,
+            phase,
             TicketPhase::Failed,
             "ticket should be Failed after trip"
         );
@@ -3207,8 +3207,8 @@ mod tests {
             "phase guard must reject re-trip (ticket is now Failed)"
         );
 
-        let status = expect_ticket_phase(board(), &ticket_id).await;
-        assert_eq!(status, TicketPhase::Failed, "ticket must remain Failed");
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
+        assert_eq!(phase, TicketPhase::Failed, "ticket must remain Failed");
     }
 
     // ── handle_analyst_verdicts — analyst scoring and transitions ─────────
@@ -3269,13 +3269,13 @@ mod tests {
 
             handle_analyst_verdicts(&ticket, &case.results).await;
 
-            let status = expect_ticket_phase(board(), &ticket_id).await;
+            let phase = expect_ticket_phase(board(), &ticket_id).await;
             assert_eq!(
-                status,
+                phase,
                 TicketPhase::Planning,
                 "case {}: expected Planning, got {:?}",
                 case.name,
-                status,
+                phase,
             );
 
             // Verify comment structure: 3 per-analyst + 1 system summary = 4
@@ -3333,9 +3333,9 @@ mod tests {
 
         handle_qa_passed(ticket, ws).await;
 
-        let status = expect_ticket_phase(board(), &ticket_id).await;
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
-            status,
+            phase,
             TicketPhase::Done,
             "QA passed should eventually transition to Done"
         );
@@ -3370,9 +3370,9 @@ mod tests {
 
         handle_qa_passed(ticket, ws).await;
 
-        let status = expect_ticket_phase(board(), &ticket_id).await;
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
-            status,
+            phase,
             TicketPhase::InSanitation,
             "QA passed with untracked files should transition to InSanitation"
         );
@@ -3411,11 +3411,11 @@ mod tests {
 
         handle_sanitation_verdict(&ticket_pass, pass_verdict).await;
 
-        let status = expect_ticket_phase(board(), &pass_id).await;
+        let phase = expect_ticket_phase(board(), &pass_id).await;
         assert_eq!(
-            status,
+            phase,
             TicketPhase::SanitationPassed,
-            "pass=true should transition to SanitationPassed, got {status:?}",
+            "pass=true should transition to SanitationPassed, got {phase:?}",
         );
 
         // Verify a sanitation comment was added
