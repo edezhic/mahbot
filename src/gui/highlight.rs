@@ -30,43 +30,26 @@ use super::theme;
 
 // ── Compiled query cache — avoids re-parsing query patterns per line ───
 
-static RUST_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static JAVASCRIPT_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static PYTHON_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static TYPESCRIPT_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static TSX_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static JSON_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static TOML_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static BASH_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static CSS_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static HTML_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static GO_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static RUBY_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static C_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static SQL_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-static MARKDOWN_BLOCK_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+// Note: MARKDOWN_INLINE_QUERY is not part of this array because the inline
+// grammar is a separate tree-sitter language (MD_INLINE_LANG) not tied to
+// the HighlightLanguage::Markdown variant (which uses the block grammar).
 static MARKDOWN_INLINE_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+
+/// Number of [`HighlightLanguage`] variants (used as the array size for
+/// the query cache). Kept in sync with the enum — if a variant is added or
+/// removed this constant must be updated. The array index relies on
+/// `#[repr(usize)]` so the variant order must match the enum declaration.
+const N_LANGS: usize = HighlightLanguage::Markdown as usize + 1;
+
+/// Per-language highlight query cache, indexed by `#[repr(usize)]`
+/// discriminant of [`HighlightLanguage`]. Initialised lazily on first
+/// access via [`cached_query`].
+static QUERIES: [OnceLock<Option<Query>>; N_LANGS] = [const { OnceLock::new() }; N_LANGS];
 
 /// Get (or compile) the highlight query for a language.
 /// Returns None if the query is invalid (should not happen with baked-in queries).
 pub(crate) fn cached_query(lang: HighlightLanguage) -> Option<&'static Query> {
-    let cell = match lang {
-        HighlightLanguage::Rust => &RUST_QUERY,
-        HighlightLanguage::JavaScript => &JAVASCRIPT_QUERY,
-        HighlightLanguage::TypeScript => &TYPESCRIPT_QUERY,
-        HighlightLanguage::TSX => &TSX_QUERY,
-        HighlightLanguage::Python => &PYTHON_QUERY,
-        HighlightLanguage::Json => &JSON_QUERY,
-        HighlightLanguage::Toml => &TOML_QUERY,
-        HighlightLanguage::Bash => &BASH_QUERY,
-        HighlightLanguage::Css => &CSS_QUERY,
-        HighlightLanguage::Html => &HTML_QUERY,
-        HighlightLanguage::Go => &GO_QUERY,
-        HighlightLanguage::Ruby => &RUBY_QUERY,
-        HighlightLanguage::C => &C_QUERY,
-        HighlightLanguage::Sql => &SQL_QUERY,
-        HighlightLanguage::Markdown => &MARKDOWN_BLOCK_QUERY,
-    };
+    let cell = &QUERIES[lang as usize];
     cell.get_or_init(|| {
         let (ts_lang, query_str) = lang.language_and_query();
         Query::new(&ts_lang, query_str).ok()
@@ -508,6 +491,7 @@ fn capture_class(capture_name: &str) -> HighlightClass {
 
 /// Supported languages for syntax highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
 pub enum HighlightLanguage {
     Rust,
     JavaScript,
@@ -747,9 +731,14 @@ mod tests {
             ("SQL", HighlightLanguage::Sql),
             ("MD block", HighlightLanguage::Markdown),
         ] {
+            // Direct query compilation (doesn't go through the cache layer).
             let (lang, query) = variant.language_and_query();
             let q = tree_sitter::Query::new(&lang, query);
             assert!(q.is_ok(), "{name} query failed: {:?}", q.err());
+
+            // Also verify it compiles through the cache layer (array-indexed lookup).
+            let cached = cached_query(variant);
+            assert!(cached.is_some(), "{name} cached_query returned None");
         }
 
         // Inline Markdown uses a separate grammar that has no extension mapping,
