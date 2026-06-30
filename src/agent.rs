@@ -3,6 +3,7 @@ use std::time::Instant;
 use crate::providers::compatible::strip_think_tags;
 use crate::providers::reasoning_roundtrip::{
     assistant_replay_payload, coalesce_streamed_reasoning_details, merge_reasoning_details_delta,
+    push_reasoning_delta,
 };
 use crate::providers::{chat, stream_chat};
 use crate::session::Session;
@@ -703,14 +704,8 @@ async fn stream_assistant_response(request: ChatRequest) -> anyhow::Result<ChatR
                     reasoning: reason,
                 } = chunk;
                 if let Some(patch) = reason {
-                    if let Some(s) = patch.reasoning {
-                        reasoning.get_or_insert_with(String::new).push_str(&s);
-                    }
-                    if let Some(s) = patch.reasoning_content {
-                        reasoning_content
-                            .get_or_insert_with(String::new)
-                            .push_str(&s);
-                    }
+                    push_reasoning_delta(&mut reasoning, patch.reasoning);
+                    push_reasoning_delta(&mut reasoning_content, patch.reasoning_content);
                     if let Some(d) = patch.reasoning_details {
                         merge_reasoning_details_delta(&mut reasoning_details, d);
                     }

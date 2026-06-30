@@ -154,6 +154,18 @@ pub fn coalesce_streamed_reasoning_details(patches: &[Value]) -> Option<Value> {
     (!items.is_empty()).then_some(Value::Array(items))
 }
 
+/// Accumulate a streaming reasoning/reasoning_content delta into an `Option<String>`.
+///
+/// Both `reasoning` and `reasoning_content` fields in `StreamChunk` arrive as
+/// a series of `Option<String>` deltas that need to be concatenated.  This
+/// helper avoids duplicating the `get_or_insert_with(String::new).push_str()`
+/// pattern for each field.
+pub fn push_reasoning_delta(acc: &mut Option<String>, s: Option<String>) {
+    if let Some(s) = s {
+        acc.get_or_insert_with(String::new).push_str(&s);
+    }
+}
+
 /// Append streaming `reasoning_details` deltas (arrays or single objects) in order.
 pub fn merge_reasoning_details_delta(into: &mut Vec<serde_json::Value>, patch: serde_json::Value) {
     match patch {
@@ -279,6 +291,27 @@ pub fn assistant_replay_payload(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn push_reasoning_delta_accumulates() {
+        let mut acc: Option<String> = None;
+        // Starting from None, pushed Some("hello") → becomes Some("hello")
+        push_reasoning_delta(&mut acc, Some("hello".to_string()));
+        assert_eq!(acc.as_deref(), Some("hello"));
+
+        // Second delta appends → Some("hello world")
+        push_reasoning_delta(&mut acc, Some(" world".to_string()));
+        assert_eq!(acc.as_deref(), Some("hello world"));
+
+        // None is a no-op → unchanged
+        push_reasoning_delta(&mut acc, None);
+        assert_eq!(acc.as_deref(), Some("hello world"));
+
+        // Accumulation on an already-Some value with no prior content
+        let mut empty: Option<String> = Some(String::new());
+        push_reasoning_delta(&mut empty, Some("x".to_string()));
+        assert_eq!(empty.as_deref(), Some("x"));
+    }
 
     #[test]
     fn plaintext_from_reasoning_details_behavior() {
