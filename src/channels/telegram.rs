@@ -2109,7 +2109,7 @@ mod tests {
             "message": {
                 "message_id": 100,
                 "chat": { "id": -100_200_300 },
-                "date": 1700000000
+                "date": 1_700_000_000
             }
         });
         let obj = cq.as_object_mut().unwrap();
