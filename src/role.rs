@@ -328,14 +328,17 @@ impl Role {
 
     /// Appends a web search tool based on the current configuration.
     ///
-    /// Exactly one web search tool is registered, depending on config.
+    /// At most one web search tool is registered — if an explicit provider
+    /// is configured but its API key is missing, no tool is added.
     /// Auto-selection: Firecrawl wins ties (both keys set, no preference).
     /// The caller is responsible for skipping this for Manager (who is
     /// expected to delegate web searches to analysts via [`AskTool`]).
     fn add_web_search_tool(tools: &mut Vec<Box<dyn Tool>>) {
+        let provider = CONFIG.web_search_provider();
         let firecrawl_key = CONFIG.firecrawl_key();
         let exa_key = CONFIG.exa_key();
-        match CONFIG.web_search_provider().as_deref() {
+
+        match provider.as_deref() {
             Some(p) if p.eq_ignore_ascii_case("firecrawl") => {
                 if let Some(key) = firecrawl_key {
                     tools.push(Box::new(WebSearchTool::new(key)));
