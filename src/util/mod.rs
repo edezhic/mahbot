@@ -125,13 +125,26 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Attempt to repair malformed JSON using [`jsonrepair_rs::jsonrepair`] then re-parse.
+///
+/// Heals common LLM JSON formatting issues (single quotes, trailing commas,
+/// unquoted keys, Python keywords, etc.).
+///
+/// Returns `None` if either the repair or the re-parse fails.
+#[must_use]
+pub(crate) fn try_repair_json<T: DeserializeOwned>(s: &str) -> Option<T> {
+    jsonrepair_rs::jsonrepair(s)
+        .ok()
+        .and_then(|repaired| serde_json::from_str(&repaired).ok())
+}
+
 /// Parse a JSON value from text that may be markdown-fenced.
 ///
 /// Supports ` ```json ... ``` ` blocks, generic ` ``` ... ``` ` blocks,
 /// and bare JSON objects. Generic over `T: DeserializeOwned` so callers
 /// can deserialize directly into their target type.
 ///
-/// On parse failure, attempts [`jsonrepair_rs::jsonrepair`] to heal
+/// On parse failure, attempts [`try_repair_json`] to heal
 /// common LLM JSON formatting issues (single quotes, trailing commas,
 /// unquoted keys, Python keywords, etc.) before retrying.
 pub(crate) fn parse_fenced_json<T: DeserializeOwned>(text: &str) -> anyhow::Result<T> {
@@ -149,9 +162,7 @@ pub(crate) fn parse_fenced_json<T: DeserializeOwned>(text: &str) -> anyhow::Resu
 
     serde_json::from_str::<T>(json_str).or_else(|parse_err| {
         // Attempt JSON repair before giving up
-        if let Ok(repaired) = jsonrepair_rs::jsonrepair(json_str)
-            && let Ok(value) = serde_json::from_str::<T>(&repaired)
-        {
+        if let Some(value) = try_repair_json::<T>(json_str) {
             tracing::warn!(
                 original_error = %parse_err,
                 "Repaired malformed JSON in fenced extraction"

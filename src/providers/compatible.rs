@@ -6,6 +6,7 @@ use crate::providers::compatible_streaming::drain_sse_into_channel;
 use crate::providers::reasoning_roundtrip;
 use crate::providers::{ensure_chat_completions_url, provider_routing_json};
 use crate::util::error::HttpError;
+use crate::util::try_repair_json;
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     MessageRole, Provider, ProviderUsage, Reasoning, StreamError, StreamEvent, StreamResult,
@@ -524,9 +525,7 @@ impl OpenAiCompatibleProvider {
 #[must_use]
 pub(crate) fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|parse_err| {
-        if let Ok(repaired) = jsonrepair_rs::jsonrepair(arguments)
-            && let Ok(value) = serde_json::from_str(&repaired)
-        {
+        if let Some(value) = try_repair_json::<serde_json::Value>(arguments) {
             tracing::debug!(
                 function = %name,
                 original_error = %parse_err,
