@@ -46,7 +46,7 @@ const PARALLEL_AGENT_COUNT: usize = 3;
 /// Comments threshold — tickets accumulating more than this number of comments
 /// are tripped by the circuit breaker (i.e., the trip point is > threshold),
 /// transitioning to Failed for Manager triage.
-const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 50;
+const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 30;
 
 /// Maximum number of cumulative diagnostics failures allowed before the circuit
 /// breaker trips. The breaker trips when `count > DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`
