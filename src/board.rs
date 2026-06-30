@@ -487,7 +487,8 @@ struct AddCommentSql {
 /// Bundles a SQL mutation statement with its parameters and a human-readable
 /// action description. Returned by [`BoardStore::build_transition_sql`] and
 /// [`BoardStore::build_set_commit_info_sql`]; also accepted by
-/// [`BoardStore::execute_and_cancel`].
+/// [`BoardStore::execute_and_cancel`] and
+/// [`BoardStore::execute_prepared_tx`].
 struct PreparedUpdate {
     sql: String,
     params: Vec<turso::Value>,
@@ -1062,15 +1063,34 @@ impl BoardStore {
         reservation: Option<bool>,
     ) -> Result<()> {
         let prepared = Self::build_transition_sql(id, expected_phase, target_phase, reservation);
-        let rows = tx.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, id, &prepared.action)?;
-        Ok(())
+        Self::execute_prepared_tx(tx, prepared, id).await
     }
 
     /// Verify that a mutation query affected at least one row, returning an
     /// error with a descriptive message if the ticket was not found.
     fn ensure_ticket_found(rows: u64, id: &str, action: &str) -> Result<()> {
         anyhow::ensure!(rows > 0, "Ticket {id} not found — cannot {action}");
+        Ok(())
+    }
+
+    /// Execute a prepared UPDATE within an existing transaction, verify it
+    /// affected a row, and return success.
+    ///
+    /// This is the transactional counterpart of
+    /// [`execute_and_cancel`](Self::execute_and_cancel) — it skips agent
+    /// cancellation because the caller manages transaction lifecycle and must
+    /// cancel agents before starting the transaction when needed.
+    ///
+    /// Used by [`transition_to_tx`](Self::transition_to_tx),
+    /// [`set_assigned_to_tx`](Self::set_assigned_to_tx), and
+    /// [`set_commit_info_tx`](Self::set_commit_info_tx).
+    async fn execute_prepared_tx(
+        tx: &TxGuard<'_>,
+        prepared: PreparedUpdate,
+        id: &str,
+    ) -> Result<()> {
+        let rows = tx.execute(&prepared.sql, prepared.params).await?;
+        Self::ensure_ticket_found(rows, id, &prepared.action)?;
         Ok(())
     }
 
@@ -1142,9 +1162,7 @@ impl BoardStore {
         assigned_to: Option<&str>,
     ) -> Result<()> {
         let prepared = Self::build_set_assigned_to_sql(id, assigned_to);
-        let rows = tx.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, id, &prepared.action)?;
-        Ok(())
+        Self::execute_prepared_tx(tx, prepared, id).await
     }
 
     /// Atomically claim a ticket for diagnostics execution.
@@ -1294,9 +1312,7 @@ impl BoardStore {
         lines_removed: i64,
     ) -> Result<()> {
         let prepared = Self::build_set_commit_info_sql(id, hash, lines_added, lines_removed);
-        let rows = tx.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, id, &prepared.action)?;
-        Ok(())
+        Self::execute_prepared_tx(tx, prepared, id).await
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify
