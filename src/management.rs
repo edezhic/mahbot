@@ -3429,8 +3429,7 @@ mod tests {
         assert_eq!(
             status,
             TicketPhase::SanitationPassed,
-            "pass=true should transition to SanitationPassed, got {:?}",
-            status,
+            "pass=true should transition to SanitationPassed, got {status:?}",
         );
 
         // Verify a sanitation comment was added

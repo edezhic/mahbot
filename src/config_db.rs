@@ -589,13 +589,10 @@ mod tests {
     // ── config_kv lifecycle ──────────────────────────────────
     //
     // KV storage uses the production set_kv/delete_kv/get_all_kv path.
-    // For individual value lookups we use an inline query instead of the
-    // (removed) test-only get_kv helper.
+    // For individual value lookups we use an inline get_kv helper (defined below).
 
     #[tokio::test]
     async fn test_config_kv_lifecycle() {
-        let (store, _dir) = setup().await;
-
         // Inline helper for single-key lookup.
         async fn get_kv(store: &ConfigStore, key: &str) -> Result<Option<String>> {
             store
@@ -607,6 +604,8 @@ mod tests {
                 )
                 .await
         }
+
+        let (store, _dir) = setup().await;
 
         // 1. empty state
         let val = get_kv(&store, "nonexistent").await.unwrap();
