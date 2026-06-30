@@ -164,7 +164,7 @@ impl Tool for UpdateTicketTool {
         let ticket_id = super::get_str(&args, "ticket_id")?;
         let new_status = super::get_str(&args, "status")?;
 
-        let parsed_status = parse_ticket_phase(new_status)?;
+        let parsed_status = new_status.parse::<TicketPhase>()?;
 
         let store = crate::board::store();
 
@@ -222,7 +222,7 @@ impl Tool for ListTicketsTool {
 
         let status_filter = match raw_status {
             Some(s) => {
-                let parsed = parse_ticket_phase(s)?;
+                let parsed = s.parse::<TicketPhase>()?;
                 Some(parsed)
             }
             None => None,
@@ -341,17 +341,6 @@ impl Tool for AddCommentTool {
     }
 }
 
-/// Parse a status string into a [`TicketPhase`], returning a user-friendly
-/// error message listing all valid phases on failure.
-fn parse_ticket_phase(s: &str) -> Result<TicketPhase> {
-    s.parse::<TicketPhase>().map_err(|_| {
-        let valid: Vec<String> = <TicketPhase as strum::IntoEnumIterator>::iter()
-            .map(|p| p.to_string())
-            .collect();
-        anyhow::anyhow!("Invalid status '{s}'. Valid statuses: {}", valid.join(", "))
-    })
-}
-
 /// Guard: refuse to proceed if the ticket is in a pipeline-blocking phase.
 /// All three user-facing ticket tools use this to prevent modifications
 /// to in-flight tickets during automated pipeline processing.
@@ -379,31 +368,6 @@ mod tests {
     use crate::util::test::make_ticket;
     use crate::workspace::test_ws;
     use serde_json::json;
-
-    // ── Unit test for parse_ticket_phase error formatting ──────────
-
-    #[test]
-    fn test_parse_ticket_phase_error_message() {
-        let err = parse_ticket_phase("bogus_status").unwrap_err();
-        let msg = format!("{err}");
-
-        assert!(
-            msg.contains("Invalid status"),
-            "error should mention 'Invalid status'"
-        );
-        assert!(
-            msg.contains("bogus_status"),
-            "error should contain the invalid input value"
-        );
-        assert!(
-            msg.contains("backlog"),
-            "error should list valid phases (e.g. backlog)"
-        );
-        assert!(
-            msg.contains("done"),
-            "error should list valid phases (e.g. done)"
-        );
-    }
 
     #[tokio::test]
     async fn test_create_ticket_tool() {
