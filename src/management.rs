@@ -1642,7 +1642,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 ticket = %ticket.id,
                 error = %e,
                 "Diagnostics completed but transition to DiagnosticsDone \
-                 failed — ticket stuck in DiagnosticsDone",
+                 failed — ticket stuck in InDiagnostics",
             );
         }
     } else {
