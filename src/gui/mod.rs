@@ -786,6 +786,14 @@ impl Dashboard {
             Message::Sessions(msg) if self.ready => {
                 self.sessions_state.update(msg).map(Message::Sessions)
             }
+            // Intercept CloseModal from successful manual commit — auto-close
+            // the diff modal while keeping the diff state in working-tree view.
+            // ClearCommitState is intentionally not emitted; the commit handler
+            // already cleared commit state and kicked off a diff refresh.
+            Message::DiffModal(diff::DiffMessage::CloseModal) if self.ready => {
+                self.show_diff_modal = false;
+                Task::none()
+            }
             Message::DiffModal(msg) if self.ready => {
                 self.diff_state.update(msg).map(Message::DiffModal)
             }

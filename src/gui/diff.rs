@@ -114,6 +114,8 @@ pub enum DiffMessage {
     CommitMessageChanged(String),
     CommitClicked,
     CommitResult(Result<CommitInfo, String>),
+    /// Emitted on successful manual commit — signals the parent to close the modal.
+    CloseModal,
     Toast(super::ToastMessage),
     // ── Tree keyboard navigation ──────────────────────────────────
     /// Ctrl+B toggled tree keyboard focus on/off.
@@ -584,6 +586,7 @@ impl DiffState {
                             let workspace_name = ws_name.clone();
                             let ws_path = self.personal_workspace_path.clone();
                             return Task::batch([
+                                Task::done(DiffMessage::CloseModal),
                                 Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
                                     toast_msg,
                                 ))),
@@ -592,9 +595,12 @@ impl DiffState {
                                 }),
                             ]);
                         }
-                        Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
-                            toast_msg,
-                        )))
+                        Task::batch([
+                            Task::done(DiffMessage::CloseModal),
+                            Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
+                                toast_msg,
+                            ))),
+                        ])
                     }
                     Err(e) => {
                         self.error = Some(e);
@@ -602,7 +608,7 @@ impl DiffState {
                     }
                 }
             }
-            DiffMessage::Toast(_) => Task::none(),
+            DiffMessage::CloseModal | DiffMessage::Toast(_) => Task::none(),
 
             DiffMessage::DiscardPath(path, target) => {
                 // Guard: no discard from historical commit view.
