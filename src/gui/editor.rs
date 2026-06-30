@@ -4654,25 +4654,20 @@ impl EditorState {
             .into();
 
         let overlay: Element<'_, EditorMessage> = match &self.active_modal {
-            Some(ModalKind::CloseDialog(tab_idx)) => editor_dialog::wrap_dialog(
-                editor_dialog::build_close_dialog(
-                    EditorMessage::CloseDialog {
-                        tab_index: *tab_idx,
-                        action: CloseAction::Save,
-                    },
-                    EditorMessage::CloseDialog {
-                        tab_index: *tab_idx,
-                        action: CloseAction::Discard,
-                    },
-                    EditorMessage::CloseDialog {
-                        tab_index: *tab_idx,
-                        action: CloseAction::Cancel,
-                    },
-                    "This file has unsaved changes. What would you like to do?".to_string(),
-                ),
-                420,
-                EditorMessage::Escape,
-                0.5,
+            Some(ModalKind::CloseDialog(tab_idx)) => Self::build_close_modal(
+                EditorMessage::CloseDialog {
+                    tab_index: *tab_idx,
+                    action: CloseAction::Save,
+                },
+                EditorMessage::CloseDialog {
+                    tab_index: *tab_idx,
+                    action: CloseAction::Discard,
+                },
+                EditorMessage::CloseDialog {
+                    tab_index: *tab_idx,
+                    action: CloseAction::Cancel,
+                },
+                "This file has unsaved changes. What would you like to do?".to_string(),
             ),
             Some(ModalKind::CloseOthers(keep_idx)) => {
                 let dirty_count = self
@@ -4686,25 +4681,20 @@ impl EditorState {
                 } else {
                     format!("{dirty_count} files have unsaved changes. What would you like to do?")
                 };
-                editor_dialog::wrap_dialog(
-                    editor_dialog::build_close_dialog(
-                        EditorMessage::CloseOthersDialog {
-                            keep_idx: *keep_idx,
-                            action: CloseAction::Save,
-                        },
-                        EditorMessage::CloseOthersDialog {
-                            keep_idx: *keep_idx,
-                            action: CloseAction::Discard,
-                        },
-                        EditorMessage::CloseOthersDialog {
-                            keep_idx: *keep_idx,
-                            action: CloseAction::Cancel,
-                        },
-                        desc,
-                    ),
-                    420,
-                    EditorMessage::Escape,
-                    0.5,
+                Self::build_close_modal(
+                    EditorMessage::CloseOthersDialog {
+                        keep_idx: *keep_idx,
+                        action: CloseAction::Save,
+                    },
+                    EditorMessage::CloseOthersDialog {
+                        keep_idx: *keep_idx,
+                        action: CloseAction::Discard,
+                    },
+                    EditorMessage::CloseOthersDialog {
+                        keep_idx: *keep_idx,
+                        action: CloseAction::Cancel,
+                    },
+                    desc,
                 )
             }
             Some(ModalKind::GlobalSearch(gs)) => editor_dialog::overlay_dialog(
@@ -4734,6 +4724,21 @@ impl EditorState {
         };
 
         iced::widget::stack([body.into(), overlay]).into()
+    }
+
+    /// Build a close confirmation modal with consistent sizing and escape behavior.
+    fn build_close_modal(
+        save_msg: EditorMessage,
+        discard_msg: EditorMessage,
+        cancel_msg: EditorMessage,
+        desc: String,
+    ) -> Element<'static, EditorMessage> {
+        editor_dialog::wrap_dialog(
+            editor_dialog::build_close_dialog(save_msg, discard_msg, cancel_msg, desc),
+            420,
+            EditorMessage::Escape,
+            0.5,
+        )
     }
 
     // ── Tree panel ────────────────────────────────────────────────
