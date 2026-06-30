@@ -1352,16 +1352,17 @@ impl BoardStore {
     /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests
     /// can verify coverage against `PIPELINE_BLOCKING_STATUSES`).
     pub async fn reset_inflight_tickets(&self) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
         let now = turso::now();
         for (from, to, reserve) in Self::RESET_TRANSITIONS {
-            self.conn
-                .execute(
-                    "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
+            tx.execute(
+                "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
                  pipeline_reservation = ?4 WHERE status = ?3",
-                    turso::params![to.as_ref(), now.clone(), from.as_ref(), i64::from(*reserve)],
-                )
-                .await?;
+                turso::params![to.as_ref(), now.clone(), from.as_ref(), i64::from(*reserve)],
+            )
+            .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
