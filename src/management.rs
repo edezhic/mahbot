@@ -154,7 +154,7 @@ fn diagnostics_breaker_comment(count: usize) -> String {
 /// Returns `false` if the ticket was moved externally or an error occurred.
 #[must_use]
 async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
-    match board().get_ticket_status(ticket_id).await {
+    match board().get_ticket_phase(ticket_id).await {
         Ok(Some(status)) => {
             let ok = status == expected;
             if !ok {
@@ -2366,7 +2366,7 @@ mod tests {
     use super::*;
     use crate::board::DEFAULT_TICKET_PHASE;
     use crate::util::test::make_ticket;
-    use crate::util::test::{expect_ticket, expect_ticket_status, init_test_stores};
+    use crate::util::test::{expect_ticket, expect_ticket_phase, init_test_stores};
     use crate::workspace::test_ws_named;
 
     /// Verify that `guard_phase_and_circuit_breaker` rejects a ticket
@@ -2944,7 +2944,7 @@ mod tests {
         assert!(tripped, "Should trip with 4 failures (threshold: 3, 4 > 3)");
 
         // Verify the ticket is now Failed
-        let status = expect_ticket_status(board(), &ticket_id).await;
+        let status = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::Failed,
@@ -3177,7 +3177,7 @@ mod tests {
                 case.name, case.expected_trip, tripped,
             );
 
-            let status = expect_ticket_status(board(), &ticket_id).await;
+            let status = expect_ticket_phase(board(), &ticket_id).await;
             assert_eq!(
                 status, case.expected_status,
                 "case {}: expected status {:?}, got {:?}",
@@ -3218,7 +3218,7 @@ mod tests {
         .await;
         assert!(tripped, "breaker should trip");
 
-        let status = expect_ticket_status(board(), &ticket_id).await;
+        let status = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::Failed,
@@ -3249,7 +3249,7 @@ mod tests {
             "phase guard must reject re-trip (ticket is now Failed)"
         );
 
-        let status = expect_ticket_status(board(), &ticket_id).await;
+        let status = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(status, TicketPhase::Failed, "ticket must remain Failed");
     }
 
@@ -3367,7 +3367,7 @@ mod tests {
 
             handle_analyst_verdicts(&ticket, &case.results).await;
 
-            let status = expect_ticket_status(board(), &ticket_id).await;
+            let status = expect_ticket_phase(board(), &ticket_id).await;
             assert_eq!(
                 status,
                 TicketPhase::Planning,
@@ -3431,7 +3431,7 @@ mod tests {
 
         handle_qa_passed(ticket, ws).await;
 
-        let status = expect_ticket_status(board(), &ticket_id).await;
+        let status = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::Done,
@@ -3468,7 +3468,7 @@ mod tests {
 
         handle_qa_passed(ticket, ws).await;
 
-        let status = expect_ticket_status(board(), &ticket_id).await;
+        let status = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
             status,
             TicketPhase::InSanitation,

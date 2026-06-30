@@ -139,28 +139,28 @@ pub async fn expect_ticket(store: &BoardStore, id: &str) -> Ticket {
         .expect("expected ticket to exist")
 }
 
-/// Fetch a ticket's status by ID, panicking if the DB query fails or the
+/// Fetch a ticket's phase by ID, panicking if the DB query fails or the
 /// ticket does not exist.
 ///
 /// Replaces the common test boilerplate:
 /// ```ignore
-/// let status = store.get_ticket_status(&id).await.expect("query").expect("exists");
+/// let status = store.get_ticket_phase(&id).await.expect("query").expect("exists");
 /// ```
 /// with the more concise:
 /// ```ignore
-/// let status = expect_ticket_status(&store, &id).await;
+/// let status = expect_ticket_phase(&store, &id).await;
 /// ```
 ///
 /// # Panics
 ///
 /// Panics if the DB query fails or the ticket is not found (returns `None`).
 /// The panic originates from within this helper function.
-pub async fn expect_ticket_status(store: &BoardStore, id: &str) -> TicketPhase {
+pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
     store
-        .get_ticket_status(id)
+        .get_ticket_phase(id)
         .await
-        .expect("BoardStore::get_ticket_status query failed")
-        .expect("expected ticket status to exist")
+        .expect("BoardStore::get_ticket_phase query failed")
+        .expect("expected ticket phase to exist")
 }
 
 /// Assert that a ticket has been superseded: its status is `Cancelled`,

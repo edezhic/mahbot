@@ -922,8 +922,8 @@ impl BoardStore {
             .next())
     }
 
-    /// Get a ticket's status phase by id — lightweight, no comments loaded.
-    pub async fn get_ticket_status(&self, id: &str) -> Result<Option<TicketPhase>> {
+    /// Get a ticket's phase by id — lightweight, no comments loaded.
+    pub async fn get_ticket_phase(&self, id: &str) -> Result<Option<TicketPhase>> {
         let sql = "SELECT status FROM tickets WHERE id = ?1";
         let rows = self.conn.query(sql, turso::params![id]).await?;
         match rows.into_iter().next() {
@@ -1934,13 +1934,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_ticket_status() {
+    async fn test_get_ticket_phase() {
         let (store, _tmp) = open_test_store().await;
 
         // Non-existent ticket returns None.
         assert!(
             store
-                .get_ticket_status("nonexistent")
+                .get_ticket_phase("nonexistent")
                 .await
                 .expect("query")
                 .is_none()
@@ -1951,13 +1951,13 @@ mod tests {
             crate::workspace::test_ws_named("/workspace", "workspace"),
         )
         .title("Status Test")
-        .desc("Testing get_ticket_status")
+        .desc("Testing get_ticket_phase")
         .phase(TicketPhase::Planning)
         .create()
         .await
         .expect("create");
 
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
+        let status = crate::util::test::expect_ticket_phase(&store, &id).await;
         assert_eq!(status, TicketPhase::Planning);
 
         // After transition, reflects new status.
@@ -1965,7 +1965,7 @@ mod tests {
             .transition_to(&id, None, TicketPhase::ReadyForDevelopment, None)
             .await
             .expect("set");
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
+        let status = crate::util::test::expect_ticket_phase(&store, &id).await;
         assert_eq!(status, TicketPhase::ReadyForDevelopment);
     }
 
@@ -3678,7 +3678,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         .expect("transition_to_tx");
         let label = commit_or_rollback(tx, should_commit).await;
 
-        let status = crate::util::test::expect_ticket_status(&store, &id).await;
+        let status = crate::util::test::expect_ticket_phase(&store, &id).await;
         if should_commit {
             assert_eq!(status, TicketPhase::Done, "({label}) status");
         } else {

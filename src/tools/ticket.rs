@@ -348,7 +348,7 @@ async fn guard_not_pipeline_blocking(
     store: &crate::board::BoardStore,
     ticket_id: &str,
 ) -> Result<()> {
-    if let Some(current_phase) = store.get_ticket_status(ticket_id).await?
+    if let Some(current_phase) = store.get_ticket_phase(ticket_id).await?
         && current_phase.is_pipeline_blocking()
     {
         anyhow::bail!(
