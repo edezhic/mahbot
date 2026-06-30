@@ -250,7 +250,7 @@ use crate::tools::{
 
 impl Role {
     /// Core read/search/read-only-shell tools for inspector-style roles
-    /// (Analyst, QA, Reviewer, Discovery, Sanitation).
+    /// (Analyst, QA, Reviewer, Discovery, Sanitation, Maintainer).
     fn readonly_core_tools() -> Vec<Box<dyn Tool>> {
         vec![
             Box::new(ReadTool),
@@ -310,13 +310,10 @@ impl Role {
                 ]
             }
             Role::Maintainer => {
-                vec![
-                    Box::new(ReadTool),
-                    Box::new(SearchTool),
-                    Box::new(AskTool::new(vec![Role::Analyst], None)),
-                    Box::new(CreateTicketTool::new("maintainer")),
-                    Box::new(ShellTool::new(ShellMode::ReadOnly)),
-                ]
+                let mut t = Self::readonly_core_tools();
+                t.push(Box::new(AskTool::new(vec![Role::Analyst], None)));
+                t.push(Box::new(CreateTicketTool::new("maintainer")));
+                t
             }
         };
 
