@@ -2087,11 +2087,6 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
         }
     };
 
-    let planning_move_comment = format!(
-        "Moved to planning due to circuit breaker trip on {}: {}. Re-advance to ReadyForDevelopment after Manager resolves the failure.",
-        ticket.id, ticket.title,
-    );
-
     // There is a small race window: between listing ReadyForDevelopment
     // tickets here and transitioning them individually, a concurrent poll
     // cycle could claim one. This is rare in practice (dispatch tasks spawn
@@ -2120,12 +2115,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
                 error = %e,
                 "Failed to move other ReadyForDevelopment ticket to planning — likely raced by external move",
             );
-            continue;
         }
-
-        let _ = board()
-            .add_comment(&other.id, SYSTEM_ROLE, &planning_move_comment)
-            .await;
     }
 }
 
@@ -2442,9 +2432,8 @@ mod tests {
     }
 
     /// Verify that when the circuit breaker trips on a ticket, all other
-    /// ReadyForDevelopment tickets in the same workspace are moved to Planning
-    /// with a system comment referencing the tripped ticket. Tickets in other
-    /// workspaces must not be affected.
+    /// ReadyForDevelopment tickets in the same workspace are moved to Planning.
+    /// Tickets in other workspaces must not be affected.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning() {
@@ -2528,35 +2517,6 @@ mod tests {
                 ticket_c.phase,
                 TicketPhase::ReadyForDevelopment,
                 "ticket C in different workspace must not be moved"
-            );
-        }
-
-        // ── Verify ticket B has a system comment referencing ticket A ──
-        {
-            let comments = board()
-                .get_comments(&victim_id)
-                .await
-                .expect("get_comments for B");
-            let comment = comments
-                .iter()
-                .find(|c| c.role == SYSTEM_ROLE)
-                .expect("ticket B should have a system comment");
-
-            assert!(
-                comment.content.contains(&trip_id),
-                "comment should contain the tripped ticket's ID"
-            );
-            assert!(
-                comment
-                    .content
-                    .contains("Moved to planning due to circuit breaker trip on"),
-                "comment should start with expected format"
-            );
-            assert!(
-                comment.content.contains(
-                    "Re-advance to ReadyForDevelopment after Manager resolves the failure"
-                ),
-                "comment should end with expected format"
             );
         }
     }
