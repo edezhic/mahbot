@@ -390,7 +390,7 @@ impl Agent {
             );
         }
 
-        // Two distinct log levels for error arms (info vs warn) distinguish
+        // Two distinct log levels for error arms (info vs debug) distinguish
         // unknown-tool failures from execution errors without string-prefix matching.
         let (outcome, error_reason) = match find_tool(&self.tools, &tool_name) {
             None => {
