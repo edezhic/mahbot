@@ -59,7 +59,7 @@ const DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD: usize = 4;
 ///
 /// This is a separate, lower threshold than the general comment-count
 /// circuit breaker — sanitation failures are cheap to detect and should
-/// not consume 50 comments before tripping.
+/// not consume 30 comments before tripping.
 const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
 
 /// Compile-time invariant: the sanitation circuit breaker must always trip
@@ -1347,7 +1347,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     // pattern usage across all dispatch functions.
     //
     // The sanitation breaker (threshold=3) will always trip before the general
-    // comment-count breaker (threshold=50), so the general breaker is not needed
+    // comment-count breaker (threshold=30), so the general breaker is not needed
     // here — see the compile-time invariant at line 69.
     //
     // guard_phase_and_breaker returns true=safe, so the `!` inverts it for the
