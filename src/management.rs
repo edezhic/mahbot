@@ -2637,6 +2637,21 @@ mod tests {
         (ws, ticket_id)
     }
 
+    /// Shorthand for [`setup_ticket`] when the workspace is not needed.
+    ///
+    /// Calls [`setup_ticket`] but discards the workspace, returning only the
+    /// ticket ID. Use this when a test needs a ticket in a given phase but
+    /// does not interact with the `Workspace` value.
+    async fn setup_ticket_id(
+        ws_path: &str,
+        ws_name: &str,
+        title: &str,
+        phase: TicketPhase,
+    ) -> String {
+        let (_, id) = setup_ticket(ws_path, ws_name, title, phase).await;
+        id
+    }
+
     /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
     /// via `transition_ticket_to_done`: the first one buffers, the last one
     /// notifies and drains the buffer.
@@ -2815,10 +2830,9 @@ mod tests {
     /// Verify that the sanitation circuit breaker counting logic works correctly.
     #[tokio::test]
     async fn sanitation_breaker_counts_failures() {
-        init_management_test_stores().await;
-        let ticket_id = make_ticket(
-            board(),
-            test_ws_named("/tmp/test", "san_breaker_test"),
+        let ticket_id = setup_ticket_id(
+            "/tmp/test",
+            "san_breaker_test",
             "Sanitation Breaker Test",
             TicketPhase::InSanitation,
         )
@@ -3140,14 +3154,8 @@ mod tests {
     /// phase mismatch before the breaker is called.
     #[tokio::test]
     async fn circuit_breaker_guard_prevents_retrip() {
-        init_management_test_stores().await;
-        let ticket_id = make_ticket(
-            board(),
-            test_ws_named("/tmp/test", "cb_guard"),
-            "CB Guard",
-            TicketPhase::InReview,
-        )
-        .await;
+        let ticket_id =
+            setup_ticket_id("/tmp/test", "cb_guard", "CB Guard", TicketPhase::InReview).await;
 
         for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
             board()
