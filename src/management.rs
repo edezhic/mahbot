@@ -1897,7 +1897,12 @@ async fn dispatch_parallel_with_guard(
 /// trips the comment-count circuit breaker (which may transition the ticket to
 /// Failed for Manager triage). Returns `false` when the caller should abort.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
-    let message = load_prompt("analyze.md");
+    let prompt_key = if ticket.reporter == "maintainer" {
+        "analyze/maintainer_ticket.md"
+    } else {
+        "analyze/manager_ticket.md"
+    };
+    let message = load_prompt(prompt_key);
     let extraction_prompt = load_prompt("extraction/analyst.md");
     let Some(results) = dispatch_parallel_with_guard(
         &ticket,
