@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use turso::Builder;
-pub use turso::{Error as TursoError, IntoParams, Row, Value, params, params_from_iter};
+pub use turso::{IntoParams, Row, Value, params, params_from_iter};
 
 // ── Timestamp helper ────────────────────────────────────────────────
 
