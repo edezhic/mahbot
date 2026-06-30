@@ -427,7 +427,7 @@ mod tests {
             );
             let kind = &marker[1..marker.len() - 1]; // strip [ and :
             assert!(
-                !kind.is_empty() && kind.chars().all(|c| c.is_uppercase()),
+                !kind.is_empty() && kind.chars().all(char::is_uppercase),
                 "{name} marker kind {kind:?} should be non-empty uppercase letters"
             );
             // Validate against the canonical MEDIA_MARKER_RE pattern
