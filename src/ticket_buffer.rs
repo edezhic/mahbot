@@ -1,4 +1,4 @@
-//! Ticket status accumulation buffer — piggyback non-critical transitions
+//! Ticket phase transition buffer — piggyback non-critical transitions
 //! onto critical notifications and user messages.
 //!
 //! Non-critical transitions (where `transition_ticket` is called with
@@ -19,12 +19,12 @@ use crate::util::UnwrapPoison;
 /// Maximum number of buffered entries per workspace before oldest are dropped.
 const PER_WORKSPACE_CAPACITY: usize = 100;
 
-/// A single buffered ticket status transition entry.
+/// A single buffered ticket phase transition entry.
 #[derive(Clone)]
 struct Entry {
     id: String,
-    old_status: String,
-    new_status: String,
+    old_phase: String,
+    new_phase: String,
 }
 
 /// Global ticket transition buffer, keyed by workspace name.
@@ -46,7 +46,7 @@ pub fn init_global() {
 /// # Panics
 ///
 /// Panics if the buffer has not been initialized via [`init_global`].
-pub fn push(workspace_name: &str, id: &str, old_status: TicketPhase, new_status: TicketPhase) {
+pub fn push(workspace_name: &str, id: &str, old_phase: TicketPhase, new_phase: TicketPhase) {
     let mutex = TICKET_BUFFER
         .get()
         .expect("ticket_buffer not initialized — call init_global() first");
@@ -62,8 +62,8 @@ pub fn push(workspace_name: &str, id: &str, old_status: TicketPhase, new_status:
     }
     deque.push_back(Entry {
         id: id.to_string(),
-        old_status: old_status.to_string(),
-        new_status: new_status.to_string(),
+        old_phase: old_phase.to_string(),
+        new_phase: new_phase.to_string(),
     });
 }
 
@@ -98,7 +98,7 @@ pub fn drain(workspace_name: &str) -> String {
         let _ = writeln!(
             out,
             "• {}: {} → {}",
-            entry.id, entry.old_status, entry.new_status
+            entry.id, entry.old_phase, entry.new_phase
         );
     }
     out
