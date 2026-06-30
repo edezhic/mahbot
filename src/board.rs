@@ -1100,6 +1100,20 @@ impl BoardStore {
         Ok(())
     }
 
+    fn build_set_assigned_to_sql(id: &str, assigned_to: Option<&str>) -> PreparedUpdate {
+        let action = if assigned_to.is_some() {
+            "set assigned_to"
+        } else {
+            "clear assigned_to"
+        };
+        Self::update_tickets_with_updated_at(
+            "assigned_to = ?1",
+            vec![Value::from(assigned_to)],
+            action.to_string(),
+            id,
+        )
+    }
+
     /// Set or clear the assignee for a ticket (does not change status).
     ///
     /// When `assigned_to` is `Some(value)`, sets the `assigned_to` column to that
@@ -1111,17 +1125,7 @@ impl BoardStore {
     /// no-op. For clear operations, this ensures no stale agent remains bound to
     /// a now-unassigned ticket.
     pub async fn set_assigned_to(&self, id: &str, assigned_to: Option<&str>) -> Result<()> {
-        let action = if assigned_to.is_some() {
-            "set assigned_to"
-        } else {
-            "clear assigned_to"
-        };
-        let prepared = Self::update_tickets_with_updated_at(
-            "assigned_to = ?1",
-            vec![Value::from(assigned_to)],
-            action.to_string(),
-            id,
-        );
+        let prepared = Self::build_set_assigned_to_sql(id, assigned_to);
         self.execute_and_cancel(id, prepared).await
     }
 
@@ -1137,17 +1141,7 @@ impl BoardStore {
         id: &str,
         assigned_to: Option<&str>,
     ) -> Result<()> {
-        let action = if assigned_to.is_some() {
-            "set assigned_to"
-        } else {
-            "clear assigned_to"
-        };
-        let prepared = Self::update_tickets_with_updated_at(
-            "assigned_to = ?1",
-            vec![Value::from(assigned_to)],
-            action.to_string(),
-            id,
-        );
+        let prepared = Self::build_set_assigned_to_sql(id, assigned_to);
         let rows = tx.execute(&prepared.sql, prepared.params).await?;
         Self::ensure_ticket_found(rows, id, &prepared.action)?;
         Ok(())
