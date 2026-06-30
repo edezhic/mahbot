@@ -1391,6 +1391,10 @@ impl DiffState {
 
 /// Resolve a workspace's filesystem path, supporting both DB-registered
 /// shared workspaces and personal workspace path overrides.
+///
+/// This is an **async** helper that queries the workspace database.  For a
+/// synchronous in-memory lookup (dashboard state maps), see
+/// `gui::resolve_dashboard_workspace_path`.
 async fn resolve_workspace_path(
     ws_name: &str,
     ws_path_override: Option<String>,

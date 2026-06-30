@@ -1359,7 +1359,7 @@ impl Dashboard {
         // guards against this in normal operation, but guard for db
         // inconsistency).  Personal workspaces get their resolved path.
         let (editor_name, editor_path) =
-            resolve_workspace_path(name, ws_path.as_ref(), personal_path.as_ref());
+            resolve_dashboard_workspace_path(name, ws_path.as_ref(), personal_path.as_ref());
         let editor_task: Task<Message> = Task::done(editor::EditorMessage::WorkspaceSelected(
             editor_name,
             editor_path,
@@ -1378,7 +1378,7 @@ impl Dashboard {
                 .map(Message::DiffModal);
 
         let (shell_name, shell_path) =
-            resolve_workspace_path(name, ws_path.as_ref(), personal_path.as_ref());
+            resolve_dashboard_workspace_path(name, ws_path.as_ref(), personal_path.as_ref());
         let shell_task: Task<Message> = Task::done(shell::ShellMessage::WorkspaceSelected(
             shell_name, shell_path,
         ))
@@ -2601,14 +2601,18 @@ fn open_url(url: &str) {
     };
 }
 
-/// Resolve a workspace name+path pair from the workspace map and optional
-/// personal workspace path.  If `ws_path` is `Some`, that takes priority;
-/// otherwise `personal_path` is used as a fallback ("Personal workspace — use
-/// resolved user path").  When `name` is empty and no path is available,
-/// returns `None` for the path ("Personal workspace without a selected user —
-/// no path to send").  Logs a warning for non-empty names where neither path
-/// source is available (possible DB inconsistency).
-fn resolve_workspace_path(
+/// Resolve a workspace name+path pair from the dashboard's in-memory workspace
+/// map and optional personal workspace path.  This is a synchronous lookup —
+/// it does **not** query the database.  For a DB-backed resolution (async),
+/// see `gui::diff::resolve_workspace_path`.
+///
+/// If `ws_path` is `Some`, that takes priority; otherwise `personal_path` is
+/// used as a fallback ("Personal workspace — use resolved user path").  When
+/// `name` is empty and no path is available, returns `None` for the path
+/// ("Personal workspace without a selected user — no path to send").  Logs a
+/// warning for non-empty names where neither path source is available (possible
+/// DB inconsistency).
+fn resolve_dashboard_workspace_path(
     name: &str,
     ws_path: Option<&String>,
     personal_path: Option<&String>,
