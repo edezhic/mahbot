@@ -35,14 +35,33 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// Resolve the workspace for a user, falling back to a personal workspace
 /// if `get_workspace` fails or returns `None`.
 async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
-    if let Ok(Some(ws)) = mahbot::users::get_workspace(&msg.user_name).await {
-        ws
-    } else {
-        // Fallback: construct a bare workspace from the user_name.
-        // This should not happen in practice since get_workspace always
-        // returns a personal workspace when no shared workspace is selected.
-        let path = mahbot::users::personal_workspace_path(&msg.user_name);
-        mahbot::users::personal_workspace_struct(&msg.user_name, &path)
+    match mahbot::users::get_workspace(&msg.user_name).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => {
+            // The user's selected_workspace points to a workspace that no
+            // longer exists in workspaces.db (deleted or renamed).  Construct
+            // a personal workspace as a safe fallback so the user can still
+            // interact.
+            tracing::warn!(
+                user_name = %msg.user_name,
+                "workspace resolution: selected_workspace points to non-existent workspace; \
+                 falling back to personal workspace",
+            );
+            let path = mahbot::users::personal_workspace_path(&msg.user_name);
+            mahbot::users::personal_workspace_struct(&msg.user_name, &path)
+        }
+        Err(e) => {
+            // Database error during workspace lookup.  Fall back to a
+            // personal workspace so the message can still be processed
+            // rather than failing outright.
+            tracing::warn!(
+                user_name = %msg.user_name,
+                error = %e,
+                "workspace resolution: database error; falling back to personal workspace",
+            );
+            let path = mahbot::users::personal_workspace_path(&msg.user_name);
+            mahbot::users::personal_workspace_struct(&msg.user_name, &path)
+        }
     }
 }
 
