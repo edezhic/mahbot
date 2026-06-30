@@ -2392,7 +2392,10 @@ mod tests {
     use super::*;
     use crate::board::DEFAULT_TICKET_PHASE;
     use crate::util::test::make_ticket;
-    use crate::util::test::{expect_ticket, expect_ticket_phase, init_test_stores};
+    use crate::util::test::{
+        create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
+        init_test_stores,
+    };
     use crate::workspace::test_ws_named;
 
     /// Verify that `guard_phase_and_circuit_breaker` rejects a ticket
@@ -2637,34 +2640,6 @@ mod tests {
 
     // ── transition_ticket_to_done — conditional notification ─────────
 
-    /// Initialize all stores needed by management tests that call
-    /// [`transition_ticket`] or interact with the ticket buffer.
-    ///
-    /// Idempotent across concurrent tests — all globals use OnceCell/OnceLock
-    /// guards, so duplicate initialization is a harmless no-op.
-    async fn init_management_test_stores() {
-        init_test_stores().await;
-
-        let _ = crate::workspace::init_global().await;
-        let _ = crate::manager_queue::init_global();
-    }
-
-    /// Create a test workspace — parameters are `(name, path)`;
-    /// [`test_ws_named`] takes `(path, name)`, so the order is swapped internally.
-    async fn create_test_workspace(name: &str, path: &str) -> crate::Workspace {
-        let now = crate::turso::now();
-        crate::workspace::store()
-            .conn
-            .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                turso::params![name, path, now.clone(), now, 0],
-            )
-            .await
-            .expect("insert test workspace");
-        test_ws_named(path, name)
-    }
-
     /// Shorthand for [`init_management_test_stores`] + [`create_test_workspace`]
     /// with a generated `ws_{suffix}` / `/tmp/test_{suffix}` name/path.
     ///
@@ -2678,7 +2653,7 @@ mod tests {
 
         let ws_name = format!("ws_{suffix}");
         let ws_path = format!("/tmp/test_{suffix}");
-        create_test_workspace(&ws_name, &ws_path).await
+        create_test_workspace(&ws_path, &ws_name).await
     }
 
     /// Shorthand for [`init_management_test_stores`] + [`test_ws_named`] +
@@ -2814,7 +2789,7 @@ mod tests {
 
         init_management_test_stores().await;
         for case in &cases {
-            let ws = create_test_workspace(case.ws_suffix, case.ws_path).await;
+            let ws = create_test_workspace(case.ws_path, case.ws_suffix).await;
             let ticket_id = make_ticket(board(), ws, "Test Ticket", TicketPhase::Backlog).await;
             let ticket = expect_ticket(board(), &ticket_id).await;
 

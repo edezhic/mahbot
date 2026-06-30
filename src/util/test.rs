@@ -12,10 +12,17 @@
 //! Also provides [`TicketBuilder`], a builder for creating test tickets that was
 //! historically defined in the `board` module and imported from there by sibling
 //! modules. Moved here so all test infrastructure lives in one place.
+//!
+//! Also provides [`create_test_workspace`] (inserting a workspace into the test DB)
+//! and [`init_management_test_stores`] (initializing all stores plus the manager
+//! queue), relocated from `management.rs` tests so they are discoverable alongside
+//! the rest of the shared test infrastructure.
 
 #![cfg(test)]
 
 use crate::board::{BoardStore, Ticket, TicketParams, TicketPhase};
+use crate::turso;
+use crate::workspace::test_ws_named;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -361,6 +368,64 @@ pub async fn init_test_stores() {
         init_test_store!(crate::chat_history::CHAT_HISTORY, ChatHistoryStore);
     })
     .await;
+}
+
+/// Initialize all stores needed by management tests that call
+/// [`transition_ticket`](crate::management::transition_ticket) or interact
+/// with the ticket buffer.
+///
+/// Calls [`init_test_stores`] (all test DBs) then initializes the global
+/// manager queue. The manager queue consumer is required by callers that
+/// exercise [`notify_ticket`](crate::management::notify_ticket) which
+/// enqueues notifications via [`crate::manager_queue::manager_queue`].
+///
+/// # Panics
+///
+/// Panics if [`init_test_stores`] has not been called first (the manager
+/// queue depends on stores being available), or if initialization of the
+/// manager queue fails.
+///
+/// # Idempotency note
+///
+/// [`init_test_stores`] is idempotent (uses a [`tokio::sync::OnceCell`]).
+/// [`crate::manager_queue::init_global`] spawns a consumer loop before
+/// setting its [`OnceCell`](tokio::sync::OnceCell), so calling this
+/// function more than once leaks a background task — ensure callers
+/// initialize once per process lifetime.
+pub async fn init_management_test_stores() {
+    init_test_stores().await;
+
+    let _ = crate::manager_queue::init_global();
+}
+
+/// Create a test workspace by inserting it into the test DB and returning
+/// a [`Workspace`](crate::Workspace) struct with the given `path` and `name`.
+///
+/// Parameters are `(path, name)` to match the convention of
+/// [`test_ws_named`](crate::workspace::test_ws_named).
+///
+/// # Precondition
+///
+/// [`init_test_stores`] must be called before this function — the
+/// workspace store's [`OnceCell`](tokio::sync::OnceCell) panics if
+/// accessed before initialization.
+///
+/// # Panics
+///
+/// Panics if the workspace store is not initialized, or if the INSERT
+/// SQL query fails.
+pub async fn create_test_workspace(path: &str, name: &str) -> crate::Workspace {
+    let now = crate::turso::now();
+    crate::workspace::store()
+        .conn
+        .execute(
+            "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            turso::params![name, path, now.clone(), now, 0],
+        )
+        .await
+        .expect("insert test workspace");
+    test_ws_named(path, name)
 }
 
 /// Create a temporary directory initialized as a git repository with a
