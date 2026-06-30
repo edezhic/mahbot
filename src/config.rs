@@ -1,4 +1,5 @@
 use crate::Role;
+use crate::config_db::ConfigStore;
 use crate::role::role_info;
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -768,14 +769,17 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     let tx = store.conn.begin_tx().await?;
     for (key, value) in config.string_fields() {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
-            store.set_kv_tx(&tx, key, v).await?;
+            ConfigStore::set_kv_tx(&tx, key, v).await?;
         } else {
-            store.delete_kv_tx(&tx, key).await?;
+            ConfigStore::delete_kv_tx(&tx, key).await?;
         }
     }
-    store
-        .save_role_and_routing_configs_tx(&tx, &config.per_role_configs, &config.model_routings)
-        .await?;
+    ConfigStore::save_role_and_routing_configs_tx(
+        &tx,
+        &config.per_role_configs,
+        &config.model_routings,
+    )
+    .await?;
     tx.commit().await?;
 
     // Warmup succeeded above — now persist runtime config and swap singletons.

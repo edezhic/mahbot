@@ -162,8 +162,7 @@ impl ConfigStore {
         model_routings: &[ModelRouting],
     ) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
-        self.save_role_and_routing_configs_tx(&tx, role_configs, model_routings)
-            .await?;
+        Self::save_role_and_routing_configs_tx(&tx, role_configs, model_routings).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -178,7 +177,6 @@ impl ConfigStore {
     /// it uses the supplied `tx` directly, making it safe to call from within
     /// an outer transaction without deadlocking on the connection mutex.
     pub(crate) async fn save_role_and_routing_configs_tx(
-        &self,
         tx: &turso::TxGuard<'_>,
         role_configs: &[RoleConfig],
         model_routings: &[ModelRouting],
@@ -214,12 +212,7 @@ impl ConfigStore {
 
     /// Upsert a key-value pair within an existing transaction.
     /// Like [`set_kv`] but executes on the supplied [`turso::TxGuard`].
-    pub(crate) async fn set_kv_tx(
-        &self,
-        tx: &turso::TxGuard<'_>,
-        key: &str,
-        value: &str,
-    ) -> Result<()> {
+    pub(crate) async fn set_kv_tx(tx: &turso::TxGuard<'_>, key: &str, value: &str) -> Result<()> {
         tx.execute(UPSERT_KV_SQL, turso::params![key, value])
             .await?;
         Ok(())
@@ -228,7 +221,7 @@ impl ConfigStore {
     /// Delete a key-value pair within an existing transaction.
     /// Like [`delete_kv`] but executes on the supplied [`turso::TxGuard`].
     /// Succeeds even if the key does not exist.
-    pub(crate) async fn delete_kv_tx(&self, tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
+    pub(crate) async fn delete_kv_tx(tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
         tx.execute("DELETE FROM config_kv WHERE key = ?1", turso::params![key])
             .await?;
         Ok(())
