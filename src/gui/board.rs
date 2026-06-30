@@ -1,11 +1,12 @@
 //! Board dashboard page — ticket management.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::str::FromStr;
 
 use crate::Role;
 use crate::board::{Ticket, TicketPhase, UNBLOCKING_STATUSES};
-use crate::diff_parse::parse_numstat_lines;
+use crate::diff_parse::{parse_numstat_lines, run_git_raw};
 
 use iced::widget::{
     Column, Row, Space, button, column, container, markdown, row, scrollable, text, tooltip,
@@ -505,12 +506,11 @@ impl BoardState {
     ) -> Result<CommitStats, anyhow::Error> {
         // Detect merge commits: `git rev-list --parents -n 1 <hash>` outputs
         // `<hash> <parent>` for non-merge, or `<hash> <parent1> <parent2> ...` for merges.
-        let is_merge = match tokio::process::Command::new("git")
-            .args(["rev-list", "--parents", "-n", "1", commit_hash])
-            .current_dir(ws_path)
-            .env("LC_ALL", "C")
-            .output()
-            .await
+        let is_merge = match run_git_raw(
+            Path::new(ws_path),
+            &["rev-list", "--parents", "-n", "1", commit_hash],
+        )
+        .await
         {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -520,14 +520,15 @@ impl BoardState {
             Err(_) => false, // if rev-list fails, assume non-merge
         };
 
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(["show", "--numstat", "--format="]);
+        let mut args: Vec<&str> = vec!["show", "--numstat", "--format="];
         if is_merge {
-            cmd.arg("-m");
+            args.push("-m");
         }
-        cmd.arg(commit_hash);
+        args.push(commit_hash);
 
-        let output = cmd.current_dir(ws_path).env("LC_ALL", "C").output().await?;
+        let output = run_git_raw(Path::new(ws_path), &args)
+            .await
+            .map_err(|e| anyhow::anyhow!("git show failed: {e}"))?;
 
         if !output.status.success() {
             anyhow::bail!(

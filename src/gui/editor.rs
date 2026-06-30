@@ -32,7 +32,9 @@ use fff_search::parse_grep_query;
 
 use super::context_menu::ContextMenu;
 
-use crate::diff_parse::{is_git_repo, run_git_check_ignore, run_git_status, unquote_c_style};
+use crate::diff_parse::{
+    is_git_repo, run_git_check_ignore, run_git_raw, run_git_status, unquote_c_style,
+};
 
 use super::editor_widget::{LineEnding, detect_line_ending, has_trailing_newline};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
@@ -1299,10 +1301,7 @@ async fn load_git_ignore(
     let ws_path = Path::new(&workspace_path);
 
     // Find the git repo root (handles subdirectory-of-repo workspaces).
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(ws_path)
-        .output()
+    let output = run_git_raw(ws_path, &["rev-parse", "--show-toplevel"])
         .await
         .map_err(|e| format!("Failed to run git rev-parse: {e}"))?;
 

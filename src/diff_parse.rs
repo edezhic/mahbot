@@ -651,7 +651,10 @@ pub async fn run_git_show(
 /// duplicating the spawn + output + decode pattern. Returns the raw
 /// [`std::process::Output`] so each caller can interpret the exit
 /// status as appropriate.
-async fn run_git_raw(repo_path: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+pub(crate) async fn run_git_raw(
+    repo_path: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     tokio::process::Command::new("git")
         .args(args)
         .current_dir(repo_path)
