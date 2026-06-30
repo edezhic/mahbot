@@ -337,6 +337,30 @@ async fn transition_ticket(
     }
 }
 
+/// Log a warning when a ticket transition fails, using `source` and `target`
+/// phases directly so hardcoded phase-name strings can't drift.
+///
+/// `context_label` is a human-readable name for the dispatch phase (e.g.
+/// `"Engineer"`, `"Sanitation"`, `"Analyst"`). `verb` is the past-tense action
+/// the phase performed — typically `"completed"`, but may be `"failed"` or
+/// `"passed"` depending on context.
+fn warn_transition_failed(
+    ticket: &Ticket,
+    source: TicketPhase,
+    target: TicketPhase,
+    context_label: &str,
+    verb: &str,
+    error: &anyhow::Error,
+) {
+    warn!(
+        ticket = %ticket.id,
+        error = %error,
+        "{context_label} {verb} but transition to {target} failed — ticket stuck in {source}",
+        target = target.as_ref(),
+        source = source.as_ref(),
+    );
+}
+
 /// Resolve a workspace from a ticket's stored `workspace_name`.
 ///
 /// Returns `None` and logs a warning if the workspace cannot be found. Both
@@ -986,12 +1010,13 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             TicketPhase::InDiagnostics => "completed",
             _ => "failed",
         };
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Engineer {verb} but transition to {phase} failed — ticket stuck in {stuck}",
-            phase = target_phase.as_ref(),
-            stuck = TicketPhase::InDevelopment.as_ref(),
+        warn_transition_failed(
+            &ticket,
+            TicketPhase::InDevelopment,
+            target_phase,
+            "Engineer",
+            verb,
+            &e,
         );
     }
 }
@@ -1444,11 +1469,13 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         )
         .await
         {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Sanitation passed but transition to SanitationPassed failed — \
-                 ticket stuck in InSanitation"
+            warn_transition_failed(
+                &ticket,
+                TicketPhase::InSanitation,
+                TicketPhase::SanitationPassed,
+                "Sanitation",
+                "passed",
+                &e,
             );
         }
     } else {
@@ -1638,11 +1665,13 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         )
         .await
         {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Diagnostics completed but transition to DiagnosticsDone \
-                 failed — ticket stuck in InDiagnostics",
+            warn_transition_failed(
+                &ticket,
+                TicketPhase::InDiagnostics,
+                TicketPhase::DiagnosticsDone,
+                "Diagnostics",
+                "completed",
+                &e,
             );
         }
     } else {
@@ -1967,12 +1996,13 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     )
     .await
     {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Analyst verdicts completed but transition to {phase} failed — ticket stuck in {stuck}",
-            phase = target.as_ref(),
-            stuck = TicketPhase::Analysis.as_ref(),
+        warn_transition_failed(
+            ticket,
+            TicketPhase::Analysis,
+            target,
+            "Analyst",
+            "completed",
+            &e,
         );
         return;
     }
@@ -2305,13 +2335,13 @@ async fn process_verdict_results(
     )
     .await
     {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "{role} verdicts completed but transition to {phase} failed — ticket stuck in {stuck}",
-            role = verifier.log_label,
-            phase = verifier.success_phase.as_ref(),
-            stuck = verifier.active_phase.as_ref(),
+        warn_transition_failed(
+            ticket,
+            verifier.active_phase,
+            verifier.success_phase,
+            verifier.log_label,
+            "completed",
+            &e,
         );
     } else {
         info!(
