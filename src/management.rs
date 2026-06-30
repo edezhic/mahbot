@@ -153,14 +153,14 @@ fn diagnostics_breaker_comment(count: usize) -> String {
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
 /// Returns `false` if the ticket was moved externally or an error occurred.
 #[must_use]
-async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
+async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> bool {
     match board().get_ticket_phase(ticket_id).await {
         Ok(Some(status)) => {
-            let ok = status == expected;
+            let ok = status == expected_phase;
             if !ok {
                 debug!(
                     ticket = %ticket_id,
-                    expected = %expected,
+                    expected_phase = %expected_phase,
                     actual = %status,
                     "Ticket moved externally — bailing out",
                 );
@@ -180,7 +180,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 
 /// Generalized pre-flight guard for dispatch functions that spawn agents.
 ///
-/// Verifies the ticket is still in `expected` (avoids wasted DB writes
+/// Verifies the ticket is still in `expected_phase` (avoids wasted DB writes
 /// and LLM API costs if the ticket was moved externally) and runs a
 /// configurable circuit breaker (fails tickets that exceed a domain-specific
 /// failure threshold to prevent dispatch thrashing).
@@ -191,7 +191,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 /// # Parameters
 ///
 /// * `ticket` — the ticket being guarded.
-/// * `expected` — the phase the ticket must still be in.
+/// * `expected_phase` — the phase the ticket must still be in.
 /// * `threshold` — the count at which the circuit breaker trips (passed to
 ///   [`run_circuit_breaker`]; uses `>` comparison).
 /// * `count_fn` — extracts the failure count from comments (passed to
@@ -209,16 +209,25 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
 #[must_use]
 async fn guard_phase_and_breaker(
     ticket: &Ticket,
-    expected: TicketPhase,
+    expected_phase: TicketPhase,
     threshold: usize,
     count_fn: impl Fn(&[TicketComment]) -> usize,
     comment_text: impl Fn(usize) -> String,
     label: &str,
 ) -> bool {
-    if !is_ticket_in_phase(&ticket.id, expected).await {
+    if !is_ticket_in_phase(&ticket.id, expected_phase).await {
         return false;
     }
-    if run_circuit_breaker(ticket, expected, threshold, count_fn, comment_text, label).await {
+    if run_circuit_breaker(
+        ticket,
+        expected_phase,
+        threshold,
+        count_fn,
+        comment_text,
+        label,
+    )
+    .await
+    {
         return false;
     }
     true
@@ -240,12 +249,12 @@ async fn guard_phase_and_breaker(
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
     ticket: &Ticket,
-    expected: TicketPhase,
+    expected_phase: TicketPhase,
     label: &str,
 ) -> bool {
     guard_phase_and_breaker(
         ticket,
-        expected,
+        expected_phase,
         CIRCUIT_BREAKER_COMMENT_THRESHOLD,
         <[TicketComment]>::len,
         general_breaker_comment,
@@ -2165,8 +2174,8 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// # Parameters
 ///
 /// * `ticket` — the ticket being evaluated for the circuit breaker.
-/// * `expected` — the phase the ticket must currently be in for the transition
-///   to succeed (passed through to [`transition_ticket`]).
+/// * `expected_phase` — the phase the ticket must currently be in for the transition
+///   to succeed (passed to [`transition_ticket`] as the `source` parameter).
 /// * `threshold` — the count at which the breaker trips (using `>` comparison).
 /// * `count_fn` — extracts the count from the fetched comment list. Responsible
 ///   for its own filtering (including self-counting prevention).
@@ -2176,7 +2185,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 #[must_use]
 async fn run_circuit_breaker(
     ticket: &Ticket,
-    expected: TicketPhase,
+    expected_phase: TicketPhase,
     threshold: usize,
     count_fn: impl Fn(&[TicketComment]) -> usize,
     comment_text: impl Fn(usize) -> String,
@@ -2214,7 +2223,7 @@ async fn run_circuit_breaker(
 
     if let Err(e) = transition_ticket(
         ticket,
-        expected,
+        expected_phase,
         TicketPhase::Failed,
         NotifyPolicy::Notify,
         None,
@@ -2403,7 +2412,7 @@ mod tests {
     use crate::workspace::test_ws_named;
 
     /// Verify that `guard_phase_and_circuit_breaker` rejects a ticket
-    /// whose phase does not match `expected`. This validates that the
+    /// whose phase does not match `expected_phase`. This validates that the
     /// pre-agent guard works correctly for `dispatch_verifiers` (and all
     /// other agent-spawning dispatch functions).
     #[tokio::test]
