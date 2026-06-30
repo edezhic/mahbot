@@ -181,7 +181,11 @@ fn is_path_in_extra_allowed(path: &Path) -> bool {
     is_path_under_roots(path, &EXTRA_READ_ALLOWED)
 }
 
-/// Whether `path` looks like an OS temp/scratch directory (checked at read time).
+/// Whether two paths refer to the same file or directory.
+///
+/// First compares by direct structural equality; if that fails, falls back
+/// to canonicalizing both paths and comparing the canonical forms.
+/// Returns `false` if either path cannot be canonicalized.
 fn paths_same_or_canonical(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
