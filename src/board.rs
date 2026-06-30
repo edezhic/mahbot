@@ -625,7 +625,6 @@ impl BoardStore {
         prerequisites: &[String],
     ) -> Result<(TxGuard<'_>, String)> {
         let tx = self.conn.begin_tx().await?;
-        // Generate sequential ticket ID: {workspace_name}-{seq}
         let seq: i64 = tx
             .query_row(
                 "INSERT INTO ticket_counters (workspace_name, next_id) VALUES (?1, 1) \
@@ -681,14 +680,11 @@ impl BoardStore {
         supersede_id: &str,
         params: &TicketParams,
     ) -> Result<String> {
-        // Self-reference: a ticket cannot supersede and depend on the same ticket.
         anyhow::ensure!(
             !params.prerequisites.iter().any(|p| p == supersede_id),
             "Ticket cannot supersede and depend on the same ticket: {supersede_id}"
         );
 
-        // Begin transaction and validate prerequisites — counter upsert, old
-        // cancel, new create, and dependent rewiring all happen atomically.
         let (tx, new_id) = self
             .begin_tx_and_validate_prerequisites(&params.workspace_name, &params.prerequisites)
             .await?;

@@ -897,10 +897,7 @@ async fn poll_round() -> anyhow::Result<()> {
         dispatch_unassigned_in_phase(TicketPhase::InDiagnostics, PollPhase::DiagnosticsCheck, ws)
             .await;
 
-        // 3. SanitationPassed → Done (auto-commit).
-        //
-        // After the sanitation agent approves, the ticket reaches SanitationPassed.
-        // We commit the changes and transition to Done, following the same pattern
+        // 3. SanitationPassed → Done (auto-commit), following the same pattern
         // as the QaPassed→Done commit flow.
         spawn_for_each_ticket_in_phase(TicketPhase::SanitationPassed, ws, |ticket, ws| {
             finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed)
@@ -1256,8 +1253,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
         return;
     }
 
-    // Check for untracked files — use list_untracked_files which returns the
-    // actual file list, then check if non-empty (avoids a separate git call).
+    // list_untracked_files returns the file list, avoiding a separate git call.
     let untracked = match list_untracked_files(repo_path).await {
         Ok(files) => files,
         Err(e) => {
