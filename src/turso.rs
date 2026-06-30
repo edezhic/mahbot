@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
+use tracing::warn;
 use turso::Builder;
 pub use turso::{IntoParams, Row, Value, params, params_from_iter};
 
@@ -686,6 +687,56 @@ pub(crate) async fn open_store(
 ) -> anyhow::Result<Connection> {
     let db_path = root.join("db").join(format!("{name}.db"));
     open_with_schema(&db_path, schema).await
+}
+
+/// Execute `work` within a transaction on `conn`, committing on success.
+///
+/// Uses `ticket_id` (or any identifying label) and `action_label` (a verb
+/// phrase like "add comment") for structured warn-level logging on failure.
+///
+/// This is the canonical implementation; callers in `board.rs` and
+/// `management.rs` delegate to it rather than duplicating the logic.
+pub(crate) async fn with_tx(
+    conn: &Connection,
+    ticket_id: &str,
+    action_label: &str,
+    work: impl AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let tx = conn
+        .begin_tx()
+        .await
+        .map_err(|e| {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Failed to begin transaction for {action_label}",
+            );
+            e
+        })
+        .with_context(|| format!("Failed to begin transaction for {action_label}"))?;
+
+    if let Err(e) = work(&tx).await {
+        warn!(
+            ticket = %ticket_id,
+            error = %e,
+            "{action_label}: transaction rolled back",
+        );
+        return Err(e.context(format!("{action_label}: transaction rolled back")));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Failed to commit transaction for {action_label}",
+            );
+            e
+        })
+        .with_context(|| format!("Failed to commit transaction for {action_label}"))?;
+
+    Ok(())
 }
 
 #[cfg(test)]

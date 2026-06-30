@@ -1077,13 +1077,6 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
 
 /// Begin a transaction, run `work`, and commit on success.
 ///
-/// On any failure (begin transaction fails, `work` returns an error, or commit
-/// fails), logs a `warn!` with the provided `action_label` context and returns
-/// `Err`. On success, returns `Ok(())`.
-///
-/// When `work` returns an error, the transaction is rolled back automatically
-/// via [`crate::turso::TxGuard::drop`].
-///
 /// `action_label` accepts any `&str` including dynamic temporaries from
 /// `format!` — it is intentionally not `&'static str` to allow callers to
 /// include dynamic context (e.g. phase transitions, short hashes) in log
@@ -1094,37 +1087,7 @@ async fn with_tx(
     action_label: &str,
     work: impl AsyncFnOnce(&crate::turso::TxGuard<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let tx = match board().conn.begin_tx().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            warn!(
-                ticket = %ticket_id,
-                error = %e,
-                "Failed to begin transaction for {action_label}",
-            );
-            return Err(anyhow::anyhow!("{e:#}"));
-        }
-    };
-
-    if let Err(e) = work(&tx).await {
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "{action_label}: transaction rolled back",
-        );
-        return Err(anyhow::anyhow!("{e:#}"));
-    }
-
-    if let Err(e) = tx.commit().await {
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "Failed to commit transaction for {action_label}",
-        );
-        return Err(anyhow::anyhow!("{e:#}"));
-    }
-
-    Ok(())
+    crate::turso::with_tx(&board().conn, ticket_id, action_label, work).await
 }
 
 /// After a successful `git commit`, persist the metadata and transition the

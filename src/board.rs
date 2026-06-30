@@ -1530,10 +1530,10 @@ impl BoardStore {
 
     /// Add a comment to a ticket (append-only).
     pub async fn add_comment(&self, id: &str, role: &str, content: &str) -> Result<()> {
-        let tx = self.conn.begin_tx().await?;
-        Self::add_comment_tx(&tx, id, role, content).await?;
-        tx.commit().await?;
-        Ok(())
+        crate::turso::with_tx(&self.conn, id, "add comment", async |tx| {
+            Self::add_comment_tx(tx, id, role, content).await
+        })
+        .await
     }
 
     /// Transactional variant of [`add_comment`](Self::add_comment) —
