@@ -178,7 +178,7 @@ impl Workspace {
         // directory does not exist yet (rare in tests, but harmless).
         let stored = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         Self {
-            name: dir_name(&stored),
+            name: last_path_component(&stored),
             path: stored.to_string_lossy().to_string(),
             ..Default::default()
         }
@@ -189,12 +189,12 @@ impl Workspace {
     /// Uses the last path component (directory name).
     #[must_use]
     pub fn display_name(&self) -> String {
-        dir_name(self.as_path())
+        last_path_component(self.as_path())
     }
 }
 
-/// Extract the last directory component of a path as a string.
-fn dir_name(path: &Path) -> String {
+/// Extract the last component of a path as a string.
+fn last_path_component(path: &Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
