@@ -178,29 +178,72 @@ async fn is_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
     }
 }
 
-/// Shared pre-flight guard for dispatch functions that spawn agents.
-/// Verifies the ticket is still in `expected` (avoids wasted DB writes
-/// and LLM API costs if the ticket was moved externally) and checks the
-/// circuit breaker (fails tickets with excessive comment accumulation
-/// to prevent dispatch thrashing).
+/// Generalized pre-flight guard for dispatch functions that spawn agents.
 ///
-/// Returns `true` when it's safe for the caller to proceed. Returns `false`
-/// when the ticket has moved, been failed — the caller should bail out immediately.
+/// Verifies the ticket is still in `expected` (avoids wasted DB writes
+/// and LLM API costs if the ticket was moved externally) and runs a
+/// configurable circuit breaker (fails tickets that exceed a domain-specific
+/// failure threshold to prevent dispatch thrashing).
+///
+/// This is the recommended entry point for all dispatch-phase guard logic.
+/// See [`guard_phase_and_circuit_breaker`] for the default general-breaker variant.
+///
+/// # Parameters
+///
+/// * `ticket` — the ticket being guarded.
+/// * `expected` — the phase the ticket must still be in.
+/// * `threshold` — the count at which the circuit breaker trips (passed to
+///   [`run_circuit_breaker`]; uses `>` comparison).
+/// * `count_fn` — extracts the failure count from comments (passed to
+///   [`run_circuit_breaker`]).
+/// * `comment_text` — formats the system comment body given the count
+///   (passed to [`run_circuit_breaker`]).
+/// * `label` — human-readable label used in logs to identify the caller.
+///
+/// # Return value
+///
+/// Returns `true` when it's safe for the caller to proceed (ticket is still in
+/// the expected phase AND the circuit breaker count does not exceed threshold).
+/// Returns `false` when the ticket has moved, been failed, or the breaker
+/// tripped — the caller MUST bail out immediately.
+#[must_use]
+async fn guard_phase_and_breaker(
+    ticket: &Ticket,
+    expected: TicketPhase,
+    threshold: usize,
+    count_fn: impl Fn(&[TicketComment]) -> usize,
+    comment_text: impl Fn(usize) -> String,
+    label: &str,
+) -> bool {
+    if !is_ticket_in_phase(&ticket.id, expected).await {
+        return false;
+    }
+    if run_circuit_breaker(ticket, expected, threshold, count_fn, comment_text, label).await {
+        return false;
+    }
+    true
+}
+
+/// Shared pre-flight guard that combines a phase check with the general
+/// comment-count circuit breaker.
+///
+/// Thin wrapper around [`guard_phase_and_breaker`] that passes the general
+/// default parameters: [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`], standard
+/// `Vec::len` (counting all comments), and [`general_breaker_comment`].
 ///
 /// Used directly by [`dispatch_engineer`] and by [`dispatch_parallel_with_guard`]
 /// (which wraps the guard + dispatch + post-check skeleton shared by
 /// [`dispatch_backlog_analysts`] and [`dispatch_verifiers`]).
-/// Diagnostics uses a separate circuit breaker (see [`run_circuit_breaker`]).
+///
+/// Callers that need a domain-specific circuit breaker (sanitation, diagnostics)
+/// should use [`guard_phase_and_breaker`] directly with custom parameters.
 #[must_use]
 async fn guard_phase_and_circuit_breaker(
     ticket: &Ticket,
     expected: TicketPhase,
     label: &str,
 ) -> bool {
-    if !is_ticket_in_phase(&ticket.id, expected).await {
-        return false;
-    }
-    if run_circuit_breaker(
+    guard_phase_and_breaker(
         ticket,
         expected,
         CIRCUIT_BREAKER_COMMENT_THRESHOLD,
@@ -209,10 +252,6 @@ async fn guard_phase_and_circuit_breaker(
         label,
     )
     .await
-    {
-        return false;
-    }
-    true
 }
 
 /// Controls whether a ticket transition triggers an immediate notification
@@ -1273,30 +1312,17 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
 
-    // Phase check only (no general circuit breaker): verify the ticket is still
-    // in InSanitation before starting the agent. The dedicated sanitation circuit
-    // breaker below (threshold: 3) will always trip before the general comment-count
-    // breaker, so running both would waste a DB round-trip fetching comments twice.
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
-        return;
-    }
-
-    // Check the sanitation-specific circuit breaker before running the agent.
+    // Phase check + sanitation-specific circuit breaker (threshold: 3
+    // consecutive failures). Combined into a single guard for consistent
+    // pattern usage across all dispatch functions.
     //
-    // Sanitation circuit breaker — trip if the ticket has accumulated too
-    // many consecutive sanitation failures.
+    // The sanitation breaker (threshold=3) will always trip before the general
+    // comment-count breaker (threshold=50), so the general breaker is not needed
+    // here — see the compile-time invariant at line 69.
     //
-    // Delegates to run_circuit_breaker which calls
-    // drain_ready_for_development_siblings to move other ReadyForDevelopment
-    // tickets to Planning, and consistent failure handling with the general breaker.
-    //
-    // Counts system comments where role == `SYSTEM_ROLE` and content contains
-    // "Sanitation failed".
-    //
-    // Separate from the general comment-count circuit breaker so that
-    // garbage-thrashing tickets are caught early without consuming the full
-    // 50-comment budget.
-    if run_circuit_breaker(
+    // guard_phase_and_breaker returns true=safe, so the `!` inverts it for the
+    // "bail on failure" convention.
+    if !guard_phase_and_breaker(
         &ticket,
         TicketPhase::InSanitation,
         SANITATION_CIRCUIT_BREAKER_THRESHOLD,
@@ -1527,7 +1553,13 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     // Counts prior diagnostics system comments that indicate failures, and
     // fails the ticket if the count exceeds DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD
     // (i.e., trip at ≥5 failures).
-    if run_circuit_breaker(
+    //
+    // Uses guard_phase_and_breaker which also re-checks the phase via
+    // is_ticket_in_phase. claim_diagnostics above already confirmed the phase,
+    // but the diagnostics loading step between then and now is a TOCTOU window
+    // where the ticket could have moved externally — the redundant phase check
+    // is a beneficial race-condition guard.
+    if !guard_phase_and_breaker(
         &ticket,
         TicketPhase::InDiagnostics,
         DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
