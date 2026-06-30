@@ -303,12 +303,11 @@ impl ConfigStore {
     async fn get_kv(&self, key: &str) -> Result<Option<String>> {
         self.conn
             .query_optional(
-                &format!("SELECT {KV_COLUMNS} FROM config_kv WHERE key = ?1"),
+                "SELECT value FROM config_kv WHERE key = ?1",
                 turso::params![key],
-                kv_from_row,
+                |row| row.get::<String>(0),
             )
             .await
-            .map(|opt| opt.map(|(_key, value)| value))
     }
 
     // Get the role config overrides for a role.
