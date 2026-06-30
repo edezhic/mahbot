@@ -4,8 +4,6 @@
 //! with the Home page workspace picker), and chat with MahBot agents in real time
 //! with full markdown rendering and typing indicators.
 
-#![allow(clippy::too_many_lines)]
-
 use crate::ChatDirection;
 use crate::Role;
 use crate::chat_history::ChatHistoryEntry;
@@ -630,6 +628,7 @@ impl HomeState {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, HomeMessage> {
         // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
@@ -949,6 +948,7 @@ impl HomeState {
         iced::Subscription::batch(subs)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: HomeMessage) -> Task<HomeMessage> {
         // Allow match_same_arms on the entire update() match block: many variants
         // return Task::none() as intercepted/intermediate messages. Narrowing to
