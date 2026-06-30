@@ -763,14 +763,20 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 ///
 /// Lists tickets via [`BoardStore::list_tickets_in_phase`], iterates, and logs
 /// a structured error on failure.
-async fn for_tickets_in_phase(phase: TicketPhase, ws_name: &str, mut action: impl FnMut(Ticket)) {
-    match board().list_tickets_in_phase(phase, ws_name).await {
+async fn for_tickets_in_phase(
+    phase: TicketPhase,
+    workspace_name: &str,
+    mut action: impl FnMut(Ticket),
+) {
+    match board().list_tickets_in_phase(phase, workspace_name).await {
         Ok(tickets) => {
             for ticket in tickets {
                 action(ticket);
             }
         }
-        Err(e) => error!(workspace = ws_name, phase = %phase, error = %e, "Phase listing failed"),
+        Err(e) => {
+            error!(workspace = workspace_name, phase = %phase, error = %e, "Phase listing failed");
+        }
     }
 }
 
