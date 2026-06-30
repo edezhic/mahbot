@@ -111,7 +111,7 @@ fn session_metadata_from_row(
 }
 
 /// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction.
-/// Shared helper used by [`SessionStore::batch_append`] and [`SessionStore::replace_messages`].
+/// Shared helper used by [`SessionStore::append_messages`].
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
     session_key: &str,
@@ -181,15 +181,31 @@ impl SessionStore {
             .await
     }
 
+    async fn append_messages(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        replace: bool,
+    ) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        if replace {
+            tx.execute(
+                "DELETE FROM sessions WHERE session_key = ?1",
+                params![session_key],
+            )
+            .await?;
+        }
+        insert_messages_in_transaction(&tx, session_key, messages).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn batch_append(
         &self,
         session_key: &str,
         messages: &[ChatMessage],
     ) -> Result<()> {
-        let tx = self.conn.begin_tx().await?;
-        insert_messages_in_transaction(&tx, session_key, messages).await?;
-        tx.commit().await?;
-        Ok(())
+        self.append_messages(session_key, messages, false).await
     }
 
     pub(crate) async fn replace_messages(
@@ -197,15 +213,7 @@ impl SessionStore {
         session_key: &str,
         messages: &[ChatMessage],
     ) -> Result<()> {
-        let tx = self.conn.begin_tx().await?;
-        tx.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .await?;
-        insert_messages_in_transaction(&tx, session_key, messages).await?;
-        tx.commit().await?;
-        Ok(())
+        self.append_messages(session_key, messages, true).await
     }
 
     pub(crate) async fn delete(&self, session_key: &str) -> Result<bool> {
