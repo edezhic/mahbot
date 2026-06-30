@@ -211,45 +211,41 @@ mod tests {
         );
     }
 
-    /// Tests that ask dispatches correctly to the analyst agent.
+    /// Tests that ask dispatches correctly to each supported role.
     /// Requires an LLM provider to be configured.
     #[tokio::test]
     #[ignore = "requires LLM provider"]
-    async fn test_ask_analyst() {
-        let tool = AskTool::new(vec![Role::Analyst, Role::Coder, Role::Qa], None);
-        let ws = test_ws("/tmp/test_ws");
-        let args = json!({"role": "analyst", "ask": "Say 'hello analyst' and nothing else."});
-        let result = tool.execute(&ws, args).await.expect("execute");
-        assert!(
-            result.contains("hello"),
-            "Analyst output should contain hello"
-        );
-    }
+    async fn test_ask_all_roles() {
+        struct Case {
+            role: &'static str,
+            ask: &'static str,
+        }
 
-    /// Tests that ask dispatches correctly to the coder agent.
-    /// Requires an LLM provider to be configured.
-    #[tokio::test]
-    #[ignore = "requires LLM provider"]
-    async fn test_ask_coder() {
-        let tool = AskTool::new(vec![Role::Analyst, Role::Coder, Role::Qa], None);
-        let ws = test_ws("/tmp/test_ws");
-        let args = json!({"role": "coder", "ask": "Say 'hello coder' and nothing else."});
-        let result = tool.execute(&ws, args).await.expect("execute");
-        assert!(
-            result.contains("hello"),
-            "Coder output should contain hello"
-        );
-    }
+        let cases = [
+            Case {
+                role: "analyst",
+                ask: "Say 'hello analyst' and nothing else.",
+            },
+            Case {
+                role: "coder",
+                ask: "Say 'hello coder' and nothing else.",
+            },
+            Case {
+                role: "qa",
+                ask: "Say 'hello qa' and nothing else.",
+            },
+        ];
 
-    /// Tests that ask dispatches correctly to the qa agent.
-    /// Requires an LLM provider to be configured.
-    #[tokio::test]
-    #[ignore = "requires LLM provider"]
-    async fn test_ask_qa() {
-        let tool = AskTool::new(vec![Role::Analyst, Role::Coder, Role::Qa], None);
-        let ws = test_ws("/tmp/test_ws");
-        let args = json!({"role": "qa", "ask": "Say 'hello qa' and nothing else."});
-        let result = tool.execute(&ws, args).await.expect("execute");
-        assert!(result.contains("hello"), "QA output should contain hello");
+        for c in &cases {
+            let tool = AskTool::new(vec![Role::Analyst, Role::Coder, Role::Qa], None);
+            let ws = test_ws("/tmp/test_ws");
+            let args = json!({"role": c.role, "ask": c.ask});
+            let result = tool.execute(&ws, args).await.expect("execute");
+            assert!(
+                result.contains("hello"),
+                "{} output should contain hello",
+                c.role
+            );
+        }
     }
 }
