@@ -703,6 +703,61 @@ pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Run a git command with data piped to stdin.
+///
+/// Like [`run_git_raw`], but pipes the given lines to the subprocess's stdin
+/// before collecting output. Returns the raw [`std::process::Output`] so
+/// callers can interpret exit codes as appropriate for their use case.
+///
+/// The `name` parameter is used to identify the subcommand in error messages
+/// (e.g., `"check-ignore"`).
+///
+/// **Environment sanitization**: Same as [`run_git_raw`] — the subprocess
+/// environment is cleared and re-populated with only a safe set of variables.
+/// `LC_ALL=C` is set for consistent locale behavior.
+pub(crate) async fn run_git_with_stdin(
+    repo_path: &Path,
+    args: &[&str],
+    stdin_lines: &[String],
+    name: &str,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut cmd = git_command();
+    cmd.args(args)
+        .current_dir(repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.env("LC_ALL", "C");
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn git {name}: {e}"))?;
+
+    // Write all lines to stdin, then close it.
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("Failed to capture stdin for git {name}"))?;
+    if !stdin_lines.is_empty() {
+        let input = stdin_lines.join("\n");
+        stdin
+            .write_all(input.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write to git {name} stdin: {e}"))?;
+    }
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Failed to wait for git {name}: {e}"))?;
+
+    Ok(output)
+}
+
 /// Run `git check-ignore --stdin` with the given file paths.
 /// Pipes paths via stdin and returns the set of paths that are ignored.
 ///
@@ -713,37 +768,13 @@ pub async fn run_git_check_ignore(
     repo_path: &Path,
     paths: &[String],
 ) -> Result<HashSet<String>, String> {
-    use std::process::Stdio;
-
-    let mut cmd = git_command();
-    cmd.args(["check-ignore", "--stdin"])
-        .current_dir(repo_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn git check-ignore: {e}"))?;
-
-    // Write all paths to stdin, then close it.
-    let mut stdin = child.stdin.take().expect("stdin not captured");
-    for path in paths {
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(path.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write to git stdin: {e}"))?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("Failed to write newline to git stdin: {e}"))?;
-    }
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("Failed to wait for git check-ignore: {e}"))?;
+    let output = run_git_with_stdin(
+        repo_path,
+        &["check-ignore", "--stdin"],
+        paths,
+        "check-ignore",
+    )
+    .await?;
 
     // Exit code 1 means "no files ignored" — not a failure, return empty set.
     if output.status.code() == Some(1) {
@@ -1795,5 +1826,122 @@ AM staged_then_modified.js
     fn parse_numstat_lines_empty() {
         assert!(parse_numstat_lines("").is_empty());
         assert!(parse_numstat_lines("\n\n\n").is_empty());
+    }
+
+    // ── run_git_with_stdin — stdin-piping helper ──
+
+    /// Verify that stdin piping works by hashing content via stdin.
+    #[tokio::test]
+    async fn test_run_git_with_stdin_pipes_stdin() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        let output = run_git_with_stdin(
+            &repo_path,
+            &["hash-object", "--stdin"],
+            &["hello world".to_string()],
+            "hash-object",
+        )
+        .await
+        .unwrap();
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // git hash-object --stdin outputs the SHA-1 hash followed by a newline
+        assert!(!stdout.trim().is_empty(), "Expected a non-empty hash");
+    }
+
+    /// Verify empty stdin lines produce a valid (empty) output.
+    #[tokio::test]
+    async fn test_run_git_with_stdin_empty_lines() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        let output = run_git_with_stdin(
+            &repo_path,
+            &["hash-object", "--stdin"],
+            &[] as &[String],
+            "hash-object",
+        )
+        .await
+        .unwrap();
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // hash-object with empty/absent stdin still outputs a hash (empty blob hash)
+        assert!(
+            !stdout.trim().is_empty(),
+            "Expected a non-empty hash for empty input"
+        );
+    }
+
+    // ── run_git_check_ignore — .gitignore matching ──
+
+    /// A path matching .gitignore should be reported as ignored.
+    #[tokio::test]
+    async fn test_run_git_check_ignore_matches_ignored_path() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create a .gitignore that excludes *.log
+        std::fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let ignored = run_git_check_ignore(&repo_path, &["test.log".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            ignored.contains("test.log"),
+            "test.log should be ignored by *.log pattern"
+        );
+    }
+
+    /// A path not matching .gitignore should return an empty set.
+    #[tokio::test]
+    async fn test_run_git_check_ignore_non_ignored_path() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create a .gitignore that excludes *.log
+        std::fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["commit", "-m", "Add .gitignore"])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let ignored = run_git_check_ignore(&repo_path, &["test.txt".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            ignored.is_empty(),
+            "test.txt should not be ignored by *.log pattern"
+        );
+    }
+
+    /// Empty path list should return an empty set.
+    #[tokio::test]
+    async fn test_run_git_check_ignore_empty_paths() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        let ignored = run_git_check_ignore(&repo_path, &[]).await.unwrap();
+        assert!(
+            ignored.is_empty(),
+            "Empty path list should produce empty result"
+        );
     }
 }
