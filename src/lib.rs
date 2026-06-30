@@ -531,7 +531,7 @@ pub struct Agent {
 // ── Verdict type ─────────────────────────────────────────────────
 
 /// Result of a single review or QA verification pass.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Verdict {
     /// Quality score from 0 (worst) to 10 (best).
     pub score: u8,

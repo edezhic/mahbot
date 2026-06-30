@@ -1658,6 +1658,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
 
 /// Result from a single parallel verifier agent.
+#[derive(Clone)]
 struct ParallelVerdict {
     response: String,
     verdict: Option<crate::Verdict>,
@@ -2538,11 +2539,7 @@ mod tests {
 
         // ── FailingOnly with all-passing verdicts ──
         // Should produce 0 comments (nothing to write).
-        let passing_verdict = pass_verdict();
-        let results = vec![ParallelVerdict {
-            response: "Looks good.".into(),
-            verdict: Some(passing_verdict),
-        }];
+        let results = vec![pass_result("Looks good.")];
         record_verdict_comments(
             &ticket_id,
             &results,
@@ -2563,11 +2560,7 @@ mod tests {
 
         // ── FailingOnly with a failing verdict ──
         // Should produce 1 comment.
-        let failing = fail_verdict();
-        let results = vec![ParallelVerdict {
-            response: "Has issues.".into(),
-            verdict: Some(failing),
-        }];
+        let results = vec![fail_result("Has issues.")];
         record_verdict_comments(
             &ticket_id,
             &results,
@@ -2589,25 +2582,14 @@ mod tests {
 
         // ── All filter (analyst path) ──
         // Should produce 2 comments (both verdicts recorded).
-        let pass = crate::Verdict {
-            score: 10,
-            critique: Some("Excellent analysis.".into()),
-            issues_detected: vec![],
-        };
-        let fail = crate::Verdict {
-            score: 4,
-            critique: Some("Needs more research.".into()),
-            issues_detected: vec!["Missing citations".into()],
-        };
         let results = vec![
-            ParallelVerdict {
-                response: "Agent 1 response.".into(),
-                verdict: Some(pass),
-            },
-            ParallelVerdict {
-                response: "Agent 2 response.".into(),
-                verdict: Some(fail),
-            },
+            analyst_verdict("Agent 1 response.", 10, "Excellent analysis.", &[]),
+            analyst_verdict(
+                "Agent 2 response.",
+                4,
+                "Needs more research.",
+                &["Missing citations"],
+            ),
         ];
         record_verdict_comments(
             &ticket_id,
@@ -2972,6 +2954,47 @@ mod tests {
         }
     }
 
+    /// Helper: a `ParallelVerdict` with no verdict (agent produced no response).
+    fn no_verdict() -> ParallelVerdict {
+        ParallelVerdict {
+            response: String::new(),
+            verdict: None,
+        }
+    }
+
+    /// Helper: wrap a passing verdict with a response string (reviewer/QA flow).
+    fn pass_result(response: &str) -> ParallelVerdict {
+        ParallelVerdict {
+            response: response.into(),
+            verdict: Some(pass_verdict()),
+        }
+    }
+
+    /// Helper: wrap a failing verdict with a response string (reviewer/QA flow).
+    fn fail_result(response: &str) -> ParallelVerdict {
+        ParallelVerdict {
+            response: response.into(),
+            verdict: Some(fail_verdict()),
+        }
+    }
+
+    /// Helper: construct an analyst verdict with explicit score / critique / issues.
+    fn analyst_verdict(
+        response: &str,
+        score: u8,
+        critique: &str,
+        issues: &[&str],
+    ) -> ParallelVerdict {
+        ParallelVerdict {
+            response: response.into(),
+            verdict: Some(crate::Verdict {
+                score,
+                critique: Some(critique.into()),
+                issues_detected: issues.iter().map(|&s| s.into()).collect(),
+            }),
+        }
+    }
+
     // ── process_verdict_results — verdict processing ─────────────────────
 
     /// Verify all verdict-processing outcomes:
@@ -2980,7 +3003,6 @@ mod tests {
     /// - All passed (Reviewer) → Reviewed
     /// - All passed (QA) → QaPassed
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn process_verdict_results_cases() {
         struct Case {
             name: &'static str,
@@ -3001,20 +3023,7 @@ mod tests {
                 ws_suffix: "vp_all_fail",
                 title: "VP All Failed",
                 phase: TicketPhase::InReview,
-                results: vec![
-                    ParallelVerdict {
-                        response: String::new(),
-                        verdict: None,
-                    },
-                    ParallelVerdict {
-                        response: String::new(),
-                        verdict: None,
-                    },
-                    ParallelVerdict {
-                        response: String::new(),
-                        verdict: None,
-                    },
-                ],
+                results: vec![no_verdict(); 3],
                 vi: REVIEWER_VI,
                 expected_status: TicketPhase::Failed,
                 expected_pipeline_reservation: false,
@@ -3025,18 +3034,9 @@ mod tests {
                 title: "VP Any Failed",
                 phase: TicketPhase::InReview,
                 results: vec![
-                    ParallelVerdict {
-                        response: "Good.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
-                    ParallelVerdict {
-                        response: "Issues found.".into(),
-                        verdict: Some(fail_verdict()),
-                    },
-                    ParallelVerdict {
-                        response: "Looks fine.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
+                    pass_result("Good."),
+                    fail_result("Issues found."),
+                    pass_result("Looks fine."),
                 ],
                 vi: REVIEWER_VI,
                 expected_status: TicketPhase::ReadyForDevelopment,
@@ -3048,18 +3048,9 @@ mod tests {
                 title: "VP All Pass",
                 phase: TicketPhase::InReview,
                 results: vec![
-                    ParallelVerdict {
-                        response: "Good.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
-                    ParallelVerdict {
-                        response: "Fine.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
-                    ParallelVerdict {
-                        response: "OK.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
+                    pass_result("Good."),
+                    pass_result("Fine."),
+                    pass_result("OK."),
                 ],
                 vi: REVIEWER_VI,
                 expected_status: TicketPhase::Reviewed,
@@ -3071,18 +3062,9 @@ mod tests {
                 title: "VP QA Pass",
                 phase: TicketPhase::InQa,
                 results: vec![
-                    ParallelVerdict {
-                        response: "QA pass.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
-                    ParallelVerdict {
-                        response: "OK.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
-                    ParallelVerdict {
-                        response: "Good.".into(),
-                        verdict: Some(pass_verdict()),
-                    },
+                    pass_result("QA pass."),
+                    pass_result("OK."),
+                    pass_result("Good."),
                 ],
                 vi: QA_VI,
                 expected_status: TicketPhase::QaPassed,
@@ -3260,7 +3242,6 @@ mod tests {
     /// - Partial fail → Planning with "blockers" summary
     /// - No verdicts → Planning with "no analysis" summary
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn handle_analyst_verdicts_cases() {
         struct Case {
             name: &'static str,
@@ -3278,30 +3259,9 @@ mod tests {
                 ws_suffix: "an_all_pass",
                 title: "Analyst All Pass",
                 results: vec![
-                    ParallelVerdict {
-                        response: "Analysis A".into(),
-                        verdict: Some(crate::Verdict {
-                            score: 10,
-                            critique: Some("Great analysis.".into()),
-                            issues_detected: vec![],
-                        }),
-                    },
-                    ParallelVerdict {
-                        response: "Analysis B".into(),
-                        verdict: Some(crate::Verdict {
-                            score: 9,
-                            critique: Some("Solid work.".into()),
-                            issues_detected: vec![],
-                        }),
-                    },
-                    ParallelVerdict {
-                        response: "Analysis C".into(),
-                        verdict: Some(crate::Verdict {
-                            score: 8,
-                            critique: Some("Good analysis.".into()),
-                            issues_detected: vec![],
-                        }),
-                    },
+                    analyst_verdict("Analysis A", 10, "Great analysis.", &[]),
+                    analyst_verdict("Analysis B", 9, "Solid work.", &[]),
+                    analyst_verdict("Analysis C", 8, "Good analysis.", &[]),
                 ],
                 expected_comment_substring: "All LGTM",
             },
@@ -3310,30 +3270,9 @@ mod tests {
                 ws_suffix: "an_partial",
                 title: "Analyst Partial Fail",
                 results: vec![
-                    ParallelVerdict {
-                        response: "Analysis A".into(),
-                        verdict: Some(crate::Verdict {
-                            score: 10,
-                            critique: Some("Great.".into()),
-                            issues_detected: vec![],
-                        }),
-                    },
-                    ParallelVerdict {
-                        response: "Analysis B".into(),
-                        verdict: Some(crate::Verdict {
-                            score: 3,
-                            critique: Some("Poor analysis.".into()),
-                            issues_detected: vec!["Missing data".into()],
-                        }),
-                    },
-                    ParallelVerdict {
-                        response: "Analysis C".into(),
-                        verdict: Some(crate::Verdict {
-                            score: 8,
-                            critique: Some("Decent.".into()),
-                            issues_detected: vec!["Minor issue".into()],
-                        }),
-                    },
+                    analyst_verdict("Analysis A", 10, "Great.", &[]),
+                    analyst_verdict("Analysis B", 3, "Poor analysis.", &["Missing data"]),
+                    analyst_verdict("Analysis C", 8, "Decent.", &["Minor issue"]),
                 ],
                 expected_comment_substring: "blockers",
             },
@@ -3341,20 +3280,7 @@ mod tests {
                 name: "no verdicts -> Planning with no analysis",
                 ws_suffix: "an_no_v",
                 title: "Analyst No Verdicts",
-                results: vec![
-                    ParallelVerdict {
-                        response: String::new(),
-                        verdict: None,
-                    },
-                    ParallelVerdict {
-                        response: String::new(),
-                        verdict: None,
-                    },
-                    ParallelVerdict {
-                        response: String::new(),
-                        verdict: None,
-                    },
-                ],
+                results: vec![no_verdict(); 3],
                 expected_comment_substring: "no analysis",
             },
         ];
