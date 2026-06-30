@@ -316,8 +316,15 @@ impl NativeMessage {
 #[must_use]
 fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
+    let mut cleaned = String::with_capacity(content.len());
+    let mut last_end = 0;
 
     for caps in crate::util::MEDIA_MARKER_RE.captures_iter(content) {
+        let m = caps.get(0).expect("MEDIA_MARKER_RE: expected full match");
+
+        // Emit text before this match.
+        cleaned.push_str(&content[last_end..m.start()]);
+
         if caps
             .name("kind")
             .expect("MEDIA_MARKER_RE: expected 'kind' group")
@@ -330,22 +337,17 @@ fn parse_image_markers(content: &str) -> (String, Vec<String>) {
                 .as_str()
                 .trim();
             refs.push(path.to_string());
+            // IMAGE markers are stripped — don't emit anything.
+        } else {
+            // AUDIO/VIDEO markers are preserved verbatim.
+            cleaned.push_str(m.as_str());
         }
+
+        last_end = m.end();
     }
 
-    // Strip IMAGE markers; preserve AUDIO and other non-IMAGE markers.
-    let cleaned = crate::util::MEDIA_MARKER_RE.replace_all(content, |caps: &regex::Captures| {
-        if caps
-            .name("kind")
-            .expect("MEDIA_MARKER_RE: expected 'kind' group")
-            .as_str()
-            == "IMAGE"
-        {
-            String::new()
-        } else {
-            caps.get(0).unwrap().as_str().to_string()
-        }
-    });
+    // Emit remaining text after the last match.
+    cleaned.push_str(&content[last_end..]);
 
     (cleaned.trim().to_string(), refs)
 }
@@ -1031,6 +1033,22 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    /// Non‑IMAGE markers (AUDIO, VIDEO) are preserved verbatim in the cleaned
+    /// output while IMAGE markers are stripped. This test covers the mixed case
+    /// to prevent regression of the preservation behaviour.
+    #[test]
+    fn parse_image_markers_preserves_audio_and_video_markers() {
+        let input =
+            "[AUDIO:/tmp/sound.mp3] Listen to this [VIDEO:/tmp/clip.mp4] and [IMAGE:/tmp/img.png]";
+        let (cleaned, refs) = parse_image_markers(input);
+
+        assert_eq!(
+            cleaned,
+            "[AUDIO:/tmp/sound.mp3] Listen to this [VIDEO:/tmp/clip.mp4] and"
+        );
+        assert_eq!(refs, vec!["/tmp/img.png"]);
     }
 
     #[test]
