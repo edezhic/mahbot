@@ -806,14 +806,16 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
 
 /// Check if the command has the given short flag (e.g., `-i`, including `-i.bak` variant).
 fn has_flag(command: &str, flag: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
     let dash_flag = format!("-{flag}");
-    for part in &parts {
-        if *part == dash_flag || part.starts_with(&format!("-{flag}.")) {
-            return true;
-        }
-    }
-    false
+    let dash_flag_dot = format!("-{flag}.");
+    command
+        .split_whitespace()
+        .any(|part| part == dash_flag || part.starts_with(&dash_flag_dot))
+}
+
+/// Check if the command has any of the given exact-match flags.
+fn has_any_flag(command: &str, flags: &[&str]) -> bool {
+    command.split_whitespace().any(|part| flags.contains(&part))
 }
 
 /// Check if a `sed` command has the `-i` flag (in-place edit).
@@ -824,12 +826,7 @@ fn sed_has_flag_i(command: &str) -> bool {
 /// Check if `awk -i inplace` is present.
 fn has_inplace(command: &str) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
-    for i in 0..parts.len().saturating_sub(1) {
-        if parts[i] == "-i" && parts[i + 1] == "inplace" {
-            return true;
-        }
-    }
-    false
+    parts.windows(2).any(|w| w[0] == "-i" && w[1] == "inplace")
 }
 
 /// Check if `dd of=...` is present.
@@ -839,10 +836,7 @@ fn has_dd_of(command: &str) -> bool {
 
 /// Check if curl has output flags.
 fn has_curl_output_flag(command: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    parts
-        .iter()
-        .any(|p| *p == "-o" || *p == "--output" || *p == "-O" || *p == "--remote-name")
+    has_any_flag(command, &["-o", "--output", "-O", "--remote-name"])
 }
 
 /// Check if tar is using only `-t`/`--list` (list) mode. Handles combined flags.
@@ -882,10 +876,7 @@ fn is_not_tar_list_only(command: &str) -> bool {
 /// Check if `base64` has both decode flag (`-d`/`--decode`) and output flag
 /// (`-o`/`--output`), which would write decoded data to a file.
 fn has_base64_decode_output(command: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    let has_d = parts.iter().any(|p| *p == "-d" || *p == "--decode");
-    let has_o = parts.iter().any(|p| *p == "-o" || *p == "--output");
-    has_d && has_o
+    has_any_flag(command, &["-d", "--decode"]) && has_any_flag(command, &["-o", "--output"])
 }
 
 /// Check if `cargo clippy` has `--fix` before `--`.
