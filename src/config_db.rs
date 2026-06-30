@@ -116,51 +116,34 @@ impl ConfigStore {
 
     /// Get all key-value pairs.
     pub async fn get_all_kv(&self) -> Result<Vec<(String, String)>> {
-        let rows = self
-            .conn
-            .query_map(
-                &format!("SELECT {KV_COLUMNS} FROM config_kv ORDER BY key"),
-                turso::params![],
-                kv_from_row,
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        self.get_all_rows(KV_COLUMNS, "config_kv", "key", kv_from_row)
+            .await
     }
 
     // ── config_role ──────────────────────────────────────────
 
     /// Get all role config rows.
     pub async fn get_all_role_configs(&self) -> Result<Vec<RoleConfig>> {
-        let rows = self
-            .conn
-            .query_map(
-                &format!("SELECT {ROLE_CONFIG_COLUMNS} FROM config_role ORDER BY role"),
-                turso::params![],
-                role_config_from_row,
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        self.get_all_rows(
+            ROLE_CONFIG_COLUMNS,
+            "config_role",
+            "role",
+            role_config_from_row,
+        )
+        .await
     }
 
     // ── config_model_routing ──────────────────────────────────
 
     /// Get all model routing rows.
     pub async fn get_all_model_routings(&self) -> Result<Vec<ModelRouting>> {
-        let rows = self
-            .conn
-            .query_map(
-                &format!("SELECT {MODEL_ROUTING_COLUMNS} FROM config_model_routing ORDER BY model"),
-                turso::params![],
-                model_routing_from_row,
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        self.get_all_rows(
+            MODEL_ROUTING_COLUMNS,
+            "config_model_routing",
+            "model",
+            model_routing_from_row,
+        )
+        .await
     }
 
     // ── batch save (role configs + model routings) ──────────────
@@ -269,6 +252,32 @@ impl ConfigStore {
             turso::params![key],
         )
         .await
+    }
+
+    /// Execute a read-only query with a row mapper, collecting all results into
+    /// a `Vec`.  Shared implementation for all `get_all_*` methods.
+    ///
+    /// # Safety
+    ///
+    /// `columns`, `table`, and `order_by` are always compile-time string
+    /// literals supplied by the caller; they are never user-provided, so the
+    /// `format!` injection is benign.
+    async fn get_all_rows<T, E>(
+        &self,
+        columns: &str,
+        table: &str,
+        order_by: &str,
+        parser: impl FnMut(&turso::Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> Result<Vec<T>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let sql = format!("SELECT {columns} FROM {table} ORDER BY {order_by}");
+        let rows = self.conn.query_map(&sql, turso::params![], parser).await?;
+        Ok(rows
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
 
