@@ -674,6 +674,8 @@ Use this tool only for inspection: reading files, listing directories, running c
 //   3. Dispatch to apply_profile_pipeline
 //
 // Phase 2 — apply_profile_pipeline (profile-driven stages):
+//   NOTE: stderr is scrubbed at function entry before any stages, so all
+//   paths (early-return and main) consistently receive scrubbed stderr.
 //   Stage numbers below match inline comments in apply_profile_pipeline.
 //   1.  json_preview           — if output is JSON, return a schema preview
 //   2.  short_circuit          — match success patterns (skipped for chained
@@ -1504,13 +1506,22 @@ fn apply_profile_pipeline(
     elapsed: Duration,
     is_chained: bool,
 ) -> String {
+    // Scrub stderr once at the top of the pipeline so all early-return
+    // paths (JSON preview, short-circuit, on_empty) consistently receive
+    // scrubbed stderr, matching the normal path's behavior through
+    // finish_shell_output. Scrubbing before keep_stderr filtering means
+    // credential lines that matched keep_stderr patterns will be dropped
+    // entirely because the redacted version no longer matches — this is
+    // acceptable since credentials should never appear in output.
+    let stderr = scrub_credentials(stderr);
+
     // Stage 1: try JSON preview — early-return path; scrub credentials on
     // array element serializations which include raw values.
     if let Some(json_preview) = try_json_preview(output) {
         let json_preview = scrub_credentials(&json_preview);
         return combine_output(
             &json_preview,
-            stderr,
+            &stderr,
             exit_code,
             profile.keep_stderr.as_ref(),
         );
@@ -1519,7 +1530,7 @@ fn apply_profile_pipeline(
     // Stage 2: short-circuit on success patterns — skip for chained commands
     // to avoid suppressing output from later segments (e.g., `cargo build && echo done`).
     if !is_chained && let Some(msg) = match_short_circuit(output, &profile.short_circuits) {
-        return combine_output(msg, stderr, exit_code, profile.keep_stderr.as_ref());
+        return combine_output(msg, &stderr, exit_code, profile.keep_stderr.as_ref());
     }
 
     let mut processed = output.to_string();
@@ -1555,7 +1566,7 @@ fn apply_profile_pipeline(
         let secs = elapsed.as_secs_f64();
         return combine_output(
             &format!("{msg}{exit_note} ({secs:.1}s)"),
-            stderr,
+            &stderr,
             exit_code,
             profile.keep_stderr.as_ref(),
         );
@@ -1571,7 +1582,7 @@ fn apply_profile_pipeline(
         processed = transform(&processed, exit_code);
     }
 
-    let combined = combine_output(&processed, stderr, exit_code, profile.keep_stderr.as_ref());
+    let combined = combine_output(&processed, &stderr, exit_code, profile.keep_stderr.as_ref());
     finish_shell_output(combined, elapsed, pre_head_tail.as_deref())
 }
 
@@ -2637,6 +2648,90 @@ mod tests {
         assert!(
             result.contains("[JSON array:"),
             "should still show JSON preview"
+        );
+    }
+
+    #[test]
+    fn json_preview_scrubs_credentials_in_stderr() {
+        // JSON preview path (stage 1) must scrub credentials in stderr
+        // when stderr is visible (non-zero exit code).
+        let result = process_shell_output(
+            "echo test",
+            r#"[{"name": "alice"}]"#,
+            "api_key=abcdefghijklmnop12345678",
+            1,
+            Duration::ZERO,
+        );
+        // Raw credential should not appear in output
+        assert!(
+            !result.contains("api_key=abcdefghijklmnop12345678"),
+            "raw credential should be scrubbed from stderr: {result}"
+        );
+        // Redacted form should be present (first 4 chars preserved)
+        assert!(
+            result.contains("api_key=abcd*[REDACTED]"),
+            "should contain redacted credential: {result}"
+        );
+        // JSON preview should still be shown
+        assert!(
+            result.contains("alice"),
+            "JSON preview content should remain"
+        );
+    }
+
+    #[test]
+    fn short_circuit_scrubs_credentials_in_stderr() {
+        // Short-circuit path (stage 2) must scrub credentials in stderr
+        // when stderr is visible (non-zero exit code).
+        let result = process_shell_output(
+            "git diff",
+            "",
+            "api_key=abcdefghijklmnop12345678",
+            1,
+            Duration::ZERO,
+        );
+        // Raw credential should not appear in output
+        assert!(
+            !result.contains("api_key=abcdefghijklmnop12345678"),
+            "raw credential should be scrubbed from stderr: {result}"
+        );
+        // Redacted form should be present (first 4 chars preserved)
+        assert!(
+            result.contains("api_key=abcd*[REDACTED]"),
+            "should contain redacted credential: {result}"
+        );
+        // Short-circuit message should still be present
+        assert!(
+            result.contains("no changes"),
+            "short-circuit message should remain"
+        );
+    }
+
+    #[test]
+    fn on_empty_scrubs_credentials_in_stderr() {
+        // On-empty path (stage 7) must scrub credentials in stderr
+        // when stderr is visible (non-zero exit code).
+        let result = process_shell_output(
+            "tsc --noEmit",
+            "",
+            "api_key=abcdefghijklmnop12345678",
+            1,
+            Duration::ZERO,
+        );
+        // Raw credential should not appear in output
+        assert!(
+            !result.contains("api_key=abcdefghijklmnop12345678"),
+            "raw credential should be scrubbed from stderr: {result}"
+        );
+        // Redacted form should be present (first 4 chars preserved)
+        assert!(
+            result.contains("api_key=abcd*[REDACTED]"),
+            "should contain redacted credential: {result}"
+        );
+        // On-empty message should still be present
+        assert!(
+            result.contains("[tsc: ok]"),
+            "on-empty message should remain"
         );
     }
 
