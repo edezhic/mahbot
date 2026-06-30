@@ -299,6 +299,7 @@ mod tests {
     // for all the scenarios below.  The tests are structured to match the
     // original lifecycle shape for continuity.
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_config_role_lifecycle() {
         let (store, _dir) = setup().await;
@@ -445,6 +446,7 @@ mod tests {
     // Tests through the production batch path; see the comment on
     // test_config_role_lifecycle for rationale.
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_config_model_routing_lifecycle() {
         let (store, _dir) = setup().await;
