@@ -279,8 +279,6 @@ pub(crate) fn distribute_byte_spans(
     source: &str,
     byte_spans: &[(usize, usize, HighlightClass)],
 ) -> FileHighlights {
-    use std::collections::BTreeSet;
-
     // Compute byte offsets of each line start (and the past-end sentinel).
     let mut line_starts: Vec<usize> = Vec::new();
     let mut pos = 0;
@@ -306,7 +304,7 @@ pub(crate) fn distribute_byte_spans(
         }
 
         let mut clipped: Vec<(usize, usize, HighlightClass)> = Vec::new();
-        let mut boundaries: BTreeSet<usize> = BTreeSet::from([line_start, line_end]);
+        let mut boundaries: Vec<usize> = vec![line_start, line_end];
 
         for &(span_start, span_end, class) in byte_spans {
             if span_end <= line_start || span_start >= line_end {
@@ -315,16 +313,17 @@ pub(crate) fn distribute_byte_spans(
             let s = span_start.max(line_start);
             let e = span_end.min(line_end);
             if s < e {
-                boundaries.insert(s);
-                boundaries.insert(e);
+                boundaries.push(s);
+                boundaries.push(e);
                 clipped.push((s, e, class));
             }
         }
 
-        let bounds: Vec<usize> = boundaries.into_iter().collect();
+        boundaries.sort_unstable();
+        boundaries.dedup();
         let mut line_spans: Vec<HighlightSpan> = Vec::new();
 
-        for window in bounds.windows(2) {
+        for window in boundaries.windows(2) {
             let seg_start = window[0];
             let seg_end = window[1];
             if seg_start >= seg_end {
