@@ -88,6 +88,22 @@ fn is_os_file(name: &str) -> bool {
     lower == ".ds_store" || lower == "thumbs.db" || lower == "desktop.ini"
 }
 
+/// Render a centered empty-state placeholder with text content.
+///
+/// The caller passes a fully-configured `text()` widget (with size, color,
+/// optional font, etc.) and this helper wraps it in the standard centered
+/// container pattern used throughout the editor panel.
+fn empty_placeholder(
+    text: iced::widget::Text<'_, iced::Theme, iced::Renderer>,
+) -> Element<'_, EditorMessage> {
+    container(text)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+}
+
 // ── Types ─────────────────────────────────────────────────────────
 
 /// File-system entry for the directory tree.
@@ -4602,18 +4618,12 @@ impl EditorState {
     pub fn view(&self) -> Element<'_, EditorMessage> {
         // ── No workspace selected — placeholder ──────────────────────
         if self.selected_workspace_name.is_none() {
-            let placeholder = container(
+            return empty_placeholder(
                 text("No workspace selected")
                     .size(24)
                     .color(theme::TEXT_MUTED)
                     .font(theme::FONT_BOLD),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill);
-
-            return placeholder.into();
+            );
         }
 
         // ── Split layout ─────────────────────────────────────────────
@@ -5094,16 +5104,11 @@ impl EditorState {
 
     fn build_editor_panel(&self) -> Element<'_, EditorMessage> {
         if self.tabs.is_empty() {
-            return container(
+            return empty_placeholder(
                 text("Select a file to edit")
                     .size(18)
                     .color(theme::TEXT_MUTED),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into();
+            );
         }
 
         let tab_bar = self.build_tab_bar();
@@ -5693,30 +5698,20 @@ impl EditorState {
 
     fn build_editor_widget(&self) -> Element<'_, EditorMessage> {
         let Some(idx) = self.active_tab_idx() else {
-            return container(
+            return empty_placeholder(
                 text("No file selected")
                     .size(EDITOR_FONT_SIZE)
                     .color(theme::TEXT_MUTED),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into();
+            );
         };
 
         let path = &self.tabs[idx].path;
         let Some(tab_data) = self.tab_contents.get(path) else {
-            return container(
+            return empty_placeholder(
                 text("Error: tab content missing")
                     .size(EDITOR_FONT_SIZE)
                     .color(theme::STATUS_ERROR),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into();
+            );
         };
 
         // ── Build editor widget ────────────────────────────────────────
