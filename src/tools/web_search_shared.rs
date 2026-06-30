@@ -95,10 +95,7 @@ pub(crate) async fn check_search_error(
     }
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_else(|e| {
-        tracing::warn!(?e, "Failed to read search response body");
-        String::new()
-    });
+    let body = crate::util::http::read_error_body(response, "search").await;
 
     // APIs return structured JSON errors — try to extract for a better message.
     if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)

@@ -69,6 +69,15 @@ pub(crate) fn extract_http_status(msg: &str) -> Option<u16> {
         .find(|&code| (400..500).contains(&code))
 }
 
+/// Safely read a response body on failure, returning a fallback string.
+/// Logs a warning with the provided context and the underlying error.
+pub(crate) async fn read_error_body(response: reqwest::Response, context: &str) -> String {
+    response.text().await.unwrap_or_else(|e| {
+        tracing::warn!(?e, "Failed to read {context} response body");
+        "failed to read response body".to_string()
+    })
+}
+
 /// Check that an HTTP response has a successful status code.
 ///
 /// If the status is 2xx the response is returned unmodified for further
@@ -86,10 +95,7 @@ async fn check_response(
 ) -> anyhow::Result<reqwest::Response> {
     let status = response.status();
     if !status.is_success() {
-        let error_text = response.text().await.unwrap_or_else(|e| {
-            tracing::warn!(?e, "Failed to read response body");
-            "failed to read response body".to_string()
-        });
+        let error_text = read_error_body(response, error_context).await;
         let preview = crate::util::truncate(&error_text, 500);
         return Err(anyhow::Error::from(super::error::HttpError::new(
             status.as_u16(),

@@ -824,10 +824,8 @@ impl TelegramChannel {
 
             if !response.status().is_success() {
                 let status = response.status();
-                let err_body = response.text().await.unwrap_or_else(|e| {
-                    tracing::warn!(?e, "Failed to read ACK reaction error response body");
-                    "failed to read response body".to_string()
-                });
+                let err_body =
+                    crate::util::http::read_error_body(response, "ACK reaction error").await;
                 tracing::warn!(
                     "Telegram: add ACK reaction failed for chat_id={chat_id}, message_id={message_id}: status={status}, body={err_body}"
                 );
@@ -1192,10 +1190,7 @@ impl TelegramChannel {
         if status.is_success() {
             Ok(())
         } else {
-            let err_body = resp.text().await.unwrap_or_else(|e| {
-                tracing::warn!(?e, "Failed to read sendMessage error response body");
-                "failed to read response body".to_string()
-            });
+            let err_body = crate::util::http::read_error_body(resp, "sendMessage error").await;
             Err((status, err_body))
         }
     }
