@@ -1504,8 +1504,10 @@ fn apply_profile_pipeline(
     elapsed: Duration,
     is_chained: bool,
 ) -> String {
-    // Stage 1: try JSON preview — if output is JSON, return schema preview early
+    // Stage 1: try JSON preview — early-return path; scrub credentials on
+    // array element serializations which include raw values.
     if let Some(json_preview) = try_json_preview(output) {
+        let json_preview = scrub_credentials(&json_preview);
         return combine_output(
             &json_preview,
             stderr,
@@ -2577,6 +2579,65 @@ mod tests {
         let input = "hello world\nthis is not json";
         let result = try_json_preview(input);
         assert!(result.is_none(), "should not detect JSON");
+    }
+
+    #[test]
+    fn json_preview_scrubs_credentials_in_array() {
+        // JSON array containing credential values — must be scrubbed
+        // in the JSON preview early-return path.
+        let input = r#"[{"token": "sk-abcdefghijklmnop12345678", "name": "test"}]"#;
+        let result = process_shell_output("echo test", input, "", 0, Duration::ZERO);
+        // The JSON preview is triggered first; credentials should be scrubbed
+        assert!(
+            !result.contains("sk-abcdefghijklmnop12345678"),
+            "raw credential should be scrubbed: {result}"
+        );
+        assert!(
+            result.contains("sk-a*[REDACTED]"),
+            "should contain redacted credential: {result}"
+        );
+        // Non-sensitive values should pass through
+        assert!(
+            result.contains("test"),
+            "non-sensitive values should remain"
+        );
+    }
+
+    #[test]
+    fn json_preview_scrubs_credentials_in_object() {
+        // JSON object preview only shows field names and types (not values),
+        // so credential VALUES are never serialized in the object preview.
+        // The field name `api_key` appears as metadata — this tests that
+        // scrubbing doesn't corrupt the output and that no values leak.
+        let input = r#"{"api_key": "abcdefghijklmnop12345678", "status": "ok"}"#;
+        let result = process_shell_output("curl api", input, "", 0, Duration::ZERO);
+        // Object preview shows field names and types, not values — but even
+        // if values were serialized, scrub_credentials catches them.
+        assert!(
+            !result.contains("abcdefghijklmnop12345678"),
+            "raw credential value should not be present: {result}"
+        );
+        // Field names are visible (metadata, not credential values)
+        assert!(result.contains("api_key"), "field name should be present");
+        assert!(result.contains("status"), "field names should be preserved");
+        assert!(
+            result.contains("[JSON object:"),
+            "should still show JSON preview"
+        );
+    }
+
+    #[test]
+    fn json_preview_preserves_clean_json() {
+        // JSON without credentials — should not be altered
+        let input = r#"[{"name": "alice", "age": 30}]"#;
+        let result = process_shell_output("echo test", input, "", 0, Duration::ZERO);
+        assert!(result.contains("alice"), "clean values should pass through");
+        assert!(result.contains("age"), "field names should be preserved");
+        assert!(result.contains("30"), "numeric values should pass through");
+        assert!(
+            result.contains("[JSON array:"),
+            "should still show JSON preview"
+        );
     }
 
     #[test]
