@@ -555,14 +555,14 @@ impl BoardStore {
     }
 
     /// Rewire dependents after supersede: tickets whose prerequisites mention
-    /// `old_id` get updated to point to `new_id`. Queried and updated within
+    /// `supersede_id` get updated to point to `new_id`. Queried and updated within
     /// the same transaction — no TOCTOU window between SELECT and UPDATE.
     ///
     /// Uses `json_each()` for exact prerequisite matching (consistent with
     /// [`claim_ticket_in_workspace`](Self::claim_ticket_in_workspace)).
     async fn rewire_dependents(
         tx: &TxGuard<'_>,
-        old_id: &str,
+        supersede_id: &str,
         new_id: &str,
         workspace_name: &str,
     ) -> Result<()> {
@@ -571,7 +571,7 @@ impl BoardStore {
                 "SELECT DISTINCT t.id, t.prerequisites \
                  FROM tickets t, json_each(t.prerequisites) AS je \
                  WHERE je.value = ?1 AND t.workspace_name = ?2",
-                turso::params![old_id, workspace_name],
+                turso::params![supersede_id, workspace_name],
             )
             .await?;
 
@@ -582,7 +582,7 @@ impl BoardStore {
                 .with_context(|| format!("Failed to parse prerequisites for ticket {dep_id}"))?;
             let mut changed = false;
             for p in &mut prereqs {
-                if *p == old_id {
+                if *p == supersede_id {
                     *p = new_id.to_string();
                     changed = true;
                 }
