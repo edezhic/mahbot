@@ -817,19 +817,16 @@ impl Embedder {
     fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let (_batch_size, _seq_len) = input_ids.shape().dims2()?;
 
-        // Create bidirectional attention mask (no causal masking since this is an encoder)
+        // No causal masking — this is an encoder
         let mask = build_attn_mask(attention_mask, &Device::Cpu)?;
 
-        // Token embeddings
         let mut h = self.tok_embeddings.forward(input_ids)?;
         // h: [batch, seq, hidden_size]
 
-        // Pass through all transformer layers
         for layer in &self.layers {
             h = layer.forward(&h, &mask, &self.cos, &self.sin, self.n_head, self.head_dim)?;
         }
 
-        // Final norm
         h = candle_nn::ops::rms_norm(&h, &self.output_norm, 1e-5)?;
 
         Ok(h)
