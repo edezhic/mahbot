@@ -96,7 +96,7 @@ fn kv_from_row(row: &turso::Row) -> Result<(String, String), ::turso::Error> {
     Ok((key, value))
 }
 
-// ── Shared UPSERT SQL (reused by `set_kv` and `set_kv_tx`) ────────
+// ── UPSERT SQL constants ──────────────────────────────────
 
 const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
      ON CONFLICT(key) DO UPDATE SET value = excluded.value";
@@ -281,6 +281,22 @@ impl ConfigStore {
     }
 }
 
+// ── Test-only UPSERT SQL constants ──────────────────────────
+
+#[cfg(test)]
+const UPSERT_ROLE_CONFIG_SQL: &str = "INSERT INTO config_role (role, model, reasoning_effort) \
+     VALUES (?1, ?2, ?3) \
+     ON CONFLICT(role) DO UPDATE SET \
+         model = excluded.model, \
+         reasoning_effort = excluded.reasoning_effort";
+
+#[cfg(test)]
+const UPSERT_MODEL_ROUTING_SQL: &str = "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
+     VALUES (?1, ?2, ?3) \
+     ON CONFLICT(model) DO UPDATE SET \
+         provider_order = excluded.provider_order, \
+         allow_fallbacks = excluded.allow_fallbacks";
+
 #[cfg(test)]
 impl ConfigStore {
     // Get a single key-value pair by key. Returns `None` if not found.
@@ -315,11 +331,7 @@ impl ConfigStore {
         reasoning_effort: Option<&str>,
     ) -> Result<()> {
         self.exec(
-            "INSERT INTO config_role (role, model, reasoning_effort) \
-             VALUES (?1, ?2, ?3) \
-             ON CONFLICT(role) DO UPDATE SET \
-                 model = excluded.model, \
-                 reasoning_effort = excluded.reasoning_effort",
+            UPSERT_ROLE_CONFIG_SQL,
             turso::params![role, model, reasoning_effort],
         )
         .await
@@ -353,11 +365,7 @@ impl ConfigStore {
     ) -> Result<()> {
         let allow_fallbacks_int = allow_fallbacks.map(i32::from);
         self.exec(
-            "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
-             VALUES (?1, ?2, ?3) \
-             ON CONFLICT(model) DO UPDATE SET \
-                 provider_order = excluded.provider_order, \
-                 allow_fallbacks = excluded.allow_fallbacks",
+            UPSERT_MODEL_ROUTING_SQL,
             turso::params![model, provider_order, allow_fallbacks_int],
         )
         .await
