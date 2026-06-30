@@ -1947,16 +1947,13 @@ mod tests {
                 .is_none()
         );
 
-        let id = TicketBuilder::new(
+        let id = make_ticket(
             &store,
             crate::workspace::test_ws_named("/workspace", "workspace"),
+            "Status Test",
+            TicketPhase::Planning,
         )
-        .title("Status Test")
-        .desc("Testing get_ticket_phase")
-        .phase(TicketPhase::Planning)
-        .create()
-        .await
-        .expect("create");
+        .await;
 
         let status = crate::util::test::expect_ticket_phase(&store, &id).await;
         assert_eq!(status, TicketPhase::Planning);
@@ -2683,23 +2680,17 @@ with a comment explaining why no agent is mid-execution in that state.\
                     // Not reachable: NoBlocker is guarded by the enclosing if-let.
                     Scenario::NoBlocker => unreachable!(),
                 };
-                TicketBuilder::new(&store, blocker_target.clone())
-                    .title("Blocker")
-                    .desc("already in pipeline")
-                    .phase(*phase)
-                    .create()
-                    .await
-                    .expect("create blocker");
+                make_ticket(&store, blocker_target.clone(), "Blocker", *phase).await;
             }
 
             // Create a claimable ticket
-            let id = TicketBuilder::new(&store, claimable_ws)
-                .title("Claimable")
-                .desc("ready for dev")
-                .phase(TicketPhase::ReadyForDevelopment)
-                .create()
-                .await
-                .expect("create claimable");
+            let id = make_ticket(
+                &store,
+                claimable_ws,
+                "Claimable",
+                TicketPhase::ReadyForDevelopment,
+            )
+            .await;
 
             // Claim with require_clear_pipeline=true
             let claimed = store
@@ -2739,18 +2730,8 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // Create prerequisite tickets first
-        let p1 = TicketBuilder::new(&store, ws.clone())
-            .title("P1")
-            .desc("prereq one")
-            .create()
-            .await
-            .expect("create p1");
-        let p2 = TicketBuilder::new(&store, ws.clone())
-            .title("P2")
-            .desc("prereq two")
-            .create()
-            .await
-            .expect("create p2");
+        let p1 = make_ticket(&store, ws.clone(), "P1", TicketPhase::Backlog).await;
+        let p2 = make_ticket(&store, ws.clone(), "P2", TicketPhase::Backlog).await;
 
         // Create a ticket depending on both
         let deps = vec![p1.clone(), p2.clone()];
@@ -2824,22 +2805,12 @@ with a comment explaining why no agent is mid-execution in that state.\
             //   have ID `ws_sr-1`.
             let seed: Option<String> = match &case.scenario {
                 Scenario::NonExistent => None,
-                Scenario::CrossWorkspace => Some(
-                    TicketBuilder::new(&store, ws.clone())
-                        .title("Existing")
-                        .desc("in ws")
-                        .create()
-                        .await
-                        .expect("create seed for cross-workspace"),
-                ),
-                Scenario::SelfReference => Some(
-                    TicketBuilder::new(&store, ws_sr.clone())
-                        .title("First")
-                        .desc("any")
-                        .create()
-                        .await
-                        .expect("create seed for self-reference"),
-                ),
+                Scenario::CrossWorkspace => {
+                    Some(make_ticket(&store, ws.clone(), "Existing", TicketPhase::Backlog).await)
+                }
+                Scenario::SelfReference => {
+                    Some(make_ticket(&store, ws_sr.clone(), "First", TicketPhase::Backlog).await)
+                }
             };
 
             let target_ws = match case.scenario {
@@ -2886,12 +2857,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // A depends on nothing
-        let a = TicketBuilder::new(&store, ws.clone())
-            .title("A")
-            .desc("first")
-            .create()
-            .await
-            .expect("create a");
+        let a = make_ticket(&store, ws.clone(), "A", TicketPhase::Backlog).await;
 
         // B depends on A
         let b = TicketBuilder::new(&store, ws.clone())
@@ -2921,12 +2887,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // A (no prereqs)
 
-        let a = TicketBuilder::new(&store, ws.clone())
-            .title("A")
-            .desc("leaf")
-            .create()
-            .await
-            .expect("create a");
+        let a = make_ticket(&store, ws.clone(), "A", TicketPhase::Backlog).await;
 
         // B depends on A
         let b = TicketBuilder::new(&store, ws.clone())
@@ -3103,13 +3064,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("cancel");
 
-        let backlog_id = TicketBuilder::new(&store, ws)
-            .title("backlog")
-            .desc("will be done")
-            .phase(TicketPhase::Backlog)
-            .create()
-            .await
-            .expect("create_ticket");
+        let backlog_id = make_ticket(&store, ws, "backlog", TicketPhase::Backlog).await;
         // Leave in Backlog.
 
         // Act
@@ -3244,12 +3199,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws("/tmp/test_ws_tool_prereqs");
 
         // Create a prerequisite via the store directly
-        let p_id = TicketBuilder::new(store, ws.clone())
-            .title("Pre")
-            .desc("a prereq")
-            .create()
-            .await
-            .expect("create prereq");
+        let p_id = make_ticket(store, ws.clone(), "Pre", TicketPhase::Backlog).await;
 
         let tool = crate::tools::CreateTicketTool::new("test");
         let args = serde_json::json!({
@@ -3269,11 +3219,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         init_test_stores().await;
         let store = crate::board::BOARD.get().unwrap();
         let ws = test_ws_named("/ws", "ws");
-        let old_id = TicketBuilder::new(store, ws.clone())
-            .title("Test")
-            .create()
-            .await
-            .expect("setup");
+        let old_id = make_ticket(store, ws.clone(), "Test", TicketPhase::Backlog).await;
 
         // Supersede it
         let new_id = TicketBuilder::new(store, ws)
@@ -3306,18 +3252,8 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // Create ticket A (will be superseded) and ticket C (independent).
-        let a_id = TicketBuilder::new(store, ws.clone())
-            .title("A")
-            .desc("old")
-            .create()
-            .await
-            .expect("create A");
-        let c_id = TicketBuilder::new(store, ws.clone())
-            .title("C")
-            .desc("other")
-            .create()
-            .await
-            .expect("create C");
+        let a_id = make_ticket(store, ws.clone(), "A", TicketPhase::Backlog).await;
+        let c_id = make_ticket(store, ws.clone(), "C", TicketPhase::Backlog).await;
 
         // Create ticket B that depends on both A and C.
         let b_id = TicketBuilder::new(store, ws.clone())
@@ -3329,12 +3265,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("create B");
 
         // Create ticket D with no prerequisites — should be untouched.
-        let d_id = TicketBuilder::new(store, ws.clone())
-            .title("D")
-            .desc("no deps")
-            .create()
-            .await
-            .expect("create D");
+        let d_id = make_ticket(store, ws.clone(), "D", TicketPhase::Backlog).await;
 
         // Supersede A → A2.
         let supersede_id = TicketBuilder::new(store, ws)
@@ -3407,12 +3338,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             let original_id = match case.scenario {
                 Scenario::NonExistent => None,
                 Scenario::CrossWorkspace | Scenario::SelfReference => {
-                    let id = TicketBuilder::new(&store, ws.clone())
-                        .title("A")
-                        .desc("desc")
-                        .create()
-                        .await
-                        .expect("create original");
+                    let id = make_ticket(&store, ws.clone(), "A", TicketPhase::Backlog).await;
                     Some(id)
                 }
             };
@@ -3457,12 +3383,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws("/tmp/test_ws_supersede_tool");
 
         // Create old ticket
-        let old_id = TicketBuilder::new(store, ws.clone())
-            .title("Old")
-            .desc("old desc")
-            .create()
-            .await
-            .expect("create old");
+        let old_id = make_ticket(store, ws.clone(), "Old", TicketPhase::Backlog).await;
 
         let tool = crate::tools::CreateTicketTool::new("test");
         let args = serde_json::json!({
@@ -3490,11 +3411,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         init_test_stores().await;
         let store = crate::board::BOARD.get().unwrap();
         let ws = test_ws_named("/ws", "ws");
-        let old_id = TicketBuilder::new(store, ws.clone())
-            .title("Test")
-            .create()
-            .await
-            .expect("setup");
+        let old_id = make_ticket(store, ws.clone(), "Test", TicketPhase::Backlog).await;
 
         // Cancel the ticket
         store
@@ -4449,12 +4366,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/test-workspace", "test-ws");
 
-        let prereq_id = TicketBuilder::new(&store, ws.clone())
-            .title("Prereq")
-            .desc("prereq desc")
-            .create()
-            .await
-            .expect("create prereq");
+        let prereq_id = make_ticket(&store, ws.clone(), "Prereq", TicketPhase::Backlog).await;
 
         let id = TicketBuilder::new(&store, ws)
             .title("Display Test Ticket")
@@ -4616,13 +4528,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // Create an old ticket first
-        let old_id = TicketBuilder::new(store, ws.clone())
-            .title("Old ticket")
-            .desc("old desc")
-            .phase(TicketPhase::Backlog)
-            .create()
-            .await
-            .expect("create old");
+        let old_id = make_ticket(store, ws.clone(), "Old ticket", TicketPhase::Backlog).await;
 
         // Supersede it — new ticket gets supersedes = old_id, old ticket gets
         // superseded_by = new_id and is archived.
