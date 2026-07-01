@@ -3962,16 +3962,19 @@ impl EditorState {
 
     /// Handle tree-nav-enter — opens file or expands/collapses directory.
     fn tree_nav_enter(&mut self) -> Task<EditorMessage> {
-        // When global search is active, Enter selects the highlighted result.
-        // Borrow to extract the index without cloning the entire state.
-        if let Some(ModalKind::GlobalSearch(ref gs)) = self.active_modal {
-            let idx = gs.selected_index.min(gs.results.len().saturating_sub(1));
-            return Task::done(EditorMessage::GlobalSearchSelect(idx));
-        }
-        // When quick-open is active, Enter selects the highlighted file.
-        if let Some(ModalKind::QuickOpen(ref qo)) = self.active_modal {
-            let idx = qo.selected_index.min(qo.results.len().saturating_sub(1));
-            return Task::done(EditorMessage::QuickOpenSelect(idx));
+        // When global search or quick-open is active, Enter selects the
+        // highlighted result / file.  Borrow to extract the index without
+        // cloning the entire state.
+        match &self.active_modal {
+            Some(ModalKind::GlobalSearch(gs)) => {
+                let idx = gs.selected_index.min(gs.results.len().saturating_sub(1));
+                return Task::done(EditorMessage::GlobalSearchSelect(idx));
+            }
+            Some(ModalKind::QuickOpen(qo)) => {
+                let idx = qo.selected_index.min(qo.results.len().saturating_sub(1));
+                return Task::done(EditorMessage::QuickOpenSelect(idx));
+            }
+            _ => {}
         }
         // When any modal overlay (Rename, GotoLine, NewItem, DeleteConfirm,
         // CloseDialog, etc.) is active, suppress tree navigation — the
@@ -4546,6 +4549,20 @@ impl EditorState {
         }
     }
 
+    /// Shared helper for navigating search results — adjusts the selected index
+    /// based on the direction, staying within bounds.
+    fn navigate_search_results(
+        selected_index: &mut usize,
+        results_len: usize,
+        direction: &TreeNavDirection,
+    ) {
+        match *direction {
+            TreeNavDirection::Up if *selected_index > 0 => *selected_index -= 1,
+            TreeNavDirection::Down if *selected_index + 1 < results_len => *selected_index += 1,
+            _ => {}
+        }
+    }
+
     /// Navigate vertically in the active overlay or file tree.
     ///
     /// Handles global-search results, quick-open results, and file-tree focus
@@ -4554,28 +4571,12 @@ impl EditorState {
     fn navigate_tree_vertical(&mut self, direction: &TreeNavDirection) -> Task<EditorMessage> {
         // When global search is active, navigate the results list.
         if let Some(ModalKind::GlobalSearch(ref mut gs)) = self.active_modal {
-            match *direction {
-                TreeNavDirection::Up if gs.selected_index > 0 => {
-                    gs.selected_index -= 1;
-                }
-                TreeNavDirection::Down if gs.selected_index + 1 < gs.results.len() => {
-                    gs.selected_index += 1;
-                }
-                _ => {}
-            }
+            Self::navigate_search_results(&mut gs.selected_index, gs.results.len(), direction);
             return Task::none();
         }
         // When quick-open is active, navigate the results list.
         if let Some(ModalKind::QuickOpen(ref mut qo)) = self.active_modal {
-            match *direction {
-                TreeNavDirection::Up if qo.selected_index > 0 => {
-                    qo.selected_index -= 1;
-                }
-                TreeNavDirection::Down if qo.selected_index + 1 < qo.results.len() => {
-                    qo.selected_index += 1;
-                }
-                _ => {}
-            }
+            Self::navigate_search_results(&mut qo.selected_index, qo.results.len(), direction);
             return Task::none();
         }
         // When another modal overlay (GotoLine, NewItem, DeleteConfirm,
