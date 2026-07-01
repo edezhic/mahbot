@@ -95,7 +95,6 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
 /// # Panics
 /// Never — this is a complete match over all [`Role`] variants.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub const fn role_info(role: &Role) -> &'static RoleInfo {
     match role {
         Role::Manager => &RoleInfo {
