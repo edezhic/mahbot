@@ -5,7 +5,7 @@ pub use manager::Session;
 
 pub mod summarization;
 
-use crate::turso::{self, TxGuard, Value, params};
+use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, MessageRole, Reasoning, ToolCall as ProviderToolCall};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -141,39 +141,68 @@ async fn insert_messages_in_transaction(
     Ok(())
 }
 
+/// Execute a `query_map`, logging warnings on failure and skipping unparseable rows.
+/// Returns an empty [`Vec`] on query error.
+///
+/// When `session_key` is `Some`, it is included as a structured tracing field in both
+/// the query-failure and row-decode warnings, enabling log-aggregation filtering and
+/// cross-correlation with other session-scoped events.
+async fn query_map_collect<T, E>(
+    conn: &turso::Connection,
+    sql: &str,
+    params: impl IntoParams + Send + 'static,
+    row_parser: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
+    warn_context: &str,
+    session_key: Option<&str>,
+) -> Vec<T>
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
+{
+    let rows = match conn.query_map(sql, params, row_parser).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            if let Some(sk) = session_key {
+                tracing::warn!(error = %e, session_key = sk, "{warn_context}: query failed, returning empty");
+            } else {
+                tracing::warn!(error = %e, "{warn_context}: query failed, returning empty");
+            }
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .filter_map(|r| match r {
+            Ok(val) => Some(val),
+            Err(e) => {
+                if let Some(sk) = session_key {
+                    tracing::warn!(error = %e, session_key = sk, "{warn_context}: row decode failed, skipping");
+                } else {
+                    tracing::warn!(error = %e, "{warn_context}: row decode failed, skipping");
+                }
+                None
+            }
+        })
+        .collect()
+}
+
 // ── Methods — callable on the static ──────────────────────────
 
 impl SessionStore {
     pub(crate) async fn load(&self, session_key: &str) -> Vec<ChatMessage> {
-        let rows = match self
-            .conn
-            .query_map(
-                &format!("SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE session_key = ?1 ORDER BY id ASC"),
-                params![session_key],
-                |row| {
-                    Ok::<_, anyhow::Error>(ChatMessage {
-                        role: row.get::<String>(COL_SM_ROLE)?.parse().map_err(|e: String| anyhow!(e))?,
-                        content: row.get(COL_SM_CONTENT)?,
-                    })
-                },
-            )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!(error = %e, session_key, "Failed to load session history, treating as new session");
-                return Vec::new();
-            }
-        };
-        rows.into_iter()
-            .filter_map(|r| match r {
-                Ok(msg) => Some(msg),
-                Err(e) => {
-                    tracing::warn!(error = %e, session_key, "Failed to decode session row, skipping");
-                    None
-                }
-            })
-            .collect()
+        query_map_collect(
+            &self.conn,
+            &format!("SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE session_key = ?1 ORDER BY id ASC"),
+            params![session_key],
+            |row| {
+                Ok::<_, anyhow::Error>(ChatMessage {
+                    role: row.get::<String>(COL_SM_ROLE)?.parse().map_err(|e: String| anyhow!(e))?,
+                    content: row.get(COL_SM_CONTENT)?,
+                })
+            },
+            "load session",
+            Some(session_key),
+        )
+        .await
     }
 
     pub(crate) async fn append(&self, session_key: &str, message: &ChatMessage) -> Result<()> {
@@ -234,43 +263,28 @@ impl SessionStore {
     }
 
     pub(crate) async fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
-        let rows = match self
-            .conn
-            .query_map(
-                &format!(
-                    "SELECT {SESSION_LIST_COLUMNS} \
-                     FROM session_metadata sm \
-                     LEFT JOIN sessions s ON s.session_key = sm.session_key \
-                     GROUP BY sm.session_key \
-                     ORDER BY sm.last_activity DESC",
-                ),
-                (),
-                |row| {
-                    Ok::<_, anyhow::Error>(session_metadata_from_row(
-                        &row.get::<String>(COL_SL_SESSION_KEY)?,
-                        &row.get::<String>(COL_SL_CREATED_AT)?,
-                        &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
-                        row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
-                    ))
-                },
-            )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to list sessions with metadata, returning empty vec");
-                return Vec::new();
-            }
-        };
-        rows.into_iter()
-            .filter_map(|r| match r {
-                Ok(meta) => Some(meta),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to decode session metadata row, skipping");
-                    None
-                }
-            })
-            .collect()
+        query_map_collect(
+            &self.conn,
+            &format!(
+                "SELECT {SESSION_LIST_COLUMNS} \
+                 FROM session_metadata sm \
+                 LEFT JOIN sessions s ON s.session_key = sm.session_key \
+                 GROUP BY sm.session_key \
+                 ORDER BY sm.last_activity DESC",
+            ),
+            (),
+            |row| {
+                Ok::<_, anyhow::Error>(session_metadata_from_row(
+                    &row.get::<String>(COL_SL_SESSION_KEY)?,
+                    &row.get::<String>(COL_SL_CREATED_AT)?,
+                    &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
+                    row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
+                ))
+            },
+            "list sessions",
+            None,
+        )
+        .await
     }
 }
 
