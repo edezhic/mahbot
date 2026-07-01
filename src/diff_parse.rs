@@ -9,8 +9,6 @@ use tracing::warn;
 
 use crate::tools::shell::apply_safe_env;
 
-use anyhow::Result;
-
 /// Result of a successful `git commit` — the full hash and line stats.
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
@@ -1003,10 +1001,8 @@ pub async fn run_git_commit_message(
 ///
 /// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
 /// including `A ` clean staged and `AM` staged+modified).
-pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>> {
-    let porcelain = run_git_status(repo_path)
-        .await
-        .map_err(anyhow::Error::msg)?;
+pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>, String> {
+    let porcelain = run_git_status(repo_path).await?;
     Ok(parse_new_files_from_porcelain(&porcelain))
 }
 
