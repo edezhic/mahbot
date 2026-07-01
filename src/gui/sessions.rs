@@ -387,11 +387,7 @@ impl SessionsState {
                         tool_calls,
                         reasoning,
                     } => {
-                        let reasoning_text = reasoning
-                            .as_ref()
-                            .and_then(|r| r.reasoning.as_deref())
-                            .filter(|r| !r.is_empty())
-                            .map(ToString::to_string);
+                        let reasoning_text = crate::util::plaintext_for_display(reasoning.as_ref());
 
                         let calls: Vec<ToolCallInfo> = tool_calls
                             .iter()
@@ -415,12 +411,10 @@ impl SessionsState {
                     }
                     DecodedNativeHistoryMessage::AssistantReasoning { content, reasoning } => {
                         let mut parts = Vec::new();
-                        if let Some(r) = reasoning
-                            .as_ref()
-                            .and_then(|r| r.reasoning.as_deref())
-                            .filter(|r| !r.is_empty())
+                        if let Some(reasoning_text) =
+                            crate::util::plaintext_for_display(reasoning.as_ref())
                         {
-                            parts.push(format!("[thinking]\n{r}\n[/thinking]"));
+                            parts.push(format!("[thinking]\n{reasoning_text}\n[/thinking]"));
                         }
                         if let Some(c) = content
                             && !c.is_empty()
