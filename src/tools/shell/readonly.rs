@@ -534,15 +534,123 @@ const FLAG_CHECKS: &[FlagCheck] = &[
     },
 ];
 
-/// Non-flag arguments from a command segment (after canonicalization).
+/// Collect all non-flag, non-redirect, non-heredoc path-like arguments from a
+/// command segment, scanning the **original** whitespace-split tokens.
+///
+/// This replaces the previous implementation that used [`canonical_command`],
+/// which truncated to the first non-flag argument only, meaning multiple
+/// path arguments (e.g. `tee /tmp/a /etc/passwd`) had only the first one
+/// validated — a security bypass (see mahbot-396).
+///
+/// The function skips:
+/// - Shell flags (tokens starting with `-`)
+/// - Standalone redirect operators that expect a target word (the next token
+///   is also skipped): symbolic forms `>`, `>&`, `>>`, `>|`, `<`, `<&`, `<>`;
+///   digit-prefixed forms `{digit}>`, `{digit}<` (e.g. `2>`, `10>`, `3<`);
+///   bash extensions `&>`, `&>>`
+/// - Self-contained redirect operators (no separate target): `2>&1`, `1>&2`
+/// - Combined redirect tokens (operator merged with target, no separate word
+///   to skip): e.g. `>/dev/null`, `2>/dev/null`, `</dev/null`, `<<`/`<<-` heredocs,
+///   `<&2`, `<>/tmp/file`, `&>/dev/null`, `&>>file`, `{digit}<<EOF`
+/// - Heredoc operators (`<<`, `<<-`, `{digit}<<`) and everything after them
+///   (delimiter, body, terminating delimiter).  **Limitation:** path arguments
+///   that appear after the heredoc terminator are not validated (e.g.
+///   `tee /tmp/a << 'EOF'\nbody\nEOF /etc/passwd`).  This is consistent with
+///   the best-effort security model documented in [`check_command`].
+///
+///   The same conservative skip-everything-after-heredoc-operator applies to
+///   fd-prefixed heredocs (`3<<EOF`, `1<<-EOF`).
 fn non_flag_path_args(segment: &str) -> Vec<String> {
-    let canonical = super::canonical_command(segment);
-    let parts: Vec<&str> = canonical.split_whitespace().collect();
-    if parts.len() > 1 {
-        vec![parts[1].to_string()]
-    } else {
-        vec![]
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let Some(cmd_idx) = super::find_first_command_word_index(&words) else {
+        return vec![];
+    };
+
+    let mut args = Vec::new();
+    let mut skip_redirect_target = false;
+    let mut in_heredoc_body = false;
+
+    for w in &words[cmd_idx + 1..] {
+        if in_heredoc_body {
+            continue;
+        }
+
+        if skip_redirect_target {
+            skip_redirect_target = false;
+            continue;
+        }
+
+        if w.starts_with('-') {
+            continue;
+        }
+
+        // ── Heredoc detection ───────────────────────────────────────
+        if matches!(*w, "<<" | "<<-") {
+            in_heredoc_body = true;
+            continue;
+        }
+        if w.starts_with("<<") {
+            in_heredoc_body = true;
+            continue;
+        }
+        // Heredoc with fd prefix (e.g. 3<<EOF, 1<<-EOF)
+        if w.len() > 2 && w.as_bytes()[0].is_ascii_digit() && w.contains("<<") {
+            in_heredoc_body = true;
+            continue;
+        }
+
+        // ── Redirect detection ──────────────────────────────────────
+        // Standalone output redirect operators: symbolic or digit-prefixed
+        if matches!(*w, ">" | ">&" | ">>" | ">|") || is_digit_suffix_redirect(w, b'>') {
+            skip_redirect_target = true;
+            continue;
+        }
+        // Standalone input redirect operators: symbolic or digit-prefixed
+        if matches!(*w, "<" | "<&" | "<>") || is_digit_suffix_redirect(w, b'<') {
+            skip_redirect_target = true;
+            continue;
+        }
+        // Self-contained fd-merge redirects — no separate target
+        if matches!(*w, "2>&1" | "1>&2") {
+            continue;
+        }
+        // Combined redirect tokens: operator merged with target
+        // (e.g. >/dev/null, >>file, </dev/null, <&2, <>file)
+        if w.starts_with('>') || w.starts_with('<') {
+            continue;
+        }
+        // Combined fd+redirect like 2>/dev/null, 1>/tmp/out, 3</dev/null
+        if w.len() > 1 && w.as_bytes()[0].is_ascii_digit() && (w.contains('>') || w.contains('<')) {
+            continue;
+        }
+        // Bash &> standalone redirect (space-separated target expected)
+        if matches!(*w, "&>" | "&>>") {
+            skip_redirect_target = true;
+            continue;
+        }
+        // Bash &> combined stdout+stderr redirect (e.g. &>/dev/null, &>>file)
+        if w.contains("&>") {
+            continue;
+        }
+
+        args.push(w.to_string());
     }
+
+    args
+}
+
+/// True when `w` is a standalone redirect token consisting of one or more
+/// digits followed by a single `>` or `<` operator character, with no other
+/// content (e.g. `2>`, `10>`, `3<`).  Combined forms like `2>/dev/null` or
+/// `2>&1` do not match because they have non-digit characters before the
+/// trailing operator byte (or the trailing byte isn't a bare operator).
+fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
+    let bytes = w.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_digit() || bytes[bytes.len() - 1] != op {
+        return false;
+    }
+    // All bytes except the last must be decimal digits
+    bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
 /// True when every explicit path argument is an absolute path under allowed temp.
@@ -1742,6 +1850,103 @@ mod tests {
             Case {
                 command: "rm /tmp/scratch.txt",
                 allowed: false,
+            },
+            // ── Multiple path arguments (mahbot-396 security bypass) ──
+            // Multiple path args under temp → should be allowed
+            Case {
+                command: "tee /tmp/scratch.log /tmp/out.txt",
+                allowed: true,
+            },
+            Case {
+                command: "touch /tmp/a.txt /tmp/b.txt",
+                allowed: true,
+            },
+            // Mixed: one temp, one non-temp → should be rejected
+            Case {
+                command: "tee /tmp/scratch.log /etc/passwd",
+                allowed: false,
+            },
+            Case {
+                command: "touch /tmp/scratch.txt /etc/cron.d/evil",
+                allowed: false,
+            },
+            Case {
+                command: "mkdir -p /tmp/dir /etc/cron.d",
+                allowed: false,
+            },
+            // Mixed with redirects → only path args checked
+            Case {
+                command: "tee /tmp/scratch.log /etc/passwd > /dev/null",
+                allowed: false,
+            },
+            Case {
+                command: "tee /tmp/scratch.log /tmp/out.txt > /dev/null",
+                allowed: true,
+            },
+            // Combined redirect tokens (2>/dev/null style)
+            Case {
+                command: "tee /tmp/scratch.log /etc/passwd 2>/dev/null",
+                allowed: false,
+            },
+            Case {
+                command: "tee /tmp/scratch.log /tmp/out.txt 2>&1",
+                allowed: true,
+            },
+            // Heredoc with scratch mutator → heredoc body not treated as path
+            Case {
+                command: "tee /tmp/scratch.log << 'EOF'\nbody\nEOF",
+                allowed: true,
+            },
+            Case {
+                command: "tee /tmp/scratch.log /tmp/out.txt << 'EOF'\nbody\nEOF",
+                allowed: true,
+            },
+            // 1> standalone redirect (separate target) → not a path arg
+            Case {
+                command: "tee /tmp/scratch.log 1>/dev/null",
+                allowed: true,
+            },
+            // Bash &> combined redirect → not collected as path arg
+            Case {
+                command: "tee /tmp/scratch.log &>/dev/null",
+                allowed: true,
+            },
+            Case {
+                command: "tee /tmp/scratch.log &>>/dev/null",
+                allowed: true,
+            },
+            // 1> with space-separated target → redirect target not collected as path
+            Case {
+                command: "tee /tmp/scratch.log 1> /dev/null",
+                allowed: true,
+            },
+            // Generic digit-prefixed redirects ({digit}> and {digit}<)
+            Case {
+                command: "tee /tmp/scratch.log 3> /dev/null",
+                allowed: true,
+            },
+            Case {
+                command: "tee /tmp/scratch.log 3< /dev/null",
+                allowed: true,
+            },
+            // Digit-prefixed heredoc (e.g. 3<<EOF) → body not treated as path
+            Case {
+                command: "tee /tmp/scratch.log 3<< 'EOF'\nbody\nEOF",
+                allowed: true,
+            },
+            // Multi-digit fd redirect with space-separated target (10> /dev/null)
+            Case {
+                command: "tee /tmp/scratch.log 10> /dev/null",
+                allowed: true,
+            },
+            // &> standalone redirect with space before target
+            Case {
+                command: "tee /tmp/scratch.log &> /dev/null",
+                allowed: true,
+            },
+            Case {
+                command: "tee /tmp/scratch.log &>> /dev/null",
+                allowed: true,
             },
         ];
 
