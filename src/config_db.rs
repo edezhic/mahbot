@@ -107,12 +107,18 @@ impl ConfigStore {
 
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
-        self.exec(UPSERT_KV_SQL, turso::params![key, value]).await
+        self.conn
+            .execute(UPSERT_KV_SQL, turso::params![key, value])
+            .await?;
+        Ok(())
     }
 
     /// Delete a key-value pair. Succeeds even if the key does not exist.
     pub async fn delete_kv(&self, key: &str) -> Result<()> {
-        self.exec(DELETE_KV_SQL, turso::params![key]).await
+        self.conn
+            .execute(DELETE_KV_SQL, turso::params![key])
+            .await?;
+        Ok(())
     }
 
     /// Get all key-value pairs.
@@ -224,12 +230,6 @@ impl ConfigStore {
     /// Succeeds even if the key does not exist.
     pub(crate) async fn delete_kv_tx(tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
         tx.execute(DELETE_KV_SQL, turso::params![key]).await?;
-        Ok(())
-    }
-
-    /// Execute a SQL statement and discard the row count.
-    async fn exec(&self, sql: &str, params: impl turso::IntoParams + Send + 'static) -> Result<()> {
-        self.conn.execute(sql, params).await?;
         Ok(())
     }
 
