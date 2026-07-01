@@ -38,7 +38,7 @@ use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::util::panic_message;
 use crate::util::scrub_credentials;
-use crate::{Role, Tool, Workspace};
+use crate::{DiagnosticsCommands, Role, Tool, Workspace};
 
 /// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
 const PARALLEL_AGENT_COUNT: usize = 3;
@@ -1527,6 +1527,70 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
 
 // ── Post-development diagnostics ───────────────────────────────────────
 
+/// Run diagnostics commands sequentially, collecting output and pass/fail status.
+///
+/// Executes each non-`None` command from [`DiagnosticsCommands::commands`] via
+/// [`ShellTool`], appending output (scrubbed of credentials) to an accumulating
+/// comment string. Stops at the first failure (non-zero exit or execution error).
+/// Appends a pass/fail marker before returning. Labels are string literals from
+/// [`DiagnosticsCommands::commands`].
+///
+/// Returns `(comment_text, all_passed)` where `comment_text` includes the
+/// [`DIAGNOSTICS_COMMENT_PREFIX`] header and the appropriate pass/fail marker.
+async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) -> (String, bool) {
+    let mut comment = String::from(DIAGNOSTICS_COMMENT_PREFIX);
+    let mut all_passed = true;
+    let mut failed_at: &str = "";
+
+    for (label, cmd_opt) in diag.commands() {
+        let Some(cmd) = cmd_opt else {
+            continue;
+        };
+
+        let _ = write!(comment, "\n\n{label} ({cmd}):\n");
+
+        match ShellTool::new(ShellMode::Full)
+            .execute(ws, serde_json::json!({"command": cmd}))
+            .await
+        {
+            Ok(output) => {
+                // ShellTool returns Ok(String) for non-zero exits (annotation
+                // appended). Exit 0 produces no annotation, so any occurrence
+                // of "[exit status: " means non-zero exit or signal termination.
+                let failed = output.contains("[exit status: ");
+                let display = if output.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    output
+                };
+                comment.push_str(&scrub_credentials(&display));
+
+                if failed {
+                    all_passed = false;
+                    failed_at = label;
+                    break;
+                }
+            }
+            Err(e) => {
+                // Timeout or process launch failure.
+                comment.push_str(&e.to_string());
+                all_passed = false;
+                failed_at = label;
+                break;
+            }
+        }
+    }
+
+    if all_passed {
+        comment.push_str("\n\n---\n");
+        comment.push_str(DIAGNOSTICS_PASSED_MARKER);
+    } else {
+        let _ = write!(comment, "\n\n---\n{DIAGNOSTICS_FAILED_MARKER} {failed_at}");
+    }
+
+    (comment, all_passed)
+}
+
 /// Run diagnostics commands after the engineer completes development.
 ///
 /// Called by [`PollPhase::DiagnosticsCheck`] via [`spawn_dispatch`].
@@ -1536,10 +1600,10 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
 /// dispatch runs), diagnostics keeps the ticket in InDiagnostics while
 /// executing, so a separate atomic guard is needed to close the TOCTOU window.
 /// Loads discovered diagnostics commands for the workspace and runs them
-/// sequentially. Stops at the first failure. After execution, transitions
-/// the ticket to either `DiagnosticsDone` (all passed) or `ReadyForDevelopment`
-/// (any failure), unless the circuit breaker trips (see
-/// [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
+/// sequentially via [`run_diagnostics_commands`]. Stops at the first failure.
+/// After execution, transitions the ticket to either `DiagnosticsDone` (all
+/// passed) or `ReadyForDevelopment` (any failure), unless the circuit breaker
+/// trips (see [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
 #[allow(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     match board().claim_diagnostics(&ticket.id).await {
@@ -1618,57 +1682,9 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     // 2. Run commands sequentially in the prescribed order.
-
-    let mut comment = String::from(DIAGNOSTICS_COMMENT_PREFIX);
-    let mut all_passed = true;
-    let mut failed_at: &str = "";
-
-    for (label, cmd_opt) in diag.commands() {
-        let Some(cmd) = cmd_opt else {
-            continue;
-        };
-
-        let _ = write!(comment, "\n\n{label} ({cmd}):\n");
-
-        match ShellTool::new(ShellMode::Full)
-            .execute(&ws, serde_json::json!({"command": cmd}))
-            .await
-        {
-            Ok(output) => {
-                // ShellTool returns Ok(String) for non-zero exits (annotation
-                // appended). Exit 0 produces no annotation, so any occurrence
-                // of "[exit status: " means non-zero exit or signal termination.
-                let failed = output.contains("[exit status: ");
-                let display = if output.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    output
-                };
-                comment.push_str(&scrub_credentials(&display));
-
-                if failed {
-                    all_passed = false;
-                    failed_at = label;
-                    break;
-                }
-            }
-            Err(e) => {
-                // Timeout or process launch failure.
-                comment.push_str(&e.to_string());
-                all_passed = false;
-                failed_at = label;
-                break;
-            }
-        }
-    }
+    let (comment, all_passed) = run_diagnostics_commands(&diag, &ws).await;
 
     // 3. Final outcome.
-    if all_passed {
-        comment.push_str("\n\n---\n");
-        comment.push_str(DIAGNOSTICS_PASSED_MARKER);
-    } else {
-        let _ = write!(comment, "\n\n---\n{DIAGNOSTICS_FAILED_MARKER} {failed_at}");
-    }
     let _ = board()
         .add_comment(&ticket.id, DIAGNOSTICS_ROLE, &comment)
         .await;
