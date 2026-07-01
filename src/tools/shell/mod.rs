@@ -62,7 +62,7 @@ pub(super) const NON_DELEGATING_PREFIXES: &[&str] =
 /// Boolean flags like `--bare` MUST NOT be listed here — `find_first_non_flag_index`
 /// skips 2 words (flag + value) for each entry, causing boolean flags to consume
 /// the subcommand as their "value" and bypass read-only validation entirely.
-pub(super) const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
+const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
 
 /// Default maximum shell command execution time before kill.
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
@@ -921,7 +921,7 @@ pub(super) fn canonical_command(segment: &str) -> String {
 ///
 /// The word must start with `[A-Za-z_]`, contain at least one `=`, and the
 /// name portion (before `=`) must consist only of `[A-Za-z0-9_]`.
-pub(super) fn is_env_assignment(word: &str) -> bool {
+fn is_env_assignment(word: &str) -> bool {
     if let Some(eq_pos) = word.find('=')
         && eq_pos > 0
     {
