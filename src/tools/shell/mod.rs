@@ -595,17 +595,8 @@ Use this tool only for inspection: reading files, listing directories, running c
                 // the full output even when filtered/truncated to fit the context.
                 let raw_hint = save_raw_output_if_large(&stdout, &stderr, command_str);
 
-                // Strip ANSI escape codes before truncation so that
-                // truncation boundaries cannot split multi-character
-                // escape sequences into garbled fragments.
-                let stdout_str = String::from_utf8_lossy(&stdout);
-                let cleaned_stdout = strip_ansi_escapes(&stdout_str);
-                let stdout =
-                    crate::util::truncate_sandwich(&cleaned_stdout, MAX_OUTPUT_BYTES, "output");
-                let stderr_str = String::from_utf8_lossy(&stderr);
-                let cleaned_stderr = strip_ansi_escapes(&stderr_str);
-                let stderr =
-                    crate::util::truncate_sandwich(&cleaned_stderr, MAX_OUTPUT_BYTES, "stderr");
+                let stdout = clean_truncate(&stdout, "output");
+                let stderr = clean_truncate(&stderr, "stderr");
 
                 let (exit_code, exit_note) = match status.code() {
                     Some(c) => (c, format!("[exit status: {c}]")),
@@ -1603,6 +1594,17 @@ fn strip_ansi_escapes(input: &str) -> String {
         .unwrap()
     });
     RE.replace_all(input, "").to_string()
+}
+
+/// Strip ANSI escape sequences first, then truncate to [`MAX_OUTPUT_BYTES`].
+///
+/// Applying [`truncate_sandwich`] after ANSI stripping guarantees that
+/// truncation boundaries cannot split multi-character escape sequences
+/// into garbled fragments.
+fn clean_truncate(data: &[u8], label: &'static str) -> String {
+    let s = String::from_utf8_lossy(data);
+    let cleaned = strip_ansi_escapes(&s);
+    crate::util::truncate_sandwich(&cleaned, MAX_OUTPUT_BYTES, label)
 }
 
 /// Try to parse as JSON/structured data and return a schema preview.
