@@ -95,8 +95,9 @@ pub(crate) async fn resolve_write_target(
         .context("Failed to resolve file path")?;
 
     // Re-extract canonicalized parent for the post-canonicalization security check.
-    // The helper guarantees the result has a parent component.
-    let resolved_parent = resolved_target.parent().unwrap();
+    let Some(resolved_parent) = resolved_target.parent() else {
+        anyhow::bail!("Invalid canonicalized path: missing parent directory");
+    };
 
     if !is_path_safe_for_workspace(&resolved_parent.to_string_lossy(), workspace_root) {
         anyhow::bail!(
