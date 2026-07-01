@@ -2348,7 +2348,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn extract_reply_context() {
+    fn test_extract_reply_context() {
         // text message reply
         let msg = serde_json::json!({
             "reply_to_message": {
@@ -2421,7 +2421,7 @@ mod tests {
     // ── IncomingAttachment / parse_attachment_metadata tests ─────────
 
     #[test]
-    fn parse_attachment_metadata() {
+    fn test_parse_attachment_metadata() {
         // Document with all fields
         let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
             "document": {"file_id": "BQ", "file_name": "report.pdf", "file_size": 12345, "mime_type": "application/pdf"}
