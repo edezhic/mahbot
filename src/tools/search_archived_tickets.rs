@@ -52,7 +52,7 @@ impl Tool for SearchArchivedTicketsTool {
         let fts_results = fts_results?;
         let vector_results = vector_results?;
 
-        let merged = crate::vector::hybrid_merge(&vector_results, &fts_results);
+        let merged = crate::vector::hybrid_merge(vector_results, fts_results);
 
         let top_ids: Vec<String> = merged.into_iter().take(10).map(|r| r.id).collect();
 

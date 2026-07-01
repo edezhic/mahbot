@@ -81,12 +81,11 @@ pub struct ScoredResult {
 /// Encapsulates the rank-to-reciprocal-score mapping so it can be applied
 /// independently to each search source before summing across sources.
 #[allow(clippy::cast_precision_loss)]
-fn accumulate_rrf(scores: &mut HashMap<String, f32>, results: &[(String, f32)]) {
-    let mut sorted: Vec<_> = results.to_vec();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    for (rank, (id, _)) in sorted.iter().enumerate() {
+fn accumulate_rrf(scores: &mut HashMap<String, f32>, mut results: Vec<(String, f32)>) {
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (rank, (id, _)) in results.into_iter().enumerate() {
         let rrf = 1.0 / (RRF_K + (rank + 1) as f32);
-        *scores.entry(id.clone()).or_insert(0.0) += rrf;
+        *scores.entry(id).or_insert(0.0) += rrf;
     }
 }
 
@@ -101,9 +100,9 @@ fn accumulate_rrf(scores: &mut HashMap<String, f32>, results: &[(String, f32)]) 
 /// Results are sorted by final score descending, with deterministic tiebreaking
 /// by ID (lexicographic order).
 #[must_use]
-pub fn hybrid_merge(
-    vector_results: &[(String, f32)],  // (id, cosine_similarity)
-    keyword_results: &[(String, f32)], // (id, bm25_score)
+pub(crate) fn hybrid_merge(
+    vector_results: Vec<(String, f32)>,  // (id, cosine_similarity)
+    keyword_results: Vec<(String, f32)>, // (id, bm25_score)
 ) -> Vec<ScoredResult> {
     let mut rrf_scores: HashMap<String, f32> = HashMap::new();
 
@@ -220,8 +219,8 @@ mod tests {
             },
         ];
 
-        for case in &cases {
-            let merged = hybrid_merge(&case.vector, &case.keyword);
+        for case in cases {
+            let merged = hybrid_merge(case.vector, case.keyword);
             assert_eq!(
                 merged.len(),
                 case.expected_len,
