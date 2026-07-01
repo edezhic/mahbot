@@ -352,10 +352,9 @@ async fn guard_not_pipeline_blocking(
         && current_phase.is_pipeline_blocking()
     {
         anyhow::bail!(
-            "Ticket {ticket_id} is currently in phase '{status}' — \
+            "Ticket {ticket_id} is currently in phase '{current_phase}' — \
                  in-flight tickets cannot be modified through automated tools. \
                  Use the GUI to cancel or manage this ticket manually.",
-            status = current_phase.as_ref(),
         );
     }
     Ok(())

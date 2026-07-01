@@ -365,8 +365,6 @@ fn warn_transition_failed(
         ticket = %ticket.id,
         error = %error,
         "{context_label} {verb} but transition to {target} failed — ticket stuck in {source}",
-        target = target.as_ref(),
-        source = source.as_ref(),
     );
 }
 
