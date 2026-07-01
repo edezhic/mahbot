@@ -58,7 +58,7 @@ pub struct ChatHistoryInsert {
 pub struct ChatHistoryEntry {
     pub id: i64,
     pub message_id: String,
-    /// The user's canonical name for user messages; agent role name for agent messages.
+    /// The user's canonical name for both user and agent messages. Use `agent_role` to identify which role produced an agent message.
     pub user_name: String,
     pub content: String,
     pub direction: ChatDirection,
