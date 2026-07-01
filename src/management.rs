@@ -1164,21 +1164,6 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
     }
 }
 
-/// Begin a transaction, run `work`, and commit on success.
-///
-/// `action_label` accepts any `&str` including dynamic temporaries from
-/// `format!` — it is intentionally not `&'static str` to allow callers to
-/// include dynamic context (e.g. phase transitions, short hashes) in log
-/// messages. Use a verb phrase for natural reading (e.g. "record sanitation
-/// failure", "write verdict comments") rather than a bare noun.
-async fn with_tx(
-    ticket_id: &str,
-    action_label: &str,
-    work: impl AsyncFnOnce(&crate::turso::TxGuard<'_>) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    crate::turso::with_tx(&board().conn, ticket_id, action_label, work).await
-}
-
 /// After a successful `git commit`, persist the metadata and transition the
 /// ticket to Done atomically within a single DB transaction.
 ///
@@ -1206,7 +1191,8 @@ async fn commit_and_transition_ticket_from(
     // Done ticket (which crash-recovery cannot rescue).
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
-    if with_tx(
+    if crate::turso::with_tx(
+        &board().conn,
         &ticket.id,
         &format!("finalize Done transition from {phase_label} ({short_hash})"),
         async |tx| {
@@ -1336,11 +1322,16 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 /// and clear assigned_to so the ticket can be re-dispatched.
 async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
     let reason_str = format!("{SANITATION_FAILED_PREFIX} — {reason}");
-    let _ = with_tx(ticket_id, "record sanitation failure", async |tx| {
-        BoardStore::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, &reason_str).await?;
-        BoardStore::set_assigned_to_tx(tx, ticket_id, None).await?;
-        Ok(())
-    })
+    let _ = crate::turso::with_tx(
+        &board().conn,
+        ticket_id,
+        "record sanitation failure",
+        async |tx| {
+            BoardStore::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, &reason_str).await?;
+            BoardStore::set_assigned_to_tx(tx, ticket_id, None).await?;
+            Ok(())
+        },
+    )
     .await;
 }
 
@@ -1875,15 +1866,20 @@ async fn record_verdict_comments(
     role_str: &str,
     filter: VerdictFilter,
 ) {
-    let _ = with_tx(ticket_id, "write verdict comments", async |tx| {
-        for (i, r) in results.iter().enumerate() {
-            let role_label = format!("{role_str}_{}", i + 1);
-            if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-                BoardStore::add_comment_tx(tx, ticket_id, &role_label, &comment).await?;
+    let _ = crate::turso::with_tx(
+        &board().conn,
+        ticket_id,
+        "write verdict comments",
+        async |tx| {
+            for (i, r) in results.iter().enumerate() {
+                let role_label = format!("{role_str}_{}", i + 1);
+                if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
+                    BoardStore::add_comment_tx(tx, ticket_id, &role_label, &comment).await?;
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .await;
 }
 

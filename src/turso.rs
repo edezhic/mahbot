@@ -691,8 +691,14 @@ pub(crate) async fn open_store(
 
 /// Execute `work` within a transaction on `conn`, committing on success.
 ///
-/// Uses `ticket_id` (or any identifying label) and `action_label` (a verb
-/// phrase like "add comment") for structured warn-level logging on failure.
+/// `action_label` accepts any `&str` including dynamic temporaries from
+/// `format!` — it is intentionally not `&'static str` to allow callers to
+/// include dynamic context (e.g. phase transitions, short hashes) in log
+/// messages. Use a verb phrase for natural reading (e.g. "add comment",
+/// "record sanitation failure") rather than a bare noun.
+///
+/// Uses `ticket_id` (or any identifying label) and `action_label` for
+/// structured warn-level logging on failure.
 ///
 /// This is the canonical implementation; callers in `board.rs` and
 /// `management.rs` delegate to it rather than duplicating the logic.
