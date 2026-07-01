@@ -35,7 +35,7 @@ impl CreateTicketTool {
         title: &str,
         description: &str,
         prerequisites: &[String],
-        embedding_bytes: Option<&Vec<u8>>,
+        embedding_bytes: Option<Vec<u8>>,
     ) -> TicketParams {
         TicketParams {
             title: title.to_string(),
@@ -44,7 +44,7 @@ impl CreateTicketTool {
             phase: TicketPhase::Backlog,
             prerequisites: prerequisites.to_vec(),
             reporter: self.reporter.clone(),
-            embedding: embedding_bytes.cloned(),
+            embedding: embedding_bytes,
         }
     }
 }
@@ -113,13 +113,7 @@ impl Tool for CreateTicketTool {
             format!(" with prerequisites: {}", prerequisites.join(", "))
         };
 
-        let params = self.build_params(
-            ws,
-            title,
-            description,
-            &prerequisites,
-            embedding_bytes.as_ref(),
-        );
+        let params = self.build_params(ws, title, description, &prerequisites, embedding_bytes);
         if let Some(supersede_id) = supersede_id {
             guard_not_pipeline_blocking(store, &supersede_id).await?;
 
