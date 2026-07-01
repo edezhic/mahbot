@@ -2403,8 +2403,13 @@ mod tests {
     async fn guard_phase_mismatch_rejected() {
         init_test_stores().await;
 
-        let ws = test_ws_named("/tmp/test", "test");
-        let ticket_id = make_ticket(board(), ws, "Test", TicketPhase::Backlog).await;
+        let ticket_id = make_ticket(
+            board(),
+            test_ws_named("/tmp/test", "test"),
+            "Test",
+            TicketPhase::Backlog,
+        )
+        .await;
 
         // Transition to InDevelopment so we have a known phase
         board()
@@ -2528,8 +2533,13 @@ mod tests {
     async fn record_verdict_comments_counts() {
         init_test_stores().await;
 
-        let ws = test_ws_named("/tmp/test", "test");
-        let ticket_id = make_ticket(board(), ws, "Test", TicketPhase::Backlog).await;
+        let ticket_id = make_ticket(
+            board(),
+            test_ws_named("/tmp/test", "test"),
+            "Test",
+            TicketPhase::Backlog,
+        )
+        .await;
 
         // ── FailingOnly with all-passing verdicts ──
         // Should produce 0 comments (nothing to write).
@@ -3040,8 +3050,13 @@ mod tests {
         ];
 
         for case in &cases {
-            let ws = test_ws_named("/tmp/test", case.ws_suffix);
-            let ticket_id = make_ticket(board(), ws, case.title, case.phase).await;
+            let ticket_id = make_ticket(
+                board(),
+                test_ws_named("/tmp/test", case.ws_suffix),
+                case.title,
+                case.phase,
+            )
+            .await;
 
             let ticket = expect_ticket(board(), &ticket_id).await;
 
@@ -3099,8 +3114,13 @@ mod tests {
         ];
 
         for case in &cases {
-            let ws = test_ws_named("/tmp/test", case.ws_suffix);
-            let ticket_id = make_ticket(board(), ws, case.title, TicketPhase::InReview).await;
+            let ticket_id = make_ticket(
+                board(),
+                test_ws_named("/tmp/test", case.ws_suffix),
+                case.title,
+                TicketPhase::InReview,
+            )
+            .await;
 
             for i in 0..case.comment_count {
                 board()
@@ -3259,8 +3279,13 @@ mod tests {
         ];
 
         for case in &cases {
-            let ws = test_ws_named("/tmp/test", case.ws_suffix);
-            let ticket_id = make_ticket(board(), ws, case.title, TicketPhase::Analysis).await;
+            let ticket_id = make_ticket(
+                board(),
+                test_ws_named("/tmp/test", case.ws_suffix),
+                case.title,
+                TicketPhase::Analysis,
+            )
+            .await;
 
             let ticket = expect_ticket(board(), &ticket_id).await;
 
