@@ -6,9 +6,6 @@ use async_trait::async_trait;
 use futures_util::stream;
 use std::time::Duration;
 
-// reqwest is used for typed downcast in classify_err — not for direct HTTP calls.
-use reqwest;
-
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
 // non-retryable (permanent client errors). This distinction drives whether
@@ -136,13 +133,11 @@ fn is_non_retryable_4xx(code: u16) -> bool {
 ///    non-retryable body-text hints, then 4xx codes other than
 ///    408 and 429 as [`NonRetryable`](ErrorClass::NonRetryable), else
 ///    [`classify_fallback`]
-/// 2. **Transport typed path** (downcast to [`reqwest::Error`] succeeds): dispatch
-///    using typed `is_timeout()`, `is_connect()`, `is_builder()`, `is_redirect()`,
-///    `is_status()` via [`classify_transport_err`] — avoids string-matching transport
-///    error messages
-/// 3. **String-fallback path** (no structured wrapper): extract HTTP status from
+/// 2. **String-fallback path** (no structured wrapper): extract HTTP status from
 ///    string via [`crate::util::http::extract_http_status`], then dispatch via
-///    [`classify_by_status_code`]
+///    [`classify_by_status_code`] — transport errors (timeouts, connection
+///    failures, etc.) are handled by [`classify_fallback`] via string pattern
+///    matching, producing the same [`ErrorClass`] as the removed typed reqwest path
 fn classify_err(err: &anyhow::Error) -> ErrorClass {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
@@ -152,42 +147,8 @@ fn classify_err(err: &anyhow::Error) -> ErrorClass {
         return classify_by_status_code(Some(http_err.status), &lower);
     }
 
-    // ── Transport error typed path: extract from reqwest::Error ──
-    if let Some(transport_err) = err.downcast_ref::<reqwest::Error>() {
-        return classify_transport_err(transport_err, &lower);
-    }
-
-    // ── Fallback: string-parsing path (for non-structured errors) ──
+    // ── Fallback: string-parsing path (for all other errors, including transport) ──
     classify_by_status_code(extract_http_status(&msg), &lower)
-}
-
-/// Classify a transport error using typed `reqwest::Error` properties.
-///
-/// Uses `is_timeout()`, `is_connect()`, `is_builder()`, `is_redirect()`,
-/// and `is_status()` with `.status()` for precise classification, avoiding
-/// the string-matching fallback.
-///
-/// ## Classification Rules
-/// - **Timeout / connect**: `Retryable` — transient network conditions
-/// - **Builder / redirect**: `NonRetryable` — misconfiguration, won't self-heal
-/// - **Status error** (e.g. 4xx from `error_for_status`): delegate to
-///   [`classify_by_status_code`] using the actual status code
-/// - **Body / stream errors**: `Retryable` — transient transport issues
-fn classify_transport_err(transport_err: &reqwest::Error, lower: &str) -> ErrorClass {
-    if transport_err.is_timeout() || transport_err.is_connect() {
-        return ErrorClass::Retryable;
-    }
-    if transport_err.is_builder() || transport_err.is_redirect() {
-        return ErrorClass::NonRetryable;
-    }
-    if transport_err.is_status()
-        && let Some(status) = transport_err.status()
-    {
-        let code = status.as_u16();
-        return classify_by_status_code(Some(code), lower);
-    }
-    // Body read errors, stream errors, default → retryable
-    ErrorClass::Retryable
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error.
@@ -295,8 +256,12 @@ impl Provider for ReliableProvider {
                     let can_retry = class == ErrorClass::Retryable;
 
                     if can_retry && attempt < self.max_retries {
-                        // Check for global shutdown before sleeping
-                        if crate::shutdown::shutdown_token().is_cancelled() {
+                        let wait = Self::compute_backoff(backoff_ms, &e);
+
+                        // sleep_or_shutdown returns false immediately if the
+                        // global shutdown token is already cancelled, or when
+                        // it fires during sleep — no separate pre-check needed.
+                        if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(wait)).await {
                             tracing::info!(
                                 provider = self.name,
                                 attempt = attempt + 1,
@@ -312,10 +277,6 @@ impl Provider for ReliableProvider {
                             error = %error_detail,
                             "Provider call failed, retrying"
                         );
-                        let wait = Self::compute_backoff(backoff_ms, &e);
-                        if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(wait)).await {
-                            break;
-                        }
                         backoff_ms = backoff_ms.saturating_mul(2);
                     } else {
                         let log_msg = match class {
