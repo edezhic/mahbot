@@ -90,10 +90,9 @@ impl OpenAiCompatibleProvider {
                 builder = builder.default_headers(headers);
             }
 
-            builder.build().unwrap_or_else(|error| {
-                tracing::warn!("Failed to build custom client: {error}");
-                Client::new()
-            })
+            builder
+                .build()
+                .expect("Failed to build HTTP client — check TLS/network configuration")
         })
     }
 
@@ -435,21 +434,10 @@ pub(crate) fn to_message_content(
 }
 
 impl OpenAiCompatibleProvider {
-    /// Check if a tool name is valid for OpenAI-compatible APIs.
-    /// Must match `^[a-zA-Z0-9_-]{1,64}$`.
-    fn is_valid_tool_name(name: &str) -> bool {
-        !name.is_empty()
-            && name.len() <= 64
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    }
-
     fn convert_tool_specs(tools: Option<&[ToolSpec]>) -> Option<Vec<serde_json::Value>> {
         let items = tools?;
         let converted: Vec<_> = items
             .iter()
-            .filter(|t| Self::is_valid_tool_name(&t.name))
             .map(|tool| {
                 let params = tool.parameters.clone();
                 serde_json::json!({
