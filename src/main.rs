@@ -36,7 +36,7 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// if `get_workspace` fails or returns `None`.
 async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
     match mahbot::users::get_workspace(&msg.user_name).await {
-        Ok(Some(ws)) => ws,
+        Ok(Some(ws)) => return ws,
         Ok(None) => {
             // The user's selected_workspace points to a workspace that no
             // longer exists in workspaces.db (deleted or renamed).  Construct
@@ -47,8 +47,6 @@ async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
                 "workspace resolution: selected_workspace points to non-existent workspace; \
                  falling back to personal workspace",
             );
-            let path = mahbot::users::personal_workspace_path(&msg.user_name);
-            mahbot::users::personal_workspace_struct(&msg.user_name, &path)
         }
         Err(e) => {
             // Database error during workspace lookup.  Fall back to a
@@ -59,10 +57,10 @@ async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
                 error = %e,
                 "workspace resolution: database error; falling back to personal workspace",
             );
-            let path = mahbot::users::personal_workspace_path(&msg.user_name);
-            mahbot::users::personal_workspace_struct(&msg.user_name, &path)
         }
     }
+    let path = mahbot::users::personal_workspace_path(&msg.user_name);
+    mahbot::users::personal_workspace_struct(&msg.user_name, &path)
 }
 
 /// Enrich a message with multimodal transcription and link summarization.
