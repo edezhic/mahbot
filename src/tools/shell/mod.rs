@@ -1436,8 +1436,7 @@ fn split_head_tail(
     }
 }
 
-/// Apply line truncation in a single pass: head/tail sandwich (byte-gated) with a
-/// defensive `max_lines` cap, `max_lines`-only absolute cap, or passthrough.
+/// Apply line truncation: head/tail sandwich (byte-gated), `max_lines`-only absolute cap, or passthrough.
 ///
 /// Returns `(truncated_output, pre_truncation_copy)` where the copy captures the
 /// full output before truncation for potential spilling by `finish_shell_output`.
@@ -1467,10 +1466,10 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
     };
 
     // Single-pass truncation:
-    // 1. Head/tail sandwich (byte-gated) with a defensive max cap, OR
+    // 1. Head/tail sandwich (byte-gated), OR
     // 2. max_lines-only absolute cap, OR
     // 3. passthrough.
-    let mut result = if should_sandwich {
+    let result = if should_sandwich {
         let (head_lines, omitted, tail_lines) = split_head_tail(output, head, tail);
         let mut v = head_lines;
         v.push(format!("... ({omitted} lines omitted)"));
@@ -1482,15 +1481,13 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
         output.to_string()
     };
 
-    // Defensive max cap on the sandwich path: ensures the sandwich +
-    // omission marker doesn't exceed max_lines even if the
-    // head+tail+1 <= max invariant is violated.
-    if should_sandwich
-        && let Some(max) = max
-        && result.lines().count() > max
-    {
-        result = cap_at_max_lines(&result, max);
-    }
+    // Invariant: head+tail+1 <= max_lines — guaranteed by profile configs.
+    debug_assert!(
+        !should_sandwich || max.is_none_or(|m| result.lines().count() <= m),
+        "sandwich result ({}) exceeds max_lines ({:?}) — profile invariant violated",
+        result.lines().count(),
+        max,
+    );
 
     (result, pre_truncation)
 }
@@ -3345,14 +3342,14 @@ mod tests {
 
         let (result, pre) = apply_line_truncation(&output, &p);
         assert!(pre.is_some(), "should capture pre-truncation");
-        // head+tail+1 = 5 <= max=100, so defensive cap is no-op
+        // head+tail+1 = 5 <= max=100, so sandwich format is the final output
         assert!(
             result.contains("... (96 lines omitted)"),
             "should have sandwich omission marker"
         );
         assert!(
             !result.contains("lines truncated"),
-            "defensive cap should not fire when head+tail+1 <= max"
+            "sandwich should not be additionally truncated when head+tail+1 <= max"
         );
     }
 
