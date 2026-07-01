@@ -1841,8 +1841,8 @@ mod tests {
         TelegramChannel::new("token".into())
     }
 
-    #[tokio::test]
-    async fn telegram_api_url() {
+    #[test]
+    fn telegram_api_url() {
         let ch = TelegramChannel::new("123:ABC".into());
         assert_eq!(
             ch.api_url("getMe"),
@@ -2013,8 +2013,8 @@ mod tests {
         assert_eq!(msg.content, "hello");
     }
 
-    #[tokio::test]
-    async fn parse_attachment_markers_tests() {
+    #[test]
+    fn parse_attachment_markers_tests() {
         let (cleaned, att) = parse_attachment_markers(
             "Here are files [IMAGE:/tmp/a.png] and [AUDIO:/tmp/voice.ogg]",
         );
@@ -2034,8 +2034,8 @@ mod tests {
         assert_eq!(att[1].kind, TelegramAttachmentKind::Video);
     }
 
-    #[tokio::test]
-    async fn parse_path_only_attachment_tests() {
+    #[test]
+    fn parse_path_only_attachment_tests() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("snap.png");
         std::fs::write(&p, b"fake-png").unwrap();
@@ -2420,8 +2420,8 @@ mod tests {
 
     // ── IncomingAttachment / parse_attachment_metadata tests ─────────
 
-    #[tokio::test]
-    async fn parse_attachment_metadata() {
+    #[test]
+    fn parse_attachment_metadata() {
         // Document with all fields
         let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
             "document": {"file_id": "BQ", "file_name": "report.pdf", "file_size": 12345, "mime_type": "application/pdf"}
@@ -2496,8 +2496,8 @@ mod tests {
 
     // ── Attachment content format tests ──────────────────────────────
 
-    #[tokio::test]
-    async fn attachment_content_format_rules() {
+    #[test]
+    fn attachment_content_format_rules() {
         // photo → [IMAGE:]
         let c = format_attachment_content(
             IncomingAttachmentKind::Photo,
@@ -2578,8 +2578,8 @@ mod tests {
         assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]");
     }
 
-    #[tokio::test]
-    async fn attachment_multimodal_and_helpers() {
+    #[test]
+    fn attachment_multimodal_and_helpers() {
         // is_image_extension
         for p in [
             "photo.png",
