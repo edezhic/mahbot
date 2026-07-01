@@ -280,12 +280,15 @@ enum NotifyPolicy {
 /// `source` is the phase the ticket transitioned *from* (used for the buffer
 /// entry).
 ///
+/// Parameters follow the `(source, target)` convention shared with
+/// [`transition_ticket`], [`transition_ticket_to_done`], and others.
+///
 /// The `log_label` string is forwarded to [`resolve_ticket_workspace`] to
 /// distinguish callers in log messages.
 async fn dispatch_notification(
     ticket: &Ticket,
-    target: TicketPhase,
     source: TicketPhase,
+    target: TicketPhase,
     notify: NotifyPolicy,
     log_label: &'static str,
 ) {
@@ -329,7 +332,7 @@ async fn transition_ticket(
         .await
     {
         Ok(()) => {
-            dispatch_notification(ticket, target, source, notify, "cannot buffer transition").await;
+            dispatch_notification(ticket, source, target, notify, "cannot buffer transition").await;
 
             Ok(())
         }
@@ -1214,8 +1217,8 @@ async fn commit_and_transition_ticket_from(
         let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
         dispatch_notification(
             ticket,
-            TicketPhase::Done,
             source,
+            TicketPhase::Done,
             notify_policy,
             "cannot buffer Done transition",
         )
