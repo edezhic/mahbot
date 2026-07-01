@@ -651,7 +651,8 @@ pub async fn run_git_show(
 ///
 /// The subprocess environment is cleared and re-populated with only safe
 /// environment variables (see [`apply_safe_env`]) to prevent credential
-/// leakage (CWE-200). This is the only entry point for production git
+/// leakage (CWE-200). `LC_ALL=C` is set for consistent locale behavior
+/// across all git invocations. This is the only entry point for production git
 /// subprocess creation in this module — all callers must use this helper.
 ///
 /// Callers should add further configuration (args, current_dir, stdio, etc.)
@@ -659,6 +660,7 @@ pub async fn run_git_show(
 fn git_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
     apply_safe_env(&mut cmd);
+    cmd.env("LC_ALL", "C");
     cmd
 }
 
@@ -683,7 +685,6 @@ pub(crate) async fn run_git_raw(
 ) -> Result<std::process::Output, String> {
     let mut cmd = git_command();
     cmd.args(args).current_dir(repo_path);
-    cmd.env("LC_ALL", "C");
     cmd.output()
         .await
         .map_err(|e| format!("Failed to run git: {e}"))
@@ -714,7 +715,6 @@ pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, 
 ///
 /// **Environment sanitization**: Same as [`run_git_raw`] — the subprocess
 /// environment is cleared and re-populated with only a safe set of variables.
-/// `LC_ALL=C` is set for consistent locale behavior.
 pub(crate) async fn run_git_with_stdin(
     repo_path: &Path,
     args: &[&str],
@@ -730,7 +730,6 @@ pub(crate) async fn run_git_with_stdin(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.env("LC_ALL", "C");
 
     let mut child = cmd
         .spawn()
