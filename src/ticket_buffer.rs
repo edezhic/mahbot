@@ -90,9 +90,6 @@ pub fn drain(workspace_name: &str) -> String {
     let Some(entries) = map.remove(workspace_name) else {
         return String::new();
     };
-    if entries.is_empty() {
-        return String::new();
-    }
     let mut out = String::from("Ticket updates:\n");
     for entry in entries {
         let _ = writeln!(
