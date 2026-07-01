@@ -115,7 +115,7 @@ impl ToolFailuresState {
 
     /// Request a refresh from the stats store.
     ///
-    /// Delegates to [`AsyncLoadState::start_loading`].
+    /// Delegates to `AsyncLoadState::start_loading`.
     pub fn refresh(&mut self) -> Task<ToolFailuresMessage> {
         self.load_state.start_loading();
         let query = self.build_query();

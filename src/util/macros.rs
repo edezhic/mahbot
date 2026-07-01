@@ -1,6 +1,6 @@
 //! Declarative macros for column-index constant generation.
 //!
-//! The [`columns!`] macro eliminates the brittle hand-maintained coupling
+//! The [`crate::columns!`] macro eliminates the brittle hand-maintained coupling
 //! between a `*_COLUMNS` SQL column-string and its `COL_*` positional-index
 //! constants. Instead of 3–4 separate locations to update per column set,
 //! a single `columns!` invocation serves as the single source of truth.
@@ -107,7 +107,7 @@ macro_rules! columns {
 // ---------------------------------------------------------------------------
 
 /// Generate a DB-backed store struct, its `open()` constructor, and a global
-/// singleton (via [`global_store!`]).
+/// singleton (via [`crate::global_store!`]).
 ///
 /// Eliminates ~64 lines of boilerplate per store module.
 ///

@@ -75,7 +75,7 @@ pub const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"]
 /// manual open path for `logs`).
 ///
 /// Used by:
-/// - [`checkpoint_all_databases`] — iterates all stores for WAL checkpointing.
+/// - [`crate::checkpoint::checkpoint_all_databases`] — iterates all stores for WAL checkpointing.
 /// - `mahbot debug` — validates `--db` argument values.
 ///
 /// When adding a new store, add its canonical name here to ensure it is
@@ -89,7 +89,7 @@ pub const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"]
 /// [`define_store!`](crate::define_store!) invocation.
 ///
 /// See the test `all_store_names_appear_in_checkpoint` which verifies that this
-/// list and [`checkpoint_all_databases`]'s store array are equal as sets.
+/// list and [`crate::checkpoint::checkpoint_all_databases`]'s store array are equal as sets.
 pub const ALL_STORE_NAMES: &[&str] = &[
     "board",
     "chat_history",

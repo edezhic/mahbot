@@ -311,7 +311,7 @@ pub fn make_untracked_diff_file(path: &str, content: &str) -> DiffFile {
 /// Strip surrounding double-quotes and unescape C-style escapes.
 ///
 /// If the input starts with `"` and ends with `"`, strips the quotes and
-/// calls [`unescape_c_style`] on the inner content. Otherwise returns the
+/// calls `unescape_c_style` on the inner content. Otherwise returns the
 /// input as-is (no unescaping needed — git only C-quotes paths that contain
 /// trigger characters).
 ///
@@ -961,7 +961,7 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> Result<(usize, usize), St
 
 /// Run `git diff --numstat HEAD` and return the total added/removed lines.
 ///
-/// Delegates to [`parse_numstat`].
+/// Delegates to `parse_numstat`.
 pub async fn run_git_diff_stats(repo_path: &Path) -> Result<(i64, i64), String> {
     parse_numstat(repo_path, &["diff", "--numstat", "HEAD"]).await
 }

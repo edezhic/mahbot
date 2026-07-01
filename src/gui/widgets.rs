@@ -125,7 +125,7 @@ pub fn selectable_text<'a>(
 /// Returns a [`Row`] showing only non-zero sides with a `/` separator.
 /// Returns an empty [`Row`] when both `added` and `removed` are zero.
 ///
-/// Callers typically wrap this in a styled [`button`] with an appropriate
+/// Callers typically wrap this in a styled [`button()`] with an appropriate
 /// action message.
 pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> Row<'a, Message> {
     let mut parts: Vec<Element<'a, Message>> = Vec::new();
@@ -211,7 +211,7 @@ pub struct FileTree {
     /// Scrollable ID for the tree panel (for scroll-into-view).
     pub tree_scroll_id: iced::widget::Id,
     /// Current vertical scroll offset of the tree panel viewport.
-    /// Updated via [`on_scroll`] on the scrollable widget.
+    /// Updated via `on_scroll` on the scrollable widget.
     pub scroll_y: f32,
     /// Visible height of the tree panel viewport.
     /// `None` until the first scroll event fires, at which point it becomes
@@ -446,7 +446,7 @@ pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_FONT_SIZE * 1.3;
 /// * [`ScrollIntoView`](ScrollMode::ScrollIntoView): only scrolls when the
 ///   focused row is not fully visible — for rows above the viewport the
 ///   row is brought to the top, for rows below the viewport the view
-///   advances by one row height. Falls back to [`SnapToTop`] when the
+///   advances by one row height. Falls back to [`ScrollMode::SnapToTop`] when the
 ///   viewport height is unknown ([`FileTree::viewport_h`] is `None`).
 ///
 /// Row height is approximated by [`ESTIMATED_TREE_ROW_HEIGHT`], derived
@@ -454,7 +454,7 @@ pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_FONT_SIZE * 1.3;
 ///
 /// This method updates [`FileTree::scroll_y`] directly so that consecutive
 /// calls during the same frame see an accurate scroll offset even before the
-/// [`on_scroll`](widget::scrollable::on_scroll) callback fires.
+/// `on_scroll` callback fires.
 #[allow(clippy::cast_precision_loss)]
 pub fn scroll_to_tree_focus<Message: 'static>(
     file_tree: &mut FileTree,
@@ -526,11 +526,11 @@ fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Tas
 /// `tree_element` rows. A focus border is applied when `file_tree.tree_focused`
 /// is true.
 ///
-/// `on_scroll` is attached to the inner [`widget::scrollable`] via
-/// [`widget::scrollable::on_scroll`] and fires whenever the viewport changes
+/// `on_scroll` is attached to the inner [`widget::scrollable()`] via
+/// `on_scroll` and fires whenever the viewport changes
 /// (scrollbar drag, mouse wheel, programmatic scroll). The caller should
 /// produce a message that updates [`FileTree::scroll_y`] and
-/// [`FileTree::viewport_h`] from the [`Viewport`] data.
+/// [`FileTree::viewport_h`] from the [`iced::widget::scrollable::Viewport`] data.
 pub fn build_tree_panel<'a, Message: 'a>(
     file_tree: &'a FileTree,
     tree_rows: Vec<Element<'a, Message>>,

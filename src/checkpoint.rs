@@ -47,7 +47,7 @@ use tracing::{error, info, warn};
 ///
 /// Store names are paired inline with their connection accessors as a single
 /// array literal — the single source of truth for which stores get checkpointed.
-/// The test [`all_store_names_appear_in_checkpoint`] verifies that every entry
+/// The test `all_store_names_appear_in_checkpoint` verifies that every entry
 /// in [`crate::turso::ALL_STORE_NAMES`] has a corresponding entry here.
 pub async fn checkpoint_all_databases() {
     let stores = [
@@ -86,8 +86,8 @@ const AUTO_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 /// Spawn a background task that periodically checkpoints all databases.
 ///
-/// Uses [`JoinSet`] tracking and [`catch_unwind`] panic protection,
-/// matching the style of [`spawn_cancellable`] in `main.rs`.
+/// Uses [`tokio::task::JoinSet`] tracking and [`std::panic::catch_unwind`] panic protection,
+/// matching the style of `spawn_cancellable` in `main.rs`.
 ///
 /// This is defense-in-depth: even if the process crashes or a shutdown path
 /// misses the explicit checkpoint, the periodic checkpoint ensures that at

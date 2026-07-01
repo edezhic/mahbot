@@ -1296,9 +1296,9 @@ impl BoardStore {
     /// valid values in production.
     ///
     /// Executes the UPDATE directly (no transaction wrapper needed for a single
-    /// write) via the [`execute_update`](Self::execute_update) helper. For callers that need to
+    /// write) via the `execute_update` helper. For callers that need to
     /// participate in an outer transaction (e.g. `commit_and_transition_ticket_from`
-    /// in management.rs), use [`set_commit_info_tx`](Self::set_commit_info_tx)
+    /// in management.rs), use `set_commit_info_tx`
     /// instead.
     pub async fn set_commit_info(
         &self,
@@ -1448,7 +1448,7 @@ impl BoardStore {
     /// was bounced back and is awaiting rework. Used by the maintainer to avoid
     /// scanning codebases that are actively being changed or about to be changed by rework.
     ///
-    /// Delegates to [`has_active_tickets_internal`] with
+    /// Delegates to `has_active_tickets_internal` with
     /// `require_reservation = true` and no exclusion filter.
     ///
     /// Only used in tests — retained for coverage of the pipeline-blocker query.
@@ -1470,14 +1470,14 @@ impl BoardStore {
     /// Check if the workspace has any active tickets other than the excluded one.
     ///
     /// "Active" means a ticket whose status is either a pipeline-blocking status
-    /// ([`PIPELINE_BLOCKING_STATUSES`]) or [`TicketPhase::ReadyForDevelopment`]
+    /// (`PIPELINE_BLOCKING_STATUSES`) or [`TicketPhase::ReadyForDevelopment`]
     /// (regardless of `pipeline_reservation` — unstarted backlog tickets are
     /// considered active to suppress Done notifications until the pipeline is
     /// fully drained).
     ///
-    /// Delegates to [`has_active_tickets_internal`] with
+    /// Delegates to `has_active_tickets_internal` with
     /// `require_reservation = false`. The test-only
-    /// [`has_pipeline_blocker_for_workspace`] uses `require_reservation = true`,
+    /// `has_pipeline_blocker_for_workspace` uses `require_reservation = true`,
     /// requiring `pipeline_reservation = 1` for `ReadyForDevelopment` tickets.
     ///
     /// Non-active statuses (not matched by the query): `Done`, `Cancelled`,
@@ -1490,7 +1490,7 @@ impl BoardStore {
     /// each other as active and both buffer their Done transitions. In this
     /// scenario all tickets are already in Done in the database — the only
     /// consequence is that Done notifications are delayed until the next
-    /// [`UserMessage`] drains the buffer. This is an accepted trade-off:
+    /// [`crate::manager_queue::JobKind::UserMessage`] drains the buffer. This is an accepted trade-off:
     /// the race window is small and the buffer always drains eventually.
     pub async fn has_active_tickets_excluding(
         &self,
