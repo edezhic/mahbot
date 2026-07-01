@@ -741,7 +741,13 @@ impl TelegramChannel {
 
         // chat_id is intentionally unused here: callback queries don't need
         // to route replies by chat context, only the reply_target is used.
-        let (user_name, _, reply_target) = resolve_authorized_sender(cq, msg).await?;
+        let Some((user_name, _, reply_target)) = resolve_authorized_sender(cq, msg).await else {
+            tracing::debug!(
+                "Telegram: ignoring callback query from unknown user '{}'",
+                extract_sender_user_name(cq)
+            );
+            return None;
+        };
 
         Some(ChannelMessage {
             user_name,
