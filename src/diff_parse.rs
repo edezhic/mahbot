@@ -994,14 +994,14 @@ pub async fn run_git_commit_message(
     Ok(out.trim().to_string())
 }
 
-/// List untracked/new files in the working tree.
+/// List new or untracked files in the working tree.
 ///
 /// Delegates to [`run_git_status`] to run `git status --porcelain`, then passes
 /// the output to [`parse_new_files_from_porcelain`] for parsing.
 ///
 /// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
 /// including `A ` clean staged and `AM` staged+modified).
-pub(crate) async fn list_untracked_files(repo_path: &Path) -> Result<Vec<String>, String> {
+pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> Result<Vec<String>, String> {
     let porcelain = run_git_status(repo_path).await?;
     Ok(parse_new_files_from_porcelain(&porcelain))
 }

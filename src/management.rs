@@ -29,7 +29,7 @@ use futures_util::future::join_all;
 
 use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, Ticket, TicketComment, TicketPhase};
-use crate::diff_parse::list_untracked_files;
+use crate::diff_parse::list_new_or_untracked_files;
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
@@ -1266,8 +1266,8 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
         return;
     }
 
-    // list_untracked_files returns the file list, avoiding a separate git call.
-    let untracked = match list_untracked_files(repo_path).await {
+    // list_new_or_untracked_files returns the file list, avoiding a separate git call.
+    let untracked = match list_new_or_untracked_files(repo_path).await {
         Ok(files) => files,
         Err(e) => {
             warn!(
@@ -1386,7 +1386,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     // and the data from `handle_qa_passed` cannot be shared across that boundary.
     // The shell overhead of one `git status` call per sanitation cycle is negligible
     // relative to the LLM agent cost that follows.
-    let untracked_files = match list_untracked_files(ws.as_path()).await {
+    let untracked_files = match list_new_or_untracked_files(ws.as_path()).await {
         Ok(files) => files.join("\n"),
         Err(e) => {
             warn!(
