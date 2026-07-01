@@ -819,33 +819,28 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> Result<CommitInf
     };
 
     // Capture line stats via --numstat. Try HEAD~1..HEAD first.
-    if let Ok((lines_added, lines_removed)) =
-        parse_numstat(repo_path, &["diff", "--numstat", "HEAD~1..HEAD"]).await
-    {
-        Ok(CommitInfo {
-            hash,
-            lines_added,
-            lines_removed,
-        })
-    } else {
-        // HEAD~1 doesn't exist (first commit) — fall back to the empty tree hash.
-        let (lines_added, lines_removed) = parse_numstat(
-            repo_path,
-            &[
-                "diff",
-                "--numstat",
-                "4b825dc642cb6eb9a060e54bf899dcee6a7b9e2a",
-                "HEAD",
-            ],
-        )
-        .await
-        .unwrap_or((0, 0));
-        Ok(CommitInfo {
-            hash,
-            lines_added,
-            lines_removed,
-        })
-    }
+    let (lines_added, lines_removed) =
+        if let Ok(stats) = parse_numstat(repo_path, &["diff", "--numstat", "HEAD~1..HEAD"]).await {
+            stats
+        } else {
+            // HEAD~1 doesn't exist (first commit) — fall back to the empty tree hash.
+            parse_numstat(
+                repo_path,
+                &[
+                    "diff",
+                    "--numstat",
+                    "4b825dc642cb6eb9a060e54bf899dcee6a7b9e2a",
+                    "HEAD",
+                ],
+            )
+            .await
+            .unwrap_or((0, 0))
+        };
+    Ok(CommitInfo {
+        hash,
+        lines_added,
+        lines_removed,
+    })
 }
 
 /// Parse the output of `git diff --numstat` or `git show --numstat`.
