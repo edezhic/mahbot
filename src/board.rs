@@ -1125,6 +1125,8 @@ impl BoardStore {
     ///   commit via a different pattern.
     /// - **`batch_set_archived`** — batch operation on many tickets, handles
     ///   zero-affected-rows gracefully (no error).
+    /// - **`claim_sanitation`** — returns `Result<bool>` (conditional success),
+    ///   does NOT cancel registered agents (QaPassed has no running agent).
     async fn execute_and_cancel(&self, ticket_id: &str, prepared: PreparedUpdate) -> Result<()> {
         self.execute_update(ticket_id, prepared).await?;
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
