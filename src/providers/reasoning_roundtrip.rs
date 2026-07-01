@@ -26,18 +26,12 @@ fn flattened_detail_items(patches: &[Value]) -> Vec<Value> {
 }
 
 /// Try to merge `item` into the last element of `items` when both share the
-/// same type and carry the named `field`. Returns `true` when the item was
-/// consumed (either merged in or pushed).
-fn try_merge_detail_field(
-    items: &mut Vec<Value>,
-    item: Value,
-    ty: &str,
-    field: &str,
-    join: &str,
-) -> bool {
+/// same type and carry the named `field`. When not mergeable, the item is
+/// pushed onto `items` as-is.
+fn try_merge_detail_field(items: &mut Vec<Value>, item: Value, ty: &str, field: &str, join: &str) {
     let Some(value) = item.get(field).and_then(Value::as_str) else {
         items.push(item);
-        return true;
+        return;
     };
     if let Some(last) = items.last_mut()
         && last.get("type").and_then(Value::as_str) == Some(ty)
@@ -52,7 +46,6 @@ fn try_merge_detail_field(
     } else {
         items.push(item);
     }
-    true
 }
 
 fn merge_adjacent_textual_detail_items(items: Vec<Value>) -> Vec<Value> {
