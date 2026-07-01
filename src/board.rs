@@ -1879,16 +1879,13 @@ impl BoardStore {
 
 /// Open a [`BoardStore`] in a fresh temp directory (no global CONFIG dependency).
 ///
-/// Thin wrapper around [`crate::open_test_store!`] that avoids touching the 34+
+/// Thin wrapper around [`crate::open_test_store!`] that avoids touching the 32
 /// call sites inside `self::tests`.  Delegates to the shared macro so the
 /// actual boilerplate lives in one place.
 ///
-/// Kept outside `mod tests` so that sibling modules (e.g.
-/// `tools::search_archived_tickets`) can call it as
-/// `crate::board::open_test_store().await`.  New code should prefer the macro
-/// directly.
+/// Internal test convenience — external modules should use the macro directly.
 #[cfg(test)]
-pub(crate) async fn open_test_store() -> (BoardStore, tempfile::TempDir) {
+async fn open_test_store() -> (BoardStore, tempfile::TempDir) {
     crate::open_test_store!(BoardStore, "board")
 }
 
@@ -1912,7 +1909,7 @@ mod tests {
     /// Open a test store and create a default ticket.
     /// Returns (store, temp_dir, ticket_id).
     async fn setup() -> (BoardStore, TempDir, String) {
-        let (store, tmp) = crate::board::open_test_store().await;
+        let (store, tmp) = open_test_store().await;
         let id = make_ticket(
             &store,
             test_ws_named("/ws", "ws"),
