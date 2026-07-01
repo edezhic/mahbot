@@ -229,8 +229,14 @@ async fn run_command_with_timeout(
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
-            let stdout = stdout_handle.await.unwrap_or_default();
-            let stderr = stderr_handle.await.unwrap_or_default();
+            let stdout = stdout_handle.await.unwrap_or_else(|e| {
+                tracing::warn!(%e, "stdout reader task panicked");
+                Vec::new()
+            });
+            let stderr = stderr_handle.await.unwrap_or_else(|e| {
+                tracing::warn!(%e, "stderr reader task panicked");
+                Vec::new()
+            });
             ShellRunResult::Completed {
                 stdout,
                 stderr,
