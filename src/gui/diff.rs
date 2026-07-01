@@ -1564,10 +1564,7 @@ async fn compute_old_highlights(
     // For historical commits, read the parent version (~1).
     // For working-tree diffs, read HEAD.
     let show_ref = commit_ref.map(|hash| format!("{hash}~1"));
-    let content = run_git_show(ws_path, old_path, show_ref.as_deref())
-        .await
-        .ok()
-        .flatten()?;
+    let content = run_git_show(ws_path, old_path, show_ref.as_deref()).await?;
 
     compute_highlights_for_content(&content, lang)
 }
@@ -1586,10 +1583,7 @@ async fn compute_new_highlights(
     let content = if let Some(hash) = commit_ref {
         // Historical commit: read file content from git, NOT from disk.
         // The working-tree path may not match the commit version.
-        run_git_show(ws_path, &dfile.path, Some(hash))
-            .await
-            .ok()
-            .flatten()?
+        run_git_show(ws_path, &dfile.path, Some(hash)).await?
     } else {
         // Working-tree diff: read from disk (existing behavior).
         let full_path = ws_path.join(&dfile.path);

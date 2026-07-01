@@ -627,8 +627,8 @@ pub async fn run_git_status(repo_path: &Path) -> Result<String, String> {
 /// Run `git show HEAD:<path>` (when `commit_ref` is `None`)
 /// or `git show <commit_ref>:<path>` (when `Some`) and return the file content.
 ///
-/// Returns `Ok(None)` if the file does not exist at that ref (new/untracked files,
-/// or root-commit `~1` which has no parent).
+/// Returns `None` if the file does not exist at that ref (new/untracked files,
+/// or root-commit `~1` which has no parent), or if any git error occurs.
 ///
 /// **`~1` parent refs**: The caller constructs the parent hash. To get the parent
 /// version, pass `commit_ref = Some(&format!("{hash}~1"))`.
@@ -636,16 +636,13 @@ pub async fn run_git_show(
     repo_path: &Path,
     file_path: &str,
     commit_ref: Option<&str>,
-) -> Result<Option<String>, String> {
+) -> Option<String> {
     let show_arg = if let Some(hash) = commit_ref {
         format!("{hash}:{file_path}")
     } else {
         format!("HEAD:{file_path}")
     };
-    match run_git_command(repo_path, &["show", &show_arg]).await {
-        Ok(output) => Ok(Some(output)),
-        Err(_) => Ok(None),
-    }
+    run_git_command(repo_path, &["show", &show_arg]).await.ok()
 }
 /// Create a [`tokio::process::Command`] for `git` with a sanitized environment.
 ///
