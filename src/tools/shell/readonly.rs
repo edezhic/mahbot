@@ -1032,18 +1032,13 @@ mod tests {
         );
     }
 
-    struct Case {
-        command: &'static str,
-        allowed: bool,
-    }
-
     /// Assert each case in a table-driven test.
-    fn run_cases(cases: &[Case]) {
-        for case in cases {
-            if case.allowed {
-                ok(case.command);
+    fn run_cases(cases: &[(&str, bool)]) {
+        for &(command, allowed) in cases {
+            if allowed {
+                ok(command);
             } else {
-                assert_rejected(case.command);
+                assert_rejected(command);
             }
         }
     }
@@ -1067,18 +1062,9 @@ mod tests {
     #[test]
     fn empty_whitespace_and_unknown() {
         let cases = [
-            Case {
-                command: "",
-                allowed: true,
-            },
-            Case {
-                command: "   ",
-                allowed: true,
-            },
-            Case {
-                command: "some_obscure_tool --flag",
-                allowed: true,
-            },
+            ("", true),
+            ("   ", true),
+            ("some_obscure_tool --flag", true),
         ];
 
         run_cases(&cases);
@@ -1097,30 +1083,12 @@ mod tests {
     #[test]
     fn git_individual_commands() {
         let cases = [
-            Case {
-                command: "git commit -m test",
-                allowed: false,
-            },
-            Case {
-                command: "git push",
-                allowed: false,
-            },
-            Case {
-                command: "git stash",
-                allowed: false,
-            },
-            Case {
-                command: "git stash list",
-                allowed: true,
-            },
-            Case {
-                command: "git merge feature",
-                allowed: false,
-            },
-            Case {
-                command: "git rebase main",
-                allowed: false,
-            },
+            ("git commit -m test", false),
+            ("git push", false),
+            ("git stash", false),
+            ("git stash list", true),
+            ("git merge feature", false),
+            ("git rebase main", false),
         ];
 
         run_cases(&cases);
@@ -1131,30 +1099,12 @@ mod tests {
     #[test]
     fn git_bare_flag() {
         let cases = [
-            Case {
-                command: "git --bare status",
-                allowed: true,
-            },
-            Case {
-                command: "git --bare log --oneline",
-                allowed: true,
-            },
-            Case {
-                command: "git --bare diff",
-                allowed: true,
-            },
-            Case {
-                command: "git --bare push",
-                allowed: false,
-            },
-            Case {
-                command: "git --bare commit -m test",
-                allowed: false,
-            },
-            Case {
-                command: "git --bare reset --hard",
-                allowed: false,
-            },
+            ("git --bare status", true),
+            ("git --bare log --oneline", true),
+            ("git --bare diff", true),
+            ("git --bare push", false),
+            ("git --bare commit -m test", false),
+            ("git --bare reset --hard", false),
         ];
 
         run_cases(&cases);
@@ -1179,30 +1129,12 @@ mod tests {
     #[test]
     fn cargo_individual_commands() {
         let cases = [
-            Case {
-                command: "cargo clippy --fix",
-                allowed: false,
-            },
-            Case {
-                command: "cargo clippy -- --fix",
-                allowed: true,
-            },
-            Case {
-                command: "cargo fmt",
-                allowed: false,
-            },
-            Case {
-                command: "cargo fmt --check",
-                allowed: true,
-            },
-            Case {
-                command: "cargo fmt -- --check",
-                allowed: true,
-            },
-            Case {
-                command: "cargo fix",
-                allowed: false,
-            },
+            ("cargo clippy --fix", false),
+            ("cargo clippy -- --fix", true),
+            ("cargo fmt", false),
+            ("cargo fmt --check", true),
+            ("cargo fmt -- --check", true),
+            ("cargo fix", false),
         ];
 
         run_cases(&cases);
@@ -1249,79 +1181,28 @@ mod tests {
     fn flag_dependent_tests() {
         let cases = [
             // sed
-            Case {
-                command: "sed 's/a/b/' file",
-                allowed: true,
-            },
-            Case {
-                command: "sed -i 's/a/b/' file",
-                allowed: false,
-            },
-            Case {
-                command: "sed -i.bak 's/a/b/' file",
-                allowed: false,
-            },
+            ("sed 's/a/b/' file", true),
+            ("sed -i 's/a/b/' file", false),
+            ("sed -i.bak 's/a/b/' file", false),
             // awk
-            Case {
-                command: "awk '{print $1}' file",
-                allowed: true,
-            },
-            Case {
-                command: "awk -i inplace '{print $1}' file",
-                allowed: false,
-            },
+            ("awk '{print $1}' file", true),
+            ("awk -i inplace '{print $1}' file", false),
             // dd
-            Case {
-                command: "dd if=/dev/zero bs=1 count=10",
-                allowed: true,
-            },
-            Case {
-                command: "dd if=/dev/zero of=file bs=1 count=10",
-                allowed: false,
-            },
+            ("dd if=/dev/zero bs=1 count=10", true),
+            ("dd if=/dev/zero of=file bs=1 count=10", false),
             // curl
-            Case {
-                command: "curl https://example.com",
-                allowed: true,
-            },
-            Case {
-                command: "curl -o file https://example.com",
-                allowed: false,
-            },
-            Case {
-                command: "curl -O https://example.com/file",
-                allowed: false,
-            },
+            ("curl https://example.com", true),
+            ("curl -o file https://example.com", false),
+            ("curl -O https://example.com/file", false),
             // tar
-            Case {
-                command: "tar -tf archive.tar.gz",
-                allowed: true,
-            },
-            Case {
-                command: "tar -xzf archive.tar.gz",
-                allowed: false,
-            },
-            Case {
-                command: "tar -czf archive.tar.gz dir/",
-                allowed: false,
-            },
-            Case {
-                command: "tar --list -f archive.tar.gz",
-                allowed: true,
-            },
+            ("tar -tf archive.tar.gz", true),
+            ("tar -xzf archive.tar.gz", false),
+            ("tar -czf archive.tar.gz dir/", false),
+            ("tar --list -f archive.tar.gz", true),
             // base64
-            Case {
-                command: "base64 -d file.txt",
-                allowed: true,
-            },
-            Case {
-                command: "base64 -d -o out.bin file.txt",
-                allowed: false,
-            },
-            Case {
-                command: "base64 --decode --output out.bin file.txt",
-                allowed: false,
-            },
+            ("base64 -d file.txt", true),
+            ("base64 -d -o out.bin file.txt", false),
+            ("base64 --decode --output out.bin file.txt", false),
         ];
 
         run_cases(&cases);
@@ -1332,26 +1213,11 @@ mod tests {
     #[test]
     fn chained_commands() {
         let cases = [
-            Case {
-                command: "cargo check && cargo test",
-                allowed: true,
-            },
-            Case {
-                command: "cargo check && rm file",
-                allowed: false,
-            },
-            Case {
-                command: "git status && cargo fmt",
-                allowed: false,
-            },
-            Case {
-                command: "git log --oneline | head -20",
-                allowed: true,
-            },
-            Case {
-                command: "cargo check; rm file",
-                allowed: false,
-            },
+            ("cargo check && cargo test", true),
+            ("cargo check && rm file", false),
+            ("git status && cargo fmt", false),
+            ("git log --oneline | head -20", true),
+            ("cargo check; rm file", false),
         ];
 
         run_cases(&cases);
@@ -1363,88 +1229,28 @@ mod tests {
     fn redirect_tests() {
         let cases = [
             // Original redirect tests
-            Case {
-                command: "echo hello > file.txt",
-                allowed: false,
-            },
-            Case {
-                command: "echo hello > /dev/null",
-                allowed: true,
-            },
-            Case {
-                command: "echo hello > /tmp/output.txt",
-                allowed: true,
-            },
-            Case {
-                command: "cmd 2>&1",
-                allowed: true,
-            },
-            Case {
-                command: "echo \"hello > world\"",
-                allowed: true,
-            },
-            Case {
-                command: "echo hello >> /tmp/log",
-                allowed: true,
-            },
-            Case {
-                command: "echo hello >| /tmp/force",
-                allowed: true,
-            },
-            Case {
-                command: "cargo build > /dev/null 2>&1",
-                allowed: true,
-            },
+            ("echo hello > file.txt", false),
+            ("echo hello > /dev/null", true),
+            ("echo hello > /tmp/output.txt", true),
+            ("cmd 2>&1", true),
+            ("echo \"hello > world\"", true),
+            ("echo hello >> /tmp/log", true),
+            ("echo hello >| /tmp/force", true),
+            ("cargo build > /dev/null 2>&1", true),
             // /var/tmp redirect tests
-            Case {
-                command: "echo hello > /var/tmp/output.txt",
-                allowed: true,
-            },
-            Case {
-                command: "echo hello >> /var/tmp/log",
-                allowed: true,
-            },
+            ("echo hello > /var/tmp/output.txt", true),
+            ("echo hello >> /var/tmp/log", true),
             // Redirect operators refactor tests
-            Case {
-                command: "cmd > output.txt",
-                allowed: false,
-            },
-            Case {
-                command: "cmd 1>&2",
-                allowed: true,
-            },
-            Case {
-                command: "cmd 2> /tmp/errors.log",
-                allowed: true,
-            },
-            Case {
-                command: "cmd 2> errors.log",
-                allowed: false,
-            },
-            Case {
-                command: "cmd >&2",
-                allowed: false,
-            },
-            Case {
-                command: "echo \\> /tmp/file",
-                allowed: true,
-            },
-            Case {
-                command: "echo \\>",
-                allowed: true,
-            },
-            Case {
-                command: "echo \\\\\\> file",
-                allowed: true,
-            },
-            Case {
-                command: "echo \"> /tmp/foo",
-                allowed: true,
-            },
-            Case {
-                command: "echo '> /tmp/foo",
-                allowed: true,
-            },
+            ("cmd > output.txt", false),
+            ("cmd 1>&2", true),
+            ("cmd 2> /tmp/errors.log", true),
+            ("cmd 2> errors.log", false),
+            ("cmd >&2", false),
+            ("echo \\> /tmp/file", true),
+            ("echo \\>", true),
+            ("echo \\\\\\> file", true),
+            ("echo \"> /tmp/foo", true),
+            ("echo '> /tmp/foo", true),
         ];
 
         run_cases(&cases);
@@ -1464,88 +1270,32 @@ mod tests {
             // Primary bug scenario: `<<` inside single quotes followed by
             // a real redirect on the same line.  strip_heredoc_bodies must
             // NOT strip `> output.txt` because `<<` is inside quotes.
-            Case {
-                command: "echo '<<EOF' > output.txt",
-                allowed: false,
-            },
+            ("echo '<<EOF' > output.txt", false),
             // Same with double quotes
-            Case {
-                command: "echo \"<<EOF\" > output.txt",
-                allowed: false,
-            },
+            ("echo \"<<EOF\" > output.txt", false),
             // Quoted << without redirect — should be allowed regardless
-            Case {
-                command: "echo '<<EOF'",
-                allowed: true,
-            },
-            Case {
-                command: "echo \"<<EOF\"",
-                allowed: true,
-            },
+            ("echo '<<EOF'", true),
+            ("echo \"<<EOF\"", true),
             // <<- with dash inside single quotes, redirect follows
-            Case {
-                command: "echo '<<-EOF' > output.txt",
-                allowed: false,
-            },
+            ("echo '<<-EOF' > output.txt", false),
             // No-redirect variant: quoted << with no redirect (just text)
-            Case {
-                command: "echo 'before <<EOF after'",
-                allowed: true,
-            },
-            Case {
-                command: "echo \"before <<EOF after\"",
-                allowed: true,
-            },
-            // Backslash-escaped << (double-escape): `\<\<` prevents heredoc
-            // detection because both `<` characters are escaped individually
-            // by their respective backslashes, so neither participates in
-            // `<<` detection.  The redirect after them is a real unquoted
-            // redirect and must be rejected.
-            Case {
-                command: "echo \\<\\<file > /etc/output",
-                allowed: false,
-            },
-            // Backslash-escaped << (single-escape): `\<<` prevents heredoc
-            // detection because the first `<` is escaped and consumed
-            // without participating in `<<` detection; the remaining
-            // single `<` is insufficient to form `<<`.  Distinct code
-            // path from double-escape — tests the standalone `<` fallthrough.
-            Case {
-                command: "echo \\<<EOF > /etc/output",
-                allowed: false,
-            },
-            // Escaped single quote: `\'` produces literal `'` without
-            // toggling quote state.  Without escape tracking, `check_outside_quotes`
-            // would see `'` and toggle in_single, causing subsequent redirect
-            // operators to be treated as inside quotes and skipped.
-            // This test validates that escape tracking prevents that false
-            // negative by using a non-temp redirect target.
-            Case {
-                command: "echo \\'hello > /etc/output",
-                allowed: false,
-            },
-            // Nested quotes: single-quoted string inside double quotes.
-            // The inner single quotes are literal (shell rule: single
-            // quotes have no special meaning inside double quotes),
-            // so `<<` is inside the double-quote context and must not
-            // trigger heredoc detection.  Tests that check_outside_quotes
-            // correctly handles nesting: `"` toggles in_double, then
-            // `'` is literal (no toggle because in_double=true).
-            Case {
-                command: "echo \"'<<EOF'\" > /etc/output",
-                allowed: false,
-            },
+            ("echo 'before <<EOF after'", true),
+            ("echo \"before <<EOF after\"", true),
+            // Backslash-escaped << (double-escape)
+            ("echo \\<\\<file > /etc/output", false),
+            // Backslash-escaped << (single-escape)
+            ("echo \\<<EOF > /etc/output", false),
+            // Escaped single quote
+            ("echo \\'hello > /etc/output", false),
+            // Nested quotes: single-quoted string inside double quotes
+            ("echo \"'<<EOF'\" > /etc/output", false),
             // Existing real heredoc behaviors still work:
-            // heredoc with redirect to temp
-            Case {
-                command: "cat > /tmp/test_match.rs << 'EOF'\nfn test() { match x { \"a\" => 1, _ => 0 } }\nEOF",
-                allowed: true,
-            },
+            (
+                "cat > /tmp/test_match.rs << 'EOF'\nfn test() { match x { \"a\" => 1, _ => 0 } }\nEOF",
+                true,
+            ),
             // Real heredoc with no redirect
-            Case {
-                command: "cat <<EOF\nbody\nEOF",
-                allowed: true,
-            },
+            ("cat <<EOF\nbody\nEOF", true),
         ];
 
         run_cases(&cases);
@@ -1555,16 +1305,7 @@ mod tests {
 
     #[test]
     fn mktemp_allowed() {
-        let cases = [
-            Case {
-                command: "mktemp",
-                allowed: true,
-            },
-            Case {
-                command: "mktemp -t mahbot.XXXXXX",
-                allowed: true,
-            },
-        ];
+        let cases = [("mktemp", true), ("mktemp -t mahbot.XXXXXX", true)];
 
         run_cases(&cases);
     }
@@ -1584,27 +1325,18 @@ mod tests {
     #[test]
     fn shell_prefixes_delegating() {
         let cases = [
-            Case {
-                command: "rm file",
-                allowed: false,
-            },
-            Case {
-                command: "git push",
-                allowed: false,
-            },
-            Case {
-                command: "git status",
-                allowed: true,
-            },
+            ("rm file", false),
+            ("git push", false),
+            ("git status", true),
         ];
 
         for prefix in SHELL_PREFIXES {
             if NON_DELEGATING_PREFIXES.contains(prefix) {
                 continue;
             }
-            for case in &cases {
-                let cmd = format!("{prefix} {}", case.command);
-                if case.allowed {
+            for &(command, allowed) in &cases {
+                let cmd = format!("{prefix} {command}");
+                if allowed {
                     ok(&cmd);
                 } else {
                     assert_rejected(&cmd);
@@ -1619,56 +1351,20 @@ mod tests {
     fn prefix_bypass_and_env() {
         let cases = [
             // Prefix stripping with flags
-            Case {
-                command: "sudo -E rm file",
-                allowed: false,
-            },
-            Case {
-                command: "sudo git status",
-                allowed: true,
-            },
-            Case {
-                command: "sudo cargo check",
-                allowed: true,
-            },
+            ("sudo -E rm file", false),
+            ("sudo git status", true),
+            ("sudo cargo check", true),
             // Git prefix bypass
-            Case {
-                command: "sudo git push",
-                allowed: false,
-            },
-            Case {
-                command: "env git push",
-                allowed: false,
-            },
-            Case {
-                command: "GIT_DIR=/tmp sudo git push",
-                allowed: false,
-            },
-            Case {
-                command: "sudo git stash list",
-                allowed: true,
-            },
-            Case {
-                command: "cd",
-                allowed: true,
-            },
-            Case {
-                command: "cd ..",
-                allowed: true,
-            },
+            ("sudo git push", false),
+            ("env git push", false),
+            ("GIT_DIR=/tmp sudo git push", false),
+            ("sudo git stash list", true),
+            ("cd", true),
+            ("cd ..", true),
             // VAR=val stripping
-            Case {
-                command: "FOO=bar rm file",
-                allowed: false,
-            },
-            Case {
-                command: "VAR=val sudo rm -rf /",
-                allowed: false,
-            },
-            Case {
-                command: "GIT_DIR=/tmp git status",
-                allowed: true,
-            },
+            ("FOO=bar rm file", false),
+            ("VAR=val sudo rm -rf /", false),
+            ("GIT_DIR=/tmp git status", true),
         ];
 
         run_cases(&cases);
@@ -1680,31 +1376,13 @@ mod tests {
     fn script_and_container_tools() {
         let cases = [
             // Script interpreters
-            Case {
-                command: "python3 --version",
-                allowed: true,
-            },
-            Case {
-                command: "python3 -c \"print('hello')\"",
-                allowed: true,
-            },
-            Case {
-                command: "node -e \"console.log('hi')\"",
-                allowed: true,
-            },
-            Case {
-                command: "bash -c \"echo hello\"",
-                allowed: true,
-            },
+            ("python3 --version", true),
+            ("python3 -c \"print('hello')\"", true),
+            ("node -e \"console.log('hi')\"", true),
+            ("bash -c \"echo hello\"", true),
             // Container tools
-            Case {
-                command: "docker ps",
-                allowed: true,
-            },
-            Case {
-                command: "kubectl get pods",
-                allowed: true,
-            },
+            ("docker ps", true),
+            ("kubectl get pods", true),
         ];
 
         run_cases(&cases);
@@ -1823,131 +1501,53 @@ mod tests {
     #[test]
     fn temp_scratch_tests() {
         let cases = [
-            Case {
-                command: "cat > /tmp/test_match.rs << 'EOF'\nfn test() { match x { \"a\" => 1, _ => 0 } }\nEOF",
-                allowed: true,
-            },
-            Case {
-                command: "echo hello > /private/tmp/mahbot_test_out.txt",
-                allowed: true,
-            },
-            Case {
-                command: "tee /tmp/scratch.log",
-                allowed: true,
-            },
-            Case {
-                command: "touch /tmp/scratch.txt",
-                allowed: true,
-            },
-            Case {
-                command: "mkdir -p /tmp/scratch_dir",
-                allowed: true,
-            },
-            Case {
-                command: "tee output.log",
-                allowed: false,
-            },
-            Case {
-                command: "rm /tmp/scratch.txt",
-                allowed: false,
-            },
+            (
+                "cat > /tmp/test_match.rs << 'EOF'\nfn test() { match x { \"a\" => 1, _ => 0 } }\nEOF",
+                true,
+            ),
+            ("echo hello > /private/tmp/mahbot_test_out.txt", true),
+            ("tee /tmp/scratch.log", true),
+            ("touch /tmp/scratch.txt", true),
+            ("mkdir -p /tmp/scratch_dir", true),
+            ("tee output.log", false),
+            ("rm /tmp/scratch.txt", false),
             // ── Multiple path arguments (mahbot-396 security bypass) ──
             // Multiple path args under temp → should be allowed
-            Case {
-                command: "tee /tmp/scratch.log /tmp/out.txt",
-                allowed: true,
-            },
-            Case {
-                command: "touch /tmp/a.txt /tmp/b.txt",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log /tmp/out.txt", true),
+            ("touch /tmp/a.txt /tmp/b.txt", true),
             // Mixed: one temp, one non-temp → should be rejected
-            Case {
-                command: "tee /tmp/scratch.log /etc/passwd",
-                allowed: false,
-            },
-            Case {
-                command: "touch /tmp/scratch.txt /etc/cron.d/evil",
-                allowed: false,
-            },
-            Case {
-                command: "mkdir -p /tmp/dir /etc/cron.d",
-                allowed: false,
-            },
+            ("tee /tmp/scratch.log /etc/passwd", false),
+            ("touch /tmp/scratch.txt /etc/cron.d/evil", false),
+            ("mkdir -p /tmp/dir /etc/cron.d", false),
             // Mixed with redirects → only path args checked
-            Case {
-                command: "tee /tmp/scratch.log /etc/passwd > /dev/null",
-                allowed: false,
-            },
-            Case {
-                command: "tee /tmp/scratch.log /tmp/out.txt > /dev/null",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log /etc/passwd > /dev/null", false),
+            ("tee /tmp/scratch.log /tmp/out.txt > /dev/null", true),
             // Combined redirect tokens (2>/dev/null style)
-            Case {
-                command: "tee /tmp/scratch.log /etc/passwd 2>/dev/null",
-                allowed: false,
-            },
-            Case {
-                command: "tee /tmp/scratch.log /tmp/out.txt 2>&1",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log /etc/passwd 2>/dev/null", false),
+            ("tee /tmp/scratch.log /tmp/out.txt 2>&1", true),
             // Heredoc with scratch mutator → heredoc body not treated as path
-            Case {
-                command: "tee /tmp/scratch.log << 'EOF'\nbody\nEOF",
-                allowed: true,
-            },
-            Case {
-                command: "tee /tmp/scratch.log /tmp/out.txt << 'EOF'\nbody\nEOF",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log << 'EOF'\nbody\nEOF", true),
+            (
+                "tee /tmp/scratch.log /tmp/out.txt << 'EOF'\nbody\nEOF",
+                true,
+            ),
             // 1> standalone redirect (separate target) → not a path arg
-            Case {
-                command: "tee /tmp/scratch.log 1>/dev/null",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log 1>/dev/null", true),
             // Bash &> combined redirect → not collected as path arg
-            Case {
-                command: "tee /tmp/scratch.log &>/dev/null",
-                allowed: true,
-            },
-            Case {
-                command: "tee /tmp/scratch.log &>>/dev/null",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log &>/dev/null", true),
+            ("tee /tmp/scratch.log &>>/dev/null", true),
             // 1> with space-separated target → redirect target not collected as path
-            Case {
-                command: "tee /tmp/scratch.log 1> /dev/null",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log 1> /dev/null", true),
             // Generic digit-prefixed redirects ({digit}> and {digit}<)
-            Case {
-                command: "tee /tmp/scratch.log 3> /dev/null",
-                allowed: true,
-            },
-            Case {
-                command: "tee /tmp/scratch.log 3< /dev/null",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log 3> /dev/null", true),
+            ("tee /tmp/scratch.log 3< /dev/null", true),
             // Digit-prefixed heredoc (e.g. 3<<EOF) → body not treated as path
-            Case {
-                command: "tee /tmp/scratch.log 3<< 'EOF'\nbody\nEOF",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log 3<< 'EOF'\nbody\nEOF", true),
             // Multi-digit fd redirect with space-separated target (10> /dev/null)
-            Case {
-                command: "tee /tmp/scratch.log 10> /dev/null",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log 10> /dev/null", true),
             // &> standalone redirect with space before target
-            Case {
-                command: "tee /tmp/scratch.log &> /dev/null",
-                allowed: true,
-            },
-            Case {
-                command: "tee /tmp/scratch.log &>> /dev/null",
-                allowed: true,
-            },
+            ("tee /tmp/scratch.log &> /dev/null", true),
+            ("tee /tmp/scratch.log &>> /dev/null", true),
         ];
 
         run_cases(&cases);
