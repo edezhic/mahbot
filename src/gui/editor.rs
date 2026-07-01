@@ -4125,7 +4125,6 @@ impl EditorState {
     }
 
     /// Handle find-replace — replaces the current match and advances to the next.
-    #[allow(clippy::too_many_lines)]
     fn find_replace(&mut self) -> Task<EditorMessage> {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
@@ -4224,7 +4223,6 @@ impl EditorState {
     }
 
     /// Handle refresh-file-tree — re-reads all expanded directories from disk.
-    #[allow(clippy::too_many_lines)]
     fn refresh_file_tree(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the file tree should
         // not refresh behind an active overlay.  This covers both the
@@ -4384,7 +4382,6 @@ impl EditorState {
     }
 
     /// Handle check-file-changes — detects external file modifications and reloads.
-    #[allow(clippy::too_many_lines)]
     fn check_file_changes(&mut self) -> Task<EditorMessage> {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
@@ -4456,7 +4453,6 @@ impl EditorState {
     }
 
     /// Handle file-reloaded — replaces tab content with the reloaded file data.
-    #[allow(clippy::too_many_lines)]
     fn file_reloaded(
         &mut self,
         path: String,
