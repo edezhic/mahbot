@@ -573,12 +573,8 @@ impl ConfigReload {
     /// keys are silently ignored for forward compatibility).
     #[must_use]
     pub fn set_string_field_and_apply(&self, key: &str, value: &str) -> bool {
-        let mut config = self.snapshot();
-        let recognized = config.set_string_field(key, value);
-        if recognized {
-            *self.inner.write().expect("CONFIG inner poisoned") = config;
-        }
-        recognized
+        let mut guard = self.inner.write().expect("CONFIG inner poisoned");
+        guard.set_string_field(key, value)
     }
 
     // ── Provider routing (per-model) ──────────────────────────
