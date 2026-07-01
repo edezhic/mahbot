@@ -243,9 +243,9 @@ impl Role {
 use crate::Tool;
 use crate::config::CONFIG;
 use crate::tools::{
-    AddCommentTool, AskTool, BrowserTool, CreateTicketTool, EditTool, ExaSearchTool, GetTicketTool,
-    ImageGenTool, ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool, ShellMode,
-    ShellTool, UpdateTicketTool, VideoGenTool, WebSearchTool,
+    AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, ExaSearchTool,
+    GetTicketTool, ImageGenTool, ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool,
+    ShellMode, ShellTool, UpdateTicketTool, VideoGenTool, WebSearchTool,
 };
 
 impl Role {
@@ -278,7 +278,7 @@ impl Role {
                 let mut t = Self::full_core_tools();
                 t.push(Box::new(AskTool::new(
                     vec![Role::Analyst, Role::Coder],
-                    None,
+                    DispatchMode::Sync,
                 )));
                 t
             }
@@ -311,7 +311,10 @@ impl Role {
             }
             Role::Maintainer => {
                 let mut t = Self::readonly_core_tools();
-                t.push(Box::new(AskTool::new(vec![Role::Analyst], None)));
+                t.push(Box::new(AskTool::new(
+                    vec![Role::Analyst],
+                    DispatchMode::Sync,
+                )));
                 t.push(Box::new(CreateTicketTool::new("maintainer")));
                 t
             }

@@ -14,21 +14,40 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
+/// Controls sub-agent dispatch behaviour.
+///
+/// [`Sync`](DispatchMode::Sync) blocks the caller until the sub-agent completes.
+/// [`Async`](DispatchMode::Async) dispatches the sub-agent in a background task
+/// and injects the result via the Manager queue.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DispatchMode {
+    Sync,
+    Async,
+}
+
+impl DispatchMode {
+    /// Returns `true` when this dispatch mode is [`Async`](DispatchMode::Async).
+    #[must_use]
+    pub const fn is_async(self) -> bool {
+        matches!(self, Self::Async)
+    }
+}
+
 pub struct AskTool {
     pub allowed_roles: Vec<Role>,
-    /// When `Some`, dispatches the sub-agent asynchronously and injects
-    /// the result into the Manager's session via the serialized Manager queue.
-    /// When `None` (default), blocks the caller until the sub-agent completes.
-    /// Only set by the Manager role — Engineer and Maintainer pass `None`.
-    caller_agent_id: Option<String>,
+    /// Controls how the sub-agent is dispatched.
+    /// - [`DispatchMode::Sync`] — blocks the caller until the sub-agent completes.
+    /// - [`DispatchMode::Async`] — dispatches in a background task, result
+    ///   delivered via the Manager queue. Only the Manager role uses this.
+    dispatch_mode: DispatchMode,
 }
 
 impl AskTool {
     #[must_use]
-    pub const fn new(allowed_roles: Vec<Role>, caller_agent_id: Option<String>) -> Self {
+    pub const fn new(allowed_roles: Vec<Role>, dispatch_mode: DispatchMode) -> Self {
         Self {
             allowed_roles,
-            caller_agent_id,
+            dispatch_mode,
         }
     }
 
@@ -93,7 +112,7 @@ impl Tool for AskTool {
         // Async dispatch path — Manager delegates to Analyst in background.
         // Routing is handled by the consumer loop via DB lookup — no reply
         // context needed in the job.
-        if self.caller_agent_id.is_some() {
+        if self.dispatch_mode.is_async() {
             let ws = ws.clone();
             let ask = ask.to_string();
 
@@ -151,7 +170,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_missing_args() {
-        let tool = AskTool::new(vec![Role::Analyst, Role::Coder, Role::Qa], None);
+        let tool = AskTool::new(
+            vec![Role::Analyst, Role::Coder, Role::Qa],
+            DispatchMode::Sync,
+        );
         let ws = test_ws("/tmp/test_ws");
 
         // Missing role
@@ -179,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_unsupported_role() {
-        let tool = AskTool::new(vec![Role::Analyst], None);
+        let tool = AskTool::new(vec![Role::Analyst], DispatchMode::Sync);
         let ws = test_ws("/tmp/test_ws");
         // "manager" is a valid Role but not one that AskTool can delegate to
         let args = json!({"role": "manager", "ask": "do something"});
@@ -194,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_unknown_role() {
-        let tool = AskTool::new(vec![], None);
+        let tool = AskTool::new(vec![], DispatchMode::Sync);
         let ws = test_ws("/tmp/test_ws");
         // Truly unknown role string — returns bail!
         let args = json!({"role": "nonexistent", "ask": "do something"});
@@ -237,7 +259,10 @@ mod tests {
         ];
 
         for c in &cases {
-            let tool = AskTool::new(vec![Role::Analyst, Role::Coder, Role::Qa], None);
+            let tool = AskTool::new(
+                vec![Role::Analyst, Role::Coder, Role::Qa],
+                DispatchMode::Sync,
+            );
             let ws = test_ws("/tmp/test_ws");
             let args = json!({"role": c.role, "ask": c.ask});
             let result = tool.execute(&ws, args).await.expect("execute");

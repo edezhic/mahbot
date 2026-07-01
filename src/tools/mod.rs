@@ -52,7 +52,7 @@ pub(crate) fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
 
 // ── Re-exports ─────────────────────────────────────────────────────────
 
-pub use ask::AskTool;
+pub use ask::{AskTool, DispatchMode};
 pub use browser::BrowserTool;
 pub use edit::EditTool;
 pub use exa_search::ExaSearchTool;

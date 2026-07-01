@@ -8,8 +8,8 @@ use crate::providers::reasoning_roundtrip::{
 use crate::providers::{chat, stream_chat};
 use crate::session::Session;
 use crate::tools::{
-    AskTool, ToolExecutionOutcome, find_tool, format_tool_failure_feedback, normalize_tool_call,
-    sanitize_success_tool_output, unknown_tool_message,
+    AskTool, DispatchMode, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
+    normalize_tool_call, sanitize_success_tool_output, unknown_tool_message,
 };
 use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
 use crate::{
@@ -83,7 +83,7 @@ impl Agent {
         if role == Role::Manager {
             tools.push(Box::new(AskTool::new(
                 vec![Role::Analyst],
-                Some(session_key.clone()),
+                DispatchMode::Async,
             )));
         }
         let tool_specs = tools.iter().map(|t| t.spec()).collect();
