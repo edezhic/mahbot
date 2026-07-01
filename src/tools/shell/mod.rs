@@ -247,9 +247,11 @@ async fn run_command_with_timeout(
         Ok(Err(e)) => ShellRunResult::SpawnFailed(e),
         Err(_) => {
             let _ = child.kill().await;
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-            let _ = tokio::time::timeout(Duration::from_secs(2), stdout_handle).await;
-            let _ = tokio::time::timeout(Duration::from_secs(2), stderr_handle).await;
+            let (_, _, _) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(2), child.wait()),
+                tokio::time::timeout(Duration::from_secs(2), stdout_handle),
+                tokio::time::timeout(Duration::from_secs(2), stderr_handle),
+            );
             let stdout = stdout_shared.lock().unwrap_poison().clone();
             let stderr = stderr_shared.lock().unwrap_poison().clone();
             ShellRunResult::TimedOut {
