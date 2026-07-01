@@ -501,10 +501,10 @@ async fn notify_ticket(ticket: &Ticket, phase: TicketPhase) {
 
     if phase == TicketPhase::Failed {
         let failure_details = match board().get_comments(&ticket.id).await {
-            Ok(comments) => comments.last().map_or_else(
-                || "No failure details available.".to_string(),
-                |c| c.content.clone(),
-            ),
+            Ok(comments) => comments
+                .last()
+                .map_or("No failure details available.", |c| c.content.as_str())
+                .to_string(),
             Err(e) => {
                 warn!(
                     ticket = %ticket.id,
