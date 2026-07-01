@@ -289,16 +289,17 @@ fn is_grandparent_temp_root(path: &Path) -> bool {
 /// dependency caches, SDK headers, etc.).
 fn check_path_read_allowed(path: &str, workspace_root: &Path) -> anyhow::Result<()> {
     let path_buf = Path::new(path);
-    let spill_shaped = is_mahbot_spill_shaped(path_buf);
-    let spill_on_temp = spill_shaped && is_grandparent_temp_root(path_buf);
 
-    if spill_shaped && !spill_on_temp {
-        anyhow::bail!("Path not allowed by security policy: {path}");
+    // Early-return for spill files on an OS temp root (allowed unconditionally).
+    // If a path looks like a spill file but is NOT on a temp root, reject it.
+    if is_mahbot_spill_shaped(path_buf) {
+        if !is_grandparent_temp_root(path_buf) {
+            anyhow::bail!("Path not allowed by security policy: {path}");
+        }
+        return Ok(());
     }
-    if !is_path_safe_for_workspace(path, workspace_root)
-        && !is_path_in_extra_allowed(path_buf)
-        && !spill_on_temp
-    {
+
+    if !is_path_safe_for_workspace(path, workspace_root) && !is_path_in_extra_allowed(path_buf) {
         anyhow::bail!("Path not allowed by security policy: {path}");
     }
     Ok(())
