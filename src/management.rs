@@ -2436,7 +2436,6 @@ mod tests {
     /// Verify that when the circuit breaker trips on a ticket, all other
     /// ReadyForDevelopment tickets in the same workspace are moved to Planning.
     /// Tickets in other workspaces must not be affected.
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning() {
         init_management_test_stores().await;
