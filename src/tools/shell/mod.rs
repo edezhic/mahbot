@@ -1023,14 +1023,13 @@ fn finish_shell_output(
     elapsed: Duration,
     full_output_for_spill: Option<&str>,
 ) -> String {
-    // Defense-in-depth: scrub credentials before any further processing so
-    // that both the inline `combined` output and the spill-file content are
-    // consistently sanitized, regardless of which spill path is taken.
-    // Double-scrubbing is idempotent because the redacted marker (*[REDACTED])
-    // does not match the credential regex pattern. The agent layer also scrubs
-    // shell output downstream (sanitize_success_tool_output) — this ensures
-    // the function is internally consistent even if called outside the agent
-    // dispatch loop.
+    // Primary credential scrub for the stdout portion of `combined`. The
+    // stdout string (`processed`) enters this function unscrubbed; stderr was
+    // already scrubbed at `apply_profile_pipeline` entry, so this is a secondary
+    // pass for stderr — double-scrubbing is idempotent because the redacted
+    // marker (*[REDACTED]) does not match the credential regex.  The spill-file
+    // paths below and the agent layer's `sanitize_success_tool_output` also call
+    // `scrub_credentials`, so the output is scrubbed regardless of call site.
     combined = scrub_credentials(&combined);
 
     if elapsed.as_secs_f64() >= 1.0 {
