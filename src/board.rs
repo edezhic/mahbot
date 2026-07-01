@@ -1297,12 +1297,6 @@ impl BoardStore {
     /// ticket phase (unlike `set_assigned_to`, which cancels running agents). Non-negative line counts are
     /// enforced by debug assertions; the caller is responsible for providing
     /// valid values in production.
-    ///
-    /// Executes the UPDATE directly (no transaction wrapper needed for a single
-    /// write) via the `execute_update` helper. For callers that need to
-    /// participate in an outer transaction (e.g. `commit_and_transition_ticket_from`
-    /// in management.rs), use `set_commit_info_tx`
-    /// instead.
     pub async fn set_commit_info(
         &self,
         ticket_id: &str,
