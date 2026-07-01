@@ -1058,6 +1058,14 @@ fn finish_shell_output(
     try_spill_to_file(combined, SPILL_THRESHOLD_BYTES)
 }
 
+/// Append `line` to `buf`, inserting a `'\n'` separator if `buf` is non-empty.
+fn push_line(buf: &mut String, line: &str) {
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(line);
+}
+
 /// Collapse runs of blank lines to at most 2 consecutive.
 fn collapse_blank_lines(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
@@ -1071,10 +1079,7 @@ fn collapse_blank_lines(input: &str) -> String {
         } else {
             blank_run = 0;
         }
-        if !result.is_empty() {
-            result.push('\n');
-        }
-        result.push_str(line);
+        push_line(&mut result, line);
     }
     result
 }
@@ -1163,10 +1168,7 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
     if f.has_failures {
         let mut result = f.output_lines.join("\n");
         if !f.summary_lines.is_empty() {
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&f.summary_lines.join("\n"));
+            push_line(&mut result, &f.summary_lines.join("\n"));
         }
         return result;
     }
@@ -1719,18 +1721,12 @@ fn collapse_consecutive_lines(input: &str) -> String {
             count += 1;
         }
         if count >= THRESHOLD {
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(current);
+            push_line(&mut result, current);
             let _ = write!(result, "\n[repeated {count} times]");
             i += count;
         } else {
             for _ in 0..count {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(current);
+                push_line(&mut result, current);
             }
             i += count;
         }
@@ -1742,19 +1738,16 @@ fn collapse_consecutive_lines(input: &str) -> String {
 fn truncate_line_width(input: &str, max_line_len: usize) -> String {
     let mut result = String::with_capacity(input.len());
     for line in input.lines() {
-        if !result.is_empty() {
-            result.push('\n');
-        }
         if line.len() > max_line_len {
             let cut = line.floor_char_boundary(max_line_len);
-            result.push_str(&line[..cut]);
+            push_line(&mut result, &line[..cut]);
             let _ = write!(
                 result,
                 "\n... ({} more chars on this line)",
                 line.len() - cut
             );
         } else {
-            result.push_str(line);
+            push_line(&mut result, line);
         }
     }
     result
