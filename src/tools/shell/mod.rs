@@ -603,8 +603,9 @@ Use this tool only for inspection: reading files, listing directories, running c
                 let stdout =
                     crate::util::truncate_sandwich(&cleaned_stdout, MAX_OUTPUT_BYTES, "output");
                 let stderr_str = String::from_utf8_lossy(&stderr);
+                let cleaned_stderr = strip_ansi_escapes(&stderr_str);
                 let stderr =
-                    crate::util::truncate_sandwich(&stderr_str, MAX_OUTPUT_BYTES, "stderr");
+                    crate::util::truncate_sandwich(&cleaned_stderr, MAX_OUTPUT_BYTES, "stderr");
 
                 let (exit_code, exit_note) = match status.code() {
                     Some(c) => (c, format!("[exit status: {c}]")),
