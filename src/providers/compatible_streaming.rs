@@ -4,7 +4,10 @@
 
 use crate::{
     Reasoning, StreamChunk, StreamError, StreamEvent, StreamResult, ToolCall as ProviderToolCall,
-    providers::compatible::ApiToolCallFunction, providers::compatible::parse_tool_call_arguments,
+    providers::compatible::{
+        ApiToolCallFunction, parse_tool_call_arguments, resolve_tool_call_arguments,
+        resolve_tool_call_name,
+    },
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -68,24 +71,19 @@ impl StreamToolCallAccumulator {
             self.id = Some(id.clone());
         }
 
-        let delta_name = delta
-            .function
-            .as_ref()
-            .and_then(|function| function.name.as_ref())
-            .or(delta.name.as_ref())
-            .filter(|value| !value.is_empty());
-        if let Some(name) = delta_name {
-            self.name = Some(name.clone());
+        if let Some(name) = resolve_tool_call_name(
+            delta.function.as_ref().and_then(|f| f.name.as_deref()),
+            delta.name.as_deref(),
+        ) {
+            self.name = Some(name);
         }
 
-        if let Some(arguments_delta) = delta
-            .function
-            .as_ref()
-            .and_then(|function| function.arguments.as_ref())
-            .or(delta.arguments.as_ref())
-            .filter(|value| !value.is_empty())
-        {
-            self.arguments.push_str(arguments_delta);
+        if let Some(arguments_delta) = resolve_tool_call_arguments(
+            delta.function.as_ref().and_then(|f| f.arguments.as_deref()),
+            delta.arguments.as_deref(),
+            None,
+        ) {
+            self.arguments.push_str(&arguments_delta);
         }
     }
 
