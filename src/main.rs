@@ -236,17 +236,27 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     let mut tasks = JoinSet::<()>::new();
     let shutdown_token = mahbot::shutdown::shutdown_token();
 
-    tasks.spawn(run_cleanup_loop("Session cleanup", |cutoff| async move {
-        mahbot::session::cleanup_old_transient_sessions(&cutoff).await
-    }));
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "session-cleanup",
+        run_cleanup_loop("Session cleanup", |cutoff| async move {
+            mahbot::session::cleanup_old_transient_sessions(&cutoff).await
+        }),
+    );
 
-    tasks.spawn(run_cleanup_loop("Log cleanup", {
-        let store = log_store;
-        move |cutoff| {
-            let store = store.clone();
-            async move { store.delete_older_than("INFO", &cutoff).await }
-        }
-    }));
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "log-cleanup",
+        run_cleanup_loop("Log cleanup", {
+            let store = log_store;
+            move |cutoff| {
+                let store = store.clone();
+                async move { store.delete_older_than("INFO", &cutoff).await }
+            }
+        }),
+    );
 
     spawn_cancellable(
         &mut tasks,
