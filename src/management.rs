@@ -1639,11 +1639,14 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// Run diagnostics commands after the engineer completes development.
 ///
 /// Called by [`PollPhase::DiagnosticsCheck`] via [`spawn_dispatch`].
-/// Uses [`BoardStore::claim_diagnostics`] (atomic claim+phase check) to
-/// prevent double-dispatch. Unlike dispatch_engineer (which is dispatched
-/// from the atomic claim loop and already owns the ticket by the time its
-/// dispatch runs), diagnostics keeps the ticket in InDiagnostics while
-/// executing, so a separate atomic guard is needed to close the TOCTOU window.
+/// Checks the diagnostics-specific circuit breaker first (consistent with all
+/// other dispatchers — [`dispatch_engineer`], [`dispatch_sanitation`],
+/// [`dispatch_backlog_analysts`], [`dispatch_verifiers`]), then uses
+/// [`BoardStore::claim_diagnostics`] to set `assigned_to` and prevent
+/// double-dispatch. Unlike the pipeline-phase dispatchers (which are dispatched
+/// from the atomic claim loop and already own the ticket by the time their
+/// dispatch runs), diagnostics keeps the ticket in `InDiagnostics` while
+/// executing, so a separate atomic claim is needed to close the TOCTOU window.
 /// Loads discovered diagnostics commands for the workspace and runs them
 /// sequentially via [`run_diagnostics_commands`]. Stops at the first failure.
 /// After execution, transitions the ticket to either `DiagnosticsDone` (all
@@ -1651,6 +1654,24 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// trips (see [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
 #[allow(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
+    // Check circuit breaker before claiming the ticket, consistent with all
+    // other dispatchers. This eliminates a correctness risk: if the circuit
+    // breaker trips after the claim (the previous ordering), the ticket is left
+    // with `assigned_to` set but no agent running, stranding it until the
+    // re-dispatch guard in the next poll cycle recovers it.
+    if !is_phase_and_breaker_clear(
+        &ticket,
+        TicketPhase::InDiagnostics,
+        DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
+        count_diagnostics_failures,
+        diagnostics_breaker_comment,
+        "Diagnostics",
+    )
+    .await
+    {
+        return;
+    }
+
     match board().claim_diagnostics(&ticket.id).await {
         Err(e) => {
             error!(
@@ -1702,29 +1723,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         }
         return;
     };
-
-    // Check circuit breaker before running diagnostics.
-    // Counts prior diagnostics system comments that indicate failures, and
-    // fails the ticket if the count exceeds DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD
-    // (i.e., trip at ≥5 failures).
-    //
-    // Uses is_phase_and_breaker_clear which also re-checks the phase via
-    // is_ticket_in_phase. claim_diagnostics above already confirmed the phase,
-    // but the diagnostics loading step between then and now is a TOCTOU window
-    // where the ticket could have moved externally — the redundant phase check
-    // is a beneficial race-condition guard.
-    if !is_phase_and_breaker_clear(
-        &ticket,
-        TicketPhase::InDiagnostics,
-        DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
-        count_diagnostics_failures,
-        diagnostics_breaker_comment,
-        "Diagnostics",
-    )
-    .await
-    {
-        return;
-    }
 
     // 2. Run commands sequentially in the prescribed order.
     let (comment, all_passed) = run_diagnostics_commands(&diag, &ws).await;
