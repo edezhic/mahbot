@@ -544,9 +544,9 @@ impl OpenAiCompatibleProvider {
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning = Reasoning::from_optional_parts(
-            message.reasoning.clone(),
-            message.reasoning_content.clone(),
-            message.reasoning_details.clone(),
+            message.reasoning,
+            message.reasoning_content,
+            message.reasoning_details,
         );
         let tool_calls = message
             .tool_calls
@@ -633,8 +633,8 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     async fn chat(&self, request: ProviderChatRequest) -> anyhow::Result<ProviderChatResponse> {
-        let model = request.model.clone();
         let req_builder = self.build_chat_request_raw(&request, false);
+        let model = request.model;
 
         let response = crate::shutdown::race_shutdown(req_builder.send())
             .await
