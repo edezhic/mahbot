@@ -812,134 +812,108 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------
-    // resolve_tool_call_name unit tests
-    // ----------------------------------------------------------
-
     #[test]
-    fn resolve_tool_call_name_function_wins() {
-        // When both function.name and direct name are present, function wins
-        assert_eq!(
-            resolve_tool_call_name(Some("func_name"), Some("direct_name")),
-            Some("func_name".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_name_direct_fallback() {
-        // When function.name is None, falls back to direct name
-        assert_eq!(
-            resolve_tool_call_name(None, Some("direct_name")),
-            Some("direct_name".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_name_both_none() {
-        assert_eq!(resolve_tool_call_name(None, None), None);
-    }
-
-    #[test]
-    fn resolve_tool_call_name_empty_function_name() {
-        // Empty function name is filtered out, falls back to direct name
-        assert_eq!(
-            resolve_tool_call_name(Some(""), Some("direct_name")),
-            Some("direct_name".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_name_empty_direct_name() {
-        assert_eq!(
-            resolve_tool_call_name(Some("func_name"), Some("")),
-            Some("func_name".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_name_both_empty() {
-        assert_eq!(resolve_tool_call_name(Some(""), Some("")), None);
-    }
-
-    // ----------------------------------------------------------
-    // resolve_tool_call_arguments unit tests
-    // ----------------------------------------------------------
-
-    #[test]
-    fn resolve_tool_call_arguments_function_wins() {
-        assert_eq!(
-            resolve_tool_call_arguments(
-                Some("{\"key\":\"func_val\"}"),
-                Some("{\"key\":\"direct_val\"}"),
-                None,
+    fn resolve_tool_call_name_cases() {
+        let cases: &[(&str, Option<&str>, Option<&str>, Option<&str>)] = &[
+            (
+                "function wins",
+                Some("func_name"),
+                Some("direct_name"),
+                Some("func_name"),
             ),
-            Some("{\"key\":\"func_val\"}".to_string()),
-        );
+            (
+                "direct fallback",
+                None,
+                Some("direct_name"),
+                Some("direct_name"),
+            ),
+            ("both none", None, None, None),
+            (
+                "empty function name",
+                Some(""),
+                Some("direct_name"),
+                Some("direct_name"),
+            ),
+            (
+                "empty direct name",
+                Some("func_name"),
+                Some(""),
+                Some("func_name"),
+            ),
+            ("both empty", Some(""), Some(""), None),
+        ];
+        for (name, fn_name, direct_name, expected) in cases {
+            assert_eq!(
+                resolve_tool_call_name(*fn_name, *direct_name),
+                expected.map(String::from),
+                "{name}",
+            );
+        }
     }
 
     #[test]
-    fn resolve_tool_call_arguments_direct_fallback() {
-        assert_eq!(
-            resolve_tool_call_arguments(None, Some("{\"key\":\"val\"}"), None),
-            Some("{\"key\":\"val\"}".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_arguments_both_none() {
-        assert_eq!(resolve_tool_call_arguments(None, None, None), None);
-    }
-
-    #[test]
-    fn resolve_tool_call_arguments_empty_function_args() {
-        // Empty function arguments filtered out, falls back to direct
-        assert_eq!(
-            resolve_tool_call_arguments(Some(""), Some("{\"key\":\"val\"}"), None),
-            Some("{\"key\":\"val\"}".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_arguments_empty_direct_args() {
-        assert_eq!(
-            resolve_tool_call_arguments(Some("{\"key\":\"val\"}"), Some(""), None),
-            Some("{\"key\":\"val\"}".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_arguments_both_empty() {
-        assert_eq!(resolve_tool_call_arguments(Some(""), Some(""), None), None);
-    }
-
-    #[test]
-    fn resolve_tool_call_arguments_parameters_fallback() {
-        // DeepSeek compatibility: parameters object serialized as string
-        let params = serde_json::json!({"command": "pwd"});
-        assert_eq!(
-            resolve_tool_call_arguments(None, None, Some(&params)),
-            Some("{\"command\":\"pwd\"}".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_arguments_string_fields_empty_with_parameters() {
-        // Both string fields empty -> falls through to parameters
-        let params = serde_json::json!({"command": "ls"});
-        assert_eq!(
-            resolve_tool_call_arguments(Some(""), Some(""), Some(&params)),
-            Some("{\"command\":\"ls\"}".to_string()),
-        );
-    }
-
-    #[test]
-    fn resolve_tool_call_arguments_parameters_takes_precedence_over_none() {
-        // parameters is only considered when both string fields are absent/empty
-        let params = serde_json::json!({"query": "test"});
-        assert_eq!(
-            resolve_tool_call_arguments(Some("{\"key\":\"val\"}"), None, Some(&params)),
-            Some("{\"key\":\"val\"}".to_string()),
-        );
+    fn resolve_tool_call_arguments_cases() {
+        let cases: &[(&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
+            (
+                "function wins",
+                Some(r#"{"key":"func_val"}"#),
+                Some(r#"{"key":"direct_val"}"#),
+                None,
+                Some(r#"{"key":"func_val"}"#),
+            ),
+            (
+                "direct fallback",
+                None,
+                Some(r#"{"key":"val"}"#),
+                None,
+                Some(r#"{"key":"val"}"#),
+            ),
+            ("both none", None, None, None, None),
+            (
+                "empty function args",
+                Some(""),
+                Some(r#"{"key":"val"}"#),
+                None,
+                Some(r#"{"key":"val"}"#),
+            ),
+            (
+                "empty direct args",
+                Some(r#"{"key":"val"}"#),
+                Some(""),
+                None,
+                Some(r#"{"key":"val"}"#),
+            ),
+            ("both empty", Some(""), Some(""), None, None),
+            (
+                "parameters fallback",
+                None,
+                None,
+                Some(r#"{"command":"pwd"}"#),
+                Some(r#"{"command":"pwd"}"#),
+            ),
+            (
+                "string fields empty with parameters",
+                Some(""),
+                Some(""),
+                Some(r#"{"command":"ls"}"#),
+                Some(r#"{"command":"ls"}"#),
+            ),
+            (
+                "function wins over parameters",
+                Some(r#"{"key":"val"}"#),
+                None,
+                Some(r#"{"query":"test"}"#),
+                Some(r#"{"key":"val"}"#),
+            ),
+        ];
+        for (name, fn_args, direct_args, params_json, expected) in cases {
+            let params = params_json.map(|j| serde_json::from_str(j).expect(name));
+            assert_eq!(
+                resolve_tool_call_arguments(*fn_args, *direct_args, params.as_ref()),
+                expected.map(String::from),
+                "{name}",
+            );
+        }
     }
 
     // ----------------------------------------------------------
