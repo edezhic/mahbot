@@ -943,6 +943,11 @@ fn has_curl_output_flag(command: &str) -> bool {
     has_any_flag(command, &["-o", "--output", "-O", "--remote-name"])
 }
 
+/// Characters that are non-operation tar flags (format/output modifiers).
+/// These can appear alongside the operation flag in combined forms (e.g.
+/// `-tvf` combines `t` (list) with `v` (verbose) and `f` (file)).
+const TAR_SAFE_CHARS: &[char] = &['v', 'f', 'z', 'j', 'J'];
+
 /// Check if tar is using only `-t`/`--list` (list) mode. Handles combined flags.
 fn is_tar_list_only(command: &str) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
@@ -954,14 +959,14 @@ fn is_tar_list_only(command: &str) -> bool {
         }
         if part.starts_with('-') && !part.starts_with("--") {
             // Skip non-operation flags
-            if *part == "-v" || *part == "-f" || *part == "-z" || *part == "-j" || *part == "-J" {
+            if part.len() == 2 && TAR_SAFE_CHARS.contains(&part.chars().nth(1).unwrap()) {
                 continue;
             }
             // Check if this contains only 't' (and maybe v/f/z/j/J) as operation flags
             let ops: String = part
                 .chars()
                 .skip(1) // skip leading '-'
-                .filter(|c| !['v', 'f', 'z', 'j', 'J'].contains(c))
+                .filter(|c| !TAR_SAFE_CHARS.contains(c))
                 .collect();
             if !ops.is_empty() {
                 return ops == "t";
