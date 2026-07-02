@@ -449,13 +449,19 @@ impl Dashboard {
         iced::Theme::Dark
     }
 
-    fn save_and_exit(&self) -> Task<Message> {
+    /// Persist the current window position, size, selected workspace, and
+    /// selected user to `~/.mahbot/window-state.json`.
+    fn persist_window_state(&self) {
         save_window_state(
             self.last_position,
             self.last_size,
             self.selected_workspace_name.as_deref(),
             self.selected_user_name.as_deref(),
         );
+    }
+
+    fn save_and_exit(&self) -> Task<Message> {
+        self.persist_window_state();
         Task::perform(crate::checkpoint::checkpoint_all_databases(), |()| {
             Message::CheckpointAndExit
         })
@@ -678,12 +684,7 @@ impl Dashboard {
                 // selected_user_name and persist to window state.
                 if let home::HomeMessage::UserSelected(ref user) = msg {
                     self.selected_user_name = Some(user.clone());
-                    save_window_state(
-                        self.last_position,
-                        self.last_size,
-                        self.selected_workspace_name.as_deref(),
-                        self.selected_user_name.as_deref(),
-                    );
+                    self.persist_window_state();
                 }
                 self.home_state.update(msg).map(Message::Home)
             }
@@ -757,12 +758,7 @@ impl Dashboard {
                 {
                     if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
                         self.selected_user_name = Some("admin".to_string());
-                        save_window_state(
-                            self.last_position,
-                            self.last_size,
-                            self.selected_workspace_name.as_deref(),
-                            self.selected_user_name.as_deref(),
-                        );
+                        self.persist_window_state();
                         let switch =
                             Task::done(home::HomeMessage::UserSelected("admin".to_string()))
                                 .map(Message::Home);
@@ -923,12 +919,7 @@ impl Dashboard {
             Message::UpdateBot if self.ready => {
                 self.updating = true;
                 // Save window state before update (synchronous).
-                save_window_state(
-                    self.last_position,
-                    self.last_size,
-                    self.selected_workspace_name.as_deref(),
-                    self.selected_user_name.as_deref(),
-                );
+                self.persist_window_state();
                 Task::perform(
                     async {
                         crate::self_update::execute_update()
@@ -1093,12 +1084,7 @@ impl Dashboard {
             self.selected_workspace_name = None;
             self.paused = false;
             self.maintenance = false;
-            save_window_state(
-                self.last_position,
-                self.last_size,
-                None,
-                self.selected_user_name.as_deref(),
-            );
+            self.persist_window_state();
             self.propagate_workspace_selection("")
         } else {
             self.selected_workspace_name = Some(name.to_string());
@@ -1108,12 +1094,7 @@ impl Dashboard {
                 .get(name)
                 .copied()
                 .unwrap_or(false);
-            save_window_state(
-                self.last_position,
-                self.last_size,
-                Some(name),
-                self.selected_user_name.as_deref(),
-            );
+            self.persist_window_state();
             self.propagate_workspace_selection(name)
         }
     }
