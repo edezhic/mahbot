@@ -392,6 +392,11 @@ fn warn_transition_failed(
 /// paths (verdict handling, diagnostics completion, sanitation verdict, etc.) —
 /// no agents should be running on this ticket at any call site that reaches
 /// this function.
+///
+/// `pipeline_reservation` is forwarded to [`BoardStore::transition_to_tx`]; pass
+/// `Some(true)` for bounce-back transitions (back to
+/// [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets priority
+/// re-dispatch over fresh tickets, or `None` for all other transitions.
 #[allow(clippy::too_many_arguments)]
 async fn comment_and_transition(
     ticket: &Ticket,
@@ -402,6 +407,7 @@ async fn comment_and_transition(
     notify: NotifyPolicy,
     context_label: &str,
     verb: &str,
+    pipeline_reservation: Option<bool>,
 ) -> bool {
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
@@ -414,7 +420,7 @@ async fn comment_and_transition(
                 &ticket.id,
                 Some(source),
                 target,
-                None, // pipeline_reservation — not used in this path
+                pipeline_reservation,
             )
             .await?;
             Ok(())
@@ -1064,6 +1070,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         notify,
         "Engineer",
         verb,
+        None,
     )
     .await;
 }
@@ -1120,6 +1127,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
         notify_policy,
         source.as_ref(),
         "passed",
+        None,
     )
     .await;
 }
@@ -1139,6 +1147,7 @@ async fn transition_ticket_to_failed(
         NotifyPolicy::Notify,
         context_label,
         "failed",
+        None,
     )
     .await
 }
@@ -1534,6 +1543,7 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             NotifyPolicy::Buffer,
             "Sanitation",
             "passed",
+            None,
         )
         .await;
     } else {
@@ -1679,6 +1689,7 @@ async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
         NotifyPolicy::Buffer,
         "Diagnostics",
         verb,
+        None,
     )
     .await;
 }
@@ -1758,46 +1769,26 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 // Path C2: Diagnostics failed — write the failure comment and
                 // bounce back to development for rework.
                 //
-                // Both writes are wrapped in a single transaction to eliminate
-                // the crash window between comment insertion and phase transition,
-                // matching the pattern used by handle_sanitation_verdict. If the
-                // process crashes before the transaction commits, neither the
-                // comment nor the transition is persisted — the ticket stays in
-                // InDiagnostics and reset_inflight_tickets on the next startup
+                // Uses `comment_and_transition` (which wraps both writes in a
+                // single transaction) with `pipeline_reservation: Some(true)` to
+                // ensure the ticket gets priority re-dispatch over fresh tickets.
+                // If the process crashes before the transaction commits, neither
+                // the comment nor the transition is persisted — the ticket stays
+                // in InDiagnostics and reset_inflight_tickets on the next startup
                 // handles recovery without inflating the circuit breaker counter.
-                //
-                // Note: we use transition_to_tx (which does NOT cancel agents)
-                // instead of transition_to (which does). This is safe because
-                // diagnostics spawns no LLM agents and claim_diagnostics already
-                // cancels any stale agents from a prior crash cycle (matching the
-                // pattern used by handle_sanitation_verdict and all other
-                // transition_to_tx callers).
-                if let Err(e) = crate::turso::with_tx(
-                    &board().conn,
-                    &ticket.id,
-                    "diagnostics failure + bounce",
-                    async |tx| {
-                        BoardStore::add_comment_tx(tx, &ticket.id, DIAGNOSTICS_ROLE, &comment)
-                            .await?;
-                        BoardStore::transition_to_tx(
-                            tx,
-                            &ticket.id,
-                            Some(TicketPhase::InDiagnostics),
-                            TicketPhase::ReadyForDevelopment,
-                            Some(true),
-                        )
-                        .await?;
-                        Ok(())
-                    },
+                if !comment_and_transition(
+                    &ticket,
+                    DIAGNOSTICS_ROLE,
+                    &comment,
+                    TicketPhase::InDiagnostics,
+                    TicketPhase::ReadyForDevelopment,
+                    NotifyPolicy::Buffer,
+                    "diagnostics_failure",
+                    "failed",
+                    Some(true),
                 )
                 .await
                 {
-                    warn!(
-                        ticket = %ticket.id,
-                        error = %e,
-                        "Failed to write diagnostics failure comment and \
-                         transition ticket — transaction rolled back",
-                    );
                     return;
                 }
 
@@ -1805,17 +1796,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                     ticket = %ticket.id,
                     "Diagnostics failed — pipeline reservation set for rework priority",
                 );
-
-                // Notification fires after the transaction commits so the user
-                // always sees the new phase in the database.
-                dispatch_notification(
-                    &ticket,
-                    TicketPhase::InDiagnostics,
-                    TicketPhase::ReadyForDevelopment,
-                    NotifyPolicy::Buffer,
-                    "diagnostics_failure",
-                )
-                .await;
             }
         }
         Ok(_) => {
@@ -2180,6 +2160,7 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
         NotifyPolicy::Notify,
         "Analyst",
         "completed",
+        None,
     )
     .await
     {
