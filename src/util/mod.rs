@@ -337,6 +337,27 @@ pub(crate) fn plaintext_from_reasoning_details(details: &Value) -> String {
     out
 }
 
+/// Strip `<think>...</think>` reasoning blocks from model output.
+///
+/// Some models (e.g. `MiniMax`) embed their reasoning inline in `content` using
+/// `<think>...</think>` tags instead of (or in addition to) the standard
+/// `reasoning_content` API field.
+///
+/// Returns `None` when stripping leaves an empty string (the model only emitted
+/// reasoning wrapped in think tags with no visible output).
+#[must_use]
+pub(crate) fn strip_think_tags(s: &str) -> Option<String> {
+    static THINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<think>.*?</think>|<think>.*$").expect("think tag regex must compile")
+    });
+    let stripped = THINK_RE.replace_all(s, "").trim().to_string();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
+    }
+}
+
 /// Prefer `reasoning_content`, then `reasoning` (`OpenRouter`). **Display / effective text only**
 /// — never use for API replay fields.
 pub(crate) fn merged_reasoning_string(
@@ -791,5 +812,68 @@ mod scrub_tests {
         for &(name, input) in CASES {
             assert_eq!(scrub_credentials(input), input, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod strip_think_tag_tests {
+    use super::strip_think_tags;
+
+    #[test]
+    fn strips_inline_think_block() {
+        assert_eq!(
+            strip_think_tags("visible<think>hidden"),
+            Some("visible".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_multiple_think_blocks() {
+        assert_eq!(
+            strip_think_tags("Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"),
+            Some("Answer A  and B  done".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_unclosed_think_tag() {
+        assert_eq!(
+            strip_think_tags("Visible<think>hidden tail"),
+            Some("Visible".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_multiline_think_block() {
+        assert_eq!(
+            strip_think_tags("Hello<think>\nmulti\nline\n</think>world"),
+            Some("Helloworld".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_multiple_multiline_blocks() {
+        assert_eq!(
+            strip_think_tags("<think>\nblock 1\n</think>A<think>\nblock 2\n</think>B"),
+            Some("AB".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_empty_think_block() {
+        assert_eq!(
+            strip_think_tags("before<think></think>after"),
+            Some("beforeafter".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_only_think_tags() {
+        assert_eq!(strip_think_tags("<think>hidden</think>"), None);
+    }
+
+    #[test]
+    fn returns_none_for_whitespace_only() {
+        assert_eq!(strip_think_tags("  <think>content</think>  "), None);
     }
 }

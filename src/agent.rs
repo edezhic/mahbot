@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use crate::providers::compatible::strip_think_tags;
 use crate::providers::reasoning_roundtrip::{
     assistant_replay_payload, coalesce_streamed_reasoning_details, merge_reasoning_details_delta,
     push_reasoning_delta,
@@ -11,6 +10,7 @@ use crate::tools::{
     AskTool, DispatchMode, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
     normalize_tool_call, sanitize_success_tool_output, unknown_tool_message,
 };
+use crate::util::strip_think_tags;
 use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
 use crate::{
     Agent, ChatMessage, ChatRequest, ChatResponse, Reasoning, Role, StreamChunk, StreamEvent, Tool,
@@ -719,17 +719,9 @@ async fn stream_assistant_response(request: ChatRequest) -> anyhow::Result<ChatR
     let reasoning = Reasoning::from_optional_parts(reasoning, reasoning_content, coalesced_details);
 
     // Strip <think>...</think> blocks that some models embed inline in content.
-    // Mirror the non-streaming path (effective_content_optional) which returns
-    // None when stripping leaves an empty string (the model only emitted
+    // Returns None when stripping leaves an empty string (the model only emitted
     // reasoning wrapped in think tags — fall through to reasoning display).
-    let text = {
-        let stripped = strip_think_tags(&response_text);
-        if stripped.is_empty() {
-            None
-        } else {
-            Some(stripped)
-        }
-    };
+    let text = strip_think_tags(&response_text);
 
     Ok(ChatResponse {
         text,

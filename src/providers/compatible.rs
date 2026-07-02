@@ -14,13 +14,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
-use regex::Regex;
 use reqwest::{
     Client, RequestBuilder,
     header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 use std::sync::OnceLock;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
@@ -156,12 +154,6 @@ struct Choice {
 /// Some reasoning models (e.g. `MiniMax`) embed their chain-of-thought inline
 /// in the `content` field rather than a separate `reasoning_content` field.
 /// The resulting `<think>` tags must be stripped before returning to the user.
-pub(crate) fn strip_think_tags(s: &str) -> String {
-    static THINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)<think>.*?</think>|<think>.*$").expect("think tag regex must compile")
-    });
-    THINK_RE.replace_all(s, "").trim().to_string()
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
@@ -186,11 +178,10 @@ impl ResponseMessage {
     /// Strips `<think>...</think>` blocks that some models (e.g. `MiniMax`) embed
     /// inline in `content` instead of using a separate field.
     fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return Some(stripped);
-            }
+        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty())
+            && let Some(stripped) = crate::util::strip_think_tags(content)
+        {
+            return Some(stripped);
         }
 
         crate::util::merged_reasoning_string(
@@ -994,31 +985,6 @@ mod tests {
             Some(MessageContent::Text(value))
                 if value == "System primer [IMAGE:data:image/png;base64,abcd] user turn"
         ));
-    }
-
-    #[test]
-    fn strip_think_tags_tests() {
-        assert_eq!(strip_think_tags("visible<think>hidden"), "visible");
-        assert_eq!(
-            strip_think_tags("Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"),
-            "Answer A  and B  done"
-        );
-        assert_eq!(strip_think_tags("Visible<think>hidden tail"), "Visible");
-        // Multi-line think block (requires (?s) dotall flag)
-        assert_eq!(
-            strip_think_tags("Hello<think>\nmulti\nline\n</think>world"),
-            "Helloworld"
-        );
-        // Multiple multi-line blocks
-        assert_eq!(
-            strip_think_tags("<think>\nblock 1\n</think>A<think>\nblock 2\n</think>B"),
-            "AB"
-        );
-        // Empty think block
-        assert_eq!(
-            strip_think_tags("before<think></think>after"),
-            "beforeafter"
-        );
     }
 
     #[test]
