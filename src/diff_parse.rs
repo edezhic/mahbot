@@ -187,9 +187,15 @@ impl DiffParser {
     /// Handle a content line within a hunk: classify as Added/Removed/Context, track
     /// line numbers, and push to the hunk.
     ///
-    /// Annotation lines (`\ No newline at end of file` or unknown lines) are silently
+    /// Annotation lines (`\ No newline at end of file`) are filtered early, before the
+    /// hunk guard, since they are not diff content. Unknown lines are also silently
     /// skipped — the caller continues normally.
     fn handle_diff_content_line(&mut self, line: &str) {
+        // Annotation lines are not diff content — skip regardless of hunk state.
+        if line == r"\ No newline at end of file" {
+            return;
+        }
+
         // If no hunk is active, this line falls outside any diff hunk — skip.
         let Some(hunk) = self.current_hunk.as_mut() else {
             return;
@@ -201,9 +207,6 @@ impl DiffParser {
             DiffLineKind::Removed
         } else if line.starts_with(' ') {
             DiffLineKind::Context
-        } else if line == r"\ No newline at end of file" {
-            // Skip this annotation — handled implicitly
-            return;
         } else {
             // Unknown line — skip
             return;
