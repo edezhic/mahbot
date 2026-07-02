@@ -1619,10 +1619,31 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
 // ── Navigation sidebar ──────────────────────────────────────────
 
 impl Dashboard {
-    #[allow(clippy::too_many_lines)]
     fn sidebar_view(&self) -> Element<'_, Message> {
-        // Sidebar navigation: Home, Editor, Shell (icon-only, 28px)
-        let mut nav_col = Column::new().spacing(4);
+        container(
+            column![
+                self.render_sidebar_nav(),
+                Space::new().height(Length::Fill),
+                self.render_maintainer_toggle(),
+                self.render_pause_toggle(),
+            ]
+            .spacing(2),
+        )
+        .width(Length::Fixed(56.0))
+        .height(Length::Fill)
+        .style(theme::surface_container_style)
+        .padding(12)
+        .into()
+    }
+
+    /// Sidebar navigation icons: Home, Editor, Shell (28px).
+    ///
+    /// Nav buttons use position::Position::Right to avoid clipping off the left
+    /// edge of the 56px-wide sidebar container — Position::Top would overflow
+    /// the narrow column. The adjacent toggle buttons below use Position::Top
+    /// because they have more vertical room before reaching the sidebar top edge.
+    fn render_sidebar_nav(&self) -> Element<'_, Message> {
+        let mut col = Column::new().spacing(2);
         for page in Page::sidebar_pages() {
             let is_active = self.page == *page;
             // Editor, Shell require any workspace (shared or personal with a user selected).
@@ -1672,25 +1693,17 @@ impl Dashboard {
             } else {
                 page.label().to_string()
             };
-            // Sidebar nav buttons use Position::Right to avoid clipping off the left edge
-            // of the 56px-wide sidebar container — Position::Top would overflow the narrow
-            // column. The adjacent maintainer/pause toggles below use Position::Top because
-            // they are positioned below the spacer and have more vertical room before
-            // reaching the sidebar top edge.
             let nav_btn = tooltip(btn, text(tooltip_text).size(11), tooltip::Position::Right)
                 .style(theme::tooltip_style);
-            nav_col = nav_col.push(nav_btn);
+            col = col.push(nav_btn);
         }
+        col.into()
+    }
 
-        // Spacer to push buttons to the bottom of the sidebar
-        nav_col = nav_col.push(Space::new().height(Length::Fill));
-
-        // Determine whether a shared workspace is selected (Personal mode has no
-        // workspace-level pipeline or maintainer toggles).
+    /// Per-workspace Maintainer toggle button.
+    /// Disabled when no workspace is selected (Personal mode).
+    fn render_maintainer_toggle(&self) -> Element<'_, Message> {
         let has_ws = self.has_active_workspace();
-
-        // Per-workspace Maintainer toggle.
-        // Positioned immediately above the pause button.
         let maint_icon = column![
             text("Maint").size(8).color(theme::TEXT_MUTED),
             text(if self.maintenance { "ON" } else { "OFF" })
@@ -1703,7 +1716,7 @@ impl Dashboard {
         ]
         .spacing(0)
         .align_x(Alignment::Center);
-        let maint_btn = tooltip(
+        tooltip(
             button(
                 container(maint_icon)
                     .width(Length::Fill)
@@ -1728,11 +1741,14 @@ impl Dashboard {
             .size(11),
             tooltip::Position::Top,
         )
-        .style(theme::tooltip_style);
-        nav_col = nav_col.push(maint_btn);
+        .style(theme::tooltip_style)
+        .into()
+    }
 
-        // Per-workspace pipeline pause/unpause toggle.
-        // Disabled when no workspace is selected (Personal mode).
+    /// Per-workspace pipeline pause/unpause toggle button.
+    /// Disabled when no workspace is selected (Personal mode).
+    fn render_pause_toggle(&self) -> Element<'_, Message> {
+        let has_ws = self.has_active_workspace();
         let pause_icon = if !has_ws {
             lucide::pause::<iced::Theme, iced::Renderer>()
                 .size(28)
@@ -1746,7 +1762,7 @@ impl Dashboard {
                 .size(28)
                 .color(theme::TEXT_MUTED)
         };
-        let pause_btn = tooltip(
+        tooltip(
             button(
                 container(pause_icon)
                     .width(Length::Fill)
@@ -1771,17 +1787,8 @@ impl Dashboard {
             .size(11),
             tooltip::Position::Top,
         )
-        .style(theme::tooltip_style);
-        nav_col = nav_col.push(pause_btn);
-
-        let inner = nav_col.spacing(2);
-
-        container(inner)
-            .width(Length::Fixed(56.0))
-            .height(Length::Fill)
-            .style(theme::surface_container_style)
-            .padding(12)
-            .into()
+        .style(theme::tooltip_style)
+        .into()
     }
 
     /// Render the self-update button in the footer bar.
