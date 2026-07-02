@@ -608,9 +608,9 @@ impl BoardStore {
     /// Callers must not call `self.conn` methods until the guard is dropped
     /// or committed — `TxGuard` holds a tokio mutex lock.
     ///
-    /// # Safety (TOCTOU)
+    /// # Correctness (TOCTOU)
     ///
-    /// Safety relies on both the tokio mutex inside `conn` (serializes
+    /// Correctness relies on both the tokio mutex inside `conn` (serializes
     /// Rust-level writes) and the SQLite transaction `tx` (provides
     /// database-level isolation) — no concurrent write can change
     /// prerequisite tickets between validation and the caller's INSERT.

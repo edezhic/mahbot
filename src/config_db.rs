@@ -236,7 +236,7 @@ impl ConfigStore {
     /// Execute a read-only query with a row mapper, collecting all results into
     /// a `Vec`.  Shared implementation for all `get_all_*` methods.
     ///
-    /// # Safety
+    /// # Correctness
     ///
     /// `columns`, `table`, and `order_by` are always compile-time string
     /// literals supplied by the caller; they are never user-provided, so the

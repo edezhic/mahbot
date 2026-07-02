@@ -384,11 +384,11 @@ fn warn_transition_failed(
 /// This is atomic — there is no crash window between comment and transition
 /// where an orphaned comment could persist.
 ///
-/// # SAFETY
+/// # Correctness
 ///
 /// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
 /// agents (unlike [`BoardStore::transition_to`] / `execute_and_cancel`).
-/// This is safe because `comment_and_transition` is only called from post-agent
+/// This is correct because `comment_and_transition` is only called from post-agent
 /// paths (verdict handling, diagnostics completion, sanitation verdict, etc.) —
 /// no agents should be running on this ticket at any call site that reaches
 /// this function.
