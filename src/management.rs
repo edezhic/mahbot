@@ -186,7 +186,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// failure threshold to prevent dispatch thrashing).
 ///
 /// This is the recommended entry point for all dispatch-phase guard logic.
-/// See [`is_phase_and_circuit_breaker_clear`] for the default general-breaker variant.
+/// See [`is_phase_and_general_breaker_clear`] for the default general-breaker variant.
 ///
 /// # Parameters
 ///
@@ -247,7 +247,7 @@ async fn is_phase_and_breaker_clear(
 /// Callers that need a domain-specific circuit breaker (sanitation, diagnostics)
 /// should use [`is_phase_and_breaker_clear`] directly with custom parameters.
 #[must_use]
-async fn is_phase_and_circuit_breaker_clear(
+async fn is_phase_and_general_breaker_clear(
     ticket: &Ticket,
     expected_phase: TicketPhase,
     label: &str,
@@ -988,7 +988,7 @@ async fn poll_round() -> anyhow::Result<()> {
 
 /// Run an Engineer agent to implement the ticket.
 ///
-/// Guards with [`is_phase_and_circuit_breaker_clear`] (phase check + comment-count
+/// Guards with [`is_phase_and_general_breaker_clear`] (phase check + comment-count
 /// circuit breaker) before starting. Gathers feedback comments from all roles
 /// since the last engineer run and includes them in the agent prompt. After the
 /// agent finishes, performs a post-run phase check to catch race conditions,
@@ -998,7 +998,7 @@ async fn poll_round() -> anyhow::Result<()> {
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Engineer.as_str());
 
-    if !is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InDevelopment, "Engineer").await {
+    if !is_phase_and_general_breaker_clear(&ticket, TicketPhase::InDevelopment, "Engineer").await {
         return;
     }
 
@@ -1970,7 +1970,7 @@ async fn record_verdict_comments(
 /// Shared orchestration skeleton for dispatch functions that spawn parallel
 /// agents and then process results via extraction.
 ///
-/// 1. Runs [`is_phase_and_circuit_breaker_clear`] (phase check + circuit breaker)
+/// 1. Runs [`is_phase_and_general_breaker_clear`] (phase check + circuit breaker)
 /// 2. Spawns agents via [`run_parallel_with_extraction`]
 /// 3. Runs a post-dispatch phase check (guard against race conditions)
 ///
@@ -1987,7 +1987,7 @@ async fn dispatch_parallel_with_guard(
     prompt: &str,
     extraction_prompt: &str,
 ) -> Option<Vec<ParallelVerdict>> {
-    if !is_phase_and_circuit_breaker_clear(ticket, guard_phase, guard_label).await {
+    if !is_phase_and_general_breaker_clear(ticket, guard_phase, guard_label).await {
         return None;
     }
     let results = run_parallel_with_extraction(ticket, ws, role, prompt, extraction_prompt).await;
@@ -2004,7 +2004,7 @@ async fn dispatch_parallel_with_guard(
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYSIS_THRESHOLD`/10)
 /// - Planning (notify) when any analyst fails, with a comment listing the counts
 ///
-/// Before spawning agents, [`is_phase_and_circuit_breaker_clear`] checks the phase and
+/// Before spawning agents, [`is_phase_and_general_breaker_clear`] checks the phase and
 /// trips the comment-count circuit breaker (which may transition the ticket to
 /// Failed for Manager triage). Returns `false` when the caller should abort.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
@@ -2334,7 +2334,7 @@ async fn is_circuit_breaker_tripped(
 /// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
 ///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (via
 ///    [`transition_ticket`]). The circuit
-///    breaker is checked *before* dispatch by [`is_phase_and_circuit_breaker_clear`], so only
+///    breaker is checked *before* dispatch by [`is_phase_and_general_breaker_clear`], so only
 ///    the bounce-back is needed here.
 ///
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
@@ -2472,7 +2472,7 @@ mod tests {
     };
     use crate::workspace::test_ws_named;
 
-    /// Verify that `is_phase_and_circuit_breaker_clear` rejects a ticket
+    /// Verify that `is_phase_and_general_breaker_clear` rejects a ticket
     /// whose phase does not match `expected_phase`. This validates that the
     /// pre-agent guard works correctly for `dispatch_verifiers` (and all
     /// other agent-spawning dispatch functions).
@@ -2503,15 +2503,15 @@ mod tests {
 
         // Call with wrong phase — guard should reject immediately
         assert!(
-            !is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InReview, "test_label").await,
-            "is_phase_and_circuit_breaker_clear must reject a phase mismatch"
+            !is_phase_and_general_breaker_clear(&ticket, TicketPhase::InReview, "test_label").await,
+            "is_phase_and_general_breaker_clear must reject a phase mismatch"
         );
 
         // Call with correct phase and 0 comments (below threshold) — guard should pass
         assert!(
-            is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InDevelopment, "test_label")
+            is_phase_and_general_breaker_clear(&ticket, TicketPhase::InDevelopment, "test_label")
                 .await,
-            "is_phase_and_circuit_breaker_clear must pass when phase matches and comments are below threshold"
+            "is_phase_and_general_breaker_clear must pass when phase matches and comments are below threshold"
         );
     }
 
@@ -3243,7 +3243,7 @@ mod tests {
     /// *not* filter out its own trip comment (unlike the diagnostics breaker
     /// which has explicit self-counting prevention). Cascade prevention relies
     /// on the phase guard: after tripping, the ticket transitions to Failed,
-    /// and `is_phase_and_circuit_breaker_clear` rejects the next cycle via
+    /// and `is_phase_and_general_breaker_clear` rejects the next cycle via
     /// phase mismatch before the breaker is called.
     #[tokio::test]
     async fn circuit_breaker_guard_prevents_retrip() {
@@ -3303,7 +3303,7 @@ mod tests {
         let ticket = expect_ticket(board(), &ticket_id).await;
 
         let guarded =
-            is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InReview, "test").await;
+            is_phase_and_general_breaker_clear(&ticket, TicketPhase::InReview, "test").await;
         assert!(
             !guarded,
             "phase guard must reject re-trip (ticket is now Failed)"
