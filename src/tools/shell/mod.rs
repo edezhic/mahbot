@@ -1397,6 +1397,18 @@ fn split_head_tail(
     }
 }
 
+/// Build a head/tail sandwich with an omitted-lines marker in the middle.
+fn format_sandwich(output: &str, head: usize, tail: usize) -> String {
+    let (head_lines, omitted, tail_lines) = split_head_tail(output, head, tail);
+    if omitted == 0 {
+        return output.to_string();
+    }
+    let mut v = head_lines;
+    v.push(format!("... ({omitted} lines omitted)"));
+    v.extend(tail_lines);
+    v.join("\n")
+}
+
 /// Apply line truncation: head/tail sandwich (byte-gated), `max_lines`-only absolute cap, or passthrough.
 ///
 /// Returns `(truncated_output, pre_truncation_copy)` where the copy captures the
@@ -1431,11 +1443,7 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
     // 2. max_lines-only absolute cap, OR
     // 3. passthrough.
     let result = if should_sandwich {
-        let (head_lines, omitted, tail_lines) = split_head_tail(output, head, tail);
-        let mut v = head_lines;
-        v.push(format!("... ({omitted} lines omitted)"));
-        v.extend(tail_lines);
-        v.join("\n")
+        format_sandwich(output, head, tail)
     } else if let Some(max) = max {
         cap_at_max_lines(output, max)
     } else {
@@ -1739,19 +1747,7 @@ fn format_spill_preview(output: &str, path: &Path) -> String {
     let line_count = output.lines().count();
     let byte_count = output.len();
     let header = format_spill_header(path, byte_count, line_count);
-
-    let (head_lines, omitted, tail_lines) = split_head_tail(output, 5, 5);
-    if omitted == 0 {
-        format!("{header}{output}")
-    } else {
-        format!(
-            "{}{}\n... ({} lines omitted)\n{}",
-            header,
-            head_lines.join("\n"),
-            omitted,
-            tail_lines.join("\n"),
-        )
-    }
+    format!("{header}{}", format_sandwich(output, 5, 5))
 }
 
 /// Get the shared temp directory for spill files and raw output logs.
@@ -3366,6 +3362,35 @@ mod tests {
         let (result, pre) = apply_line_truncation(output, &p);
         assert_eq!(result, output, "not enough lines to truncate");
         assert_eq!(pre, None);
+    }
+
+    // ── format_sandwich tests ──────────────────────────────────────────
+
+    #[test]
+    fn format_sandwich_passthrough_when_fits() {
+        let output = "a\nb\nc";
+        assert_eq!(format_sandwich(output, 2, 2), output);
+    }
+
+    #[test]
+    fn format_sandwich_omits_middle_lines() {
+        let output = "a\nb\nc\nd\ne\nf\ng";
+        let result = format_sandwich(output, 2, 2);
+        assert_eq!(result, "a\nb\n... (3 lines omitted)\nf\ng");
+    }
+
+    #[test]
+    fn format_sandwich_head_only() {
+        let output = "a\nb\nc\nd\ne\nf\ng";
+        let result = format_sandwich(output, 7, 0);
+        assert_eq!(result, "a\nb\nc\nd\ne\nf\ng");
+    }
+
+    #[test]
+    fn format_sandwich_tail_only() {
+        let output = "a\nb\nc\nd\ne\nf\ng";
+        let result = format_sandwich(output, 0, 7);
+        assert_eq!(result, "a\nb\nc\nd\ne\nf\ng");
     }
 
     // ── finish_shell_output credential scrubbing tests ────────────────
