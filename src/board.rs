@@ -3570,42 +3570,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         };
     }
 
-    async fn set_commit_info_tx_inner(should_commit: bool) {
-        let (store, _tmp, id) = setup().await;
-
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
-            .await
-            .expect("set_commit_info_tx");
-        let label = commit_or_rollback(tx, should_commit).await;
-
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        if should_commit {
-            assert_eq!(
-                ticket.commit_hash.as_deref(),
-                Some("abcdef0123456789abcdef0123456789abcd0123"),
-                "({label}) commit_hash",
-            );
-            assert_eq!(ticket.lines_added, Some(10), "({label}) lines_added");
-            assert_eq!(ticket.lines_removed, Some(5), "({label}) lines_removed");
-        } else {
-            assert_eq!(
-                ticket.commit_hash, None,
-                "({label}) commit_hash after rollback"
-            );
-            assert_eq!(
-                ticket.lines_added, None,
-                "({label}) lines_added after rollback"
-            );
-            assert_eq!(
-                ticket.lines_removed, None,
-                "({label}) lines_removed after rollback"
-            );
-        }
-    }
-
-    transaction_test!(test_set_commit_info_tx, set_commit_info_tx_inner);
-
     async fn add_comment_tx_inner(should_commit: bool) {
         let (store, _tmp, id) = setup().await;
 
@@ -3667,8 +3631,14 @@ with a comment explaining why no agent is mid-execution in that state.\
 
     async fn transactional_triple_write_inner(should_commit: bool) {
         // Exercise the full pattern used by commit_and_transition_ticket:
-        // all three _tx writes in one transaction → commit → all visible
-        // (or rollback → none persist).
+        // all three _tx writes (set_commit_info_tx, transition_to_tx,
+        // add_comment_tx) in one transaction → commit → all visible
+        // (or rollback → none persist).  This is the sole transactional
+        // test for set_commit_info_tx (its standalone test was removed
+        // as subsumed); the commit_hash, lines_added, and lines_removed
+        // assertions below verify its behavior under both commit and
+        // rollback, complementing the non-transactional coverage in
+        // test_set_commit_info.
         // Now delegates to the real production method BoardStore::finalize_done_tx.
         let (store, _tmp, id) = setup().await;
         store
@@ -3699,6 +3669,8 @@ with a comment explaining why no agent is mid-execution in that state.\
                 Some("abcdef0123456789abcdef0123456789abcd0123"),
                 "({label}) commit_hash",
             );
+            assert_eq!(ticket.lines_added, Some(10), "({label}) lines_added");
+            assert_eq!(ticket.lines_removed, Some(5), "({label}) lines_removed");
             assert_eq!(ticket.phase, TicketPhase::Done, "({label}) phase");
             assert_eq!(comments.len(), 1, "({label}) comments.len");
             assert_eq!(
@@ -3710,6 +3682,14 @@ with a comment explaining why no agent is mid-execution in that state.\
             assert_eq!(
                 ticket.commit_hash, None,
                 "({label}) commit_hash after rollback"
+            );
+            assert_eq!(
+                ticket.lines_added, None,
+                "({label}) lines_added after rollback"
+            );
+            assert_eq!(
+                ticket.lines_removed, None,
+                "({label}) lines_removed after rollback"
             );
             assert_eq!(
                 ticket.phase,
