@@ -1678,6 +1678,13 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             // 2. Run commands sequentially in the prescribed order.
             let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
 
+            // Post-run check: verify ticket hasn't been moved externally while
+            // diagnostics commands ran. Consistent with dispatch_engineer and
+            // dispatch_sanitation.
+            if !is_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
+                return;
+            }
+
             if all_passed {
                 // Path C1: All diagnostics passed — transition to DiagnosticsDone.
                 comment_and_transition(
