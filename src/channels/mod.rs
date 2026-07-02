@@ -392,7 +392,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     };
 
     for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {
-        let whole = caps.get(0).unwrap();
+        let whole = caps.get_match();
         let kind = caps
             .name("kind")
             .expect("MEDIA_MARKER_RE: expected 'kind' group")
@@ -490,7 +490,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                     .as_str()
                     == "IMAGE"
             {
-                caps.get(0).unwrap().as_str().to_string()
+                caps.get_match().as_str().to_string()
             } else {
                 String::new()
             }

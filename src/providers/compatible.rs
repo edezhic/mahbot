@@ -353,7 +353,7 @@ fn parse_image_markers(content: &str) -> (String, Vec<String>) {
                 String::new()
             } else {
                 // AUDIO/VIDEO markers are preserved verbatim.
-                caps.get(0).unwrap().as_str().to_string()
+                caps.get_match().as_str().to_string()
             }
         })
         .to_string();

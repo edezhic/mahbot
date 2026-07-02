@@ -378,7 +378,7 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
             // as original text, mirroring the old hand-rolled parser's behavior
             // where `target.is_empty()` after trim caused the marker to be kept.
             if path.is_empty() {
-                return caps.get(0).unwrap().as_str().to_string();
+                return caps.get_match().as_str().to_string();
             }
 
             if let Some(kind) = TelegramAttachmentKind::from_marker(kind_str) {
