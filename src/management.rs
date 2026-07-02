@@ -1438,7 +1438,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    let Some(ref _text) = response else {
+    if response.is_none() {
         // Agent failed or was cancelled — record failure and clear assigned_to
         // for re-dispatch retry. The system comment lets the sanitation circuit
         // breaker detect repeated failures.
@@ -1448,7 +1448,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         );
         record_sanitation_failure(&ticket.id, "agent returned no output").await;
         return;
-    };
+    }
 
     let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
     let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
