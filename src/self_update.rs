@@ -174,12 +174,14 @@ fn try_flock(file: &File) -> Result<bool> {
 #[cfg(windows)]
 fn try_flock(file: &File) -> Result<bool> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
     use windows_sys::Win32::Storage::FileSystem::{
         LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     };
 
     let handle = file.as_raw_handle() as HANDLE;
+
+    const LOCK_VIOLATION: i32 = ERROR_LOCK_VIOLATION as i32;
 
     // Set HANDLE_FLAG_INHERIT to 0 so child processes don't inherit the lock.
     unsafe {
@@ -203,7 +205,7 @@ fn try_flock(file: &File) -> Result<bool> {
     } else {
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(33) | Some(36) => Ok(false), // ERROR_LOCK_VIOLATION or ERROR_SHARING_VIOLATION
+            Some(LOCK_VIOLATION) => Ok(false),
             _ => Err(anyhow::Error::from(err).context("LockFileEx failed on lock file")),
         }
     }
