@@ -278,21 +278,17 @@ async fn download_retry_loop() {
             ),
         );
 
-        if let (Err(e_model), Err(e_tokenizer)) = (&model_result, &tokenizer_result) {
-            warn!(
-                model_error = %e_model,
-                tokenizer_error = %e_tokenizer,
-                retry_after_secs = delay.as_secs(),
-                "Failed to download embedding model files, retrying"
-            );
-        } else if let Err(e) = &model_result {
-            warn!(error = %e, retry_after_secs = delay.as_secs(), "Failed to download embedding model, retrying");
-        } else if let Err(e) = &tokenizer_result {
-            warn!(error = %e, retry_after_secs = delay.as_secs(), "Failed to download tokenizer, retrying");
-        }
-
         let model_ok = model_result.is_ok();
         let tokenizer_ok = tokenizer_result.is_ok();
+
+        if let Err(e) = &model_result {
+            warn!(error = %e, retry_after_secs = delay.as_secs(), "Failed to download embedding model, retrying");
+            let _ = std::fs::remove_file(model_dest.with_extension("tmp"));
+        }
+        if let Err(e) = &tokenizer_result {
+            warn!(error = %e, retry_after_secs = delay.as_secs(), "Failed to download tokenizer, retrying");
+            let _ = std::fs::remove_file(tokenizer_dest.with_extension("tmp"));
+        }
 
         if model_ok && tokenizer_ok {
             // Both downloaded successfully — try to load the embedder
@@ -308,18 +304,6 @@ async fn download_retry_loop() {
                     // Don't delete cached files — load failure may be a code bug,
                     // not file corruption. The backoff will apply and we'll retry.
                 }
-            }
-        } else {
-            // Partial failure: at least one download failed.
-            // Don't delete successfully downloaded files — maybe_download
-            // skips existing files on the next iteration, so a valid file
-            // from a partial success is reused without re-downloading.
-            if !model_ok {
-                // Clean up .tmp file that download_file may have left on error
-                let _ = std::fs::remove_file(model_dest.with_extension("tmp"));
-            }
-            if !tokenizer_ok {
-                let _ = std::fs::remove_file(tokenizer_dest.with_extension("tmp"));
             }
         }
 
