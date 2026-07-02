@@ -1,6 +1,5 @@
 //! A [`cosmic_text::Buffer`]-backed text buffer with cursor and selection
-//! management. Intended as a drop-in replacement for `text_editor::Content`
-//! in the editor.rs codebase.
+//! management. Serves as the core text editing buffer for the editor.rs codebase.
 
 use std::cell::{Cell, RefCell};
 
@@ -173,8 +172,8 @@ pub enum EditorAction {
 
 /// A text buffer backed by [`cosmic_text::Buffer`] with manual cursor and
 /// selection tracking. All mutating methods take `&self` using interior
-/// mutability (`Cell` / `RefCell`) so the buffer can be used from Iced's
-/// `view()` without a `&mut` reference.
+/// mutability (`Cell` / `RefCell`) so the buffer can be used throughout
+/// Iced's widget tree without requiring `&mut` access.
 pub struct EditorBuffer {
     buffer: RefCell<cosmic_text::Buffer>,
     cursor_line: Cell<usize>,

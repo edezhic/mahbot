@@ -1951,7 +1951,7 @@ impl EditorState {
         self.active_modal.as_ref()
     }
 
-    /// Returns `true` when a modal overlay or text input owns keyboard focus
+    /// Returns `true` when a modal overlay owns keyboard focus
     /// and editor-wide shortcuts (undo, save, tab switch, etc.) must not run.
     fn modal_overlay_blocks_editor_shortcuts(&self) -> bool {
         self.active_modal().is_some()
