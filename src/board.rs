@@ -1,6 +1,6 @@
 //! Ticket/board system — Turso-backed task management.
 
-use crate::role::DIAGNOSTICS_ROLE;
+use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
 use crate::turso::{self, IntoParams, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -1333,6 +1333,39 @@ impl BoardStore {
         Self::execute_prepared_tx(tx, prepared, ticket_id).await
     }
 
+    /// Finalize a ticket with commit info, comment, and transition to Done
+    /// within a single transaction.
+    ///
+    /// This encapsulates the triple-write pattern
+    /// (`set_commit_info_tx` + `add_comment_tx` + `transition_to_tx`)
+    /// shared by production code and tests. The caller must already have
+    /// a running transaction and is responsible for committing or rolling it
+    /// back after this method returns.
+    ///
+    /// # Parameters
+    ///
+    /// * `tx` — active transaction
+    /// * `ticket_id` — the ticket to finalize
+    /// * `hash` — git commit hash to record
+    /// * `lines_added` — lines added in the commit
+    /// * `lines_removed` — lines removed in the commit
+    /// * `comment` — comment body to add (the role is fixed to [`SYSTEM_ROLE`])
+    /// * `source` — the ticket's expected current phase (e.g. `QaPassed`)
+    pub(crate) async fn finalize_done_tx(
+        tx: &TxGuard<'_>,
+        ticket_id: &str,
+        hash: &str,
+        lines_added: i64,
+        lines_removed: i64,
+        comment: &str,
+        source: TicketPhase,
+    ) -> Result<()> {
+        Self::set_commit_info_tx(tx, ticket_id, hash, lines_added, lines_removed).await?;
+        Self::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, comment).await?;
+        Self::transition_to_tx(tx, ticket_id, Some(source), TicketPhase::Done, None).await?;
+        Ok(())
+    }
+
     /// Transition pairs for crash/restart recovery (extracted so tests can verify
     /// coverage against [`PIPELINE_BLOCKING_STATUSES`] without duplicating the pairs).
     ///
@@ -1917,8 +1950,7 @@ mod tests {
     use crate::Role;
     use crate::Tool;
     use crate::Workspace;
-    use crate::role::DIAGNOSTICS_ROLE;
-    use crate::role::SYSTEM_ROLE;
+    use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
     use crate::util::test::TicketBuilder;
     use crate::util::test::assert_superseded_ticket;
     use crate::util::test::expect_ticket;
@@ -3641,6 +3673,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         // Exercise the full pattern used by commit_and_transition_ticket:
         // all three _tx writes in one transaction → commit → all visible
         // (or rollback → none persist).
+        // Now delegates to the real production method BoardStore::finalize_done_tx.
         let (store, _tmp, id) = setup().await;
         store
             .transition_to(&id, None, TicketPhase::QaPassed, None)
@@ -3648,18 +3681,14 @@ with a comment explaining why no agent is mid-execution in that state.\
             .unwrap();
 
         let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
-            .await
-            .unwrap();
-        BoardStore::add_comment_tx(&tx, &id, SYSTEM_ROLE, "triple write comment")
-            .await
-            .unwrap();
-        BoardStore::transition_to_tx(
+        BoardStore::finalize_done_tx(
             &tx,
             &id,
-            Some(TicketPhase::QaPassed),
-            TicketPhase::Done,
-            None,
+            "abcdef0123456789abcdef0123456789abcd0123",
+            10,
+            5,
+            "triple write comment",
+            TicketPhase::QaPassed,
         )
         .await
         .unwrap();

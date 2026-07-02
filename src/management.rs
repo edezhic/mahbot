@@ -1211,18 +1211,16 @@ async fn commit_and_transition_ticket_from(
         &ticket.id,
         &format!("finalize Done transition from {phase_label} ({short_hash})"),
         async |tx| {
-            BoardStore::set_commit_info_tx(
+            BoardStore::finalize_done_tx(
                 tx,
                 &ticket.id,
                 &commit_info.hash,
                 commit_info.lines_added,
                 commit_info.lines_removed,
+                &comment,
+                source,
             )
-            .await?;
-            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
-            BoardStore::transition_to_tx(tx, &ticket.id, Some(source), TicketPhase::Done, None)
-                .await?;
-            Ok(())
+            .await
         },
     )
     .await
