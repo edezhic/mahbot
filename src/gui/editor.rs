@@ -7885,69 +7885,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_rename_validation_empty_name() {
+    /// Helper: set up a rename with `input`, submit it, and assert that
+    /// the resulting error equals `expected`.
+    fn assert_rename_rejects(input: &str, expected: Option<&'static str>) {
         let mut state = make_editor_with_tree();
-        setup_rename_state(&mut state, "   ");
+        setup_rename_state(&mut state, input);
         let _ = state.update(EditorMessage::RenameSubmit);
         let err = match &state.active_modal {
             Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
             _ => None,
         };
-        assert_eq!(err, Some("Name cannot be empty"));
+        assert_eq!(err, expected, "rejection of {input:?}");
     }
 
     #[test]
-    fn test_rename_validation_path_separators() {
-        let mut state = make_editor_with_tree();
-        setup_rename_state(&mut state, "foo/bar.rs");
-        let _ = state.update(EditorMessage::RenameSubmit);
-        let err = match &state.active_modal {
-            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
-            _ => None,
-        };
-        assert_eq!(err, Some("Name cannot contain path separators"));
-
-        // Backslash
-        let mut state = make_editor_with_tree();
-        setup_rename_state(&mut state, "foo\\bar.rs");
-        let _ = state.update(EditorMessage::RenameSubmit);
-        let err = match &state.active_modal {
-            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
-            _ => None,
-        };
-        assert_eq!(err, Some("Name cannot contain path separators"));
-
-        // Null byte
-        let mut state = make_editor_with_tree();
-        setup_rename_state(&mut state, "foo\0bar.rs");
-        let _ = state.update(EditorMessage::RenameSubmit);
-        let err = match &state.active_modal {
-            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
-            _ => None,
-        };
-        assert_eq!(err, Some("Name cannot contain path separators"));
-    }
-
-    #[test]
-    fn test_rename_validation_dot_dotdot() {
-        let mut state = make_editor_with_tree();
-        setup_rename_state(&mut state, ".");
-        let _ = state.update(EditorMessage::RenameSubmit);
-        let err = match &state.active_modal {
-            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
-            _ => None,
-        };
-        assert_eq!(err, Some("Invalid name"));
-
-        let mut state = make_editor_with_tree();
-        setup_rename_state(&mut state, "..");
-        let _ = state.update(EditorMessage::RenameSubmit);
-        let err = match &state.active_modal {
-            Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
-            _ => None,
-        };
-        assert_eq!(err, Some("Invalid name"));
+    fn test_rename_validation() {
+        struct Case {
+            input: &'static str,
+            expected: Option<&'static str>,
+        }
+        let cases: &[Case] = &[
+            // Empty / whitespace-only
+            Case {
+                input: "   ",
+                expected: Some("Name cannot be empty"),
+            },
+            // Path separators
+            Case {
+                input: "foo/bar.rs",
+                expected: Some("Name cannot contain path separators"),
+            },
+            Case {
+                input: "foo\\bar.rs",
+                expected: Some("Name cannot contain path separators"),
+            },
+            Case {
+                input: "foo\0bar.rs",
+                expected: Some("Name cannot contain path separators"),
+            },
+            // Dot / dot-dot
+            Case {
+                input: ".",
+                expected: Some("Invalid name"),
+            },
+            Case {
+                input: "..",
+                expected: Some("Invalid name"),
+            },
+        ];
+        for case in cases {
+            assert_rename_rejects(case.input, case.expected);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -7955,18 +7943,7 @@ mod tests {
     fn test_rename_validation_os_reserved_names() {
         let reserved = ["con", "NUL", "prn", "AUX", "com1", "lpt3"];
         for name in &reserved {
-            let mut state = make_editor_with_tree();
-            setup_rename_state(&mut state, name);
-            let _ = state.update(EditorMessage::RenameSubmit);
-            let err = match &state.active_modal {
-                Some(ModalKind::Rename(rt)) => rt.error.as_deref(),
-                _ => None,
-            };
-            assert_eq!(
-                err,
-                Some("Name is reserved by the operating system"),
-                "expected '{name}' to be rejected as reserved"
-            );
+            assert_rename_rejects(name, Some("Name is reserved by the operating system"));
         }
     }
 
