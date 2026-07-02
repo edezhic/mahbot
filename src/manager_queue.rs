@@ -151,6 +151,18 @@ async fn setup_telegram_typing(
     typing_tasks
 }
 
+/// Broadcast typing indicators to the GUI for all workspace users.
+fn broadcast_typing(users: &[UserRecord], is_typing: bool) {
+    if let Some(tx) = crate::CHAT_BROADCAST.get() {
+        for user in users {
+            let _ = tx.send(ChatEvent::Typing {
+                user_name: user.name.clone(),
+                is_typing,
+            });
+        }
+    }
+}
+
 /// The single consumer task that processes Manager jobs one at a time.
 ///
 /// Shutdown-aware loop: checks for global shutdown between jobs, races
@@ -229,14 +241,7 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
         let typing_tasks = setup_telegram_typing(&users).await;
 
         // Send typing start to GUI subscribers for all users in this workspace.
-        let _ = crate::CHAT_BROADCAST.get().map(|tx| {
-            for user in &users {
-                let _ = tx.send(ChatEvent::Typing {
-                    user_name: user.name.clone(),
-                    is_typing: true,
-                });
-            }
-        });
+        broadcast_typing(&users, true);
 
         // Drain buffered ticket transitions on user-initiated messages so
         // the Manager sees accumulated non-critical status changes.
@@ -264,14 +269,7 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
         }
 
         // Typing stop for GUI.
-        let _ = crate::CHAT_BROADCAST.get().map(|tx| {
-            for user in &users {
-                let _ = tx.send(ChatEvent::Typing {
-                    user_name: user.name.clone(),
-                    is_typing: false,
-                });
-            }
-        });
+        broadcast_typing(&users, false);
 
         let Some(response) = response else {
             // Agent was cancelled or errored — nothing to deliver
