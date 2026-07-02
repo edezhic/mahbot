@@ -71,6 +71,19 @@ const TOKENIZER_URL: &str = "https://huggingface.co/jinaai/jina-embeddings-v5-te
 /// SHA256 checksum of the tokenizer file (verified at download time).
 const TOKENIZER_SHA256: &str = "98d4a1d32152d6cedf85b5e88f3b205106dca1fe72aaab34e0ac13c238421069";
 
+// ── Model filenames ──────────────────────────────────────────────────
+
+/// Filename of the quantized GGUF model file.
+///
+/// Extracted as a constant to avoid drift between the synchronous cache-load, background
+/// download, and test paths when upgrading the model.
+const MODEL_FILENAME: &str = "v5-nano-retrieval-Q4_K_M.gguf";
+
+/// Filename of the tokenizer JSON file.
+///
+/// Must be kept in sync with [`MODEL_FILENAME`] — both files come from the same model repo.
+const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
+
 // ── Global state ─────────────────────────────────────────────────────
 
 /// Embedder state machine.
@@ -132,8 +145,8 @@ fn ensure_embedder() -> bool {
         STATE.store(STATE_UNINIT, Ordering::Release);
         return false;
     };
-    let model_path = models_dir.join("v5-nano-retrieval-Q4_K_M.gguf");
-    let tokenizer_path = models_dir.join("embed_tokenizer.json");
+    let model_path = models_dir.join(MODEL_FILENAME);
+    let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
 
     std::fs::create_dir_all(&models_dir).ok();
 
@@ -223,8 +236,8 @@ async fn download_retry_loop() {
         models_dir().expect("CONFIG storage_root must be set before download_retry_loop runs");
     std::fs::create_dir_all(&models_dir).ok();
 
-    let model_dest = models_dir.join("v5-nano-retrieval-Q4_K_M.gguf");
-    let tokenizer_dest = models_dir.join("embed_tokenizer.json");
+    let model_dest = models_dir.join(MODEL_FILENAME);
+    let tokenizer_dest = models_dir.join(TOKENIZER_FILENAME);
 
     // Shared HTTP client reused across retries (avoids new TLS handshake per iteration).
     let client = reqwest::Client::builder()
@@ -995,8 +1008,8 @@ mod tests {
 
         // Try each candidate until we find model files.
         for models_dir in &candidates {
-            let model_path = models_dir.join("v5-nano-retrieval-Q4_K_M.gguf");
-            let tokenizer_path = models_dir.join("embed_tokenizer.json");
+            let model_path = models_dir.join(MODEL_FILENAME);
+            let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
 
             if model_path.exists() && tokenizer_path.exists() {
                 match Embedder::load(&model_path, &tokenizer_path) {
