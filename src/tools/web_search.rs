@@ -1,6 +1,7 @@
 use crate::Tool;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::web_search_shared::{WebSearchCache, check_search_error};
 
@@ -206,7 +207,23 @@ impl Tool for WebSearchTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        WebSearchCache::parameters_schema()
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The web search query"
+                },
+                "expand": {
+                    "type": "integer",
+                    "description": "The expand id of a previous search result to retrieve full cached content. Provide this to expand a result instead of running a new search."
+                }
+            },
+            "oneOf": [
+                {"required": ["query"]},
+                {"required": ["expand"]}
+            ]
+        })
     }
 
     /// Preserve full search results — don't truncate with default 5K limit.
@@ -215,7 +232,7 @@ impl Tool for WebSearchTool {
     }
 
     fn side_effects(&self, _args: &serde_json::Value) -> bool {
-        WebSearchCache::side_effects()
+        false // web search has no workspace side effects
     }
 
     async fn execute(

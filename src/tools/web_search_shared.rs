@@ -1,11 +1,10 @@
 //! Shared caching infrastructure for web search tools.
 //!
 //! [`WebSearchTool`](super::web_search::WebSearchTool) uses this to avoid
-//! duplicating the identical cache, argument-validation, schema, and HTTP
+//! duplicating the identical cache, argument-validation, and HTTP
 //! error-handling logic across its backends.
 
 use serde_json::Value;
-use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
@@ -106,36 +105,7 @@ pub(crate) async fn check_search_error(
     anyhow::bail!("search failed with status {status}: {body}");
 }
 
-// ── Shared Tool trait helpers ────────────────────────────────────
-
 impl WebSearchCache {
-    /// JSON schema for the `web_search` tool parameters.
-    #[must_use]
-    pub(crate) fn parameters_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The web search query"
-                },
-                "expand": {
-                    "type": "integer",
-                    "description": "The expand id of a previous search result to retrieve full cached content. Provide this to expand a result instead of running a new search."
-                }
-            },
-            "oneOf": [
-                {"required": ["query"]},
-                {"required": ["expand"]}
-            ]
-        })
-    }
-
-    /// Web search tools have no workspace side effects.
-    pub(crate) const fn side_effects() -> bool {
-        false
-    }
-
     /// Parse and validate `web_search` tool arguments.
     ///
     /// Returns `(query, Option<expand_id>)` where `query` is the trimmed query
@@ -200,20 +170,6 @@ impl WebSearchCache {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_parameters_schema() {
-        let schema = WebSearchCache::parameters_schema();
-        assert!(schema.get("properties").is_some());
-        assert!(schema.get("oneOf").is_some());
-        assert!(schema["properties"]["query"]["type"] == "string");
-        assert!(schema["properties"]["expand"]["type"] == "integer");
-    }
-
-    #[test]
-    fn test_side_effects_false() {
-        assert!(!WebSearchCache::side_effects());
-    }
 
     #[test]
     fn test_validate_no_args() {
