@@ -175,7 +175,8 @@ fn try_flock(file: &File) -> Result<bool> {
 
     const LOCK_VIOLATION: i32 = ERROR_LOCK_VIOLATION as i32;
 
-    let mut overlapped = std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>();
+    let mut overlapped =
+        unsafe { std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>() };
     let locked = unsafe {
         LockFileEx(
             handle,
