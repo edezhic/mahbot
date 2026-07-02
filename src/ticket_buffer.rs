@@ -23,8 +23,8 @@ const PER_WORKSPACE_CAPACITY: usize = 100;
 #[derive(Clone)]
 struct Entry {
     id: String,
-    old_phase: String,
-    new_phase: String,
+    source: String,
+    target: String,
 }
 
 /// Global ticket transition buffer, keyed by workspace name.
@@ -46,7 +46,7 @@ pub fn init_global() {
 /// # Panics
 ///
 /// Panics if the buffer has not been initialized via [`init_global`].
-pub fn push(workspace_name: &str, id: &str, old_phase: TicketPhase, new_phase: TicketPhase) {
+pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketPhase) {
     let mutex = TICKET_BUFFER
         .get()
         .expect("ticket_buffer not initialized — call init_global() first");
@@ -62,8 +62,8 @@ pub fn push(workspace_name: &str, id: &str, old_phase: TicketPhase, new_phase: T
     }
     deque.push_back(Entry {
         id: id.to_string(),
-        old_phase: old_phase.to_string(),
-        new_phase: new_phase.to_string(),
+        source: source.to_string(),
+        target: target.to_string(),
     });
 }
 
@@ -92,11 +92,7 @@ pub fn drain(workspace_name: &str) -> String {
     };
     let mut out = String::from("Ticket updates:\n");
     for entry in entries {
-        let _ = writeln!(
-            out,
-            "• {}: {} → {}",
-            entry.id, entry.old_phase, entry.new_phase
-        );
+        let _ = writeln!(out, "• {}: {} → {}", entry.id, entry.source, entry.target);
     }
     out
 }
