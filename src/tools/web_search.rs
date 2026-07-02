@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use super::web_search_shared::{WebSearchCache, check_search_error};
 
+// ── Backend selection ───────────────────────────────────────────────────────────
+
+/// Backend provider for web search.
+pub enum WebSearchBackend {
+    /// Firecrawl API (`api.firecrawl.dev/v2/search`).
+    Firecrawl { key: String },
+    /// Exa API (`api.exa.ai/search`).
+    Exa { key: String },
+}
+
 // ── Firecrawl API types ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -40,32 +50,63 @@ struct SearchResponse {
     data: SearchData,
 }
 
+// ── Exa API types ───────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ExaContentsOptions {
+    text: bool,
+}
+
+#[derive(Serialize)]
+struct ExaSearchBody {
+    query: String,
+    #[serde(rename = "numResults")]
+    num_results: usize,
+    contents: ExaContentsOptions,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExaResult {
+    title: Option<String>,
+    url: String,
+    text: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExaSearchResponse {
+    results: Vec<ExaResult>,
+}
+
 // ── Tool ────────────────────────────────────────────────────────────────────────
 
-/// Web search tool backed by the Firecrawl API.
+/// Web search tool backed by a configurable backend (Firecrawl or Exa).
 ///
-/// Uses `api.firecrawl.dev/v2/search` for search. Results are cached
-/// per-instance in-memory and can be expanded via the `expand` parameter
-/// to retrieve full text content.  Each agent session gets its own tool
-/// instance, so caches are automatically freed when the agent session ends.
+/// Dispatches to the appropriate API based on [`WebSearchBackend`]. Results are
+/// cached per-instance in-memory and can be expanded via the `expand` parameter
+/// to retrieve full text content.  Each agent session gets its own tool instance,
+/// so caches are automatically freed when the agent session ends.
 pub struct WebSearchTool {
-    firecrawl_key: String,
+    backend: WebSearchBackend,
     cache: WebSearchCache,
 }
 
 impl WebSearchTool {
     #[must_use]
-    pub fn new(firecrawl_key: String) -> Self {
+    pub fn new(backend: WebSearchBackend) -> Self {
         Self {
-            firecrawl_key,
+            backend,
             cache: WebSearchCache::new(),
         }
     }
 
     async fn firecrawl_search(&self, query: &str) -> anyhow::Result<String> {
+        let WebSearchBackend::Firecrawl { key } = &self.backend else {
+            unreachable!("firecrawl_search called for non-Firecrawl backend");
+        };
+
         let res = crate::util::http::media_http_client()
             .post("https://api.firecrawl.dev/v2/search")
-            .header("Authorization", format!("Bearer {}", &self.firecrawl_key))
+            .header("Authorization", format!("Bearer {key}"))
             .json(&SearchRequest {
                 query: query.to_string(),
                 limit: 10,
@@ -88,9 +129,6 @@ impl WebSearchTool {
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!("Search results for: {query}"));
 
-        // When changing result formatting here, also check
-        // `src/tools/exa_search.rs` — the Exa loop follows the same pattern
-        // but differs in fields (no `description`, uses `text` vs `markdown`).
         for (i, result) in search_resp.data.web.iter().enumerate() {
             let title = result.title.as_deref().unwrap_or("(no title)").to_string();
             let description = result.description.as_deref().unwrap_or("");
@@ -108,6 +146,52 @@ impl WebSearchTool {
             if !description.is_empty() {
                 lines.push(format!("   > {description}"));
             }
+            lines.push(format!("   `expand` id: `{id}`"));
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    async fn exa_search(&self, query: &str) -> anyhow::Result<String> {
+        let WebSearchBackend::Exa { key } = &self.backend else {
+            unreachable!("exa_search called for non-Exa backend");
+        };
+
+        let res = crate::util::http::media_http_client()
+            .post("https://api.exa.ai/search")
+            .header("x-api-key", key)
+            .json(&ExaSearchBody {
+                query: query.to_string(),
+                num_results: 10,
+                contents: ExaContentsOptions { text: true },
+            })
+            .send()
+            .await?;
+
+        let res = check_search_error(res).await?;
+
+        let search_resp = res.json::<ExaSearchResponse>().await?;
+
+        if search_resp.results.is_empty() {
+            return Ok(format!("No results found for: {query}"));
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("Search results for: {query}"));
+
+        for (i, result) in search_resp.results.iter().enumerate() {
+            let title = result.title.as_deref().unwrap_or("(no title)").to_string();
+
+            let id = self
+                .cache
+                .cache_result(
+                    title.clone(),
+                    result.url.clone(),
+                    result.text.clone().unwrap_or_default(),
+                )
+                .await;
+
+            lines.push(format!("{}. [{title}]({url})", i + 1, url = result.url));
             lines.push(format!("   `expand` id: `{id}`"));
         }
 
@@ -146,7 +230,15 @@ impl Tool for WebSearchTool {
             return self.cache.expand_result(id).await;
         }
 
-        tracing::info!("Searching web (Firecrawl) for: {}", query);
-        self.firecrawl_search(query).await
+        match &self.backend {
+            WebSearchBackend::Firecrawl { .. } => {
+                tracing::info!("Searching web (Firecrawl) for: {}", query);
+                self.firecrawl_search(query).await
+            }
+            WebSearchBackend::Exa { .. } => {
+                tracing::info!("Searching web (Exa) for: {}", query);
+                self.exa_search(query).await
+            }
+        }
     }
 }

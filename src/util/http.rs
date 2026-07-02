@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// HTTP client shared by [`crate::tools::image_gen::ImageGenTool`],
 /// [`crate::tools::video_gen::VideoGenTool`],
-/// [`crate::tools::web_search::WebSearchTool`], [`crate::tools::exa_search::ExaSearchTool`], and
+/// [`crate::tools::web_search::WebSearchTool`], and
 /// [`crate::providers::transcribe::MediaTranscriber`] — all call their
 /// respective APIs with a 2-minute timeout.
 ///
@@ -232,7 +232,7 @@ pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::
 /// Return the shared media-generation HTTP client, initialising it on first
 /// call with a 2-minute request timeout and a 10-second connection timeout.
 ///
-/// Used by [`crate::tools::image_gen::ImageGenTool`], [`crate::tools::video_gen::VideoGenTool`], [`crate::tools::web_search::WebSearchTool`] / [`crate::tools::exa_search::ExaSearchTool`] (web search APIs),
+/// Used by [`crate::tools::image_gen::ImageGenTool`], [`crate::tools::video_gen::VideoGenTool`], [`crate::tools::web_search::WebSearchTool`] (web search APIs),
 /// and `MediaTranscriber` — all of which need the same timeout.  If a future
 /// consumer requires a different timeout it should call
 /// [`build_http_client`] directly with the appropriate duration.

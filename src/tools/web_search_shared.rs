@@ -1,9 +1,8 @@
-//! Shared caching infrastructure for web search tools (Firecrawl, Exa, etc.).
+//! Shared caching infrastructure for web search tools.
 //!
-//! Both [`WebSearchTool`](super::web_search::WebSearchTool) and
-//! [`ExaSearchTool`](super::exa_search::ExaSearchTool) use this to avoid
+//! [`WebSearchTool`](super::web_search::WebSearchTool) uses this to avoid
 //! duplicating the identical cache, argument-validation, schema, and HTTP
-//! error-handling logic.
+//! error-handling logic across its backends.
 
 use serde_json::Value;
 use serde_json::json;

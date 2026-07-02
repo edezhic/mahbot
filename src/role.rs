@@ -249,9 +249,9 @@ impl Role {
 use crate::Tool;
 use crate::config::CONFIG;
 use crate::tools::{
-    AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, ExaSearchTool,
-    GetTicketTool, ImageGenTool, ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool,
-    ShellMode, ShellTool, UpdateTicketTool, VideoGenTool, WebSearchTool,
+    AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, GetTicketTool,
+    ImageGenTool, ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool, ShellMode,
+    ShellTool, UpdateTicketTool, VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -350,12 +350,14 @@ impl Role {
         match provider.as_deref() {
             Some(p) if p.eq_ignore_ascii_case("firecrawl") => {
                 if let Some(key) = firecrawl_key {
-                    tools.push(Box::new(WebSearchTool::new(key)));
+                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Firecrawl {
+                        key,
+                    })));
                 }
             }
             Some(p) if p.eq_ignore_ascii_case("exa") => {
                 if let Some(key) = exa_key {
-                    tools.push(Box::new(ExaSearchTool::new(key)));
+                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Exa { key })));
                 }
             }
             Some(other) => {
@@ -363,9 +365,11 @@ impl Role {
             }
             None => {
                 if let Some(key) = firecrawl_key {
-                    tools.push(Box::new(WebSearchTool::new(key)));
+                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Firecrawl {
+                        key,
+                    })));
                 } else if let Some(key) = exa_key {
-                    tools.push(Box::new(ExaSearchTool::new(key)));
+                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Exa { key })));
                 }
             }
         }

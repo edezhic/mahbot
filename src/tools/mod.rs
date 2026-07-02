@@ -5,7 +5,6 @@ use anyhow::Context;
 pub mod ask;
 pub mod browser;
 pub mod edit;
-pub mod exa_search;
 pub mod image_gen;
 pub mod path;
 pub mod read;
@@ -55,7 +54,6 @@ pub(crate) fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
 pub use ask::{AskTool, DispatchMode};
 pub use browser::BrowserTool;
 pub use edit::EditTool;
-pub use exa_search::ExaSearchTool;
 pub use image_gen::ImageGenTool;
 pub use read::ReadTool;
 pub use search::SearchTool;
@@ -65,7 +63,7 @@ pub use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
 pub use video_gen::VideoGenTool;
-pub use web_search::WebSearchTool;
+pub use web_search::{WebSearchBackend, WebSearchTool};
 
 use crate::{Tool, Workspace};
 use std::path::PathBuf;
