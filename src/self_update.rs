@@ -151,14 +151,6 @@ fn try_flock(file: &File) -> Result<bool> {
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
 
-    // Set FD_CLOEXEC so child processes don't inherit the lock.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags != -1 {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
-    }
-
     let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
         Ok(true)
@@ -182,11 +174,6 @@ fn try_flock(file: &File) -> Result<bool> {
     let handle = file.as_raw_handle() as HANDLE;
 
     const LOCK_VIOLATION: i32 = ERROR_LOCK_VIOLATION as i32;
-
-    // Set HANDLE_FLAG_INHERIT to 0 so child processes don't inherit the lock.
-    unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(handle, 1, 0);
-    }
 
     let mut overlapped = std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>();
     let locked = unsafe {
