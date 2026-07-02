@@ -148,8 +148,14 @@ impl DiffParser {
         };
 
         f.status = DiffFileStatus::Renamed;
-        // INVARIANT: caller guarantees line starts with "rename from "
-        let raw = line.strip_prefix("rename from ").unwrap();
+        let Some(raw) = line.strip_prefix("rename from ") else {
+            warn!(
+                line = %line,
+                "rename from: unexpected format, dropping rename info"
+            );
+            f.status = DiffFileStatus::Modified;
+            return;
+        };
         let Some(old_path) = unquote_c_style(raw) else {
             warn!(
                 line = %line,
