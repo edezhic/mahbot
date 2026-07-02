@@ -1084,26 +1084,18 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 /// Transition a ticket to Done with a descriptive reason from the given source phase.
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, reason: &str) {
     info!(ticket = %ticket.id, "{reason}");
-
-    if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, reason).await {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to write system comment during transition-to-Done",
-        );
-    }
-
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-
-    if let Err(e) = transition_ticket(ticket, source, TicketPhase::Done, notify_policy, None).await
-    {
-        let phase_label = source.as_ref();
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "{phase_label} passed but transition to Done failed",
-        );
-    }
+    comment_and_transition(
+        ticket,
+        SYSTEM_ROLE,
+        reason,
+        source,
+        TicketPhase::Done,
+        notify_policy,
+        source.as_ref(),
+        "passed",
+    )
+    .await;
 }
 
 async fn transition_ticket_to_failed(
