@@ -831,6 +831,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn resolve_tool_call_name_cases() {
         let cases: &[(&str, Option<&str>, Option<&str>, Option<&str>)] = &[
             (
@@ -870,6 +871,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn resolve_tool_call_arguments_cases() {
         let cases: &[(&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
             (

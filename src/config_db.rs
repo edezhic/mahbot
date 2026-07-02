@@ -323,12 +323,12 @@ mod tests {
         // 4. replace again with all fields
         save(store, core::slice::from_ref(&step4)).await.unwrap();
         let all = get_all(store).await.unwrap();
-        assert_eq!(all, vec![step4], "save should fully replace existing row",);
+        assert_eq!(all, vec![step4], "save should fully replace existing row");
 
         // 5. multi-item save — items already in expected sort order
         save(store, &step5).await.unwrap();
         let all = get_all(store).await.unwrap();
-        assert_eq!(all, step5, "get_all should return all rows sorted by key",);
+        assert_eq!(all, step5, "get_all should return all rows sorted by key");
 
         // 6. delete by saving a subset (omitted row is deleted by blanket DELETE)
         save(store, core::slice::from_ref(&step6)).await.unwrap();
