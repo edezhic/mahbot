@@ -947,7 +947,7 @@ impl BoardStore {
     }
 
     /// Build a [`PreparedUpdate`] for an `UPDATE tickets` statement, appending
-    /// `updated_at = ?N` and `WHERE id = ?M` as the last two parameters.
+    /// `updated_at = ?` and `WHERE id = ?` as the last two parameters.
     ///
     /// Callers provide the SET-clause-specific columns (without `updated_at` or
     /// `WHERE`) together with their parameter values.  The helper appends the
@@ -958,12 +958,12 @@ impl BoardStore {
     ///
     /// ```ignore
     /// let prep = Self::update_tickets_with_updated_at(
-    ///     "assigned_to = ?1",
+    ///     "assigned_to = ?",
     ///     vec![Value::from("user-123")],
     ///     "set assigned_to",
     ///     "ticket-456",
     /// );
-    /// // SQL:  "UPDATE tickets SET assigned_to = ?1, updated_at = ?2 WHERE id = ?3"
+    /// // SQL:  "UPDATE tickets SET assigned_to = ?, updated_at = ? WHERE id = ?"
     /// // params: [user-123, now, ticket-456]
     /// ```
     fn update_tickets_with_updated_at(
@@ -973,11 +973,7 @@ impl BoardStore {
         ticket_id: &str,
     ) -> PreparedUpdate {
         let now = turso::now();
-        let sql = format!(
-            "UPDATE tickets SET {set_clause}, updated_at = ?{u} WHERE id = ?{w}",
-            u = set_params.len() + 1,
-            w = set_params.len() + 2,
-        );
+        let sql = format!("UPDATE tickets SET {set_clause}, updated_at = ? WHERE id = ?");
         let mut params = set_params;
         params.push(Value::from(now));
         params.push(Value::from(ticket_id));
@@ -1149,7 +1145,7 @@ impl BoardStore {
             "clear assigned_to"
         };
         Self::update_tickets_with_updated_at(
-            "assigned_to = ?1",
+            "assigned_to = ?",
             vec![Value::from(assigned_to)],
             action.to_string(),
             ticket_id,
@@ -1291,7 +1287,7 @@ impl BoardStore {
         );
 
         Self::update_tickets_with_updated_at(
-            "commit_hash = ?1, lines_added = ?2, lines_removed = ?3",
+            "commit_hash = ?, lines_added = ?, lines_removed = ?",
             vec![
                 Value::from(hash),
                 Value::from(lines_added),
