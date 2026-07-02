@@ -1798,6 +1798,27 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 }
 
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
+//
+// Why `handle_analyst_verdicts` and `process_verdict_results` are separate
+// -----------------------------------------------------------------------
+// Both follow the same skeleton (record comments -> classify -> transition)
+// but differ in four ways that make a single unified function awkward:
+//
+//   * Classification — analysts use 4 categories
+//     (lgtm/minor_issues/potential_blockers/missing_analysis) that feed
+//     `build_analyst_summary`; reviewers/QA use a binary pass/fail via
+//     `verdict_passes` against `REVIEW_QA_THRESHOLD`.
+//   * Transition policy — analysts always advance to `Planning` regardless
+//     of outcome (even failures proceed, just with a comment listing the
+//     counts). Reviewers/QA have a 3-way outcome: all-failed -> Failed,
+//     any-failed -> bounce back to development, all-pass -> success phase.
+//   * Comment recording — analysts record all verdicts
+//     (`VerdictFilter::All`); reviewers/QA record only failing verdicts
+//     (`VerdictFilter::FailingOnly`).
+//   * Signature — analysts need only `&Ticket` and `&[ParallelVerdict]`;
+//     reviewers/QA need the `VerifierInfo` struct to drive the 3-way
+//     transition (success phase, active phase, role label). This structural
+//     difference alone prevents a shared function signature without closures.
 
 /// Result from a single parallel verifier agent.
 #[derive(Clone)]
@@ -2059,24 +2080,8 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 /// - to Planning (notify) if ALL analysts passed (≥ `ANALYSIS_THRESHOLD`/10)
 /// - to Planning (notify) if any analyst failed, with a comment listing the counts
 ///
-/// # Design note: why this is separate from [`process_verdict_results`]
-///
-/// Both functions follow the same skeleton (record comments → classify → transition)
-/// but differ in semantics that make a unified awkward:
-///
-/// * **Classification** — analysts use 4 categories (`lgtm`/`minor_issues`/`potential_blockers`/`missing_analysis`)
-///   while reviewers/QA use a binary pass/fail. The 4-class output feeds
-///   [`build_analyst_summary`], which has no reviewer/QA equivalent.
-/// * **Transition policy** — analysts always transition to `Planning` regardless of
-///   outcome (even failures proceed, just with a comment listing the counts).
-///   Reviewers/QA have a 3-way outcome: all-failed→Failed, any-failed→bounce back
-///   to development, all-pass→success phase.
-/// * **Comment recording** — analysts record all verdicts (`VerdictFilter::All`);
-///   reviewers/QA record only failing verdicts (`VerdictFilter::FailingOnly`).
-/// * **Signature** — analysts only need a `&Ticket` and `&[ParallelVerdict]`; reviewers/QA
-///   need the [`VerifierInfo`] struct to drive the 3-way transition (success phase,
-///   active phase, role label). This structural difference alone prevents a shared
-///   function signature without closures.
+/// See the "Parallel agent helpers (shared)" section for why this is separate
+/// from [`process_verdict_results`].
 async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // Record per-analyst comments.
     // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
@@ -2362,24 +2367,8 @@ async fn is_circuit_breaker_tripped(
 ///    it waits until the ticket reaches Done (after the QaPassed commit succeeds in
 ///    [`finalize_ticket_from_phase`]).
 ///
-/// # Design note: why this is separate from [`handle_analyst_verdicts`]
-///
-/// Both functions follow the same skeleton (record comments → classify → transition)
-/// but differ in semantics that make a unified handler awkward:
-///
-/// * **Classification** — verifiers use a binary pass/fail (via [`verdict_passes`])
-///   against [`REVIEW_QA_THRESHOLD`]. Analysts use 4 categories
-///   (`lgtm`/`minor_issues`/`potential_blockers`/`missing_analysis`) that feed a
-///   natural-language summary with no reviewer/QA equivalent.
-/// * **Transition policy** — verifiers have a 3-way outcome: all-failed→[`TicketPhase::Failed`],
-///   any-failed→bounce back to development, all-pass→[`VerifierInfo::success_phase`].
-///   Analysts always transition to `Planning` regardless of outcome.
-/// * **Comment recording** — verifiers record only failing verdicts
-///   ([`VerdictFilter::FailingOnly`]); analysts record all verdicts ([`VerdictFilter::All`]).
-/// * **Signature** — verifiers require [`VerifierInfo`] to drive the 3-way transition
-///   (carries `success_phase`, `active_phase`, role label). Analysts only need the
-///   ticket and results. This structural difference alone prevents a shared signature
-///   without closures.
+/// See the "Parallel agent helpers (shared)" section for why this is separate
+/// from [`handle_analyst_verdicts`].
 async fn process_verdict_results(
     ticket: &Ticket,
     results: &[ParallelVerdict],
