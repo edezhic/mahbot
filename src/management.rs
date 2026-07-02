@@ -186,7 +186,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// failure threshold to prevent dispatch thrashing).
 ///
 /// This is the recommended entry point for all dispatch-phase guard logic.
-/// See [`guard_phase_and_circuit_breaker`] for the default general-breaker variant.
+/// See [`is_phase_and_circuit_breaker_clear`] for the default general-breaker variant.
 ///
 /// # Parameters
 ///
@@ -207,7 +207,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// Returns `false` when the ticket has moved, been failed, or the breaker
 /// tripped — the caller MUST bail out immediately.
 #[must_use]
-async fn guard_phase_and_breaker(
+async fn is_phase_and_breaker_clear(
     ticket: &Ticket,
     expected_phase: TicketPhase,
     threshold: usize,
@@ -236,7 +236,7 @@ async fn guard_phase_and_breaker(
 /// Shared pre-flight guard that combines a phase check with the general
 /// comment-count circuit breaker.
 ///
-/// Thin wrapper around [`guard_phase_and_breaker`] that passes the general
+/// Thin wrapper around [`is_phase_and_breaker_clear`] that passes the general
 /// default parameters: [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`], standard
 /// `Vec::len` (counting all comments), and [`general_breaker_comment`].
 ///
@@ -245,14 +245,14 @@ async fn guard_phase_and_breaker(
 /// [`dispatch_backlog_analysts`] and [`dispatch_verifiers`]).
 ///
 /// Callers that need a domain-specific circuit breaker (sanitation, diagnostics)
-/// should use [`guard_phase_and_breaker`] directly with custom parameters.
+/// should use [`is_phase_and_breaker_clear`] directly with custom parameters.
 #[must_use]
-async fn guard_phase_and_circuit_breaker(
+async fn is_phase_and_circuit_breaker_clear(
     ticket: &Ticket,
     expected_phase: TicketPhase,
     label: &str,
 ) -> bool {
-    guard_phase_and_breaker(
+    is_phase_and_breaker_clear(
         ticket,
         expected_phase,
         CIRCUIT_BREAKER_COMMENT_THRESHOLD,
@@ -926,7 +926,7 @@ async fn poll_round() -> anyhow::Result<()> {
 
 /// Run an Engineer agent to implement the ticket.
 ///
-/// Guards with [`guard_phase_and_circuit_breaker`] (phase check + comment-count
+/// Guards with [`is_phase_and_circuit_breaker_clear`] (phase check + comment-count
 /// circuit breaker) before starting. Gathers feedback comments from all roles
 /// since the last engineer run and includes them in the agent prompt. After the
 /// agent finishes, performs a post-run phase check to catch race conditions,
@@ -936,7 +936,7 @@ async fn poll_round() -> anyhow::Result<()> {
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Engineer.as_str());
 
-    if !guard_phase_and_circuit_breaker(&ticket, TicketPhase::InDevelopment, "Engineer").await {
+    if !is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InDevelopment, "Engineer").await {
         return;
     }
 
@@ -1353,9 +1353,9 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     // comment-count breaker (threshold=30), so the general breaker is not needed
     // here — see the compile-time invariant at line 69.
     //
-    // guard_phase_and_breaker returns true=safe, so the `!` inverts it for the
+    // is_phase_and_breaker_clear returns true=safe, so the `!` inverts it for the
     // "bail on failure" convention.
-    if !guard_phase_and_breaker(
+    if !is_phase_and_breaker_clear(
         &ticket,
         TicketPhase::InSanitation,
         SANITATION_CIRCUIT_BREAKER_THRESHOLD,
@@ -1666,12 +1666,12 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     // fails the ticket if the count exceeds DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD
     // (i.e., trip at ≥5 failures).
     //
-    // Uses guard_phase_and_breaker which also re-checks the phase via
+    // Uses is_phase_and_breaker_clear which also re-checks the phase via
     // is_ticket_in_phase. claim_diagnostics above already confirmed the phase,
     // but the diagnostics loading step between then and now is a TOCTOU window
     // where the ticket could have moved externally — the redundant phase check
     // is a beneficial race-condition guard.
-    if !guard_phase_and_breaker(
+    if !is_phase_and_breaker_clear(
         &ticket,
         TicketPhase::InDiagnostics,
         DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
@@ -1901,7 +1901,7 @@ async fn record_verdict_comments(
 /// Shared orchestration skeleton for dispatch functions that spawn parallel
 /// agents and then process results via extraction.
 ///
-/// 1. Runs [`guard_phase_and_circuit_breaker`] (phase check + circuit breaker)
+/// 1. Runs [`is_phase_and_circuit_breaker_clear`] (phase check + circuit breaker)
 /// 2. Spawns agents via [`run_parallel_with_extraction`]
 /// 3. Runs a post-dispatch phase check (guard against race conditions)
 ///
@@ -1918,7 +1918,7 @@ async fn dispatch_parallel_with_guard(
     prompt: &str,
     extraction_prompt: &str,
 ) -> Option<Vec<ParallelVerdict>> {
-    if !guard_phase_and_circuit_breaker(ticket, guard_phase, guard_label).await {
+    if !is_phase_and_circuit_breaker_clear(ticket, guard_phase, guard_label).await {
         return None;
     }
     let results = run_parallel_with_extraction(ticket, ws, role, prompt, extraction_prompt).await;
@@ -1935,7 +1935,7 @@ async fn dispatch_parallel_with_guard(
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYSIS_THRESHOLD`/10)
 /// - Planning (notify) when any analyst fails, with a comment listing the counts
 ///
-/// Before spawning agents, [`guard_phase_and_circuit_breaker`] checks the phase and
+/// Before spawning agents, [`is_phase_and_circuit_breaker_clear`] checks the phase and
 /// trips the comment-count circuit breaker (which may transition the ticket to
 /// Failed for Manager triage). Returns `false` when the caller should abort.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
@@ -2268,7 +2268,7 @@ async fn run_circuit_breaker(
 /// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
 ///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (via
 ///    [`transition_ticket`]). The circuit
-///    breaker is checked *before* dispatch by [`guard_phase_and_circuit_breaker`], so only
+///    breaker is checked *before* dispatch by [`is_phase_and_circuit_breaker_clear`], so only
 ///    the bounce-back is needed here.
 ///
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
@@ -2406,7 +2406,7 @@ mod tests {
     };
     use crate::workspace::test_ws_named;
 
-    /// Verify that `guard_phase_and_circuit_breaker` rejects a ticket
+    /// Verify that `is_phase_and_circuit_breaker_clear` rejects a ticket
     /// whose phase does not match `expected_phase`. This validates that the
     /// pre-agent guard works correctly for `dispatch_verifiers` (and all
     /// other agent-spawning dispatch functions).
@@ -2437,15 +2437,15 @@ mod tests {
 
         // Call with wrong phase — guard should reject immediately
         assert!(
-            !guard_phase_and_circuit_breaker(&ticket, TicketPhase::InReview, "test_label").await,
-            "guard_phase_and_circuit_breaker must reject a phase mismatch"
+            !is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InReview, "test_label").await,
+            "is_phase_and_circuit_breaker_clear must reject a phase mismatch"
         );
 
         // Call with correct phase and 0 comments (below threshold) — guard should pass
         assert!(
-            guard_phase_and_circuit_breaker(&ticket, TicketPhase::InDevelopment, "test_label")
+            is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InDevelopment, "test_label")
                 .await,
-            "guard_phase_and_circuit_breaker must pass when phase matches and comments are below threshold"
+            "is_phase_and_circuit_breaker_clear must pass when phase matches and comments are below threshold"
         );
     }
 
@@ -3170,7 +3170,7 @@ mod tests {
     /// *not* filter out its own trip comment (unlike the diagnostics breaker
     /// which has explicit self-counting prevention). Cascade prevention relies
     /// on the phase guard: after tripping, the ticket transitions to Failed,
-    /// and `guard_phase_and_circuit_breaker` rejects the next cycle via
+    /// and `is_phase_and_circuit_breaker_clear` rejects the next cycle via
     /// phase mismatch before the breaker is called.
     #[tokio::test]
     async fn circuit_breaker_guard_prevents_retrip() {
@@ -3229,7 +3229,8 @@ mod tests {
         // InReview, so is_ticket_in_phase rejects it before the breaker runs.
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        let guarded = guard_phase_and_circuit_breaker(&ticket, TicketPhase::InReview, "test").await;
+        let guarded =
+            is_phase_and_circuit_breaker_clear(&ticket, TicketPhase::InReview, "test").await;
         assert!(
             !guarded,
             "phase guard must reject re-trip (ticket is now Failed)"
