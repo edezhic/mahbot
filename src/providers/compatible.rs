@@ -540,6 +540,29 @@ pub(crate) fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_js
     })
 }
 
+/// Shared helper to build a [`ProviderToolCall`] from parsed API tool-call data.
+///
+/// Handles empty/whitespace-only arguments, JSON parsing with repair fallback,
+/// and generates a fallback ID when none is provided.
+#[must_use]
+pub(crate) fn make_provider_tool_call(
+    id: Option<String>,
+    name: String,
+    arguments: &str,
+) -> ProviderToolCall {
+    let arguments = if arguments.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        arguments.to_string()
+    };
+    let arguments = parse_tool_call_arguments(&name, &arguments);
+    ProviderToolCall {
+        id: id.unwrap_or_else(crate::generate_id),
+        name,
+        arguments,
+    }
+}
+
 impl OpenAiCompatibleProvider {
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
@@ -554,13 +577,8 @@ impl OpenAiCompatibleProvider {
             .into_iter()
             .filter_map(|tc| {
                 let name = tc.function_name()?;
-                let arguments = tc.function_arguments().unwrap_or("{}".to_string());
-                let parsed_arguments = parse_tool_call_arguments(&name, &arguments);
-                Some(ProviderToolCall {
-                    id: tc.id.unwrap_or_else(crate::generate_id),
-                    name,
-                    arguments: parsed_arguments,
-                })
+                let arguments = tc.function_arguments().unwrap_or_default();
+                Some(make_provider_tool_call(tc.id, name, &arguments))
             })
             .collect::<Vec<_>>();
 

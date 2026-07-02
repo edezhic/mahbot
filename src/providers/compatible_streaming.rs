@@ -5,7 +5,7 @@
 use crate::{
     Reasoning, StreamChunk, StreamError, StreamEvent, StreamResult, ToolCall as ProviderToolCall,
     providers::compatible::{
-        ApiToolCallFunction, parse_tool_call_arguments, resolve_tool_call_arguments,
+        ApiToolCallFunction, make_provider_tool_call, resolve_tool_call_arguments,
         resolve_tool_call_name,
     },
 };
@@ -88,19 +88,11 @@ impl StreamToolCallAccumulator {
     }
 
     fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
-        let name = self.name?;
-        let arguments = if self.arguments.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            self.arguments
-        };
-        let parsed = parse_tool_call_arguments(&name, &arguments);
-
-        Some(ProviderToolCall {
-            id: self.id.unwrap_or_else(crate::generate_id),
-            name,
-            arguments: parsed,
-        })
+        Some(make_provider_tool_call(
+            self.id,
+            self.name?,
+            &self.arguments,
+        ))
     }
 }
 
