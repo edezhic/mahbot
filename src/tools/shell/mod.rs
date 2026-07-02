@@ -292,7 +292,9 @@ fn format_timeout_error(
     msg.push_str("\nreason: command was killed after exceeding the timeout");
 
     if !stdout.is_empty() {
-        let scrubbed = scrub_credentials(&String::from_utf8_lossy(stdout));
+        let decoded = String::from_utf8_lossy(stdout);
+        let stripped = strip_ansi_escapes(&decoded);
+        let scrubbed = scrub_credentials(&stripped);
         let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
         let _ = write!(
             msg,
@@ -301,7 +303,9 @@ fn format_timeout_error(
         );
     }
     if !stderr.is_empty() {
-        let scrubbed = scrub_credentials(&String::from_utf8_lossy(stderr));
+        let decoded = String::from_utf8_lossy(stderr);
+        let stripped = strip_ansi_escapes(&decoded);
+        let scrubbed = scrub_credentials(&stripped);
         let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
         let _ = write!(
             msg,
@@ -2547,6 +2551,23 @@ mod tests {
         assert!(msg.contains("elapsed:"), "msg: {msg}");
         assert!(msg.contains("timeout_limit:"), "msg: {msg}");
         assert!(msg.contains("before-timeout"), "msg: {msg}");
+
+        // Verify ANSI escape sequences are stripped from timeout error messages
+        let ansi_stdout = b"\x1B[31mred error\x1B[0m";
+        let ansi_stderr = b"\x1B[1mBOLD STUFF\x1B[22m";
+        let ansi_msg = format_timeout_error("test", elapsed, Some(42), ansi_stdout, ansi_stderr);
+        assert!(
+            ansi_msg.contains("red error"),
+            "ANSI text content should survive stripping: {ansi_msg}"
+        );
+        assert!(
+            !ansi_msg.contains("\x1B["),
+            "ANSI escape codes should be stripped from timeout error: {ansi_msg}"
+        );
+        assert!(
+            ansi_msg.contains("BOLD STUFF"),
+            "ANSI text content should survive stripping: {ansi_msg}"
+        );
     }
 
     // ── Shell compression pipeline tests ────────────────────────────
