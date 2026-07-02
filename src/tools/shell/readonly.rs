@@ -585,10 +585,6 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
         }
 
         // ── Heredoc detection ───────────────────────────────────────
-        if matches!(*w, "<<" | "<<-") {
-            in_heredoc_body = true;
-            continue;
-        }
         if w.starts_with("<<") {
             in_heredoc_body = true;
             continue;
