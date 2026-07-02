@@ -135,11 +135,8 @@ pub struct LogsState {
     newest_entry_timestamp: Option<String>,
     /// Fade progress: 0.0 = just appeared, 1.0 = fully settled.
     fade_anim: Animated<f32>,
-    /// Debounce counter for text-input filters. Each keystroke increments this;
-    /// only the most recent generation's sleep-task triggers a DB refresh.
-    debounce_generation: u64,
-    /// True when a debounced refresh is pending (prevents Tick from double-firing).
-    debounce_pending: bool,
+    /// Debounce state for search-text input filtering.
+    debounce: super::common::DebounceState,
 }
 
 impl LogsState {
@@ -170,8 +167,7 @@ impl LogsState {
                 0.0f32,
                 Easing::EASE_OUT.with_duration(Duration::from_millis(theme::ANIM_LOG_FADE_MS)),
             ),
-            debounce_generation: 0,
-            debounce_pending: false,
+            debounce: super::common::DebounceState::new(),
         }
     }
 
@@ -185,22 +181,10 @@ impl LogsState {
         LogQuery {
             level,
             target: None,
-            search: if self.search_filter.is_empty() {
-                None
-            } else {
-                Some(self.search_filter.clone())
-            },
+            search: super::common::none_if_empty(&self.search_filter),
             agent_id: None,
-            agent_role: if self.role_filter.is_empty() {
-                None
-            } else {
-                Some(self.role_filter.clone())
-            },
-            workspace: if self.workspace_filter.is_empty() {
-                None
-            } else {
-                Some(self.workspace_filter.clone())
-            },
+            agent_role: super::common::none_if_empty(&self.role_filter),
+            workspace: super::common::none_if_empty(&self.workspace_filter),
             since: None,
             until: None,
             limit: Some(self.pagination.page_size),
@@ -372,13 +356,7 @@ impl LogsState {
                 LogsTab::AllLogs | LogsTab::Issues => {
                     self.search_filter = v;
                     self.pagination.reset();
-                    self.debounce_generation = self.debounce_generation.wrapping_add(1);
-                    self.debounce_pending = true;
-                    let generation = self.debounce_generation;
-                    Task::perform(
-                        widgets::debounce_sleep(300, generation),
-                        LogMessage::DebouncedRefresh,
-                    )
+                    self.debounce.trigger(300).map(LogMessage::DebouncedRefresh)
                 }
                 LogsTab::ToolFailures => {
                     self.search_filter.clone_from(&v);
@@ -388,15 +366,7 @@ impl LogsState {
                 }
             },
             LogMessage::DebouncedRefresh(generation) => {
-                if self.active_tab == LogsTab::ToolFailures {
-                    return Task::none();
-                }
-                if widgets::debounce_should_process(
-                    generation,
-                    self.debounce_generation,
-                    self.debounce_pending,
-                ) {
-                    self.debounce_pending = false;
+                if self.debounce.should_process(generation) {
                     return self.refresh(log_store);
                 }
                 Task::none()

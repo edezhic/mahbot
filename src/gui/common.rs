@@ -1,5 +1,7 @@
 //! Shared state types used across GUI pages.
 
+use iced::Task;
+
 /// Pagination state shared by dashboard pages that display paginated data.
 ///
 /// Groups `page`, `page_size`, and `total` into a single struct with helper
@@ -151,5 +153,95 @@ impl AsyncLoadState {
     /// "Loading…" after the first attempt, even on failure.
     pub(crate) fn set_has_loaded(&mut self) {
         self.has_loaded = true;
+    }
+}
+
+// ── Debounce state ──────────────────────────────────────────────────
+
+/// Debounce state for search/filter text inputs.
+///
+/// Groups the generation counter and pending flag from the manual debounce
+/// pattern into a single struct.  The caller keeps a `DebounceState` field,
+/// calls [`trigger`](Self::trigger) on input changes, and calls
+/// [`should_process`](Self::should_process) in the response handler.
+///
+/// # Pattern
+///
+/// ```ignore
+/// // In the input handler:
+/// self.debounce.trigger(300).map(MyMessage::DebouncedRefresh)
+///
+/// // In the response handler:
+/// if self.debounce.should_process(generation) {
+///     return self.refresh();
+/// }
+/// Task::none()
+/// ```
+#[derive(Debug, Clone)]
+pub(crate) struct DebounceState {
+    /// Monotonically increasing (modulo overflow) counter.  Each
+    /// [`trigger`](Self::trigger) call bumps this; the response handler
+    /// compares the incoming generation against it to reject stale tasks.
+    generation: u64,
+    /// `true` while a debounced refresh is pending (avoids processing
+    /// stale responses after a newer trigger has been spawned).
+    pending: bool,
+}
+
+impl DebounceState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            generation: 0,
+            pending: false,
+        }
+    }
+
+    /// Register a new debounced trigger.
+    ///
+    /// Increments the generation counter (wrapping on overflow), sets
+    /// `pending` to `true`, and returns a [`Task`] that resolves to the
+    /// new generation after `ms` milliseconds.
+    ///
+    /// The caller should map the returned task to their debounced-refresh
+    /// message variant (e.g. `.map(MyMessage::DebouncedRefresh)`).
+    pub(crate) fn trigger(&mut self, ms: u64) -> Task<u64> {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = true;
+        let current = self.generation;
+        Task::perform(
+            super::widgets::debounce_sleep(ms, current),
+            std::convert::identity,
+        )
+    }
+
+    /// Check whether a debounced response should be processed.
+    ///
+    /// Returns `true` **and** clears the pending flag when `generation`
+    /// matches the current generation while a response is pending.
+    /// Returns `false` for stale (out-of-date) responses.
+    ///
+    /// After a `true` return the caller should run their refresh logic.
+    #[must_use]
+    pub(crate) fn should_process(&mut self, generation: u64) -> bool {
+        if generation == self.generation && self.pending {
+            self.pending = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ── String helpers ──────────────────────────────────────────────────
+
+/// Convert a string reference to `None` if empty, otherwise
+/// `Some(s.to_string())`.
+///
+/// Useful when building query structs where empty filters mean "no filter".
+pub(crate) fn none_if_empty(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
     }
 }

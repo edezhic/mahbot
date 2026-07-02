@@ -159,26 +159,13 @@ pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> R
 
 /// Spawn a sleep task that returns `generation` after `ms` milliseconds.
 ///
-/// Use with a debounced refresh message to avoid multiple rapid refreshes:
-/// increment a generation counter, spawn this task with the new generation,
-/// and in the response handler check [`debounce_should_process`].
+/// Used by [`DebounceState`](super::common::DebounceState) to implement
+/// debounced refresh: increment a generation counter, spawn this task
+/// with the new generation, and check the returned generation against
+/// the current counter in the response handler.
 pub async fn debounce_sleep(ms: u64, generation: u64) -> u64 {
     tokio::time::sleep(Duration::from_millis(ms)).await;
     generation
-}
-
-/// Returns `true` if a debounced refresh should proceed.
-///
-/// Pass the generation from the debounce response, the current generation
-/// counter, and the pending flag.  This prevents stale debounce tasks
-/// from triggering a refresh after a newer task has been spawned.
-#[must_use]
-pub const fn debounce_should_process(
-    generation: u64,
-    current_generation: u64,
-    pending: bool,
-) -> bool {
-    generation == current_generation && pending
 }
 
 /// Render a pagination bar with ← Prev / Page X of Y / Next →.

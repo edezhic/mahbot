@@ -56,11 +56,8 @@ pub struct ToolFailuresState {
     /// Search text filter (empty = no search).
     pub(crate) search_filter: String,
 
-    /// Debounce counter for the search text input. Each keystroke increments
-    /// this; only the most recent generation's sleep-task triggers a DB refresh.
-    debounce_generation: u64,
-    /// True when a debounced refresh is pending (prevents double-firing).
-    debounce_pending: bool,
+    /// Debounce state for the search text input.
+    debounce: super::common::DebounceState,
 }
 
 impl ToolFailuresState {
@@ -72,28 +69,15 @@ impl ToolFailuresState {
             role_filter: String::new(),
             workspace_filter: String::new(),
             search_filter: String::new(),
-            debounce_generation: 0,
-            debounce_pending: false,
+            debounce: super::common::DebounceState::new(),
         }
     }
 
     fn build_query(&self) -> ToolErrorQuery {
         ToolErrorQuery {
-            role_filter: if self.role_filter.is_empty() {
-                None
-            } else {
-                Some(self.role_filter.clone())
-            },
-            workspace_filter: if self.workspace_filter.is_empty() {
-                None
-            } else {
-                Some(self.workspace_filter.clone())
-            },
-            search: if self.search_filter.is_empty() {
-                None
-            } else {
-                Some(self.search_filter.clone())
-            },
+            role_filter: super::common::none_if_empty(&self.role_filter),
+            workspace_filter: super::common::none_if_empty(&self.workspace_filter),
+            search: super::common::none_if_empty(&self.search_filter),
         }
     }
 
@@ -148,21 +132,12 @@ impl ToolFailuresState {
             ToolFailuresMessage::SearchInput(v) => {
                 self.search_filter = v;
                 self.pagination.reset();
-                self.debounce_generation = self.debounce_generation.wrapping_add(1);
-                self.debounce_pending = true;
-                let generation = self.debounce_generation;
-                Task::perform(
-                    widgets::debounce_sleep(300, generation),
-                    ToolFailuresMessage::DebouncedRefresh,
-                )
+                self.debounce
+                    .trigger(300)
+                    .map(ToolFailuresMessage::DebouncedRefresh)
             }
             ToolFailuresMessage::DebouncedRefresh(generation) => {
-                if widgets::debounce_should_process(
-                    generation,
-                    self.debounce_generation,
-                    self.debounce_pending,
-                ) {
-                    self.debounce_pending = false;
+                if self.debounce.should_process(generation) {
                     return self.refresh();
                 }
                 Task::none()

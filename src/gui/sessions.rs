@@ -769,17 +769,13 @@ impl SessionsState {
                 DecodedMsgKind::Regular { content_parts: cp } => {
                     // Regular message — extract owned strings from the content parts
                     let (thinking, after, simple) = match cp {
-                        ContentParts::Simple(s) => (
-                            None,
-                            None,
-                            if s.is_empty() { None } else { Some(s.clone()) },
-                        ),
+                        ContentParts::Simple(s) => (None, None, super::common::none_if_empty(s)),
                         ContentParts::WithThinking {
                             thinking: t,
                             after_thinking: a,
                         } => {
                             let t_owned = t.clone();
-                            let a_owned = if a.is_empty() { None } else { Some(a.clone()) };
+                            let a_owned = super::common::none_if_empty(a);
                             (Some(t_owned), a_owned, None)
                         }
                     };
