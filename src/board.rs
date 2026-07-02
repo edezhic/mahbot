@@ -1902,6 +1902,7 @@ mod tests {
     use super::*;
     use crate::Role;
     use crate::Tool;
+    use crate::Workspace;
     use crate::role::DIAGNOSTICS_ROLE;
     use crate::role::SYSTEM_ROLE;
     use crate::util::test::TicketBuilder;
@@ -2871,22 +2872,25 @@ with a comment explaining why no agent is mid-execution in that state.\
         }
     }
 
+    /// Create a 2-ticket dependency chain: A (no prereqs) → B (depends on A).
+    async fn create_chain_ab(store: &BoardStore, ws: Workspace) -> (String, String) {
+        let a = make_ticket(store, ws.clone(), "A", TicketPhase::Backlog).await;
+        let b = TicketBuilder::new(store, ws)
+            .title("B")
+            .desc("depends on A")
+            .prereqs(std::slice::from_ref(&a))
+            .create()
+            .await
+            .expect("create b");
+        (a, b)
+    }
+
     #[tokio::test]
     async fn test_circular_dependency_rejected() {
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/ws", "ws");
 
-        // A depends on nothing
-        let a = make_ticket(&store, ws.clone(), "A", TicketPhase::Backlog).await;
-
-        // B depends on A
-        let b = TicketBuilder::new(&store, ws.clone())
-            .title("B")
-            .desc("second")
-            .prereqs(std::slice::from_ref(&a))
-            .create()
-            .await
-            .expect("create b");
+        let (a, b) = create_chain_ab(&store, ws.clone()).await;
 
         // Verify that A→B chain works: creating a ticket with both A and B
         // as prerequisites is NOT a cycle (it's just redundant, since A is
@@ -2905,18 +2909,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/ws", "ws");
 
-        // A (no prereqs)
-
-        let a = make_ticket(&store, ws.clone(), "A", TicketPhase::Backlog).await;
-
-        // B depends on A
-        let b = TicketBuilder::new(&store, ws.clone())
-            .title("B")
-            .desc("middle")
-            .prereqs(std::slice::from_ref(&a))
-            .create()
-            .await
-            .expect("create b");
+        let (a, b) = create_chain_ab(&store, ws.clone()).await;
 
         // C depends on B
         let c = TicketBuilder::new(&store, ws)
