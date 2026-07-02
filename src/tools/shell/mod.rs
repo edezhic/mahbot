@@ -188,6 +188,20 @@ async fn read_stream_limited(
     shared.lock().unwrap_poison().clone()
 }
 
+/// Spawn a background task that reads from an optional pipe into a shared buffer.
+fn spawn_pipe_reader(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    shared: Arc<Mutex<Vec<u8>>>,
+) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        if let Some(mut reader) = pipe {
+            read_stream_limited(&mut reader, SHELL_PIPE_READ_CAP, &shared).await
+        } else {
+            Vec::new()
+        }
+    })
+}
+
 /// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout`.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
@@ -210,22 +224,8 @@ async fn run_command_with_timeout(
     let stdout_shared = Arc::new(Mutex::new(Vec::new()));
     let stderr_shared = Arc::new(Mutex::new(Vec::new()));
 
-    let stdout_buf = Arc::clone(&stdout_shared);
-    let stdout_handle = tokio::spawn(async move {
-        if let Some(mut out) = stdout_pipe {
-            read_stream_limited(&mut out, SHELL_PIPE_READ_CAP, &stdout_buf).await
-        } else {
-            Vec::new()
-        }
-    });
-    let stderr_buf = Arc::clone(&stderr_shared);
-    let stderr_handle = tokio::spawn(async move {
-        if let Some(mut err) = stderr_pipe {
-            read_stream_limited(&mut err, SHELL_PIPE_READ_CAP, &stderr_buf).await
-        } else {
-            Vec::new()
-        }
-    });
+    let stdout_handle = spawn_pipe_reader(stdout_pipe, Arc::clone(&stdout_shared));
+    let stderr_handle = spawn_pipe_reader(stderr_pipe, Arc::clone(&stderr_shared));
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
