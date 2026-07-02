@@ -1757,18 +1757,65 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             } else {
                 // Path C2: Diagnostics failed — write the failure comment and
                 // bounce back to development for rework.
-                if let Err(e) = board()
-                    .add_comment(&ticket.id, DIAGNOSTICS_ROLE, &comment)
-                    .await
+                //
+                // Both writes are wrapped in a single transaction to eliminate
+                // the crash window between comment insertion and phase transition,
+                // matching the pattern used by handle_sanitation_verdict. If the
+                // process crashes before the transaction commits, neither the
+                // comment nor the transition is persisted — the ticket stays in
+                // InDiagnostics and reset_inflight_tickets on the next startup
+                // handles recovery without inflating the circuit breaker counter.
+                //
+                // Safety: we use transition_to_tx (which does NOT cancel agents)
+                // instead of transition_to (which does). This is safe because
+                // diagnostics spawns no LLM agents and claim_diagnostics already
+                // cancels any stale agents from a prior crash cycle (matching the
+                // pattern used by handle_sanitation_verdict and all other
+                // transition_to_tx callers).
+                if let Err(e) = crate::turso::with_tx(
+                    &board().conn,
+                    &ticket.id,
+                    "diagnostics failure + bounce",
+                    async |tx| {
+                        BoardStore::add_comment_tx(tx, &ticket.id, DIAGNOSTICS_ROLE, &comment)
+                            .await?;
+                        BoardStore::transition_to_tx(
+                            tx,
+                            &ticket.id,
+                            Some(TicketPhase::InDiagnostics),
+                            TicketPhase::ReadyForDevelopment,
+                            Some(true),
+                        )
+                        .await?;
+                        Ok(())
+                    },
+                )
+                .await
                 {
                     warn!(
                         ticket = %ticket.id,
                         error = %e,
-                        "Failed to write diagnostics comment",
+                        "Failed to write diagnostics failure comment and \
+                         transition ticket — transaction rolled back",
                     );
+                    return;
                 }
-                bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics")
-                    .await;
+
+                info!(
+                    ticket = %ticket.id,
+                    "Diagnostics failed — pipeline reservation set for rework priority",
+                );
+
+                // Notification fires after the transaction commits so the user
+                // always sees the new phase in the database.
+                dispatch_notification(
+                    &ticket,
+                    TicketPhase::InDiagnostics,
+                    TicketPhase::ReadyForDevelopment,
+                    NotifyPolicy::Buffer,
+                    "diagnostics_failure",
+                )
+                .await;
             }
         }
         Ok(_) => {
@@ -3655,5 +3702,83 @@ mod tests {
             "comment should explain that no diagnostics commands are configured: {}",
             comment.content,
         );
+    }
+
+    /// Verify that when diagnostics commands fail, `dispatch_diagnostics` writes a
+    /// failure comment and bounces the ticket back to `ReadyForDevelopment` with
+    /// `pipeline_reservation = true`. This exercises Path C2 through the complete
+    /// transaction (comment + transition), complementing the Path B test above
+    /// and verifying the with_tx crash-consistency fix for mahbot-847.
+    #[tokio::test]
+    async fn diagnostics_failure_bounces_to_ready_for_development() {
+        init_management_test_stores().await;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let ws_path = dir.path().to_string_lossy().to_string();
+        let ws_name = "test_diag_fail";
+        let ws = create_test_workspace(&ws_path, ws_name).await;
+
+        // Set a diagnostics command that will always fail (exit non-zero).
+        let cmds = DiagnosticsCommands {
+            format: Some("false".to_string()),
+            format_check: None,
+            lint_fix: None,
+            lint: None,
+            type_check: None,
+            build: None,
+            unit_test: None,
+        };
+        crate::workspace::store()
+            .set_diagnostics(ws_name, &cmds, &crate::turso::now())
+            .await
+            .expect("set diagnostics");
+
+        let ticket_id = make_ticket(
+            board(),
+            ws.clone(),
+            "Diagnostics Failure Test",
+            TicketPhase::InDiagnostics,
+        )
+        .await;
+
+        // NOTE: Do NOT claim the ticket beforehand — dispatch_diagnostics
+        // calls claim_diagnostics internally as its first step.
+        let ticket = expect_ticket(board(), &ticket_id).await;
+
+        dispatch_diagnostics(Arc::new(ticket), ws).await;
+
+        // Verify transition to ReadyForDevelopment with pipeline_reservation.
+        let ticket = expect_ticket(board(), &ticket_id).await;
+        assert_eq!(
+            ticket.phase,
+            TicketPhase::ReadyForDevelopment,
+            "diagnostics failure should bounce to ReadyForDevelopment",
+        );
+        assert!(
+            ticket.pipeline_reservation,
+            "bounced ticket should have pipeline_reservation = true",
+        );
+
+        // Verify a DIAGNOSTICS_ROLE comment was written with the failure marker.
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert!(
+            !comments.is_empty(),
+            "should have written at least one comment",
+        );
+        let has_diag_failure = comments.iter().any(|c| {
+            c.role == DIAGNOSTICS_ROLE
+                && c.content.contains(DIAGNOSTICS_COMMENT_PREFIX)
+                && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
+        });
+        assert!(
+            has_diag_failure,
+            "should have a DIAGNOSTICS_ROLE comment with the failure marker",
+        );
+
+        // Keep dir alive until after the test completes.
+        drop(dir);
     }
 }
