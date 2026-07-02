@@ -649,7 +649,7 @@ impl DiffState {
                         // we verify via `git status --porcelain -- <path>`: if empty, success;
                         // otherwise report the remaining changes.
                         //
-                        // Safety: `git reset HEAD` also exists with non-zero status when the
+                        // Note: `git reset HEAD` also exists with non-zero status when the
                         // path is outside the repository — we rely on the workspace-bound
                         // path validation to prevent this.
 

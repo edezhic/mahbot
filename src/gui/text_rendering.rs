@@ -219,7 +219,7 @@ pub(crate) fn iced_color_to_cosmic(c: Color) -> cosmic_text::Color {
 /// attribute application to characters in the gap region between the
 /// two slices.
 ///
-/// # Safety
+/// # Correctness
 ///
 /// Both slices must be subslices of the same `text` allocation. The
 /// contiguity check uses pointer arithmetic and would produce undefined

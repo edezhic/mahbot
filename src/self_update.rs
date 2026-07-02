@@ -437,7 +437,7 @@ pub async fn execute_update() -> Result<()> {
     }
 
     // 13. Clean up the build output binary after successful spawn.
-    //     Safety: never delete:
+    //     Note: never delete:
     //     - The spawn target (prevents macOS Gatekeeper race — see step 12).
     //     - The current_exe path (same Gatekeeper concern).
     //     - The cargo bin path (same Gatekeeper concern, also the spawn target).

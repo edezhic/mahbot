@@ -1017,7 +1017,7 @@ fn parse_porcelain_paths(porcelain: &str, predicate: impl FnMut(&&str) -> bool) 
     porcelain
         .lines()
         .filter(predicate)
-        // Safety: porcelain lines are at minimum 4 chars (<XY><space><path>), but
+        // Note: porcelain lines are at minimum 4 chars (<XY><space><path>), but
         // we guard with `get()` to prevent panics on malformed input.
         .filter_map(|line| {
             let path = line.get(3..)?;

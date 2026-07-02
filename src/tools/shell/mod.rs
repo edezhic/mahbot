@@ -467,7 +467,7 @@ fn windows_baseline_env_value(name: &str) -> Option<String> {
         "PATHEXT" => Some(".COM;.EXE;.BAT;.CMD;.VBS;.JS".into()),
         "HOMEDRIVE" | "HOMEPATH" => UserDirs::new().and_then(|d| {
             let s = d.home_dir().to_string_lossy().into_owned();
-            // Safety: Windows home paths always start with a drive letter
+            // Note: Windows home paths always start with a drive letter
             // (e.g., "C:\Users\..."), so byte-index slicing at positions 0..2
             // is safe. We validate the drive-letter pattern by checking that
             // the second byte is b':' (colon). This relies on the ASCII

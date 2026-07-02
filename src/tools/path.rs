@@ -552,7 +552,7 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     if expanded_path.is_absolute() {
         // Lexical prefix check — no sync I/O.
         //
-        // Safety: workspace_root is pre-canonicalized at workspace registration
+        // Note: workspace_root is pre-canonicalized at workspace registration
         // (see canonicalize_workspace_path in workspace.rs). The lexical check
         // may reject absolute paths whose prefix is a symlink into the workspace
         // (e.g. /tmp/… when the real workspace is /private/tmp/… on macOS), but

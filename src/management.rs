@@ -643,7 +643,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let ticket_for_failure = Arc::clone(&ticket);
 
     tokio::spawn(async move {
-        // Safety: AssertUnwindSafe is sound because:
+        // Correctness: AssertUnwindSafe is sound because:
         //   - `ticket` is Arc<Ticket> (atomic refcount, panic-safe); the inner
         //     Ticket data may be inconsistent after a panic, but it is consumed
         //     entirely within the unwound closure and never inspected afterwards.
@@ -1766,7 +1766,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 // InDiagnostics and reset_inflight_tickets on the next startup
                 // handles recovery without inflating the circuit breaker counter.
                 //
-                // Safety: we use transition_to_tx (which does NOT cancel agents)
+                // Note: we use transition_to_tx (which does NOT cancel agents)
                 // instead of transition_to (which does). This is safe because
                 // diagnostics spawns no LLM agents and claim_diagnostics already
                 // cancels any stale agents from a prior crash cycle (matching the
