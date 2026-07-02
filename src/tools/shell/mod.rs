@@ -344,7 +344,6 @@ impl ShellTool {
 /// with a non-default `CARGO_HOME` still have their cargo-installed tools
 /// found. Deduplication in [`prepend_path_entries`] handles the case when
 /// both point to the same directory.
-#[cfg(unix)]
 fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     let mut v = Vec::new();
 
@@ -363,6 +362,7 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
         v.push(dirs.home_dir().join(".cargo").join("bin"));
     }
 
+    #[cfg(unix)]
     if let Some(dirs) = UserDirs::new() {
         v.push(dirs.home_dir().join(".npm-global").join("bin"));
     }
@@ -371,40 +371,6 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
         v.push(PathBuf::from("/opt/homebrew/bin"));
         v.push(PathBuf::from("/usr/local/bin"));
     }
-    v
-}
-
-/// Extra `PATH` entries prepended for shell subprocesses so developer tools
-/// (`cargo`, etc.) resolve without reading the parent process `PATH`.
-///
-/// Always includes the cargo bin directory (via `$CARGO_HOME/bin` if set,
-/// else `~/.cargo/bin`).
-///
-/// # `$CARGO_HOME` belt-and-suspenders
-///
-/// When `$CARGO_HOME` is explicitly set, both `$CARGO_HOME/bin` (from
-/// [`crate::util::cargo_bin_dir`]) AND `~/.cargo/bin` are added. Same approach
-/// as the Unix variant.
-#[cfg(windows)]
-fn extra_shell_path_prefixes() -> Vec<PathBuf> {
-    let mut v = Vec::new();
-
-    // cargo_bin_dir() returns $CARGO_HOME/bin if CARGO_HOME is set,
-    // else ~/.cargo/bin.
-    if let Some(dir) = crate::util::cargo_bin_dir() {
-        v.push(dir);
-    }
-
-    // Belt-and-suspenders: when CARGO_HOME is explicitly set, also add
-    // ~/.cargo/bin so both paths are covered.
-    if let Ok(cargo_home) = std::env::var("CARGO_HOME")
-        && !cargo_home.is_empty()
-    {
-        if let Some(dirs) = UserDirs::new() {
-            v.push(dirs.home_dir().join(".cargo").join("bin"));
-        }
-    }
-
     v
 }
 
