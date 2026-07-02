@@ -21,6 +21,7 @@
 
 use crate::Workspace;
 use crate::config::CONFIG;
+use crate::util::UnwrapPoison;
 use fff_search::file_picker::{FFFMode, FilePickerOptions};
 use fff_search::shared::{SharedFilePicker, SharedFrecency, SharedQueryTracker};
 use fff_search::{FilePicker, QueryTracker};
@@ -88,9 +89,7 @@ pub(crate) fn get_or_init_engine(
 ) -> Result<Arc<SearchEngineEntry>, String> {
     // Fast path: read-lock check.
     {
-        let reg = registry()
-            .read()
-            .map_err(|e| format!("registry lock poisoned: {e}"))?;
+        let reg = registry().read().unwrap_poison();
         if let Some(entry) = reg.get(name) {
             return Ok(Arc::clone(entry));
         }
@@ -98,9 +97,7 @@ pub(crate) fn get_or_init_engine(
 
     // Slow path: serialise creation under the write lock so that two
     // concurrent callers never create duplicate scans/query-tracker DBs.
-    let mut reg = registry()
-        .write()
-        .map_err(|e| format!("registry lock poisoned: {e}"))?;
+    let mut reg = registry().write().unwrap_poison();
 
     // Double-check: another writer may have inserted while we waited.
     if let Some(existing) = reg.get(name) {
@@ -297,16 +294,7 @@ impl EngineHandle {
 /// require closing the LMDB environment while no readers are active, which is
 /// tricky across threads. The directory is small and harmless to leave behind.
 pub fn remove_engine(workspace_name: &str) {
-    let mut reg = match registry().write() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(
-                workspace_name,
-                "registry lock poisoned while removing engine: {e}"
-            );
-            return;
-        }
-    };
+    let mut reg = registry().write().unwrap_poison();
     if let Some(entry) = reg.remove(workspace_name) {
         drop(entry); // explicit: drop Arc before logging
         tracing::info!(workspace_name, "Search engine removed from registry");
