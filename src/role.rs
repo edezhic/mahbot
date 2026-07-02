@@ -5,6 +5,8 @@
 //! tool assignments, and [`RoleInfo`]. Used by [`crate::agent`] and other modules
 //! that need role data.
 
+use std::sync::LazyLock;
+
 use crate::Role;
 
 /// Role string for diagnostics comments — used both when posting diagnostics
@@ -164,6 +166,14 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
 
 // ── Trait impls ─────────────────────────────────────────────────────────
 
+/// Valid role names, pre-computed once to avoid re-iteration in error paths.
+static ALL_ROLE_NAMES: LazyLock<String> = LazyLock::new(|| {
+    <Role as strum::IntoEnumIterator>::iter()
+        .map(|r| r.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+});
+
 impl std::str::FromStr for Role {
     type Err = anyhow::Error;
 
@@ -172,10 +182,7 @@ impl std::str::FromStr for Role {
         <Role as strum::IntoEnumIterator>::iter()
             .find(|r| r.as_str() == lower)
             .ok_or_else(|| {
-                let names: Vec<&str> = <Role as strum::IntoEnumIterator>::iter()
-                    .map(|r| r.as_str())
-                    .collect();
-                anyhow::anyhow!("Unknown role '{s}', expected one of: {}", names.join(", "))
+                anyhow::anyhow!("Unknown role '{s}', expected one of: {}", *ALL_ROLE_NAMES)
             })
     }
 }

@@ -7,6 +7,7 @@ use chrono::{Duration, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::LazyLock;
 use tracing::{debug, info, warn};
 
 crate::define_store! {
@@ -464,6 +465,14 @@ impl TicketPhase {
     }
 }
 
+/// Valid phase names, pre-computed once to avoid re-iteration in error paths.
+static ALL_TICKET_PHASE_NAMES: LazyLock<String> = LazyLock::new(|| {
+    <TicketPhase as strum::IntoEnumIterator>::iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+});
+
 impl std::str::FromStr for TicketPhase {
     type Err = anyhow::Error;
 
@@ -473,10 +482,10 @@ impl std::str::FromStr for TicketPhase {
         <TicketPhase as strum::IntoEnumIterator>::iter()
             .find(|p| p.as_ref() == s)
             .ok_or_else(|| {
-                let names: Vec<String> = <TicketPhase as strum::IntoEnumIterator>::iter()
-                    .map(|p| p.to_string())
-                    .collect();
-                anyhow::anyhow!("Invalid status '{s}'. Valid statuses: {}", names.join(", "))
+                anyhow::anyhow!(
+                    "Invalid status '{s}'. Valid statuses: {}",
+                    *ALL_TICKET_PHASE_NAMES
+                )
             })
     }
 }
