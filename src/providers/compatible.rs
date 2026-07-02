@@ -540,27 +540,6 @@ pub(crate) fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_js
     })
 }
 
-/// Convert wire-format [`ApiToolCall`] fields into a [`ProviderToolCall`].
-///
-/// Returns `None` when the name is absent (incomplete/final delta for streaming).
-/// Arguments default to `"{}"` when `None` or absent — unified across
-/// streaming and non-streaming paths.
-#[must_use]
-pub(crate) fn api_tool_call_to_provider(
-    id: Option<String>,
-    name: Option<String>,
-    arguments: Option<String>,
-) -> Option<ProviderToolCall> {
-    let name = name?;
-    let arguments = arguments.unwrap_or_else(|| "{}".to_string());
-    let parsed = parse_tool_call_arguments(&name, &arguments);
-    Some(ProviderToolCall {
-        id: id.unwrap_or_else(crate::generate_id),
-        name,
-        arguments: parsed,
-    })
-}
-
 impl OpenAiCompatibleProvider {
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
@@ -574,10 +553,14 @@ impl OpenAiCompatibleProvider {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|tc| {
-                let name = tc.function_name();
-                let arguments = tc.function_arguments();
-                let id = tc.id;
-                api_tool_call_to_provider(id, name, arguments)
+                let name = tc.function_name()?;
+                let arguments = tc.function_arguments().unwrap_or("{}".to_string());
+                let parsed_arguments = parse_tool_call_arguments(&name, &arguments);
+                Some(ProviderToolCall {
+                    id: tc.id.unwrap_or_else(crate::generate_id),
+                    name,
+                    arguments: parsed_arguments,
+                })
             })
             .collect::<Vec<_>>();
 
@@ -957,72 +940,6 @@ mod tests {
             resolve_tool_call_arguments(Some("{\"key\":\"val\"}"), None, Some(&params)),
             Some("{\"key\":\"val\"}".to_string()),
         );
-    }
-
-    // ----------------------------------------------------------
-    // api_tool_call_to_provider unit tests
-    // ----------------------------------------------------------
-
-    #[test]
-    fn api_tool_call_to_provider_returns_none_when_name_is_none() {
-        let result = api_tool_call_to_provider(Some("id_1".into()), None, Some("{}".into()));
-        assert!(result.is_none(), "should return None when name is absent");
-    }
-
-    #[test]
-    fn api_tool_call_to_provider_defaults_empty_arguments() {
-        let result = api_tool_call_to_provider(Some("id_1".into()), Some("shell".into()), None)
-            .expect("should produce a tool call");
-        assert_eq!(result.id, "id_1");
-        assert_eq!(result.name, "shell");
-        assert_eq!(result.arguments, serde_json::json!({}));
-    }
-
-    #[test]
-    fn api_tool_call_to_provider_defaults_empty_arguments_with_name_only() {
-        // Even with empty string arguments, None is equivalent to "{}"
-        let result =
-            api_tool_call_to_provider(Some("id_2".into()), Some("read".into()), Some("".into()))
-                .expect("should produce a tool call");
-        assert_eq!(result.id, "id_2");
-        assert_eq!(result.name, "read");
-        assert_eq!(result.arguments, serde_json::json!({}));
-    }
-
-    #[test]
-    fn api_tool_call_to_provider_generates_id_when_missing() {
-        let result =
-            api_tool_call_to_provider(None, Some("shell".into()), Some("{\"cmd\":\"ls\"}".into()))
-                .expect("should produce a tool call");
-        assert!(!result.id.is_empty(), "id should be generated");
-        assert_eq!(result.name, "shell");
-        assert_eq!(result.arguments, serde_json::json!({"cmd": "ls"}));
-    }
-
-    #[test]
-    fn api_tool_call_to_provider_parses_arguments() {
-        let result = api_tool_call_to_provider(
-            Some("call_1".into()),
-            Some("shell".into()),
-            Some("{\"command\":\"date\"}".into()),
-        )
-        .expect("should produce a tool call");
-        assert_eq!(result.id, "call_1");
-        assert_eq!(result.name, "shell");
-        assert_eq!(result.arguments, serde_json::json!({"command": "date"}));
-    }
-
-    #[test]
-    fn api_tool_call_to_provider_repairs_malformed_json() {
-        let result = api_tool_call_to_provider(
-            Some("call_1".into()),
-            Some("shell".into()),
-            Some("{\"command\":\"date\"".into()), // missing closing brace
-        )
-        .expect("should produce a tool call");
-        assert_eq!(result.name, "shell");
-        // repair should succeed — arguments should contain command
-        assert_eq!(result.arguments, serde_json::json!({"command": "date"}));
     }
 
     // ----------------------------------------------------------
