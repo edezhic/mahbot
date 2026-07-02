@@ -203,22 +203,18 @@ fn find_closest_aspect_ratio(width: usize, height: usize) -> Option<&'static str
 
     let ratio = width as f64 / height as f64;
 
-    // Find the closest canonical ratio by minimising absolute difference.
-    // When two ratios are equally close, the first in declaration order wins
-    // (a practical impossibility with the given spacing, but handled for
-    // correctness).
-    let mut best = CANONICAL_ASPECT_RATIOS[0];
-    let mut best_diff = (ratio - best.1).abs();
-
-    for entry in CANONICAL_ASPECT_RATIOS.iter().skip(1) {
-        let diff = (ratio - entry.1).abs();
-        if diff < best_diff {
-            best = *entry;
-            best_diff = diff;
-        }
-    }
-
-    Some(best.0)
+    // Find the closest canonical ratio via `min_by`. When two ratios are
+    // equally close, the first in declaration order wins (a practical
+    // impossibility with the given spacing, but `unwrap_or(Equal)` gives
+    // the correct tie-break).
+    CANONICAL_ASPECT_RATIOS
+        .iter()
+        .min_by(|a, b| {
+            let da = (ratio - a.1).abs();
+            let db = (ratio - b.1).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(name, _)| *name)
 }
 
 /// The parts extracted from an image generation response.
