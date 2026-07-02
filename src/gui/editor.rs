@@ -2473,9 +2473,9 @@ impl EditorState {
 
             EditorMessage::FindReplaceInput(replace) => self.find_replace_input(replace),
 
-            EditorMessage::FindNext => self.find_next(),
+            EditorMessage::FindNext => self.navigate_find_match(&FindDirection::Next),
 
-            EditorMessage::FindPrev => self.find_prev(),
+            EditorMessage::FindPrev => self.navigate_find_match(&FindDirection::Prev),
 
             EditorMessage::FindReplace => self.find_replace(),
 
@@ -4214,17 +4214,6 @@ impl EditorState {
     }
 
     /// Navigate to the next find match.
-    fn find_next(&mut self) -> Task<EditorMessage> {
-        self.navigate_find_match(&FindDirection::Next);
-        Task::none()
-    }
-
-    /// Navigate to the previous find match.
-    fn find_prev(&mut self) -> Task<EditorMessage> {
-        self.navigate_find_match(&FindDirection::Prev);
-        Task::none()
-    }
-
     /// Handle refresh-file-tree — re-reads all expanded directories from disk.
     fn refresh_file_tree(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the file tree should
@@ -4519,9 +4508,9 @@ impl EditorState {
 
     /// Navigate to the next or previous find match in the active tab.
     /// Returns silently if there is no active tab, no find state, or no matches.
-    fn navigate_find_match(&mut self, direction: &FindDirection) {
+    fn navigate_find_match(&mut self, direction: &FindDirection) -> Task<EditorMessage> {
         let Some((_, path)) = self.active_tab() else {
-            return;
+            return Task::none();
         };
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if let Some(ref mut state) = tab_data.find_replace_state {
@@ -4547,6 +4536,7 @@ impl EditorState {
                 }
             }
         }
+        Task::none()
     }
 
     /// Shared helper for navigating search results — adjusts the selected index
