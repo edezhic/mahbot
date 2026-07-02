@@ -371,6 +371,42 @@ fn warn_transition_failed(
     );
 }
 
+/// Write a comment to a ticket, then transition it to a new phase.
+///
+/// The comment is written first; if it fails, a warning is logged but execution
+/// continues to the transition. Returns `true` if the transition succeeded,
+/// `false` if it failed (comment failure is non-fatal).
+///
+/// This is **not** atomic — the crash window between comment and transition is
+/// self-healing via the poll loop.
+#[allow(clippy::too_many_arguments)]
+async fn comment_and_transition(
+    ticket: &Ticket,
+    role: &str,
+    comment: &str,
+    source: TicketPhase,
+    target: TicketPhase,
+    notify: NotifyPolicy,
+    context_label: &str,
+    verb: &str,
+) -> bool {
+    if let Err(e) = board().add_comment(&ticket.id, role, comment).await {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "{context_label} {verb}: failed to write comment",
+        );
+    }
+
+    match transition_ticket(ticket, source, target, notify, None).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn_transition_failed(ticket, source, target, context_label, verb, &e);
+            false
+        }
+    }
+}
+
 /// Resolve a workspace from a ticket's stored `workspace_name`.
 ///
 /// Returns `None` and logs a warning if the workspace cannot be found. Both
@@ -988,38 +1024,22 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         ("Agent failed", TicketPhase::Failed, NotifyPolicy::Notify)
     };
 
-    if let Err(e) = board()
-        .add_comment(&ticket.id, Role::Engineer.as_str(), comment_text)
-        .await
-    {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to write engineer completion comment",
-        );
-    }
-    if let Err(e) = transition_ticket(
+    let verb = match target_phase {
+        TicketPhase::InDiagnostics => "completed",
+        _ => "failed",
+    };
+
+    comment_and_transition(
         &ticket,
+        Role::Engineer.as_str(),
+        comment_text,
         TicketPhase::InDevelopment,
         target_phase,
         notify,
-        None,
+        "Engineer",
+        verb,
     )
-    .await
-    {
-        let verb = match target_phase {
-            TicketPhase::InDiagnostics => "completed",
-            _ => "failed",
-        };
-        warn_transition_failed(
-            &ticket,
-            TicketPhase::InDevelopment,
-            target_phase,
-            "Engineer",
-            verb,
-            &e,
-        );
-    }
+    .await;
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
@@ -1507,35 +1527,17 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
                 rationale = verdict.rationale
             )
         };
-        if let Err(e) = board()
-            .add_comment(&ticket.id, Role::Sanitation.as_str(), &comment)
-            .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to write sanitation pass comment",
-            );
-        }
-
-        if let Err(e) = transition_ticket(
+        comment_and_transition(
             ticket,
+            Role::Sanitation.as_str(),
+            &comment,
             TicketPhase::InSanitation,
             TicketPhase::SanitationPassed,
             NotifyPolicy::Buffer,
-            None,
+            "Sanitation",
+            "passed",
         )
-        .await
-        {
-            warn_transition_failed(
-                ticket,
-                TicketPhase::InSanitation,
-                TicketPhase::SanitationPassed,
-                "Sanitation",
-                "passed",
-                &e,
-            );
-        }
+        .await;
     } else {
         let garbage_list = verdict.garbage_files.join("\n- ");
         let comment = format!(
@@ -2085,14 +2087,6 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
         potential_blockers,
         missing_analysis,
     );
-    if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, &summary).await {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to write analyst verdict summary comment",
-        );
-    }
-
     let extracted_count = total - missing_analysis;
     let passing_count = lgtm + minor_issues;
 
@@ -2101,25 +2095,18 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // analysts must produce passing verdicts for the ticket to proceed.
     let all_passed = passing_count == PARALLEL_AGENT_COUNT;
 
-    let target = TicketPhase::Planning;
-
-    if let Err(e) = transition_ticket(
+    if !comment_and_transition(
         ticket,
+        SYSTEM_ROLE,
+        &summary,
         TicketPhase::Analysis,
-        target,
+        TicketPhase::Planning,
         NotifyPolicy::Notify,
-        None,
+        "Analyst",
+        "completed",
     )
     .await
     {
-        warn_transition_failed(
-            ticket,
-            TicketPhase::Analysis,
-            target,
-            "Analyst",
-            "completed",
-            &e,
-        );
         return;
     }
     if all_passed {
