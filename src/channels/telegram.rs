@@ -550,7 +550,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
         // ── Headers: ## Title → <b>Title</b> ───────────────────
         let stripped = line.trim_start_matches('#');
         let header_level = line.len() - stripped.len();
-        if header_level > 0 && line.starts_with('#') && stripped.starts_with(' ') {
+        if header_level > 0 && stripped.starts_with(' ') {
             let title = escape_html(stripped.trim());
             let _ = writeln!(out, "<b>{title}</b>");
             continue;
