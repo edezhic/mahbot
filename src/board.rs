@@ -1843,7 +1843,17 @@ impl BoardStore {
         }
         Ok(candidates)
     }
+}
 
+/// Minimal ticket info for display purposes (id, title, status).
+#[derive(Debug, Clone)]
+pub(crate) struct TicketMinimal {
+    pub id: String,
+    pub title: String,
+    pub phase: String,
+}
+
+impl BoardStore {
     /// Batch fetch minimal ticket info (id, title, status) by ID list.
     ///
     /// Results are returned in the same order as `ids`. Missing IDs are
@@ -1852,10 +1862,7 @@ impl BoardStore {
     /// This method exists specifically for the search-archived-ticket
     /// formatting path, which needs just `id`, `title`, and `status` for
     /// display purposes after hybrid ranking.
-    pub async fn list_tickets_minimal(
-        &self,
-        ids: &[String],
-    ) -> Result<Vec<(String, String, String)>> {
+    pub(crate) async fn list_tickets_minimal(&self, ids: &[String]) -> Result<Vec<TicketMinimal>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1867,18 +1874,25 @@ impl BoardStore {
 
         let rows = self.conn.query(&sql, params_from_iter(params)).await?;
 
-        let mut map: HashMap<String, (String, String)> = HashMap::new();
+        let mut map: HashMap<String, TicketMinimal> = HashMap::new();
         for row in &rows {
-            let id: String = row.get(0)?;
+            let ticket_id: String = row.get(0)?;
             let title: String = row.get(1)?;
-            let status: String = row.get(2)?;
-            map.insert(id, (title, status));
+            let phase: String = row.get(2)?;
+            map.insert(
+                ticket_id.clone(),
+                TicketMinimal {
+                    id: ticket_id,
+                    title,
+                    phase,
+                },
+            );
         }
 
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some((title, status)) = map.get(id) {
-                results.push((id.clone(), title.clone(), status.clone()));
+            if let Some(entry) = map.get(id) {
+                results.push(entry.clone());
             }
         }
         Ok(results)
@@ -4342,9 +4356,9 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("list minimal");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, id_a);
-        assert_eq!(rows[0].1, "Alpha");
-        assert_eq!(rows[0].2, "done");
+        assert_eq!(rows[0].id, id_a);
+        assert_eq!(rows[0].title, "Alpha");
+        assert_eq!(rows[0].phase, "done");
 
         // 2. Nonexistent IDs omitted.
         let rows = store
@@ -4352,10 +4366,10 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("list minimal");
         assert_eq!(rows.len(), 1, "nonexistent IDs should be omitted");
-        assert_eq!(rows[0].0, id_a);
+        assert_eq!(rows[0].id, id_a);
 
         // 3. Empty ids returns empty (early-return guard).
-        let rows: Vec<(String, String, String)> = store
+        let rows: Vec<crate::board::TicketMinimal> = store
             .list_tickets_minimal(&[] as &[String])
             .await
             .expect("list minimal");
@@ -4367,9 +4381,9 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("list minimal");
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].0, id_c, "first result should be Gamma");
-        assert_eq!(rows[1].0, id_a, "second result should be Alpha");
-        assert_eq!(rows[2].0, id_b, "third result should be Beta");
+        assert_eq!(rows[0].id, id_c, "first result should be Gamma");
+        assert_eq!(rows[1].id, id_a, "second result should be Alpha");
+        assert_eq!(rows[2].id, id_b, "third result should be Beta");
     }
 
     /// Basic field layout of `detailed_display`: fields present, negative

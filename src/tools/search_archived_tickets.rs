@@ -124,8 +124,8 @@ impl SearchArchivedTicketsTool {
 
         let mut output = String::from("Search results (top 10, highest score first):\n");
         for id in top_ids {
-            if let Some((_, title, status)) = rows.iter().find(|(rid, _, _)| rid == id) {
-                let _ = writeln!(output, "  [{status}] {id}: {title}");
+            if let Some(entry) = rows.iter().find(|entry| entry.id == *id) {
+                let _ = writeln!(output, "  [{}] {}: {}", entry.phase, id, entry.title);
             }
         }
 
