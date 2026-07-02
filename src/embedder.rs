@@ -37,7 +37,7 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tokenizers::Tokenizer;
@@ -100,9 +100,6 @@ static GLOBAL_EMBEDDER: OnceLock<RwLock<Option<Embedder>>> = OnceLock::new();
 
 /// Atomic state tracker to coordinate lazy initialization.
 static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
-
-/// Whether a background download has been spawned.
-static DOWNLOAD_SPAWNED: AtomicBool = AtomicBool::new(false);
 
 /// Returns a reference to the global singleton [`Embedder`] RwLock. Never panics.
 #[must_use]
@@ -184,22 +181,14 @@ fn ensure_embedder() -> bool {
         return true;
     }
 
-    // Spawn background download (only once)
-    if !DOWNLOAD_SPAWNED.swap(true, Ordering::AcqRel) {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(download_retry_loop());
-        } else {
-            // No tokio runtime available (e.g., in unit tests without runtime).
-            // The download will be triggered on the next call when a runtime exists.
-            // Reset state to UNINIT so the next caller retries the cache check + spawn.
-            // Reset both atomics: DOWNLOAD_SPAWNED first (via AcqRel swap), then STATE.
-            // The swap provides an atomic full barrier: any concurrent thread calling
-            // DOWNLOAD_SPAWNED.swap(true, ...) either sees the old true and skips, or
-            // sees false after our store and will attempt to spawn. After the barrier,
-            // STATE is set to UNINIT so the next caller re-enters ensure_embedder().
-            DOWNLOAD_SPAWNED.store(false, Ordering::Release);
-            STATE.store(STATE_UNINIT, Ordering::Release);
-        }
+    // Spawn background download
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(download_retry_loop());
+    } else {
+        // No tokio runtime available (e.g., in unit tests without runtime).
+        // The download will be triggered on the next call when a runtime exists.
+        // Reset STATE to UNINIT so the next caller re-enters ensure_embedder().
+        STATE.store(STATE_UNINIT, Ordering::Release);
     }
 
     false
@@ -1027,7 +1016,6 @@ mod tests {
     fn reset_global_state() {
         *global_embedder().write().unwrap_poison() = None;
         STATE.store(STATE_UNINIT, Ordering::Release);
-        DOWNLOAD_SPAWNED.store(false, Ordering::Release);
     }
 
     #[test]
