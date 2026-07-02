@@ -1112,35 +1112,17 @@ async fn transition_ticket_to_failed(
     comment: &str,
     context_label: &str,
 ) -> bool {
-    if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, comment).await {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to write system comment during transition-to-failed ({context_label})",
-            context_label = context_label,
-        );
-    }
-
-    match transition_ticket(
+    comment_and_transition(
         ticket,
+        SYSTEM_ROLE,
+        comment,
         source,
         TicketPhase::Failed,
         NotifyPolicy::Notify,
-        None,
+        context_label,
+        "failed",
     )
     .await
-    {
-        Ok(()) => true,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "{context_label} — transition to Failed failed",
-                context_label = context_label,
-            );
-            false
-        }
-    }
 }
 
 /// Auto-commit changes and move the ticket to Done.
