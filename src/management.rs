@@ -1108,13 +1108,13 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 }
 
 /// Transition a ticket to Done with a descriptive reason from the given source phase.
-async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, reason: &str) {
-    info!(ticket = %ticket.id, "{reason}");
+async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
+    info!(ticket = %ticket.id, "{comment}");
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
     comment_and_transition(
         ticket,
         SYSTEM_ROLE,
-        reason,
+        comment,
         source,
         TicketPhase::Done,
         notify_policy,
@@ -1157,15 +1157,15 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    let reason = if !crate::diff_parse::git_is_installed().await {
+    let comment = if !crate::diff_parse::git_is_installed().await {
         Some("Git not installed — moving to Done without commit")
     } else if !crate::diff_parse::is_git_repo(repo_path) {
         Some("Not a git repo — moving to Done without commit")
     } else {
         None
     };
-    if let Some(r) = reason {
-        transition_ticket_to_done(&ticket, source, r).await;
+    if let Some(c) = comment {
+        transition_ticket_to_done(&ticket, source, c).await;
         return;
     }
 
