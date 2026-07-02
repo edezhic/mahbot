@@ -347,31 +347,24 @@ impl Role {
         let firecrawl_key = CONFIG.firecrawl_key();
         let exa_key = CONFIG.exa_key();
 
-        match provider.as_deref() {
+        let backend: Option<WebSearchBackend> = match provider.as_deref() {
             Some(p) if p.eq_ignore_ascii_case("firecrawl") => {
-                if let Some(key) = firecrawl_key {
-                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Firecrawl {
-                        key,
-                    })));
-                }
+                firecrawl_key.map(|key| WebSearchBackend::Firecrawl { key })
             }
             Some(p) if p.eq_ignore_ascii_case("exa") => {
-                if let Some(key) = exa_key {
-                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Exa { key })));
-                }
+                exa_key.map(|key| WebSearchBackend::Exa { key })
             }
             Some(other) => {
                 tracing::warn!("Unknown web_search_provider: {other}");
+                None
             }
-            None => {
-                if let Some(key) = firecrawl_key {
-                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Firecrawl {
-                        key,
-                    })));
-                } else if let Some(key) = exa_key {
-                    tools.push(Box::new(WebSearchTool::new(WebSearchBackend::Exa { key })));
-                }
-            }
+            None => firecrawl_key
+                .map(|key| WebSearchBackend::Firecrawl { key })
+                .or_else(|| exa_key.map(|key| WebSearchBackend::Exa { key })),
+        };
+
+        if let Some(backend) = backend {
+            tools.push(Box::new(WebSearchTool::new(backend)));
         }
     }
 }
