@@ -110,6 +110,16 @@ pub fn global_embedder() -> &'static RwLock<Option<Embedder>> {
     GLOBAL_EMBEDDER.get_or_init(|| RwLock::new(None))
 }
 
+/// Atomically store a ready [`Embedder`] and transition state to [`STATE_READY`].
+///
+/// This bundles the two operations (RwLock write + state transition) into a single
+/// call so no future code path can do one without the other.
+#[inline]
+fn set_embedder_ready(emb: Embedder) {
+    *global_embedder().write().unwrap_poison() = Some(emb);
+    STATE.store(STATE_READY, Ordering::Release);
+}
+
 /// Try to initialize the embedder (sync load from cache or spawn background download).
 ///
 /// Called on every [`embed()`] invocation. Returns `true` if the embedder is
@@ -153,8 +163,7 @@ fn ensure_embedder() -> bool {
     let cache_loaded = if model_path.exists() && tokenizer_path.exists() {
         match Embedder::load(&model_path, &tokenizer_path) {
             Ok(emb) => {
-                *global_embedder().write().unwrap_poison() = Some(emb);
-                STATE.store(STATE_READY, Ordering::Release);
+                set_embedder_ready(emb);
                 true
             }
             Err(e) => {
@@ -258,8 +267,7 @@ async fn download_retry_loop() {
             // Both files already present from a previous iteration — try to load.
             if let Ok(emb) = Embedder::load(&model_dest, &tokenizer_dest) {
                 info!("Embedding model loaded successfully (from previously downloaded files)");
-                *global_embedder().write().unwrap_poison() = Some(emb);
-                STATE.store(STATE_READY, Ordering::Release);
+                set_embedder_ready(emb);
                 return;
             }
             // Loading failed — could be a code bug, not necessarily corrupted files.
@@ -295,8 +303,7 @@ async fn download_retry_loop() {
             match Embedder::load(&model_dest, &tokenizer_dest) {
                 Ok(emb) => {
                     info!("Embedding model loaded successfully after download");
-                    *global_embedder().write().unwrap_poison() = Some(emb);
-                    STATE.store(STATE_READY, Ordering::Release);
+                    set_embedder_ready(emb);
                     return;
                 }
                 Err(e) => {
