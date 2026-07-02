@@ -193,11 +193,11 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// * `ticket` — the ticket being guarded.
 /// * `expected_phase` — the phase the ticket must still be in.
 /// * `threshold` — the count at which the circuit breaker trips (passed to
-///   [`run_circuit_breaker`]; uses `>` comparison).
+///   [`is_circuit_breaker_tripped`]; uses `>` comparison).
 /// * `count_fn` — extracts the failure count from comments (passed to
-///   [`run_circuit_breaker`]).
+///   [`is_circuit_breaker_tripped`]).
 /// * `comment_text` — formats the system comment body given the count
-///   (passed to [`run_circuit_breaker`]).
+///   (passed to [`is_circuit_breaker_tripped`]).
 /// * `label` — human-readable label used in logs to identify the caller.
 ///
 /// # Return value
@@ -218,7 +218,7 @@ async fn is_phase_and_breaker_clear(
     if !is_ticket_in_phase(&ticket.id, expected_phase).await {
         return false;
     }
-    if run_circuit_breaker(
+    if is_circuit_breaker_tripped(
         ticket,
         expected_phase,
         threshold,
@@ -2222,6 +2222,12 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// rather than dispatching an agent to a stale or unreachable ticket).
 /// Returns `false` only when the count does not exceed `threshold`.
 ///
+/// Despite the `is_` prefix, this is **not** a pure predicate — it transitions
+/// the ticket to `Failed` (and drains ReadyForDevelopment siblings) when the
+/// breaker trips. This is an acceptable trade-off for a private function: the
+/// interrogative name improves readability at call sites ("if the breaker
+/// tripped, bail out") while the side-effect is documented here.
+///
 /// # Parameters
 ///
 /// * `ticket` — the ticket being evaluated for the circuit breaker.
@@ -2234,7 +2240,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// * `log_label` — human-readable label used in log messages to identify the
 ///   circuit breaker caller.
 #[must_use]
-async fn run_circuit_breaker(
+async fn is_circuit_breaker_tripped(
     ticket: &Ticket,
     expected_phase: TicketPhase,
     threshold: usize,
@@ -2522,7 +2528,7 @@ mod tests {
         // Fetch ticket A and trip the circuit breaker with threshold 0.
         let ticket_a = expect_ticket(board(), &trip_id).await;
 
-        let tripped = run_circuit_breaker(
+        let tripped = is_circuit_breaker_tripped(
             &ticket_a,
             TicketPhase::ReadyForDevelopment,
             0,                      // threshold = 0, so 1 comment > 0 trips
@@ -2868,7 +2874,7 @@ mod tests {
         .expect("transition to Analysis");
     }
 
-    // ── run_circuit_breaker — sanitation counting ──
+    // ── is_circuit_breaker_tripped — sanitation counting ──
 
     /// Verify that the sanitation circuit breaker counting logic works correctly.
     #[tokio::test]
@@ -2897,7 +2903,7 @@ mod tests {
 
         // Should NOT trip (2 <= 3)
         assert!(
-            !run_circuit_breaker(
+            !is_circuit_breaker_tripped(
                 &ticket,
                 TicketPhase::InSanitation,
                 SANITATION_CIRCUIT_BREAKER_THRESHOLD,
@@ -2932,11 +2938,11 @@ mod tests {
             .await;
 
         // Now with 4 failures, should trip (4 > 3).
-        // Re-fetch ticket with fresh comments (run_circuit_breaker fetches comments
+        // Re-fetch ticket with fresh comments (is_circuit_breaker_tripped fetches comments
         // from DB internally, so we just need the ticket id).
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        let tripped = run_circuit_breaker(
+        let tripped = is_circuit_breaker_tripped(
             &ticket,
             TicketPhase::InSanitation,
             SANITATION_CIRCUIT_BREAKER_THRESHOLD,
@@ -3121,7 +3127,7 @@ mod tests {
         }
     }
 
-    // ── run_circuit_breaker — general circuit breaker ────────
+    // ── is_circuit_breaker_tripped — general circuit breaker ────────
 
     /// Verify the circuit breaker trips at the threshold boundary:
     /// - `> CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → trips (ticket → Failed)
@@ -3176,7 +3182,7 @@ mod tests {
 
             let ticket = expect_ticket(board(), &ticket_id).await;
 
-            let tripped = run_circuit_breaker(
+            let tripped = is_circuit_breaker_tripped(
                 &ticket,
                 TicketPhase::InReview,
                 CIRCUIT_BREAKER_COMMENT_THRESHOLD,
@@ -3227,7 +3233,7 @@ mod tests {
         // Trip the breaker
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        let tripped = run_circuit_breaker(
+        let tripped = is_circuit_breaker_tripped(
             &ticket,
             TicketPhase::InReview,
             CIRCUIT_BREAKER_COMMENT_THRESHOLD,
