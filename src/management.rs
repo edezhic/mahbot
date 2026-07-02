@@ -317,9 +317,9 @@ async fn dispatch_notification(
 /// (back to [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets
 /// priority re-dispatch over fresh tickets, or `None` for all other transitions.
 ///
-/// If `notify` is [`NotifyPolicy::Notify`], delegates to [`dispatch_notification`]
-/// on success (which may enqueue a notification or buffer the transition);
-/// errors from notification are logged and discarded (not propagated).
+/// On success, delegates to [`dispatch_notification`] (which dispatches or buffers
+/// based on the `notify` policy); errors from notification are logged and discarded
+/// (not propagated).
 async fn transition_ticket(
     ticket: &Ticket,
     source: TicketPhase,
@@ -332,7 +332,7 @@ async fn transition_ticket(
         .await
     {
         Ok(()) => {
-            dispatch_notification(ticket, source, target, notify, "cannot buffer transition").await;
+            dispatch_notification(ticket, source, target, notify, "transition_ticket").await;
 
             Ok(())
         }
@@ -1234,7 +1234,7 @@ async fn commit_and_transition_ticket_from(
             source,
             TicketPhase::Done,
             notify_policy,
-            "cannot buffer Done transition",
+            "commit_and_transition_ticket_from",
         )
         .await;
     } else {
