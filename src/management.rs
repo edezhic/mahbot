@@ -1065,6 +1065,14 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, reason: &str) {
     info!(ticket = %ticket.id, "{reason}");
 
+    if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, reason).await {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to write system comment during transition-to-Done",
+        );
+    }
+
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
 
     if let Err(e) = transition_ticket(ticket, source, TicketPhase::Done, notify_policy, None).await
@@ -2765,7 +2773,7 @@ mod tests {
         )
         .await;
 
-        // Verify both tickets are Done
+        // Verify both tickets are Done and have SYSTEM_ROLE comments
         for (id, label) in [(&first_id, "A"), (&second_id, "B")] {
             let t = board()
                 .get_ticket(id)
@@ -2773,6 +2781,13 @@ mod tests {
                 .expect("get_ticket")
                 .unwrap_or_else(|| panic!("ticket {label} exists"));
             assert_eq!(t.phase, TicketPhase::Done, "Ticket {label} should be Done");
+
+            // Each Done transition should have written a SYSTEM_ROLE comment
+            let comments = board().get_comments(id).await.expect("get_comments");
+            assert!(
+                comments.iter().any(|c| c.role == SYSTEM_ROLE),
+                "Ticket {label}: expected SYSTEM_ROLE comment from transition_ticket_to_done"
+            );
         }
 
         // No entries should remain for this workspace (the Notify path on
@@ -3433,6 +3448,18 @@ mod tests {
             phase,
             TicketPhase::Done,
             "QA passed should eventually transition to Done"
+        );
+
+        // Verify a SYSTEM_ROLE comment was written capturing the reason.
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.role == SYSTEM_ROLE && c.content.contains("without commit")),
+            "Expected a SYSTEM_ROLE comment explaining why no commit was made"
         );
     }
 
