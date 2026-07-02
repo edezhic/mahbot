@@ -629,17 +629,18 @@ impl ConfigReload {
 
     /// Resolve the configured reasoning effort for a role.
     ///
-    /// Returns `None` when unset (model defaults apply).
     /// Priority: per-role override → role info default.
+    /// Always returns a value — the role info default is guaranteed non-empty
+    /// by a compile-time assertion (see [`role_info`]).
     #[must_use]
-    pub fn role_reasoning_effort(&self, role: Role) -> Option<String> {
+    pub fn role_reasoning_effort(&self, role: Role) -> String {
         if let Some(rc) = self.find_role_config(role)
             && let Some(ref r) = rc.reasoning_effort
             && !r.is_empty()
         {
-            return Some(r.clone());
+            return r.clone();
         }
-        Some(role_info(&role).default_reasoning_effort.to_string())
+        role_info(&role).default_reasoning_effort.to_string()
     }
 }
 

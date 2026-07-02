@@ -567,7 +567,7 @@ impl Agent {
     }
 
     /// Resolve reasoning effort for this agent's role from current config.
-    fn reasoning_effort(&self) -> Option<String> {
+    fn reasoning_effort(&self) -> String {
         crate::config::CONFIG.role_reasoning_effort(self.role)
     }
 
@@ -613,7 +613,7 @@ impl Agent {
             model: self.model(),
             allow_image_parts,
             temperature: self.temperature(),
-            reasoning_effort: self.reasoning_effort(),
+            reasoning_effort: Some(self.reasoning_effort()),
             provider_order: routing.provider_order,
             provider_allow_fallbacks: routing.allow_fallbacks,
         }
@@ -640,7 +640,7 @@ impl Agent {
             model: &model,
             tool_specs: Some(&self.tool_specs),
             temperature: self.temperature(),
-            reasoning_effort: self.reasoning_effort(),
+            reasoning_effort: Some(self.reasoning_effort()),
             max_attempts,
         };
         crate::extraction::retry_extract_structured(
