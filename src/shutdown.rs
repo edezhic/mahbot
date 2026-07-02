@@ -128,11 +128,11 @@ pub fn install_fatal_signal_handlers() {
         unsafe {
             libc::signal(
                 libc::SIGBUS,
-                sigbus_handler as *const () as libc::sighandler_t,
+                fatal_signal_handler as *const () as libc::sighandler_t,
             );
             libc::signal(
                 libc::SIGABRT,
-                sigabrt_handler as *const () as libc::sighandler_t,
+                fatal_signal_handler as *const () as libc::sighandler_t,
             );
         }
     });
@@ -141,25 +141,18 @@ pub fn install_fatal_signal_handlers() {
 const SIGBUS_MSG: &str = "mahbot: caught SIGBUS (bus error), terminating\n";
 const SIGABRT_MSG: &str = "mahbot: caught SIGABRT (abort), terminating\n";
 
-extern "C" fn sigbus_handler(_sig: i32) {
+extern "C" fn fatal_signal_handler(sig: i32) {
+    let msg = match sig {
+        libc::SIGBUS => SIGBUS_MSG,
+        libc::SIGABRT => SIGABRT_MSG,
+        _ => "mahbot: caught unknown fatal signal, terminating\n",
+    };
     // SAFETY: write(2) and _exit(2) are async-signal-safe per POSIX.
     unsafe {
         let _ = libc::write(
             libc::STDERR_FILENO,
-            SIGBUS_MSG.as_ptr().cast::<libc::c_void>(),
-            SIGBUS_MSG.len(),
-        );
-        libc::_exit(1);
-    }
-}
-
-extern "C" fn sigabrt_handler(_sig: i32) {
-    // SAFETY: write(2) and _exit(2) are async-signal-safe per POSIX.
-    unsafe {
-        let _ = libc::write(
-            libc::STDERR_FILENO,
-            SIGABRT_MSG.as_ptr().cast::<libc::c_void>(),
-            SIGABRT_MSG.len(),
+            msg.as_ptr().cast::<libc::c_void>(),
+            msg.len(),
         );
         libc::_exit(1);
     }
