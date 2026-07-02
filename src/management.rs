@@ -1550,17 +1550,26 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             count = verdict.garbage_files.len(),
         );
 
-        // Write both comments atomically so the circuit breaker always sees
-        // the failure marker when a user-facing comment exists.  This matches
-        // the pattern used by record_sanitation_failure and record_verdict_comments.
+        // Write both comments and transition atomically so the circuit breaker
+        // always sees the failure marker when a user-facing comment exists, and
+        // there is no crash window between comment and transition.  This matches
+        // the pattern used by comment_and_transition and finalize_done_tx.
         if let Err(e) = crate::turso::with_tx(
             &board().conn,
             &ticket.id,
-            "sanitation failure comment",
+            "sanitation failure + bounce",
             async |tx| {
                 BoardStore::add_comment_tx(tx, &ticket.id, Role::Sanitation.as_str(), &comment)
                     .await?;
                 BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &sys_comment).await?;
+                BoardStore::transition_to_tx(
+                    tx,
+                    &ticket.id,
+                    Some(TicketPhase::InSanitation),
+                    TicketPhase::ReadyForDevelopment,
+                    Some(true),
+                )
+                .await?;
                 Ok(())
             },
         )
@@ -1569,11 +1578,21 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Failed to write sanitation failure comments",
+                "Failed to write sanitation failure comments and transition ticket",
             );
+            return;
         }
 
-        bounce_back_to_development(ticket, TicketPhase::InSanitation, "Sanitation").await;
+        // Notification fires after the transaction commits so the user always
+        // sees the new phase in the database.
+        dispatch_notification(
+            ticket,
+            TicketPhase::InSanitation,
+            TicketPhase::ReadyForDevelopment,
+            NotifyPolicy::Buffer,
+            "sanitation_verdict",
+        )
+        .await;
     }
 }
 
