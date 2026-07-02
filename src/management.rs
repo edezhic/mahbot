@@ -373,12 +373,25 @@ fn warn_transition_failed(
 
 /// Write a comment to a ticket, then transition it to a new phase.
 ///
-/// The comment is written first; if it fails, a warning is logged but execution
-/// continues to the transition. Returns `true` if the transition succeeded,
-/// `false` if it failed (comment failure is non-fatal).
+/// Both the comment write and the phase transition are wrapped in a single
+/// transaction via [`crate::turso::with_tx`]. If either operation fails, the
+/// entire transaction is rolled back — neither the comment nor the transition
+/// takes effect. Returns `true` on success, `false` on failure.
 ///
-/// This is **not** atomic — the crash window between comment and transition is
-/// self-healing via the poll loop.
+/// On success, dispatches a notification after the transaction commits (via
+/// [`dispatch_notification`]).
+///
+/// This is atomic — there is no crash window between comment and transition
+/// where an orphaned comment could persist.
+///
+/// # SAFETY
+///
+/// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
+/// agents (unlike [`BoardStore::transition_to`] / `execute_and_cancel`).
+/// This is safe because `comment_and_transition` is only called from post-agent
+/// paths (verdict handling, diagnostics completion, sanitation verdict, etc.) —
+/// no agents should be running on this ticket at any call site that reaches
+/// this function.
 #[allow(clippy::too_many_arguments)]
 async fn comment_and_transition(
     ticket: &Ticket,
@@ -390,21 +403,34 @@ async fn comment_and_transition(
     context_label: &str,
     verb: &str,
 ) -> bool {
-    if let Err(e) = board().add_comment(&ticket.id, role, comment).await {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "{context_label} {verb}: failed to write comment",
-        );
+    if let Err(e) = crate::turso::with_tx(
+        &board().conn,
+        &ticket.id,
+        &format!("{context_label} {verb}"),
+        async |tx| {
+            BoardStore::add_comment_tx(tx, &ticket.id, role, comment).await?;
+            BoardStore::transition_to_tx(
+                tx,
+                &ticket.id,
+                Some(source),
+                target,
+                None, // pipeline_reservation — not used in this path
+            )
+            .await?;
+            Ok(())
+        },
+    )
+    .await
+    {
+        warn_transition_failed(ticket, source, target, context_label, verb, &e);
+        return false;
     }
 
-    match transition_ticket(ticket, source, target, notify, None).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn_transition_failed(ticket, source, target, context_label, verb, &e);
-            false
-        }
-    }
+    // Notification fires after the transaction commits so the user always
+    // sees the new phase in the database.
+    dispatch_notification(ticket, source, target, notify, "comment_and_transition").await;
+
+    true
 }
 
 /// Resolve a workspace from a ticket's stored `workspace_name`.
