@@ -1673,74 +1673,74 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     // 1. Load diagnostics commands for this workspace.
-    let diag = match crate::workspace::store().get_diagnostics(&ws.name).await {
-        Ok(Some(cmds)) if !cmds.is_empty() => Some(cmds),
-        Ok(Some(_) | None) => None,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone"
-            );
-            None
+    match crate::workspace::store().get_diagnostics(&ws.name).await {
+        Ok(Some(cmds)) if !cmds.is_empty() => {
+            // 2. Run commands sequentially in the prescribed order.
+            let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
+
+            if all_passed {
+                // Path C1: All diagnostics passed — transition to DiagnosticsDone.
+                comment_and_transition(
+                    &ticket,
+                    DIAGNOSTICS_ROLE,
+                    &comment,
+                    TicketPhase::InDiagnostics,
+                    TicketPhase::DiagnosticsDone,
+                    NotifyPolicy::Buffer,
+                    "Diagnostics",
+                    "completed",
+                )
+                .await;
+            } else {
+                // Path C2: Diagnostics failed — write the failure comment and
+                // bounce back to development for rework.
+                if let Err(e) = board()
+                    .add_comment(&ticket.id, DIAGNOSTICS_ROLE, &comment)
+                    .await
+                {
+                    warn!(
+                        ticket = %ticket.id,
+                        error = %e,
+                        "Failed to write diagnostics comment",
+                    );
+                }
+                bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics")
+                    .await;
+            }
         }
-    };
-
-    let Some(diag) = diag else {
-        if let Err(e) = transition_ticket(
-            &ticket,
-            TicketPhase::InDiagnostics,
-            TicketPhase::DiagnosticsDone,
-            NotifyPolicy::Buffer,
-            None,
-        )
-        .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "No diagnostics commands — failed to transition to DiagnosticsDone",
-            );
-        }
-        return;
-    };
-
-    // 2. Run commands sequentially in the prescribed order.
-    let (comment, all_passed) = run_diagnostics_commands(&diag, &ws).await;
-
-    // 3. Final outcome.
-    if let Err(e) = board()
-        .add_comment(&ticket.id, DIAGNOSTICS_ROLE, &comment)
-        .await
-    {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to write diagnostics comment",
-        );
-    }
-
-    if all_passed {
-        if let Err(e) = transition_ticket(
-            &ticket,
-            TicketPhase::InDiagnostics,
-            TicketPhase::DiagnosticsDone,
-            NotifyPolicy::Buffer,
-            None,
-        )
-        .await
-        {
-            warn_transition_failed(
+        Ok(_) => {
+            // Path B: No diagnostics commands configured (or empty list) — skip.
+            comment_and_transition(
                 &ticket,
+                DIAGNOSTICS_ROLE,
+                "No diagnostics commands are configured for this workspace — diagnostics skipped.",
                 TicketPhase::InDiagnostics,
                 TicketPhase::DiagnosticsDone,
+                NotifyPolicy::Buffer,
                 "Diagnostics",
-                "completed",
-                &e,
-            );
+                "skipped (no commands configured)",
+            )
+            .await;
         }
-    } else {
-        bounce_back_to_development(&ticket, TicketPhase::InDiagnostics, "Diagnostics").await;
+        Err(e) => {
+            // Path A: DB error loading diagnostics — log and skip.
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
+            );
+            comment_and_transition(
+                &ticket,
+                DIAGNOSTICS_ROLE,
+                &format!("Could not load diagnostics commands due to a database error: {e}"),
+                TicketPhase::InDiagnostics,
+                TicketPhase::DiagnosticsDone,
+                NotifyPolicy::Buffer,
+                "Diagnostics",
+                "skipped (DB error)",
+            )
+            .await;
+        }
     }
 }
 
@@ -3555,6 +3555,57 @@ mod tests {
         assert!(
             has_system_breaker,
             "pass=false should have a system comment with the circuit breaker prefix",
+        );
+    }
+
+    /// Verify that when a workspace has no diagnostics commands configured,
+    /// `dispatch_diagnostics` writes a no-commands comment and transitions
+    /// the ticket to `DiagnosticsDone`.
+    #[tokio::test]
+    async fn no_diagnostics_commands_skips_to_diagnostics_done() {
+        init_management_test_stores().await;
+
+        let ws = create_test_workspace("/tmp/test_no_diag", "test_no_diag").await;
+
+        let ticket_id = make_ticket(
+            board(),
+            ws.clone(),
+            "No Diagnostics Commands",
+            TicketPhase::InDiagnostics,
+        )
+        .await;
+
+        // NOTE: Do NOT claim the ticket beforehand — dispatch_diagnostics
+        // calls claim_diagnostics internally as its first step.
+        let ticket = expect_ticket(board(), &ticket_id).await;
+
+        dispatch_diagnostics(Arc::new(ticket), ws).await;
+
+        // Verify transition to DiagnosticsDone.
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
+        assert_eq!(
+            phase,
+            TicketPhase::DiagnosticsDone,
+            "ticket should be DiagnosticsDone when no diagnostics commands are configured",
+        );
+
+        // Verify a diagnostics-role comment was written explaining the skip.
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert!(
+            !comments.is_empty(),
+            "should have written at least one comment",
+        );
+        let comment = &comments[0];
+        assert_eq!(comment.role, DIAGNOSTICS_ROLE);
+        assert!(
+            comment
+                .content
+                .contains("No diagnostics commands are configured"),
+            "comment should explain that no diagnostics commands are configured: {}",
+            comment.content,
         );
     }
 }
