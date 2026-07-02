@@ -1784,48 +1784,47 @@ impl Dashboard {
             .into()
     }
 
-    /// 42px footer bar — nav items (left) and active agents (right).
-    #[allow(clippy::too_many_lines)]
-    fn footer_view(&self) -> Element<'_, Message> {
-        // Left: footer navigation (Sessions, Logs, Settings) + git blocks
-        // Icon-only, 24px. Active page in ACCENT, inactive in TEXT_MUTED.
-        let mut left_icons = Vec::with_capacity(10);
-
-        // Update button — leftmost, disabled while updating.
-        // Only shown when self-update is available on this installation.
-        if self.update_available {
-            let update_color = if self.updating {
-                theme::TEXT_FAINT
-            } else {
-                theme::ACCENT
-            };
-            let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                .size(24)
-                .color(update_color);
-            let update_btn = button(update_icon)
-                .style(theme::button_text)
-                .padding(3)
-                .on_press_maybe(if self.updating {
-                    None
-                } else {
-                    Some(Message::UpdateBot)
-                });
-            let update_tooltip = if self.updating {
-                "Updating…"
-            } else {
-                "Update MahBot"
-            };
-            left_icons.push(
-                tooltip(
-                    update_btn,
-                    text(update_tooltip).size(11),
-                    tooltip::Position::Top,
-                )
-                .style(theme::tooltip_style)
-                .into(),
-            );
+    /// Render the self-update button in the footer bar.
+    /// Returns `None` when self-update is not available on this installation.
+    fn render_update_button(&self) -> Option<Element<'_, Message>> {
+        if !self.update_available {
+            return None;
         }
+        let update_color = if self.updating {
+            theme::TEXT_FAINT
+        } else {
+            theme::ACCENT
+        };
+        let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+            .size(24)
+            .color(update_color);
+        let update_btn = button(update_icon)
+            .style(theme::button_text)
+            .padding(3)
+            .on_press_maybe(if self.updating {
+                None
+            } else {
+                Some(Message::UpdateBot)
+            });
+        let update_tooltip = if self.updating {
+            "Updating…"
+        } else {
+            "Update MahBot"
+        };
+        Some(
+            tooltip(
+                update_btn,
+                text(update_tooltip).size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .into(),
+        )
+    }
 
+    /// Render the footer navigation icons (Sessions, Logs, Settings).
+    fn render_nav_icons(&self) -> Element<'_, Message> {
+        let mut icons: Vec<Element<'_, Message>> = Vec::with_capacity(3);
         for page in Page::footer_pages() {
             let is_active = self.page == *page;
             let color = if is_active {
@@ -1833,7 +1832,7 @@ impl Dashboard {
             } else {
                 theme::TEXT_MUTED
             };
-            let icon: iced::Element<'_, Message> = match page {
+            let icon: Element<'_, Message> = match page {
                 Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>()
                     .size(24)
                     .color(color)
@@ -1852,192 +1851,243 @@ impl Dashboard {
                 .style(theme::button_text)
                 .padding(3)
                 .on_press(Message::Navigation(*page));
-            left_icons.push(
+            icons.push(
                 tooltip(btn, text(page.label()).size(11), tooltip::Position::Top)
                     .style(theme::tooltip_style)
                     .into(),
             );
         }
+        Row::with_children(icons)
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
+    }
 
-        // Git blocks — branch, sync, diff — after Settings,
-        // visually grouped with a small gap from nav buttons.
-        let has_fs = self.git_state.has_filesystem_path();
+    /// Vertical divider between nav icons and git blocks.
+    fn render_git_divider() -> Element<'static, Message> {
+        rule::vertical(1)
+            .style(|_: &iced::Theme| rule::Style {
+                color: theme::TEXT_MUTED,
+                radius: 0.0.into(),
+                fill_mode: rule::FillMode::Padded(8),
+                snap: true,
+            })
+            .into()
+    }
 
-        if has_fs {
-            // ── Vertical divider between nav buttons and git blocks ──
-            left_icons.push(
-                rule::vertical(1)
-                    .style(|_: &iced::Theme| rule::Style {
-                        color: theme::TEXT_MUTED,
-                        radius: 0.0.into(),
-                        fill_mode: rule::FillMode::Padded(8),
-                        snap: true,
-                    })
-                    .into(),
-            );
+    /// Render the current git branch button (clickable -> branch modal).
+    /// Returns `None` when no branch is known.
+    fn render_git_branch(&self) -> Option<Element<'_, Message>> {
+        let b = self.git_state.current_branch()?;
+        let truncated = if b.len() > 20 {
+            let mut end = 19;
+            while !b.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &b[..end])
+        } else {
+            b.to_string()
+        };
+        let branch_content = row![
+            lucide::git_branch::<iced::Theme, iced::Renderer>()
+                .size(24)
+                .color(theme::ACCENT),
+            text(truncated).size(16).color(theme::ACCENT),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        Some(
+            button(branch_content)
+                .style(theme::button_text)
+                .padding(3)
+                .on_press(Message::Git(git::GitMessage::OpenModal))
+                .into(),
+        )
+    }
 
-            // a) Branch name — clickable -> branch modal
-            // Only shown when a branch is known.
-            if let Some(b) = self.git_state.current_branch() {
-                let truncated = if b.len() > 20 {
-                    // Safe truncation at char boundary
-                    let mut end = 19;
-                    while !b.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}…", &b[..end])
+    /// Render the git sync indicator (refresh icon + behind/ahead counts, clickable).
+    /// Uses lucide arrow_up/arrow_down at 16px (same as number text) for
+    /// consistent vertical alignment with the 24px refresh icon.
+    /// Returns `None` when there are no behind/ahead counts or both are zero.
+    fn render_git_sync(&self) -> Option<Element<'_, Message>> {
+        let (behind, ahead) = self.git_state.behind_ahead()?;
+        if behind == 0 && ahead == 0 {
+            return None;
+        }
+        // Build arrow+number text using lucide icons (not Unicode arrows)
+        // so all elements share the same vertical baseline.
+        let sync_text_label: Element<'_, Message> = {
+            let mut parts: Vec<Element<'_, Message>> = Vec::new();
+            if ahead > 0 {
+                parts.push(
+                    lucide::arrow_up::<iced::Theme, iced::Renderer>()
+                        .size(16)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                );
+                parts.push(
+                    text(format!("{ahead}"))
+                        .size(16)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                );
+            }
+            if behind > 0 {
+                if ahead > 0 {
+                    parts.push(Space::new().width(8).into());
+                }
+                parts.push(
+                    lucide::arrow_down::<iced::Theme, iced::Renderer>()
+                        .size(16)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                );
+                parts.push(
+                    text(format!("{behind}"))
+                        .size(16)
+                        .color(theme::TEXT_MUTED)
+                        .into(),
+                );
+            }
+            Row::with_children(parts)
+                .spacing(2)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let sync_icon_color = if self.git_state.is_syncing() {
+            theme::TEXT_MUTED
+        } else {
+            theme::ACCENT
+        };
+        let sync_content = row![
+            lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+                .size(24)
+                .color(sync_icon_color),
+            sync_text_label,
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        Some(
+            button(sync_content)
+                .style(theme::button_text)
+                .padding(3)
+                .on_press_maybe(if self.git_state.is_syncing() {
+                    None
                 } else {
-                    b.to_string()
-                };
-                let branch_content = row![
-                    lucide::git_branch::<iced::Theme, iced::Renderer>()
-                        .size(24)
-                        .color(theme::ACCENT),
-                    text(truncated).size(16).color(theme::ACCENT),
-                ]
+                    Some(Message::Git(git::GitMessage::Sync))
+                })
+                .into(),
+        )
+    }
+
+    /// Render the git diff stats button (+X/−Y, clickable -> diff modal).
+    /// Returns `None` when there are no non-zero changes.
+    fn render_git_diff_stats(&self) -> Option<Element<'_, Message>> {
+        let (added, removed) = self.git_state.diff_stats()?;
+        if added == 0 && removed == 0 {
+            return None;
+        }
+        let stats_row = widgets::diff_stats_row::<Message>(added, removed, 15.0);
+        Some(
+            button(stats_row)
+                .style(theme::button_text)
+                .padding(3)
+                .on_press(Message::OpenDiffModal(None))
+                .into(),
+        )
+    }
+
+    /// Render the git block: divider, branch, sync, and diff stats.
+    /// Returns `None` when the workspace has no filesystem path.
+    fn render_git_block(&self) -> Option<Element<'_, Message>> {
+        if !self.git_state.has_filesystem_path() {
+            return None;
+        }
+        let mut elements: Vec<Element<'_, Message>> = Vec::with_capacity(4);
+        elements.push(Self::render_git_divider());
+        if let Some(el) = self.render_git_branch() {
+            elements.push(el);
+        }
+        if let Some(el) = self.render_git_sync() {
+            elements.push(el);
+        }
+        if let Some(el) = self.render_git_diff_stats() {
+            elements.push(el);
+        }
+        Some(
+            Row::with_children(elements)
                 .spacing(6)
-                .align_y(Alignment::Center);
-                let branch_btn = button(branch_content)
-                    .style(theme::button_text)
-                    .padding(3)
-                    .on_press(Message::Git(git::GitMessage::OpenModal));
-                left_icons.push(branch_btn.into());
-            }
+                .align_y(Alignment::Center)
+                .into(),
+        )
+    }
 
-            // b) Sync — ↻ icon + behind/ahead counts, clickable -> git sync
-            // Uses lucide arrow_up/arrow_down at 16px (same as number text) for
-            // consistent vertical alignment with the 24px refresh icon.
-            if let Some((behind, ahead)) = self.git_state.behind_ahead() {
-                if behind > 0 || ahead > 0 {
-                    // Build arrow+number text using lucide icons (not Unicode arrows)
-                    // so all elements share the same vertical baseline.
-                    let sync_text_label: iced::Element<'_, Message> = {
-                        let mut parts: Vec<iced::Element<'_, Message>> = Vec::new();
-                        if ahead > 0 {
-                            parts.push(
-                                lucide::arrow_up::<iced::Theme, iced::Renderer>()
-                                    .size(16)
-                                    .color(theme::TEXT_MUTED)
-                                    .into(),
-                            );
-                            parts.push(
-                                text(format!("{ahead}"))
-                                    .size(16)
-                                    .color(theme::TEXT_MUTED)
-                                    .into(),
-                            );
-                        }
-                        if behind > 0 {
-                            if ahead > 0 {
-                                parts.push(Space::new().width(8).into());
-                            }
-                            parts.push(
-                                lucide::arrow_down::<iced::Theme, iced::Renderer>()
-                                    .size(16)
-                                    .color(theme::TEXT_MUTED)
-                                    .into(),
-                            );
-                            parts.push(
-                                text(format!("{behind}"))
-                                    .size(16)
-                                    .color(theme::TEXT_MUTED)
-                                    .into(),
-                            );
-                        }
-                        Row::with_children(parts)
-                            .spacing(2)
-                            .align_y(Alignment::Center)
-                            .into()
-                    };
-                    let sync_content = row![
-                        lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                            .size(24)
-                            .color(if self.git_state.is_syncing() {
-                                theme::TEXT_MUTED
-                            } else {
-                                theme::ACCENT
-                            }),
-                        sync_text_label,
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center);
-                    let sync_btn = button(sync_content)
-                        .padding(3)
-                        .style(theme::button_text)
-                        .on_press_maybe(if self.git_state.is_syncing() {
-                            None
-                        } else {
-                            Some(Message::Git(git::GitMessage::Sync))
-                        });
-                    left_icons.push(sync_btn.into());
-                }
-            }
-
-            // c) Diff stats — ticket card format (+X/−Y), clickable -> diff modal
-            // Only rendered when there are non-zero changes.
-            if let Some((added, removed)) = self.git_state.diff_stats() {
-                if added > 0 || removed > 0 {
-                    let stats_row = widgets::diff_stats_row::<Message>(added, removed, 15.0);
-                    let diff_btn = button(stats_row)
-                        .style(theme::button_text)
-                        .padding(3)
-                        .on_press(Message::OpenDiffModal(None));
-                    left_icons.push(diff_btn.into());
-                }
+    /// Render the active agent icons in the right side of the footer.
+    fn render_active_agents() -> Element<'static, Message> {
+        let handles = crate::registry::AGENT_REGISTRY.list();
+        let mut role_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for h in &handles {
+            *role_counts.entry(h.role.as_str()).or_insert(0) += 1;
+        }
+        if role_counts.is_empty() {
+            return text("").into();
+        }
+        let mut icons: Vec<Element<'_, Message>> = Vec::new();
+        for (role_str, count) in &role_counts {
+            let role: crate::Role = role_str.parse().unwrap_or(crate::Role::Engineer);
+            let (color, _bg) = theme::role_badge_color_for(&role);
+            let icon = theme::role_icon(&role).size(24).color(color);
+            if *count > 1 {
+                let label = text(format!("×{count}")).size(15).color(color);
+                icons.push(
+                    container(row![icon, label].spacing(3).align_y(Alignment::Center))
+                        .padding(iced::Padding {
+                            left: 3.0,
+                            right: 3.0,
+                            top: 0.0,
+                            bottom: 0.0,
+                        })
+                        .into(),
+                );
+            } else {
+                icons.push(
+                    container(icon)
+                        .padding(iced::Padding {
+                            left: 3.0,
+                            right: 3.0,
+                            top: 0.0,
+                            bottom: 0.0,
+                        })
+                        .into(),
+                );
             }
         }
+        Row::with_children(icons)
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .into()
+    }
 
-        let left = Row::with_children(left_icons)
+    /// 42px footer bar — nav items (left) and active agents (right).
+    fn footer_view(&self) -> Element<'_, Message> {
+        let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(3);
+
+        if let Some(el) = self.render_update_button() {
+            left_elements.push(el);
+        }
+
+        left_elements.push(self.render_nav_icons());
+
+        if let Some(el) = self.render_git_block() {
+            left_elements.push(el);
+        }
+
+        let left = Row::with_children(left_elements)
             .spacing(6)
             .align_y(Alignment::Center);
 
-        // Right: active agent icons (horizontal, one per role, "×N" for multiples)
-        let right: iced::Element<'_, Message> = {
-            let handles = crate::registry::AGENT_REGISTRY.list();
-            let mut role_counts: std::collections::BTreeMap<&str, usize> =
-                std::collections::BTreeMap::new();
-            for h in &handles {
-                *role_counts.entry(h.role.as_str()).or_insert(0) += 1;
-            }
-            if role_counts.is_empty() {
-                text("").into()
-            } else {
-                let mut icons: Vec<iced::Element<'_, Message>> = Vec::new();
-                for (role_str, count) in &role_counts {
-                    let role: crate::Role = role_str.parse().unwrap_or(crate::Role::Engineer);
-                    let (color, _bg) = theme::role_badge_color_for(&role);
-                    let icon = theme::role_icon(&role).size(24).color(color);
-                    if *count > 1 {
-                        let label = text(format!("×{count}")).size(15).color(color);
-                        icons.push(
-                            container(row![icon, label].spacing(3).align_y(Alignment::Center))
-                                .padding(iced::Padding {
-                                    left: 3.0,
-                                    right: 3.0,
-                                    top: 0.0,
-                                    bottom: 0.0,
-                                })
-                                .into(),
-                        );
-                    } else {
-                        icons.push(
-                            container(icon)
-                                .padding(iced::Padding {
-                                    left: 3.0,
-                                    right: 3.0,
-                                    top: 0.0,
-                                    bottom: 0.0,
-                                })
-                                .into(),
-                        );
-                    }
-                }
-                let c = Row::with_children(icons)
-                    .spacing(12)
-                    .align_y(Alignment::Center);
-                c.into()
-            }
-        };
+        let right = Self::render_active_agents();
 
         let footer_row = row![left, Space::new().width(Length::Fill), right]
             .align_y(Alignment::Center)
