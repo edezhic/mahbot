@@ -740,6 +740,14 @@ pub async fn reload_from_db() -> Result<()> {
 pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     validate_config(&config)?;
 
+    // Normalize BEFORE any DB write or provider warmup so that:
+    //  1. The database always stores canonical values.
+    //  2. The warmup uses exactly the same values that will be swapped
+    //     into the global CONFIG — no risk of a valid config change being
+    //     rejected due to superficial differences (e.g. leading/trailing
+    //     whitespace) that finalize would have stripped anyway.
+    config.finalize();
+
     // Capture old Telegram token BEFORE we mutate DB so we can detect
     // changes and trigger hot-reload after persistence succeeds.
     let old_token = CONFIG.telegram_bot_token();
@@ -778,13 +786,8 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     .await?;
     tx.commit().await?;
 
-    // Warmup succeeded above — now persist runtime config and swap singletons.
-    //
-    // Apply the same normalisation + sorting that reload_from_db's read path
-    // performs so the behaviour is identical regardless of which persistence
-    // path produced the data.
-    config.finalize();
-
+    // Warmup succeeded above — now swap the normalized config into the global
+    // singleton and recreate providers so the runtime reflects the new values.
     let new_token = config.telegram_bot_token.clone();
     CONFIG.swap(config);
     tracing::info!("Config saved and swapped into runtime");
