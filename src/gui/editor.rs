@@ -1967,7 +1967,7 @@ impl EditorState {
     /// generation is mapped to [`EditorMessage::TabsSaved`], and the handler
     /// discards the result if a newer save superseded it.
     #[must_use]
-    pub(crate) fn save_current_tabs(&mut self) -> Option<Task<EditorMessage>> {
+    pub(crate) fn try_save_current_tabs(&mut self) -> Option<Task<EditorMessage>> {
         if !self.session_initialized {
             return None;
         }
@@ -1986,6 +1986,16 @@ impl EditorState {
             save_gen,
             self.tab_save_counter.clone(),
         ))
+    }
+
+    /// Save editor tabs to the database, returning a fallback [`Task::none`] if
+    /// the session isn't initialized or no workspace is selected.
+    ///
+    /// Most callers should use this wrapper; only use
+    /// [`try_save_current_tabs`](Self::try_save_current_tabs) directly when you
+    /// need to inspect whether a save was actually dispatched.
+    pub(crate) fn save_current_tabs(&mut self) -> Task<EditorMessage> {
+        self.try_save_current_tabs().unwrap_or(Task::none())
     }
 
     /// Scroll the tab bar to keep the active tab visible.
@@ -2019,10 +2029,7 @@ impl EditorState {
             return Task::none();
         }
         self.active_tab_index = idx;
-        Task::batch(vec![
-            self.scroll_to_active_tab(),
-            self.save_current_tabs().unwrap_or(Task::none()),
-        ])
+        Task::batch(vec![self.scroll_to_active_tab(), self.save_current_tabs()])
     }
 
     /// Switch to the tab one step in the given direction, wrapping around.
@@ -2177,7 +2184,7 @@ impl EditorState {
         }
         self.active_modal = None;
         self.remove_tab_at(idx);
-        self.save_current_tabs().unwrap_or(Task::none())
+        self.save_current_tabs()
     }
 
     /// Apply an undo or redo snapshot to the tab at `idx`.
@@ -2781,10 +2788,7 @@ impl EditorState {
                     }
                 }
 
-                let tasks = vec![
-                    self.scroll_to_active_tab(),
-                    self.save_current_tabs().unwrap_or(Task::none()),
-                ];
+                let tasks = vec![self.scroll_to_active_tab(), self.save_current_tabs()];
                 Task::batch(tasks)
             }
             Err(e) => {
@@ -2845,7 +2849,7 @@ impl EditorState {
                         if !self.tabs.is_empty() {
                             tasks.push(self.scroll_to_active_tab());
                         }
-                        tasks.push(self.save_current_tabs().unwrap_or(Task::none()));
+                        tasks.push(self.save_current_tabs());
                         return Task::batch(tasks);
                     }
                 }
@@ -2855,7 +2859,7 @@ impl EditorState {
                         // All dirty tabs saved — close everything except keep_idx.
                         self.remove_all_tabs_except(keep_idx);
                         // Save after removal.
-                        self.save_current_tabs().map_or_else(Task::none, |t| {
+                        self.try_save_current_tabs().map_or_else(Task::none, |t| {
                             Task::batch([
                                 t,
                                 Task::done(EditorMessage::Toast(super::ToastMessage::Saved)),
@@ -2870,7 +2874,7 @@ impl EditorState {
                 }
 
                 // Regular save (not from close dialog) — persist clean state.
-                if let Some(save_task) = self.save_current_tabs() {
+                if let Some(save_task) = self.try_save_current_tabs() {
                     save_task
                 } else {
                     Task::done(EditorMessage::Toast(super::ToastMessage::Saved))
@@ -3251,7 +3255,7 @@ impl EditorState {
                 if tab_index < self.tabs.len() {
                     self.remove_tab_at(tab_index);
                 }
-                self.save_current_tabs().unwrap_or(Task::none())
+                self.save_current_tabs()
             }
             CloseAction::Cancel => {
                 self.active_modal = None;
@@ -3273,7 +3277,7 @@ impl EditorState {
                 if dirty.is_empty() {
                     // Nothing to save — just close the rest and persist.
                     self.remove_all_tabs_except(keep_idx);
-                    return self.save_current_tabs().unwrap_or(Task::none());
+                    return self.save_current_tabs();
                 }
                 // Start saving the first dirty tab in the queue.
                 let first = dirty.remove(0);
@@ -3285,7 +3289,7 @@ impl EditorState {
                 self.pending_close_others = None;
                 // Close all tabs except keep_idx, discarding unsaved changes.
                 self.remove_all_tabs_except(keep_idx);
-                self.save_current_tabs().unwrap_or(Task::none())
+                self.save_current_tabs()
             }
             CloseAction::Cancel => {
                 self.active_modal = None;
@@ -3307,7 +3311,7 @@ impl EditorState {
         if dirty.is_empty() {
             // No unsaved changes — close immediately and persist.
             self.remove_all_tabs_except(idx);
-            return self.save_current_tabs().unwrap_or(Task::none());
+            return self.save_current_tabs();
         }
         self.active_modal = Some(ModalKind::CloseOthers(idx));
         Task::none()
@@ -3854,7 +3858,7 @@ impl EditorState {
                 }
 
                 Task::batch([
-                    self.save_current_tabs().unwrap_or(Task::none()),
+                    self.save_current_tabs(),
                     Task::done(EditorMessage::Toast(super::ToastMessage::SuccessMsg(
                         format!("Renamed \"{old_path}\" → \"{new_path}\""),
                     ))),
