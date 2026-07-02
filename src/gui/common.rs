@@ -1,5 +1,75 @@
 //! Shared state types used across GUI pages.
 
+/// Pagination state shared by dashboard pages that display paginated data.
+///
+/// Groups `page`, `page_size`, and `total` into a single struct with helper
+/// methods for common operations.  Used by [`PaginationState`] and the
+/// [`pagination_bar`](super::widgets::pagination_bar) widget.
+///
+/// # Structural benefits (not line savings)
+///
+/// The struct adds a few lines of definition, but the value is:
+/// - Cleaner [`pagination_bar`](super::widgets::pagination_bar) signature
+///   (takes `page` / `total_pages` instead of needing the whole state object)
+/// - Centralised boundary logic in [`prev_page`](Self::prev_page) /
+///   [`next_page`](Self::next_page)
+/// - Reusable by any future page that needs pagination
+#[derive(Debug, Clone)]
+pub(crate) struct PaginationState {
+    pub(crate) page: usize,
+    pub(crate) page_size: usize,
+    pub(crate) total: usize,
+}
+
+impl PaginationState {
+    pub(crate) const fn new(page_size: usize) -> Self {
+        Self {
+            page: 0,
+            page_size,
+            total: 0,
+        }
+    }
+
+    /// Total number of pages given the current `total` and `page_size`.
+    pub(crate) const fn total_pages(&self) -> usize {
+        if self.total == 0 {
+            0
+        } else {
+            self.total.div_ceil(self.page_size)
+        }
+    }
+
+    /// Move to the previous page.  Returns `true` if the page changed.
+    pub(crate) fn prev_page(&mut self) -> bool {
+        if self.page > 0 {
+            self.page -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move to the next page.  Returns `true` if the page changed.
+    pub(crate) fn next_page(&mut self) -> bool {
+        if self.page + 1 < self.total_pages() {
+            self.page += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset to page 0 (e.g. when a filter changes).
+    pub(crate) fn reset(&mut self) {
+        self.page = 0;
+    }
+
+    /// Compute the offset for SQL ``LIMIT … OFFSET …`` queries.
+    pub(crate) fn offset(&self) -> usize {
+        self.page * self.page_size
+    }
+}
+
 /// Shared async loading state, used by GUI pages that fetch data asynchronously.
 ///
 /// Combines the three common fields (`loading`, `has_loaded`, `error`) into a single

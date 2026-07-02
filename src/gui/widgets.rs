@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use iced::widget::{self, Row, button, column, container, pick_list, scrollable, text, text_input};
+use iced::widget::{
+    self, Row, Space, button, column, container, pick_list, scrollable, text, text_input,
+};
 use iced::{Alignment, Color, Element, Length, Padding, Task};
 
 use iced_selection;
@@ -177,6 +179,52 @@ pub const fn debounce_should_process(
     pending: bool,
 ) -> bool {
     generation == current_generation && pending
+}
+
+/// Render a pagination bar with ← Prev / Page X of Y / Next →.
+///
+/// Returns a zero-height element when `total_pages == 0` so callers can
+/// unconditionally push it.  The 8px top spacer is included.
+///
+/// # Generics
+///
+/// `Message` must be `Clone` so the `on_prev` / `on_next` values can be
+/// passed to both the condition check and the button builder.
+pub fn pagination_bar<'a, Message: 'a + Clone>(
+    page: usize,
+    total_pages: usize,
+    on_prev: Message,
+    on_next: Message,
+) -> Element<'a, Message> {
+    if total_pages == 0 {
+        return Space::new().height(0).into();
+    }
+
+    let prev_button = button(text("← Prev").size(12))
+        .style(super::theme::button_text)
+        .on_press_maybe(if page > 0 { Some(on_prev) } else { None });
+
+    let next_button = button(text("Next →").size(12))
+        .style(super::theme::button_text)
+        .on_press_maybe(if page + 1 < total_pages {
+            Some(on_next)
+        } else {
+            None
+        });
+
+    let pagination = Row::with_children(vec![
+        prev_button.into(),
+        Space::new().width(8).into(),
+        text(format!("Page {} of {}", page + 1, total_pages))
+            .size(12)
+            .color(super::theme::TEXT_MUTED)
+            .into(),
+        Space::new().width(8).into(),
+        next_button.into(),
+    ])
+    .align_y(Alignment::Center);
+
+    column![Space::new().height(8), pagination].into()
 }
 
 // ── File tree ───────────────────────────────────────────────────────

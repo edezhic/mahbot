@@ -107,7 +107,6 @@ pub enum LogMessage {
 
 pub struct LogsState {
     entries: Vec<LogEntry>,
-    total: usize,
     load_state: super::common::AsyncLoadState,
 
     // Filters
@@ -120,8 +119,7 @@ pub struct LogsState {
     workspace_options: Vec<super::widgets::PickOption>,
 
     // Pagination
-    page: usize,
-    page_size: usize,
+    pagination: super::common::PaginationState,
 
     // Tab state
     active_tab: LogsTab,
@@ -148,7 +146,6 @@ impl LogsState {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            total: 0,
             load_state: super::common::AsyncLoadState::new(),
             role_filter: String::new(),
             workspace_filter: String::new(),
@@ -163,8 +160,7 @@ impl LogsState {
                 })
                 .collect(),
             workspace_options: Vec::new(),
-            page: 0,
-            page_size: 50,
+            pagination: super::common::PaginationState::new(50),
             active_tab: LogsTab::AllLogs,
             tool_failures_state: super::tool_failures::ToolFailuresState::new(),
             paused: false,
@@ -207,16 +203,8 @@ impl LogsState {
             },
             since: None,
             until: None,
-            limit: Some(self.page_size),
-            offset: Some(self.page * self.page_size),
-        }
-    }
-
-    const fn total_pages(&self) -> usize {
-        if self.total == 0 {
-            0
-        } else {
-            self.total.div_ceil(self.page_size)
+            limit: Some(self.pagination.page_size),
+            offset: Some(self.pagination.offset()),
         }
     }
 
@@ -268,7 +256,7 @@ impl LogsState {
         match msg {
             LogMessage::Refreshed(entries, total, ws_opts) => {
                 self.entries = entries;
-                self.total = total;
+                self.pagination.total = total;
                 self.load_state.finish_loading();
 
                 // Build workspace options from registry
@@ -283,7 +271,7 @@ impl LogsState {
             LogMessage::LiveEntry(entry) => {
                 // Only prepend live entries when on page 0 (the live view).
                 // Other pages are static snapshots from the database.
-                if self.page != 0 {
+                if self.pagination.page != 0 {
                     return Task::none();
                 }
 
@@ -320,9 +308,9 @@ impl LogsState {
 
                 if passes {
                     self.entries.insert(0, entry);
-                    self.total += 1;
+                    self.pagination.total += 1;
                     // Auto-evict: keep exactly page_size entries visible.
-                    self.entries.truncate(self.page_size);
+                    self.entries.truncate(self.pagination.page_size);
                     // Mark this entry as newest so the view can fade it in.
                     self.newest_entry_timestamp = Some(
                         self.entries
@@ -355,7 +343,7 @@ impl LogsState {
             LogMessage::RoleFilterInput(v) => match self.active_tab {
                 LogsTab::AllLogs | LogsTab::Issues => {
                     self.role_filter = v;
-                    self.page = 0;
+                    self.pagination.reset();
                     self.refresh(log_store)
                 }
                 LogsTab::ToolFailures => {
@@ -370,7 +358,7 @@ impl LogsState {
             LogMessage::WorkspaceInput(v) => match self.active_tab {
                 LogsTab::AllLogs | LogsTab::Issues => {
                     self.workspace_filter = v;
-                    self.page = 0;
+                    self.pagination.reset();
                     self.refresh(log_store)
                 }
                 LogsTab::ToolFailures => {
@@ -383,7 +371,7 @@ impl LogsState {
             LogMessage::SearchInput(v) => match self.active_tab {
                 LogsTab::AllLogs | LogsTab::Issues => {
                     self.search_filter = v;
-                    self.page = 0;
+                    self.pagination.reset();
                     self.debounce_generation = self.debounce_generation.wrapping_add(1);
                     self.debounce_pending = true;
                     let generation = self.debounce_generation;
@@ -414,15 +402,13 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::PrevPage => {
-                if self.page > 0 {
-                    self.page -= 1;
+                if self.pagination.prev_page() {
                     return self.refresh(log_store);
                 }
                 Task::none()
             }
             LogMessage::NextPage => {
-                if self.page + 1 < self.total_pages() {
-                    self.page += 1;
+                if self.pagination.next_page() {
                     return self.refresh(log_store);
                 }
                 Task::none()
@@ -708,34 +694,12 @@ impl LogsState {
         }
 
         // Pagination bar
-        let total_pages = self.total_pages();
-        if total_pages > 0 {
-            let pagination = row![
-                button(text("← Prev").size(12))
-                    .style(theme::button_text)
-                    .on_press_maybe(if self.page > 0 {
-                        Some(LogMessage::PrevPage)
-                    } else {
-                        None
-                    }),
-                Space::new().width(8),
-                text(format!("Page {} of {}", self.page + 1, total_pages))
-                    .size(12)
-                    .color(theme::TEXT_MUTED),
-                Space::new().width(8),
-                button(text("Next →").size(12))
-                    .style(theme::button_text)
-                    .on_press_maybe(if self.page + 1 < total_pages {
-                        Some(LogMessage::NextPage)
-                    } else {
-                        None
-                    }),
-            ]
-            .align_y(Alignment::Center);
-
-            content = content.push(Space::new().height(8));
-            content = content.push(pagination);
-        }
+        content = content.push(widgets::pagination_bar(
+            self.pagination.page,
+            self.pagination.total_pages(),
+            LogMessage::PrevPage,
+            LogMessage::NextPage,
+        ));
 
         let base = container(content)
             .width(Length::Fill)

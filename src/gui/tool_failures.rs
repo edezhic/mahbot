@@ -6,7 +6,7 @@
 
 use crate::stats::{ToolErrorEntry, ToolErrorQuery};
 
-use iced::widget::{Column, Space, button, column, container, row, scrollable, text};
+use iced::widget::{Column, Space, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
@@ -43,12 +43,10 @@ pub enum ToolFailuresMessage {
 
 pub struct ToolFailuresState {
     entries: Vec<ToolErrorEntry>,
-    total: usize,
     load_state: super::common::AsyncLoadState,
-    /// Current page (0-indexed).
-    page: usize,
-    /// Rows per page.
-    page_size: usize,
+
+    // Pagination
+    pagination: super::common::PaginationState,
 
     // Filters
     /// Role name filter (empty = all roles).
@@ -57,9 +55,6 @@ pub struct ToolFailuresState {
     pub(crate) workspace_filter: String,
     /// Search text filter (empty = no search).
     pub(crate) search_filter: String,
-
-    /// Visual highlight for search input (Cmd+F).
-    focus_search: bool,
 
     /// Debounce counter for the search text input. Each keystroke increments
     /// this; only the most recent generation's sleep-task triggers a DB refresh.
@@ -72,24 +67,13 @@ impl ToolFailuresState {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            total: 0,
             load_state: super::common::AsyncLoadState::new(),
-            page: 0,
-            page_size: 50,
+            pagination: super::common::PaginationState::new(50),
             role_filter: String::new(),
             workspace_filter: String::new(),
             search_filter: String::new(),
-            focus_search: false,
             debounce_generation: 0,
             debounce_pending: false,
-        }
-    }
-
-    const fn total_pages(&self) -> usize {
-        if self.total == 0 {
-            0
-        } else {
-            self.total.div_ceil(self.page_size)
         }
     }
 
@@ -119,8 +103,8 @@ impl ToolFailuresState {
     pub fn refresh(&mut self) -> Task<ToolFailuresMessage> {
         self.load_state.start_loading();
         let query = self.build_query();
-        let page = self.page;
-        let page_size = self.page_size;
+        let page = self.pagination.page;
+        let page_size = self.pagination.page_size;
         Task::perform(
             async move {
                 let store = crate::stats::store();
@@ -140,7 +124,7 @@ impl ToolFailuresState {
         match message {
             ToolFailuresMessage::Refreshed(entries, total) => {
                 self.entries = entries;
-                self.total = total;
+                self.pagination.total = total;
                 self.load_state.finish_loading();
                 Task::none()
             }
@@ -153,17 +137,17 @@ impl ToolFailuresState {
             }
             ToolFailuresMessage::RoleFilterInput(v) => {
                 self.role_filter = v;
-                self.page = 0;
+                self.pagination.reset();
                 self.refresh()
             }
             ToolFailuresMessage::WorkspaceInput(v) => {
                 self.workspace_filter = v;
-                self.page = 0;
+                self.pagination.reset();
                 self.refresh()
             }
             ToolFailuresMessage::SearchInput(v) => {
                 self.search_filter = v;
-                self.page = 0;
+                self.pagination.reset();
                 self.debounce_generation = self.debounce_generation.wrapping_add(1);
                 self.debounce_pending = true;
                 let generation = self.debounce_generation;
@@ -184,28 +168,24 @@ impl ToolFailuresState {
                 Task::none()
             }
             ToolFailuresMessage::PrevPage => {
-                if self.page > 0 {
-                    self.page -= 1;
+                if self.pagination.prev_page() {
                     return self.refresh();
                 }
                 Task::none()
             }
             ToolFailuresMessage::NextPage => {
-                if self.page + 1 < self.total_pages() {
-                    self.page += 1;
+                if self.pagination.next_page() {
                     return self.refresh();
                 }
                 Task::none()
             }
-            ToolFailuresMessage::Escape => {
-                self.focus_search = false;
+            ToolFailuresMessage::Escape | ToolFailuresMessage::FocusSearch => {
+                // focus_search was dead code here — Cmd+F on ToolFailures tab
+                // had no visual effect.  Dropped during PaginationState migration
+                // (see ticket mahbot-673).
                 Task::none()
             }
             ToolFailuresMessage::Toast(_) => Task::none(),
-            ToolFailuresMessage::FocusSearch => {
-                self.focus_search = true;
-                Task::none()
-            }
         }
     }
 
@@ -246,34 +226,12 @@ impl ToolFailuresState {
         }
 
         // Pagination bar
-        let total_pages = self.total_pages();
-        if total_pages > 0 {
-            let pagination = row![
-                button(text("← Prev").size(12))
-                    .style(theme::button_text)
-                    .on_press_maybe(if self.page > 0 {
-                        Some(ToolFailuresMessage::PrevPage)
-                    } else {
-                        None
-                    }),
-                Space::new().width(8),
-                text(format!("Page {} of {}", self.page + 1, total_pages))
-                    .size(12)
-                    .color(theme::TEXT_MUTED),
-                Space::new().width(8),
-                button(text("Next →").size(12))
-                    .style(theme::button_text)
-                    .on_press_maybe(if self.page + 1 < total_pages {
-                        Some(ToolFailuresMessage::NextPage)
-                    } else {
-                        None
-                    }),
-            ]
-            .align_y(Alignment::Center);
-
-            content = content.push(Space::new().height(8));
-            content = content.push(pagination);
-        }
+        content = content.push(widgets::pagination_bar(
+            self.pagination.page,
+            self.pagination.total_pages(),
+            ToolFailuresMessage::PrevPage,
+            ToolFailuresMessage::NextPage,
+        ));
 
         container(content)
             .width(Length::Fill)
