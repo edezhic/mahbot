@@ -34,10 +34,11 @@ pub(crate) fn get_opt_u64(val: &Value, key: &str) -> Option<u64> {
 }
 
 /// Extract a usize field with default value.
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn get_usize(val: &Value, key: &str, default: usize) -> usize {
     val.get(key)
         .and_then(Value::as_u64)
-        .map_or(default, |v| usize::try_from(v).unwrap_or(default))
+        .map_or(default, |v| v as usize)
 }
 
 /// Extract a string array field as `Vec<String>`.
