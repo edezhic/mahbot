@@ -272,6 +272,24 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
     s.chars().skip(skip).collect()
 }
 
+/// Appends the tail of an output buffer to `msg` with a label (e.g. "stdout" or "stderr").
+///
+/// The transformation chain: lossy UTF-8 decode → strip ANSI escapes → scrub credentials
+/// → truncate to [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
+fn append_output_tail(msg: &mut String, label: &str, data: &[u8]) {
+    if !data.is_empty() {
+        let decoded = String::from_utf8_lossy(data);
+        let stripped = strip_ansi_escapes(&decoded);
+        let scrubbed = scrub_credentials(&stripped);
+        let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
+        let _ = write!(
+            msg,
+            "\n{label} (last {} chars): {tail}",
+            tail.chars().count()
+        );
+    }
+}
+
 fn format_timeout_error(
     command: &str,
     elapsed: Duration,
@@ -291,28 +309,8 @@ fn format_timeout_error(
     }
     msg.push_str("\nreason: command was killed after exceeding the timeout");
 
-    if !stdout.is_empty() {
-        let decoded = String::from_utf8_lossy(stdout);
-        let stripped = strip_ansi_escapes(&decoded);
-        let scrubbed = scrub_credentials(&stripped);
-        let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
-        let _ = write!(
-            msg,
-            "\nstdout (last {} chars): {tail}",
-            tail.chars().count()
-        );
-    }
-    if !stderr.is_empty() {
-        let decoded = String::from_utf8_lossy(stderr);
-        let stripped = strip_ansi_escapes(&decoded);
-        let scrubbed = scrub_credentials(&stripped);
-        let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
-        let _ = write!(
-            msg,
-            "\nstderr (last {} chars): {tail}",
-            tail.chars().count()
-        );
-    }
+    append_output_tail(&mut msg, "stdout", stdout);
+    append_output_tail(&mut msg, "stderr", stderr);
     msg
 }
 
