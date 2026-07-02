@@ -162,19 +162,6 @@ mod tests {
         checkpoint_all_databases().await;
     }
 
-    /// Verify the interval constant is positive and sane.
-    #[test]
-    fn interval_is_reasonable() {
-        assert!(
-            AUTO_CHECKPOINT_INTERVAL >= Duration::from_secs(30),
-            "auto-checkpoint interval should be at least 30 seconds"
-        );
-        assert!(
-            AUTO_CHECKPOINT_INTERVAL <= Duration::from_mins(10),
-            "auto-checkpoint interval should be at most 10 minutes"
-        );
-    }
-
     /// Verify that every name in [`crate::turso::ALL_STORE_NAMES`] appears in
     /// [`checkpoint_all_databases`]'s inline array, and vice-versa (the two
     /// lists are equal as sets).

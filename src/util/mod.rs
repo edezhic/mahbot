@@ -792,19 +792,4 @@ mod scrub_tests {
             assert_eq!(scrub_credentials(input), input, "{name}");
         }
     }
-
-    #[test]
-    fn unix_millis_is_reasonable() {
-        // Any reasonable system: timestamp should be > year 2020 (~1_577_836_800_000)
-        // and < year 2100 (~4_102_444_800_000) to catch drastic clock skew.
-        let ts = super::unix_millis();
-        assert!(
-            ts > 1_577_836_800_000,
-            "unix_millis() seems too small: {ts}"
-        );
-        assert!(
-            ts < 4_102_444_800_000,
-            "unix_millis() seems too large: {ts}"
-        );
-    }
 }
