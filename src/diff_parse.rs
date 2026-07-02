@@ -652,6 +652,7 @@ pub async fn run_git_show(
     };
     run_git_command(repo_path, &["show", &show_arg]).await.ok()
 }
+
 /// Create a [`tokio::process::Command`] for `git` with a sanitized environment.
 ///
 /// The subprocess environment is cleared and re-populated with only safe
