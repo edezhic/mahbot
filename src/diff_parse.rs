@@ -1641,12 +1641,10 @@ index abc123..def456 100644
 
     // ── parse_new_files_from_porcelain — combined untracked + staged-as-new ──
 
-    /// Verify that `parse_new_files_from_porcelain` correctly extracts untracked
-    /// and staged-as-new file paths from git porcelain output, including C-quoted
-    /// paths with special characters (tab, double-quote, non-ASCII).
-    #[test]
-    fn parse_new_files_from_porcelain_extracts_new_files() {
-        let porcelain = "\
+    /// Shared porcelain test input with a mix of untracked (`??`), staged-as-new
+    /// (`A `), modified, and C-quoted special-character paths.  Used by both
+    /// `parse_new_files_from_porcelain` and `parse_untracked_from_porcelain` tests.
+    const PORCELAIN_INPUT: &str = "\
 ?? new_file.rs
 M  modified.rs
 ?? another_new.py
@@ -1660,6 +1658,13 @@ AM staged_then_modified.js
 A  \"staged\\\"file.js\"
 ?? \"file\\\\backslash.rs\"
 ";
+
+    /// Verify that `parse_new_files_from_porcelain` correctly extracts untracked
+    /// and staged-as-new file paths from git porcelain output, including C-quoted
+    /// paths with special characters (tab, double-quote, non-ASCII).
+    #[test]
+    fn parse_new_files_from_porcelain_extracts_new_files() {
+        let porcelain = PORCELAIN_INPUT;
 
         let files = parse_new_files_from_porcelain(porcelain);
 
@@ -1725,20 +1730,7 @@ D  deleted.rs
     /// untracked) entries and excludes `A ` (staged-as-new) files.
     #[test]
     fn parse_untracked_from_porcelain_returns_only_untracked() {
-        let porcelain = "\
-?? new_file.rs
-M  modified.rs
-?? another_new.py
-A  staged_new.js
-?? dir/untracked.txt
- M working_tree_only.txt
-?? temp.log
-AM staged_then_modified.js
- A working_tree_new.txt
-?? \"file\\tname.rs\"
-A  \"staged\\\"file.js\"
-?? \"file\\\\backslash.rs\"
-";
+        let porcelain = PORCELAIN_INPUT;
 
         let files = parse_untracked_from_porcelain(porcelain);
 
