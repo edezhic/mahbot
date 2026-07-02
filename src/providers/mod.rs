@@ -11,6 +11,7 @@ pub mod reliable;
 pub mod transcribe;
 
 use crate::config::{CONFIG, trimmed_or_none};
+use crate::util::UnwrapPoison;
 pub use crate::{ChatMessage, ChatRequest, ChatResponse, Provider};
 use crate::{StreamEvent, StreamResult};
 
@@ -162,13 +163,9 @@ async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Res
     }
 
     // Atomically swap all three globals after warmup verification.
-    *PROVIDER.write().expect("PROVIDER poisoned") = Some(provider);
-    *IMAGE_TRANSCRIBER
-        .write()
-        .expect("IMAGE_TRANSCRIBER poisoned") = image_transcriber;
-    *AUDIO_TRANSCRIBER
-        .write()
-        .expect("AUDIO_TRANSCRIBER poisoned") = audio_transcriber;
+    *PROVIDER.write().unwrap_poison() = Some(provider);
+    *IMAGE_TRANSCRIBER.write().unwrap_poison() = image_transcriber;
+    *AUDIO_TRANSCRIBER.write().unwrap_poison() = audio_transcriber;
 
     Ok(())
 }
@@ -214,19 +211,13 @@ pub async fn recreate_all() -> anyhow::Result<()> {
 /// Get the global image transcriber, if a vision model is configured.
 #[must_use]
 pub fn image_transcriber() -> Option<ImageTranscriber> {
-    IMAGE_TRANSCRIBER
-        .read()
-        .expect("IMAGE_TRANSCRIBER poisoned")
-        .clone()
+    IMAGE_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
 /// Get the global audio transcriber, if an audio model is configured.
 #[must_use]
 pub fn audio_transcriber() -> Option<transcribe::AudioTranscriber> {
-    AUDIO_TRANSCRIBER
-        .read()
-        .expect("AUDIO_TRANSCRIBER poisoned")
-        .clone()
+    AUDIO_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
 /// Delegate `Provider` trait for the global static.
@@ -236,7 +227,7 @@ pub fn audio_transcriber() -> Option<transcribe::AudioTranscriber> {
 pub async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
     let provider = PROVIDER
         .read()
-        .expect("PROVIDER poisoned")
+        .unwrap_poison()
         .clone()
         .expect("PROVIDER not initialized");
     provider.chat(request).await
@@ -245,7 +236,7 @@ pub async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
 pub fn stream_chat(request: ChatRequest) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let provider = PROVIDER
         .read()
-        .expect("PROVIDER poisoned")
+        .unwrap_poison()
         .clone()
         .expect("PROVIDER not initialized");
     provider.stream_chat(request)
