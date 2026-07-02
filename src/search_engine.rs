@@ -86,7 +86,7 @@ pub(crate) fn get_or_init_engine(
     name: &str,
     path: &Path,
 ) -> Result<Arc<SearchEngineEntry>, String> {
-    // Fast path
+    // Fast path: read-lock check.
     {
         let reg = registry()
             .read()
@@ -96,19 +96,18 @@ pub(crate) fn get_or_init_engine(
         }
     }
 
-    // Slow path: create the engine under the write lock
-    let entry = init_engine_for_workspace(name, path)?;
-
+    // Slow path: serialise creation under the write lock so that two
+    // concurrent callers never create duplicate scans/query-tracker DBs.
     let mut reg = registry()
         .write()
         .map_err(|e| format!("registry lock poisoned: {e}"))?;
 
-    // Double-check: another caller may have beaten us to it
+    // Double-check: another writer may have inserted while we waited.
     if let Some(existing) = reg.get(name) {
         return Ok(Arc::clone(existing));
     }
 
-    let entry = Arc::new(entry);
+    let entry = Arc::new(init_engine_for_workspace(name, path)?);
     reg.insert(name.to_string(), Arc::clone(&entry));
     Ok(entry)
 }
