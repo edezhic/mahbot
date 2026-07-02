@@ -526,17 +526,9 @@ fn extract_b_path(b_part: &str) -> Option<String> {
 
 /// Parse a single range token like `-10,7` or `+10` from a hunk header.
 /// Returns the starting line number, or `None` if the token is malformed.
-/// `header` is the original hunk header string, used for diagnostic messages.
-fn parse_range_token(part: &str, prefix: char, header: &str) -> Option<usize> {
+fn parse_range_token(part: &str, prefix: char) -> Option<usize> {
     let remainder = part.strip_prefix(prefix)?;
-    if remainder.is_empty() || !remainder.chars().all(|c| c.is_ascii_digit() || c == ',') {
-        warn!("Skipping non-numeric '{prefix}' token {part:?} in hunk header {header:?}");
-        return None;
-    }
-    remainder
-        .split(',')
-        .next()
-        .and_then(|s| s.parse::<usize>().ok())
+    remainder.split(',').next()?.parse::<usize>().ok()
 }
 
 /// Parse a hunk header: `@@ -old_start,old_count +new_start,new_count @@ [context]`.
@@ -556,10 +548,9 @@ fn parse_range_token(part: &str, prefix: char, header: &str) -> Option<usize> {
 ///   but appears after the closing `@@` delimiter — again stopped by the
 ///   `@` break.
 ///
-/// The character validation in [`parse_range_token`] provides a second
-/// line of defense: even if a spurious `-` or `+` token somehow appeared
-/// before the closing `@@`, non-digit/non-comma characters cause it to be
-/// skipped (e.g. `->` yields remainder `>` which fails validation).
+/// The `@` break alone is sufficient — [`parse_range_token`] simply returns
+/// `None` for any non-numeric remainder (its `parse::<usize>()` call fails),
+/// so spurious `-` or `+` tokens like `->` are harmlessly skipped.
 fn parse_hunk_header(header: &str) -> (usize, usize) {
     // Example inputs:
     //   @@ -10,7 +10,9 @@ fn main() {
@@ -581,11 +572,11 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
         }
 
         if part.starts_with('-')
-            && let Some(n) = parse_range_token(part, '-', header)
+            && let Some(n) = parse_range_token(part, '-')
         {
             old_start = n;
         } else if part.starts_with('+')
-            && let Some(n) = parse_range_token(part, '+', header)
+            && let Some(n) = parse_range_token(part, '+')
         {
             new_start = n;
         }
@@ -1426,7 +1417,7 @@ index abc123..def456 100644
             ),
             // Expressions like `a + b` in context must not corrupt new_start.
             // (Any `->` token is after the closing @@ delimiter — the parser
-            // breaks on @@ first, so the warn!() path is not reached here.)
+            // breaks on @@ first, so spurious tokens are not inspected.)
             (
                 "hunk_context_with_plus",
                 "@@ -5,3 +5,4 @@ fn add(a: i32, b: i32) -> i32 { let x = a + b; }",
