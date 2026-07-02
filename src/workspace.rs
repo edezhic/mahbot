@@ -487,7 +487,9 @@ impl WorkspaceStore {
         // diagnostics/status writes will be skipped by the generation guard.
         spawn_workspace_discovery(&ws, 0);
         // Eagerly initialize the shared search engine for this workspace.
-        if let Err(e) = crate::search_engine::get_or_init_engine(&ws) {
+        if let Err(e) =
+            crate::search_engine::get_or_init_engine(name, std::path::Path::new(&ws.path))
+        {
             tracing::warn!(workspace_name = name, error = %e, "Failed to init search engine on workspace add");
         }
         Ok(ws)

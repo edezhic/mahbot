@@ -203,7 +203,7 @@ impl SearchTool {
     /// Resolve the shared engine for a workspace and ensure the background
     /// scan has finished.
     async fn resolve_engine(ws: &crate::Workspace) -> Result<search_engine::EngineHandle, String> {
-        let entry = search_engine::get_or_init_engine(ws)?;
+        let entry = search_engine::get_or_init_engine(&ws.name, std::path::Path::new(&ws.path))?;
         search_engine::ensure_scanned(&entry).await?;
         Ok(search_engine::EngineHandle::new(entry))
     }

@@ -25,6 +25,7 @@ use fff_search::file_picker::{FFFMode, FilePickerOptions};
 use fff_search::shared::{SharedFilePicker, SharedFrecency, SharedQueryTracker};
 use fff_search::{FilePicker, QueryTracker};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::OnceCell;
@@ -81,31 +82,34 @@ pub(crate) struct SearchEngineEntry {
 ///
 /// Returns a cloneable handle. Multiple callers racing on first access are
 /// serialized by the registry write lock — only one engine is created.
-pub(crate) fn get_or_init_engine(ws: &Workspace) -> Result<Arc<SearchEngineEntry>, String> {
+pub(crate) fn get_or_init_engine(
+    name: &str,
+    path: &Path,
+) -> Result<Arc<SearchEngineEntry>, String> {
     // Fast path
     {
         let reg = registry()
             .read()
             .map_err(|e| format!("registry lock poisoned: {e}"))?;
-        if let Some(entry) = reg.get(&ws.name) {
+        if let Some(entry) = reg.get(name) {
             return Ok(Arc::clone(entry));
         }
     }
 
     // Slow path: create the engine under the write lock
-    let entry = init_engine_for_workspace(ws)?;
+    let entry = init_engine_for_workspace(name, path)?;
 
     let mut reg = registry()
         .write()
         .map_err(|e| format!("registry lock poisoned: {e}"))?;
 
     // Double-check: another caller may have beaten us to it
-    if let Some(existing) = reg.get(&ws.name) {
+    if let Some(existing) = reg.get(name) {
         return Ok(Arc::clone(existing));
     }
 
     let entry = Arc::new(entry);
-    reg.insert(ws.name.clone(), Arc::clone(&entry));
+    reg.insert(name.to_string(), Arc::clone(&entry));
     Ok(entry)
 }
 
@@ -113,12 +117,11 @@ pub(crate) fn get_or_init_engine(ws: &Workspace) -> Result<Arc<SearchEngineEntry
 ///
 /// Handles persistent query tracker setup with fallback, creates the
 /// `FilePicker`, and spawns the background scan.
-fn init_engine_for_workspace(ws: &Workspace) -> Result<SearchEngineEntry, String> {
-    let workspace_path = std::path::Path::new(&ws.path);
-    if !workspace_path.exists() {
+fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntry, String> {
+    if !path.exists() {
         return Err(format!(
             "Workspace directory does not exist: {}",
-            workspace_path.display()
+            path.display()
         ));
     }
 
@@ -126,11 +129,11 @@ fn init_engine_for_workspace(ws: &Workspace) -> Result<SearchEngineEntry, String
     let frecency = SharedFrecency::default();
 
     // Try to open persistent query tracker DB; fall back to in-memory
-    let query_tracker = match open_persistent_query_tracker(&ws.name) {
+    let query_tracker = match open_persistent_query_tracker(name) {
         Ok(qt) => qt,
         Err(e) => {
             tracing::warn!(
-                workspace_name = ws.name,
+                workspace_name = name,
                 error = %e,
                 "Failed to open persistent query tracker — using in-memory fallback"
             );
@@ -139,7 +142,7 @@ fn init_engine_for_workspace(ws: &Workspace) -> Result<SearchEngineEntry, String
     };
 
     let options = FilePickerOptions {
-        base_path: ws.path.clone(),
+        base_path: path.to_string_lossy().to_string(),
         enable_mmap_cache: false,
         enable_content_indexing: true,
         mode: FFFMode::Ai,
@@ -154,8 +157,8 @@ fn init_engine_for_workspace(ws: &Workspace) -> Result<SearchEngineEntry, String
         .map_err(|e| format!("Failed to create search engine: {e}"))?;
 
     tracing::info!(
-        workspace_name = ws.name,
-        workspace_path = %ws.path,
+        workspace_name = name,
+        workspace_path = %path.display(),
         "Search engine created — background scan started"
     );
 
@@ -326,7 +329,7 @@ pub async fn init_all_engines() {
     };
 
     for ws in &workspaces {
-        match get_or_init_engine(ws) {
+        match get_or_init_engine(&ws.name, Path::new(&ws.path)) {
             Ok(_) => { /* scan started */ }
             Err(e) => {
                 tracing::warn!(

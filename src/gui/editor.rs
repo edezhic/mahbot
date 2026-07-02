@@ -1378,21 +1378,17 @@ async fn run_global_search(
     tokio::time::sleep(Duration::from_millis(GLOBAL_SEARCH_DEBOUNCE_MS)).await;
 
     // Step 2: Get or init the search engine.
-    let ws = crate::Workspace {
-        name: ws_name,
-        path: ws_path.clone(),
-        ..Default::default()
-    };
-    let entry = match crate::search_engine::get_or_init_engine(&ws) {
-        Ok(e) => e,
-        Err(e) => {
-            return EditorMessage::GlobalSearchResults {
-                r#gen: gs_gen,
-                results: Vec::new(),
-                error: Some(e),
-            };
-        }
-    };
+    let entry =
+        match crate::search_engine::get_or_init_engine(&ws_name, std::path::Path::new(&ws_path)) {
+            Ok(e) => e,
+            Err(e) => {
+                return EditorMessage::GlobalSearchResults {
+                    r#gen: gs_gen,
+                    results: Vec::new(),
+                    error: Some(e),
+                };
+            }
+        };
     if let Err(e) = crate::search_engine::ensure_scanned(&entry).await {
         return EditorMessage::GlobalSearchResults {
             r#gen: gs_gen,
@@ -2976,12 +2972,10 @@ impl EditorState {
         // Start scanning the search engine and show readiness status.
         let engine_task = Task::perform(
             async move {
-                let ws = crate::Workspace {
-                    name: ws_name,
-                    path: ws_path,
-                    ..Default::default()
-                };
-                match crate::search_engine::get_or_init_engine(&ws) {
+                match crate::search_engine::get_or_init_engine(
+                    &ws_name,
+                    std::path::Path::new(&ws_path),
+                ) {
                     Ok(entry) => match crate::search_engine::ensure_scanned(&entry).await {
                         Ok(()) => EditorMessage::GlobalSearchResults {
                             r#gen: gs_gen,
