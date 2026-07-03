@@ -918,11 +918,7 @@ impl HomeState {
                 } => {
                     let km = super::detect_keyboard_mods(modifiers);
                     // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
-                    if km.is_platform_mod
-                        && !km.is_emacs_ctrl
-                        && !km.altgr_active
-                        && key.to_latin(physical_key) == Some('z')
-                    {
+                    if km.is_shortcut_platform_mod() && key.to_latin(physical_key) == Some('z') {
                         if modifiers.shift() {
                             return Some(HomeMessage::Redo);
                         }

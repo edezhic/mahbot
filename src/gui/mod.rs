@@ -299,6 +299,19 @@ impl KeyboardMods {
             self.is_platform_mod && !self.altgr_active
         }
     }
+
+    /// Platform modifier for general keyboard shortcuts
+    /// (everything except navigation and text operations).
+    ///
+    /// On macOS: Cmd is pressed (with or without Ctrl), but not Ctrl alone
+    /// (which triggers terminal control characters / Emacs bindings).
+    ///
+    /// On other platforms: Cmd or Ctrl is pressed, but not AltGr
+    /// (Ctrl+Alt, which produces international text characters).
+    #[must_use]
+    pub fn is_shortcut_platform_mod(self) -> bool {
+        self.is_platform_mod && !self.is_emacs_ctrl && !self.altgr_active
+    }
 }
 
 /// Compute [`KeyboardMods`] from an Iced [`keyboard::Modifiers`] value.

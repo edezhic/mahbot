@@ -1795,7 +1795,7 @@ impl EditorState {
             let latin = |target: char| -> bool { key.to_latin(physical_key) == Some(target) };
 
             // Ctrl+B / Cmd+B → toggle tree focus.
-            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('b') {
+            if km.is_shortcut_platform_mod() && latin('b') {
                 return Some(EditorMessage::TreeFocusToggled);
             }
             // Cmd+Shift+F / Ctrl+Shift+F → global search (find-in-files).
@@ -1807,23 +1807,18 @@ impl EditorState {
             // Cmd+F / Ctrl+F → toggle find/replace bar.
             // Guard: Cmd+Shift+F handled above, so !modifiers.shift() prevents
             // Cmd+Shift+F from also triggering FindToggle.
-            if km.is_platform_mod
-                && !km.is_emacs_ctrl
-                && !km.altgr_active
-                && !modifiers.shift()
-                && latin('f')
-            {
+            if km.is_shortcut_platform_mod() && !modifiers.shift() && latin('f') {
                 return Some(EditorMessage::FindToggle);
             }
             // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z / Ctrl+Shift+Z → redo.
-            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('z') {
+            if km.is_shortcut_platform_mod() && latin('z') {
                 if modifiers.shift() {
                     return Some(EditorMessage::Redo);
                 }
                 return Some(EditorMessage::Undo);
             }
             // Cmd+S / Ctrl+S → save.
-            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('s') {
+            if km.is_shortcut_platform_mod() && latin('s') {
                 return Some(EditorMessage::SaveActiveTab);
             }
             // Ctrl+Tab / Ctrl+Shift+Tab → switch tabs.
@@ -1856,11 +1851,11 @@ impl EditorState {
                 }
             }
             // Quick open: Cmd+P / Ctrl+P
-            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('p') {
+            if km.is_shortcut_platform_mod() && latin('p') {
                 return Some(EditorMessage::QuickOpenToggle);
             }
             // Refresh file tree: Cmd+R / Ctrl+R
-            if km.is_platform_mod && !km.is_emacs_ctrl && !km.altgr_active && latin('r') {
+            if km.is_shortcut_platform_mod() && latin('r') {
                 return Some(EditorMessage::RefreshFileTree);
             }
             // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev
