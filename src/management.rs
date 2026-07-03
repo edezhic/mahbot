@@ -389,7 +389,7 @@ fn warn_transition_failed(
 /// The `comments` slice pairs a role string with the comment text for each
 /// comment to write. All comments and the phase transition are written in a
 /// single database transaction. At least one comment is required; an empty
-/// slice will panic in debug builds.
+/// slice will panic.
 ///
 /// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
 /// agents (unlike [`BoardStore::transition_to`] / `execute_and_cancel`).
@@ -413,7 +413,7 @@ async fn comment_and_transition(
     verb: &str,
     pipeline_reservation: Option<bool>,
 ) -> bool {
-    debug_assert!(
+    assert!(
         !comments.is_empty(),
         "comment_and_transition requires at least one comment"
     );
