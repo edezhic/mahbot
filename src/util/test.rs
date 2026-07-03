@@ -563,9 +563,9 @@ mod env_var_guard_tests {
 
     #[test]
     fn sets_and_restores_to_absent() {
-        let _guard = set_env_var("MAHBOT_TEST_SET_RESTORE", Some("hello"));
+        let guard = set_env_var("MAHBOT_TEST_SET_RESTORE", Some("hello"));
         assert_eq!(std::env::var("MAHBOT_TEST_SET_RESTORE"), Ok("hello".into()));
-        drop(_guard);
+        drop(guard);
 
         // Variable was absent before the guard (unique name, first use).
         // The guard should restore to that state.
@@ -584,12 +584,12 @@ mod env_var_guard_tests {
             std::env::set_var("MAHBOT_TEST_REMOVE", "present");
         }
 
-        let _guard = set_env_var("MAHBOT_TEST_REMOVE", None);
+        let guard = set_env_var("MAHBOT_TEST_REMOVE", None);
         assert!(
             std::env::var_os("MAHBOT_TEST_REMOVE").is_none(),
             "set_env_var(key, None) should remove the variable"
         );
-        drop(_guard);
+        drop(guard);
 
         // Original should be restored.
         assert_eq!(
@@ -611,9 +611,9 @@ mod env_var_guard_tests {
             std::env::set_var("MAHBOT_TEST_CAPTURE", "original");
         }
 
-        let _guard = set_env_var("MAHBOT_TEST_CAPTURE", Some("override"));
+        let guard = set_env_var("MAHBOT_TEST_CAPTURE", Some("override"));
         assert_eq!(std::env::var("MAHBOT_TEST_CAPTURE"), Ok("override".into()));
-        drop(_guard);
+        drop(guard);
 
         assert_eq!(
             std::env::var("MAHBOT_TEST_CAPTURE"),
