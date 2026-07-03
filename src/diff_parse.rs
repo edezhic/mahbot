@@ -1857,20 +1857,7 @@ AM staged_then_modified.js
     async fn test_run_git_check_ignore_matches_ignored_path() {
         let (_dir, repo_path) = init_temp_repo();
 
-        // Create a .gitignore that excludes *.log
         std::fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
-        let status = std::process::Command::new("git")
-            .args(["add", ".gitignore"])
-            .current_dir(&repo_path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["commit", "-m", "Add .gitignore"])
-            .current_dir(&repo_path)
-            .status()
-            .unwrap();
-        assert!(status.success());
 
         let ignored = run_git_check_ignore(&repo_path, &["test.log".to_string()])
             .await
@@ -1886,20 +1873,7 @@ AM staged_then_modified.js
     async fn test_run_git_check_ignore_non_ignored_path() {
         let (_dir, repo_path) = init_temp_repo();
 
-        // Create a .gitignore that excludes *.log
         std::fs::write(repo_path.join(".gitignore"), "*.log\n").unwrap();
-        let status = std::process::Command::new("git")
-            .args(["add", ".gitignore"])
-            .current_dir(&repo_path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["commit", "-m", "Add .gitignore"])
-            .current_dir(&repo_path)
-            .status()
-            .unwrap();
-        assert!(status.success());
 
         let ignored = run_git_check_ignore(&repo_path, &["test.txt".to_string()])
             .await
