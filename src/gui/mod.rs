@@ -1076,15 +1076,13 @@ impl Dashboard {
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
         // Git state is cleared and eagerly refreshed below via
         // propagate_workspace_selection → set_workspace_path.
-        if name.is_empty() {
-            self.selected_workspace_name = None;
-            self.persist_window_state();
-            self.propagate_workspace_selection("")
+        self.selected_workspace_name = if name.is_empty() {
+            None
         } else {
-            self.selected_workspace_name = Some(name.to_string());
-            self.persist_window_state();
-            self.propagate_workspace_selection(name)
-        }
+            Some(name.to_string())
+        };
+        self.persist_window_state();
+        self.propagate_workspace_selection(name)
     }
 
     /// Propagate the global workspace selection to all affected pages.
