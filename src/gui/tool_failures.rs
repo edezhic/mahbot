@@ -37,8 +37,6 @@ pub enum ToolFailuresMessage {
     Escape,
     /// Request toast notification.
     Toast(super::ToastMessage),
-    /// Cmd+F keyboard shortcut — focus the search input.
-    FocusSearch,
 }
 
 pub struct ToolFailuresState {
@@ -154,13 +152,7 @@ impl ToolFailuresState {
                 }
                 Task::none()
             }
-            ToolFailuresMessage::Escape | ToolFailuresMessage::FocusSearch => {
-                // focus_search was dead code here — Cmd+F on ToolFailures tab
-                // had no visual effect.  Dropped during PaginationState migration
-                // (see ticket mahbot-673).
-                Task::none()
-            }
-            ToolFailuresMessage::Toast(_) => Task::none(),
+            ToolFailuresMessage::Escape | ToolFailuresMessage::Toast(_) => Task::none(),
         }
     }
 

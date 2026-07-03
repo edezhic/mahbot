@@ -391,25 +391,13 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::Escape => {
-                if self.active_tab == LogsTab::ToolFailures {
-                    self.tool_failures_state
-                        .update(super::tool_failures::ToolFailuresMessage::Escape)
-                        .map(LogMessage::ToolFailures)
-                } else {
-                    self.focus_search = false;
-                    Task::none()
-                }
+                self.focus_search = false;
+                Task::none()
             }
             LogMessage::Toast(_) => Task::none(),
             LogMessage::FocusSearch => {
-                if self.active_tab == LogsTab::ToolFailures {
-                    self.tool_failures_state
-                        .update(super::tool_failures::ToolFailuresMessage::FocusSearch)
-                        .map(LogMessage::ToolFailures)
-                } else {
-                    self.focus_search = true;
-                    Task::none()
-                }
+                self.focus_search = true;
+                Task::none()
             }
             LogMessage::TabSelected(tab) => {
                 self.active_tab = tab;
