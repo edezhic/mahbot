@@ -1429,7 +1429,7 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
 /// they are legitimate project files or intermediate garbage.
 ///
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
-/// delegates to [`handle_sanitation_verdict`] for pass/fail processing.
+/// delegates to [`process_sanitation_verdict`] for pass/fail processing.
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
 
@@ -1534,7 +1534,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         }
     };
 
-    handle_sanitation_verdict(&ticket, verdict).await;
+    process_sanitation_verdict(&ticket, verdict).await;
 }
 
 /// Process the result of a sanitation agent inspection.
@@ -1548,7 +1548,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 ///   files and transitions the ticket to [`TicketPhase::ReadyForDevelopment`] with a
 ///   pipeline reservation (via [`comment_and_transition`]), matching the existing review/QA
 ///   failure pattern.
-async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVerdict) {
+async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVerdict) {
     if verdict.pass {
         let passed_suffix = if verdict.garbage_files.is_empty() {
             ""
@@ -1847,7 +1847,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
 //
-// Why `handle_analyst_verdicts` and `process_verdict_results` are separate
+// Why `process_analyst_verdicts` and `process_verdict_results` are separate
 // -----------------------------------------------------------------------
 // Both follow the same skeleton (record comments -> classify -> transition)
 // but differ in four ways that make a single unified function awkward:
@@ -2118,7 +2118,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     };
 
-    handle_analyst_verdicts(&ticket, &results).await;
+    process_analyst_verdicts(&ticket, &results).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -2130,7 +2130,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verdict_results`].
-async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
+async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // Record per-analyst comments.
     // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
     record_verdict_comments(
@@ -2415,7 +2415,7 @@ async fn is_circuit_breaker_tripped(
 ///    [`finalize_ticket_from_phase`]).
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
-/// from [`handle_analyst_verdicts`].
+/// from [`process_analyst_verdicts`].
 async fn process_verdict_results(
     ticket: &Ticket,
     results: &[ParallelVerdict],
@@ -3369,14 +3369,14 @@ mod tests {
         assert_eq!(phase, TicketPhase::Failed, "ticket must remain Failed");
     }
 
-    // ── handle_analyst_verdicts — analyst scoring and transitions ─────────
+    // ── process_analyst_verdicts — analyst scoring and transitions ─────────
 
-    /// Verify handle_analyst_verdicts across all outcomes:
+    /// Verify process_analyst_verdicts across all outcomes:
     /// - All analysts pass → Planning with "All LGTM" summary
     /// - Partial fail → Planning with "blockers" summary
     /// - No verdicts → Planning with "no analysis" summary
     #[tokio::test]
-    async fn handle_analyst_verdicts_cases() {
+    async fn process_analyst_verdicts_cases() {
         struct Case {
             name: &'static str,
             ws_suffix: &'static str,
@@ -3430,7 +3430,7 @@ mod tests {
 
             let ticket = expect_ticket(board(), &ticket_id).await;
 
-            handle_analyst_verdicts(&ticket, &case.results).await;
+            process_analyst_verdicts(&ticket, &case.results).await;
 
             let phase = expect_ticket_phase(board(), &ticket_id).await;
             assert_eq!(
@@ -3563,14 +3563,14 @@ mod tests {
         );
     }
 
-    // ── handle_sanitation_verdict — verdict processing ──────────────────
+    // ── process_sanitation_verdict — verdict processing ──────────────────
 
-    /// Verify both branches of `handle_sanitation_verdict`:
+    /// Verify both branches of `process_sanitation_verdict`:
     /// - pass=true → SanitationPassed with a sanitation comment
     /// - pass=false → ReadyForDevelopment with pipeline reservation,
     ///   a sanitation comment, and a system circuit-breaker comment
     #[tokio::test]
-    async fn handle_sanitation_verdict_cases() {
+    async fn process_sanitation_verdict_cases() {
         init_management_test_stores().await;
 
         // Case 1: pass=true → SanitationPassed
@@ -3584,7 +3584,7 @@ mod tests {
             rationale: "All files are legitimate project files.".into(),
         };
 
-        handle_sanitation_verdict(&ticket_pass, pass_verdict).await;
+        process_sanitation_verdict(&ticket_pass, pass_verdict).await;
 
         let phase = expect_ticket_phase(board(), &pass_id).await;
         assert_eq!(
@@ -3619,7 +3619,7 @@ mod tests {
             rationale: "These are intermediate build artifacts.".into(),
         };
 
-        handle_sanitation_verdict(&ticket_fail, fail_verdict).await;
+        process_sanitation_verdict(&ticket_fail, fail_verdict).await;
 
         let ticket = expect_ticket(board(), &fail_id).await;
         assert_eq!(
