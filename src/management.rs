@@ -1556,17 +1556,15 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             "Sanitation passed — transitioning to SanitationPassed",
         );
 
-        let comment = if verdict.garbage_files.is_empty() {
-            format!(
-                "🧹 Sanitation passed: {rationale}",
-                rationale = verdict.rationale
-            )
+        let passed_suffix = if verdict.garbage_files.is_empty() {
+            ""
         } else {
-            format!(
-                "🧹 Sanitation passed (files reviewed): {rationale}",
-                rationale = verdict.rationale
-            )
+            " (files reviewed)"
         };
+        let comment = format!(
+            "🧹 Sanitation passed{passed_suffix}: {rationale}",
+            rationale = verdict.rationale
+        );
         comment_and_transition(
             ticket,
             &[(Role::Sanitation.as_str(), &comment)],
