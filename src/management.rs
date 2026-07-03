@@ -518,9 +518,26 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 /// [`BoardStore::get_comments`]). Every code path that transitions a ticket to
 /// `Failed` MUST write a relevant comment first — otherwise the warning will
 /// surface unrelated or stale content (or "No failure details available."
-/// if no comment exists). This invariant is upheld by all four
-/// existing failure paths (dispatch panic, agent failure, circuit breaker, all
-/// verifiers failed) but is not enforced at the type or API level.
+/// if no comment exists).
+///
+/// This invariant IS enforced at the API level:
+///
+/// * [`transition_ticket_to_failed()`] takes a required `comment: &str`
+///   and delegates to [`comment_and_transition()`], which writes the comment
+///   and performs the phase transition atomically in a single transaction.
+///   It is used by the dispatch-panic, circuit-breaker, and all-verifiers-failed
+///   paths.
+/// * The inline [`comment_and_transition()`] call in [`dispatch_engineer()`]
+///   (agent-failure path) also always writes a comment before transitioning to
+///   `Failed`.
+///
+/// Because all four production failure paths go through one of these two entry
+/// points, the failure comment is always written atomically with the transition
+/// and committed to the database before [`dispatch_notification`] →
+/// [`notify_ticket`] runs. The generic [`transition_ticket()`] function does
+/// not enforce this invariant (it accepts any `TicketPhase` target without
+/// requiring a comment), but no production caller uses it to transition to
+/// `Failed`.
 ///
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
