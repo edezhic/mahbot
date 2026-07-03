@@ -504,6 +504,17 @@ struct PreparedUpdate {
     action: String,
 }
 
+/// A single reset transition: when a ticket in `from` phase is found on startup,
+/// it is rolled back to `to` phase. If `pipeline_reservation` is true, the ticket
+/// gets `pipeline_reservation = 1` so it is claimed before any fresh ticket in the
+/// same phase (preserving rework priority across restarts).
+#[derive(Debug, Clone, Copy)]
+struct ResetTransition {
+    from: TicketPhase,
+    to: TicketPhase,
+    pipeline_reservation: bool,
+}
+
 impl BoardStore {
     /// Post-open FTS index setup.
     async fn after_open(&self) -> anyhow::Result<()> {
@@ -1376,26 +1387,42 @@ impl BoardStore {
     /// Transitory handoff phases (see [`TicketPhase::is_transitory_handoff`]) are pipeline
     /// blocking but don't need a reset entry — the poller picks them up within seconds
     /// of restart, so no agent session is mid-execution in those states.
-    const RESET_TRANSITIONS: &[(TicketPhase, TicketPhase, bool)] = &[
-        (
-            TicketPhase::InDevelopment,
-            TicketPhase::ReadyForDevelopment,
-            true,
-        ),
-        (
-            TicketPhase::InDiagnostics,
-            TicketPhase::ReadyForDevelopment,
-            true,
-        ),
-        (TicketPhase::InSanitation, TicketPhase::QaPassed, true),
-        // Note: pipeline_reservation = true on InSanitation → QaPassed is inert —
-        // QaPassed uses list-based dispatch (for_tickets_in_phase), not the claim
-        // loop where pipeline_reservation provides ordering. Set for consistency
-        // with the crash-recovery pattern; the flag is harmless for list-based
-        // dispatch.
-        (TicketPhase::InQa, TicketPhase::Reviewed, false),
-        (TicketPhase::InReview, TicketPhase::DiagnosticsDone, false),
-        (TicketPhase::Analysis, TicketPhase::Backlog, false),
+    const RESET_TRANSITIONS: &[ResetTransition] = &[
+        ResetTransition {
+            from: TicketPhase::InDevelopment,
+            to: TicketPhase::ReadyForDevelopment,
+            pipeline_reservation: true,
+        },
+        ResetTransition {
+            from: TicketPhase::InDiagnostics,
+            to: TicketPhase::ReadyForDevelopment,
+            pipeline_reservation: true,
+        },
+        ResetTransition {
+            from: TicketPhase::InSanitation,
+            to: TicketPhase::QaPassed,
+            pipeline_reservation: true,
+            // Note: pipeline_reservation = true on InSanitation → QaPassed is inert —
+            // QaPassed uses list-based dispatch (for_tickets_in_phase), not the claim
+            // loop where pipeline_reservation provides ordering. Set for consistency
+            // with the crash-recovery pattern; the flag is harmless for list-based
+            // dispatch.
+        },
+        ResetTransition {
+            from: TicketPhase::InQa,
+            to: TicketPhase::Reviewed,
+            pipeline_reservation: false,
+        },
+        ResetTransition {
+            from: TicketPhase::InReview,
+            to: TicketPhase::DiagnosticsDone,
+            pipeline_reservation: false,
+        },
+        ResetTransition {
+            from: TicketPhase::Analysis,
+            to: TicketPhase::Backlog,
+            pipeline_reservation: false,
+        },
     ];
     /// Reset all in-flight tickets to their ready state (for crash/restart recovery).
     ///
@@ -1417,11 +1444,16 @@ impl BoardStore {
     pub async fn reset_inflight_tickets(&self) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         let now = turso::now();
-        for (from, to, reserve) in Self::RESET_TRANSITIONS {
+        for transition in Self::RESET_TRANSITIONS {
             tx.execute(
                 "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
                  pipeline_reservation = ?4 WHERE status = ?3",
-                turso::params![to.as_ref(), now.clone(), from.as_ref(), i64::from(*reserve)],
+                turso::params![
+                    transition.to.as_ref(),
+                    now.clone(),
+                    transition.from.as_ref(),
+                    i64::from(transition.pipeline_reservation)
+                ],
             )
             .await?;
         }
@@ -2590,7 +2622,7 @@ be a pipeline blocker.\
         // Collect all `from` phases from BoardStore::RESET_TRANSITIONS for easy lookup.
         let reset_from: Vec<TicketPhase> = BoardStore::RESET_TRANSITIONS
             .iter()
-            .map(|(from, _, _)| *from)
+            .map(|t| t.from)
             .collect();
 
         for phase in PIPELINE_BLOCKING_STATUSES {
