@@ -31,6 +31,9 @@ pub struct OpenAiCompatibleProvider {
     timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
+    /// Whether to set `"tool_stream": true` in chat completion requests
+    /// (needed by some providers like z.ai for streaming tool calls).
+    tool_stream: bool,
     /// Cached HTTP client with connection reuse across all API calls.
     /// Initialized lazily on first `http_client()` call.
     http_client: OnceLock<Client>,
@@ -45,6 +48,7 @@ impl OpenAiCompatibleProvider {
             credential: credential.map(ToString::to_string),
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
+            tool_stream: false,
             http_client: OnceLock::new(),
         }
     }
@@ -56,6 +60,14 @@ impl OpenAiCompatibleProvider {
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    /// Enable or disable `"tool_stream": true` in chat completion requests.
+    /// Required by some providers (e.g. z.ai) for correct streaming of tool calls.
+    #[must_use]
+    pub fn with_tool_stream(mut self, enabled: bool) -> Self {
+        self.tool_stream = enabled;
         self
     }
 
@@ -90,23 +102,6 @@ impl OpenAiCompatibleProvider {
                 .build()
                 .expect("Failed to build HTTP client — check TLS/network configuration")
         })
-    }
-
-    fn requires_tool_stream(&self) -> bool {
-        let host_requires_tool_stream = reqwest::Url::parse(&self.base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-            .is_some_and(|host| host == "api.z.ai" || host.ends_with(".z.ai"));
-
-        host_requires_tool_stream || matches!(self.name.as_str(), "zai" | "z.ai")
-    }
-
-    fn tool_stream_for_tools(&self, has_tools: bool) -> Option<bool> {
-        if has_tools && self.requires_tool_stream() {
-            Some(true)
-        } else {
-            None
-        }
     }
 }
 
@@ -616,7 +611,7 @@ impl OpenAiCompatibleProvider {
             temperature: f64::from(request.temperature),
             max_tokens: 32000,
             stream: Some(stream),
-            tool_stream: self.tool_stream_for_tools(has_tools),
+            tool_stream: (has_tools && self.tool_stream).then_some(true),
             tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
             tools: tool_specs,
             extra,
@@ -1202,48 +1197,77 @@ mod tests {
     }
 
     #[test]
-    fn zai_tool_requests_enable_tool_stream() {
-        let provider = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
-        let req = ChatCompletionRequest {
-            model: "glm-5".to_string(),
-            messages: vec![NativeMessage::user("List /tmp")],
+    fn default_tool_stream_omits_field() {
+        let provider = make_provider("generic", "https://api.example.com/v1", None);
+        let chat_request = ChatRequest {
+            messages: vec![ChatMessage::user("hello")],
+            tools: Some(vec![ToolSpec {
+                name: "shell".to_string(),
+                description: "Run a shell command".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                    },
+                }),
+            }]),
+            model: "test-model".to_string(),
+            allow_image_parts: false,
             temperature: 0.7,
-            max_tokens: 32000,
-            stream: Some(false),
-            tool_stream: provider.tool_stream_for_tools(true),
-            tools: Some(vec![serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "shell",
-                    "description": "Run a shell command",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string"}
-                        }
-                    }
-                }
-            })]),
-            tool_choice: Some("auto".to_string()),
-            extra: serde_json::Map::new(),
+            reasoning_effort: None,
+            provider_order: None,
+            provider_allow_fallbacks: None,
         };
 
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"tool_stream\":true"));
+        let builder = provider.build_chat_request_raw(&chat_request, false);
+        let http_request = builder.build().unwrap();
+        let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
+
+        assert!(
+            body.get("tool_stream").is_none(),
+            "tool_stream should be absent when default false"
+        );
+        assert!(
+            body.get("tools").is_some(),
+            "tools should be present in request"
+        );
     }
 
     #[test]
-    fn non_zai_provider_omits_tool_stream_regardless_of_streaming() {
-        let provider = make_provider("custom", "https://proxy.example.com/v1", None);
-        // tool_stream_for_tools should return None for non-Z.AI providers
-        assert_eq!(provider.tool_stream_for_tools(true), None);
-        assert_eq!(provider.tool_stream_for_tools(false), None);
-    }
+    fn tool_stream_enabled_by_flag() {
+        let provider =
+            make_provider("generic", "https://api.example.com/v1", None).with_tool_stream(true);
+        let chat_request = ChatRequest {
+            messages: vec![ChatMessage::user("hello")],
+            tools: Some(vec![ToolSpec {
+                name: "shell".to_string(),
+                description: "Run a shell command".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                    },
+                }),
+            }]),
+            model: "test-model".to_string(),
+            allow_image_parts: false,
+            temperature: 0.7,
+            reasoning_effort: None,
+            provider_order: None,
+            provider_allow_fallbacks: None,
+        };
 
-    #[test]
-    fn z_ai_host_enables_tool_stream_for_custom_profiles() {
-        let provider = make_provider("custom", "https://api.z.ai/api/coding/paas/v4", None);
-        assert_eq!(provider.tool_stream_for_tools(true), Some(true));
+        let builder = provider.build_chat_request_raw(&chat_request, false);
+        let http_request = builder.build().unwrap();
+        let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
+
+        assert_eq!(
+            body["tool_stream"],
+            serde_json::json!(true),
+            "tool_stream should be true when flag is enabled"
+        );
     }
 
     #[test]
