@@ -157,30 +157,18 @@ fn ensure_embedder() -> bool {
 
     std::fs::create_dir_all(&models_dir).ok();
 
-    let cache_loaded = if model_path.exists() && tokenizer_path.exists() {
-        match Embedder::load(&model_path, &tokenizer_path) {
-            Ok(emb) => {
-                info!("Embedding model loaded successfully from cache");
-                set_embedder_ready(emb);
-                true
-            }
-            Err(e) => {
-                warn!(reason = %e, "Failed to load cached embedding model");
-                // Don't delete files on the sync-load path — the background retry
-                // loop (spawned below) will handle load failures by deleting and
-                // re-downloading. The sync path is intentionally conservative
-                // because a transient filesystem glitch on every embed() call
-                // should not force a 167 MB re-download.
-                false
-            }
-        }
-    } else {
-        false
-    };
-
-    if cache_loaded {
+    if model_path.exists()
+        && tokenizer_path.exists()
+        && let Some(emb) = try_load_embedder(&model_path, &tokenizer_path, "from cached files")
+    {
+        set_embedder_ready(emb);
         return true;
     }
+    // Don't delete files on the sync-load path — the background retry
+    // loop (spawned below) will handle load failures by deleting and
+    // re-downloading. The sync path is intentionally conservative
+    // because a transient filesystem glitch on every embed() call
+    // should not force a 167 MB re-download.
 
     // Spawn background download
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -333,7 +321,7 @@ async fn download_retry_loop() {
 /// Try to load the embedder from cached files, returning [`Some`] on success.
 ///
 /// `context` is a label included in log messages (e.g. `"from cached files"` or
-/// `"after download"`) to distinguish the two call sites in the retry loop.
+/// `"after download"`) to distinguish the origin of a load attempt.
 ///
 /// This avoids duplicating the `Embedder::load()` call + logging pattern at each site.
 fn try_load_embedder(
