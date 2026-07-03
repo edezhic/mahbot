@@ -737,6 +737,15 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
 #[derive(Copy, Clone)]
 struct VerifierInfo {
     role: Role,
+    /// Human-readable label used in logs and circuit-breaker messages.
+    ///
+    /// Conventions:
+    /// - Prefer Title Case: `"Sanitation"`, `"Diagnostics"`, `"Engineer"`
+    /// - Keep abbreviations uppercase: `"QA"` (not `"Qa"`)
+    /// - Keep lowercase-with-spaces only for natural-language phrases where
+    ///   Title Case would hurt readability: `"dispatch panic"`
+    /// - Plural is acceptable when the label refers to a dispatched group:
+    ///   `"Reviewers"` (3 parallel agents)
     log_label: &'static str,
     success_phase: TicketPhase,
     /// The ticket phase during which this verifier is active — the phase
@@ -1611,7 +1620,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             source: TicketPhase::InSanitation,
             target: TicketPhase::ReadyForDevelopment,
             notify: NotifyPolicy::Buffer,
-            log_label: "sanitation_verdict",
+            log_label: "Sanitation",
             verb: "failed",
             pipeline_reservation: Some(true),
         })
@@ -1808,7 +1817,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                     source: TicketPhase::InDiagnostics,
                     target: TicketPhase::ReadyForDevelopment,
                     notify: NotifyPolicy::Buffer,
-                    log_label: "diagnostics_failure",
+                    log_label: "Diagnostics",
                     verb: "failed",
                     pipeline_reservation: Some(true),
                 })
@@ -2112,7 +2121,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         &ticket,
         &ws,
         TicketPhase::Analysis,
-        "Analysts",
+        "Analyst",
         Role::Analyst,
         &message,
         &extraction_prompt,
