@@ -526,11 +526,10 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 in_code_block = false;
                 let escaped = escape_html(code_buf.trim_end_matches('\n'));
                 let _ = writeln!(out, "<pre><code>{escaped}</code></pre>");
-                code_buf.clear();
             } else {
                 in_code_block = true;
-                code_buf.clear();
             }
+            code_buf.clear();
             continue;
         }
 

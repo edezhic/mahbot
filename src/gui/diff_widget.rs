@@ -534,13 +534,12 @@ where
                     state.mouse_held = true;
                     state.sel_anchor = Some(byte);
                     state.sel_cursor = Some(byte);
-                    shell.request_redraw();
                 } else {
                     state.mouse_held = false;
                     state.sel_anchor = None;
                     state.sel_cursor = None;
-                    shell.request_redraw();
                 }
+                shell.request_redraw();
             }
 
             Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {

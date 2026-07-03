@@ -322,10 +322,8 @@ impl BrowserTool {
                 if by == "nth" {
                     let idx = index.map_or_else(|| "0".into(), |i| i.to_string());
                     args.push(idx);
-                    args.push(value.clone());
-                } else {
-                    args.push(value.clone());
                 }
+                args.push(value.clone());
                 args.push(action.clone());
                 if let Some(t) = text {
                     args.push(t.clone());

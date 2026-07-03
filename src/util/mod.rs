@@ -564,11 +564,10 @@ fn unescape_c_style(input: &str) -> Option<String> {
                     return None;
                 }
             }
-            i += 1;
         } else {
             result.push(bytes[i] as char);
-            i += 1;
         }
+        i += 1;
     }
 
     Some(result)

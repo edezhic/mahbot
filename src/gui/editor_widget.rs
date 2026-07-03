@@ -2619,17 +2619,14 @@ where
                     } else {
                         shell.publish(EditorAction::MoveTo { line, col });
                     }
-
-                    // Request redraw to keep the cursor blinking.
-                    shell.request_redraw();
                 } else {
                     state.mouse_held = false;
                     // Gutter/padding click — clear double-click tracking.
                     state.last_click_time = None;
                     state.last_click_pos = None;
-                    // Keep blinking after gutter click too.
-                    shell.request_redraw();
                 }
+                // Request redraw to keep the cursor blinking.
+                shell.request_redraw();
             }
 
             // ── Mouse button release: end selection drag ────────────

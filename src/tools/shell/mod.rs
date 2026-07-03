@@ -1662,13 +1662,12 @@ fn collapse_consecutive_lines(input: &str) -> String {
         if count >= THRESHOLD {
             push_line(&mut result, current);
             let _ = write!(result, "\n[repeated {count} times]");
-            i += count;
         } else {
             for _ in 0..count {
                 push_line(&mut result, current);
             }
-            i += count;
         }
+        i += count;
     }
     result
 }
