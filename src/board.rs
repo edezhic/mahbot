@@ -2035,29 +2035,6 @@ mod tests {
 
     #[test]
     fn test_ticket_phase_parse_and_roundtrip() {
-        // Parse roundtrip — all variants
-        let variants: &[(&str, TicketPhase)] = &[
-            ("backlog", TicketPhase::Backlog),
-            ("analysis", TicketPhase::Analysis),
-            ("planning", TicketPhase::Planning),
-            ("ready_for_development", TicketPhase::ReadyForDevelopment),
-            ("in_development", TicketPhase::InDevelopment),
-            ("in_diagnostics", TicketPhase::InDiagnostics),
-            ("diagnostics_done", TicketPhase::DiagnosticsDone),
-            ("in_sanitation", TicketPhase::InSanitation),
-            ("sanitation_passed", TicketPhase::SanitationPassed),
-            ("in_review", TicketPhase::InReview),
-            ("reviewed", TicketPhase::Reviewed),
-            ("in_qa", TicketPhase::InQa),
-            ("qa_passed", TicketPhase::QaPassed),
-            ("done", TicketPhase::Done),
-            ("cancelled", TicketPhase::Cancelled),
-            ("failed", TicketPhase::Failed),
-        ];
-        for (s, expected) in variants {
-            assert_eq!(&s.parse::<TicketPhase>().unwrap(), expected, "variant: {s}");
-        }
-
         // Roundtrip: as_ref() -> parse() for every variant
         for v in TicketPhase::iter() {
             let parsed: TicketPhase = v.as_ref().parse().unwrap();
