@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use tracing::warn;
 
-use crate::diff_parse::unquote_c_style;
 use crate::tools::shell::apply_safe_env;
+use crate::util::unquote_c_style;
 
 /// Result of a successful `git commit` — the full hash and line stats.
 #[derive(Debug, Clone)]

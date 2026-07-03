@@ -459,6 +459,121 @@ pub(crate) fn cargo_bin_dir() -> Option<PathBuf> {
     Some(dirs.home_dir().join(".cargo").join("bin"))
 }
 
+/// Strip surrounding double-quotes and unescape C-style escapes.
+///
+/// If the input starts with `"` and ends with `"`, strips the quotes and
+/// calls `unescape_c_style` on the inner content. Otherwise returns the
+/// input as-is (no unescaping needed — git only C-quotes paths that contain
+/// trigger characters).
+///
+/// This is the standard pattern for handling git's quoted path output
+/// (the same approach as git's own `unquote_c_style`).
+#[must_use]
+pub fn unquote_c_style(raw: &str) -> Option<String> {
+    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        unescape_c_style(inner)
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// Unescape C-style escape sequences from a git path name.
+///
+/// Supports the same escapes as git's `unquote_c_style`:
+/// - `\"` → literal `"`, `\\` → literal `\`
+/// - `\t` → tab, `\n` → newline, `\a` → bell, `\b` → backspace
+/// - `\f` → form feed, `\r` → carriage return, `\v` → vertical tab
+/// - `\0`–`\3` followed by 1–3 octal digits → byte value
+///
+/// Malformed escapes cause this function to return `None`:
+/// - `\` at end of string (dangling backslash)
+/// - `\x` or any other unrecognized escape letter
+/// - `\4`–`\7` followed by a digit (git rejects these as invalid octal prefixes)
+///
+/// Non-UTF-8 bytes produced by octal escapes are handled via
+/// `String::from_utf8_lossy` — pragmatic for macOS where non-UTF-8 paths
+/// are filesystem-impossible.
+fn unescape_c_style(input: &str) -> Option<String> {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i: usize = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1; // consume backslash
+            if i >= bytes.len() {
+                tracing::warn!(
+                    input = %input,
+                    "unescape_c_style: dangling backslash at end of string"
+                );
+                return None;
+            }
+            match bytes[i] {
+                b'"' => result.push('"'),
+                b'\\' => result.push('\\'),
+                b't' => result.push('\t'),
+                b'n' => result.push('\n'),
+                b'a' => result.push('\x07'),
+                b'b' => result.push('\x08'),
+                b'f' => result.push('\x0c'),
+                b'r' => result.push('\r'),
+                b'v' => result.push('\x0b'),
+                b'0'..=b'3' => {
+                    // Octal escape: 1–3 octal digits.
+                    let digits_start = i;
+                    i += 1;
+                    let mut digit_count = 1;
+                    while digit_count < 3 && i < bytes.len() && bytes[i].is_ascii_digit() {
+                        if !(b'0'..=b'7').contains(&bytes[i]) {
+                            break;
+                        }
+                        i += 1;
+                        digit_count += 1;
+                    }
+                    let octal_str = std::str::from_utf8(&bytes[digits_start..i]).ok()?;
+                    let Ok(byte_val) = u8::from_str_radix(octal_str, 8) else {
+                        tracing::warn!(
+                            input = %input, octal = %octal_str,
+                            "unescape_c_style: invalid octal escape"
+                        );
+                        return None;
+                    };
+                    result.push_str(&String::from_utf8_lossy(&[byte_val]));
+                    continue; // skip the i += 1 at end of loop
+                }
+                b'4'..=b'7' => {
+                    // \4–\7 are not valid octal prefixes in git's unquote_c_style.
+                    // If followed by a digit, it's a malformed octal attempt.
+                    if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                        tracing::warn!(
+                            input = %input,
+                            ch = %(bytes[i] as char),
+                            "unescape_c_style: invalid octal prefix \\4–\\7 followed by digit"
+                        );
+                        return None;
+                    }
+                    // Otherwise: literal digit (backslash consumed, no special meaning).
+                    result.push(bytes[i] as char);
+                }
+                _ => {
+                    tracing::warn!(
+                        input = %input,
+                        ch = %(bytes[i] as char),
+                        "unescape_c_style: unrecognized escape sequence"
+                    );
+                    return None;
+                }
+            }
+            i += 1;
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_fenced_json;
@@ -875,5 +990,66 @@ mod strip_think_tag_tests {
     #[test]
     fn returns_none_for_whitespace_only() {
         assert_eq!(strip_think_tags("  <think>content</think>  "), None);
+    }
+}
+
+#[cfg(test)]
+mod unescape_c_style_tests {
+    use super::unescape_c_style;
+
+    #[test]
+    fn test_unescape_c_style() {
+        // Cases: (input, expected_output).
+        // Uses Option<&str> — compared via .as_deref() against the
+        // function's Option<String> return type.
+        let cases: &[(&str, Option<&str>)] = &[
+            // ── basic escapes ──
+            (
+                r#"hello\"world\\test\nline\there"#,
+                Some("hello\"world\\test\nline\there"),
+            ),
+            // Bell, backspace, formfeed, CR, vertical tab.
+            (r"\a\b\f\r\v", Some("\x07\x08\x0c\r\x0b")),
+            // ── octal escapes, 1–3 digits ──
+            // \0 → NUL (0x00), \1 → SOH (0x01)
+            (r"\0\1", Some("\0\x01")),
+            // \12 → newline (0x0a), \37 → unit separator (0x1f)
+            (r"\12\37", Some("\n\x1f")),
+            // \101 → 'A' (0x41), \377 → 0xff → U+FFFD (from_utf8_lossy replacement)
+            (r"\101\377", Some("A\u{FFFD}")),
+            // Octal stops at non-octal-digit: \12x → newline + 'x'
+            (r"\12x", Some("\nx")),
+            // \18 → \1 (SOH, 0x01) then '8' (8 is not an octal digit)
+            (r"\18", Some("\x018")),
+            // ── no-op cases (no escape sequences) ──
+            ("plain/path.rs", Some("plain/path.rs")),
+            ("", Some("")),
+            // ── error cases (return None) ──
+            // Dangling backslash at end of string.
+            (r"path\", None),
+            // \x looks like a hex escape prefix but git's unquote_c_style rejects it.
+            (r"\x", None),
+            // \q is not a recognized escape sequence.
+            (r"\q", None),
+            // \40 — \4 followed by digit (git rejects as invalid octal prefix).
+            (r"\40", None),
+            // \77 — \7 followed by digit (git rejects as invalid octal prefix).
+            (r"\77", None),
+            // \70 — \7 followed by digit (git rejects as invalid octal prefix).
+            (r"\70", None),
+            // ── literal-digit cases (\4/\7 not followed by digit) ──
+            // \4 at end of string → literal '4'.
+            (r"\4", Some("4")),
+            // \7 followed by non-digit → literal '7' then 'x'.
+            (r"\7x", Some("7x")),
+        ];
+        for (i, (input, expected)) in cases.iter().enumerate() {
+            let result = unescape_c_style(input);
+            assert_eq!(
+                result.as_deref(),
+                *expected,
+                "case {i}: unescape_c_style({input:?})"
+            );
+        }
     }
 }
