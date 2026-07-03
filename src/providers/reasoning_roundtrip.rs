@@ -147,12 +147,11 @@ pub fn coalesce_streamed_reasoning_details(patches: &[Value]) -> Option<Value> {
     (!items.is_empty()).then_some(Value::Array(items))
 }
 
-/// Accumulate a streaming reasoning/reasoning_content delta into an `Option<String>`.
+/// Accumulate a reasoning/reasoning_content delta into an `Option<String>`.
 ///
-/// Both `reasoning` and `reasoning_content` fields in `StreamChunk` arrive as
-/// a series of `Option<String>` deltas that need to be concatenated.  This
-/// helper avoids duplicating the `get_or_insert_with(String::new).push_str()`
-/// pattern for each field.
+/// Both `reasoning` and `reasoning_content` fields arrive as a series of
+/// `Option<String>` deltas that need to be concatenated.  This helper avoids
+/// duplicating the `get_or_insert_with(String::new).push_str()` pattern.
 pub fn push_reasoning_delta(acc: &mut Option<String>, s: Option<String>) {
     if let Some(s) = s {
         acc.get_or_insert_with(String::new).push_str(&s);

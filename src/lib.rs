@@ -46,7 +46,6 @@ pub mod vector;
 pub mod workspace;
 
 use async_trait::async_trait;
-use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -868,22 +867,6 @@ pub struct ChatRequest {
     pub provider_allow_fallbacks: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
-pub struct StreamChunk {
-    pub delta: String,
-    pub reasoning: Option<Reasoning>,
-}
-
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    /// Text delta from the assistant.
-    TextDelta(StreamChunk),
-    /// Structured tool call emitted during streaming.
-    ToolCall(ToolCall),
-    /// Stream has completed.
-    Final,
-}
-
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Send a chat request using the model specified in the request.
@@ -892,26 +875,6 @@ pub trait Provider: Send + Sync {
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())
     }
-
-    fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>>;
-}
-
-pub type StreamResult<T> = std::result::Result<T, StreamError>;
-
-/// Structured error for streaming responses.
-#[derive(Debug, thiserror::Error)]
-pub enum StreamError {
-    #[error("HTTP error: {0}")]
-    Http(String),
-
-    #[error("JSON parse error: {0}")]
-    Json(serde_json::Error),
-
-    #[error("Provider error: {0}")]
-    Provider(String),
 }
 
 /// A skill is a user-defined or community-built capability.

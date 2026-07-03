@@ -1,9 +1,8 @@
 use super::Provider;
 use crate::util::error::HttpError;
 use crate::util::http::extract_http_status;
-use crate::{ChatRequest, ChatResponse, StreamEvent, StreamResult};
+use crate::{ChatRequest, ChatResponse};
 use async_trait::async_trait;
-use futures_util::stream;
 use std::time::Duration;
 
 // ── Error Classification ─────────────────────────────────────────────────
@@ -255,24 +254,12 @@ impl Provider for ReliableProvider {
 
         anyhow::bail!("All attempts failed.\n{}", failures.join("\n"))
     }
-
-    /// Stream a chat request. Streaming errors are not retried because
-    /// partial output may have already been delivered to the caller.
-    /// When streaming fails, callers (e.g., `agent::llm_call`) typically
-    /// fall back to [`chat`](Self::chat), which has full retry logic.
-    fn stream_chat(
-        &self,
-        request: ChatRequest,
-    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        self.provider.stream_chat(request)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ChatMessage, ToolSpec};
-    use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -360,21 +347,6 @@ mod tests {
                 tool_calls: self.tool_calls.clone(),
                 ..Default::default()
             })
-        }
-
-        fn stream_chat(
-            &self,
-            _request: ChatRequest,
-        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-            stream::iter(vec![
-                Ok(StreamEvent::ToolCall(crate::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "shell".to_string(),
-                    arguments: serde_json::json!({"command": "date"}),
-                })),
-                Ok(StreamEvent::Final),
-            ])
-            .boxed()
         }
 
         async fn warmup(&self) -> anyhow::Result<()> {
@@ -755,33 +727,5 @@ mod tests {
             1,
             "should not retry tool schema errors"
         );
-    }
-
-    #[tokio::test]
-    async fn stream_chat_works_when_provider_supports_tool_events() {
-        let provider =
-            ReliableProvider::new("primary".into(), Box::new(TestProvider::new("ok")), 0, 1);
-
-        let request = ChatRequest {
-            messages: vec![ChatMessage::user("hello")],
-            tools: Some(vec![ToolSpec {
-                name: "test".into(),
-                description: "A test tool".into(),
-                parameters: serde_json::json!({}),
-            }]),
-            model: "test".to_string(),
-            allow_image_parts: false,
-            temperature: 0.1,
-            reasoning_effort: None,
-            provider_order: None,
-            provider_allow_fallbacks: None,
-        };
-        let mut stream = provider.stream_chat(request);
-        let first = stream.next().await.unwrap().unwrap();
-        if let StreamEvent::ToolCall(tc) = first {
-            assert_eq!(tc.name, "shell");
-        } else {
-            panic!("expected ToolCall event");
-        }
     }
 }

@@ -2,18 +2,15 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
-use crate::providers::compatible_streaming::drain_sse_into_channel;
 use crate::providers::reasoning_roundtrip;
 use crate::providers::{ensure_chat_completions_url, provider_routing_json};
 use crate::util::error::HttpError;
 use crate::util::try_repair_json;
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    MessageRole, Provider, ProviderUsage, Reasoning, StreamError, StreamEvent, StreamResult,
-    ToolCall as ProviderToolCall, ToolSpec,
+    MessageRole, Provider, ProviderUsage, Reasoning, ToolCall as ProviderToolCall, ToolSpec,
 };
 use async_trait::async_trait;
-use futures_util::{StreamExt, stream};
 use reqwest::{
     Client, RequestBuilder,
     header::{HeaderMap, HeaderValue},
@@ -574,12 +571,8 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Build the HTTP request for both synchronous [`Provider::chat`] and streaming [`Provider::stream_chat`] calls.
-    fn build_chat_request_raw(
-        &self,
-        request: &ProviderChatRequest,
-        stream: bool,
-    ) -> RequestBuilder {
+    /// Build the HTTP request for synchronous [`Provider::chat`] calls.
+    fn build_chat_request_raw(&self, request: &ProviderChatRequest) -> RequestBuilder {
         let native =
             Self::convert_messages_for_native(&request.messages, request.allow_image_parts);
         let tool_specs = Self::convert_tool_specs(request.tools.as_deref());
@@ -610,7 +603,7 @@ impl OpenAiCompatibleProvider {
             messages: native,
             temperature: f64::from(request.temperature),
             max_tokens: 32000,
-            stream: Some(stream),
+            stream: None,
             tool_stream: (has_tools && self.tool_stream).then_some(true),
             tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
             tools: tool_specs,
@@ -635,7 +628,7 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     async fn chat(&self, request: ProviderChatRequest) -> anyhow::Result<ProviderChatResponse> {
-        let req_builder = self.build_chat_request_raw(&request, false);
+        let req_builder = self.build_chat_request_raw(&request);
         let model = request.model;
 
         let response = crate::shutdown::race_shutdown(req_builder.send())
@@ -692,45 +685,6 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         Ok(result)
-    }
-
-    fn stream_chat(
-        &self,
-        request: ProviderChatRequest,
-    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        let req_builder = self.build_chat_request_raw(&request, true);
-
-        let req_builder = req_builder.header("Accept", "text/event-stream");
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
-
-        let provider_name = self.name.clone();
-
-        tokio::spawn(async move {
-            let response = match crate::shutdown::race_shutdown(req_builder.send()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
-                    return;
-                }
-                Err(_) => return,
-            };
-
-            if !response.status().is_success() {
-                let http_err = HttpError::from_response(response, &provider_name).await;
-                let _ = tx
-                    .send(Err(StreamError::Provider(http_err.to_string())))
-                    .await;
-                return;
-            }
-
-            drain_sse_into_channel(response, &tx).await;
-        });
-
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
-        })
-        .boxed()
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1219,7 +1173,7 @@ mod tests {
             provider_allow_fallbacks: None,
         };
 
-        let builder = provider.build_chat_request_raw(&chat_request, false);
+        let builder = provider.build_chat_request_raw(&chat_request);
         let http_request = builder.build().unwrap();
         let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
         let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
@@ -1258,7 +1212,7 @@ mod tests {
             provider_allow_fallbacks: None,
         };
 
-        let builder = provider.build_chat_request_raw(&chat_request, false);
+        let builder = provider.build_chat_request_raw(&chat_request);
         let http_request = builder.build().unwrap();
         let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
         let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();

@@ -5,7 +5,6 @@
 //! are supported, wrapped with automatic retry logic.
 
 pub mod compatible;
-pub mod compatible_streaming;
 pub mod reasoning_roundtrip;
 pub mod reliable;
 pub mod transcribe;
@@ -13,9 +12,7 @@ pub mod transcribe;
 use crate::config::{CONFIG, trimmed_or_none};
 use crate::util::UnwrapPoison;
 pub use crate::{ChatMessage, ChatRequest, ChatResponse, Provider};
-use crate::{StreamEvent, StreamResult};
 
-use futures_util::stream;
 use std::sync::{Arc, RwLock};
 
 pub use crate::providers::transcribe::ImageTranscriber;
@@ -231,15 +228,6 @@ pub async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
         .clone()
         .expect("PROVIDER not initialized");
     provider.chat(request).await
-}
-
-pub fn stream_chat(request: ChatRequest) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-    let provider = PROVIDER
-        .read()
-        .unwrap_poison()
-        .clone()
-        .expect("PROVIDER not initialized");
-    provider.stream_chat(request)
 }
 
 /// Create a resilient OpenAI-compatible provider from flat config.
