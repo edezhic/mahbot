@@ -290,7 +290,7 @@ async fn dispatch_notification(
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
-    log_label: &'static str,
+    log_label: &str,
 ) {
     match notify {
         NotifyPolicy::Notify => notify_ticket(ticket, target).await,
@@ -459,10 +459,7 @@ async fn comment_and_transition(
 ///
 /// The `context` string is embedded in the log message to distinguish callers.
 #[must_use]
-async fn resolve_ticket_workspace(
-    ticket: &Ticket,
-    log_label: &'static str,
-) -> Option<crate::Workspace> {
+async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<crate::Workspace> {
     match crate::workspace::get_by_name(&ticket.workspace_name).await {
         Ok(Some(ws)) => Some(ws),
         Ok(None) => {
