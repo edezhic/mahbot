@@ -132,7 +132,7 @@ crate::columns! {
 ///
 /// Note: [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
 /// of these (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) plus Analysis — see its
-/// docs for rationale. The remaining four phases ([`TRANSITORY_HANDOFF_PHASES`]) are transitory
+/// docs for rationale. The remaining four phases (`TRANSITORY_HANDOFF_PHASES`) are transitory
 /// handoff states intentionally excluded from reset. The `tests::test_pipeline_blockers_coverage`
 /// test enforces that every non-transitory pipeline blocker has a corresponding reset transition.
 const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
@@ -153,6 +153,7 @@ const PIPELINE_BLOCKING_STATUSES: &[TicketPhase] = &[
 ///
 /// This is a subset of [`PIPELINE_BLOCKING_STATUSES`]. The relationship is
 /// mechanically verified by `tests::test_pipeline_blockers_coverage`.
+#[cfg(test)]
 const TRANSITORY_HANDOFF_PHASES: &[TicketPhase] = &[
     TicketPhase::DiagnosticsDone,
     TicketPhase::SanitationPassed,
@@ -423,6 +424,7 @@ impl TicketPhase {
     ///
     /// Delegates to `TRANSITORY_HANDOFF_PHASES` so the transitory handoff set can never
     /// accidentally diverge from the definition used in coverage tests.
+    #[cfg(test)]
     #[must_use]
     pub fn is_transitory_handoff(&self) -> bool {
         TRANSITORY_HANDOFF_PHASES.contains(self)
@@ -1384,7 +1386,7 @@ impl BoardStore {
     /// but `Analysis` is intentionally NOT in [`PIPELINE_BLOCKING_STATUSES`] (it's a pre-flight
     /// phase, not a pipeline blocker).
     ///
-    /// Transitory handoff phases (see [`TicketPhase::is_transitory_handoff`]) are pipeline
+    /// Transitory handoff phases (see `TRANSITORY_HANDOFF_PHASES`) are pipeline
     /// blocking but don't need a reset entry — the poller picks them up within seconds
     /// of restart, so no agent session is mid-execution in those states.
     const RESET_TRANSITIONS: &[ResetTransition] = &[
