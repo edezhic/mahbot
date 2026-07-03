@@ -1066,39 +1066,31 @@ mod tests {
     // ── finalize_discovery — auto-unpause invariants ─────────────
 
     #[tokio::test]
-    async fn finalize_discovery_success_gen0_auto_unpauses() {
-        let (store, _tmp) = test_store().await;
-        // Start paused with discovery_generation = 0.
-        insert_direct(&store, "gen0", "/tmp/gen0", true, false, 0).await;
+    async fn finalize_discovery_success_auto_unpauses() {
+        for (suffix, generation) in [("gen0", 0), ("gen1", 1)] {
+            let (store, _tmp) = test_store().await;
+            insert_direct(
+                &store,
+                suffix,
+                &format!("/tmp/{suffix}"),
+                true,
+                false,
+                generation,
+            )
+            .await;
+            finalize_discovery(&store, suffix, generation, true, &[]).await;
 
-        // Act: simulate initial discovery completion (all_ok = true, gen 0).
-        finalize_discovery(&store, "gen0", 0, true, &[]).await;
-
-        let ws = store
-            .get_by_name("gen0")
-            .await
-            .expect("fetch")
-            .expect("exists");
-        assert!(!ws.paused, "Should auto-unpause after initial discovery OK");
-        assert_eq!(ws.status, "ready", "Status should be 'ready'");
-    }
-
-    #[tokio::test]
-    async fn finalize_discovery_success_gen1_auto_unpauses() {
-        let (store, _tmp) = test_store().await;
-        // Start paused with discovery_generation = 1 (rediscovery case).
-        insert_direct(&store, "gen1", "/tmp/gen1", true, false, 1).await;
-
-        // Act: simulate rediscovery completing successfully (generation 1).
-        finalize_discovery(&store, "gen1", 1, true, &[]).await;
-
-        let ws = store
-            .get_by_name("gen1")
-            .await
-            .expect("fetch")
-            .expect("exists");
-        assert!(!ws.paused, "Should auto-unpause on rediscovery (gen > 0)");
-        assert_eq!(ws.status, "ready", "Status should be 'ready'");
+            let ws = store
+                .get_by_name(suffix)
+                .await
+                .expect("fetch")
+                .expect("exists");
+            assert!(
+                !ws.paused,
+                "Should auto-unpause after discovery OK (gen {generation})"
+            );
+            assert_eq!(ws.status, "ready", "Status should be 'ready'");
+        }
     }
 
     #[tokio::test]
