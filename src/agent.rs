@@ -8,7 +8,7 @@ use crate::providers::{chat, stream_chat};
 use crate::session::Session;
 use crate::tools::{
     AskTool, DispatchMode, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
-    normalize_tool_call, sanitize_success_tool_output, unknown_tool_message,
+    normalize_tool_call, sanitize_success_tool_output,
 };
 use crate::util::strip_think_tags;
 use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
@@ -394,7 +394,7 @@ impl Agent {
         // unknown-tool failures from execution errors without string-prefix matching.
         let (outcome, error_reason) = match find_tool(&self.tools, &tool_name) {
             None => {
-                let reason = unknown_tool_message(&tool_name);
+                let reason = format!("Unknown tool: {tool_name}");
                 let duration = start.elapsed();
                 tracing::info!(
                     tool = %tool_name,

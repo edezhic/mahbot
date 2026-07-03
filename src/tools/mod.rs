@@ -268,12 +268,6 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
         .map(Box::as_ref)
 }
 
-/// User-facing reason when no static tool matches `call_name`.
-#[must_use]
-pub fn unknown_tool_message(call_name: &str) -> String {
-    format!("Unknown tool: {call_name}")
-}
-
 /// Save generated media bytes to `workspace/generated/{prefix}_{timestamp}.{ext}`.
 ///
 /// Creates the `generated/` directory if needed, generates a millisecond-precision
