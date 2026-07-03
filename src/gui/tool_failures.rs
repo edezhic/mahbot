@@ -48,11 +48,11 @@ pub struct ToolFailuresState {
 
     // Filters
     /// Role name filter (empty = all roles).
-    pub(crate) role_filter: String,
+    role_filter: String,
     /// Workspace name filter (empty = all workspaces).
-    pub(crate) workspace_filter: String,
+    workspace_filter: String,
     /// Search text filter (empty = no search).
-    pub(crate) search_filter: String,
+    search_filter: String,
 
     /// Debounce state for the search text input.
     debounce: super::common::DebounceState,
