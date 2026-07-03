@@ -620,7 +620,6 @@ impl ConfigReload {
     pub fn role_model(&self, role: Role) -> String {
         if let Some(rc) = self.find_role_config(role)
             && let Some(ref m) = rc.model
-            && !m.is_empty()
         {
             return m.clone();
         }
@@ -636,7 +635,6 @@ impl ConfigReload {
     pub fn role_reasoning_effort(&self, role: Role) -> String {
         if let Some(rc) = self.find_role_config(role)
             && let Some(ref r) = rc.reasoning_effort
-            && !r.is_empty()
         {
             return r.clone();
         }
@@ -775,7 +773,7 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // partial state on restart.
     let tx = store.conn.begin_tx().await?;
     for (key, value) in config.string_fields() {
-        if let Some(v) = value.filter(|v| !v.is_empty()) {
+        if let Some(v) = value {
             ConfigStore::set_kv_tx(&tx, key, v).await?;
         } else {
             ConfigStore::delete_kv_tx(&tx, key).await?;
