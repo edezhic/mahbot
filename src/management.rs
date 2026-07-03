@@ -2537,7 +2537,7 @@ mod tests {
 
         let ticket_id = make_ticket(
             board(),
-            test_ws_named("/tmp/test", "test"),
+            &test_ws_named("/tmp/test", "test"),
             "Test",
             TicketPhase::Backlog,
         )
@@ -2583,7 +2583,7 @@ mod tests {
         // Create ticket A in workspace A — this will trip the circuit breaker.
         let trip_id = make_ticket(
             board(),
-            ws_a.clone(),
+            &ws_a,
             "Trip Ticket",
             TicketPhase::ReadyForDevelopment,
         )
@@ -2592,7 +2592,7 @@ mod tests {
         // Create ticket B in workspace A — this should be moved to Planning when A trips.
         let victim_id = make_ticket(
             board(),
-            ws_a,
+            &ws_a,
             "Victim Ticket",
             TicketPhase::ReadyForDevelopment,
         )
@@ -2601,7 +2601,7 @@ mod tests {
         // Create ticket C in workspace B — this must NOT be moved.
         let other_ws_id = make_ticket(
             board(),
-            ws_b,
+            &ws_b,
             "Other Workspace Ticket",
             TicketPhase::ReadyForDevelopment,
         )
@@ -2667,7 +2667,7 @@ mod tests {
 
         let ticket_id = make_ticket(
             board(),
-            test_ws_named("/tmp/test", "test"),
+            &test_ws_named("/tmp/test", "test"),
             "Test",
             TicketPhase::Backlog,
         )
@@ -2778,7 +2778,7 @@ mod tests {
     ) -> (crate::Workspace, String) {
         init_management_test_stores().await;
         let ws = test_ws_named(ws_path, ws_name);
-        let ticket_id = make_ticket(board(), ws.clone(), title, phase).await;
+        let ticket_id = make_ticket(board(), &ws, title, phase).await;
         (ws, ticket_id)
     }
 
@@ -2790,8 +2790,8 @@ mod tests {
         let ws = setup_db_workspace("drains_buffer").await;
 
         // Two QaPassed tickets in the same workspace
-        let first_id = make_ticket(board(), ws.clone(), "Ticket A", TicketPhase::QaPassed).await;
-        let second_id = make_ticket(board(), ws, "Ticket B", TicketPhase::QaPassed).await;
+        let first_id = make_ticket(board(), &ws, "Ticket A", TicketPhase::QaPassed).await;
+        let second_id = make_ticket(board(), &ws, "Ticket B", TicketPhase::QaPassed).await;
 
         let ticket_a = expect_ticket(board(), &first_id).await;
 
@@ -2890,7 +2890,7 @@ mod tests {
         init_management_test_stores().await;
         for case in &cases {
             let ws = create_test_workspace(case.ws_path, case.ws_suffix).await;
-            let ticket_id = make_ticket(board(), ws, "Test Ticket", TicketPhase::Backlog).await;
+            let ticket_id = make_ticket(board(), &ws, "Test Ticket", TicketPhase::Backlog).await;
             let ticket = expect_ticket(board(), &ticket_id).await;
 
             transition_ticket(&ticket, case.source, case.target, case.policy, None)
@@ -2917,7 +2917,7 @@ mod tests {
     async fn notify_ticket_failed_transition_does_not_panic() {
         let ws = setup_db_workspace("failed_notify_test").await;
 
-        let ticket_id = make_ticket(board(), ws, "Failed Notify Test", TicketPhase::Backlog).await;
+        let ticket_id = make_ticket(board(), &ws, "Failed Notify Test", TicketPhase::Backlog).await;
 
         // Add a comment mimicking the actual failure path
         let _ = board()
@@ -2946,7 +2946,7 @@ mod tests {
         let ws = setup_db_workspace("non_failed_notify_test").await;
 
         let ticket_id =
-            make_ticket(board(), ws, "Non-Failed Notify Test", TicketPhase::Backlog).await;
+            make_ticket(board(), &ws, "Non-Failed Notify Test", TicketPhase::Backlog).await;
 
         let ticket = expect_ticket(board(), &ticket_id).await;
 
@@ -2970,7 +2970,7 @@ mod tests {
         init_management_test_stores().await;
         let ticket_id = make_ticket(
             board(),
-            test_ws_named("/tmp/test", "san_breaker_test"),
+            &test_ws_named("/tmp/test", "san_breaker_test"),
             "Sanitation Breaker Test",
             TicketPhase::InSanitation,
         )
@@ -3191,7 +3191,7 @@ mod tests {
         for case in &cases {
             let ticket_id = make_ticket(
                 board(),
-                test_ws_named("/tmp/test", case.ws_suffix),
+                &test_ws_named("/tmp/test", case.ws_suffix),
                 case.title,
                 case.phase,
             )
@@ -3255,7 +3255,7 @@ mod tests {
         for case in &cases {
             let ticket_id = make_ticket(
                 board(),
-                test_ws_named("/tmp/test", case.ws_suffix),
+                &test_ws_named("/tmp/test", case.ws_suffix),
                 case.title,
                 TicketPhase::InReview,
             )
@@ -3305,7 +3305,7 @@ mod tests {
         init_management_test_stores().await;
         let ticket_id = make_ticket(
             board(),
-            test_ws_named("/tmp/test", "cb_guard"),
+            &test_ws_named("/tmp/test", "cb_guard"),
             "CB Guard",
             TicketPhase::InReview,
         )
@@ -3421,7 +3421,7 @@ mod tests {
         for case in &cases {
             let ticket_id = make_ticket(
                 board(),
-                test_ws_named("/tmp/test", case.ws_suffix),
+                &test_ws_named("/tmp/test", case.ws_suffix),
                 case.title,
                 TicketPhase::Analysis,
             )
@@ -3574,7 +3574,7 @@ mod tests {
 
         // Case 1: pass=true → SanitationPassed
         let ws_pass = test_ws_named("/tmp/test", "sv_pass");
-        let pass_id = make_ticket(board(), ws_pass, "SV Pass", TicketPhase::InSanitation).await;
+        let pass_id = make_ticket(board(), &ws_pass, "SV Pass", TicketPhase::InSanitation).await;
         let ticket_pass = expect_ticket(board(), &pass_id).await;
 
         let pass_verdict = crate::SanitationVerdict {
@@ -3609,7 +3609,7 @@ mod tests {
 
         // Case 2: pass=false → ReadyForDevelopment with pipeline reservation
         let ws_fail = test_ws_named("/tmp/test", "sv_fail");
-        let fail_id = make_ticket(board(), ws_fail, "SV Fail", TicketPhase::InSanitation).await;
+        let fail_id = make_ticket(board(), &ws_fail, "SV Fail", TicketPhase::InSanitation).await;
         let ticket_fail = expect_ticket(board(), &fail_id).await;
 
         let fail_verdict = crate::SanitationVerdict {
@@ -3663,7 +3663,7 @@ mod tests {
 
         let ticket_id = make_ticket(
             board(),
-            ws.clone(),
+            &ws,
             "No Diagnostics Commands",
             TicketPhase::InDiagnostics,
         )
@@ -3734,7 +3734,7 @@ mod tests {
 
         let ticket_id = make_ticket(
             board(),
-            ws.clone(),
+            &ws,
             "Diagnostics Failure Test",
             TicketPhase::InDiagnostics,
         )

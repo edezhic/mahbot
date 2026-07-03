@@ -89,7 +89,7 @@ macro_rules! open_test_store {
 ///
 /// Reduces the common boilerplate:
 /// ```ignore
-/// let id = TicketBuilder::new(&store, ws)
+/// let id = TicketBuilder::new(&store, &ws)
 ///     .title("My Ticket")
 ///     .phase(TicketPhase::Backlog)
 ///     .create()
@@ -98,7 +98,7 @@ macro_rules! open_test_store {
 /// ```
 /// to:
 /// ```ignore
-/// let id = make_ticket(&store, ws, "My Ticket", TicketPhase::Backlog).await;
+/// let id = make_ticket(&store, &ws, "My Ticket", TicketPhase::Backlog).await;
 /// ```
 ///
 /// For tickets that need `.desc()`, `.prereqs()`, `.reporter()`, `.embedding()`,
@@ -110,7 +110,7 @@ macro_rules! open_test_store {
 /// and phase for debugging.
 pub(crate) async fn make_ticket(
     store: &BoardStore,
-    ws: crate::Workspace,
+    ws: &crate::Workspace,
     title: &str,
     phase: TicketPhase,
 ) -> String {
@@ -200,22 +200,22 @@ pub fn assert_superseded_ticket(ticket: &Ticket) {
 /// # Examples
 /// ```ignore
 /// // Simple ticket with defaults
-/// TicketBuilder::new(&store, ws).title("A").create().await?;
+/// TicketBuilder::new(&store, &ws).title("A").create().await?;
 ///
 /// // Custom phase and prerequisites
-/// TicketBuilder::new(&store, ws)
+/// TicketBuilder::new(&store, &ws)
 ///     .title("B")
 ///     .phase(TicketPhase::InDevelopment)
 ///     .prereqs(&[a_id, b_id])
 ///     .create().await?;
 ///
 /// // Supersede an existing ticket
-/// TicketBuilder::new(&store, ws)
+/// TicketBuilder::new(&store, &ws)
 ///     .title("New title")
 ///     .supersede(&old_id).await?;
 ///
 /// // With embedding bytes
-/// TicketBuilder::new(&store, ws)
+/// TicketBuilder::new(&store, &ws)
 ///     .title("Embedded")
 ///     .embedding(&blob)
 ///     .create().await?;
@@ -233,10 +233,10 @@ pub(crate) struct TicketBuilder<'a> {
 
 impl<'a> TicketBuilder<'a> {
     /// Start building a test ticket for `store` in workspace `ws`.
-    pub(crate) fn new(store: &'a BoardStore, ws: crate::Workspace) -> Self {
+    pub(crate) fn new(store: &'a BoardStore, ws: &crate::Workspace) -> Self {
         Self {
             store,
-            ws,
+            ws: ws.clone(),
             title: String::new(),
             desc: "desc".into(),
             phase: TicketPhase::Backlog,

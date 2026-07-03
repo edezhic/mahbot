@@ -148,7 +148,7 @@ mod tests {
         let ws = crate::workspace::test_ws("ws");
         let id = make_ticket(
             &store,
-            ws,
+            &ws,
             "UniqueSearchableTitleXYZ",
             crate::board::TicketPhase::Done,
         )
@@ -169,17 +169,11 @@ mod tests {
     async fn test_format_results_formats_correctly() {
         let (store, _tmp) = open_test_store!(BoardStore, "board");
         let ws = crate::workspace::test_ws("ws");
-        let id_a = make_ticket(
-            &store,
-            ws.clone(),
-            "Alpha ticket",
-            crate::board::TicketPhase::Done,
-        )
-        .await;
+        let id_a = make_ticket(&store, &ws, "Alpha ticket", crate::board::TicketPhase::Done).await;
         store.set_archived(&id_a).await.expect("archive");
         let id_b = make_ticket(
             &store,
-            ws,
+            &ws,
             "Beta ticket",
             crate::board::TicketPhase::Cancelled,
         )

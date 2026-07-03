@@ -386,7 +386,7 @@ mod tests {
         let store = crate::board::store();
         let id = make_ticket(
             store,
-            test_ws("/ws"),
+            &test_ws("/ws"),
             "Test",
             crate::board::TicketPhase::Backlog,
         )
@@ -414,9 +414,9 @@ mod tests {
         let store = crate::board::store();
         let ws = test_ws("/tmp_ws");
 
-        let _id_a = make_ticket(store, ws.clone(), "A", crate::board::TicketPhase::Backlog).await;
-        let id_b = make_ticket(store, ws.clone(), "B", crate::board::TicketPhase::Backlog).await;
-        let id_c = make_ticket(store, ws.clone(), "C", crate::board::TicketPhase::Backlog).await;
+        let _id_a = make_ticket(store, &ws, "A", crate::board::TicketPhase::Backlog).await;
+        let id_b = make_ticket(store, &ws, "B", crate::board::TicketPhase::Backlog).await;
+        let id_c = make_ticket(store, &ws, "C", crate::board::TicketPhase::Backlog).await;
         // Transition C to 'done' and B to 'cancelled'
         store
             .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done, None)
@@ -495,7 +495,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = TicketBuilder::new(store, test_ws("/ws"))
+        let id = TicketBuilder::new(store, &test_ws("/ws"))
             .title("GetTest")
             .desc("get me")
             .create()
@@ -521,7 +521,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = TicketBuilder::new(store, test_ws("/ws"))
+        let id = TicketBuilder::new(store, &test_ws("/ws"))
             .title("CommentTest")
             .desc("add a comment")
             .create()
@@ -551,7 +551,7 @@ mod tests {
         let store = crate::board::store();
         let id = make_ticket(
             store,
-            test_ws("/ws"),
+            &test_ws("/ws"),
             "Test",
             crate::board::TicketPhase::Backlog,
         )
@@ -576,7 +576,7 @@ mod tests {
         let store = crate::board::store();
         let ws = test_ws("/ws");
 
-        let blocking_id = TicketBuilder::new(store, ws.clone())
+        let blocking_id = TicketBuilder::new(store, &ws)
             .title("BlockingGuard")
             .desc("in development")
             .phase(TicketPhase::InDevelopment)
@@ -584,7 +584,7 @@ mod tests {
             .await
             .expect("create");
 
-        let nonblocking_id = TicketBuilder::new(store, ws)
+        let nonblocking_id = TicketBuilder::new(store, &ws)
             .title("NonBlockingGuard")
             .desc("backlog")
             .phase(TicketPhase::Backlog)
@@ -616,7 +616,7 @@ mod tests {
     async fn create_blocking_ticket() -> String {
         crate::util::test::init_test_stores().await;
         let store = crate::board::store();
-        TicketBuilder::new(store, test_ws("/ws"))
+        TicketBuilder::new(store, &test_ws("/ws"))
             .title("BlockMe")
             .desc("in flight")
             .phase(TicketPhase::InDevelopment)
@@ -675,7 +675,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
-        let id = TicketBuilder::new(store, test_ws("/ws"))
+        let id = TicketBuilder::new(store, &test_ws("/ws"))
             .title("NotBlocked")
             .desc("backlog ticket")
             .phase(TicketPhase::Backlog)
