@@ -121,8 +121,10 @@ pub(crate) fn path_contains_wildcard(path: &str) -> bool {
 /// envelope and conditionally adds `"required"` only when the slice is non-empty.
 ///
 /// This eliminates repetitive boilerplate across tool implementations.
-/// Tools with non-standard top-level keys (e.g., `oneOf` in WebSearchTool,
-/// or BrowserTool's own `action_schema` helper) should not use this.
+/// Tools with non-standard top-level keys in their top-level schema
+/// (e.g., `oneOf` in WebSearchTool) should not use this directly;
+/// they may still use it internally as a building block (e.g.,
+/// BrowserTool's `action_schema` calls it for each inner entry).
 #[must_use]
 pub(crate) fn tool_params_schema(
     properties: &serde_json::Value,
