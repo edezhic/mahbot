@@ -83,7 +83,7 @@ impl BroadcastPersistEntry {
 /// Broadcast an agent response to CHAT_BROADCAST for live GUI display and
 /// persist it to chat_history. This is the canonical entry point for all
 /// agent responses — both the non-Manager path
-/// ([`send_channel_reply_with_buttons`]) and the Manager queue consumer
+/// ([`send_channel_reply`]) and the Manager queue consumer
 /// in [`crate::manager_queue`].
 ///
 /// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
@@ -129,19 +129,8 @@ pub async fn write_incoming_to_broadcast(msg: &ChannelMessage) {
     .await;
 }
 
-/// Send a reply through a channel directly.
-pub async fn send_channel_reply(content: String, msg: &ChannelMessage) {
-    send_channel_reply_with_buttons(content, msg, None, None).await;
-}
-
-/// Send a reply through a channel with an inline keyboard. When `buttons` is `Some`,
-/// the reply is rendered with that inline keyboard.
-pub async fn send_channel_reply_with_buttons(
-    content: String,
-    msg: &ChannelMessage,
-    buttons: Option<Vec<serde_json::Value>>,
-    agent_role: Option<String>,
-) {
+/// Send a reply through a channel.
+pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_role: Option<String>) {
     let Some(channel) = crate::channel_registry().get(&msg.source_channel) else {
         tracing::warn!(
             source_channel = %msg.source_channel,
@@ -149,7 +138,7 @@ pub async fn send_channel_reply_with_buttons(
         );
         return;
     };
-    let reply_markup = buttons.map(|b| serde_json::json!({ "inline_keyboard": [b] }));
+    let reply_markup = None;
 
     // ── Broadcast agent response for live GUI display and chat_history ──
     broadcast_and_persist_agent_response(

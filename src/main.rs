@@ -15,8 +15,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use mahbot::channels::{
-    send_channel_reply, send_channel_reply_with_buttons, spawn_scoped_typing_task, stop_typing,
-    write_incoming_to_broadcast,
+    send_channel_reply, spawn_scoped_typing_task, stop_typing, write_incoming_to_broadcast,
 };
 use mahbot::config::CONFIG;
 use mahbot::extraction::{decode_action, decode_callback};
@@ -563,8 +562,9 @@ async fn handle_start_command(msg: &ChannelMessage) {
         workspace: msg.workspace.clone(),
     };
     // Send directly through the channel so the inline_keyboard structure
-    // (rows of buttons) is preserved exactly — send_channel_reply_with_buttons
-    // wraps everything in a single row.
+    // (rows of buttons) is preserved exactly — send_channel_reply does not
+    // support inline keyboards, so this path bypasses it for multi-row
+    // replies like the /start menu.
     if let Some(channel) = mahbot::channel_registry().get(&msg.source_channel) {
         let _ = channel.send(&reply).await;
     }
@@ -666,7 +666,7 @@ async fn handle_action_callback(msg: ChannelMessage) {
             let session_key =
                 build_session_key(&ws.name, &msg.user_name, role, &msg.source_channel);
             let reply = Session::reset(&session_key).await;
-            send_channel_reply(reply, &msg).await;
+            send_channel_reply(reply, &msg, None).await;
         }
         _ => {
             // Always acknowledge callback queries to dismiss the Telegram
@@ -741,7 +741,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
 
     // Populate workspace on the message so downstream broadcasts and
     // chat_history writes carry the correct workspace (non-Manager agent
-    // responses go through send_channel_reply_with_buttons, which reads
+    // responses go through send_channel_reply, which reads
     // msg.workspace for broadcast filtering).
     msg.workspace = ws.name.clone();
 
@@ -816,7 +816,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         return;
     }
 
-    send_channel_reply_with_buttons(response, &msg, None, Some(effective_role.to_string())).await;
+    send_channel_reply(response, &msg, Some(effective_role.to_string())).await;
 
     cancel.cancel();
     stop_typing(typing_handle).await;
