@@ -275,7 +275,7 @@ pub fn create_provider(
     let reliable: Box<dyn Provider> = Box::new(ReliableProvider::new(
         "openrouter".to_string(),
         provider,
-        10,
+        4,
         500,
     ));
     Ok(reliable)
