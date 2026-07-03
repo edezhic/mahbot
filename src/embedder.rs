@@ -655,7 +655,7 @@ impl Embedder {
             .token_to_id("<|end_of_text|>")
             .or_else(|| tokenizer.token_to_id("<|pad|>"))
             .or_else(|| tokenizer.token_to_id("[PAD]"))
-            .map_or(DEFAULT_PAD_ID, |id| id);
+            .unwrap_or(DEFAULT_PAD_ID);
 
         debug!(pad_id, "Discovered pad token ID from tokenizer");
 
