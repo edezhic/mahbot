@@ -213,7 +213,7 @@ async fn is_phase_and_breaker_clear(
     threshold: usize,
     count_fn: impl Fn(&[TicketComment]) -> usize,
     comment_text: impl Fn(usize) -> String,
-    label: &str,
+    log_label: &str,
 ) -> bool {
     if !is_ticket_in_phase(&ticket.id, expected_phase).await {
         return false;
@@ -224,7 +224,7 @@ async fn is_phase_and_breaker_clear(
         threshold,
         count_fn,
         comment_text,
-        label,
+        log_label,
     )
     .await
     {
@@ -250,7 +250,7 @@ async fn is_phase_and_breaker_clear(
 async fn is_phase_and_general_breaker_clear(
     ticket: &Ticket,
     expected_phase: TicketPhase,
-    label: &str,
+    log_label: &str,
 ) -> bool {
     is_phase_and_breaker_clear(
         ticket,
@@ -258,7 +258,7 @@ async fn is_phase_and_general_breaker_clear(
         CIRCUIT_BREAKER_COMMENT_THRESHOLD,
         <[TicketComment]>::len,
         general_breaker_comment,
-        label,
+        log_label,
     )
     .await
 }
@@ -352,7 +352,7 @@ async fn transition_ticket(
 /// Log a warning when a ticket transition fails, using `source` and `target`
 /// phases directly so hardcoded phase-name strings can't drift.
 ///
-/// `context_label` is a human-readable name for the dispatch phase (e.g.
+/// `log_label` is a human-readable name for the dispatch phase (e.g.
 /// `"Engineer"`, `"Sanitation"`, `"Analyst"`). `verb` is the past-tense action
 /// the phase performed — typically `"completed"`, but may be `"failed"` or
 /// `"passed"` depending on context.
@@ -360,14 +360,14 @@ fn warn_transition_failed(
     ticket: &Ticket,
     source: TicketPhase,
     target: TicketPhase,
-    context_label: &str,
+    log_label: &str,
     verb: &str,
     error: &anyhow::Error,
 ) {
     warn!(
         ticket = %ticket.id,
         error = %error,
-        "{context_label} {verb} but transition to {target} failed — ticket stuck in {source}",
+        "{log_label} {verb} but transition to {target} failed — ticket stuck in {source}",
     );
 }
 
@@ -405,14 +405,14 @@ async fn comment_and_transition(
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
-    context_label: &str,
+    log_label: &str,
     verb: &str,
     pipeline_reservation: Option<bool>,
 ) -> bool {
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
         &ticket.id,
-        &format!("{context_label} {verb}"),
+        &format!("{log_label} {verb}"),
         async |tx| {
             BoardStore::add_comment_tx(tx, &ticket.id, role, comment).await?;
             BoardStore::transition_to_tx(
@@ -428,7 +428,7 @@ async fn comment_and_transition(
     )
     .await
     {
-        warn_transition_failed(ticket, source, target, context_label, verb, &e);
+        warn_transition_failed(ticket, source, target, log_label, verb, &e);
         return false;
     }
 
@@ -1136,7 +1136,7 @@ async fn transition_ticket_to_failed(
     ticket: &Ticket,
     source: TicketPhase,
     comment: &str,
-    context_label: &str,
+    log_label: &str,
 ) -> bool {
     comment_and_transition(
         ticket,
@@ -1145,7 +1145,7 @@ async fn transition_ticket_to_failed(
         source,
         TicketPhase::Failed,
         NotifyPolicy::Notify,
-        context_label,
+        log_label,
         "failed",
         None,
     )
@@ -1677,7 +1677,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 ///
 /// This is a thin wrapper around [`comment_and_transition`] that fills in
 /// the shared parameters (`DIAGNOSTICS_ROLE`, source/target phases,
-/// notify policy, and context label), leaving only the caller-specific
+/// notify policy, and log label), leaving only the caller-specific
 /// `comment` text and `verb` string.
 async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
     comment_and_transition(
