@@ -1827,6 +1827,30 @@ mod tests {
     // assertions (contains, not_contains, eq) with a descriptive name
     // so test failures show exactly which scenario broke.
 
+    /// Shared assertion helper: verify that all `contains` strings are present
+    /// and all `not_contains` strings are absent in `result`.
+    fn assert_contains_not_contains(
+        name: &str,
+        result: &str,
+        contains: &[&str],
+        not_contains: &[&str],
+    ) {
+        for &s in contains {
+            assert!(
+                result.contains(s),
+                "[{}] expected contains {s:?}\n  got: {result:?}",
+                name,
+            );
+        }
+        for &s in not_contains {
+            assert!(
+                !result.contains(s),
+                "[{}] expected NOT contains {s:?}\n  got: {result:?}",
+                name,
+            );
+        }
+    }
+
     /// A test case for [`process_shell_output`] with multi-assertion support.
     #[derive(Default)]
     struct ShellOutputCase {
@@ -1877,20 +1901,7 @@ mod tests {
                 case.exit_code,
                 Duration::from_secs_f64(case.elapsed_secs),
             );
-            for &s in case.contains {
-                assert!(
-                    result.contains(s),
-                    "[{}] expected contains {s:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
-            for &s in case.not_contains {
-                assert!(
-                    !result.contains(s),
-                    "[{}] expected NOT contains {s:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
+            assert_contains_not_contains(case.name, &result, case.contains, case.not_contains);
             if let Some(expected) = case.eq {
                 assert_eq!(
                     result.trim(),
@@ -1906,20 +1917,7 @@ mod tests {
     fn check_cargo_test_filter(cases: &[CargoTestFilterCase]) {
         for case in cases {
             let result = filter_cargo_test_output(case.output, case.exit_code);
-            for &s in case.contains {
-                assert!(
-                    result.contains(s),
-                    "[{}] expected contains {s:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
-            for &s in case.not_contains {
-                assert!(
-                    !result.contains(s),
-                    "[{}] expected NOT contains {s:?}\n  got: {result:?}",
-                    case.name,
-                );
-            }
+            assert_contains_not_contains(case.name, &result, case.contains, case.not_contains);
         }
     }
 
@@ -3128,13 +3126,7 @@ mod tests {
                 "[{}] pre.is_some mismatch. pre: {pre:?}",
                 case.name
             );
-            for &s in case.check_contains {
-                assert!(
-                    result.contains(s),
-                    "[{}] expected contains {s:?}\n  got: {result:?}",
-                    case.name
-                );
-            }
+            assert_contains_not_contains(case.name, &result, case.check_contains, &[]);
         }
     }
 
@@ -3322,20 +3314,7 @@ mod tests {
                 case.elapsed,
                 pre_owned.as_deref(),
             );
-            for &s in case.check {
-                assert!(
-                    result.contains(s),
-                    "[{}] expected contains {s:?}\n  got: {result:?}",
-                    case.name
-                );
-            }
-            for &s in case.not_check {
-                assert!(
-                    !result.contains(s),
-                    "[{}] expected NOT contains {s:?}\n  got: {result:?}",
-                    case.name
-                );
-            }
+            assert_contains_not_contains(case.name, &result, case.check, case.not_check);
             if let Some(expected) = case.eq {
                 assert_eq!(result.trim(), expected, "[{}] expected eq", case.name);
             }
