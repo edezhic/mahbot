@@ -2083,17 +2083,17 @@ async fn record_verdict_comments(
 async fn dispatch_parallel_with_guard(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
-    guard_phase: TicketPhase,
+    expected_phase: TicketPhase,
     log_label: &str,
     role: Role,
     prompt: &str,
     extraction_prompt: &str,
 ) -> Option<Vec<ParallelVerdict>> {
-    if !is_phase_and_general_breaker_clear(ticket, guard_phase, log_label).await {
+    if !is_phase_and_general_breaker_clear(ticket, expected_phase, log_label).await {
         return None;
     }
     let results = run_parallel_with_extraction(ticket, ws, role, prompt, extraction_prompt).await;
-    if !is_ticket_in_phase(&ticket.id, guard_phase).await {
+    if !is_ticket_in_phase(&ticket.id, expected_phase).await {
         return None;
     }
     Some(results)
