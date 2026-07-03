@@ -954,21 +954,17 @@ impl Dashboard {
                     Message::UpdateResult,
                 )
             }
-            Message::UpdateResult(result) if self.ready => match result {
-                Ok(_msg) => {
-                    // Success — execute_update() called exit(0), so we
-                    // never actually reach this branch. The window closes
-                    // as the only success signal to the user.
-                    self.updating = false;
-                    Task::none()
-                }
-                Err(err) => {
+            Message::UpdateResult(result) if self.ready => {
+                // execute_update() calls exit(0) on success, so we never
+                // actually reach this branch for the Ok case. The window
+                // closes as the only success signal to the user.
+                if let Err(err) = result {
                     self.updating = false;
                     self.toasts
                         .push(Toast::from_toast_msg(&ToastMessage::Error(err)));
-                    Task::none()
                 }
-            },
+                Task::none()
+            }
             Message::TogglePause if self.ready => {
                 let Some(ws_name) = self.active_workspace_name() else {
                     self.toasts.push(Toast::new(
