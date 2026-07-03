@@ -964,7 +964,7 @@ async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
         };
     }
     // UTF-8 validation for binary detection.
-    let Ok(text) = String::from_utf8(bytes.clone()) else {
+    let Ok(text) = String::from_utf8(bytes) else {
         return EditorMessage::FileLoaded {
             path: full_path,
             r#gen,
