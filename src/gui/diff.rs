@@ -65,18 +65,18 @@ pub(super) fn compute_truncation_index(
     for (idx, file) in diff_files.iter().enumerate() {
         // Apply the same file-selection filter as the rendering functions.
         if let Some(sel) = selected_file {
-            if file.dfile.path != sel {
+            if file.path != sel {
                 continue;
             }
         }
 
         // Binary and too-large files consume no hunk/line capacity.
-        if file.dfile.is_binary || file.dfile.too_large_size.is_some() {
+        if file.is_binary || file.too_large_size.is_some() {
             continue;
         }
 
-        let file_hunks = file.dfile.hunks.len();
-        let file_lines: usize = file.dfile.hunks.iter().map(|h| h.lines.len()).sum();
+        let file_hunks = file.hunks.len();
+        let file_lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
 
         if total_hunks + file_hunks > max_hunks || total_lines + file_lines > max_lines {
             return Some(idx);
@@ -161,6 +161,20 @@ pub struct DiffFile {
     pub add_count: usize,
     /// Count of removed lines across all hunks.
     pub remove_count: usize,
+}
+
+impl std::ops::Deref for DiffFile {
+    type Target = crate::diff_parse::DiffFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dfile
+    }
+}
+
+impl std::ops::DerefMut for DiffFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.dfile
+    }
 }
 
 /// Icon identifier for file headers (avoids widget construction at cache time).
@@ -376,7 +390,7 @@ impl DiffState {
                         }
                         // Preserve file selection across refreshes if the file still exists.
                         if let Some(ref sel) = self.selected_file {
-                            if !files.iter().any(|f| f.dfile.path == *sel) {
+                            if !files.iter().any(|f| f.path == *sel) {
                                 self.selected_file = None;
                             }
                         }
@@ -1086,10 +1100,7 @@ impl DiffState {
         ancestor_mask: u64,
         is_last: bool,
     ) -> Element<'a, DiffMessage> {
-        let file = self
-            .diff_files
-            .iter()
-            .find(|f| f.dfile.path == node.full_path);
+        let file = self.diff_files.iter().find(|f| f.path == node.full_path);
         let is_selected = self.selected_file.as_deref() == Some(&node.full_path);
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
@@ -1100,16 +1111,13 @@ impl DiffState {
 
         // File status icon
         let (icon, icon_color) = if let Some(f) = file {
-            if f.dfile.status == DiffFileStatus::Renamed {
+            if f.status == DiffFileStatus::Renamed {
                 (lucide::arrow_right(), RENAME_COLOR)
-            } else if matches!(
-                f.dfile.status,
-                DiffFileStatus::Added | DiffFileStatus::Untracked
-            ) {
+            } else if matches!(f.status, DiffFileStatus::Added | DiffFileStatus::Untracked) {
                 (lucide::file_plus(), FILE_HEADER_COLOR)
-            } else if f.dfile.status == DiffFileStatus::Deleted {
+            } else if f.status == DiffFileStatus::Deleted {
                 (lucide::file_minus(), FILE_HEADER_COLOR)
-            } else if f.dfile.is_binary {
+            } else if f.is_binary {
                 (lucide::file(), theme::TEXT_MUTED)
             } else {
                 (lucide::file_text(), FILE_HEADER_COLOR)
@@ -1120,7 +1128,7 @@ impl DiffState {
 
         // Line count labels
         let counts: Element<'_, DiffMessage> = if let Some(f) = file {
-            if f.dfile.is_binary {
+            if f.is_binary {
                 text("binary").size(10).color(theme::TEXT_MUTED).into()
             } else if f.add_count > 0 || f.remove_count > 0 {
                 let mut parts: Vec<Element<'_, DiffMessage>> = Vec::new();
@@ -1236,7 +1244,7 @@ impl DiffState {
         for (idx, file) in self.diff_files.iter().enumerate() {
             // File selection filter
             if let Some(ref sel) = self.selected_file {
-                if file.dfile.path != *sel {
+                if file.path != *sel {
                     continue;
                 }
             }
@@ -1250,32 +1258,23 @@ impl DiffState {
             }
 
             // File header
-            let (header_label, header_icon) = if file.dfile.status == DiffFileStatus::Renamed {
+            let (header_label, header_icon) = if file.status == DiffFileStatus::Renamed {
                 (
                     format!(
                         "Rename: {} \u{2192} {}",
-                        file.dfile.old_path.as_deref().unwrap_or("?"),
-                        file.dfile.path
+                        file.old_path.as_deref().unwrap_or("?"),
+                        file.path
                     ),
                     CachedIcon::ArrowRight,
                 )
-            } else if file.dfile.status == DiffFileStatus::Added {
-                (
-                    format!("New file: {}", file.dfile.path),
-                    CachedIcon::FilePlus,
-                )
-            } else if file.dfile.status == DiffFileStatus::Deleted {
-                (
-                    format!("Deleted: {}", file.dfile.path),
-                    CachedIcon::FileMinus,
-                )
-            } else if file.dfile.status == DiffFileStatus::Untracked {
-                (
-                    format!("Untracked: {}", file.dfile.path),
-                    CachedIcon::FilePlus,
-                )
+            } else if file.status == DiffFileStatus::Added {
+                (format!("New file: {}", file.path), CachedIcon::FilePlus)
+            } else if file.status == DiffFileStatus::Deleted {
+                (format!("Deleted: {}", file.path), CachedIcon::FileMinus)
+            } else if file.status == DiffFileStatus::Untracked {
+                (format!("Untracked: {}", file.path), CachedIcon::FilePlus)
             } else {
-                (file.dfile.path.clone(), CachedIcon::FileText)
+                (file.path.clone(), CachedIcon::FileText)
             };
 
             rows.push(
@@ -1299,10 +1298,10 @@ impl DiffState {
             );
 
             // Binary / too-large placeholders
-            if file.dfile.is_binary {
+            if file.is_binary {
                 rows.push(
                     container(
-                        text(format!("Binary file: {}", file.dfile.path))
+                        text(format!("Binary file: {}", file.path))
                             .size(13)
                             .color(theme::TEXT_MUTED),
                     )
@@ -1311,10 +1310,10 @@ impl DiffState {
                 );
                 continue;
             }
-            if let Some(sz) = file.dfile.too_large_size {
+            if let Some(sz) = file.too_large_size {
                 rows.push(
                     container(
-                        text(format!("File too large: {}, {sz} bytes", file.dfile.path))
+                        text(format!("File too large: {}, {sz} bytes", file.path))
                             .size(13)
                             .color(theme::TEXT_MUTED),
                     )
@@ -1601,7 +1600,7 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
     let mut roots: HashMap<String, widgets::TreeNode> = HashMap::new();
 
     for file in files {
-        let path = &file.dfile.path;
+        let path = &file.path;
         let components: Vec<&str> = path.split('/').collect();
         if components.is_empty() {
             continue;

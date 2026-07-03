@@ -626,7 +626,7 @@ pub fn build_file_buffers(
 
     for (idx, file) in diff_files.iter().enumerate() {
         if let Some(sel) = selected_file {
-            if file.dfile.path != *sel {
+            if file.path != *sel {
                 continue;
             }
         }
@@ -641,7 +641,7 @@ pub fn build_file_buffers(
         // File headers, binary, too-large — these are rendered as Iced
         // widgets interleaved with DiffBufferWidgets. We skip buffer
         // construction for binary and too-large files.
-        if file.dfile.is_binary || file.dfile.too_large_size.is_some() {
+        if file.is_binary || file.too_large_size.is_some() {
             continue;
         }
 
@@ -656,7 +656,6 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
     let mut text = String::new();
     // Pre-allocate: rough estimate of 80 bytes per line
     let estimated_lines: usize = file
-        .dfile
         .hunks
         .iter()
         .map(|h| h.lines.len() + 1) // +1 for hunk header
@@ -667,7 +666,7 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
     let mut line_kinds: Vec<Option<DiffLineKind>> = Vec::new();
     let mut line_numbers: Vec<(Option<usize>, Option<usize>)> = Vec::new();
 
-    for hunk in &file.dfile.hunks {
+    for hunk in &file.hunks {
         // Hunk header line
         {
             let start = text.len();
@@ -703,7 +702,7 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
             let content_len = end - content_start;
 
             // Select highlight source based on line kind and file status
-            let (highlights, hl_line_number) = match (line.kind, file.dfile.status) {
+            let (highlights, hl_line_number) = match (line.kind, file.status) {
                 (DiffLineKind::Removed, _) | (DiffLineKind::Context, DiffFileStatus::Deleted) => {
                     (file.old_highlights.as_ref(), line.old_line_number)
                 }
@@ -827,7 +826,7 @@ mod tests {
     #[test]
     fn test_binary_file_skipped() {
         let mut file = make_test_diff_file("binary.bin", vec![], DiffFileStatus::Modified);
-        file.dfile.is_binary = true;
+        file.is_binary = true;
         let buffers = build_file_buffers(&[file], None, None);
         assert!(buffers.is_empty());
     }
@@ -835,7 +834,7 @@ mod tests {
     #[test]
     fn test_too_large_file_skipped() {
         let mut file = make_test_diff_file("large.bin", vec![], DiffFileStatus::Modified);
-        file.dfile.too_large_size = Some(5_000_000);
+        file.too_large_size = Some(5_000_000);
         let buffers = build_file_buffers(&[file], None, None);
         assert!(buffers.is_empty());
     }
