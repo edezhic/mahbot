@@ -638,55 +638,6 @@ Use this tool only for inspection: reading files, listing directories, running c
     }
 }
 
-// ── Shell output processing pipeline ──────────────────────────────────
-//
-// Single dispatch path through the profile system:
-//
-// Phase 1 — process_shell_output (select profile + dispatch):
-//   NOTE: ANSI stripping and 1MB truncation now happen in execute(),
-//   before process_shell_output is called.
-//   1. Extract command segments
-//   2. Select matching profile (or GEN_FALLBACK)
-//   3. Dispatch to apply_profile_pipeline
-//
-// Phase 2 — apply_profile_pipeline (profile-driven stages):
-//   NOTE: stderr is scrubbed at function entry before any stages, so all
-//   paths (early-return and main) consistently receive scrubbed stderr.
-//   Stage numbers below match inline comments in apply_profile_pipeline.
-//   1.  json_preview           — if output is JSON, return a schema preview
-//   2.  short_circuit          — match success patterns (skipped for chained
-//                                commands to preserve later-segment output)
-//   3.  strip lines            — drop lines via regex patterns
-//   4a. collapse_blank_lines    — collapse blank lines first (must precede 4b)
-//   4b. collapse_consecutive    — collapse consecutive identical content lines
-//   5.  max_line_len           — cap individual line length
-//   6.  line_truncation        — head/tail sandwich + max_lines cap
-//   7.  on_empty               — fallback message when all output stripped
-//   8.  output_transform       — custom transform (cargo test state machine,
-//                                ls compact parser, etc.). `standalone_only`
-//                                profiles are excluded by `select_profile` for
-//                                chained commands, falling through to
-//                                GEN_FALLBACK with its truncation defaults.
-//
-// The main pipeline path ends with combine_output + finish_shell_output.
-// Early-return paths (json_preview, short_circuit, on_empty) call combine_output
-// only, since their output is already short or includes its own timing:
-//   combine_output         — merge stderr for non-zero exit; filter stderr
-//                            warnings on success when profile has keep_stderr
-//   finish_shell_output    — append elapsed timing, spill to file for large
-//                            output. Only the main path reaches this stage;
-//                            early-return paths handle their own timing or
-//                            produce output that doesn't need spilling.
-//
-// Output size is controlled by the profile pipeline: head_lines/tail_lines,
-// max_line_len, and max_lines reduce inline content. SPILL_THRESHOLD_BYTES
-// gates stage-6 head/tail and the pre-truncation spill in finish_shell_output,
-// but is not itself a truncation target. finish_shell_output() replaces output
-// >5K with a short spill preview instead of the full content. The default
-// format_output() (5K head+tail truncation) acts as a secondary safety net
-// for any output that still exceeds 5K after all pipeline stages — no custom
-// override needed.
-
 const SPILL_THRESHOLD_BYTES: usize = 5_000;
 
 /// Once-flag for cleaning up old spill files at daemon startup.
@@ -1476,10 +1427,19 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 }
 
 /// Run the full profile-based processing pipeline on pre-processed output.
+///
+/// Upstream processing (`execute()`) handles ANSI stripping and 1 MB truncation.
+/// Stderr is scrubbed at entry so all paths (early-return and main) are consistent.
+///
+/// Early-return stages (JSON preview, short-circuit, on_empty) call
+/// `combine_output` only.  The main path continues through `combine_output` →
+/// `finish_shell_output` (timing, spill-to-file).  The caller's `format_output()`
+/// (5 KB head+tail) provides a final safety net after this function returns.
+///
 /// Stages: JSON preview, short-circuit, line filters, collapse, truncate,
-///         line_truncation, on_empty.
-/// When `is_chained` is true (command has `&&`, `||`, `;`, or `|` segments), short-circuit is
-/// skipped to avoid suppressing output from later segments.
+///         line_truncation, on_empty, output_transform.
+/// When `is_chained` is true (command has `&&`, `||`, `;`, or `|` segments),
+/// short-circuit is skipped to avoid suppressing output from later segments.
 fn apply_profile_pipeline(
     profile: &Profile,
     output: &str,
