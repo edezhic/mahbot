@@ -244,9 +244,9 @@ impl DiffParser {
             // Metadata lines — currently just skip
         } else if line.starts_with("--- ") || line.starts_with("+++ ") {
             if let Some(ref mut f) = self.current_file {
-                if line.starts_with("--- /dev/null") && f.status != DiffFileStatus::Renamed {
+                if line.starts_with("--- /dev/null") {
                     f.status = DiffFileStatus::Added;
-                } else if line.starts_with("+++ /dev/null") && f.status != DiffFileStatus::Renamed {
+                } else if line.starts_with("+++ /dev/null") {
                     f.status = DiffFileStatus::Deleted;
                 }
             }
@@ -503,6 +503,25 @@ index 0000000..abc123
         assert_eq!(output[0].status, DiffFileStatus::Added);
         assert!(!output[0].hunks[0].lines.is_empty());
         assert_eq!(output[0].hunks[0].lines[0].new_line_number, Some(1));
+    }
+
+    #[test]
+    fn test_deleted_file() {
+        let diff = r#"diff --git a/old.rs b/old.rs
+deleted file mode 100644
+index abc123..0000000
+--- a/old.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-fn hello() {
+-    println!("bye");
+-}
+"#;
+        let output = parse_git_diff(diff);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].status, DiffFileStatus::Deleted);
+        assert!(!output[0].hunks[0].lines.is_empty());
+        assert_eq!(output[0].hunks[0].lines[0].kind, DiffLineKind::Removed);
     }
 
     #[test]
