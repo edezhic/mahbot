@@ -2076,7 +2076,7 @@ async fn dispatch_parallel_with_guard(
 /// trips the comment-count circuit breaker (which may transition the ticket to
 /// Failed for Manager triage). Returns `false` when the caller should abort.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
-    let prompt_key = if ticket.reporter == "maintainer" {
+    let prompt_key = if ticket.reporter == Role::Maintainer.as_str() {
         "analyze/maintainer_ticket.md"
     } else {
         "analyze/manager_ticket.md"
