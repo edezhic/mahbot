@@ -558,7 +558,7 @@ impl BoardStore {
     ///
     /// Uses `json_each()` for exact prerequisite matching (consistent with
     /// [`claim_ticket_in_workspace`](Self::claim_ticket_in_workspace)).
-    async fn rewire_dependents(
+    async fn rewire_dependents_tx(
         tx: &TxGuard<'_>,
         supersede_id: &str,
         new_id: &str,
@@ -729,7 +729,7 @@ impl BoardStore {
 
         Self::insert_ticket_in_tx(&tx, &new_id, params, Some(supersede_id)).await?;
 
-        Self::rewire_dependents(&tx, supersede_id, &new_id, &params.workspace_name).await?;
+        Self::rewire_dependents_tx(&tx, supersede_id, &new_id, &params.workspace_name).await?;
 
         // Cancel agents on the superseded ticket BEFORE the transaction commits.
         // If the process crashes between commit and cancellation, the superseded
