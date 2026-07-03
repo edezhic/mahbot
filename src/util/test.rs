@@ -200,22 +200,22 @@ pub fn assert_superseded_ticket(ticket: &Ticket) {
 /// # Examples
 /// ```ignore
 /// // Simple ticket with defaults
-/// TicketBuilder::new(&store, &ws).title("A").create().await?;
+/// TicketBuilder::new(&store, ws).title("A").create().await?;
 ///
 /// // Custom phase and prerequisites
-/// TicketBuilder::new(&store, &ws)
+/// TicketBuilder::new(&store, ws)
 ///     .title("B")
 ///     .phase(TicketPhase::InDevelopment)
 ///     .prereqs(&[a_id, b_id])
 ///     .create().await?;
 ///
 /// // Supersede an existing ticket
-/// TicketBuilder::new(&store, &ws)
+/// TicketBuilder::new(&store, ws)
 ///     .title("New title")
 ///     .supersede(&old_id).await?;
 ///
 /// // With embedding bytes
-/// TicketBuilder::new(&store, &ws)
+/// TicketBuilder::new(&store, ws)
 ///     .title("Embedded")
 ///     .embedding(&blob)
 ///     .create().await?;
