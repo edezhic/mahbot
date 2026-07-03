@@ -475,8 +475,14 @@ async fn resolve_ticket_workspace(
 }
 
 /// Bounce a ticket back to ReadyForDevelopment with pipeline reservation,
-/// logging success/failure. Used when diagnostics, sanitation, or verifier
-/// review/QA fails and the ticket needs priority re-dispatch.
+/// logging success/failure. Used when a verifier (reviewer/QA) fails and
+/// the ticket needs priority re-dispatch.
+///
+/// Note: This does NOT support atomic comment+transition. The diagnostics
+/// failure path uses `comment_and_transition` (1 comment), sanitation uses an
+/// inline `with_tx` block (2 comments including a system marker). Those paths
+/// have different crash-safety requirements and should not be unified here —
+/// see the callers for their respective patterns.
 async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_label: &str) {
     if let Err(e) = transition_ticket(
         ticket,
