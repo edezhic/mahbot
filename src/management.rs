@@ -2349,7 +2349,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// # Parameters
 ///
 /// * `ticket` — the ticket being evaluated for the circuit breaker.
-/// * `expected_phase` — the phase the ticket must currently be in for the transition
+/// * `source_phase` — the phase the ticket must currently be in for the transition
 ///   to succeed (passed to [`transition_ticket_to_failed`] as the `source` parameter).
 /// * `threshold` — the count at which the breaker trips (using `>` comparison).
 /// * `count_fn` — extracts the count from the fetched comment list. Responsible
@@ -2360,7 +2360,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 #[must_use]
 async fn is_circuit_breaker_tripped(
     ticket: &Ticket,
-    expected_phase: TicketPhase,
+    source_phase: TicketPhase,
     threshold: usize,
     count_fn: impl Fn(&[TicketComment]) -> usize,
     comment_text: impl Fn(usize) -> String,
@@ -2394,7 +2394,7 @@ async fn is_circuit_breaker_tripped(
 
     if transition_ticket_to_failed(
         ticket,
-        expected_phase,
+        source_phase,
         &comment_text(count),
         "Circuit breaker",
     )
