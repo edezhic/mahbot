@@ -371,20 +371,25 @@ fn warn_transition_failed(
     );
 }
 
-/// Write a comment to a ticket, then transition it to a new phase.
+/// Write one or more comments to a ticket, then transition it to a new phase.
 ///
-/// Both the comment write and the phase transition are wrapped in a single
-/// transaction via [`crate::turso::with_tx`]. If either operation fails, the
-/// entire transaction is rolled back — neither the comment nor the transition
-/// takes effect. Returns `true` on success, `false` on failure.
+/// All comments and the phase transition are wrapped in a single transaction
+/// via [`crate::turso::with_tx`]. If any operation fails, the entire
+/// transaction is rolled back — neither the comments nor the transition takes
+/// effect. Returns `true` on success, `false` on failure.
 ///
 /// On success, dispatches a notification after the transaction commits (via
 /// [`dispatch_notification`]).
 ///
-/// This is atomic — there is no crash window between comment and transition
-/// where an orphaned comment could persist.
+/// This is atomic — there is no crash window between comments and transition
+/// where orphaned comments could persist.
 ///
 /// # Correctness
+///
+/// The `comments` slice pairs a role string with the comment text for each
+/// comment to write. All comments and the phase transition are written in a
+/// single database transaction. At least one comment is required; an empty
+/// slice will panic in debug builds.
 ///
 /// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
 /// agents (unlike [`BoardStore::transition_to`] / `execute_and_cancel`).
@@ -400,8 +405,7 @@ fn warn_transition_failed(
 #[allow(clippy::too_many_arguments)]
 async fn comment_and_transition(
     ticket: &Ticket,
-    role: &str,
-    comment: &str,
+    comments: &[(&str, &str)],
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
@@ -409,12 +413,19 @@ async fn comment_and_transition(
     verb: &str,
     pipeline_reservation: Option<bool>,
 ) -> bool {
+    debug_assert!(
+        !comments.is_empty(),
+        "comment_and_transition requires at least one comment"
+    );
+
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
         &ticket.id,
         &format!("{log_label} {verb}"),
         async |tx| {
-            BoardStore::add_comment_tx(tx, &ticket.id, role, comment).await?;
+            for &(role, comment) in comments {
+                BoardStore::add_comment_tx(tx, &ticket.id, role, comment).await?;
+            }
             BoardStore::transition_to_tx(
                 tx,
                 &ticket.id,
@@ -479,10 +490,10 @@ async fn resolve_ticket_workspace(
 /// the ticket needs priority re-dispatch.
 ///
 /// Note: This does NOT support atomic comment+transition. The diagnostics
-/// failure path uses `comment_and_transition` (1 comment), sanitation uses an
-/// inline `with_tx` block (2 comments including a system marker). Those paths
-/// have different crash-safety requirements and should not be unified here —
-/// see the callers for their respective patterns.
+/// failure path uses `comment_and_transition` (1 comment), sanitation uses
+/// `comment_and_transition` with a multi-comment slice (2 comments including
+/// a system marker). Those paths have different crash-safety requirements and
+/// should not be unified here — see the callers for their respective patterns.
 async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_label: &str) {
     if let Err(e) = transition_ticket(
         ticket,
@@ -1086,8 +1097,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 
     comment_and_transition(
         &ticket,
-        Role::Engineer.as_str(),
-        comment_text,
+        &[(Role::Engineer.as_str(), comment_text)],
         TicketPhase::InDevelopment,
         target_phase,
         notify,
@@ -1143,8 +1153,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
     comment_and_transition(
         ticket,
-        SYSTEM_ROLE,
-        comment,
+        &[(SYSTEM_ROLE, comment)],
         source,
         TicketPhase::Done,
         notify_policy,
@@ -1163,8 +1172,7 @@ async fn transition_ticket_to_failed(
 ) -> bool {
     comment_and_transition(
         ticket,
-        SYSTEM_ROLE,
-        comment,
+        &[(SYSTEM_ROLE, comment)],
         source,
         TicketPhase::Failed,
         NotifyPolicy::Notify,
@@ -1561,8 +1569,7 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
         };
         comment_and_transition(
             ticket,
-            Role::Sanitation.as_str(),
-            &comment,
+            &[(Role::Sanitation.as_str(), &comment)],
             TicketPhase::InSanitation,
             TicketPhase::SanitationPassed,
             NotifyPolicy::Buffer,
@@ -1585,47 +1592,22 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             count = verdict.garbage_files.len(),
         );
 
-        // Write both comments and transition atomically so the circuit breaker
-        // always sees the failure marker when a user-facing comment exists, and
-        // there is no crash window between comment and transition.  This matches
-        // the pattern used by comment_and_transition and finalize_done_tx.
-        if let Err(e) = crate::turso::with_tx(
-            &board().conn,
-            &ticket.id,
-            "sanitation failure + bounce",
-            async |tx| {
-                BoardStore::add_comment_tx(tx, &ticket.id, Role::Sanitation.as_str(), &comment)
-                    .await?;
-                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &sys_comment).await?;
-                BoardStore::transition_to_tx(
-                    tx,
-                    &ticket.id,
-                    Some(TicketPhase::InSanitation),
-                    TicketPhase::ReadyForDevelopment,
-                    Some(true),
-                )
-                .await?;
-                Ok(())
-            },
-        )
-        .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to write sanitation failure comments and transition ticket",
-            );
-            return;
-        }
-
-        // Notification fires after the transaction commits so the user always
-        // sees the new phase in the database.
-        dispatch_notification(
+        // Write both comments and transition atomically via
+        // [`comment_and_transition`], which wraps all writes in a single
+        // transaction. This matches the pattern used by all other verdict paths.
+        let comments = [
+            (Role::Sanitation.as_str(), comment.as_str()),
+            (SYSTEM_ROLE, sys_comment.as_str()),
+        ];
+        comment_and_transition(
             ticket,
+            &comments,
             TicketPhase::InSanitation,
             TicketPhase::ReadyForDevelopment,
             NotifyPolicy::Buffer,
             "sanitation_verdict",
+            "failed",
+            Some(true),
         )
         .await;
     }
@@ -1707,8 +1689,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
     comment_and_transition(
         ticket,
-        DIAGNOSTICS_ROLE,
-        comment,
+        &[(DIAGNOSTICS_ROLE, comment)],
         TicketPhase::InDiagnostics,
         TicketPhase::DiagnosticsDone,
         NotifyPolicy::Buffer,
@@ -1803,8 +1784,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 // handles recovery without inflating the circuit breaker counter.
                 if !comment_and_transition(
                     &ticket,
-                    DIAGNOSTICS_ROLE,
-                    &comment,
+                    &[(DIAGNOSTICS_ROLE, &comment)],
                     TicketPhase::InDiagnostics,
                     TicketPhase::ReadyForDevelopment,
                     NotifyPolicy::Buffer,
@@ -2178,8 +2158,7 @@ async fn handle_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
 
     if !comment_and_transition(
         ticket,
-        SYSTEM_ROLE,
-        &summary,
+        &[(SYSTEM_ROLE, &summary)],
         TicketPhase::Analysis,
         TicketPhase::Planning,
         NotifyPolicy::Notify,
