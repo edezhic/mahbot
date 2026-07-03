@@ -3593,65 +3593,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         };
     }
 
-    async fn add_comment_tx_inner(should_commit: bool) {
-        let (store, _tmp, id) = setup().await;
-
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::add_comment_tx(&tx, &id, SYSTEM_ROLE, "transactional comment")
-            .await
-            .expect("add_comment_tx");
-        let label = commit_or_rollback(tx, should_commit).await;
-
-        let comments = store.get_comments(&id).await.expect("get comments");
-        if should_commit {
-            assert_eq!(comments.len(), 1, "({label}) comments.len");
-            assert_eq!(comments[0].role, SYSTEM_ROLE, "({label}) comment role");
-            assert_eq!(
-                comments[0].content, "transactional comment",
-                "({label}) comment content"
-            );
-        } else {
-            assert_eq!(comments.len(), 0, "({label}) comments.len after rollback");
-        }
-    }
-
-    transaction_test!(test_add_comment_tx, add_comment_tx_inner);
-
-    async fn transition_to_tx_inner(should_commit: bool) {
-        let (store, _tmp, id) = setup().await;
-
-        // Start in QaPassed.
-        store
-            .transition_to(&id, None, TicketPhase::QaPassed, None)
-            .await
-            .unwrap();
-
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::transition_to_tx(
-            &tx,
-            &id,
-            Some(TicketPhase::QaPassed),
-            TicketPhase::Done,
-            None,
-        )
-        .await
-        .expect("transition_to_tx");
-        let label = commit_or_rollback(tx, should_commit).await;
-
-        let phase = crate::util::test::expect_ticket_phase(&store, &id).await;
-        if should_commit {
-            assert_eq!(phase, TicketPhase::Done, "({label}) phase");
-        } else {
-            assert_eq!(
-                phase,
-                TicketPhase::QaPassed,
-                "({label}) phase after rollback"
-            );
-        }
-    }
-
-    transaction_test!(test_transition_to_tx, transition_to_tx_inner);
-
     async fn transactional_triple_write_inner(should_commit: bool) {
         // Exercise the full pattern used by commit_and_transition_ticket:
         // all three _tx writes (set_commit_info_tx, transition_to_tx,
