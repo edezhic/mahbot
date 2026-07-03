@@ -998,6 +998,26 @@ struct FileLoadMsg {
     result: Result<FileLoadData, String>,
 }
 
+/// Spawn a file load from disk and return a `Task` that produces
+/// `EditorMessage::FileLoaded` when the data is ready.
+///
+/// This is extracted as a free function because the two callers
+/// (`open_file_in_editor` and `select_file`) have different
+/// generation-bumping strategies but share the same spawn logic.
+fn spawn_file_load(abs_path: String, file_gen: u64) -> Task<EditorMessage> {
+    Task::perform(
+        async move {
+            let msg = load_file_data(abs_path, file_gen).await;
+            EditorMessage::FileLoaded {
+                path: msg.path,
+                r#gen: msg.r#gen,
+                result: msg.result,
+            }
+        },
+        |msg| msg,
+    )
+}
+
 /// Build the `EditorTabRecord` list from the current tab state.
 #[must_use]
 fn build_tab_records(
@@ -2125,17 +2145,7 @@ impl EditorState {
         self.file_generations.insert(file_path.clone(), file_gen);
         self.selected_file = Some(file_path.clone());
 
-        Task::perform(
-            async move {
-                let result = load_file_data(file_path, file_gen).await;
-                EditorMessage::FileLoaded {
-                    path: result.path,
-                    r#gen: result.r#gen,
-                    result: result.result,
-                }
-            },
-            |msg| msg,
-        )
+        spawn_file_load(file_path, file_gen)
     }
 
     /// Remove the tab at `idx`, cleaning up `tab_contents` and adjusting
@@ -3159,17 +3169,7 @@ impl EditorState {
             .unwrap_or(0)
             .wrapping_add(1);
         self.file_generations.insert(abs_path.clone(), file_gen);
-        Task::perform(
-            async move {
-                let msg = load_file_data(abs_path, file_gen).await;
-                EditorMessage::FileLoaded {
-                    path: msg.path,
-                    r#gen: msg.r#gen,
-                    result: msg.result,
-                }
-            },
-            |msg| msg,
-        )
+        spawn_file_load(abs_path, file_gen)
     }
 
     /// Handle an editor action — performs the action, tracks undo state.
