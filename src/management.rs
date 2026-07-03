@@ -2075,12 +2075,12 @@ async fn dispatch_parallel_with_guard(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     guard_phase: TicketPhase,
-    guard_label: &str,
+    log_label: &str,
     role: Role,
     prompt: &str,
     extraction_prompt: &str,
 ) -> Option<Vec<ParallelVerdict>> {
-    if !is_phase_and_general_breaker_clear(ticket, guard_phase, guard_label).await {
+    if !is_phase_and_general_breaker_clear(ticket, guard_phase, log_label).await {
         return None;
     }
     let results = run_parallel_with_extraction(ticket, ws, role, prompt, extraction_prompt).await;
