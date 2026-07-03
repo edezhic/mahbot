@@ -317,6 +317,7 @@ mod tests {
     use super::*;
     use crate::Tool;
     use crate::ToolSpec;
+    use crate::workspace::test_ws_named;
     use tempfile::TempDir;
 
     // ── ToolSpec serde ───────────────────────────────────────────
@@ -480,19 +481,7 @@ mod tests {
     #[tokio::test]
     async fn save_generated_file_creates_file() {
         let tmp = TempDir::new().expect("tempdir");
-        let ws = Workspace {
-            name: "test".into(),
-            path: tmp.path().to_string_lossy().to_string(),
-            status: "ready".into(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            maintenance: false,
-            paused: false,
-            maintainer_debounce_mins: 5,
-            maintainer_last_run_at: None,
-            diagnostics: None,
-            diagnostics_updated_at: None,
-        };
+        let ws = test_ws_named(&tmp.path().to_string_lossy(), "test");
 
         let data = b"hello world";
         let path = save_generated_file(&ws, data, "img", "png")
@@ -522,19 +511,7 @@ mod tests {
     #[tokio::test]
     async fn save_generated_file_creates_directory_if_missing() {
         let tmp = TempDir::new().expect("tempdir");
-        let ws = Workspace {
-            name: "test".into(),
-            path: tmp.path().join("nested").to_string_lossy().to_string(),
-            status: "ready".into(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            maintenance: false,
-            paused: false,
-            maintainer_debounce_mins: 5,
-            maintainer_last_run_at: None,
-            diagnostics: None,
-            diagnostics_updated_at: None,
-        };
+        let ws = test_ws_named(&tmp.path().join("nested").to_string_lossy(), "test");
 
         let data = b"test content";
         let path = save_generated_file(&ws, data, "vid", "mp4")
