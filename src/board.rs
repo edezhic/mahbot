@@ -2766,7 +2766,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                     // Not reachable: NoBlocker is guarded by the enclosing if-let.
                     Scenario::NoBlocker => unreachable!(),
                 };
-                make_ticket(&store, &blocker_target, "Blocker", *phase).await;
+                make_ticket(&store, blocker_target, "Blocker", *phase).await;
             }
 
             // Create a claimable ticket
@@ -2922,7 +2922,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                 }
             };
 
-            let err = TicketBuilder::new(&store, &target_ws)
+            let err = TicketBuilder::new(&store, target_ws)
                 .title("New")
                 .prereqs(&prereqs)
                 .create()
@@ -3438,7 +3438,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                 Scenario::NonExistent | Scenario::CrossWorkspace => vec![],
             };
 
-            let err = TicketBuilder::new(&store, &target_ws)
+            let err = TicketBuilder::new(&store, target_ws)
                 .title("New")
                 .prereqs(&prereqs)
                 .supersede(supersede_id)
