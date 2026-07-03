@@ -207,7 +207,7 @@ pub const DEFAULT_TICKET_PHASE: TicketPhase = TicketPhase::Backlog;
 
 /// Bundled parameters for ticket creation.
 ///
-/// Reduces parameter explosion across [`BoardStore::insert_ticket_in_tx`],
+/// Reduces parameter explosion across [`BoardStore::insert_ticket_tx`],
 /// [`BoardStore::create_ticket`], and [`BoardStore::supersede_and_create`].
 #[derive(Debug, Clone)]
 pub(crate) struct TicketParams {
@@ -533,7 +533,7 @@ impl BoardStore {
     /// Computes the timestamp and serializes prerequisites internally. Does NOT
     /// commit the transaction — the caller is responsible for calling
     /// `tx.commit()` after any additional writes.
-    async fn insert_ticket_in_tx(
+    async fn insert_ticket_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
         params: &TicketParams,
@@ -662,7 +662,7 @@ impl BoardStore {
             .begin_tx_and_validate_prerequisites(&params.workspace_name, &params.prerequisites)
             .await?;
 
-        Self::insert_ticket_in_tx(&tx, &id, params, None).await?;
+        Self::insert_ticket_tx(&tx, &id, params, None).await?;
 
         tx.commit().await?;
         Ok(id)
@@ -738,7 +738,7 @@ impl BoardStore {
             .await?;
         Self::ensure_ticket_found(cancelled_rows, supersede_id, "cancel superseded ticket")?;
 
-        Self::insert_ticket_in_tx(&tx, &new_id, params, Some(supersede_id)).await?;
+        Self::insert_ticket_tx(&tx, &new_id, params, Some(supersede_id)).await?;
 
         Self::rewire_dependents_tx(&tx, supersede_id, &new_id, &params.workspace_name).await?;
 
