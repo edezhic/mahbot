@@ -358,6 +358,26 @@ fn warn_transition_failed(
     );
 }
 
+/// Bundled parameters for [`comment_and_transition`].
+///
+/// Encapsulates all arguments needed to add a comment (and optional extra
+/// comment) to a ticket and atomically transition it between phases. Using
+/// named fields prevents argument-ordering bugs (particularly
+/// [`source`](TransitionParams::source)/[`target`](TransitionParams::target)
+/// swaps) and makes call sites self-documenting.
+#[derive(Debug)]
+struct TransitionParams<'a> {
+    ticket: &'a Ticket,
+    comment: (&'a str, &'a str),
+    extra: Option<(&'a str, &'a str)>,
+    source: TicketPhase,
+    target: TicketPhase,
+    notify: NotifyPolicy,
+    log_label: &'a str,
+    verb: &'a str,
+    pipeline_reservation: Option<bool>,
+}
+
 /// Write one or more comments to a ticket, then transition it to a new phase.
 ///
 /// All comments and the phase transition are wrapped in a single transaction
@@ -390,34 +410,24 @@ fn warn_transition_failed(
 /// `Some(true)` for bounce-back transitions (back to
 /// [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets priority
 /// re-dispatch over fresh tickets, or `None` for all other transitions.
-#[allow(clippy::too_many_arguments)]
-async fn comment_and_transition(
-    ticket: &Ticket,
-    comment: (&str, &str),
-    extra: Option<(&str, &str)>,
-    source: TicketPhase,
-    target: TicketPhase,
-    notify: NotifyPolicy,
-    log_label: &str,
-    verb: &str,
-    pipeline_reservation: Option<bool>,
-) -> bool {
+async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
-        &ticket.id,
-        &format!("{log_label} {verb}"),
+        &params.ticket.id,
+        &format!("{} {}", params.log_label, params.verb),
         async |tx| {
-            let (role, comment_text) = comment;
-            BoardStore::add_comment_tx(tx, &ticket.id, role, comment_text).await?;
-            if let Some((extra_role, extra_comment)) = extra {
-                BoardStore::add_comment_tx(tx, &ticket.id, extra_role, extra_comment).await?;
+            let (role, comment_text) = params.comment;
+            BoardStore::add_comment_tx(tx, &params.ticket.id, role, comment_text).await?;
+            if let Some((extra_role, extra_comment)) = params.extra {
+                BoardStore::add_comment_tx(tx, &params.ticket.id, extra_role, extra_comment)
+                    .await?;
             }
             BoardStore::transition_to_tx(
                 tx,
-                &ticket.id,
-                Some(source),
-                target,
-                pipeline_reservation,
+                &params.ticket.id,
+                Some(params.source),
+                params.target,
+                params.pipeline_reservation,
             )
             .await?;
             Ok(())
@@ -425,13 +435,27 @@ async fn comment_and_transition(
     )
     .await
     {
-        warn_transition_failed(ticket, source, target, log_label, verb, &e);
+        warn_transition_failed(
+            params.ticket,
+            params.source,
+            params.target,
+            params.log_label,
+            params.verb,
+            &e,
+        );
         return false;
     }
 
     // Notification fires after the transaction commits so the user always
     // sees the new phase in the database.
-    dispatch_notification(ticket, source, target, notify, "comment_and_transition").await;
+    dispatch_notification(
+        params.ticket,
+        params.source,
+        params.target,
+        params.notify,
+        "comment_and_transition",
+    )
+    .await;
 
     true
 }
@@ -1078,17 +1102,17 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         _ => "failed",
     };
 
-    comment_and_transition(
-        &ticket,
-        (Role::Engineer.as_str(), comment_text),
-        None,
-        TicketPhase::InDevelopment,
-        target_phase,
+    comment_and_transition(TransitionParams {
+        ticket: &ticket,
+        comment: (Role::Engineer.as_str(), comment_text),
+        extra: None,
+        source: TicketPhase::InDevelopment,
+        target: target_phase,
         notify,
-        "Engineer",
+        log_label: "Engineer",
         verb,
-        None,
-    )
+        pipeline_reservation: None,
+    })
     .await;
 }
 
@@ -1135,17 +1159,17 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
     info!(ticket = %ticket.id, "{comment}");
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-    comment_and_transition(
+    comment_and_transition(TransitionParams {
         ticket,
-        (SYSTEM_ROLE, comment),
-        None,
+        comment: (SYSTEM_ROLE, comment),
+        extra: None,
         source,
-        TicketPhase::Done,
-        notify_policy,
-        source.as_ref(),
-        "passed",
-        None,
-    )
+        target: TicketPhase::Done,
+        notify: notify_policy,
+        log_label: source.as_ref(),
+        verb: "passed",
+        pipeline_reservation: None,
+    })
     .await;
 }
 
@@ -1155,17 +1179,17 @@ async fn transition_ticket_to_failed(
     comment: &str,
     log_label: &str,
 ) -> bool {
-    comment_and_transition(
+    comment_and_transition(TransitionParams {
         ticket,
-        (SYSTEM_ROLE, comment),
-        None,
+        comment: (SYSTEM_ROLE, comment),
+        extra: None,
         source,
-        TicketPhase::Failed,
-        NotifyPolicy::Notify,
+        target: TicketPhase::Failed,
+        notify: NotifyPolicy::Notify,
         log_label,
-        "failed",
-        None,
-    )
+        verb: "failed",
+        pipeline_reservation: None,
+    })
     .await
 }
 
@@ -1539,17 +1563,17 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             "🧹 Sanitation passed{passed_suffix}: {rationale}",
             rationale = verdict.rationale
         );
-        if !comment_and_transition(
+        if !comment_and_transition(TransitionParams {
             ticket,
-            (Role::Sanitation.as_str(), &comment),
-            None,
-            TicketPhase::InSanitation,
-            TicketPhase::SanitationPassed,
-            NotifyPolicy::Buffer,
-            "Sanitation",
-            "passed",
-            None,
-        )
+            comment: (Role::Sanitation.as_str(), &comment),
+            extra: None,
+            source: TicketPhase::InSanitation,
+            target: TicketPhase::SanitationPassed,
+            notify: NotifyPolicy::Buffer,
+            log_label: "Sanitation",
+            verb: "passed",
+            pipeline_reservation: None,
+        })
         .await
         {
             warn!(
@@ -1580,17 +1604,17 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         // Write both comments and transition atomically via
         // [`comment_and_transition`], which wraps all writes in a single
         // transaction. This matches the pattern used by all other verdict paths.
-        if !comment_and_transition(
+        if !comment_and_transition(TransitionParams {
             ticket,
-            (Role::Sanitation.as_str(), comment.as_str()),
-            Some((SYSTEM_ROLE, sys_comment.as_str())),
-            TicketPhase::InSanitation,
-            TicketPhase::ReadyForDevelopment,
-            NotifyPolicy::Buffer,
-            "sanitation_verdict",
-            "failed",
-            Some(true),
-        )
+            comment: (Role::Sanitation.as_str(), comment.as_str()),
+            extra: Some((SYSTEM_ROLE, sys_comment.as_str())),
+            source: TicketPhase::InSanitation,
+            target: TicketPhase::ReadyForDevelopment,
+            notify: NotifyPolicy::Buffer,
+            log_label: "sanitation_verdict",
+            verb: "failed",
+            pipeline_reservation: Some(true),
+        })
         .await
         {
             warn!(
@@ -1681,17 +1705,17 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// notify policy, and log label), leaving only the caller-specific
 /// `comment` text and `verb` string.
 async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
-    comment_and_transition(
+    comment_and_transition(TransitionParams {
         ticket,
-        (DIAGNOSTICS_ROLE, comment),
-        None,
-        TicketPhase::InDiagnostics,
-        TicketPhase::DiagnosticsDone,
-        NotifyPolicy::Buffer,
-        "Diagnostics",
+        comment: (DIAGNOSTICS_ROLE, comment),
+        extra: None,
+        source: TicketPhase::InDiagnostics,
+        target: TicketPhase::DiagnosticsDone,
+        notify: NotifyPolicy::Buffer,
+        log_label: "Diagnostics",
         verb,
-        None,
-    )
+        pipeline_reservation: None,
+    })
     .await;
 }
 
@@ -1777,17 +1801,17 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 // the comment nor the transition is persisted — the ticket stays
                 // in InDiagnostics and reset_inflight_tickets on the next startup
                 // handles recovery without inflating the circuit breaker counter.
-                if !comment_and_transition(
-                    &ticket,
-                    (DIAGNOSTICS_ROLE, &comment),
-                    None,
-                    TicketPhase::InDiagnostics,
-                    TicketPhase::ReadyForDevelopment,
-                    NotifyPolicy::Buffer,
-                    "diagnostics_failure",
-                    "failed",
-                    Some(true),
-                )
+                if !comment_and_transition(TransitionParams {
+                    ticket: &ticket,
+                    comment: (DIAGNOSTICS_ROLE, &comment),
+                    extra: None,
+                    source: TicketPhase::InDiagnostics,
+                    target: TicketPhase::ReadyForDevelopment,
+                    notify: NotifyPolicy::Buffer,
+                    log_label: "diagnostics_failure",
+                    verb: "failed",
+                    pipeline_reservation: Some(true),
+                })
                 .await
                 {
                     return;
@@ -2152,17 +2176,17 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     // analysts must produce passing verdicts for the ticket to proceed.
     let all_passed = passing_count == PARALLEL_AGENT_COUNT;
 
-    if !comment_and_transition(
+    if !comment_and_transition(TransitionParams {
         ticket,
-        (SYSTEM_ROLE, &summary),
-        None,
-        TicketPhase::Analysis,
-        TicketPhase::Planning,
-        NotifyPolicy::Notify,
-        "Analyst",
-        "completed",
-        None,
-    )
+        comment: (SYSTEM_ROLE, &summary),
+        extra: None,
+        source: TicketPhase::Analysis,
+        target: TicketPhase::Planning,
+        notify: NotifyPolicy::Notify,
+        log_label: "Analyst",
+        verb: "completed",
+        pipeline_reservation: None,
+    })
     .await
     {
         return;
