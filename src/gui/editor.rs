@@ -4414,7 +4414,7 @@ impl EditorState {
             return Task::none();
         }
 
-        match result {
+        let task = match result {
             Ok(text) => {
                 let has_trailing = has_trailing_newline(&text);
                 let line_ending = detect_line_ending(&text);
@@ -4438,26 +4438,21 @@ impl EditorState {
                     tab_data.saved_text_hash = hash_text(&text);
                 }
 
-                // Update stored mtime.
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if let Ok(mtime) = meta.modified() {
-                        self.file_mtimes.insert(path, mtime);
-                    }
-                }
                 Task::none()
             }
-            Err(e) => {
-                // If the file can no longer be read, don't spam.
-                // Update the stored mtime so the next tick matches
-                // and won't retry every 300 ms.
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if let Ok(mtime) = meta.modified() {
-                        self.file_mtimes.insert(path.clone(), mtime);
-                    }
-                }
-                Task::done(EditorMessage::Toast(super::ToastMessage::Warning(e)))
+            Err(e) => Task::done(EditorMessage::Toast(super::ToastMessage::Warning(e))),
+        };
+
+        // Update the stored mtime so the next tick matches
+        // and won't retry every 300 ms — even on failure,
+        // this prevents repeated read attempts.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(mtime) = meta.modified() {
+                self.file_mtimes.insert(path, mtime);
             }
         }
+
+        task
     }
 
     /// Navigate to the next or previous find match in the active tab.
