@@ -327,26 +327,13 @@ async fn transition_ticket(
     notify: NotifyPolicy,
     pipeline_reservation: Option<bool>,
 ) -> anyhow::Result<()> {
-    match board()
+    let result = board()
         .transition_to(&ticket.id, Some(source), target, pipeline_reservation)
-        .await
-    {
-        Ok(()) => {
-            dispatch_notification(ticket, source, target, notify, "transition_ticket").await;
-
-            Ok(())
-        }
-        Err(e) => {
-            debug!(
-                ticket = %ticket.id,
-                source = %source,
-                target = %target,
-                error = %e,
-                "Failed to update ticket status",
-            );
-            Err(e)
-        }
+        .await;
+    if result.is_ok() {
+        dispatch_notification(ticket, source, target, notify, "transition_ticket").await;
     }
+    result
 }
 
 /// Log a warning when a ticket transition fails, using `source` and `target`
