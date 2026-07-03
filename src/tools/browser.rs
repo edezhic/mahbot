@@ -576,7 +576,7 @@ impl Tool for BrowserTool {
                             },
                             "action": {
         "type": "string",
-                "description": "Action to perform: click (click element), fill (clear field then type), type (append text without clearing), hover (hover over element), focus (focus element). For filling text into inputs, use 'fill' with the 'text' parameter. For typing without clearing first, use 'type'. Press Enter after filling to submit forms."
+                "description": "Action to perform: click (click element), fill (clear field then type), type (append text without clearing, uses 'text' parameter), hover (hover over element), focus (focus element), check (check checkbox/radio button), uncheck (uncheck checkbox/radio button), text (get element text content — does NOT use the 'text' param; the 'text' param is only for fill/type). For filling text into inputs, use 'fill' with the 'text' parameter. For typing without clearing first, use 'type'. Press Enter after filling to submit forms."
                             },
                             "text": {
                                 "type": "string",
@@ -630,7 +630,7 @@ impl Tool for BrowserTool {
                 // Give a more helpful message when the LLM uses wrong field names.
                 let hint = match &action_value {
                     Value::Object(map) if map.contains_key("find") => {
-                        " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus (use 'text' param for the text to type/fill)".to_string()
+                        " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus, check, uncheck, text (use 'text' param only for fill/type, not for the 'text' action)".to_string()
                     }
                     _ => String::new(),
                 };
@@ -1056,6 +1056,51 @@ mod tests {
         };
         let args = BrowserTool::build_args(&action).unwrap();
         assert_eq!(args, ["find", "role", "link", "click", "--name", "Docs.rs"]);
+    }
+
+    #[test]
+    fn build_args_for_find_check() {
+        let action = BrowserAction::Find {
+            by: "text".into(),
+            value: "Accept".into(),
+            action: "check".into(),
+            text: None,
+            name: None,
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "text", "Accept", "check"]);
+    }
+
+    #[test]
+    fn build_args_for_find_uncheck() {
+        let action = BrowserAction::Find {
+            by: "text".into(),
+            value: "Subscribe".into(),
+            action: "uncheck".into(),
+            text: None,
+            name: None,
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "text", "Subscribe", "uncheck"]);
+    }
+
+    #[test]
+    fn build_args_for_find_text_action() {
+        let action = BrowserAction::Find {
+            by: "first".into(),
+            value: ".result".into(),
+            action: "text".into(),
+            text: None,
+            name: None,
+            exact: None,
+            index: None,
+        };
+        let args = BrowserTool::build_args(&action).unwrap();
+        assert_eq!(args, ["find", "first", ".result", "text"]);
     }
 
     #[test]

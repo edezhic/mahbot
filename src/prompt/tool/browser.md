@@ -65,7 +65,7 @@ The snapshot shows the *accessible name* (from `aria-label`), not the `placehold
 * `title` — matches HTML `title` attribute (exact match).
 
 ## Valid `find` actions
-`click`, `fill` (clears then types), `type` (appends without clearing), `hover`, `focus`.
+`click` (click element), `fill` (clears then types, uses `text` param), `type` (appends without clearing, uses `text` param), `hover` (hover over element), `focus` (focus element), `check` (check checkbox/radio button), `uncheck` (uncheck checkbox/radio button), `text` (get element text content — does NOT use the `text` param).
 
 ## Keyboard shortcuts
 * `press { key: "Enter" }` — submit forms after filling inputs.
