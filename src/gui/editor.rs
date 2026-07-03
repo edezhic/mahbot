@@ -556,10 +556,6 @@ pub enum EditorMessage {
     RefreshFileTree,
     /// Close all tabs except the given index.
     CloseOtherTabs(usize),
-    /// Result of a tab-save-to-DB operation. The `u64` is a generation counter
-    /// for stale-result prevention — if it doesn't match the current generation,
-    /// the result is discarded.
-    TabsSaved(u64),
     /// Periodic check (every 300 ms) for external file changes on the active tab.
     /// Only fires when a workspace is selected.
     CheckFileChanges,
@@ -1027,29 +1023,25 @@ fn build_tab_records(
 /// Save current tabs to the database for a workspace.
 ///
 /// Checks `gen_counter` for staleness before writing (pre-write guard): if a
-/// newer save has superseded this one, the DB write is skipped.  Also maps to
-/// [`EditorMessage::TabsSaved`] on completion for post-completion stale-result
-/// discarding in the handler (belt-and-suspenders).
+/// newer save has superseded this one, the DB write is skipped.  The write is
+/// fire-and-forget — completion is not tracked since the pre-write guard is the
+/// only staleness protection needed.
 fn save_tabs_to_db(
     workspace_name: String,
     records: Vec<crate::workspace::EditorTabRecord>,
     save_gen: u64,
     gen_counter: Arc<AtomicU64>,
 ) -> Task<EditorMessage> {
-    Task::perform(
-        async move {
-            // Pre-write staleness guard: if a newer save has already been
-            // initiated, skip this write to avoid overwriting newer state.
-            if gen_counter.load(Ordering::Acquire) != save_gen {
-                return;
-            }
-            let store = crate::workspace::store();
-            if let Err(e) = store.save_editor_tabs(&workspace_name, &records).await {
-                tracing::warn!("Failed to save editor tabs: {e}");
-            }
-        },
-        move |()| EditorMessage::TabsSaved(save_gen),
-    )
+    tokio::spawn(async move {
+        if gen_counter.load(Ordering::Acquire) != save_gen {
+            return;
+        }
+        let store = crate::workspace::store();
+        if let Err(e) = store.save_editor_tabs(&workspace_name, &records).await {
+            tracing::warn!("Failed to save editor tabs: {e}");
+        }
+    });
+    Task::none()
 }
 
 /// Save a single file to disk (async).
@@ -1521,12 +1513,6 @@ pub struct EditorState {
     /// widget, keeping the cursor blink alive even if the `RedrawRequested`
     /// chain breaks.
     blink_gen: u64,
-    /// Generation counter for tab-save-to-DB stale-result prevention.
-    /// Incremented before every `save_current_tabs()` call.  The value is
-    /// both stored to `tab_save_counter` (for a pre-write staleness check
-    /// inside the async task) and captured for post-completion checking in
-    /// [`EditorMessage::TabsSaved`].
-    tab_save_generation: u64,
     /// Shared atomic counter used by async save tasks for pre-write staleness
     /// checking.  Written to on every save initiation; read by in-flight tasks
     /// to determine if a newer save has superseded them.
@@ -1605,7 +1591,6 @@ impl EditorState {
             git_ignore_cache: HashSet::new(),
             git_ignore_loading: false,
             blink_gen: 0,
-            tab_save_generation: 0,
             tab_save_counter: Arc::new(AtomicU64::new(0)),
             file_mtimes: HashMap::new(),
             deleted_file_toasted: HashSet::new(),
@@ -1962,21 +1947,20 @@ impl EditorState {
     /// - Tabs haven't been initialized yet this session
     /// - No workspace is selected
     ///
-    /// Uses a generation counter for stale-result prevention: the captured
-    /// generation is mapped to [`EditorMessage::TabsSaved`], and the handler
-    /// discards the result if a newer save superseded it.
-    #[must_use]
+    /// Uses the shared atomic counter for stale-result prevention: the pre-write
+    /// guard inside the async task checks whether a newer save has superseded
+    /// this one before writing.
     pub(crate) fn try_save_current_tabs(&mut self) -> Option<Task<EditorMessage>> {
         if !self.session_initialized {
             return None;
         }
         let workspace_name = self.selected_workspace_name.as_ref()?;
 
-        // Increment generation to invalidate any in-flight stale saves.
-        self.tab_save_generation = self.tab_save_generation.wrapping_add(1);
-        let save_gen = self.tab_save_generation;
-        // Publish to shared counter so in-flight async tasks can detect staleness.
-        self.tab_save_counter.store(save_gen, Ordering::Release);
+        // Increment shared counter to invalidate any in-flight stale saves.
+        let save_gen = self
+            .tab_save_counter
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
 
         let records = build_tab_records(&self.tabs, self.active_tab_index, &self.tab_contents);
         Some(save_tabs_to_db(
@@ -2262,7 +2246,6 @@ impl EditorState {
         self.file_tree.tree_focused = false;
         self.file_tree.tree_focus_index = 0;
         self.pending_enter_dir = None;
-        self.tab_save_generation = 0;
         self.tab_save_counter.store(0, Ordering::Release);
         self.file_mtimes.clear();
         self.deleted_file_toasted.clear();
@@ -2488,8 +2471,6 @@ impl EditorState {
             EditorMessage::GitStatusLoaded(result) => self.git_status_loaded(result),
 
             EditorMessage::GitIgnoredLoaded(result) => self.git_ignored_loaded(result),
-
-            EditorMessage::TabsSaved(saved_gen) => self.tabs_saved(saved_gen),
 
             EditorMessage::CheckFileChanges => self.check_file_changes(),
 
@@ -4342,14 +4323,6 @@ impl EditorState {
                 tracing::warn!("Failed to load git ignore status: {e}");
                 self.git_ignore_cache.clear();
             }
-        }
-        Task::none()
-    }
-
-    /// Handle tabs-saved — discards stale save results.
-    fn tabs_saved(&mut self, saved_gen: u64) -> Task<EditorMessage> {
-        if saved_gen != self.tab_save_generation {
-            return Task::none();
         }
         Task::none()
     }
