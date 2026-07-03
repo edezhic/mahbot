@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tokenizers::Tokenizer;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -160,16 +160,17 @@ fn ensure_embedder() -> bool {
     let cache_loaded = if model_path.exists() && tokenizer_path.exists() {
         match Embedder::load(&model_path, &tokenizer_path) {
             Ok(emb) => {
+                info!("Embedding model loaded successfully from cache");
                 set_embedder_ready(emb);
                 true
             }
             Err(e) => {
                 warn!(reason = %e, "Failed to load cached embedding model");
-                // Don't delete cached files here — let the retry loop attempt
-                // to load again with backoff. The files passed SHA256 verification
-                // at download time, so the failure is likely a code-level issue
-                // (not corruption). Deleting on every transient error would force
-                // an unnecessary ~167 MB re-download with 1-minute minimum delay.
+                // Don't delete files on the sync-load path — the background retry
+                // loop (spawned below) will handle load failures by deleting and
+                // re-downloading. The sync path is intentionally conservative
+                // because a transient filesystem glitch on every embed() call
+                // should not force a 167 MB re-download.
                 false
             }
         }
@@ -227,8 +228,27 @@ pub fn embed(text: &str, is_query: bool) -> Option<Vec<f32>> {
 
 /// Background retry loop that downloads model and tokenizer files.
 ///
-/// Uses exponential backoff (1 min → 2 min → 4 min → … → 30 min max).
-/// Continues indefinitely until both files are downloaded successfully.
+/// Uses exponential backoff (1 min → 2 min → 4 min → … → 30 min max) for
+/// network failures. For cached-file load failures, uses a simpler strategy:
+///
+/// 1. If cached files exist but fail to load → delete them and re-download immediately.
+/// 2. If freshly downloaded (SHA256-verified) files also fail to load → give up
+///    permanently. This almost certainly indicates a code-level issue in
+///    [`Embedder::load()`] that re-downloading won't fix.
+///
+/// # Why delete + re-download?
+///
+/// The root problem this solves: [`maybe_download`] returns `Ok(())` immediately if
+/// the destination file already exists — it skips SHA256 re-verification on existing
+/// files. If cached files become corrupted (e.g., partial write during a crash) or
+/// the model format changes, the old code would loop forever: load fails →
+/// maybe_download says "already have it" → load fails again → … — with no forward
+/// progress.
+///
+/// Deleting the files on the first load failure forces a proper re-download with
+/// SHA256 verification. If the freshly downloaded files also fail to load, the
+/// problem is almost certainly a code-level bug, so the loop gives up and leaves
+/// the global embedder uninitialized (graceful degradation to FTS-only search).
 async fn download_retry_loop() {
     let models_dir =
         models_dir().expect("CONFIG storage_root must be set before download_retry_loop runs");
@@ -247,24 +267,25 @@ async fn download_retry_loop() {
     let mut delay = Duration::from_mins(1);
     let max_delay = Duration::from_mins(30); // 30 minutes
 
-    // Pre-check which files already exist (from a previous partial success).
-    // This avoids re-downloading valid files on retry iterations.
-    let mut model_has = model_dest.exists() && tokenizer_dest.exists();
-
     loop {
-        if model_has {
-            // Both files already present from a previous iteration — try to load.
-            if let Ok(emb) = Embedder::load(&model_dest, &tokenizer_dest) {
-                info!("Embedding model loaded successfully (from previously downloaded files)");
+        // ── Phase 1: Try loading cached files ──
+        // If cached files exist but fail to load, they're likely corrupted.
+        // Delete them and force a fresh download with SHA256 verification.
+        if model_dest.exists() && tokenizer_dest.exists() {
+            if let Some(emb) = try_load_embedder(&model_dest, &tokenizer_dest, "from cached files")
+            {
                 set_embedder_ready(emb);
                 return;
             }
-            // Loading failed — could be a code bug, not necessarily corrupted files.
-            // Don't delete cached files; the backoff will apply and we'll retry.
-            warn!("Failed to load embedding model from cached files, retrying with backoff");
+            // Load failed — almost certainly file corruption. Delete and re-download
+            // immediately (no backoff — we want to recover as fast as possible).
+            warn!("Deleting cached model files after load failure, forcing re-download");
+            let _ = std::fs::remove_file(&model_dest);
+            let _ = std::fs::remove_file(&tokenizer_dest);
+            continue;
         }
 
-        // Download both files concurrently, skipping files that already exist.
+        // ── Phase 2: Download missing files ──
         let (model_result, tokenizer_result) = tokio::join!(
             maybe_download(&client, MODEL_URL, &model_dest, Some(MODEL_SHA256)),
             maybe_download(
@@ -288,27 +309,47 @@ async fn download_retry_loop() {
         }
 
         if model_ok && tokenizer_ok {
-            // Both downloaded successfully — try to load the embedder
-            match Embedder::load(&model_dest, &tokenizer_dest) {
-                Ok(emb) => {
-                    info!("Embedding model loaded successfully after download");
-                    set_embedder_ready(emb);
-                    return;
-                }
-                Err(e) => {
-                    warn!(reason = %e, "Failed to load model after download, retrying with backoff (files preserved)");
-                    // Don't delete cached files — load failure may be a code bug,
-                    // not file corruption. The backoff will apply and we'll retry.
-                }
+            // Files were just downloaded and passed SHA256 verification.
+            // If loading fails despite verified integrity, it's almost certainly
+            // a code-level bug in Embedder::load() — re-downloading won't help.
+            if let Some(emb) = try_load_embedder(&model_dest, &tokenizer_dest, "after download") {
+                set_embedder_ready(emb);
+                return;
             }
+            error!(
+                "Giving up on embedding model: freshly downloaded, SHA256-verified files \
+                 failed to load. This indicates a code-level issue with Embedder::load(). \
+                 The model will remain unavailable for this session (FTS-only fallback)."
+            );
+            return;
         }
 
-        // Track which files exist for the next iteration's pre-check.
-        model_has = model_dest.exists() && tokenizer_dest.exists();
-
-        // Wait with exponential backoff
+        // Wait with exponential backoff before retrying a failed download.
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(max_delay);
+    }
+}
+
+/// Try to load the embedder from cached files, returning [`Some`] on success.
+///
+/// `context` is a label included in log messages (e.g. `"from cached files"` or
+/// `"after download"`) to distinguish the two call sites in the retry loop.
+///
+/// This avoids duplicating the `Embedder::load()` call + logging pattern at each site.
+fn try_load_embedder(
+    model_path: &Path,
+    tokenizer_path: &Path,
+    context: &'static str,
+) -> Option<Embedder> {
+    match Embedder::load(model_path, tokenizer_path) {
+        Ok(emb) => {
+            info!("Embedding model loaded successfully ({context})");
+            Some(emb)
+        }
+        Err(e) => {
+            warn!(reason = %e, context, "Failed to load embedding model");
+            None
+        }
     }
 }
 
@@ -1034,6 +1075,40 @@ mod tests {
         // Verify the global embedder is still empty
         let guard = global_embedder().read().unwrap_poison();
         assert!(guard.is_none(), "global embedder should remain None");
+    }
+
+    #[test]
+    fn test_load_corrupted_files_fails() {
+        // Create corrupted model and tokenizer files in a temp directory
+        // and verify that Embedder::load() correctly reports failure.
+        let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+        let model_path = tmp.path().join(MODEL_FILENAME);
+        let tokenizer_path = tmp.path().join(TOKENIZER_FILENAME);
+
+        // Write invalid data: model file gets random bytes, tokenizer gets
+        // non-JSON text (Tokenizer::from_file will fail early).
+        std::fs::write(&model_path, b"not a valid gguf file").unwrap();
+        std::fs::write(&tokenizer_path, b"not valid json at all").unwrap();
+
+        let result = Embedder::load(&model_path, &tokenizer_path);
+        assert!(
+            result.is_err(),
+            "Embedder::load() should fail on corrupted files"
+        );
+
+        // Verify that the error includes one of the file paths so the user can
+        // locate the problematic file. The assertion checks either path because
+        // the loading order (tokenizer first vs model first) is an implementation
+        // detail that should not make the test brittle.
+        let err = result.err().expect("just checked is_err");
+        let err_msg = format!("{err:#}");
+        let model_path_str = model_path.to_string_lossy();
+        let tokenizer_path_str = tokenizer_path.to_string_lossy();
+        assert!(
+            err_msg.contains(model_path_str.as_ref())
+                || err_msg.contains(tokenizer_path_str.as_ref()),
+            "Error should mention one of the file paths, got: {err_msg}"
+        );
     }
 
     #[test]
