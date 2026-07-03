@@ -1334,9 +1334,11 @@ impl DiffState {
         if truncated {
             rows.push(
                 container(
-                    text("\u{26a0} Diff truncated (max 5000 lines / 100 hunks)")
-                        .size(12)
-                        .color(theme::STATUS_WARNING),
+                    text(format!(
+                        "\u{26a0} Diff truncated (max {MAX_DIFF_LINES} lines / {MAX_HUNKS} hunks)",
+                    ))
+                    .size(12)
+                    .color(theme::STATUS_WARNING),
                 )
                 .padding([8, 12])
                 .into(),
