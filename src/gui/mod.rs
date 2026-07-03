@@ -237,6 +237,53 @@ pub enum Message {
     CloseDiffModal,
 }
 
+// ── Message introspection helpers ────────────────────────────────
+//
+// These methods let [`Dashboard::update`] intercept Toast and
+// LinkClicked messages before dispatching to page handlers,
+// consolidating what would otherwise be per-page boilerplate.
+
+impl Message {
+    /// Returns a reference to the inner [`ToastMessage`] if this message wraps one.
+    pub(crate) fn as_toast(&self) -> Option<&ToastMessage> {
+        match self {
+            Message::Home(home::HomeMessage::Toast(tm))
+            | Message::Logs(
+                logs::LogMessage::Toast(tm)
+                | logs::LogMessage::ToolFailures(ToolFailuresMessage::Toast(tm)),
+            )
+            | Message::Board(board::BoardMessage::Toast(tm))
+            | Message::DiffModal(diff::DiffMessage::Toast(tm))
+            | Message::Git(git::GitMessage::Toast(tm))
+            | Message::Editor(editor::EditorMessage::Toast(tm))
+            | Message::Settings(
+                settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))
+                | settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(tm)),
+            ) => Some(tm),
+            _ => None,
+        }
+    }
+
+    /// Returns the URL string if this message wraps a `LinkClicked`.
+    ///
+    /// # Design note
+    ///
+    /// [`HomeMessage::LinkClicked`] is deliberately **not** included here
+    /// because `home.rs` handles its own inline context links internally
+    /// (see `HomeState::update`).  Do not add it without understanding
+    /// the Home page's self-handling logic.
+    pub(crate) fn as_link_url(&self) -> Option<&str> {
+        match self {
+            Message::Board(board::BoardMessage::LinkClicked(url))
+            | Message::Sessions(sessions::SessionsMessage::LinkClicked(url))
+            | Message::Settings(settings::SettingsMessage::WorkspaceMsg(
+                workspaces::WorkspacesMessage::LinkClicked(url),
+            )) => Some(url.as_str()),
+            _ => None,
+        }
+    }
+}
+
 // ── Keyboard modifier helper ─────────────────────────────────────
 
 /// Platform-aware keyboard modifier state computed from a
@@ -500,45 +547,17 @@ impl Dashboard {
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // ── Centralized Toast and LinkClicked interception ──────────
-        // These are handled at the Dashboard level before dispatching
-        // to page handlers, eliminating repeated per-page intercept
-        // blocks (~50 lines of boilerplate).
+        // Intercepted at the Dashboard level (before page dispatch)
+        // so page handlers only need a Task::none() arm for match exhaustiveness.
+        // HomeMessage::LinkClicked is handled by Home itself — see
+        // as_link_url() for details.
         if self.ready {
-            // Toast: push to dashboard toast stack and return early.
-            // All page-level handlers return Task::none() for Toast
-            // variants, so skipping them is safe.
-            if let Message::Home(home::HomeMessage::Toast(ref tm))
-            | Message::Logs(
-                logs::LogMessage::Toast(ref tm)
-                | logs::LogMessage::ToolFailures(ToolFailuresMessage::Toast(ref tm)),
-            )
-            | Message::Board(board::BoardMessage::Toast(ref tm))
-            | Message::DiffModal(diff::DiffMessage::Toast(ref tm))
-            | Message::Git(git::GitMessage::Toast(ref tm))
-            | Message::Editor(editor::EditorMessage::Toast(ref tm))
-            | Message::Settings(
-                settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(
-                    ref tm,
-                ))
-                | settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(ref tm)),
-            ) = message
-            {
+            if let Some(tm) = message.as_toast() {
                 self.toasts.push(Toast::from_toast_msg(tm));
                 return Task::none();
             }
 
-            // LinkClicked: open URL in system browser and return early.
-            // All page-level handlers return Task::none() for LinkClicked
-            // variants.
-            // HomeMessage::LinkClicked is deliberately NOT intercepted
-            // here — home.rs handles its own LinkClicked internally
-            // (inline context links).
-            if let Message::Board(board::BoardMessage::LinkClicked(ref url))
-            | Message::Sessions(sessions::SessionsMessage::LinkClicked(ref url))
-            | Message::Settings(settings::SettingsMessage::WorkspaceMsg(
-                workspaces::WorkspacesMessage::LinkClicked(ref url),
-            )) = message
-            {
+            if let Some(url) = message.as_link_url() {
                 open_url(url);
                 return Task::none();
             }
