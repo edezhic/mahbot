@@ -36,21 +36,18 @@
 
 use tracing::{error, info, warn};
 
-/// Checkpoint all Turso database stores before hard process termination.
+/// Return an iterator over all checkpointable database stores.
 ///
-/// `std::process::exit(0)` bypasses Rust destructors, so Turso WAL connections
-/// are never properly closed. Without this explicit checkpoint, pending WAL
-/// writes are silently lost and `.tshm` coordination files are left inconsistent.
+/// Each item is `(name, Option<&'static Connection>)` where `None` means the
+/// store has not been initialized yet.
 ///
-/// Skips stores that haven't been initialized yet. Logs and swallows per-store
-/// errors to avoid blocking shutdown.
-///
-/// Store names are paired inline with their connection accessors as a single
-/// array literal — the single source of truth for which stores get checkpointed.
-/// The test `all_store_names_appear_in_checkpoint` verifies that every entry
-/// in [`crate::turso::ALL_STORE_NAMES`] has a corresponding entry here.
-pub async fn checkpoint_all_databases() {
-    let stores = [
+/// This is the single source of truth for which stores are checkpointed.
+/// Both [`checkpoint_all_databases`] and the test
+/// `all_store_names_appear_in_checkpoint` derive their data from this
+/// function.
+fn iter_checkpoint_stores()
+-> impl Iterator<Item = (&'static str, Option<&'static crate::turso::Connection>)> {
+    [
         ("board", crate::board::BOARD.get().map(|s| &s.conn)),
         (
             "chat_history",
@@ -68,9 +65,26 @@ pub async fn checkpoint_all_databases() {
             "workspaces",
             crate::workspace::WORKSPACES.get().map(|s| &s.conn),
         ),
-    ];
+    ]
+    .into_iter()
+}
 
-    for (name, conn_opt) in &stores {
+/// Checkpoint all Turso database stores before hard process termination.
+///
+/// `std::process::exit(0)` bypasses Rust destructors, so Turso WAL connections
+/// are never properly closed. Without this explicit checkpoint, pending WAL
+/// writes are silently lost and `.tshm` coordination files are left inconsistent.
+///
+/// Skips stores that haven't been initialized yet. Logs and swallows per-store
+/// errors to avoid blocking shutdown.
+///
+/// The store entries come from [`iter_checkpoint_stores`] — the single source
+/// of truth for which stores get checkpointed. The test
+/// `all_store_names_appear_in_checkpoint` uses the same function to verify
+/// that every entry in [`crate::turso::ALL_STORE_NAMES`] has a corresponding
+/// entry here.
+pub async fn checkpoint_all_databases() {
+    for (name, conn_opt) in iter_checkpoint_stores() {
         let Some(conn) = conn_opt else {
             continue;
         };
@@ -163,8 +177,13 @@ mod tests {
     }
 
     /// Verify that every name in [`crate::turso::ALL_STORE_NAMES`] appears in
-    /// [`checkpoint_all_databases`]'s inline array, and vice-versa (the two
+    /// [`checkpoint_all_databases`]'s store list, and vice-versa (the two
     /// lists are equal as sets).
+    ///
+    /// Instead of maintaining its own hardcoded copy of the store names, this
+    /// test reads from [`iter_checkpoint_stores`] — the same function that
+    /// [`checkpoint_all_databases`] uses — so the store list is never
+    /// duplicated.
     ///
     /// If this test fails, either:
     /// - A store was added to [`crate::turso::ALL_STORE_NAMES`] but forgotten in
@@ -173,28 +192,11 @@ mod tests {
     /// - A store was added to [`checkpoint_all_databases`] but forgotten in
     ///   [`crate::turso::ALL_STORE_NAMES`], meaning it's missing from the
     ///   canonical store list.
-    ///
-    /// # Why duplicate the list here?
-    ///
-    /// The checkpoint function uses inline name-connection pairs for robustness
-    /// (no index-based coupling).  That makes the names inaccessible from
-    /// outside the function body, so this test duplicates them as a safety net.
-    /// If you add or remove a store from either list and this test fails,
-    /// update the other list to match.
     #[test]
     fn all_store_names_appear_in_checkpoint() {
-        // Safety net: duplicated from the inline array in
-        // `checkpoint_all_databases`.  Keep this list in sync.
-        let checkpoint_stores: &[&str] = &[
-            "board",
-            "chat_history",
-            "config",
-            "logs",
-            "sessions",
-            "stats",
-            "users",
-            "workspaces",
-        ];
+        // Names come from the shared iterator — no duplication.
+        let checkpoint_stores: Vec<&'static str> =
+            iter_checkpoint_stores().map(|(name, _)| name).collect();
 
         // Every store in ALL_STORE_NAMES must be checkpointed.
         for name in crate::turso::ALL_STORE_NAMES {
@@ -209,7 +211,7 @@ mod tests {
         // Every checkpointed store must be in ALL_STORE_NAMES (catches
         // stores added to the checkpoint function but not to the canonical
         // list).
-        for name in checkpoint_stores {
+        for name in &checkpoint_stores {
             assert!(
                 crate::turso::ALL_STORE_NAMES.contains(name),
                 "store '{name}' is checkpointed but missing from \
