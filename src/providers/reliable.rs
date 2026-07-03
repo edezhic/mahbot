@@ -31,8 +31,8 @@ impl ErrorClass {
 }
 
 /// Body-text hints that indicate permanent (non-retryable) errors
-/// regardless of HTTP status code — checked by [`classify_by_status_code`]
-/// before status-based classification.
+/// regardless of HTTP status code — checked before status-based
+/// classification.
 const NON_RETRYABLE_HINTS: &[&str] = &[
     "exceeds the context window",
     "exceeds the available context size",
@@ -66,17 +66,37 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
     "error code 1113",
 ];
 
-/// Fallback classification reached when no body-text overrides or recognized
-/// 4xx status code apply. Checks model-not-found patterns, falling through
-/// to a default of retryable.
+/// Classify an error into one of the [`ErrorClass`] variants.
 ///
-/// This function is only called from [`classify_by_status_code`] after all
-/// non-retryable body-text hints have already been checked and returned no
-/// match. It handles the model-not-found composite pattern and other
-/// non-status-code signals.
-fn classify_fallback(lower: &str) -> ErrorClass {
-    // Model not found — composite check to catch variants like
-    // "model 'xyz' is unknown" alongside "model unknown".
+/// The classification cascade is:
+/// 1. **Body-text hints** — `NON_RETRYABLE_HINTS` patterns permanently classify
+///    regardless of status code (context window exceeded, tool schema errors,
+///    auth failures, quota exhaustion).
+/// 2. **4xx status codes** (except 408 Request Timeout and 429 Too Many Requests)
+///    — structured [`HttpError`] downcast or string extraction.
+/// 3. **Model-not-found composite pattern** — "model" combined with
+///    "not found"/"unknown"/"unsupported"/"does not exist".
+/// 4. Default to [`Retryable`](ErrorClass::Retryable).
+fn classify_err(err: &anyhow::Error) -> ErrorClass {
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+
+    // Typed path: extract status from HttpError; string-fallback path for
+    // errors that arrive without a structured wrapper (transport, etc.)
+    let status = err
+        .downcast_ref::<HttpError>()
+        .map(|e| e.status)
+        .or_else(|| extract_http_status(&msg));
+
+    // Body-text hints indicate permanent errors regardless of status code
+    if NON_RETRYABLE_HINTS.iter().any(|h| lower.contains(h)) {
+        return ErrorClass::NonRetryable;
+    }
+    // 4xx codes (except 408 Request Timeout and 429 Too Many Requests)
+    if status.is_some_and(|c| (400..500).contains(&c) && c != 408 && c != 429) {
+        return ErrorClass::NonRetryable;
+    }
+    // Model-not-found composite check
     if lower.contains("model")
         && (lower.contains("not found")
             || lower.contains("unknown")
@@ -86,69 +106,6 @@ fn classify_fallback(lower: &str) -> ErrorClass {
         return ErrorClass::NonRetryable;
     }
     ErrorClass::Retryable
-}
-
-/// Dispatch by HTTP status code using [`is_non_retryable_4xx`].
-///
-/// Body-text hints for permanent (non-retryable) errors are checked **before**
-/// status-based classification — they indicate permanent errors regardless of
-/// HTTP status code (e.g., a 429 with context-window body text is non-retryable,
-/// not a transient rate limit).
-///
-/// Accepts an optional status code parsed from the error:
-/// - `None` → falls through to [`classify_fallback`]
-/// - `Some(4xx)` where [`is_non_retryable_4xx`] returns `true` → [`NonRetryable`](ErrorClass::NonRetryable)
-/// - any other status (408, 429, 5xx, 3xx, etc.) → falls through to [`classify_fallback`]
-#[inline]
-fn classify_by_status_code(status: Option<u16>, lower: &str) -> ErrorClass {
-    // Non-retryable body-text hints are checked before status-based
-    // classification — they indicate permanent errors regardless of
-    // HTTP status code.
-    if NON_RETRYABLE_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::NonRetryable;
-    }
-    if status.is_some_and(is_non_retryable_4xx) {
-        ErrorClass::NonRetryable
-    } else {
-        classify_fallback(lower)
-    }
-}
-
-/// Returns `true` for 4xx status codes that are NOT retryable.
-///
-/// 408 (Request Timeout) and 429 (Too Many Requests) are excluded —
-/// both are transient and retried with appropriate backoff.
-/// Transient 429s are classified as retryable; 429s with
-/// billing/quota body signals remain non-retryable via
-/// body-text checks in [`classify_by_status_code`].
-fn is_non_retryable_4xx(code: u16) -> bool {
-    (400..500).contains(&code) && code != 408 && code != 429
-}
-
-/// Classify an error into one of the [`ErrorClass`] variants.
-///
-/// ## Cascade Order
-/// 1. **Typed path** (downcast to [`HttpError`] succeeds): dispatch on
-///    structured status code via [`classify_by_status_code`] — which checks
-///    non-retryable body-text hints, then 4xx codes other than
-///    408 and 429 as [`NonRetryable`](ErrorClass::NonRetryable), else
-///    [`classify_fallback`]
-/// 2. **String-fallback path** (no structured wrapper): extract HTTP status from
-///    string via [`crate::util::http::extract_http_status`], then dispatch via
-///    [`classify_by_status_code`] — transport errors (timeouts, connection
-///    failures, etc.) are handled by [`classify_fallback`] via string pattern
-///    matching, producing the same [`ErrorClass`] as the removed typed reqwest path
-fn classify_err(err: &anyhow::Error) -> ErrorClass {
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-
-    // ── Typed path: extract from structured HttpError ──
-    if let Some(http_err) = err.downcast_ref::<HttpError>() {
-        return classify_by_status_code(Some(http_err.status), &lower);
-    }
-
-    // ── Fallback: string-parsing path (for all other errors, including transport) ──
-    classify_by_status_code(extract_http_status(&msg), &lower)
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error.
@@ -532,7 +489,7 @@ mod tests {
         };
 
         // 429 transient rate limit → retryable (falls through to
-        // classify_fallback which returns Retryable for non-billing bodies)
+        // model-not-found check, which returns Retryable for non-billing bodies)
         assert!(matches!(
             classify_err(&make_structured(429, "Too Many Requests")),
             ErrorClass::Retryable
@@ -543,7 +500,7 @@ mod tests {
         ));
 
         // 429 with billing/quota body signals → non-retryable
-        // (caught by NON_RETRYABLE_HINTS in classify_by_status_code, not by status code)
+        // (caught by NON_RETRYABLE_HINTS, not by status code)
         assert_eq!(
             classify_err(&make_structured(429, "insufficient balance")),
             ErrorClass::NonRetryable
@@ -590,20 +547,20 @@ mod tests {
             ErrorClass::NonRetryable
         ));
 
-        // Auth patterns in body → NonRetryable (body-text override in classify_by_status_code)
+        // Auth patterns in body → NonRetryable (body-text hint override)
         assert!(matches!(
             classify_err(&make_structured(403, "unauthorized")),
             ErrorClass::NonRetryable
         ));
 
-        // Model not found → NonRetryable (via is_non_retryable_4xx for 404)
+        // Model not found → NonRetryable (via 4xx status check for 404)
         assert!(matches!(
             classify_err(&make_structured(404, "model not found")),
             ErrorClass::NonRetryable
         ));
 
         // ZhipuAI billing error code 1113 → NonRetryable
-        // (caught by NON_RETRYABLE_HINTS in classify_by_status_code)
+        // (caught by NON_RETRYABLE_HINTS)
         assert_eq!(
             classify_err(&make_structured(429, "error code 1113")),
             ErrorClass::NonRetryable
@@ -750,7 +707,7 @@ mod tests {
                 "should detect: {msg}"
             );
         }
-        // Pure 400 without tool-schema keywords → also NonRetryable (via is_non_retryable_4xx)
+        // Pure 400 without tool-schema keywords → also NonRetryable (via 4xx status check)
         assert!(
             matches!(
                 classify_err(&anyhow::anyhow!(
