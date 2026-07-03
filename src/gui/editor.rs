@@ -927,12 +927,12 @@ fn validate_file_content(bytes: &[u8]) -> Result<(), String> {
 
 /// Load a file's contents from disk with detection of indent style, line
 /// ending, and trailing newline.
-async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
+async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
     // Check file size first.
     let metadata = match tokio::fs::metadata(&full_path).await {
         Ok(m) => m,
         Err(e) => {
-            return FileLoadMsg {
+            return EditorMessage::FileLoaded {
                 path: full_path,
                 r#gen,
                 result: Err(format!("Cannot read file metadata: {e}")),
@@ -940,7 +940,7 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
         }
     };
     if metadata.len() > MAX_FILE_SIZE {
-        return FileLoadMsg {
+        return EditorMessage::FileLoaded {
             path: full_path,
             r#gen,
             result: Err(format!(
@@ -953,7 +953,7 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
     let bytes = match tokio::fs::read(&full_path).await {
         Ok(b) => b,
         Err(e) => {
-            return FileLoadMsg {
+            return EditorMessage::FileLoaded {
                 path: full_path,
                 r#gen,
                 result: Err(format!("Cannot read file: {e}")),
@@ -963,7 +963,7 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
 
     // Size and binary content validation.
     if let Err(e) = validate_file_content(&bytes) {
-        return FileLoadMsg {
+        return EditorMessage::FileLoaded {
             path: full_path,
             r#gen,
             result: Err(e),
@@ -971,7 +971,7 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
     }
     // UTF-8 validation for binary detection.
     let Ok(text) = String::from_utf8(bytes.clone()) else {
-        return FileLoadMsg {
+        return EditorMessage::FileLoaded {
             path: full_path,
             r#gen,
             result: Err("Binary file detected (invalid UTF-8)".to_string()),
@@ -984,17 +984,11 @@ async fn load_file_data(full_path: String, r#gen: u64) -> FileLoadMsg {
         line_ending: detect_line_ending(&text),
         text,
     };
-    FileLoadMsg {
+    EditorMessage::FileLoaded {
         path: data.path.clone(),
         r#gen,
         result: Ok(data),
     }
-}
-
-struct FileLoadMsg {
-    path: String,
-    r#gen: u64,
-    result: Result<FileLoadData, String>,
 }
 
 /// Spawn a file load from disk and return a `Task` that produces
@@ -1004,17 +998,7 @@ struct FileLoadMsg {
 /// (`open_file_in_editor` and `select_file`) have different
 /// generation-bumping strategies but share the same spawn logic.
 fn spawn_file_load(abs_path: String, file_gen: u64) -> Task<EditorMessage> {
-    Task::perform(
-        async move {
-            let msg = load_file_data(abs_path, file_gen).await;
-            EditorMessage::FileLoaded {
-                path: msg.path,
-                r#gen: msg.r#gen,
-                result: msg.result,
-            }
-        },
-        |msg| msg,
-    )
+    Task::perform(load_file_data(abs_path, file_gen), |msg| msg)
 }
 
 /// Build the `EditorTabRecord` list from the current tab state.
