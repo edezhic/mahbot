@@ -976,30 +976,24 @@ mod tests {
 
     // ── New function tests ─────────────────────────────────────────────────
 
-    use crate::util::test::env_lock;
+    use crate::util::test::set_env_var;
 
     #[test]
     fn test_resolve_cargo_bin_path_cargo_home() {
-        // SAFETY: Serialized via shared env_lock — no concurrent env access.
-        let _guard = env_lock().lock().unwrap();
-
         // Scenario 1: CARGO_HOME is set to a custom path.
-        // SAFETY: Serialized via shared env_lock — no concurrent env access.
-        unsafe {
-            std::env::set_var("CARGO_HOME", "/custom/cargo");
-        }
-        let path_with = resolve_cargo_bin_path();
-        // SAFETY: Same lock.
-        unsafe {
-            std::env::set_var("CARGO_HOME", "");
-        }
-        let path_empty = resolve_cargo_bin_path();
+        let path_with = {
+            let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
+            resolve_cargo_bin_path()
+        };
 
-        // Restore: remove CARGO_HOME entirely.
-        // SAFETY: Same lock.
-        unsafe {
-            std::env::remove_var("CARGO_HOME");
-        }
+        // Scenario 2: CARGO_HOME is set to empty string (falls through to
+        // UserDirs — see cargo_bin_dir() in src/util/mod.rs).
+        let path_empty = {
+            let _guard = set_env_var("CARGO_HOME", Some(""));
+            resolve_cargo_bin_path()
+        };
+        // Both guards have dropped, restoring CARGO_HOME to its original
+        // state (typically absent).
 
         // With custom CARGO_HOME, should use that path.
         assert!(

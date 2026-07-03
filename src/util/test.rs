@@ -40,6 +40,75 @@ pub fn env_lock() -> &'static std::sync::Mutex<()> {
     ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// RAII guard that restores an environment variable to its original value
+/// on drop, including during a panic (unwind safety).
+///
+/// Created by [`set_env_var`]. Holds the shared [`env_lock()`] for the
+/// entire duration to serialize concurrent env access across tests.
+///
+/// # Panic safety
+///
+/// The `Drop` implementation restores the original value even if the
+/// enclosing scope panics, preventing test-isolation leaks. This is the
+/// key advantage over a closure-based `with_env_var` helper.
+pub struct EnvVarGuard {
+    /// Serializes concurrent env access — held for the guard's entire lifetime.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    key: String,
+    /// Original value captured before mutation. Stored as [`OsString`] to
+    /// preserve arbitrary (non-UTF-8) env var values on restore.
+    original: Option<std::ffi::OsString>,
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: We hold the env_lock, prohibiting concurrent env writes
+        // from other test threads while we restore the original value.
+        unsafe {
+            match &self.original {
+                Some(val) => std::env::set_var(&self.key, val),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+}
+
+/// Set an environment variable for the duration of the returned guard.
+///
+/// The environment variable `key` is immediately set to `value` (or
+/// removed if `value` is `None`). When the returned [`EnvVarGuard`] is
+/// dropped — including on panic — the original value is restored.
+///
+/// Acquires the shared [`env_lock()`] to prevent data races with other
+/// tests that manipulate environment variables.
+///
+/// # Example
+///
+/// ```ignore
+/// let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
+/// let path = resolve_cargo_bin_path();
+/// // _guard drops here, restoring CARGO_HOME to its original value
+/// ```
+pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
+    let guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let original = std::env::var_os(key);
+    // SAFETY: Protected by the env_lock acquired above — no concurrent
+    // env writes can happen from other test threads.
+    unsafe {
+        match value {
+            Some(val) => std::env::set_var(key, val),
+            None => std::env::remove_var(key),
+        }
+    }
+    EnvVarGuard {
+        _lock: guard,
+        key: key.to_owned(),
+        original,
+    }
+}
+
 fn test_root() -> &'static PathBuf {
     TEST_ROOT.get_or_init(|| {
         let tmp = tempfile::TempDir::new().expect("failed to create test temp dir");
@@ -476,4 +545,129 @@ pub(crate) fn init_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     assert!(status.success());
 
     (dir, repo_path)
+}
+
+// ── EnvVarGuard tests ─────────────────────────────────────────────────
+//
+// These tests use `unsafe { std::env::set_var/remove_var }` directly for
+// setup and cleanup rather than going through the guard — ironic given the
+// helper's purpose. This is an accepted trade-off: we're testing the
+// wrapper's correctness, and the env_lock is independently exercised by
+// every non-helper caller. Unique-per-test variable names prevent
+// collisions within this module, but per std::env docs even writes to
+// *different* variables are a data race without the lock.
+
+#[cfg(test)]
+mod env_var_guard_tests {
+    use super::*;
+
+    #[test]
+    fn sets_and_restores_to_absent() {
+        let _guard = set_env_var("MAHBOT_TEST_SET_RESTORE", Some("hello"));
+        assert_eq!(std::env::var("MAHBOT_TEST_SET_RESTORE"), Ok("hello".into()));
+        drop(_guard);
+
+        // Variable was absent before the guard (unique name, first use).
+        // The guard should restore to that state.
+        assert!(
+            std::env::var_os("MAHBOT_TEST_SET_RESTORE").is_none(),
+            "guard should restore env var to absent on drop"
+        );
+    }
+
+    #[test]
+    fn removes_env_var() {
+        // SAFETY: This bypasses env_lock (unique var name mitigates but
+        // doesn't eliminate the race — see mod-level doc above). We need
+        // pre-existing state to test the removal+restore path.
+        unsafe {
+            std::env::set_var("MAHBOT_TEST_REMOVE", "present");
+        }
+
+        let _guard = set_env_var("MAHBOT_TEST_REMOVE", None);
+        assert!(
+            std::env::var_os("MAHBOT_TEST_REMOVE").is_none(),
+            "set_env_var(key, None) should remove the variable"
+        );
+        drop(_guard);
+
+        // Original should be restored.
+        assert_eq!(
+            std::env::var("MAHBOT_TEST_REMOVE"),
+            Ok("present".into()),
+            "guard should restore the original value on drop"
+        );
+
+        // SAFETY: Bypasses env_lock (same trade-off as above).
+        unsafe {
+            std::env::remove_var("MAHBOT_TEST_REMOVE");
+        }
+    }
+
+    #[test]
+    fn captures_and_restores_original_value() {
+        // SAFETY: Bypasses env_lock (unique var name — see mod-level doc).
+        unsafe {
+            std::env::set_var("MAHBOT_TEST_CAPTURE", "original");
+        }
+
+        let _guard = set_env_var("MAHBOT_TEST_CAPTURE", Some("override"));
+        assert_eq!(std::env::var("MAHBOT_TEST_CAPTURE"), Ok("override".into()));
+        drop(_guard);
+
+        assert_eq!(
+            std::env::var("MAHBOT_TEST_CAPTURE"),
+            Ok("original".into()),
+            "guard should restore the original value on drop"
+        );
+
+        // SAFETY: Bypasses env_lock (same trade-off).
+        unsafe {
+            std::env::remove_var("MAHBOT_TEST_CAPTURE");
+        }
+    }
+
+    #[test]
+    fn restores_on_panic() {
+        // SAFETY: Bypasses env_lock (unique var name — see mod-level doc).
+        unsafe {
+            std::env::remove_var("MAHBOT_TEST_PANIC_ABSENT");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = set_env_var("MAHBOT_TEST_PANIC_ABSENT", Some("panic-value"));
+            panic!("intentional panic");
+        });
+        assert!(result.is_err());
+
+        assert!(
+            std::env::var_os("MAHBOT_TEST_PANIC_ABSENT").is_none(),
+            "MAHBOT_TEST_PANIC_ABSENT should be absent after panic-restore"
+        );
+    }
+
+    #[test]
+    fn restores_original_on_panic() {
+        // SAFETY: Bypasses env_lock (unique var name — see mod-level doc).
+        unsafe {
+            std::env::set_var("MAHBOT_TEST_PANIC_ORIGINAL", "original");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = set_env_var("MAHBOT_TEST_PANIC_ORIGINAL", Some("panic-value"));
+            panic!("intentional panic");
+        });
+        assert!(result.is_err());
+
+        assert_eq!(
+            std::env::var("MAHBOT_TEST_PANIC_ORIGINAL"),
+            Ok("original".into()),
+            "should restore original value after panic"
+        );
+
+        // SAFETY: Bypasses env_lock (same trade-off).
+        unsafe {
+            std::env::remove_var("MAHBOT_TEST_PANIC_ORIGINAL");
+        }
+    }
 }

@@ -1818,7 +1818,7 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
-    use crate::util::test::env_lock;
+    use crate::util::test::{env_lock, set_env_var};
 
     // ── Table-driven test helpers ─────────────────────────────────────
     // These helpers reduce boilerplate for process_shell_output and
@@ -2333,7 +2333,9 @@ mod tests {
         // reads $CARGO_HOME — concurrent tests in other modules may write it, so
         // holding the shared lock prevents the theoretical data race.
         let mut cmd = {
-            let _guard = env_lock().lock().unwrap();
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             build_shell_command("env", tmp.path())
         };
 
@@ -2715,18 +2717,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolved_shell_path_includes_cargo_home_when_set() {
-        // SAFETY: Shared env_lock serializes all env writes across the crate.
-        let _guard = env_lock().lock().unwrap();
-
-        // SAFETY: Protected by the shared env_lock.
-        unsafe {
-            std::env::set_var("CARGO_HOME", "/custom/cargo");
-        }
+        let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
         let path = resolved_shell_path();
-        // SAFETY: Protected by the shared env_lock.
-        unsafe {
-            std::env::remove_var("CARGO_HOME");
-        }
 
         assert!(
             path.contains("/custom/cargo/bin"),
@@ -2747,19 +2739,9 @@ mod tests {
             return;
         };
 
-        // SAFETY: Shared env_lock serializes all env writes across the crate.
-        let _guard = env_lock().lock().unwrap();
-
         let default_cargo_home = dirs.home_dir().join(".cargo").to_string_lossy().to_string();
-        // SAFETY: Protected by the shared env_lock.
-        unsafe {
-            std::env::set_var("CARGO_HOME", &default_cargo_home);
-        }
+        let _guard = set_env_var("CARGO_HOME", Some(&default_cargo_home));
         let path = resolved_shell_path();
-        // SAFETY: Protected by the shared env_lock.
-        unsafe {
-            std::env::remove_var("CARGO_HOME");
-        }
 
         // Count occurrences of the default cargo bin path.
         let sep = ":";
