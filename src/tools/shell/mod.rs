@@ -936,13 +936,12 @@ fn finish_shell_output(
     elapsed: Duration,
     full_output_for_spill: Option<&str>,
 ) -> String {
-    // Primary credential scrub for the stdout portion of `combined`. The
-    // stdout string (`processed`) enters this function unscrubbed; stderr was
-    // already scrubbed at `apply_profile_pipeline` entry, so this is a secondary
-    // pass for stderr — double-scrubbing is idempotent because the redacted
-    // marker (*[REDACTED]) does not match the credential regex.  The spill-file
-    // paths below and the agent layer's `sanitize_success_tool_output` also call
-    // `scrub_credentials`, so the output is scrubbed regardless of call site.
+    // Scrub credentials from the combined output. For stdout this is the only
+    // scrub pass (the agent layer's `sanitize_success_tool_output` is a further
+    // safety net regardless of call site).  Stderr was already scrubbed at
+    // `apply_profile_pipeline` entry, so this is a secondary pass there —
+    // double-scrubbing is idempotent because the redacted marker (*[REDACTED])
+    // does not match the credential regex.
     combined = scrub_credentials(&combined);
 
     if elapsed.as_secs_f64() >= 1.0 {
@@ -1433,8 +1432,11 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 ///
 /// Early-return stages (JSON preview, short-circuit, on_empty) call
 /// `combine_output` only.  The main path continues through `combine_output` →
-/// `finish_shell_output` (timing, spill-to-file).  The caller's `format_output()`
-/// (5 KB head+tail) provides a final safety net after this function returns.
+/// `finish_shell_output` (timing, spill-to-file).  `SPILL_THRESHOLD_BYTES`
+/// (5 KB) gates the head/tail truncation and spill preview — it is a trigger,
+/// not a truncation cutoff.  The caller's `format_output()` (5 KB head+tail)
+/// provides a final safety net for output that still exceeds the threshold
+/// after all pipeline stages.
 ///
 /// Stages: JSON preview, short-circuit, line filters, collapse, truncate,
 ///         line_truncation, on_empty, output_transform.
@@ -1762,10 +1764,9 @@ fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
         return output;
     }
 
-    let scrubbed = scrub_credentials(&output);
-    match spill_output(&scrubbed) {
-        Some(path) => format_spill_preview(&scrubbed, &path),
-        None => crate::util::format_tool_output(&scrubbed),
+    match spill_output(&output) {
+        Some(path) => format_spill_preview(&output, &path),
+        None => crate::util::format_tool_output(&output),
     }
 }
 
@@ -3309,8 +3310,8 @@ mod tests {
         for case in cases {
             // For pre-truncation spill path: repeat the string enough times to
             // exceed SPILL_THRESHOLD_BYTES, triggering the spill-to-file branch
-            // in finish_shell_output. This lets us verify that the spill path
-            // also scrubs credentials.
+            // in finish_shell_output. This lets us verify that the pre-truncation spill
+            // path also scrubs credentials.
             let pre_owned = case.pre.map(|s| {
                 std::iter::repeat(s)
                     .take(SPILL_THRESHOLD_BYTES + 1)
