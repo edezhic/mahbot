@@ -198,7 +198,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 ///   [`is_circuit_breaker_tripped`]).
 /// * `comment_text` — formats the system comment body given the count
 ///   (passed to [`is_circuit_breaker_tripped`]).
-/// * `label` — human-readable label used in logs to identify the caller.
+/// * `log_label` — human-readable label used in logs to identify the caller.
 ///
 /// # Return value
 ///
@@ -1546,7 +1546,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 ///   (transitory handoff before auto-commit).
 /// - If **garbage detected** (pass = false): adds a comment listing the offending
 ///   files and transitions the ticket to [`TicketPhase::ReadyForDevelopment`] with a
-///   pipeline reservation (via [`transition_ticket`]), matching the existing review/QA
+///   pipeline reservation (via [`comment_and_transition`]), matching the existing review/QA
 ///   failure pattern.
 async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVerdict) {
     if verdict.pass {
@@ -2296,7 +2296,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 }
 
 /// Shared circuit breaker skeleton: fetch comments, count, compare to threshold,
-/// add a system comment (first, for crash-safety), then transition to
+/// add a system comment, then transition to
 /// [`TicketPhase::Failed`].
 ///
 /// Both concrete breakers (diagnostics and general) delegate to this helper,
@@ -2304,7 +2304,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// parameters and closures. This eliminates ~80% structural duplication while
 /// preserving exact behavioral semantics.
 ///
-/// The Manager is notified via [`transition_ticket`] when the ticket
+/// The Manager is notified via [`transition_ticket_to_failed`] when the ticket
 /// transitions to [`TicketPhase::Failed`].
 ///
 /// # Self-counting prevention
@@ -2339,7 +2339,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///
 /// * `ticket` — the ticket being evaluated for the circuit breaker.
 /// * `expected_phase` — the phase the ticket must currently be in for the transition
-///   to succeed (passed to [`transition_ticket`] as the `source` parameter).
+///   to succeed (passed to [`transition_ticket_to_failed`] as the `source` parameter).
 /// * `threshold` — the count at which the breaker trips (using `>` comparison).
 /// * `count_fn` — extracts the count from the fetched comment list. Responsible
 ///   for its own filtering (including self-counting prevention).
@@ -2407,7 +2407,7 @@ async fn is_circuit_breaker_tripped(
 ///
 /// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
 ///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (via
-///    [`transition_ticket`]). The circuit
+///    [`bounce_back_to_development`]). The circuit
 ///    breaker is checked *before* dispatch by [`is_phase_and_general_breaker_clear`], so only
 ///    the bounce-back is needed here.
 ///
