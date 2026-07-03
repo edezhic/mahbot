@@ -1548,11 +1548,6 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 ///   failure pattern.
 async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVerdict) {
     if verdict.pass {
-        info!(
-            ticket = %ticket.id,
-            "Sanitation passed — transitioning to SanitationPassed",
-        );
-
         let passed_suffix = if verdict.garbage_files.is_empty() {
             ""
         } else {
@@ -1562,7 +1557,7 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             "🧹 Sanitation passed{passed_suffix}: {rationale}",
             rationale = verdict.rationale
         );
-        comment_and_transition(
+        if !comment_and_transition(
             ticket,
             &[(Role::Sanitation.as_str(), &comment)],
             TicketPhase::InSanitation,
@@ -1572,7 +1567,19 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             "passed",
             None,
         )
-        .await;
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                "Sanitation passed but transition to SanitationPassed failed — ticket stranded in InSanitation",
+            );
+            return;
+        }
+
+        info!(
+            ticket = %ticket.id,
+            "Sanitation passed — transitioned to SanitationPassed",
+        );
     } else {
         let garbage_list = verdict.garbage_files.join("\n- ");
         let comment = format!(
@@ -1594,7 +1601,7 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             (Role::Sanitation.as_str(), comment.as_str()),
             (SYSTEM_ROLE, sys_comment.as_str()),
         ];
-        comment_and_transition(
+        if !comment_and_transition(
             ticket,
             &comments,
             TicketPhase::InSanitation,
@@ -1604,7 +1611,19 @@ async fn handle_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVe
             "failed",
             Some(true),
         )
-        .await;
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                "Sanitation failed but transition to ReadyForDevelopment failed — ticket stranded in InSanitation",
+            );
+            return;
+        }
+
+        info!(
+            ticket = %ticket.id,
+            "Sanitation failed — bounced back to ReadyForDevelopment with pipeline reservation",
+        );
     }
 }
 
