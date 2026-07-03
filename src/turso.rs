@@ -312,9 +312,7 @@ pub struct Connection {
 /// Map each row in a slice through a fallible closure, collecting into a
 /// `Vec<turso::Result<T>>` with per-row error conversion.
 ///
-/// Shared by `Connection::query_map` and `TxGuard::query_map` whose only
-/// difference is how they obtain the rows (mutex-guarded vs already-locked
-/// connection).
+/// Used by `Connection::query_map`.
 fn map_rows<T, E>(
     rows: &[Row],
     mut map: impl FnMut(&Row) -> std::result::Result<T, E>,
@@ -557,22 +555,6 @@ impl TxGuard<'_> {
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
         Connection::query_impl(&self.conn, sql, params).await
-    }
-
-    /// Execute a read-only query, mapping each row through a closure.
-    /// Returns per-row results so callers can handle errors individually.
-    pub async fn query_map<T, E>(
-        &self,
-        sql: &str,
-        params: impl IntoParams + Send + 'static,
-        map: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
-    ) -> turso::Result<Vec<turso::Result<T>>>
-    where
-        T: Send + 'static,
-        E: std::fmt::Display + Send + Sync + 'static,
-    {
-        let rows = Connection::query_impl(&self.conn, sql, params).await?;
-        Ok(map_rows(&rows, map))
     }
 
     /// Commit the transaction and release the lock.
