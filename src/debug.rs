@@ -171,7 +171,7 @@ pub async fn run_debug() -> Result<()> {
 
         // Set busy_timeout as defense-in-depth against transient lock errors
         // when the daemon holds a write transaction (matching Connection::open
-        // in turso.rs line 154). Even with NoLock, this protects against edge
+        // in turso.rs line 344). Even with NoLock, this protects against edge
         // cases where the OS or filesystem layer introduces contention.
         turso_conn.set_busy_timeout(Duration::from_mins(1));
 

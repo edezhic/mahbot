@@ -3403,7 +3403,7 @@ impl EditorState {
         // File not open — load it, then jump after loading.
         // Set pending_goto so FileLoaded handler moves the cursor.
         // Use self.generation.wrapping_add(1) to match the generation
-        // that open_file_in_editor will assign (line 1612).
+        // that open_file_in_editor will assign (line 2103).
         let file_gen = self.generation.wrapping_add(1);
         self.pending_goto = Some((abs_path.clone(), line_number, file_gen));
         self.open_file_in_editor(&abs_path)
