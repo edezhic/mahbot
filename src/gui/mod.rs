@@ -360,11 +360,6 @@ pub struct Dashboard {
     updating: bool,
     /// Whether self-update is available on this installation (controls button visibility).
     update_available: bool,
-    /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
-    paused: bool,
-    /// Whether the selected workspace's maintainer is enabled.
-    maintenance: bool,
-
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
@@ -399,8 +394,6 @@ impl Dashboard {
             selected_user_name: None,
             updating: false,
             update_available,
-            paused: false,
-            maintenance: false,
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -443,6 +436,24 @@ impl Dashboard {
                 Task::none()
             }
         }
+    }
+
+    /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
+    fn paused(&self) -> bool {
+        self.selected_workspace_name
+            .as_ref()
+            .and_then(|name| self.workspace_paused.get(name))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether the selected workspace's maintainer is enabled.
+    fn maintenance(&self) -> bool {
+        self.selected_workspace_name
+            .as_ref()
+            .and_then(|name| self.workspace_maintenance.get(name))
+            .copied()
+            .unwrap_or(false)
     }
 
     pub const fn theme(&self) -> iced::Theme {
@@ -526,19 +537,6 @@ impl Dashboard {
                 self.workspace_paths = paths;
                 self.workspace_paused = paused_map;
                 self.workspace_maintenance = maintenance_map;
-                // Derive paused & maintenance states from the selected workspace.
-                // Reads from dash.workspace_paused / dash.workspace_maintenance
-                // while writing dash.paused / dash.maintenance (disjoint fields).
-                let update_states = |dash: &mut Self, ws_name: Option<&str>| {
-                    dash.paused = ws_name
-                        .and_then(|n| dash.workspace_paused.get(n))
-                        .copied()
-                        .unwrap_or(false);
-                    dash.maintenance = ws_name
-                        .and_then(|n| dash.workspace_maintenance.get(n))
-                        .copied()
-                        .unwrap_or(false);
-                };
                 // Pre-set Home's selected_user from persisted window state
                 // so UsersLoaded doesn't auto-select the first user when
                 // a previous user was saved.
@@ -552,19 +550,16 @@ impl Dashboard {
                 let ws_name = match restored_name {
                     Some(ref name) if name.is_empty() => {
                         self.selected_workspace_name = None;
-                        update_states(self, None);
                         String::new()
                     }
                     Some(ref name) => {
                         self.selected_workspace_name = Some(name.clone());
-                        update_states(self, Some(name));
                         name.clone()
                     }
                     None => {
                         // Unreachable: load_workspace_options always produces Some.
                         // Defensive fallback — treat as Personal workspace.
                         self.selected_workspace_name = None;
-                        update_states(self, None);
                         String::new()
                     }
                 };
@@ -953,7 +948,7 @@ impl Dashboard {
                     ));
                     return Task::none();
                 };
-                let new_paused = !self.paused;
+                let new_paused = !self.paused();
                 // Persist to DB; refresh state from DB on completion.
                 let ws_name_clone = ws_name.clone();
                 Task::perform(
@@ -984,7 +979,7 @@ impl Dashboard {
                     ));
                     return Task::none();
                 };
-                let new_enabled = !self.maintenance;
+                let new_enabled = !self.maintenance();
                 // Persist to DB; refresh state from DB on completion.
                 let ws_name_clone = ws_name.clone();
                 Task::perform(
@@ -1010,18 +1005,6 @@ impl Dashboard {
             Message::WorkspaceStatesRefreshed(paused_map, maintenance_map) if self.ready => {
                 self.workspace_paused = paused_map;
                 self.workspace_maintenance = maintenance_map;
-                // Update active state for the currently selected workspace.
-                if let Some(ref name) = self.selected_workspace_name {
-                    self.paused = self.workspace_paused.get(name).copied().unwrap_or(false);
-                    self.maintenance = self
-                        .workspace_maintenance
-                        .get(name)
-                        .copied()
-                        .unwrap_or(false);
-                } else {
-                    self.paused = false;
-                    self.maintenance = false;
-                }
                 Task::none()
             }
             Message::Home(_)
@@ -1082,18 +1065,10 @@ impl Dashboard {
         // propagate_workspace_selection → set_workspace_path.
         if name.is_empty() {
             self.selected_workspace_name = None;
-            self.paused = false;
-            self.maintenance = false;
             self.persist_window_state();
             self.propagate_workspace_selection("")
         } else {
             self.selected_workspace_name = Some(name.to_string());
-            self.paused = self.workspace_paused.get(name).copied().unwrap_or(false);
-            self.maintenance = self
-                .workspace_maintenance
-                .get(name)
-                .copied()
-                .unwrap_or(false);
             self.persist_window_state();
             self.propagate_workspace_selection(name)
         }
@@ -1706,9 +1681,9 @@ impl Dashboard {
         let has_ws = self.has_active_workspace();
         let maint_icon = column![
             text("Maint").size(8).color(theme::TEXT_MUTED),
-            text(if self.maintenance { "ON" } else { "OFF" })
+            text(if self.maintenance() { "ON" } else { "OFF" })
                 .size(9)
-                .color(if self.maintenance {
+                .color(if self.maintenance() {
                     theme::ACCENT
                 } else {
                     theme::TEXT_MUTED
@@ -1733,7 +1708,7 @@ impl Dashboard {
             }),
             text(if !has_ws {
                 "Select a workspace to toggle maintainer"
-            } else if self.maintenance {
+            } else if self.maintenance() {
                 "Maintainer ON"
             } else {
                 "Maintainer OFF"
@@ -1753,7 +1728,7 @@ impl Dashboard {
             lucide::pause::<iced::Theme, iced::Renderer>()
                 .size(28)
                 .color(theme::TEXT_FAINT)
-        } else if self.paused {
+        } else if self.paused() {
             lucide::play::<iced::Theme, iced::Renderer>()
                 .size(28)
                 .color(theme::ACCENT)
@@ -1779,7 +1754,7 @@ impl Dashboard {
             }),
             text(if !has_ws {
                 "Select a workspace to pause"
-            } else if self.paused {
+            } else if self.paused() {
                 "Resume pipeline"
             } else {
                 "Pause pipeline"
