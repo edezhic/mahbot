@@ -1943,7 +1943,7 @@ impl EditorState {
     /// Uses the shared atomic counter for stale-result prevention: the pre-write
     /// guard inside the async task checks whether a newer save has superseded
     /// this one before writing.
-    pub(crate) fn try_save_current_tabs(&mut self) -> Option<Task<EditorMessage>> {
+    pub(crate) fn try_save_current_tabs(&self) -> Option<Task<EditorMessage>> {
         if !self.session_initialized {
             return None;
         }
@@ -3184,7 +3184,7 @@ impl EditorState {
     }
 
     /// Handle save-active-tab — builds a save task for the active tab.
-    fn save_active_tab(&mut self) -> Task<EditorMessage> {
+    fn save_active_tab(&self) -> Task<EditorMessage> {
         if self.modal_overlay_blocks_editor_shortcuts() {
             return Task::none();
         }
@@ -4058,7 +4058,7 @@ impl EditorState {
                     let text = tab_data.content.text();
                     state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
                     // Auto-jump to first match.
-                    auto_jump_to_first_match(&mut tab_data.content, &mut state);
+                    auto_jump_to_first_match(&tab_data.content, &mut state);
                 }
                 // Close go-to-line when opening find bar (mutually exclusive).
                 if matches!(self.active_modal, Some(ModalKind::GotoLine(_))) {
@@ -4082,7 +4082,7 @@ impl EditorState {
                 state.query = query;
                 let text = tab_data.content.text();
                 state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
-                auto_jump_to_first_match(&mut tab_data.content, state);
+                auto_jump_to_first_match(&tab_data.content, state);
             }
         }
         Task::none()
@@ -4181,7 +4181,7 @@ impl EditorState {
                 // Recompute matches with new case sensitivity.
                 let text = tab_data.content.text();
                 state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
-                auto_jump_to_first_match(&mut tab_data.content, state);
+                auto_jump_to_first_match(&tab_data.content, state);
             }
         }
         Task::none()
@@ -5840,7 +5840,7 @@ fn byte_offset_to_line_byte_col(text: &str, offset: usize) -> Option<(usize, usi
 
 /// Auto-jump the cursor to the first find match and reset the match index to 0.
 fn auto_jump_to_first_match(
-    content: &mut super::editor_widget::EditorBuffer,
+    content: &super::editor_widget::EditorBuffer,
     state: &mut FindReplaceState,
 ) {
     state.current_match_idx = 0;
