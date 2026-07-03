@@ -5,7 +5,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::Role;
-use crate::board::{Ticket, TicketPhase, UNBLOCKING_STATUSES};
+use crate::board::{Ticket, TicketPhase};
 use crate::git_commands::{parse_numstat_lines, run_git_raw};
 
 use iced::widget::{
@@ -261,7 +261,7 @@ impl BoardState {
     /// Compute how many of this ticket's prerequisites are still unfulfilled.
     /// A prerequisite is considered fulfilled if its ticket cannot be found in the
     /// loaded set (per manager clarification: missing = archived = fulfilled) or if
-    /// its status is in [`UNBLOCKING_STATUSES`].
+    /// its status passes [`TicketPhase::is_unblocking()`].
     fn unfulfilled_prereq_count(&self, ticket: &Ticket) -> (usize, Vec<String>) {
         if ticket.prerequisites.is_empty() {
             return (0, Vec::new());
@@ -274,7 +274,7 @@ impl BoardState {
         let mut unfulfilled_ids = Vec::new();
         for prereq_id in &ticket.prerequisites {
             let is_unfulfilled = match status_map.get(prereq_id.as_str()) {
-                Some(status) => !UNBLOCKING_STATUSES.contains(status),
+                Some(status) => !status.is_unblocking(),
                 None => false, // missing = archived = fulfilled
             };
             if is_unfulfilled {
