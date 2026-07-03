@@ -3551,123 +3551,85 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
     }
 
-    // ── Transactional variant tests ──
-    //
-    // These tests verify that the `_tx` variants work correctly within an
-    // outer transaction (commit → visible, rollback → invisible).
-    // Rollback assertions verify *absence* of the written data (None, 0, or
-    // the unchanged status) rather than checking for different wrong values.
-    //
-    // Each commit/rollback pair shares a single `_{name}_inner(should_commit: bool)`
-    // helper and a consolidated test function that runs both cases in a loop.
-    // commit_or_rollback returns a label string for assertion messages,
-    // preserving failure granularity.  This pattern (for-loop over [false, true])
-    // mirrors the existing test_parse_prereqs precedent below.
+    #[tokio::test]
+    async fn test_transactional_triple_write() {
+        for should_commit in [false, true] {
+            // Exercise the full pattern used by commit_and_transition_ticket:
+            // all three _tx writes (set_commit_info_tx, transition_to_tx,
+            // add_comment_tx) in one transaction → commit → all visible
+            // (or rollback → none persist).  This is the sole transactional
+            // test for set_commit_info_tx (its standalone test was removed
+            // as subsumed); the commit_hash, lines_added, and lines_removed
+            // assertions below verify its behavior under both commit and
+            // rollback, complementing the non-transactional coverage in
+            // test_set_commit_info.
+            // Now delegates to the real production method BoardStore::finalize_done_tx.
+            let (store, _tmp, id) = setup().await;
+            store
+                .transition_to(&id, None, TicketPhase::QaPassed, None)
+                .await
+                .unwrap();
 
-    /// Commit or rollback the given transaction, returning a label string
-    /// ("commit" / "rollback") for use in assertion messages.
-    async fn commit_or_rollback(tx: TxGuard<'_>, should_commit: bool) -> &'static str {
-        let label = if should_commit { "commit" } else { "rollback" };
-        if should_commit {
-            tx.commit().await.unwrap();
-        } else {
-            tx.rollback().await.unwrap();
-        }
-        label
-    }
-
-    // ── Transactional test macro ─────────────────────────────────
-    //
-    // Generates a `#[tokio::test]` wrapper that calls a `_inner` function
-    // with both `false` and `true` for `should_commit`, exercising the
-    // commit and rollback paths of the _tx functions.
-
-    macro_rules! transaction_test {
-        ($name:ident, $inner:ident) => {
-            #[tokio::test]
-            async fn $name() {
-                for should_commit in [false, true] {
-                    $inner(should_commit).await;
-                }
-            }
-        };
-    }
-
-    async fn transactional_triple_write_inner(should_commit: bool) {
-        // Exercise the full pattern used by commit_and_transition_ticket:
-        // all three _tx writes (set_commit_info_tx, transition_to_tx,
-        // add_comment_tx) in one transaction → commit → all visible
-        // (or rollback → none persist).  This is the sole transactional
-        // test for set_commit_info_tx (its standalone test was removed
-        // as subsumed); the commit_hash, lines_added, and lines_removed
-        // assertions below verify its behavior under both commit and
-        // rollback, complementing the non-transactional coverage in
-        // test_set_commit_info.
-        // Now delegates to the real production method BoardStore::finalize_done_tx.
-        let (store, _tmp, id) = setup().await;
-        store
-            .transition_to(&id, None, TicketPhase::QaPassed, None)
+            let tx = store.conn.begin_tx().await.unwrap();
+            BoardStore::finalize_done_tx(
+                &tx,
+                &id,
+                "abcdef0123456789abcdef0123456789abcd0123",
+                10,
+                5,
+                "triple write comment",
+                TicketPhase::QaPassed,
+            )
             .await
             .unwrap();
 
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::finalize_done_tx(
-            &tx,
-            &id,
-            "abcdef0123456789abcdef0123456789abcd0123",
-            10,
-            5,
-            "triple write comment",
-            TicketPhase::QaPassed,
-        )
-        .await
-        .unwrap();
-        let label = commit_or_rollback(tx, should_commit).await;
+            let label = if should_commit { "commit" } else { "rollback" };
+            if should_commit {
+                tx.commit().await.unwrap();
+            } else {
+                tx.rollback().await.unwrap();
+            }
 
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        let comments = store.get_comments(&id).await.expect("get comments");
-        if should_commit {
-            // All three changes should be visible.
-            assert_eq!(
-                ticket.commit_hash.as_deref(),
-                Some("abcdef0123456789abcdef0123456789abcd0123"),
-                "({label}) commit_hash",
-            );
-            assert_eq!(ticket.lines_added, Some(10), "({label}) lines_added");
-            assert_eq!(ticket.lines_removed, Some(5), "({label}) lines_removed");
-            assert_eq!(ticket.phase, TicketPhase::Done, "({label}) phase");
-            assert_eq!(comments.len(), 1, "({label}) comments.len");
-            assert_eq!(
-                comments[0].content, "triple write comment",
-                "({label}) comment content"
-            );
-        } else {
-            // None of the three changes should be visible.
-            assert_eq!(
-                ticket.commit_hash, None,
-                "({label}) commit_hash after rollback"
-            );
-            assert_eq!(
-                ticket.lines_added, None,
-                "({label}) lines_added after rollback"
-            );
-            assert_eq!(
-                ticket.lines_removed, None,
-                "({label}) lines_removed after rollback"
-            );
-            assert_eq!(
-                ticket.phase,
-                TicketPhase::QaPassed,
-                "({label}) phase after rollback",
-            );
-            assert_eq!(comments.len(), 0, "({label}) comments.len after rollback");
+            let ticket = crate::util::test::expect_ticket(&store, &id).await;
+            let comments = store.get_comments(&id).await.expect("get comments");
+            if should_commit {
+                // All three changes should be visible.
+                assert_eq!(
+                    ticket.commit_hash.as_deref(),
+                    Some("abcdef0123456789abcdef0123456789abcd0123"),
+                    "({label}) commit_hash",
+                );
+                assert_eq!(ticket.lines_added, Some(10), "({label}) lines_added");
+                assert_eq!(ticket.lines_removed, Some(5), "({label}) lines_removed");
+                assert_eq!(ticket.phase, TicketPhase::Done, "({label}) phase");
+                assert_eq!(comments.len(), 1, "({label}) comments.len");
+                assert_eq!(
+                    comments[0].content, "triple write comment",
+                    "({label}) comment content"
+                );
+            } else {
+                // None of the three changes should be visible.
+                assert_eq!(
+                    ticket.commit_hash, None,
+                    "({label}) commit_hash after rollback"
+                );
+                assert_eq!(
+                    ticket.lines_added, None,
+                    "({label}) lines_added after rollback"
+                );
+                assert_eq!(
+                    ticket.lines_removed, None,
+                    "({label}) lines_removed after rollback"
+                );
+                assert_eq!(
+                    ticket.phase,
+                    TicketPhase::QaPassed,
+                    "({label}) phase after rollback",
+                );
+                assert_eq!(comments.len(), 0, "({label}) comments.len after rollback");
+            }
         }
     }
-
-    transaction_test!(
-        test_transactional_triple_write,
-        transactional_triple_write_inner
-    );
 
     // ── parse_prereqs unit tests ──
 
