@@ -2245,6 +2245,10 @@ fn build_analyst_summary(
 /// After a ticket fails via circuit breaker, move all other ReadyForDevelopment
 /// tickets in the same workspace to Planning so the Manager can triage the
 /// failure without new tickets auto-starting.
+///
+/// # Precondition
+/// `ticket` must already be in the `Failed` phase before calling this function.
+/// Callers must transition the ticket to `Failed` first.
 async fn drain_ready_for_development_siblings(ticket: &Ticket) {
     let other_tickets = match board()
         .list_tickets_in_phase(TicketPhase::ReadyForDevelopment, &ticket.workspace_name)
@@ -2268,13 +2272,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
     // cycle could claim one. This is rare in practice (dispatch tasks spawn
     // after the claim loop completes) and the CAS guard in transition_to
     // handles the transition gracefully.
-    //
-    // Filter out the tripped ticket: defense-in-depth. The tripped ticket
-    // was already transitioned to Failed by the caller before this function
-    // runs and shouldn't appear in the ReadyForDevelopment results, but the
-    // filter keeps us safe if a concurrent race or future refactor changes
-    // the timing.
-    for other in other_tickets.iter().filter(|t| t.id != ticket.id) {
+    for other in &other_tickets {
         // If the transition fails (e.g., ticket was already claimed or moved
         // externally), skip it and continue with the remaining tickets.
         if let Err(e) = transition_ticket(
