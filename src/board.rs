@@ -1975,7 +1975,7 @@ mod tests {
     use crate::Role;
     use crate::Tool;
     use crate::Workspace;
-    use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
+    use crate::role::DIAGNOSTICS_ROLE;
     use crate::util::test::TicketBuilder;
     use crate::util::test::assert_superseded_ticket;
     use crate::util::test::expect_ticket;
