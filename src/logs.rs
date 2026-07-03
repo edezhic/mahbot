@@ -146,7 +146,8 @@ impl LogStore {
                     entry.level.clone(),
                     entry.target.clone(),
                     entry.message.clone(),
-                    serde_json::to_string(&entry.fields).unwrap_or_default(),
+                    serde_json::to_string(&entry.fields)
+                        .expect("log entry fields serialization failed; this should not happen"),
                     entry.agent_id.clone(),
                     entry.agent_role.clone(),
                     entry.workspace.clone(),
@@ -161,8 +162,10 @@ impl LogStore {
     fn build_query(filters: &LogQuery) -> (String, Vec<Value>) {
         let (where_sql, mut values) = build_where_clause(filters);
 
-        let limit: i64 = i64::try_from(filters.limit.unwrap_or(100).min(1000)).unwrap_or(100);
-        let offset: i64 = i64::try_from(filters.offset.unwrap_or(0)).unwrap_or(0);
+        let limit: i64 = i64::try_from(filters.limit.unwrap_or(100).min(1000))
+            .expect("log query limit overflowed i64; limit must be <= i64::MAX");
+        let offset: i64 = i64::try_from(filters.offset.unwrap_or(0))
+            .expect("log query offset overflowed i64; offset must be <= i64::MAX");
         values.push(Value::Integer(limit));
         values.push(Value::Integer(offset));
 
@@ -429,7 +432,11 @@ fn spawn_log_writer(
             };
 
             // Broadcast to dashboard subscribers before inserting (fast path)
-            let _ = broadcast.send(serde_json::to_string(&entry).unwrap_or_default());
+            let _ =
+                broadcast
+                    .send(serde_json::to_string(&entry).expect(
+                        "log entry broadcast serialization failed; this should not happen",
+                    ));
 
             if let Err(e) = store.insert(&entry).await {
                 // Log insertion failed — nowhere useful to report since

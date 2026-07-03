@@ -135,7 +135,10 @@ impl StatsStore {
             })
             .await
             .map(|opt| opt.unwrap_or(0))
-            .map(|n: i64| usize::try_from(n).unwrap_or(0))
+            .map(|n: i64| {
+                usize::try_from(n)
+                    .expect("count_tool_errors returned negative count; DB invariant violated")
+            })
     }
 
     /// Query tool call error entries with optional filters and pagination.
@@ -154,8 +157,10 @@ impl StatsStore {
         }
 
         let (where_clause, filter_params) = Self::build_tool_error_filter(query);
-        let limit_val = i64::try_from(limit).unwrap_or(50);
-        let offset_val = i64::try_from(offset).unwrap_or(0);
+        let limit_val = i64::try_from(limit)
+            .expect("query_tool_errors limit overflowed i64; limit must be <= i64::MAX");
+        let offset_val = i64::try_from(offset)
+            .expect("query_tool_errors offset overflowed i64; offset must be <= i64::MAX");
 
         let sql = format!(
             "SELECT {TOOL_ERROR_COLUMNS} \
