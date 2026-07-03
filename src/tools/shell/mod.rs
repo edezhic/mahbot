@@ -2533,190 +2533,110 @@ mod tests {
     // ── Shell compression pipeline tests ────────────────────────────
 
     #[test]
-    fn ansi_escape_stripping() {
-        let input = "\x1B[31mred\x1B[0m \x1B[1mbold\x1B[22m";
-        assert_eq!(strip_ansi_escapes(input), "red bold");
+    fn ansi_escape_cases() {
+        let cases: &[(&str, &str)] = &[
+            ("\x1B[31mred\x1B[0m \x1B[1mbold\x1B[22m", "red bold"),
+            ("hello world", "hello world"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_ansi_escapes(input), *expected, "input: {input:?}");
+        }
     }
 
     #[test]
-    fn ansi_escape_no_op_for_clean_input() {
-        let input = "hello world";
-        assert_eq!(strip_ansi_escapes(input), input);
+    fn try_json_preview_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            // JSON array → detected with item count and schema inference
+            (
+                r#"[{"name": "alice", "age": 30}, {"name": "bob", "age": 25}]"#,
+                &["2 items", "name: string", "age: int"],
+            ),
+            // JSON object → detected with field count and field names
+            (
+                r#"{"status": "ok", "count": 42}"#,
+                &["2 fields", "status", "count"],
+            ),
+            // Non-JSON → None
+            ("hello world\nthis is not json", &[]),
+        ];
+        for (input, expected_contains) in cases {
+            let result = try_json_preview(input);
+            if expected_contains.is_empty() {
+                assert!(result.is_none(), "expected no JSON preview for: {input:?}");
+            } else {
+                assert!(result.is_some(), "expected JSON preview for: {input:?}");
+                let output = result.unwrap();
+                for s in *expected_contains {
+                    assert!(output.contains(s), "expected {s:?} in: {output}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn json_array_preview() {
-        let input = r#"[{"name": "alice", "age": 30}, {"name": "bob", "age": 25}]"#;
-        let result = try_json_preview(input);
-        assert!(result.is_some(), "should detect JSON array");
-        let output = result.unwrap();
-        assert!(output.contains("2 items"), "should show item count");
-        assert!(
-            output.contains("name: string"),
-            "should infer string schema"
-        );
-        assert!(output.contains("age: int"), "should infer int schema");
-    }
-
-    #[test]
-    fn json_object_preview() {
-        let input = r#"{"status": "ok", "count": 42}"#;
-        let result = try_json_preview(input);
-        assert!(result.is_some(), "should detect JSON object");
-        let output = result.unwrap();
-        assert!(output.contains("2 fields"), "should show field count");
-        assert!(output.contains("status"), "should show field name");
-        assert!(output.contains("count"), "should show field name");
-    }
-
-    #[test]
-    fn non_json_passes_through() {
-        let input = "hello world\nthis is not json";
-        let result = try_json_preview(input);
-        assert!(result.is_none(), "should not detect JSON");
-    }
-
-    #[test]
-    fn json_preview_scrubs_credentials_in_array() {
-        // JSON array containing credential values — must be scrubbed
-        // in the JSON preview early-return path.
-        let input = r#"[{"token": "sk-abcdefghijklmnop12345678", "name": "test"}]"#;
-        let result = process_shell_output("echo test", input, "", 0, Duration::ZERO);
-        // The JSON preview is triggered first; credentials should be scrubbed
-        assert!(
-            !result.contains("sk-abcdefghijklmnop12345678"),
-            "raw credential should be scrubbed: {result}"
-        );
-        assert!(
-            result.contains("sk-a*[REDACTED]"),
-            "should contain redacted credential: {result}"
-        );
-        // Non-sensitive values should pass through
-        assert!(
-            result.contains("test"),
-            "non-sensitive values should remain"
-        );
-    }
-
-    #[test]
-    fn json_preview_scrubs_credentials_in_object() {
-        // JSON object preview only shows field names and types (not values),
-        // so credential VALUES are never serialized in the object preview.
-        // The field name `api_key` appears as metadata — this tests that
-        // scrubbing doesn't corrupt the output and that no values leak.
-        let input = r#"{"api_key": "abcdefghijklmnop12345678", "status": "ok"}"#;
-        let result = process_shell_output("curl api", input, "", 0, Duration::ZERO);
-        // Object preview shows field names and types, not values — but even
-        // if values were serialized, scrub_credentials catches them.
-        assert!(
-            !result.contains("abcdefghijklmnop12345678"),
-            "raw credential value should not be present: {result}"
-        );
-        // Field names are visible (metadata, not credential values)
-        assert!(result.contains("api_key"), "field name should be present");
-        assert!(result.contains("status"), "field names should be preserved");
-        assert!(
-            result.contains("[JSON object:"),
-            "should still show JSON preview"
-        );
-    }
-
-    #[test]
-    fn json_preview_preserves_clean_json() {
-        // JSON without credentials — should not be altered
-        let input = r#"[{"name": "alice", "age": 30}]"#;
-        let result = process_shell_output("echo test", input, "", 0, Duration::ZERO);
-        assert!(result.contains("alice"), "clean values should pass through");
-        assert!(result.contains("age"), "field names should be preserved");
-        assert!(result.contains("30"), "numeric values should pass through");
-        assert!(
-            result.contains("[JSON array:"),
-            "should still show JSON preview"
-        );
-    }
-
-    #[test]
-    fn json_preview_scrubs_credentials_in_stderr() {
-        // JSON preview path (stage 1) must scrub credentials in stderr
-        // when stderr is visible (non-zero exit code).
-        let result = process_shell_output(
-            "echo test",
-            r#"[{"name": "alice"}]"#,
-            "api_key=abcdefghijklmnop12345678",
-            1,
-            Duration::ZERO,
-        );
-        // Raw credential should not appear in output
-        assert!(
-            !result.contains("api_key=abcdefghijklmnop12345678"),
-            "raw credential should be scrubbed from stderr: {result}"
-        );
-        // Redacted form should be present (first 4 chars preserved)
-        assert!(
-            result.contains("api_key=abcd*[REDACTED]"),
-            "should contain redacted credential: {result}"
-        );
-        // JSON preview should still be shown
-        assert!(
-            result.contains("alice"),
-            "JSON preview content should remain"
-        );
-    }
-
-    #[test]
-    fn short_circuit_scrubs_credentials_in_stderr() {
-        // Short-circuit path (stage 2) must scrub credentials in stderr
-        // when stderr is visible (non-zero exit code).
-        let result = process_shell_output(
-            "git diff",
-            "",
-            "api_key=abcdefghijklmnop12345678",
-            1,
-            Duration::ZERO,
-        );
-        // Raw credential should not appear in output
-        assert!(
-            !result.contains("api_key=abcdefghijklmnop12345678"),
-            "raw credential should be scrubbed from stderr: {result}"
-        );
-        // Redacted form should be present (first 4 chars preserved)
-        assert!(
-            result.contains("api_key=abcd*[REDACTED]"),
-            "should contain redacted credential: {result}"
-        );
-        // Short-circuit message should still be present
-        assert!(
-            result.contains("no changes"),
-            "short-circuit message should remain"
-        );
-    }
-
-    #[test]
-    fn on_empty_scrubs_credentials_in_stderr() {
-        // On-empty path (stage 7) must scrub credentials in stderr
-        // when stderr is visible (non-zero exit code).
-        let result = process_shell_output(
-            "tsc --noEmit",
-            "",
-            "api_key=abcdefghijklmnop12345678",
-            1,
-            Duration::ZERO,
-        );
-        // Raw credential should not appear in output
-        assert!(
-            !result.contains("api_key=abcdefghijklmnop12345678"),
-            "raw credential should be scrubbed from stderr: {result}"
-        );
-        // Redacted form should be present (first 4 chars preserved)
-        assert!(
-            result.contains("api_key=abcd*[REDACTED]"),
-            "should contain redacted credential: {result}"
-        );
-        // On-empty message should still be present
-        assert!(
-            result.contains("[tsc: ok]"),
-            "on-empty message should remain"
-        );
+    fn pipeline_credential_scrubbing_cases() {
+        // Pipeline stages 1/2/7 all scrub credentials in stderr.
+        // Each case follows the same pattern: raw credentials not present,
+        // redacted form present, pipeline-specific content preserved.
+        let cases: &[ShellOutputCase] = &[
+            ShellOutputCase {
+                // Stage 1 (JSON preview): credentials in stdout are scrubbed
+                name: "json preview scrubs credentials in array",
+                command: "echo test",
+                stdout: r#"[{"token": "sk-abcdefghijklmnop12345678", "name": "test"}]"#,
+                not_contains: &["sk-abcdefghijklmnop12345678"],
+                contains: &["sk-a*[REDACTED]", "test"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                // Stage 1 (JSON preview): object field values are scrubbed, names preserved
+                name: "json preview scrubs credentials in object",
+                command: "curl api",
+                stdout: r#"{"api_key": "abcdefghijklmnop12345678", "status": "ok"}"#,
+                not_contains: &["abcdefghijklmnop12345678"],
+                contains: &["api_key", "status", "[JSON object:"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "json preview preserves clean json",
+                command: "echo test",
+                stdout: r#"[{"name": "alice", "age": 30}]"#,
+                contains: &["alice", "age", "30", "[JSON array:"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                // Stage 1 (JSON preview): credentials from stderr are scrubbed
+                name: "json preview scrubs credentials in stderr",
+                command: "echo test",
+                stdout: r#"[{"name": "alice"}]"#,
+                stderr: "api_key=abcdefghijklmnop12345678",
+                exit_code: 1,
+                not_contains: &["api_key=abcdefghijklmnop12345678"],
+                contains: &["api_key=abcd*[REDACTED]", "alice"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                // Stage 2 (short-circuit): credentials from stderr are scrubbed
+                name: "short-circuit scrubs credentials in stderr",
+                command: "git diff",
+                stderr: "api_key=abcdefghijklmnop12345678",
+                exit_code: 1,
+                not_contains: &["api_key=abcdefghijklmnop12345678"],
+                contains: &["api_key=abcd*[REDACTED]", "no changes"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                // Stage 7 (on-empty): credentials from stderr are scrubbed
+                name: "on-empty scrubs credentials in stderr",
+                command: "tsc --noEmit",
+                stderr: "api_key=abcdefghijklmnop12345678",
+                exit_code: 1,
+                not_contains: &["api_key=abcdefghijklmnop12345678"],
+                contains: &["api_key=abcd*[REDACTED]", "[tsc: ok]"],
+                ..Default::default()
+            },
+        ];
+        check_shell_output(cases);
     }
 
     #[test]
@@ -2734,21 +2654,17 @@ mod tests {
     }
 
     #[test]
-    fn long_lines_truncated() {
+    fn truncate_line_width_short_and_long() {
+        // Long lines truncated with continuation marker
         let long = "a".repeat(500);
         let result = truncate_line_width(&long, 100);
         assert!(result.len() < long.len() + 100, "should truncate");
         assert!(
             result.contains("more chars on this line"),
-            "should show continuation marker on separate line"
+            "should show continuation marker"
         );
-        // Verify the original line boundary is preserved (no mid-line truncation)
         let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(
-            lines.len(),
-            2,
-            "original truncated line + continuation marker"
-        );
+        assert_eq!(lines.len(), 2, "truncated line + continuation marker");
         assert_eq!(
             lines[0].len(),
             100,
@@ -2758,17 +2674,24 @@ mod tests {
             !lines[0].contains("..."),
             "first line should not contain truncation marker"
         );
-    }
 
-    #[test]
-    fn short_lines_preserved() {
+        // Short lines preserved unchanged
         let input = "hello\nworld";
         let result = truncate_line_width(input, 500);
         assert_eq!(result, input, "short lines should pass through");
     }
 
     #[test]
-    fn spill_writes_file_for_large_output() {
+    fn try_spill_to_file_behavior() {
+        // Small output passes through unchanged
+        let short = "hello".to_string();
+        assert_eq!(
+            try_spill_to_file(short.clone(), 5_000),
+            short,
+            "short output should pass through"
+        );
+
+        // Large single-line output spills
         let large = "x".repeat(10_000);
         let result = try_spill_to_file(large, 5_000);
         assert!(
@@ -2776,28 +2699,19 @@ mod tests {
             "should contain spill path"
         );
         assert!(
-            result.contains("[view with: read "),
-            "should contain actionable read hint"
+            result.contains("10000 bytes"),
+            "should mention byte count: {result}"
         );
-        assert!(result.contains("10000 bytes"), "should mention byte count");
-        // Ensure the spill file was actually written
-        assert!(
-            std::fs::read_dir(std::env::temp_dir().join(".agent")).is_ok(),
-            "spill dir should exist"
-        );
-    }
 
-    #[test]
-    fn spill_truncates_multi_line_large_output() {
-        // Many lines totalling well over 5K chars should produce head+tail preview
+        // Multi-line large output shows head+tail preview
         let lines: Vec<String> = (0..800).map(|i| format!("line_{i:04}")).collect();
-        let large = lines.join("\n");
-        let large_len = large.len();
+        let multi = lines.join("\n");
+        let multi_len = multi.len();
         assert!(
-            large_len > 5_000,
-            "test data {large_len} must exceed spill threshold",
+            multi_len > 5_000,
+            "test data {multi_len} must exceed spill threshold"
         );
-        let result = try_spill_to_file(large, 5_000);
+        let result = try_spill_to_file(multi, 5_000);
         assert!(
             result.contains("[Output saved to"),
             "should contain spill path"
@@ -2806,23 +2720,18 @@ mod tests {
             result.contains("[view with: read "),
             "should contain actionable read hint"
         );
-        // Preview should have head (first lines) and tail (last lines)
-        assert!(
-            result.contains("line_0000"),
-            "should show first line {result:?}"
-        );
+        assert!(result.contains("line_0000"), "should show first line");
         assert!(result.contains("line_0799"), "should show last line");
         assert!(
-            result.len() < large_len,
+            result.len() < multi_len,
             "inline preview should be truncated"
         );
-    }
 
-    #[test]
-    fn spill_returns_short_output_as_is() {
-        let short = "hello".to_string();
-        let result = try_spill_to_file(short.clone(), 5_000);
-        assert_eq!(result, short, "short output should pass through unchanged");
+        // Ensure the spill dir exists
+        assert!(
+            std::fs::read_dir(std::env::temp_dir().join(".agent")).is_ok(),
+            "spill dir should exist"
+        );
     }
 
     #[cfg(unix)]
@@ -3232,23 +3141,91 @@ mod tests {
 
     // ── apply_line_truncation unit tests ──────────────────────────────
 
-    #[test]
-    fn truncate_no_config_passthrough() {
-        let p = Profile::new("passthrough");
-        let output = "line1\nline2\nline3";
-        let (result, pre) = apply_line_truncation(output, &p);
-        assert_eq!(result, output);
-        assert_eq!(pre, None);
+    struct TruncateCase {
+        name: &'static str,
+        head: usize,
+        tail: usize,
+        max: Option<usize>,
+        output: &'static str,
+        pre_is_some: bool,
+        check_contains: &'static [&'static str],
+    }
+
+    fn check_truncate(cases: &[TruncateCase]) {
+        for case in cases {
+            let mut p = Profile::new("test");
+            if case.head > 0 || case.tail > 0 {
+                p = p.head(case.head).tail(case.tail);
+            }
+            if let Some(m) = case.max {
+                p = p.max(m);
+            }
+            let (result, pre) = apply_line_truncation(case.output, &p);
+            assert_eq!(
+                pre.is_some(),
+                case.pre_is_some,
+                "[{}] pre.is_some mismatch. pre: {pre:?}",
+                case.name
+            );
+            for &s in case.check_contains {
+                assert!(
+                    result.contains(s),
+                    "[{}] expected contains {s:?}\n  got: {result:?}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[test]
-    fn truncate_head_tail_only_small_output_no_sandwich() {
-        // Small output (< SPILL_THRESHOLD_BYTES) should not trigger sandwich
-        let p = Profile::new("test").head(2).tail(2);
-        let output = "line1\nline2\nline3\nline4\nline5";
-        let (result, pre) = apply_line_truncation(output, &p);
-        assert_eq!(result, output, "small output passes through");
-        assert_eq!(pre, None, "no pre-truncation for small output");
+    fn truncate_simple_cases() {
+        check_truncate(&[
+            TruncateCase {
+                name: "no config passthrough",
+                head: 0,
+                tail: 0,
+                max: None,
+                output: "line1\nline2\nline3",
+                pre_is_some: false,
+                check_contains: &["line1\nline2\nline3"],
+            },
+            TruncateCase {
+                name: "head+tail small output no sandwich",
+                head: 2,
+                tail: 2,
+                max: None,
+                output: "line1\nline2\nline3\nline4\nline5",
+                pre_is_some: false,
+                check_contains: &["line1\nline2\nline3\nline4\nline5"],
+            },
+            TruncateCase {
+                name: "max only caps at limit",
+                head: 0,
+                tail: 0,
+                max: Some(3),
+                output: "a\nb\nc\nd\ne",
+                pre_is_some: false,
+                check_contains: &["... (2 lines truncated)"],
+            },
+            TruncateCase {
+                name: "max only fits no truncation",
+                head: 0,
+                tail: 0,
+                max: Some(10),
+                output: "a\nb\nc",
+                pre_is_some: false,
+                check_contains: &["a\nb\nc"],
+            },
+            TruncateCase {
+                name: "head+tail fits when under limit",
+                head: 5,
+                tail: 3,
+                max: None,
+                output: "a\nb\nc\nd",
+                pre_is_some: false,
+                check_contains: &["a\nb\nc\nd"],
+            },
+        ]);
     }
 
     #[test]
@@ -3283,29 +3260,6 @@ mod tests {
             result.ends_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "should end with tail"
         );
-    }
-
-    #[test]
-    fn truncate_max_only_caps_at_limit() {
-        let p = Profile::new("test").max(3);
-        let output = "a\nb\nc\nd\ne";
-        let (result, pre) = apply_line_truncation(output, &p);
-        assert_eq!(pre, None, "no pre-truncation for max-only");
-        assert_eq!(
-            result.lines().count(),
-            4, // 3 lines + 1 truncation marker
-            "should have max+1 lines (3 data + marker)"
-        );
-        assert!(result.contains("... (2 lines truncated)"));
-    }
-
-    #[test]
-    fn truncate_max_only_fits_no_truncation() {
-        let p = Profile::new("test").max(10);
-        let output = "a\nb\nc";
-        let (result, pre) = apply_line_truncation(output, &p);
-        assert_eq!(result, output, "fits within max, passthrough");
-        assert_eq!(pre, None);
     }
 
     #[test]
@@ -3354,97 +3308,127 @@ mod tests {
         assert!(result.contains("... (2 lines truncated)"));
     }
 
-    #[test]
-    fn truncate_head_tail_fits_when_under_limit() {
-        let p = Profile::new("test").head(5).tail(3);
-        // Only 4 lines total — fewer than head+tail (8), so no truncation
-        let output = "a\nb\nc\nd";
-        let (result, pre) = apply_line_truncation(output, &p);
-        assert_eq!(result, output, "not enough lines to truncate");
-        assert_eq!(pre, None);
-    }
-
     // ── format_sandwich tests ──────────────────────────────────────────
 
     #[test]
-    fn format_sandwich_passthrough_when_fits() {
-        let output = "a\nb\nc";
-        assert_eq!(format_sandwich(output, 2, 2), output);
-    }
-
-    #[test]
-    fn format_sandwich_omits_middle_lines() {
-        let output = "a\nb\nc\nd\ne\nf\ng";
-        let result = format_sandwich(output, 2, 2);
-        assert_eq!(result, "a\nb\n... (3 lines omitted)\nf\ng");
-    }
-
-    #[test]
-    fn format_sandwich_head_only() {
-        let output = "a\nb\nc\nd\ne\nf\ng";
-        let result = format_sandwich(output, 7, 0);
-        assert_eq!(result, "a\nb\nc\nd\ne\nf\ng");
-    }
-
-    #[test]
-    fn format_sandwich_tail_only() {
-        let output = "a\nb\nc\nd\ne\nf\ng";
-        let result = format_sandwich(output, 0, 7);
-        assert_eq!(result, "a\nb\nc\nd\ne\nf\ng");
+    fn format_sandwich_cases() {
+        let cases: &[(&str, usize, usize, &str)] = &[
+            // (input, head, tail, expected)
+            ("a\nb\nc", 2, 2, "a\nb\nc"),
+            (
+                "a\nb\nc\nd\ne\nf\ng",
+                2,
+                2,
+                "a\nb\n... (3 lines omitted)\nf\ng",
+            ),
+            ("a\nb\nc\nd\ne\nf\ng", 7, 0, "a\nb\nc\nd\ne\nf\ng"),
+            ("a\nb\nc\nd\ne\nf\ng", 0, 7, "a\nb\nc\nd\ne\nf\ng"),
+        ];
+        for (input, head, tail, expected) in cases {
+            let result = format_sandwich(input, *head, *tail);
+            assert_eq!(
+                result, *expected,
+                "format_sandwich({input:?}, {head}, {tail})"
+            );
+        }
     }
 
     // ── finish_shell_output credential scrubbing tests ────────────────
 
-    #[test]
-    fn finish_shell_output_scrubs_combined_inline() {
-        // Path 2: no pre-truncation spill, output below threshold
-        // → combined returned directly. Credentials must be scrubbed.
-        let result =
-            finish_shell_output("API_KEY=abcdefghijklmnop".to_string(), Duration::ZERO, None);
-        assert!(!result.contains("abcdefghijklmnop"));
-        assert!(result.contains("abcd*[REDACTED]"));
+    struct FinishCase {
+        name: &'static str,
+        combined: &'static str,
+        elapsed: Duration,
+        pre: Option<&'static str>,
+        check: &'static [&'static str], // all must be contained in result
+        not_check: &'static [&'static str], // none must be contained
+        eq: Option<&'static str>,
+    }
+
+    fn check_finish(cases: &[FinishCase]) {
+        for case in cases {
+            // For pre-truncation spill path: repeat the string enough times to
+            // exceed SPILL_THRESHOLD_BYTES, triggering the spill-to-file branch
+            // in finish_shell_output. This lets us verify that the spill path
+            // also scrubs credentials.
+            let pre_owned = case.pre.map(|s| {
+                std::iter::repeat(s)
+                    .take(SPILL_THRESHOLD_BYTES + 1)
+                    .collect::<String>()
+            });
+            let result = finish_shell_output(
+                case.combined.to_string(),
+                case.elapsed,
+                pre_owned.as_deref(),
+            );
+            for &s in case.check {
+                assert!(
+                    result.contains(s),
+                    "[{}] expected contains {s:?}\n  got: {result:?}",
+                    case.name
+                );
+            }
+            for &s in case.not_check {
+                assert!(
+                    !result.contains(s),
+                    "[{}] expected NOT contains {s:?}\n  got: {result:?}",
+                    case.name
+                );
+            }
+            if let Some(expected) = case.eq {
+                assert_eq!(result.trim(), expected, "[{}] expected eq", case.name);
+            }
+        }
     }
 
     #[test]
-    fn finish_shell_output_scrubs_combined_in_pre_truncation_path() {
-        // Path 1: pre-truncation output exceeds spill threshold.
-        // Combined output with credentials must be scrubbed even though
-        // the spill file takes the `pre` content (which is also scrubbed).
-        let combined = "SECRET=wxyz1234abcdefgh".to_string();
-        let pre = "x".repeat(SPILL_THRESHOLD_BYTES + 1);
-        let result = finish_shell_output(combined, Duration::ZERO, Some(&pre));
-        assert!(!result.contains("wxyz1234abcdefgh"));
-        assert!(result.contains("wxyz*[REDACTED]"));
-        // Should include a spill header referencing the saved file
-        assert!(result.contains("[Output saved to"));
-    }
-
-    #[test]
-    fn finish_shell_output_preserves_clean_output() {
-        let result = finish_shell_output("no credentials here".to_string(), Duration::ZERO, None);
-        assert_eq!(result, "no credentials here");
-    }
-
-    #[test]
-    fn finish_shell_output_appends_elapsed_timing_after_scrub() {
-        // Elapsed timing (≥1s) is appended AFTER credential scrubbing.
-        let result = finish_shell_output(
-            "API_KEY=abcdefghijklmnop".to_string(),
-            Duration::from_secs(5),
-            None,
-        );
-        // Credentials should be scrubbed
-        assert!(!result.contains("abcdefghijklmnop"));
-        // Timing should still be appended
-        assert!(result.contains("[took 5.0s]"));
-    }
-
-    #[test]
-    fn finish_shell_output_idempotent_scrub() {
-        // Double-scrubbing is idempotent: already-scrubbed content
-        // (*[REDACTED] does not match the credential regex).
-        let already_scrubbed = "API_KEY=abcd*[REDACTED]".to_string();
-        let result = finish_shell_output(already_scrubbed.clone(), Duration::ZERO, None);
-        assert_eq!(result, already_scrubbed);
+    fn finish_shell_output_cases() {
+        check_finish(&[
+            FinishCase {
+                name: "scrubs combined inline",
+                combined: "API_KEY=abcdefghijklmnop",
+                elapsed: Duration::ZERO,
+                pre: None,
+                check: &["abcd*[REDACTED]"],
+                not_check: &["abcdefghijklmnop"],
+                eq: None,
+            },
+            FinishCase {
+                name: "scrubs combined in pre-truncation path",
+                combined: "SECRET=wxyz1234abcdefgh",
+                elapsed: Duration::ZERO,
+                pre: Some("x"),
+                check: &["wxyz*[REDACTED]", "[Output saved to"],
+                not_check: &["wxyz1234abcdefgh"],
+                eq: None,
+            },
+            FinishCase {
+                name: "preserves clean output",
+                combined: "no credentials here",
+                elapsed: Duration::ZERO,
+                pre: None,
+                check: &[],
+                not_check: &[],
+                eq: Some("no credentials here"),
+            },
+            FinishCase {
+                name: "appends elapsed timing after scrub",
+                combined: "API_KEY=abcdefghijklmnop",
+                elapsed: Duration::from_secs(5),
+                pre: None,
+                check: &["[took 5.0s]", "abcd*[REDACTED]"],
+                not_check: &["abcdefghijklmnop"],
+                eq: None,
+            },
+            FinishCase {
+                name: "scrub idempotent",
+                combined: "API_KEY=abcd*[REDACTED]",
+                elapsed: Duration::ZERO,
+                pre: None,
+                check: &[],
+                not_check: &[],
+                eq: Some("API_KEY=abcd*[REDACTED]"),
+            },
+        ]);
     }
 }
