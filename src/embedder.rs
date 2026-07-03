@@ -149,6 +149,10 @@ fn ensure_embedder() -> bool {
     // Thread-local: try to load cached files synchronously
     let Some(models_dir) = models_dir() else {
         // CONFIG not initialized yet — can't locate model cache.
+        // Unlike the no-runtime case below, this condition IS transient:
+        // CONFIG will be initialized during bootstrap. Stay UNINIT so the
+        // next embed() call (which will run under a tokio runtime post-
+        // bootstrap) can retry initialization.
         STATE.store(STATE_UNINIT, Ordering::Release);
         return false;
     };
@@ -175,9 +179,9 @@ fn ensure_embedder() -> bool {
         tokio::spawn(download_retry_loop());
     } else {
         // No tokio runtime available (e.g., in unit tests without runtime).
-        // The download will be triggered on the next call when a runtime exists.
-        // Reset STATE to UNINIT so the next caller re-enters ensure_embedder().
-        STATE.store(STATE_UNINIT, Ordering::Release);
+        // STATE stays LOADING from the CAS above — subsequent calls
+        // short-circuit at the `!= STATE_UNINIT` guard at line 139
+        // without re-entering the initialization path.
     }
 
     false
