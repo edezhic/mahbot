@@ -838,8 +838,6 @@ fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
     }
 }
 
-// ── Helpers — detection ──────────────────────────────────────────
-
 // ── Helpers — async I/O ──────────────────────────────────────────
 
 /// Read a flat list of directory entries for a given path relative to the
@@ -4189,7 +4187,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Navigate to the next find match.
     /// Handle refresh-file-tree — re-reads all expanded directories from disk.
     fn refresh_file_tree(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the file tree should
