@@ -1482,13 +1482,10 @@ impl BoardStore {
 
     /// Returns true if the given workspace has any ticket with a pipeline-blocking
     /// status (dev/review/QA), OR any reserved ReadyForDevelopment ticket that
-    /// was bounced back and is awaiting rework. Used by the maintainer to avoid
-    /// scanning codebases that are actively being changed or about to be changed by rework.
+    /// was bounced back and is awaiting rework.
     ///
-    /// Delegates to `has_active_tickets_internal` with
-    /// `require_reservation = true` and no exclusion filter.
-    ///
-    /// Only used in tests — retained for coverage of the pipeline-blocker query.
+    /// **Test-only query** — retained to provide coverage of the pipeline-blocker SQL.
+    /// Production code uses [`has_active_tickets_excluding`] or [`count_by_status`].
     ///
     /// # Maintenance warning
     /// If a future feature needs this in production, remove the `#[cfg(test)]`
