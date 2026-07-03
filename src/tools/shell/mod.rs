@@ -1838,15 +1838,13 @@ mod tests {
         for &s in contains {
             assert!(
                 result.contains(s),
-                "[{}] expected contains {s:?}\n  got: {result:?}",
-                name,
+                "[{name}] expected contains {s:?}\n  got: {result:?}",
             );
         }
         for &s in not_contains {
             assert!(
                 !result.contains(s),
-                "[{}] expected NOT contains {s:?}\n  got: {result:?}",
-                name,
+                "[{name}] expected NOT contains {s:?}\n  got: {result:?}",
             );
         }
     }
@@ -3304,11 +3302,7 @@ mod tests {
             // exceed SPILL_THRESHOLD_BYTES, triggering the spill-to-file branch
             // in finish_shell_output. This lets us verify that the pre-truncation spill
             // path also scrubs credentials.
-            let pre_owned = case.pre.map(|s| {
-                std::iter::repeat(s)
-                    .take(SPILL_THRESHOLD_BYTES + 1)
-                    .collect::<String>()
-            });
+            let pre_owned = case.pre.map(|s| s.repeat(SPILL_THRESHOLD_BYTES + 1));
             let result = finish_shell_output(
                 case.combined.to_string(),
                 case.elapsed,
