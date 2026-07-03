@@ -421,6 +421,10 @@ impl DiffState {
                 self.clear_diff_state();
                 self.selected_workspace_name = Some(ws_name.clone());
                 self.personal_workspace_path = None;
+                // clear_diff_state() resets all viewing state (file tree, buffers,
+                // error, etc.) including current_commit_ref. We re-establish
+                // current_commit_ref below; the rest stays cleared for the new
+                // commit's diff to load into.
                 // Set commit ref and loading BEFORE spawning task
                 // (prevents Tick race: subscription checks .is_some() to skip).
                 self.current_commit_ref = Some(hash.clone());
