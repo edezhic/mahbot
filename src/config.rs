@@ -733,21 +733,23 @@ pub async fn reload_from_db() -> Result<()> {
 /// config is persisted — no full application restart required.
 ///
 /// Flow:
-/// 1. Validate config values
-/// 2. Validate new Telegram token (if changed) — fails early without DB mutation
-/// 3. Warm-up a temporary provider (no global swap yet)
-/// 4. On success: write to DB, reload CONFIG, swap singletons
-/// 5. If Telegram token changed: hot-reload the listener
+/// 1. Normalize all config values (trim, collapse empty → None, sort vecs).
+/// 2. Validate config values (operates on canonical values after normalization).
+/// 3. Validate new Telegram token (if changed) — fails early without DB mutation.
+/// 4. Warm-up a temporary provider (no global swap yet).
+/// 5. On success: write to DB, reload CONFIG, swap singletons.
+/// 6. If Telegram token changed: hot-reload the listener.
 pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
-    validate_config(&config)?;
-
-    // Normalize BEFORE any DB write or provider warmup so that:
-    //  1. The database always stores canonical values.
-    //  2. The warmup uses exactly the same values that will be swapped
+    // Normalize BEFORE validation, any DB write, or provider warmup so that:
+    //  1. Validation operates on canonical (trimmed, None-normalized) values.
+    //  2. The database always stores canonical values.
+    //  3. The warmup uses exactly the same values that will be swapped
     //     into the global CONFIG — no risk of a valid config change being
     //     rejected due to superficial differences (e.g. leading/trailing
     //     whitespace) that finalize would have stripped anyway.
     config.finalize();
+
+    validate_config(&config)?;
 
     // Capture old Telegram token BEFORE we mutate DB so we can detect
     // changes and trigger hot-reload after persistence succeeds.
@@ -1310,5 +1312,57 @@ mod tests {
         // Total entries unchanged — no spurious pushes.
         assert_eq!(configs.len(), 2);
         assert_eq!(routings.len(), 2);
+    }
+
+    // ── validate_config tests ──────────────────────────────────────
+
+    /// A valid URL (trimmed) passes validation.
+    #[test]
+    fn validate_config_accepts_valid_url() {
+        let mut config = ConfigData::default();
+        config.provider_endpoint = Some("https://openrouter.ai/api/v1".into());
+        config.finalize();
+        validate_config(&config).unwrap();
+    }
+
+    /// A whitespace-padded URL passes validation after `finalize` normalises
+    /// it.  This is a regression test for the latent ordering bug where
+    /// `validate_config` (which used untrimmed `starts_with`) ran *before*
+    /// `finalize` (which trims).  The fix ensures `finalize` always runs
+    /// first, so validation only ever sees canonical values.
+    #[test]
+    fn validate_config_accepts_whitespace_padded_url_after_finalize() {
+        let mut config = ConfigData::default();
+        config.provider_endpoint = Some("  https://openrouter.ai/api/v1   ".into());
+        config.finalize();
+        // After finalize the value is trimmed — validation sees the canonical form.
+        validate_config(&config).unwrap();
+    }
+
+    /// A URL without scheme is rejected regardless of whitespace.
+    #[test]
+    fn validate_config_rejects_url_without_scheme() {
+        let mut config = ConfigData::default();
+        config.provider_endpoint = Some("not-a-url".into());
+        config.finalize();
+        let err = validate_config(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Provider endpoint must be a valid URL"),
+            "expected URL scheme error, got: {err}",
+        );
+    }
+
+    /// A placeholder provider key is rejected.
+    #[test]
+    fn validate_config_rejects_placeholder_key() {
+        let mut config = ConfigData::default();
+        config.provider_key = Some("sk-...".into());
+        config.finalize();
+        let err = validate_config(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("placeholder"),
+            "expected placeholder error, got: {err}",
+        );
     }
 }
