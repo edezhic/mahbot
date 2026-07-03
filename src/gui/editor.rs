@@ -2676,6 +2676,11 @@ impl EditorState {
         if !dir_path.is_empty() && self.dir_generations.get(dir_path) != Some(&r#gen) {
             return Task::none();
         }
+        // Consume the generation slot (mirroring the pattern in rename_completed).
+        // The entry is no longer needed once the matching result has been accepted.
+        if !dir_path.is_empty() {
+            self.dir_generations.remove(dir_path);
+        }
 
         self.loading_dirs.remove(dir_path);
 
@@ -2718,6 +2723,10 @@ impl EditorState {
         if self.file_generations.get(path).copied() != Some(r#gen) {
             return Task::none();
         }
+        // Consume the generation slot — it has served its purpose.
+        // This prevents unbounded accumulation in the map without
+        // requiring removal code at every close/delete/rename path.
+        self.file_generations.remove(path);
 
         match result {
             Ok(data) => {
@@ -3779,20 +3788,30 @@ impl EditorState {
                     }
                 }
 
-                // ── Migrate file_mtimes and deleted_file_toasted ──
+                // ── Migrate file_mtimes, deleted_file_toasted, and file_generations ──
                 // Re-key entries from old absolute path to new absolute
-                // path so auto-refresh doesn't spuriously stat the old path.
+                // path so auto-refresh doesn't spuriously stat the old path
+                // and in-flight FileLoaded results are properly validated.
                 if is_dir {
                     let old_abs_prefix = format!("{old_abs}/");
                     rekey_map_prefix(&mut self.file_mtimes, &old_abs_prefix, &new_abs, |_| {});
                     rekey_set_prefix(&mut self.deleted_file_toasted, &old_abs_prefix, &new_abs);
+                    rekey_map_prefix(
+                        &mut self.file_generations,
+                        &old_abs_prefix,
+                        &new_abs,
+                        |_| {},
+                    );
                 } else {
                     // File rename — migrate single entry.
                     if let Some(mtime) = self.file_mtimes.remove(&old_abs) {
                         self.file_mtimes.insert(new_abs.clone(), mtime);
                     }
                     if self.deleted_file_toasted.remove(&old_abs) {
-                        self.deleted_file_toasted.insert(new_abs);
+                        self.deleted_file_toasted.insert(new_abs.clone());
+                    }
+                    if let Some(file_gen) = self.file_generations.remove(&old_abs) {
+                        self.file_generations.insert(new_abs.clone(), file_gen);
                     }
                 }
 
