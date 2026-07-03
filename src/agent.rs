@@ -1,24 +1,16 @@
 use std::time::Instant;
 
-use crate::providers::reasoning_roundtrip::{
-    assistant_replay_payload, coalesce_streamed_reasoning_details, merge_reasoning_details_delta,
-    push_reasoning_delta,
-};
-use crate::providers::{chat, stream_chat};
+use crate::providers::chat;
+use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
     AskTool, DispatchMode, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
     normalize_tool_call, sanitize_success_tool_output,
 };
-use crate::util::strip_think_tags;
 use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
-use crate::{
-    Agent, ChatMessage, ChatRequest, ChatResponse, Reasoning, Role, StreamChunk, StreamEvent, Tool,
-    ToolCall, ToolOutputPhase,
-};
+use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Role, Tool, ToolCall, ToolOutputPhase};
 use std::fmt::Write;
 use std::sync::Arc;
-use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -482,15 +474,7 @@ impl Agent {
             self.role.requires_multimodal(),
         );
 
-        let response = match stream_assistant_response(request.clone()).await {
-            Ok(response) => response,
-            Err(stream_err) => {
-                tracing::warn!(
-                    "provider streaming failed, falling back to non-streaming chat: {stream_err}"
-                );
-                chat(request).await?
-            }
-        };
+        let response = chat(request).await?;
 
         Ok(response)
     }
@@ -677,58 +661,6 @@ impl Agent {
 
         Ok(crate::util::truncate(&summary_text, 32_000))
     }
-}
-
-/// Try to stream a full assistant response from the provider.
-///
-/// Accumulates deltas, reasoning, and tool calls from the stream,
-/// then coalesces reasoning details into the response.
-async fn stream_assistant_response(request: ChatRequest) -> anyhow::Result<ChatResponse> {
-    let mut provider_stream = stream_chat(request);
-    let mut response_text = String::new();
-    let mut reasoning: Option<String> = None;
-    let mut reasoning_content: Option<String> = None;
-    let mut reasoning_details: Vec<serde_json::Value> = Vec::new();
-    let mut tool_calls: Vec<ToolCall> = Vec::new();
-
-    while let Some(event_result) = provider_stream.next().await {
-        let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
-        match event {
-            StreamEvent::Final => break,
-            StreamEvent::ToolCall(tool_call) => {
-                tool_calls.push(tool_call);
-            }
-            StreamEvent::TextDelta(chunk) => {
-                let StreamChunk {
-                    delta,
-                    reasoning: reason,
-                } = chunk;
-                if let Some(patch) = reason {
-                    push_reasoning_delta(&mut reasoning, patch.reasoning);
-                    push_reasoning_delta(&mut reasoning_content, patch.reasoning_content);
-                    if let Some(d) = patch.reasoning_details {
-                        merge_reasoning_details_delta(&mut reasoning_details, d);
-                    }
-                }
-                response_text.push_str(&delta);
-            }
-        }
-    }
-
-    let coalesced_details = coalesce_streamed_reasoning_details(&reasoning_details);
-    let reasoning = Reasoning::from_optional_parts(reasoning, reasoning_content, coalesced_details);
-
-    // Strip <think>...</think> blocks that some models embed inline in content.
-    // Returns None when stripping leaves an empty string (the model only emitted
-    // reasoning wrapped in think tags — fall through to reasoning display).
-    let text = strip_think_tags(&response_text);
-
-    Ok(ChatResponse {
-        text,
-        tool_calls,
-        usage: None,
-        reasoning,
-    })
 }
 
 /// Result of preparing an assistant turn from the LLM response.
