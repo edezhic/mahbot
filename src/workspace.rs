@@ -20,11 +20,6 @@ crate::define_store! {
     expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",
 }
 
-/// Look up a workspace by its filesystem path.
-pub async fn get_by_path(path: &str) -> Result<Option<Workspace>> {
-    store().get_by_path(path).await
-}
-
 /// Look up a workspace by its name.
 pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
     store().get_by_name(name).await
@@ -534,12 +529,6 @@ impl WorkspaceStore {
     /// Look up a workspace by name.
     pub async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
         self.query_one("name = ?1", turso::params![name]).await
-    }
-
-    /// Look up a workspace by its filesystem path.
-    pub async fn get_by_path(&self, path: &str) -> Result<Option<Workspace>> {
-        self.query_one("path = ?1", turso::params![normalize_path(path)])
-            .await
     }
 
     /// Delete a workspace by name. Context rows are cascaded automatically.
