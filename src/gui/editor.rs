@@ -32,9 +32,8 @@ use fff_search::parse_grep_query;
 
 use super::context_menu::ContextMenu;
 
-use crate::diff_parse::{
-    is_git_repo, run_git_check_ignore, run_git_raw, run_git_status, unquote_c_style,
-};
+use crate::diff_parse::unquote_c_style;
+use crate::git_commands::{is_git_repo, run_git_check_ignore, run_git_raw, run_git_status};
 
 use super::editor_widget::{LineEnding, detect_line_ending, has_trailing_newline};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;

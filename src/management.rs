@@ -29,7 +29,7 @@ use futures_util::future::join_all;
 
 use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, Ticket, TicketComment, TicketPhase};
-use crate::diff_parse::list_new_or_untracked_files;
+use crate::git_commands::list_new_or_untracked_files;
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
@@ -1159,16 +1159,16 @@ async fn transition_ticket_to_failed(
 ///
 /// Checks for a dirty working tree via `git status --porcelain`:
 /// - **Clean tree:** skips commit, transitions directly to Done with notification.
-/// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::diff_parse::run_git_commit`].
+/// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::git_commands::run_git_commit`].
 /// - **Commit failure:** ticket stays in `source`, poller retries next cycle.
 /// - **Not a git repo / no git installed:** transitions to Done without commit.
 async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    let comment = if !crate::diff_parse::git_is_installed().await {
+    let comment = if !crate::git_commands::git_is_installed().await {
         Some("Git not installed — moving to Done without commit")
-    } else if !crate::diff_parse::is_git_repo(repo_path) {
+    } else if !crate::git_commands::is_git_repo(repo_path) {
         Some("Not a git repo — moving to Done without commit")
     } else {
         None
@@ -1178,7 +1178,7 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
         return;
     }
 
-    let has_changes = match crate::diff_parse::run_git_status(repo_path).await {
+    let has_changes = match crate::git_commands::run_git_status(repo_path).await {
         Ok(output) => !output.trim().is_empty(),
         Err(e) => {
             warn!(
@@ -1200,7 +1200,7 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
         return;
     }
 
-    match crate::diff_parse::run_git_commit(repo_path, &ticket.title).await {
+    match crate::git_commands::run_git_commit(repo_path, &ticket.title).await {
         Ok(commit_info) => {
             commit_and_transition_ticket_from(&ticket, commit_info, source).await;
         }
@@ -1221,7 +1221,7 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
 /// SanitationPassed→Done flows share the same implementation.
 async fn commit_and_transition_ticket_from(
     ticket: &Ticket,
-    commit_info: crate::diff_parse::CommitInfo,
+    commit_info: crate::git_commands::CommitInfo,
     source: TicketPhase,
 ) {
     let short_hash = commit_info.hash.get(..7).unwrap_or(&commit_info.hash);
@@ -1310,7 +1310,9 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
     // Only check git if it's available and the repo exists.
-    if !crate::diff_parse::git_is_installed().await || !crate::diff_parse::is_git_repo(repo_path) {
+    if !crate::git_commands::git_is_installed().await
+        || !crate::git_commands::is_git_repo(repo_path)
+    {
         finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
         return;
     }
@@ -3503,7 +3505,7 @@ mod tests {
     #[tokio::test]
     async fn handle_qa_passed_untracked_files_to_insanitation() {
         // Skip if git is not installed — the test cannot create a repo.
-        if !crate::diff_parse::git_is_installed().await {
+        if !crate::git_commands::git_is_installed().await {
             eprintln!("git not installed — skipping git-dependent test");
             return;
         }

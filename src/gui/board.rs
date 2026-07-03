@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use crate::Role;
 use crate::board::{Ticket, TicketPhase, UNBLOCKING_STATUSES};
-use crate::diff_parse::{parse_numstat_lines, run_git_raw};
+use crate::git_commands::{parse_numstat_lines, run_git_raw};
 
 use iced::widget::{
     Column, Row, Space, button, column, container, markdown, row, scrollable, text, tooltip,

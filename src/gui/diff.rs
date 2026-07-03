@@ -14,10 +14,10 @@ use super::diff_widget::{self, ADDED_COLOR, DiffBufferWidget, DiffFileBuffer, RE
 use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
 use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 
-use crate::diff_parse::{
-    CommitInfo, DiffFileStatus, DiffLineKind, git_has_commits, git_is_installed, is_git_repo,
-    make_untracked_diff_file, parse_git_diff, parse_untracked_from_porcelain, run_git_command,
-    run_git_commit, run_git_diff, run_git_show, run_git_status,
+use crate::diff_parse::{DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff};
+use crate::git_commands::{
+    CommitInfo, git_has_commits, git_is_installed, is_git_repo, parse_untracked_from_porcelain,
+    run_git_command, run_git_commit, run_git_diff, run_git_show, run_git_status,
 };
 
 use iced::widget::Id;
@@ -443,7 +443,7 @@ impl DiffState {
                     async move {
                         let ws_path = resolve_workspace_path(&msg_ws, None).await;
                         match ws_path {
-                            Ok(path) => crate::diff_parse::run_git_commit_message(
+                            Ok(path) => crate::git_commands::run_git_commit_message(
                                 &path,
                                 Some(&msg_hash_for_git),
                             )

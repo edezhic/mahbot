@@ -21,6 +21,7 @@ pub mod debug;
 pub mod diff_parse;
 pub mod embedder;
 pub mod extraction;
+pub mod git_commands;
 pub mod gui;
 pub mod logs;
 pub mod maintainer;

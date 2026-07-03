@@ -244,7 +244,7 @@ impl GitState {
                         match ws_path {
                             Some(path) => {
                                 let path = PathBuf::from(path);
-                                let out = crate::diff_parse::run_git_command(
+                                let out = crate::git_commands::run_git_command(
                                     &path,
                                     &["branch", "--format=%(refname:short)"],
                                 )
@@ -280,7 +280,7 @@ impl GitState {
                         match ws_path {
                             Some(path) => {
                                 let path = PathBuf::from(path);
-                                crate::diff_parse::run_git_sync(&path).await
+                                crate::git_commands::run_git_sync(&path).await
                             }
                             None => Err("No workspace path".to_string()),
                         }
@@ -318,7 +318,7 @@ impl GitState {
                         match ws_path {
                             Some(path) => {
                                 let path = PathBuf::from(path);
-                                crate::diff_parse::run_git_command(
+                                crate::git_commands::run_git_command(
                                     &path,
                                     &["switch", branch_clone.as_str()],
                                 )
@@ -365,7 +365,7 @@ impl GitState {
                         match ws_path {
                             Some(path) => {
                                 let path = PathBuf::from(path);
-                                crate::diff_parse::run_git_command(
+                                crate::git_commands::run_git_command(
                                     &path,
                                     &["switch", "-c", branch_clone.as_str()],
                                 )
@@ -534,7 +534,7 @@ impl GitState {
     /// branch, and behind/ahead counts. Returns a batch of tasks that
     /// produce [`GitMessage`] results.
     fn refresh_inner(path: PathBuf) -> Task<GitMessage> {
-        if !crate::diff_parse::is_git_repo(&path) {
+        if !crate::git_commands::is_git_repo(&path) {
             return Task::none();
         }
 
@@ -542,7 +542,7 @@ impl GitState {
         let stats_path = path.clone();
         let stats_task = Task::perform(
             async move {
-                match crate::diff_parse::run_git_diff_stats(&stats_path).await {
+                match crate::git_commands::run_git_diff_stats(&stats_path).await {
                     Ok(stats) => GitMessage::DiffStats(Some(stats)),
                     Err(_) => GitMessage::DiffStats(None),
                 }
@@ -554,7 +554,7 @@ impl GitState {
         let branch_path = path.clone();
         let branch_task = Task::perform(
             async move {
-                match crate::diff_parse::run_git_current_branch(&branch_path).await {
+                match crate::git_commands::run_git_current_branch(&branch_path).await {
                     Ok(b) => GitMessage::CurrentBranch(Some(b)),
                     Err(_) => GitMessage::CurrentBranch(None),
                 }
@@ -566,7 +566,7 @@ impl GitState {
         let ahead_path = path;
         let ahead_task = Task::perform(
             async move {
-                match crate::diff_parse::run_git_behind_ahead(&ahead_path).await {
+                match crate::git_commands::run_git_behind_ahead(&ahead_path).await {
                     Ok(ba) if ba.0 > 0 || ba.1 > 0 => GitMessage::BehindAhead(Some(ba)),
                     _ => GitMessage::BehindAhead(None),
                 }

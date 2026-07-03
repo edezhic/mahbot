@@ -18,7 +18,7 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::diff_parse::run_git_raw;
+use crate::git_commands::run_git_raw;
 use crate::turso::{self, TxGuard};
 use anyhow::Result;
 use serde::Serialize;
