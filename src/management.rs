@@ -389,7 +389,7 @@ fn warn_transition_failed(
 /// The caller must provide exactly one required `comment` and an optional
 /// second `extra` comment. All comments and the phase transition are written
 /// in a single database transaction. The type signature enforces that at
-/// least one comment is always written — an empty or missing comment is a
+/// least one comment is always written — a missing comment is a
 /// compile-time error, not a runtime panic.
 ///
 /// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
