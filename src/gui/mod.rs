@@ -47,8 +47,6 @@ use self::context_menu::ContextMenu;
 
 use iced_fonts::lucide;
 
-use widgets::PickOption;
-
 /// JetBrains Mono as the dashboard default font.
 /// Registered at startup via `.default_font()` on the Iced application builder,
 /// so all text widgets use JetBrains Mono by default. The font bytes are loaded
@@ -208,9 +206,8 @@ pub enum Message {
     /// No-op — produced by refresh helpers on transient DB errors to avoid
     /// sending empty state maps that would wipe cached toggle state.
     Nop,
-    /// Workspace options loaded during boot (options, paths, paused, maintenance, restored selection).
+    /// Workspace paths and state loaded during boot (paths, paused, maintenance, restored selection).
     BootWorkspaces(
-        Vec<PickOption>,
         HashMap<String, String>,
         HashMap<String, bool>,
         HashMap<String, bool>,
@@ -565,7 +562,7 @@ impl Dashboard {
 
         match message {
             Message::Boot(result) => self.finish_boot(result),
-            Message::BootWorkspaces(_, paths, paused_map, maintenance_map, restored_name) => {
+            Message::BootWorkspaces(paths, paused_map, maintenance_map, restored_name) => {
                 self.workspace_paths = paths;
                 self.workspace_paused = paused_map;
                 self.workspace_maintenance = maintenance_map;
@@ -2230,34 +2227,22 @@ fn refresh_workspace_states_task() -> Task<Message> {
     )
 }
 
-/// Load workspace `PickOption` list and path map from the workspace store,
-/// resolving `prev_selection` against the loaded list. Falls back to the
-/// first available workspace when `prev_selection` is absent or stale.
+/// Load workspace path and state maps from the workspace store, resolving
+/// `prev_selection` against the loaded list. Falls back to an empty-string
+/// "Personal" default when `prev_selection` is absent or stale.
 /// Returns a `BootWorkspaces` message ready for use with `Task::perform`.
 async fn load_workspace_options(prev_selection: Option<String>) -> Message {
     let store = crate::workspace::store();
-    let mut options = Vec::new();
     let mut paths = HashMap::new();
     let mut paused_map = HashMap::new();
     let mut maintenance_map = HashMap::new();
     let mut restored_name = None;
 
-    // "Personal" option — represents a user's personal workspace (selected_workspace=NULL).
-    options.push(PickOption {
-        value: String::new(),
-        label: "Personal".to_string(),
-    });
-
     if let Ok(ws_list) = store.list().await {
         for ws in &ws_list {
-            let display = ws.display_name();
             paths.insert(ws.name.clone(), ws.path.clone());
             paused_map.insert(ws.name.clone(), ws.paused);
             maintenance_map.insert(ws.name.clone(), ws.maintenance);
-            options.push(PickOption {
-                value: ws.name.clone(),
-                label: display,
-            });
         }
     }
 
@@ -2267,11 +2252,11 @@ async fn load_workspace_options(prev_selection: Option<String>) -> Message {
             restored_name = Some(name.clone());
         }
     }
-    if restored_name.is_none() && !options.is_empty() {
-        restored_name = Some(options[0].value.clone());
+    if restored_name.is_none() {
+        restored_name = Some(String::new());
     }
 
-    Message::BootWorkspaces(options, paths, paused_map, maintenance_map, restored_name)
+    Message::BootWorkspaces(paths, paused_map, maintenance_map, restored_name)
 }
 
 /// Open a URL in the system browser (fire-and-forget).
