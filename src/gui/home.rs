@@ -961,11 +961,6 @@ impl HomeState {
                 self.history_loaded = false;
                 self.reset_pagination_state();
 
-                // NOTE: We deliberately do NOT write the sidebar workspace to
-                // the impersonated user's DB record.  The GUI sidebar is a
-                // per-session context — persisting it would silently
-                // overwrite the user's real workspace choice (see mahbot-557).
-
                 Task::perform(
                     Self::resolve_user_workspace_sync(user, self.selected_workspace.clone()),
                     |msg| msg,
@@ -977,11 +972,6 @@ impl HomeState {
                 self.seen_ids.clear();
                 self.history_loaded = false;
                 self.reset_pagination_state();
-
-                // NOTE: We deliberately do NOT persist the sidebar workspace
-                // selection to the impersonated user's DB record.  The
-                // sidebar is a per-session context; writing it would
-                // silently corrupt the user's real workspace (mahbot-557).
 
                 // When a user is already selected, refresh history immediately.
                 // Otherwise defer — `ResolveUserSelected` will pick it up once
