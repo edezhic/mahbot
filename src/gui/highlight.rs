@@ -11,6 +11,7 @@
 
 use iced::Color;
 use std::sync::OnceLock;
+use strum::EnumCount;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 use tree_sitter_md::{INLINE_LANGUAGE as MD_INLINE_LANG, MarkdownParser, MarkdownTree};
 // Built-in highlight queries for new languages (ticket mahbot-1244).
@@ -35,16 +36,12 @@ use super::theme;
 // the HighlightLanguage::Markdown variant (which uses the block grammar).
 static MARKDOWN_INLINE_QUERY: OnceLock<Option<Query>> = OnceLock::new();
 
-/// Number of [`HighlightLanguage`] variants (used as the array size for
-/// the query cache). Kept in sync with the enum — if a variant is added or
-/// removed this constant must be updated. The array index relies on
-/// `#[repr(usize)]` so the variant order must match the enum declaration.
-const N_LANGS: usize = HighlightLanguage::Markdown as usize + 1;
-
 /// Per-language highlight query cache, indexed by `#[repr(usize)]`
 /// discriminant of [`HighlightLanguage`]. Initialised lazily on first
-/// access via [`cached_query`].
-static QUERIES: [OnceLock<Option<Query>>; N_LANGS] = [const { OnceLock::new() }; N_LANGS];
+/// access via [`cached_query`]. Array size is automatically determined
+/// from the enum variant count via `strum::EnumCount`.
+static QUERIES: [OnceLock<Option<Query>>; HighlightLanguage::COUNT] =
+    [const { OnceLock::new() }; HighlightLanguage::COUNT];
 
 /// Get (or compile) the highlight query for a language.
 /// Returns None if the query is invalid (should not happen with baked-in queries).
@@ -489,7 +486,7 @@ fn capture_class(capture_name: &str) -> HighlightClass {
 // ── Language definitions ──────────────────────────────────────────────
 
 /// Supported languages for syntax highlighting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount)]
 #[repr(usize)]
 pub enum HighlightLanguage {
     Rust,
