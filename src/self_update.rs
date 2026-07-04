@@ -648,23 +648,6 @@ async fn copy_to_cargo_bin(
         return None;
     }
 
-    // Set executable permissions on the temp file (before rename, so the
-    // target never exists without proper permissions).
-    // Rust's fs::copy preserves permission bits on Unix, so this is a
-    // belt-and-suspenders measure rather than a necessity.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(&tmp_path, PermissionsExt::from_mode(0o755)) {
-            warn!(
-                error = %e,
-                path = %tmp_path.display(),
-                "Failed to set executable permissions on temp binary \
-                 (permissions likely preserved by fs::copy)"
-            );
-        }
-    }
-
     // Atomically replace the target with the temp file.
     if let Err(e) = fs::rename(&tmp_path, dest) {
         warn!(
