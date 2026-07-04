@@ -1327,8 +1327,10 @@ mod tests {
     /// A valid URL (trimmed) passes validation.
     #[test]
     fn validate_config_accepts_valid_url() {
-        let mut config = ConfigData::default();
-        config.provider_endpoint = Some("https://openrouter.ai/api/v1".into());
+        let mut config = ConfigData {
+            provider_endpoint: Some("https://openrouter.ai/api/v1".into()),
+            ..Default::default()
+        };
         config.finalize();
         validate_config(&config).unwrap();
     }
@@ -1340,8 +1342,10 @@ mod tests {
     /// first, so validation only ever sees canonical values.
     #[test]
     fn validate_config_accepts_whitespace_padded_url_after_finalize() {
-        let mut config = ConfigData::default();
-        config.provider_endpoint = Some("  https://openrouter.ai/api/v1   ".into());
+        let mut config = ConfigData {
+            provider_endpoint: Some("  https://openrouter.ai/api/v1   ".into()),
+            ..Default::default()
+        };
         config.finalize();
         // After finalize the value is trimmed — validation sees the canonical form.
         validate_config(&config).unwrap();
@@ -1350,8 +1354,10 @@ mod tests {
     /// A URL without scheme is rejected regardless of whitespace.
     #[test]
     fn validate_config_rejects_url_without_scheme() {
-        let mut config = ConfigData::default();
-        config.provider_endpoint = Some("not-a-url".into());
+        let mut config = ConfigData {
+            provider_endpoint: Some("not-a-url".into()),
+            ..Default::default()
+        };
         config.finalize();
         let err = validate_config(&config).unwrap_err();
         assert!(
@@ -1364,8 +1370,10 @@ mod tests {
     /// A placeholder provider key is rejected.
     #[test]
     fn validate_config_rejects_placeholder_key() {
-        let mut config = ConfigData::default();
-        config.provider_key = Some("sk-...".into());
+        let mut config = ConfigData {
+            provider_key: Some("sk-...".into()),
+            ..Default::default()
+        };
         config.finalize();
         let err = validate_config(&config).unwrap_err();
         assert!(

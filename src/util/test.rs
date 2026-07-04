@@ -89,10 +89,11 @@ impl Drop for EnvVarGuard {
 /// let path = resolve_cargo_bin_path();
 /// // _guard drops here, restoring CARGO_HOME to its original value
 /// ```
+#[must_use]
 pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
     let guard = env_lock()
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original = std::env::var_os(key);
     // SAFETY: Protected by the env_lock acquired above — no concurrent
     // env writes can happen from other test threads.

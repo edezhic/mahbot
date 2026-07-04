@@ -272,6 +272,7 @@ mod tests {
     // ── config_role lifecycle ──────────────────────────────────
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_config_role_lifecycle() {
         let (store, _dir) = setup().await;
 
@@ -415,6 +416,7 @@ mod tests {
     // ── config_model_routing lifecycle ─────────────────────────
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_config_model_routing_lifecycle() {
         let (store, _dir) = setup().await;
 

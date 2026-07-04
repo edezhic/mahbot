@@ -2346,7 +2346,7 @@ mod tests {
         let mut cmd = {
             let _guard = env_lock()
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             build_shell_command("env", tmp.path())
         };
 
