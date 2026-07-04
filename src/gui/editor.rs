@@ -1469,6 +1469,10 @@ pub struct EditorState {
     selected_workspace_path: Option<String>,
     /// Monotonically increasing generation counter for stale-result prevention.
     generation: u64,
+    /// Monotonically increasing generation counter for saved-tabs restoration,
+    /// kept separate from `generation` to avoid collision with file loads and
+    /// directory expansions that are dispatched concurrently.
+    saved_tabs_gen: u64,
     /// Per-directory generation counters.
     dir_generations: HashMap<String, u64>,
     /// Per-file generation counters (prevents stale FileLoaded results).
@@ -1570,6 +1574,7 @@ impl EditorState {
             selected_workspace_name: None,
             selected_workspace_path: None,
             generation: 0,
+            saved_tabs_gen: 0,
             dir_generations: HashMap::new(),
             file_generations: HashMap::new(),
             loading_dirs: HashSet::new(),
@@ -2214,8 +2219,8 @@ impl EditorState {
     }
 
     /// Clear all workspace-scoped editor state when switching workspaces.
-    /// Does not touch `selected_workspace_name`, `selected_workspace_path`, or `generation`
-    /// — those are managed at the call site.
+    /// Does not touch `selected_workspace_name`, `selected_workspace_path`,
+    /// `generation`, or `saved_tabs_gen` — those are managed at the call site.
     fn clear_workspace_editor_state(&mut self) {
         self.file_tree.nodes.clear();
         self.file_tree.expanded_dirs.clear();
@@ -2497,9 +2502,11 @@ impl EditorState {
         self.selected_workspace_name = Some(name.to_string());
         self.selected_workspace_path = path.map(std::string::ToString::to_string);
 
-        // Clear previous state.
+        // Clear previous state and bump both generation counters.
         let r#gen = self.generation.wrapping_add(1);
         self.generation = r#gen;
+        let saved_gen = self.saved_tabs_gen.wrapping_add(1);
+        self.saved_tabs_gen = saved_gen;
         self.clear_workspace_editor_state();
 
         // ── Task 1: read root directory ───────────────────────
@@ -2522,7 +2529,7 @@ impl EditorState {
         // ── Task 2: load tabs from DB + file contents ────────
         let tab_ws = name.to_string();
         let tab_path = path.unwrap_or_default().to_string();
-        let tab_gen = r#gen;
+        let tab_gen = saved_gen;
         let load_tabs_task = Task::perform(
             async move {
                 let store = crate::workspace::store();
@@ -2605,7 +2612,7 @@ impl EditorState {
         tabs_data: Vec<SavedTabData>,
         r#gen: u64,
     ) -> Task<EditorMessage> {
-        if r#gen != self.generation {
+        if r#gen != self.saved_tabs_gen {
             return Task::none();
         }
 
