@@ -1407,56 +1407,59 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
-    if crate::git_commands::git_is_installed().await && crate::git_commands::is_git_repo(repo_path)
+    // Git not available or not a git repo — finalize directly.
+    if !crate::git_commands::git_is_installed().await
+        || !crate::git_commands::is_git_repo(repo_path)
     {
-        match list_new_or_untracked_files(repo_path).await {
-            Ok(untracked) if !untracked.is_empty() => {
-                // Untracked files exist — claim this specific ticket to InSanitation
-                // via the dedicated claim_sanitation method (see BoardStore docs).
-                let claimed = match board().claim_sanitation(&ticket.id).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(
-                            ticket = %ticket.id,
-                            error = %e,
-                            "Failed to transition QaPassed ticket to InSanitation"
-                        );
-                        return;
-                    }
-                };
+        finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
+        return;
+    }
 
-                if !claimed {
-                    debug!(
+    match list_new_or_untracked_files(repo_path).await {
+        Ok(untracked) if !untracked.is_empty() => {
+            // Untracked files exist — claim this specific ticket to InSanitation
+            // via the dedicated claim_sanitation method (see BoardStore docs).
+            let claimed = match board().claim_sanitation(&ticket.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
                         ticket = %ticket.id,
-                        "QaPassed ticket moved externally — skipping sanitation dispatch",
+                        error = %e,
+                        "Failed to transition QaPassed ticket to InSanitation"
                     );
                     return;
                 }
+            };
 
-                ticket_buffer::push(
-                    &ticket.workspace_name,
-                    &ticket.id,
-                    TicketPhase::QaPassed,
-                    TicketPhase::InSanitation,
-                );
-
-                spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
-                return;
-            }
-            Ok(_) => {} // no untracked/new files — fall through to finalize
-            Err(e) => {
-                warn!(
+            if !claimed {
+                debug!(
                     ticket = %ticket.id,
-                    error = %e,
-                    "Failed to check git status for untracked files — staying in QaPassed for retry"
+                    "QaPassed ticket moved externally — skipping sanitation dispatch",
                 );
                 return;
             }
+
+            ticket_buffer::push(
+                &ticket.workspace_name,
+                &ticket.id,
+                TicketPhase::QaPassed,
+                TicketPhase::InSanitation,
+            );
+
+            spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
+        }
+        Ok(_) => {
+            // No untracked/new files — finalize to Done.
+            finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
+        }
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to check git status for untracked files — staying in QaPassed for retry"
+            );
         }
     }
-
-    // Git not available, not a git repo, or no untracked/new files — finalize.
-    finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
 }
 
 /// Record a sanitation failure: add a system comment for the circuit breaker
