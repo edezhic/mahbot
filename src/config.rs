@@ -435,13 +435,13 @@ pub(crate) fn parse_newline_list(s: &str) -> Vec<String> {
 /// The value is trimmed before being returned.
 /// Delegates to [`trimmed_or_none`].
 #[must_use]
-fn non_empty(val: Option<String>) -> Option<String> {
+pub(crate) fn non_empty(val: Option<String>) -> Option<String> {
     val.and_then(|s| trimmed_or_none(&s))
 }
 
 /// Resolve a value with a fallback: use `val` if non-empty (after trimming), else `fallback`.
 #[must_use]
-fn resolve_or(val: Option<String>, fallback: &str) -> String {
+pub(crate) fn resolve_or(val: Option<String>, fallback: &str) -> String {
     non_empty(val).unwrap_or(fallback.to_string())
 }
 
@@ -723,9 +723,11 @@ pub async fn reload_from_db() -> Result<()> {
 /// Persist a [`ConfigData`] snapshot to the config database, reload runtime
 /// config, and recreate provider/transcriber singletons.
 ///
-/// Atomicity guarantee: provider recreation is attempted **before** committing
-/// to DB. If warmup fails (bad key, network error), the DB and CONFIG are
-/// unchanged and the existing provider continues serving.
+/// Atomicity guarantee: provider recreation is fully completed **before**
+/// the global [`CONFIG`] singleton is swapped. If recreation fails (transient
+/// network error), the DB has the new config but `CONFIG` and the running
+/// provider/transcriber globals remain unchanged. On the next restart the
+/// new config is loaded from the DB and goes through the full warmup sequence.
 ///
 /// If the Telegram bot token changed, the listener is hot-reloaded after the
 /// config is persisted — no full application restart required.
@@ -735,8 +737,10 @@ pub async fn reload_from_db() -> Result<()> {
 /// 2. Validate config values (operates on canonical values after normalization).
 /// 3. Validate new Telegram token (if changed) — fails early without DB mutation.
 /// 4. Warm-up a temporary provider (no global swap yet).
-/// 5. On success: write to DB, reload CONFIG, swap singletons.
-/// 6. If Telegram token changed: hot-reload the listener.
+/// 5. On success: write to DB.
+/// 6. Recreate all provider/transcriber singletons from the new config.
+/// 7. Swap the global [`CONFIG`] singleton.
+/// 8. If Telegram token changed: hot-reload the listener.
 pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // Normalize BEFORE validation, any DB write, or provider warmup so that:
     //  1. Validation operates on canonical (trimmed, None-normalized) values.
@@ -787,12 +791,18 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     .await?;
     tx.commit().await?;
 
-    // Warmup succeeded above — now swap the normalized config into the global
-    // singleton and recreate providers so the runtime reflects the new values.
+    // Recreate provider/transcriber singletons from the new config BEFORE
+    // swapping CONFIG. If this fails (transient network error), the database
+    // has the new config but CONFIG and the running globals remain unchanged.
+    // On restart the new config goes through the full warmup sequence.
+    crate::providers::recreate_all(&config).await?;
+    tracing::info!("Provider and transcriber singletons recreated from new config");
+
+    // Now swap the normalized config into the global singleton so readers
+    // see the latest values.
     let new_token = config.telegram_bot_token.clone();
     CONFIG.swap(config);
     tracing::info!("Config saved and swapped into runtime");
-    crate::providers::recreate_all().await?;
 
     // Do this AFTER the DB and CONFIG have been updated so the
     // running listener reflects the persisted state.

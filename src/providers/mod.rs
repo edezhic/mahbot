@@ -9,7 +9,7 @@ pub mod reasoning_roundtrip;
 pub mod reliable;
 pub mod transcribe;
 
-use crate::config::{CONFIG, trimmed_or_none};
+use crate::config::{CONFIG, non_empty, resolve_or, trimmed_or_none};
 use crate::util::UnwrapPoison;
 pub use crate::{ChatMessage, ChatRequest, ChatResponse, Provider};
 
@@ -111,21 +111,27 @@ enum WarmupMode {
 
 /// Shared provider and transcriber setup logic.
 ///
-/// Extracts config from [`CONFIG`], creates the provider and constructs both
-/// transcribers (synchronous, no I/O), then optionally warms the provider up
-/// (async HTTP call). After warmup (or warmup skip/graceful failure), all three
-/// globals — [`PROVIDER`], [`IMAGE_TRANSCRIBER`], [`AUDIO_TRANSCRIBER`] — are
-/// swapped in together.
+/// Extracts config from the given [`ConfigData`], creates the provider and
+/// constructs both transcribers (synchronous, no I/O), then optionally warms
+/// the provider up (async HTTP call). After warmup (or warmup skip/graceful
+/// failure), all three globals — [`PROVIDER`], [`IMAGE_TRANSCRIBER`],
+/// [`AUDIO_TRANSCRIBER`] — are swapped in together.
 ///
 /// Used by [`init_global`] (startup, non-fatal warmup) and [`recreate_all`]
 /// (config reload, fatal warmup) to eliminate ~28 lines of duplication.
-async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Result<()> {
-    let api_key = CONFIG.provider_key();
-    let endpoint = CONFIG.provider_endpoint();
-    let endpoint_opt = if endpoint == crate::config::DEFAULT_PROVIDER_ENDPOINT {
+async fn setup_provider_and_transcribers(
+    warmup_mode: WarmupMode,
+    config: &crate::config::ConfigData,
+) -> anyhow::Result<()> {
+    let api_key = non_empty(config.provider_key.clone());
+    let endpoint_str = resolve_or(
+        config.provider_endpoint.clone(),
+        crate::config::DEFAULT_PROVIDER_ENDPOINT,
+    );
+    let endpoint_opt = if endpoint_str == crate::config::DEFAULT_PROVIDER_ENDPOINT {
         None
     } else {
-        Some(endpoint.as_str())
+        Some(endpoint_str.as_str())
     };
 
     let provider: Arc<dyn Provider> = create_provider(api_key.as_deref(), endpoint_opt)?.into();
@@ -133,17 +139,29 @@ async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Res
     // Construct transcribers early — purely synchronous CPU work with no I/O,
     // so there's no reason to wait until after the warmup HTTP call.
     let image_transcriber = create_transcriber(
-        Some(&endpoint),
+        Some(&endpoint_str),
         api_key.as_deref(),
-        Some(CONFIG.image_transcription_model().as_str()),
-        CONFIG.transcription_provider().as_deref(),
+        Some(
+            resolve_or(
+                config.image_transcription_model.clone(),
+                crate::config::DEFAULT_IMAGE_TRANSCRIPTION_MODEL,
+            )
+            .as_str(),
+        ),
+        non_empty(config.transcription_provider.clone()).as_deref(),
         ImageTranscriber::from_inner,
     );
     let audio_transcriber = create_transcriber(
-        Some(&endpoint),
+        Some(&endpoint_str),
         api_key.as_deref(),
-        Some(CONFIG.audio_transcription_model().as_str()),
-        CONFIG.audio_transcription_provider().as_deref(),
+        Some(
+            resolve_or(
+                config.audio_transcription_model.clone(),
+                crate::config::DEFAULT_AUDIO_TRANSCRIPTION_MODEL,
+            )
+            .as_str(),
+        ),
+        non_empty(config.audio_transcription_provider.clone()).as_deref(),
         transcribe::AudioTranscriber::from_inner,
     );
 
@@ -154,7 +172,7 @@ async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Res
         }
         WarmupMode::NonFatal => {
             if let Err(e) = provider.warmup().await {
-                tracing::warn!(endpoint = %endpoint, "Provider warmup failed (non-fatal): {e}");
+                tracing::warn!(endpoint = %endpoint_str, "Provider warmup failed (non-fatal): {e}");
             }
         }
     }
@@ -172,7 +190,8 @@ async fn setup_provider_and_transcribers(warmup_mode: WarmupMode) -> anyhow::Res
 /// Warmup failures are non-fatal at startup — the system can still operate;
 /// retries happen at request time.
 pub async fn init_global() -> anyhow::Result<()> {
-    setup_provider_and_transcribers(WarmupMode::NonFatal).await
+    let config = CONFIG.snapshot();
+    setup_provider_and_transcribers(WarmupMode::NonFatal, &config).await
 }
 
 /// Warm up a provider from a config snapshot without swapping globals.
@@ -193,14 +212,14 @@ pub async fn warmup_provider_from_config(config: &crate::config::ConfigData) -> 
     Ok(())
 }
 
-/// Recreate all provider and transcriber singletons from current CONFIG.
+/// Recreate all provider and transcriber singletons from the given config.
 ///
 /// Called after a GUI-driven config save to make provider key/endpoint/model
 /// changes take effect without restart. Warmup failures are fatal here
 /// because the config has already been validated by
 /// [`warmup_provider_from_config`] before this point.
-pub async fn recreate_all() -> anyhow::Result<()> {
-    setup_provider_and_transcribers(WarmupMode::Fatal).await?;
+pub async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::Result<()> {
+    setup_provider_and_transcribers(WarmupMode::Fatal, config).await?;
     tracing::info!("Provider and transcriber singletons recreated");
     Ok(())
 }
