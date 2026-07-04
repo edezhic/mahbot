@@ -524,7 +524,7 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
             continue;
         }
 
-        if handle_dispatch_command(&mut msg).await {
+        if handle_telegram_start_command(&mut msg).await {
             continue;
         }
 
@@ -532,17 +532,14 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
     }
 }
 
-/// Handle a dispatch-level command. Returns `true` if the message was handled
+/// Handle a Telegram `/start` command. Returns `true` if the message was handled
 /// (loop should `continue`), `false` if it should be processed by the agent.
-async fn handle_dispatch_command(msg: &mut ChannelMessage) -> bool {
-    if !is_start_command(&msg.content) {
-        return false;
-    }
-
-    // Only Telegram gets the /start inline keyboard; GUI and other channels
-    // route /start as a normal message (returns false to fall through to
-    // process_channel_message).
-    if msg.source_channel != "telegram" {
+///
+/// Only Telegram gets the `/start` inline keyboard; GUI and other channels route
+/// `/start` as a normal message (returns false to fall through to
+/// `process_channel_message`).
+async fn handle_telegram_start_command(msg: &mut ChannelMessage) -> bool {
+    if !is_start_command(&msg.content) || msg.source_channel != "telegram" {
         return false;
     }
 

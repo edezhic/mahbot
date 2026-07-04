@@ -1483,11 +1483,11 @@ fn apply_profile_pipeline(
     // Stage 3: strip lines
     processed = apply_strip_lines(&processed, profile);
 
-    // Stage 4-4b: collapse blank lines first, then consecutive content lines.
-    // Blank-line collapse must run first: otherwise collapse_consecutive_lines
-    // (threshold ≥5) sees 5+ identical blank lines as a "run" and emits
-    // [repeated N times] markers, which break the blank-line run and prevent
-    // collapse_blank_lines from compressing them.
+    // Stage 4: collapse blank lines (runs >2 → 2), then collapse consecutive
+    // duplicate content lines (≥5 identical → [repeated N] marker).
+    // collapse_consecutive_lines skips blank lines — otherwise [repeated]
+    // markers on blank runs would prevent blank-line compression.
+    // The blank-line skip makes the two passes order-independent.
     processed = collapse_blank_lines(&processed);
     processed = collapse_consecutive_lines(&processed);
 
@@ -1648,7 +1648,9 @@ fn json_value_type(v: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Collapse consecutive identical lines (≥5 repetitions).
+/// Collapse consecutive identical non-blank lines (≥5 repetitions).
+/// Blank/whitespace-only lines are passed through individually so
+/// collapse_blank_lines can compress them without interference.
 fn collapse_consecutive_lines(input: &str) -> String {
     const THRESHOLD: usize = 5;
     let mut result = String::with_capacity(input.len());
@@ -1656,6 +1658,14 @@ fn collapse_consecutive_lines(input: &str) -> String {
     let mut i = 0;
     while i < lines.len() {
         let current = lines[i];
+        // Blank lines are handled by collapse_blank_lines — treat each
+        // blank line individually to avoid [repeated N times] markers
+        // that would prevent blank-line compression.
+        if current.trim().is_empty() {
+            push_line(&mut result, current);
+            i += 1;
+            continue;
+        }
         let mut count = 1;
         while i + count < lines.len() && lines[i + count] == current {
             count += 1;
@@ -2796,35 +2806,31 @@ mod tests {
         }
     }
 
-    /// 5+ consecutive blank lines should collapse to 2, not produce `[repeated]` markers.
+    /// 5+ consecutive blank lines should collapse to 2 without `[repeated]` markers,
+    /// regardless of whether collapse_blank_lines or collapse_consecutive_lines runs first.
     #[test]
     fn collapse_blank_lines_then_consecutive_no_marker() {
         let input = "a\n\n\n\n\n\nb"; // 6 blank lines between a and b
-        let result = collapse_blank_lines(input);
-        let result = collapse_consecutive_lines(&result);
+
+        // Forward order: blank first, then consecutive
+        let forward = collapse_blank_lines(input);
+        let forward = collapse_consecutive_lines(&forward);
         assert_eq!(
-            result, "a\n\n\nb",
+            forward, "a\n\n\nb",
             "6 blank lines → 2 blanks, no [repeated] marker"
         );
         assert!(
-            !result.contains("[repeated"),
+            !forward.contains("[repeated"),
             "should not contain repeated marker for blank lines"
         );
-    }
 
-    /// 5+ identical non-blank lines should still collapse with `[repeated]`.
-    #[test]
-    fn collapse_consecutive_non_blank_still_collapses() {
-        let input = "x\nx\nx\nx\nx\nx"; // 6 identical non-blank lines
-        let result = collapse_blank_lines(input); // should be a no-op
-        let result = collapse_consecutive_lines(&result);
+        // Reverse order: consecutive first, then blank — should produce same result
+        let reverse = collapse_consecutive_lines(input);
+        let reverse = collapse_blank_lines(&reverse);
+        assert_eq!(forward, reverse, "both orders produce same result");
         assert!(
-            result.contains("[repeated 6 times]"),
-            "6 identical non-blank lines should produce [repeated] marker"
-        );
-        assert!(
-            !result.contains("x\nx\nx\nx\nx\nx"),
-            "should not keep individual lines"
+            !reverse.contains("[repeated"),
+            "no [repeated] marker in reverse order"
         );
     }
 
