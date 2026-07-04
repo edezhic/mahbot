@@ -109,8 +109,6 @@ struct ChatCompletionRequest {
     temperature: f64,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
@@ -603,7 +601,6 @@ impl OpenAiCompatibleProvider {
             messages: native,
             temperature: f64::from(request.temperature),
             max_tokens: 32000,
-            stream: None,
             tool_stream: (has_tools && self.tool_stream).then_some(true),
             tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
             tools: tool_specs,
@@ -1138,7 +1135,6 @@ mod tests {
             messages: vec![NativeMessage::user("What is the weather?")],
             temperature: 0.7,
             max_tokens: 32000,
-            stream: Some(false),
             tool_stream: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
