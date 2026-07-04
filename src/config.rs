@@ -562,7 +562,7 @@ impl ConfigReload {
         self.read().clone()
     }
 
-    /// Update a single string config field in-memory and atomically apply it.
+    /// Update a single string config field in-memory.
     ///
     /// This is intentionally lightweight — it only mutates the in-memory
     /// [`ConfigData`] without touching the database or triggering provider
@@ -572,7 +572,7 @@ impl ConfigReload {
     /// Returns `true` if the key was recognised, `false` otherwise (unknown
     /// keys are silently ignored for forward compatibility).
     #[must_use]
-    pub fn set_string_field_and_apply(&self, key: &str, value: &str) -> bool {
+    pub fn set_string_field(&self, key: &str, value: &str) -> bool {
         let mut guard = self.inner.write().expect("CONFIG inner poisoned");
         guard.set_string_field(key, value)
     }
@@ -1032,18 +1032,18 @@ mod tests {
     }
 
     #[test]
-    fn set_string_field_and_apply_updates_in_memory() {
+    fn set_string_field_updates_in_memory() {
         let reload = ConfigReload::const_new();
 
         // Unknown key returns false and does nothing
-        assert!(!reload.set_string_field_and_apply("nonexistent", "value"));
+        assert!(!reload.set_string_field("nonexistent", "value"));
 
         // Known key returns true and updates the in-memory value
-        assert!(reload.set_string_field_and_apply("image_gen_model", "test-model"));
+        assert!(reload.set_string_field("image_gen_model", "test-model"));
         assert_eq!(reload.image_gen_model(), "test-model");
 
         // Empty string — typed accessor normalizes on read, so returns default
-        assert!(reload.set_string_field_and_apply("image_gen_model", ""));
+        assert!(reload.set_string_field("image_gen_model", ""));
         assert_eq!(
             reload.image_gen_model(),
             "google/gemini-3.1-flash-image-preview"

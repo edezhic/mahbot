@@ -698,7 +698,7 @@ async fn handle_set_model_action(
         return;
     }
     // Lightweight in-memory update — no DB read, no provider warmup
-    let _ = CONFIG.set_string_field_and_apply(config_key, payload);
+    let _ = CONFIG.set_string_field(config_key, payload);
 
     answer_telegram_callback(
         msg,
