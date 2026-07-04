@@ -3033,15 +3033,9 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // Ticket 1: cancelled, old (2h) → should be archived
-        let old_cancelled_id =
-            make_ticket(&store, &ws, "old-cancelled", TicketPhase::Backlog).await;
-
         let two_hours_ago = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-
-        store
-            .transition_to(&old_cancelled_id, None, TicketPhase::Cancelled, None)
-            .await
-            .expect("cancel");
+        let old_cancelled_id =
+            make_ticket(&store, &ws, "old-cancelled", TicketPhase::Cancelled).await;
         store
             .conn
             .execute(
@@ -3053,11 +3047,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Ticket 2: cancelled, fresh → should NOT be archived
         let fresh_cancelled_id =
-            make_ticket(&store, &ws, "fresh-cancelled", TicketPhase::Backlog).await;
-        store
-            .transition_to(&fresh_cancelled_id, None, TicketPhase::Cancelled, None)
-            .await
-            .expect("cancel");
+            make_ticket(&store, &ws, "fresh-cancelled", TicketPhase::Cancelled).await;
         // No backdating — updated_at is now.
 
         // Ticket 3: not cancelled (Backlog), old → should NOT be archived
@@ -3109,17 +3099,9 @@ with a comment explaining why no agent is mid-execution in that state.\
         let ws = test_ws_named("/ws", "ws");
 
         // Create three tickets: one Done, one Cancelled, one Backlog.
-        let done_id = make_ticket(&store, &ws, "done", TicketPhase::Backlog).await;
-        store
-            .transition_to(&done_id, None, TicketPhase::Done, None)
-            .await
-            .expect("set done");
+        let done_id = make_ticket(&store, &ws, "done", TicketPhase::Done).await;
 
-        let cancelled_id = make_ticket(&store, &ws, "cancelled", TicketPhase::Backlog).await;
-        store
-            .transition_to(&cancelled_id, None, TicketPhase::Cancelled, None)
-            .await
-            .expect("cancel");
+        let cancelled_id = make_ticket(&store, &ws, "cancelled", TicketPhase::Cancelled).await;
 
         let backlog_id = make_ticket(&store, &ws, "backlog", TicketPhase::Backlog).await;
         // Leave in Backlog.
@@ -3160,24 +3142,16 @@ with a comment explaining why no agent is mid-execution in that state.\
             &store,
             &test_ws_named("/ws1", "ws1"),
             "Test",
-            TicketPhase::Backlog,
+            TicketPhase::Done,
         )
         .await;
-        store
-            .transition_to(&id1, None, TicketPhase::Done, None)
-            .await
-            .expect("set done");
         let id2 = make_ticket(
             &store,
             &test_ws_named("/ws2", "ws2"),
             "Test",
-            TicketPhase::Backlog,
+            TicketPhase::Done,
         )
         .await;
-        store
-            .transition_to(&id2, None, TicketPhase::Done, None)
-            .await
-            .expect("set done");
 
         // Archive only ws1.
         let count = store
@@ -3206,18 +3180,14 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_count_by_status_excludes_archived() {
         let (store, _tmp) = open_test_store().await;
-        // Create a ticket and set it to Done.
-        let id = make_ticket(
+        // Create a ticket set to Done.
+        let _id = make_ticket(
             &store,
             &test_ws_named("/ws", "ws"),
             "Test",
-            TicketPhase::Backlog,
+            TicketPhase::Done,
         )
         .await;
-        store
-            .transition_to(&id, None, TicketPhase::Done, None)
-            .await
-            .expect("set done");
 
         // Before archiving, count includes the Done ticket.
         let count_before = store
@@ -3468,13 +3438,7 @@ with a comment explaining why no agent is mid-execution in that state.\
         init_test_stores().await;
         let store = crate::board::BOARD.get().unwrap();
         let ws = test_ws_named("/ws", "ws");
-        let old_id = make_ticket(store, &ws, "Test", TicketPhase::Backlog).await;
-
-        // Cancel the ticket
-        store
-            .transition_to(&old_id, None, TicketPhase::Cancelled, None)
-            .await
-            .expect("cancel");
+        let old_id = make_ticket(store, &ws, "Test", TicketPhase::Cancelled).await;
 
         // Superseding an already-cancelled ticket should work
         let new_id = TicketBuilder::new(store, &ws)
@@ -3543,11 +3507,9 @@ with a comment explaining why no agent is mid-execution in that state.\
             // rollback, complementing the non-transactional coverage in
             // test_set_commit_info.
             // Now delegates to the real production method BoardStore::finalize_done_tx.
-            let (store, _tmp, id) = setup().await;
-            store
-                .transition_to(&id, None, TicketPhase::QaPassed, None)
-                .await
-                .unwrap();
+            let (store, _tmp) = open_test_store().await;
+            let ws = test_ws_named("/ws", "ws");
+            let id = make_ticket(&store, &ws, "Test", TicketPhase::QaPassed).await;
 
             let tx = store.conn.begin_tx().await.unwrap();
             BoardStore::finalize_done_tx(
@@ -3768,14 +3730,13 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         for (i, case) in cases.iter().enumerate() {
             let title = format!("claim-{i}");
-            let id = make_ticket(&store, &ws, &title, TicketPhase::Backlog).await;
+            let phase = if matches!(case.scenario, Scenario::WrongPhase) {
+                TicketPhase::Backlog
+            } else {
+                TicketPhase::InDiagnostics
+            };
+            let id = make_ticket(&store, &ws, &title, phase).await;
 
-            if matches!(case.scenario, Scenario::Success | Scenario::AlreadyAssigned) {
-                store
-                    .transition_to(&id, None, TicketPhase::InDiagnostics, None)
-                    .await
-                    .expect("transition to InDiagnostics");
-            }
             if matches!(case.scenario, Scenario::AlreadyAssigned) {
                 store
                     .set_assigned_to(&id, Some(DIAGNOSTICS_ROLE))
