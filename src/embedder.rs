@@ -207,7 +207,7 @@ fn ensure_embedder() -> bool {
     } else {
         // No tokio runtime available (e.g., in unit tests without runtime).
         // STATE stays LOADING from the CAS above — subsequent calls
-        // short-circuit at the `!= STATE_UNINIT` guard at line 139
+        // short-circuit at the `!= STATE_UNINIT` guard above
         // without re-entering the initialization path.
     }
 
