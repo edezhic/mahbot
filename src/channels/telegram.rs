@@ -1715,9 +1715,6 @@ impl Channel for TelegramChannel {
                     self.offset.store(offset, Ordering::Release);
                     return Ok(());
                 }
-                () = tokio::time::sleep(Duration::from_secs(90)) => {
-                    tracing::warn!("getUpdates poll timed out (90s), retrying");
-                }
                 poll_result = self.poll_get_updates(&mut offset, 30, true) => {
                     // Persist offset after each successful poll so a
                     // hot-reloaded listener can resume from here.
