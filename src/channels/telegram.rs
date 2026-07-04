@@ -599,7 +599,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
         }
 
         // ── Blockquotes — pass through as-is ──────────────────
-        if trimmed.starts_with("<blockquote") || trimmed == "</blockquote>" {
+        if trimmed == "<blockquote>" || trimmed == "</blockquote>" {
             out.push_str(trimmed);
             out.push('\n');
             continue;
@@ -1951,6 +1951,32 @@ mod tests {
         // Literal </code> in code block must not break the HTML
         let r = markdown_to_telegram_html("```\nuse &lt;/code&gt;\n```");
         assert_eq!(r, "<pre><code>use &amp;lt;/code&amp;gt;</code></pre>");
+
+        // ── Blockquote pass-through ────────────────────────────
+
+        // Opening tag on its own line passes through unchanged
+        let r = markdown_to_telegram_html("<blockquote>");
+        assert_eq!(r, "<blockquote>");
+
+        // Closing tag on its own line passes through unchanged
+        let r = markdown_to_telegram_html("</blockquote>");
+        assert_eq!(r, "</blockquote>");
+
+        // Multi-line blockquote: content between tags gets inline formatting
+        let r = markdown_to_telegram_html("<blockquote>\nHello **world**\n</blockquote>");
+        assert_eq!(r, "<blockquote>\nHello <b>world</b>\n</blockquote>");
+
+        // Malformed tag name: <blockquote123> should NOT pass through
+        let r = markdown_to_telegram_html("<blockquote123>");
+        assert_eq!(r, "&lt;blockquote123&gt;");
+
+        // Tag with attributes: <blockquote class="x"> should NOT pass through
+        let r = markdown_to_telegram_html("<blockquote class=\"x\">");
+        assert_eq!(r, "&lt;blockquote class=&quot;x&quot;&gt;");
+
+        // Tag with trailing space inside: <blockquote > should NOT pass through
+        let r = markdown_to_telegram_html("<blockquote >");
+        assert_eq!(r, "&lt;blockquote &gt;");
     }
 
     // ── Inline formatting tests ──────────────────────────────────────
