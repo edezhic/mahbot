@@ -1407,11 +1407,15 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
-    // Git not available or not a git repo — finalize directly.
-    if !crate::git_commands::git_is_installed().await
-        || !crate::git_commands::is_git_repo(repo_path)
-    {
-        finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
+    // Git not available or not a git repo — transition to Done directly.
+    let git_installed = crate::git_commands::git_is_installed().await;
+    if !git_installed || !crate::git_commands::is_git_repo(repo_path) {
+        let reason = if git_installed {
+            "Not a git repo — moving to Done without commit"
+        } else {
+            "Git not installed — moving to Done without commit"
+        };
+        transition_ticket_to_done(&ticket, TicketPhase::QaPassed, reason).await;
         return;
     }
 
@@ -3379,7 +3383,7 @@ mod tests {
     /// handle_qa_passed first checks whether git is available and whether the
     /// workspace path is a git repo. In test environments git may exist, but
     /// the workspace path is deliberately not a git repo, so the function
-    /// falls through to finalize_ticket_from_phase → transition_ticket_to_done.
+    /// transitions directly to Done without committing.
     /// This test validates the graceful non-git fallback path.
     #[tokio::test]
     async fn handle_qa_passed_no_git_to_done() {
