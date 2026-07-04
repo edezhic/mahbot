@@ -168,7 +168,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
             ok
         }
         Ok(None) => {
-            warn!(ticket = %ticket_id, "Ticket not found — may have been deleted");
+            debug!(ticket = %ticket_id, "Ticket not found — row missing (violates architecture invariant)");
             false
         }
         Err(e) => {
