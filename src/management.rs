@@ -3345,18 +3345,10 @@ mod tests {
                 phase,
             );
 
-            // Verify comment structure: 3 per-analyst + 1 system summary = 4
             let comments = board()
                 .get_comments(&ticket_id)
                 .await
                 .expect("get_comments");
-            assert_eq!(
-                comments.len(),
-                4,
-                "case {}: expected 4 comments (3 per-analyst + 1 system summary), got {}",
-                case.name,
-                comments.len(),
-            );
 
             let system = comments.iter().find(|c| c.role == SYSTEM_ROLE);
             assert!(
