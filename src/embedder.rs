@@ -88,9 +88,36 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 
 /// Embedder state machine.
 ///
-/// 0 = UNINIT (first call triggers load/download)
-/// 1 = LOADING (background download or sync load in progress)
-/// 2 = READY (embedder is available)
+/// # States
+///
+/// | Value | Name     | Meaning                                          |
+/// |-------|----------|--------------------------------------------------|
+/// | 0     | UNINIT   | Embedder not loaded yet; first [`embed()`] call  |
+/// |       |          | triggers initialization via [`ensure_embedder()`].|
+/// | 1     | LOADING  | Initialization in progress (sync cache load or   |
+/// |       |          | background download with retries).               |
+/// | 2     | READY    | A usable [`Embedder`] instance is available.     |
+///
+/// # Transitions
+///
+/// | From       | To         | Trigger                                              |
+/// |------------|------------|------------------------------------------------------|
+/// | `UNINIT`   | `LOADING`  | Atomic CAS in [`ensure_embedder()`] — exactly one    |
+/// |            |            | caller becomes the initializer.                      |
+/// | `LOADING`  | `READY`    | [`set_embedder_ready()`] after a successful load     |
+/// |            |            | (sync cache hit, cached re-load, or fresh download). |
+/// | `LOADING`  | `UNINIT`   | CONFIG not yet initialised → `models_dir()` returns  |
+/// |            |            | `None`. STATE is rolled back so the next `embed()`   |
+/// |            |            | call can retry.                                      |
+/// | `LOADING`  | (stuck)    | **Terminal conditions** leaving `LOADING` forever:   |
+/// |            |            | • No Tokio runtime available — no background         |
+/// |            |            |   download task is spawned.                          |
+/// |            |            | • Freshly downloaded, SHA256-verified files fail     |
+/// |            |            |   to load (code-level bug in [`Embedder::load()`]);  |
+/// |            |            |   [`download_retry_loop`] returns without any        |
+/// |            |            |   state transition.                                  |
+///
+/// Once STATE reaches `READY` it stays there for the lifetime of the process.
 const STATE_UNINIT: u8 = 0;
 const STATE_LOADING: u8 = 1;
 const STATE_READY: u8 = 2;
