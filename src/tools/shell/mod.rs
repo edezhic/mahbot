@@ -3168,6 +3168,17 @@ mod tests {
                 pre_is_some: false,
                 check_contains: &["a\nb\nc\nd"],
             },
+            // head=2, tail=2, max=3 on 5-line output: small output bypasses sandwich,
+            // so max cap is the only active truncation → 3 lines + marker = 4 total.
+            TruncateCase {
+                name: "head+tail+max small output no sandwich",
+                head: 2,
+                tail: 2,
+                max: Some(3),
+                output: "a\nb\nc\nd\ne",
+                pre_is_some: false,
+                check_contains: &["... (2 lines truncated)"],
+            },
         ]);
     }
 
@@ -3203,52 +3214,19 @@ mod tests {
             result.ends_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "should end with tail"
         );
-    }
-
-    #[test]
-    fn truncate_head_tail_plus_max_byte_threshold_exceeded() {
-        let p = Profile::new("test").head(2).tail(2).max(100);
-        let lines: Vec<String> = (0..100)
-            .map(|i| {
-                format!(
-                    "line {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                )
-            })
-            .collect();
-        let output = lines.join("\n");
+        // Also verify that adding max=N doesn't change behavior when
+        // head+tail+1 <= N (sandwich format is already smaller than cap).
+        let p2 = Profile::new("test").head(2).tail(2).max(100);
+        let (result2, pre2) = apply_line_truncation(&output, &p2);
+        assert!(pre2.is_some(), "should capture pre-truncation output");
         assert!(
-            output.len() > SPILL_THRESHOLD_BYTES,
-            "test output must exceed threshold (got {} bytes)",
-            output.len()
-        );
-
-        let (result, pre) = apply_line_truncation(&output, &p);
-        assert!(pre.is_some(), "should capture pre-truncation");
-        // head+tail+1 = 5 <= max=100, so sandwich format is the final output
-        assert!(
-            result.contains("... (96 lines omitted)"),
+            result2.contains("... (96 lines omitted)"),
             "should have sandwich omission marker"
         );
         assert!(
-            !result.contains("lines truncated"),
+            !result2.contains("lines truncated"),
             "sandwich should not be additionally truncated when head+tail+1 <= max"
         );
-    }
-
-    #[test]
-    fn truncate_head_tail_plus_max_byte_threshold_not_exceeded() {
-        let p = Profile::new("test").head(2).tail(2).max(3);
-        // Small output: byte threshold NOT exceeded, so head/tail skipped,
-        // but max cap should still apply.
-        let output = "a\nb\nc\nd\ne";
-        let (result, pre) = apply_line_truncation(output, &p);
-        assert_eq!(pre, None, "no pre-truncation for small output");
-        assert_eq!(
-            result.lines().count(),
-            4, // 3 lines + 1 truncation marker
-            "max cap should apply"
-        );
-        assert!(result.contains("... (2 lines truncated)"));
     }
 
     // ── format_sandwich tests ──────────────────────────────────────────
