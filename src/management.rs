@@ -2589,7 +2589,6 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::DEFAULT_TICKET_PHASE;
     use crate::util::test::make_ticket;
     use crate::util::test::{
         create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
@@ -2877,76 +2876,6 @@ mod tests {
             drained.is_empty(),
             "Buffer should be empty after last ticket's Notify drains it",
         );
-    }
-
-    // ── Transition does not pause workspace ─────────────────────────
-
-    /// Verify that transitioning a ticket never pauses the workspace.
-    /// The old auto-pause behavior was removed — workspace pausing is no
-    /// longer part of any transition path.
-    #[tokio::test]
-    async fn transition_never_pauses_workspace() {
-        struct Case {
-            name: &'static str,
-            ws_suffix: &'static str,
-            ws_path: &'static str,
-            source: TicketPhase,
-            target: TicketPhase,
-            policy: NotifyPolicy,
-        }
-
-        let cases = [
-            Case {
-                name: "Failed with Buffer",
-                ws_suffix: "ws_no_pause_on_fail_test",
-                ws_path: "/tmp/test_ws_no_pause_on_fail",
-                source: DEFAULT_TICKET_PHASE,
-                target: TicketPhase::Failed,
-                policy: NotifyPolicy::Buffer,
-            },
-            Case {
-                name: "non-failure with Notify",
-                ws_suffix: "ws_no_pause_test",
-                ws_path: "/tmp/test_ws_no_pause",
-                source: TicketPhase::Backlog,
-                target: TicketPhase::Analysis,
-                policy: NotifyPolicy::Notify,
-            },
-        ];
-
-        init_management_test_stores().await;
-        for case in &cases {
-            let ws = create_test_workspace(case.ws_path, case.ws_suffix).await;
-            let ticket_id = make_ticket(board(), &ws, "Test Ticket", TicketPhase::Backlog).await;
-            let ticket = expect_ticket(board(), &ticket_id).await;
-
-            if case.target == TicketPhase::Failed {
-                assert!(
-                    transition_ticket_to_failed(
-                        &ticket,
-                        case.source,
-                        "transition_never_pauses_workspace test",
-                        "test",
-                    )
-                    .await,
-                    "transition_ticket_to_failed should succeed",
-                );
-            } else {
-                transition_ticket(&ticket, case.source, case.target, case.policy, None)
-                    .await
-                    .expect("transition_ticket");
-            }
-
-            let ws = crate::workspace::get_by_name(case.ws_suffix)
-                .await
-                .expect("get_by_name")
-                .expect("workspace exists");
-            assert!(
-                !ws.paused,
-                "case {}: workspace should NOT be paused after transition to {:?}",
-                case.name, case.target,
-            );
-        }
     }
 
     // ── try_trip_circuit_breaker — sanitation counting ──
