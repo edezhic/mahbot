@@ -210,8 +210,8 @@ async fn is_phase_or_breaker_blocked(
     ticket: &Ticket,
     expected_phase: TicketPhase,
     threshold: usize,
-    count_fn: impl Fn(&[TicketComment]) -> usize,
-    comment_text: impl Fn(usize) -> String,
+    count_fn: fn(&[TicketComment]) -> usize,
+    comment_text: fn(usize) -> String,
     log_label: &str,
 ) -> bool {
     if !is_ticket_in_phase(&ticket.id, expected_phase).await {
@@ -2365,8 +2365,8 @@ async fn try_trip_circuit_breaker(
     ticket: &Ticket,
     source_phase: TicketPhase,
     threshold: usize,
-    count_fn: impl Fn(&[TicketComment]) -> usize,
-    comment_text: impl Fn(usize) -> String,
+    count_fn: fn(&[TicketComment]) -> usize,
+    comment_text: fn(usize) -> String,
     log_label: &str,
 ) -> bool {
     let comments = match board().get_comments(&ticket.id).await {
