@@ -6,7 +6,7 @@ pub use manager::Session;
 pub mod summarization;
 
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
-use crate::{ChatMessage, MessageRole, Reasoning, ToolCall as ProviderToolCall};
+use crate::{ChatMessage, ChatRole, Reasoning, ToolCall as ProviderToolCall};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 
@@ -651,7 +651,7 @@ pub(crate) fn decode_native_history_message(
 ) -> Option<DecodedNativeHistoryMessage> {
     let parsed = serde_json::from_str::<serde_json::Value>(&message.content).ok();
 
-    if message.role == MessageRole::Assistant
+    if message.role == ChatRole::Assistant
         && let Some(value) = parsed.as_ref()
     {
         let content = value
@@ -688,7 +688,7 @@ pub(crate) fn decode_native_history_message(
         }
     }
 
-    if message.role == MessageRole::Tool
+    if message.role == ChatRole::Tool
         && let Some(value) = parsed.as_ref()
     {
         return Some(DecodedNativeHistoryMessage::ToolResult {

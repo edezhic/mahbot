@@ -8,7 +8,7 @@ use crate::util::error::HttpError;
 use crate::util::try_repair_json;
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    MessageRole, Provider, ProviderUsage, Reasoning, ToolCall as ProviderToolCall, ToolSpec,
+    ChatRole, Provider, ProviderUsage, Reasoning, ToolCall as ProviderToolCall, ToolSpec,
 };
 use async_trait::async_trait;
 use reqwest::{
@@ -363,16 +363,16 @@ pub(crate) struct ImageUrlPart {
 
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
 ///
-/// When `allow_user_image_parts` is true and the role is [`MessageRole::User`], image markers
+/// When `allow_user_image_parts` is true and the role is [`ChatRole::User`], image markers
 /// (e.g. `[IMAGE:data:image/png;base64,...]`) are parsed into [`MessagePart::ImageUrl`]
 /// entries alongside the cleaned text. Otherwise the raw content is returned as
 /// [`MessageContent::Text`].
 pub(crate) fn to_message_content(
-    role: MessageRole,
+    role: ChatRole,
     content: &str,
     allow_user_image_parts: bool,
 ) -> MessageContent {
-    if role != MessageRole::User || !allow_user_image_parts {
+    if role != ChatRole::User || !allow_user_image_parts {
         return MessageContent::Text(content.to_string());
     }
 
@@ -1087,7 +1087,7 @@ mod tests {
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
         let value =
-            serde_json::to_value(to_message_content(MessageRole::User, content, true)).unwrap();
+            serde_json::to_value(to_message_content(ChatRole::User, content, true)).unwrap();
         let parts = value
             .as_array()
             .expect("multimodal content should be an array");
@@ -1102,14 +1102,14 @@ mod tests {
     fn to_message_content_keeps_markers_as_text_when_user_image_parts_disabled() {
         let content = "Policy [IMAGE:data:image/png;base64,abcd]";
         let value =
-            serde_json::to_value(to_message_content(MessageRole::User, content, false)).unwrap();
+            serde_json::to_value(to_message_content(ChatRole::User, content, false)).unwrap();
         assert_eq!(value, serde_json::json!(content));
     }
 
     #[test]
     fn to_message_content_keeps_plain_text_for_non_user_roles() {
         let value = serde_json::to_value(to_message_content(
-            MessageRole::System,
+            ChatRole::System,
             "You are a helpful assistant.",
             true,
         ))

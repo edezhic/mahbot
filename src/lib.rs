@@ -690,15 +690,15 @@ pub enum ToolOutputPhase {
     After,
 }
 
-// ── Message role enum ──────────────────────────────────────────
+// ── Chat role enum ─────────────────────────────────────────────
 
 /// Typed role for a [`ChatMessage`].
 ///
 /// Replaces the previous `String`-based role to prevent typos and
-/// make the message-role API self-documenting.
+/// make the chat-role API self-documenting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MessageRole {
+pub enum ChatRole {
     /// System prompt message.
     System,
     /// User (human) message.
@@ -709,7 +709,7 @@ pub enum MessageRole {
     Tool,
 }
 
-impl std::fmt::Display for MessageRole {
+impl std::fmt::Display for ChatRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::System => write!(f, "system"),
@@ -720,7 +720,7 @@ impl std::fmt::Display for MessageRole {
     }
 }
 
-impl std::str::FromStr for MessageRole {
+impl std::str::FromStr for ChatRole {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -729,7 +729,7 @@ impl std::str::FromStr for MessageRole {
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
             "tool" => Ok(Self::Tool),
-            other => Err(format!("Unknown message role: {other}")),
+            other => Err(format!("Unknown chat role: {other}")),
         }
     }
 }
@@ -738,7 +738,7 @@ impl std::str::FromStr for MessageRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: MessageRole,
+    pub role: ChatRole,
     pub content: String,
 }
 
@@ -746,7 +746,7 @@ impl ChatMessage {
     #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: MessageRole::System,
+            role: ChatRole::System,
             content: content.into(),
         }
     }
@@ -754,7 +754,7 @@ impl ChatMessage {
     #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: MessageRole::User,
+            role: ChatRole::User,
             content: content.into(),
         }
     }
@@ -762,14 +762,14 @@ impl ChatMessage {
     #[must_use]
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: MessageRole::Assistant,
+            role: ChatRole::Assistant,
             content: content.into(),
         }
     }
 
     fn tool(content: impl Into<String>) -> Self {
         Self {
-            role: MessageRole::Tool,
+            role: ChatRole::Tool,
             content: content.into(),
         }
     }

@@ -18,7 +18,7 @@ use crate::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
 use crate::session::summarization::PREVIOUS_CONVERSATION_SUMMARY_PREFIX;
 use crate::skills;
-use crate::{ChatMessage, MessageRole, Role, Workspace};
+use crate::{ChatMessage, ChatRole, Role, Workspace};
 
 /// Coordinates session persistence and prompt building across a single
 /// agent turn.
@@ -191,7 +191,7 @@ impl Session {
         let Some(final_msg) = self
             .history
             .last()
-            .filter(|m| m.role == MessageRole::Assistant)
+            .filter(|m| m.role == ChatRole::Assistant)
         else {
             tracing::warn!("finalize called but no assistant message in history");
             return Ok(());
