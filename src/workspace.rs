@@ -581,7 +581,7 @@ impl WorkspaceStore {
             // doesn't continue creating tickets after maintenance was disabled.
             if let Some(ws) = self.get_by_name(name).await? {
                 crate::registry::AGENT_REGISTRY
-                    .cancel_by_role_and_workspace_path(&Role::Maintainer.to_string(), &ws.path);
+                    .cancel_by_role_and_workspace_path(Role::Maintainer.as_str(), &ws.path);
             }
         }
         if enabled {
