@@ -477,7 +477,7 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
         params.source,
         params.target,
         params.notify,
-        "comment_and_transition",
+        params.log_label,
     )
     .await;
 
