@@ -358,7 +358,7 @@ pub fn direct_session_key(channel: &str, user_name: &str, role: &str, ws_name: &
 ///   key is used directly — no suffix is appended.
 ///
 /// * **Parallel agents** (analysts, reviewers, QA via
-///   [`run_parallel_agents`](crate::management::run_parallel_agents)): the caller appends `_{index}_{suffix}`
+///   `run_parallel_agents`): the caller appends `_{index}_{suffix}`
 ///   for disambiguation, producing keys like
 ///   `ticket_{ticket_id}_{role}_0_nano`.
 #[must_use]

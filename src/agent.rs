@@ -58,7 +58,7 @@ fn extract_media_from_outcomes(
 impl Agent {
     /// Create a new agent with the given session_key, role, workspace, and optional ticket.
     ///
-    /// Tools are derived from the [`Role`] via [`Role::tools`].
+    /// Tools are derived from [`crate::Role`] via [`crate::Role::tools`].
     /// Automatically registers with [`crate::registry::AGENT_REGISTRY`] and creates an
     /// internal [`CancellationToken`]. The agent is deregistered on [`Drop`].
     #[must_use]
