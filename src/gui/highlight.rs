@@ -353,7 +353,7 @@ pub(crate) fn distribute_byte_spans(
         let mut merged: Vec<HighlightSpan> = Vec::with_capacity(line_spans.len());
         for span in line_spans {
             if let Some(last) = merged.last_mut() {
-                if last.highlight_class == span.highlight_class && last.end == span.start {
+                if (last.highlight_class == span.highlight_class) && (last.end == span.start) {
                     last.end = span.end;
                     continue;
                 }
