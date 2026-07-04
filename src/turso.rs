@@ -703,6 +703,13 @@ pub(crate) async fn with_tx(
         .with_context(|| format!("Failed to begin transaction for {action_label}"))?;
 
     if let Err(e) = work(&tx).await {
+        if let Err(rollback_err) = tx.rollback().await {
+            warn!(
+                ticket = %ticket_id,
+                error = %rollback_err,
+                "Transaction rollback also failed for {action_label}",
+            );
+        }
         warn!(
             ticket = %ticket_id,
             error = %e,
