@@ -205,7 +205,6 @@ pub struct DiffState {
     personal_workspace_path: Option<String>,
     generation: u64,
     diff_files: Vec<DiffFile>,
-    diff_empty: bool,
     diff_loading: bool,
     /// Whether at least one diff fetch has completed successfully
     /// (prevents "Loading diff…" flicker on auto-poll Ticks).
@@ -241,7 +240,6 @@ impl DiffState {
             personal_workspace_path: None,
             generation: 0,
             diff_files: Vec::new(),
-            diff_empty: true,
             diff_loading: false,
             diff_has_loaded: false,
             status_message: None,
@@ -275,7 +273,6 @@ impl DiffState {
         self.file_tree.expanded_dirs.clear();
         self.selected_file = None;
         self.diff_files.clear();
-        self.diff_empty = true;
         self.file_buffers.clear();
         self.current_commit_ref = None;
         self.current_commit_message = None;
@@ -370,8 +367,7 @@ impl DiffState {
                 self.status_message = None;
                 match result {
                     Ok(files) => {
-                        self.diff_empty = files.is_empty();
-                        if self.diff_empty {
+                        if files.is_empty() {
                             self.status_message = if self.current_commit_ref.is_some() {
                                 Some("No files changed in this commit.".to_string())
                             } else {
@@ -401,7 +397,6 @@ impl DiffState {
                     Err(e) => {
                         self.error = Some(e);
                         self.diff_files = Vec::new();
-                        self.diff_empty = true;
                         self.file_tree.nodes = Vec::new();
                         self.selected_file = None;
                         self.file_tree.rebuild_visible();
@@ -942,7 +937,7 @@ impl DiffState {
                 ..Default::default()
             })
             .into()
-        } else if self.diff_empty {
+        } else if self.diff_files.is_empty() {
             container(
                 column![
                     lucide::check::<iced::Theme, iced::Renderer>()
@@ -2535,7 +2530,6 @@ mod tests {
             state.diff_files.is_empty(),
             "diff_files should be cleared synchronously to avoid stale data"
         );
-        assert!(state.diff_empty, "diff_empty should be true after clearing");
         assert!(
             state.error.is_none(),
             "error should be cleared to prevent stale error banner"
@@ -2595,7 +2589,6 @@ mod tests {
         let mut state = make_diff_with_tree();
         assert!(!state.diff_files.is_empty());
         assert!(!state.file_tree.nodes.is_empty());
-        state.diff_empty = false;
         state.diff_has_loaded = true;
         state.error = Some("stale error".into());
         state.status_message = Some("stale status".into());

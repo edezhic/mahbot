@@ -693,8 +693,12 @@ impl Embedder {
         let head_dim = get_meta(&content.metadata, "eurobert.attention.value_length", |v| {
             v.to_u32()
         })? as usize;
-        let rope_freq_base = get_meta(&content.metadata, "eurobert.rope.freq_base", candle_core::quantized::gguf_file::Value::to_f32)
-            .unwrap_or(ROPE_FREQ_BASE);
+        let rope_freq_base = get_meta(
+            &content.metadata,
+            "eurobert.rope.freq_base",
+            candle_core::quantized::gguf_file::Value::to_f32,
+        )
+        .unwrap_or(ROPE_FREQ_BASE);
 
         // Count layers by scanning tensor names
         let n_layers = content
