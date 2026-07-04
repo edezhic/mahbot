@@ -19,8 +19,8 @@ use crate::util::UnwrapPoison;
 #[derive(Clone)]
 struct Entry {
     id: String,
-    source: String,
-    target: String,
+    source: TicketPhase,
+    target: TicketPhase,
 }
 
 /// Global ticket transition buffer, keyed by workspace name.
@@ -47,8 +47,8 @@ pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketP
     let deque = map.entry(workspace_name.to_string()).or_default();
     deque.push_back(Entry {
         id: id.to_string(),
-        source: source.to_string(),
-        target: target.to_string(),
+        source,
+        target,
     });
 }
 
