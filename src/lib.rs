@@ -250,11 +250,11 @@ pub fn generate_suffix() -> String {
 /// normal message (routed to the agent).
 #[must_use]
 pub fn is_start_command(content: &str) -> bool {
+    let content = content.trim();
     content
-        .trim()
-        .strip_prefix('/')
-        .map(|cmd| cmd.split_once(' ').map_or(cmd, |(c, _)| c))
-        .is_some_and(|cmd| cmd.eq_ignore_ascii_case("start"))
+        .split_once(' ')
+        .map_or(content, |(cmd, _)| cmd)
+        .eq_ignore_ascii_case("/start")
 }
 
 // ── Channel trait + types ───────────────────────────────────────
@@ -942,5 +942,48 @@ mod tests {
             unit_test: None,
         };
         assert!(!partial.is_empty());
+    }
+
+    #[test]
+    fn is_start_command_matches_slash_start() {
+        assert!(is_start_command("/start"));
+    }
+
+    #[test]
+    fn is_start_command_matches_case_insensitive() {
+        assert!(is_start_command("/STart"));
+        assert!(is_start_command("/Start"));
+        assert!(is_start_command("/START"));
+    }
+
+    #[test]
+    fn is_start_command_matches_with_args() {
+        assert!(is_start_command("/start foo"));
+        assert!(is_start_command("/start   "));
+    }
+
+    #[test]
+    fn is_start_command_matches_with_whitespace() {
+        assert!(is_start_command("  /start"));
+        assert!(is_start_command("/start  "));
+        assert!(is_start_command("  /start  "));
+        assert!(is_start_command("  /start foo  "));
+    }
+
+    #[test]
+    fn is_start_command_rejects_non_start() {
+        assert!(!is_start_command("/"));
+        assert!(!is_start_command("/s"));
+        assert!(!is_start_command("/stard"));
+        assert!(!is_start_command("/started"));
+        assert!(!is_start_command("/ reset"));
+    }
+
+    #[test]
+    fn is_start_command_rejects_missing_slash() {
+        assert!(!is_start_command("start"));
+        assert!(!is_start_command(""));
+        assert!(!is_start_command("  "));
+        assert!(!is_start_command("not a command"));
     }
 }
