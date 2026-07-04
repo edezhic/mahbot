@@ -159,7 +159,7 @@ pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> R
 
 /// Spawn a sleep task that returns `generation` after `ms` milliseconds.
 ///
-/// Used by [`DebounceState`](super::common::DebounceState) to implement
+/// Used by `DebounceState` to implement
 /// debounced refresh: increment a generation counter, spawn this task
 /// with the new generation, and check the returned generation against
 /// the current counter in the response handler.

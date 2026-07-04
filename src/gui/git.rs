@@ -168,7 +168,7 @@ impl GitState {
 
     /// Clear all cached git info (diff stats, branch, behind/ahead, modal).
     /// Does **not** clear `workspace_path` or `refresh_eagerly` — those are
-    /// managed explicitly by [`set_workspace_path`] / [`update_tick`].
+    /// managed explicitly by [`Self::set_workspace_path`] / [`Self::update_tick`].
     pub fn clear(&mut self) {
         self.diff_stats = None;
         self.current_branch = None;
@@ -187,7 +187,7 @@ impl GitState {
     /// of git info (diff stats, branch, behind/ahead). Clears all
     /// cached state first.
     ///
-    /// After this call the next [`update_tick`] is skipped (via
+    /// After this call the next [`Self::update_tick`] is skipped (via
     /// `refresh_eagerly`) to avoid double-refreshing.
     ///
     /// Returns a batch of [`Task`]s that produce [`GitMessage`] results
@@ -411,7 +411,7 @@ impl GitState {
 
     /// Called every second from the Dashboard's [`super::Message::Tick`]
     /// handler. Refreshes git info (diff stats, branch, behind/ahead)
-    /// if not gated by an eager refresh (see [`set_workspace_path`]).
+    /// if not gated by an eager refresh (see [`Self::set_workspace_path`]).
     pub fn update_tick(&mut self) -> Task<GitMessage> {
         // Skip if an eager refresh was just triggered (e.g. after
         // workspace switch) to avoid 6 subprocess calls in <1 second.

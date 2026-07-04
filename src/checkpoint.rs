@@ -78,7 +78,7 @@ fn iter_checkpoint_stores()
 /// Skips stores that haven't been initialized yet. Logs and swallows per-store
 /// errors to avoid blocking shutdown.
 ///
-/// The store entries come from [`iter_checkpoint_stores`] — the single source
+/// The store entries come from `iter_checkpoint_stores` — the single source
 /// of truth for which stores get checkpointed. The test
 /// `all_store_names_appear_in_checkpoint` uses the same function to verify
 /// that every entry in [`crate::turso::ALL_STORE_NAMES`] has a corresponding
