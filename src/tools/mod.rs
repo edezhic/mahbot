@@ -188,8 +188,14 @@ pub struct ToolExecutionOutcome {
 /// Returns `(normalized_name, normalized_args)`. Stats and dispatch should use
 /// the normalized values so recovered calls are attributed to the real tool.
 #[must_use]
-pub fn normalize_tool_call(name: &str, args: serde_json::Value) -> (String, serde_json::Value) {
-    let (normalized_name, mut args) = normalize_tool_name(name, args);
+pub fn normalize_tool_call(name: &str, mut args: serde_json::Value) -> (String, serde_json::Value) {
+    if name == "glob"
+        && let Some(obj) = args.as_object_mut()
+        && !obj.contains_key("mode")
+    {
+        obj.insert("mode".to_string(), serde_json::json!("files"));
+    }
+    let normalized_name = normalize_tool_name(name).to_string();
     normalize_tool_arguments(&normalized_name, &mut args);
     (normalized_name, args)
 }
@@ -197,13 +203,13 @@ pub fn normalize_tool_call(name: &str, args: serde_json::Value) -> (String, serd
 /// Map known tool-name aliases to their canonical names.
 ///
 /// This is the single source of truth for tool-name normalization, shared by
-/// [`normalize_tool_name`] (full call normalization) and [`find_tool`] (direct
+/// [`normalize_tool_call`] (full call normalization) and [`find_tool`] (direct
 /// lookup).  Adding a new alias here immediately affects both paths.
 ///
 /// The `"glob"` alias is included because it resolves to `"search"` regardless
 /// of arguments; the parallel `mode:"files"` injection is handled separately
-/// in [`normalize_tool_name`] when args are available.
-fn normalize_tool_name_str(name: &str) -> &str {
+/// in [`normalize_tool_call`] when args are available.
+fn normalize_tool_name(name: &str) -> &str {
     match name {
         "bash" | "run_terminal_cmd" => "shell",
         "grep" | "rg" | "grep_search" | "glob" => "search",
@@ -211,17 +217,6 @@ fn normalize_tool_name_str(name: &str) -> &str {
         "str_replace" => "edit",
         _ => name,
     }
-}
-
-fn normalize_tool_name(name: &str, mut args: serde_json::Value) -> (String, serde_json::Value) {
-    if name == "glob"
-        && let Some(obj) = args.as_object_mut()
-        && !obj.contains_key("mode")
-    {
-        obj.insert("mode".to_string(), serde_json::json!("files"));
-    }
-    let normalized = normalize_tool_name_str(name);
-    (normalized.to_string(), args)
 }
 
 fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
@@ -257,12 +252,12 @@ fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &st
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 ///
-/// Tool-name aliases are resolved via `normalize_tool_name_str` so that all
+/// Tool-name aliases are resolved via `normalize_tool_name` so that all
 /// callers benefit from the same alias mapping.  Prefer [`normalize_tool_call`]
 /// before dispatch when full argument normalization is also desired.
 #[must_use]
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    let normalized = normalize_tool_name_str(name);
+    let normalized = normalize_tool_name(name);
     tools
         .iter()
         .find(|t| t.name() == normalized)
