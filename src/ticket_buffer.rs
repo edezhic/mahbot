@@ -11,13 +11,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 use std::sync::{Mutex, OnceLock};
-use tracing::warn;
 
 use crate::board::TicketPhase;
 use crate::util::UnwrapPoison;
-
-/// Maximum number of buffered entries per workspace before oldest are dropped.
-const PER_WORKSPACE_CAPACITY: usize = 100;
 
 /// A single buffered ticket phase transition entry.
 #[derive(Clone)]
@@ -40,9 +36,6 @@ pub fn init_global() {
 
 /// Push a non-critical ticket transition into the buffer.
 ///
-/// If the per-workspace capacity (`PER_WORKSPACE_CAPACITY`) is exceeded,
-/// the oldest entry for that workspace is dropped and a warning is emitted.
-///
 /// # Panics
 ///
 /// Panics if the buffer has not been initialized via [`init_global`].
@@ -52,14 +45,6 @@ pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketP
         .expect("ticket_buffer not initialized — call init_global() first");
     let mut map = mutex.lock().unwrap_poison();
     let deque = map.entry(workspace_name.to_string()).or_default();
-    if deque.len() >= PER_WORKSPACE_CAPACITY {
-        warn!(
-            workspace = %workspace_name,
-            capacity = PER_WORKSPACE_CAPACITY,
-            "Ticket buffer overflow — dropping oldest entry"
-        );
-        deque.pop_front();
-    }
     deque.push_back(Entry {
         id: id.to_string(),
         source: source.to_string(),
@@ -158,27 +143,6 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
         assert_eq!(drain("nonexistent"), "");
-    }
-
-    #[test]
-    fn overflow_drops_oldest() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        reset();
-        for i in 0..101 {
-            push(
-                "ws-b",
-                &format!("mahbot-{i}"),
-                TicketPhase::Backlog,
-                TicketPhase::Analysis,
-            );
-        }
-        let result = drain("ws-b");
-        // mahbot-0 should be dropped (oldest), mahbot-1 through mahbot-100 retained
-        assert!(!result.contains("mahbot-0"));
-        assert!(result.contains("mahbot-1"));
-        assert!(result.contains("mahbot-100"));
-        // header + 100 entries
-        assert_eq!(result.lines().count(), 101);
     }
 
     #[test]
