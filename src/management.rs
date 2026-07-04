@@ -409,6 +409,7 @@ struct TransitionParams<'a> {
 /// `Some(true)` for bounce-back transitions (back to
 /// [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets priority
 /// re-dispatch over fresh tickets, or `None` for all other transitions.
+#[must_use]
 async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
@@ -718,7 +719,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             );
             // Best-effort transition: the ticket may have been moved
             // externally while the dispatch was running.
-            transition_ticket_to_failed(
+            let _ = transition_ticket_to_failed(
                 &ticket_for_failure,
                 active_phase,
                 &format!("❌ Dispatch panicked: {msg}"),
@@ -1176,7 +1177,7 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
     info!(ticket = %ticket.id, "{comment}");
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-    comment_and_transition(TransitionParams {
+    let _ = comment_and_transition(TransitionParams {
         ticket,
         comment: (SYSTEM_ROLE, comment),
         extra: None,
@@ -1190,6 +1191,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
     .await;
 }
 
+#[must_use]
 async fn transition_ticket_to_failed(
     ticket: &Ticket,
     source: TicketPhase,
@@ -1719,7 +1721,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// notify policy, and log label), leaving only the caller-specific
 /// `comment` text and `verb` string.
 async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
-    comment_and_transition(TransitionParams {
+    let _ = comment_and_transition(TransitionParams {
         ticket,
         comment: (DIAGNOSTICS_ROLE, comment),
         extra: None,
@@ -2453,7 +2455,7 @@ async fn process_verdict_results(
     // Priority 1: all agents failed to produce verdicts — terminal failure.
     let all_failed = results.iter().all(|r| r.verdict.is_none());
     if all_failed {
-        transition_ticket_to_failed(
+        let _ = transition_ticket_to_failed(
             ticket,
             verifier.active_phase,
             &format!(
