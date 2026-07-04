@@ -639,11 +639,11 @@ pub trait Tool: Send + Sync {
     ///
     /// Called when tool results are embedded into the conversation history
     /// (both in native tool-call mode and degraded text mode). The default
-    /// implementation uses head+tail truncation via [`crate::util::format_tool_output`]
+    /// implementation uses head+tail truncation via [`crate::util::truncate_tool_output`]
     /// (hardcoded 5K limit); override to produce a smarter summary (e.g. trim
     /// repetitive CLI output or extract key facts from search results).
     fn format_output(&self, output: &str) -> String {
-        crate::util::format_tool_output(output)
+        crate::util::truncate_tool_output(output)
     }
 
     /// Format a tool channel notification.

@@ -227,7 +227,7 @@ pub fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> String {
 /// Truncate tool output for LLM consumption (delegates to [`truncate_sandwich`]
 /// with a 5 000-byte limit). Returns input unchanged if within limit.
 #[must_use]
-pub fn format_tool_output(output: &str) -> String {
+pub fn truncate_tool_output(output: &str) -> String {
     truncate_sandwich(output, 5_000, "tool output")
 }
 
@@ -791,12 +791,12 @@ mod truncate_tests {
         );
     }
 
-    // ── format_tool_output compatibility ──────────────────────────────────
+    // ── truncate_tool_output compatibility ──────────────────────────────────
 
     #[test]
-    fn format_tool_output_delegates_correctly() {
+    fn truncate_tool_output_delegates_correctly() {
         let input = "abc".repeat(2_000); // 6_000 bytes > 5_000 limit
-        let result = format_tool_output(&input);
+        let result = truncate_tool_output(&input);
         assert!(result.len() < input.len(), "should truncate");
         assert!(
             result.contains("bytes omitted at tool output truncation"),
@@ -806,9 +806,9 @@ mod truncate_tests {
     }
 
     #[test]
-    fn format_tool_output_passthrough() {
+    fn truncate_tool_output_passthrough() {
         let input = "short";
-        let result = format_tool_output(input);
+        let result = truncate_tool_output(input);
         assert_eq!(result, input, "short input passes through unchanged");
     }
 }

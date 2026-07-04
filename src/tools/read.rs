@@ -141,7 +141,7 @@ impl Tool for ReadTool {
         }
 
         // Fallback (lossy binary output, etc.): standard head+tail truncation
-        crate::util::format_tool_output(output)
+        crate::util::truncate_tool_output(output)
     }
 
     fn debug_output(

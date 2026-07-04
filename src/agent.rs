@@ -524,7 +524,7 @@ impl Agent {
             let tool = find_tool(tools, &call.name);
             let output = match tool {
                 Some(t) => t.format_output(&outcome.output),
-                None => crate::util::format_tool_output(&outcome.output),
+                None => crate::util::truncate_tool_output(&outcome.output),
             };
             db_messages.push(ChatMessage::tool_result(&call.id, &output));
         }

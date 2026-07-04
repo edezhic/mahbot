@@ -1435,7 +1435,7 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// `finish_shell_output` (timing, spill-to-file).  `SPILL_THRESHOLD_BYTES`
 /// (5 KB) gates the head/tail truncation and spill preview — it is a trigger,
 /// not a truncation cutoff.  `finish_shell_output` → `try_spill_to_file`'s
-/// use of `crate::util::format_tool_output` (5 KB head+tail) provides a final
+/// use of `crate::util::truncate_tool_output` (5 KB head+tail) provides a final
 /// safety net for output that still exceeds the threshold after all pipeline
 /// stages.
 ///
@@ -1774,7 +1774,7 @@ fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
 
     match spill_output(&output) {
         Some(path) => format_spill_preview(&output, &path),
-        None => crate::util::format_tool_output(&output),
+        None => crate::util::truncate_tool_output(&output),
     }
 }
 
