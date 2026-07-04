@@ -573,11 +573,6 @@ impl Layer {
 
     /// Apply rotary position embeddings via [`candle_nn::rotary_emb::rope_slow`].
     ///
-    /// Replaced a hand-written chunked-RoPE implementation (July 2026).
-    /// The model runs entirely in F32 on CPU, so the old code's F32 precision
-    /// conversion was a no-op — `rope_slow` operates on the input dtype directly
-    /// and produces bit-identical results for F32.
-    ///
     /// `cos`/`sin` must have shape `[MAX_SEQ_LEN, head_dim/2]` as produced by
     /// [`precompute_freqs_cis`]; `rope_slow` internally duplicates them along
     /// the last dimension via `cat([cos, cos], -1)` to match `head_dim`.
@@ -1168,86 +1163,5 @@ mod tests {
         let Some(emb) = test_embedder() else { return };
         let result = emb.embed_documents(&[]);
         assert!(result.is_err(), "empty input should produce an error");
-    }
-
-    // ── RoPE regression test ─────────────────────────────────────────────
-
-    /// Re-implementation of the old hand-written `apply_rotary_emb` for
-    /// comparison against the new `rope_slow`-based version.
-    fn apply_rotary_emb_old(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let (_b_sz, _n_head, seq_len, head_dim) = x.shape().dims4()?;
-        let cos = cos.narrow(0, 0, seq_len)?;
-        let sin = sin.narrow(0, 0, seq_len)?;
-        let cos = cos.reshape((1, 1, seq_len, head_dim / 2))?;
-        let sin = sin.reshape((1, 1, seq_len, head_dim / 2))?;
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let chunks = x_f32.chunk(2, 3)?;
-        let x1 = &chunks[0];
-        let x2 = &chunks[1];
-        let y1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
-        let y2 = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
-        let result = Tensor::cat(&[&y1, &y2], 3)?;
-        Ok(result.to_dtype(x.dtype())?)
-    }
-
-    /// Verify that the new `rope_slow`-based implementation produces bit-identical
-    /// results to the old hand-written implementation for F32 tensors on CPU.
-    #[test]
-    fn test_rope_equivalence() {
-        let device = Device::Cpu;
-        let head_dim = 64;
-        let n_head = 4;
-        let b_sz = 2;
-        let seq_len = 16;
-
-        // Precompute cos/sin (same approach as the model's Embedder::load).
-        let (cos, sin) = precompute_freqs_cis(head_dim, ROPE_FREQ_BASE, &device).unwrap();
-
-        // Create random Q/K tensors and reshape to [b_sz, n_head, seq_len, head_dim]
-        // as done in Layer::apply_attention.
-        for _ in 0..5 {
-            let q_flat =
-                Tensor::rand(-1.0f32, 1.0f32, (b_sz, seq_len, n_head * head_dim), &device).unwrap();
-            let k_flat =
-                Tensor::rand(-1.0f32, 1.0f32, (b_sz, seq_len, n_head * head_dim), &device).unwrap();
-
-            let q = q_flat
-                .reshape((b_sz, seq_len, n_head, head_dim))
-                .unwrap()
-                .transpose(1, 2)
-                .unwrap();
-            let k = k_flat
-                .reshape((b_sz, seq_len, n_head, head_dim))
-                .unwrap()
-                .transpose(1, 2)
-                .unwrap();
-
-            // Apply both implementations.
-            let q_new = Layer::apply_rotary_emb(&q, &cos, &sin).unwrap();
-            let q_old = apply_rotary_emb_old(&q, &cos, &sin).unwrap();
-            let k_new = Layer::apply_rotary_emb(&k, &cos, &sin).unwrap();
-            let k_old = apply_rotary_emb_old(&k, &cos, &sin).unwrap();
-
-            // Compare: should be bit-identical for F32 tensors on CPU.
-            let q_diff = (&q_new - &q_old).unwrap().abs().unwrap();
-            let k_diff = (&k_new - &k_old).unwrap().abs().unwrap();
-            let q_max = q_diff
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap()
-                .into_iter()
-                .fold(0.0f32, f32::max);
-            let k_max = k_diff
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap()
-                .into_iter()
-                .fold(0.0f32, f32::max);
-
-            assert!(q_max < 1e-6, "q RoPE mismatch, max diff = {q_max}");
-            assert!(k_max < 1e-6, "k RoPE mismatch, max diff = {k_max}");
-        }
     }
 }
