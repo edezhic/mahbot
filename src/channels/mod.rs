@@ -1132,6 +1132,19 @@ mod tests {
             .expect("update_channel_contact");
     }
 
+    /// Three-line preamble shared by all mirror tests: acquire the serialization
+    /// lock, initialise test stores, and set up the spy channel. Returns the spy
+    /// sent-messages buffer and the lock guard (kept alive for the test duration).
+    async fn setup_mirror_test_env() -> (
+        &'static Arc<Mutex<Vec<SendMessage>>>,
+        tokio::sync::MutexGuard<'static, ()>,
+    ) {
+        let lock = acquire_mirror_lock().await;
+        crate::util::test::init_test_stores().await;
+        let sent = setup_spy_channel();
+        (sent, lock)
+    }
+
     fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
         ChannelMessage {
             user_name: user_name.to_string(),
@@ -1166,9 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_non_gui_source() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         setup_user_with_telegram_binding("skip_telegram", "target_non_gui").await;
 
         let msg = telegram_msg("skip_telegram", "hello from telegram");
@@ -1183,9 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_empty_content() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         setup_user_with_telegram_binding("skip_empty", "target_empty").await;
 
         let msg = gui_msg("skip_empty", "");
@@ -1200,9 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_whitespace_content() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         setup_user_with_telegram_binding("skip_ws", "target_ws").await;
 
         let msg = gui_msg("skip_ws", "   \t\n  ");
@@ -1220,9 +1227,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_user_with_no_bindings() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         // Create user but DO NOT bind a Telegram channel.
         let store = crate::users::store();
         store.add_user("no_binding", None).await.expect("add_user");
@@ -1239,9 +1244,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_binding_without_reply_target() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         // Bind a Telegram channel but don't set reply_target.
         let store = crate::users::store();
         store.add_user("no_target", None).await.expect("add_user");
@@ -1266,9 +1269,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_media_only_content() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         setup_user_with_telegram_binding("media_only", "target_media").await;
 
         let msg = gui_msg("media_only", "[IMAGE:/path/to/img.png]");
@@ -1285,9 +1286,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_blockquote_to_single_binding() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         setup_user_with_telegram_binding("single_user", "unique_single").await;
 
         let msg = gui_msg("single_user", "Hello, world!");
@@ -1310,9 +1309,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_to_multiple_telegram_bindings() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         let store = crate::users::store();
         store.add_user("multi_user", None).await.expect("add_user");
         // Bind two Telegram accounts with unique recipients.
@@ -1353,9 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn strips_media_markers_from_content() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         setup_user_with_telegram_binding("strip_markers", "unique_markers").await;
 
         let msg = gui_msg(
@@ -1379,9 +1374,7 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_markdown_formatting_in_blockquote() {
-        let _lock = acquire_mirror_lock().await;
-        crate::util::test::init_test_stores().await;
-        let sent = setup_spy_channel();
+        let (sent, _lock) = setup_mirror_test_env().await;
         setup_user_with_telegram_binding("md_user", "unique_md").await;
 
         let msg = gui_msg("md_user", "**bold** and `code` and *italic*");
