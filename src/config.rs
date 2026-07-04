@@ -819,11 +819,19 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     Ok(())
 }
 
-/// Validate a [`ConfigData`] before persisting.
+/// Validate a [`ConfigData`] before persisting — rejecting common misconfigurations.
+///
+/// # Precondition
+///
+/// [`ConfigData::finalize`] MUST have been called before this function.
+/// All `Option<String>` fields are assumed to be already trimmed, with
+/// empty/whitespace-only values collapsed to `None` by
+/// [`normalize_string_fields`][ConfigData::normalize_string_fields]
+/// (which `finalize` calls unconditionally for **every** field regardless
+/// of its per-field annotation — `non_empty`, `or(…)`, or `list_or(…)`).
 fn validate_config(config: &ConfigData) -> Result<()> {
     // Validate endpoint URL — basic sanity check
     if let Some(ref ep) = config.provider_endpoint
-        && !ep.trim().is_empty()
         && !ep.starts_with("https://")
         && !ep.starts_with("http://")
     {
