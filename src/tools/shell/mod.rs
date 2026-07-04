@@ -1552,50 +1552,48 @@ fn clean_truncate(data: &[u8], label: &'static str) -> String {
 /// Returns `Some(preview)` if JSON was parsed, `None` otherwise.
 fn try_json_preview(input: &str) -> Option<String> {
     let trimmed = input.trim();
-    if trimmed.is_empty() || (!trimmed.starts_with('[') && !trimmed.starts_with('{')) {
+    if trimmed.is_empty() {
         return None;
     }
 
-    // Try top-level array
-    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
-        let count = arr.len();
-        let preview = if arr.is_empty() {
-            String::from("[] (empty array)")
-        } else {
-            let sample = arr.iter().take(3).collect::<Vec<_>>();
-            let types = infer_json_types(&sample);
-            let entries = sample
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Array(arr)) => {
+            let count = arr.len();
+            let preview = if arr.is_empty() {
+                String::from("[] (empty array)")
+            } else {
+                let sample = arr.iter().take(3).collect::<Vec<_>>();
+                let types = infer_json_types(&sample);
+                let entries = sample
+                    .iter()
+                    .map(|v| serde_json::to_string(v).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "[JSON array: {count} items, schema: {types}]\n{entries}\n(total: {} chars)",
+                    input.len()
+                )
+            };
+            Some(preview)
+        }
+        Ok(serde_json::Value::Object(obj)) => {
+            let fields: Vec<String> = obj
                 .iter()
-                .map(|v| serde_json::to_string(v).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "[JSON array: {count} items, schema: {types}]\n{entries}\n(total: {} chars)",
+                .map(|(k, v)| {
+                    let t = json_value_type(v);
+                    format!("  {k}: {t}")
+                })
+                .collect();
+            let preview = format!(
+                "[JSON object: {} fields]\n{}\n(total: {} chars)",
+                fields.len(),
+                fields.join("\n"),
                 input.len()
-            )
-        };
-        return Some(preview);
+            );
+            Some(preview)
+        }
+        _ => None,
     }
-
-    // Try top-level object
-    if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed) {
-        let fields: Vec<String> = obj
-            .iter()
-            .map(|(k, v)| {
-                let t = json_value_type(v);
-                format!("  {k}: {t}")
-            })
-            .collect();
-        let preview = format!(
-            "[JSON object: {} fields]\n{}\n(total: {} chars)",
-            fields.len(),
-            fields.join("\n"),
-            input.len()
-        );
-        return Some(preview);
-    }
-
-    None
 }
 
 /// Infer a schema from a list of JSON values (typically array elements).
