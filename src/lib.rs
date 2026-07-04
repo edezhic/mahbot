@@ -847,6 +847,10 @@ impl ChatResponse {
     }
 }
 
+/// Default maximum tokens for agent LLM calls.
+/// Used as the fallback when callers don't explicitly set `max_tokens`.
+pub const DEFAULT_MAX_TOKENS: u32 = 32000;
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
@@ -854,6 +858,10 @@ pub struct ChatRequest {
     pub model: String,
     pub allow_image_parts: bool,
     pub temperature: f32,
+    /// Maximum tokens for the model to generate.
+    /// When `Some(n)`, sent as `max_tokens` in the API request body.
+    /// When `None`, the parameter is omitted (provider defaults apply).
+    pub max_tokens: Option<u32>,
     /// Per-role reasoning effort (xhigh, high, medium, low, minimal).
     /// When set, sent as `reasoning_effort` in the API request body.
     /// When `None`, the parameter is omitted (model defaults apply).

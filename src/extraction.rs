@@ -74,6 +74,7 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
             model: config.model.to_string(),
             allow_image_parts: false, // extractions never need image parts
             temperature: config.temperature,
+            max_tokens: None,
             reasoning_effort: config.reasoning_effort.clone(),
             provider_order: routing.provider_order.clone(),
             provider_allow_fallbacks: routing.allow_fallbacks,

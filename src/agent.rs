@@ -596,6 +596,7 @@ impl Agent {
             model: self.model(),
             allow_image_parts,
             temperature: self.temperature(),
+            max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
             reasoning_effort: Some(self.reasoning_effort()),
             provider_order: routing.provider_order,
             provider_allow_fallbacks: routing.allow_fallbacks,

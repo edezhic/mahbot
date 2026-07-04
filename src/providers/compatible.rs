@@ -107,7 +107,8 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<NativeMessage>,
     temperature: f64,
-    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -601,7 +602,7 @@ impl OpenAiCompatibleProvider {
             model: request.model.clone(),
             messages: native,
             temperature: f64::from(request.temperature),
-            max_tokens: 32000,
+            max_tokens: request.max_tokens,
             tool_stream: (has_tools && self.tool_stream).then_some(true),
             tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
             tools: tool_specs,
@@ -716,6 +717,7 @@ mod tests {
                 allow_image_parts: false,
                 temperature: 0.1,
                 reasoning_effort: None,
+                max_tokens: None,
                 provider_order: None,
                 provider_allow_fallbacks: None,
             })
@@ -1135,7 +1137,7 @@ mod tests {
             model: "test-model".to_string(),
             messages: vec![NativeMessage::user("What is the weather?")],
             temperature: 0.7,
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tool_stream: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
@@ -1165,6 +1167,7 @@ mod tests {
             model: "test-model".to_string(),
             allow_image_parts: false,
             temperature: 0.7,
+            max_tokens: None,
             reasoning_effort: None,
             provider_order: None,
             provider_allow_fallbacks: None,
@@ -1204,6 +1207,7 @@ mod tests {
             model: "test-model".to_string(),
             allow_image_parts: false,
             temperature: 0.7,
+            max_tokens: None,
             reasoning_effort: None,
             provider_order: None,
             provider_allow_fallbacks: None,

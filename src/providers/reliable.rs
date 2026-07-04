@@ -408,6 +408,7 @@ mod tests {
                 allow_image_parts: false,
                 temperature: 0.1,
                 reasoning_effort: None,
+                max_tokens: None,
                 provider_order: None,
                 provider_allow_fallbacks: None,
             })
@@ -567,6 +568,7 @@ mod tests {
             allow_image_parts: false,
             temperature: 0.1,
             reasoning_effort: None,
+            max_tokens: None,
             provider_order: None,
             provider_allow_fallbacks: None,
         };
@@ -647,6 +649,7 @@ mod tests {
                 allow_image_parts: false,
                 temperature: 0.1,
                 reasoning_effort: None,
+                max_tokens: None,
                 provider_order: None,
                 provider_allow_fallbacks: None,
             })
@@ -714,6 +717,7 @@ mod tests {
                 allow_image_parts: false,
                 temperature: 0.1,
                 reasoning_effort: None,
+                max_tokens: None,
                 provider_order: None,
                 provider_allow_fallbacks: None,
             })
