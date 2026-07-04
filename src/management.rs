@@ -1257,15 +1257,22 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    let comment = if !crate::git_commands::git_is_installed().await {
-        Some("Git not installed — moving to Done without commit")
-    } else if !crate::git_commands::is_git_repo(repo_path) {
-        Some("Not a git repo — moving to Done without commit")
-    } else {
-        None
-    };
-    if let Some(c) = comment {
-        transition_ticket_to_done(&ticket, source, c).await;
+    if !crate::git_commands::git_is_installed().await {
+        transition_ticket_to_done(
+            &ticket,
+            source,
+            "Git not installed — moving to Done without commit",
+        )
+        .await;
+        return;
+    }
+    if !crate::git_commands::is_git_repo(repo_path) {
+        transition_ticket_to_done(
+            &ticket,
+            source,
+            "Not a git repo — moving to Done without commit",
+        )
+        .await;
         return;
     }
 
