@@ -520,13 +520,11 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
             ticket = %ticket.id,
             error = %e,
             "{log_label} failed but transition to ReadyForDevelopment also failed",
-            log_label = log_label,
         );
     } else {
         info!(
             ticket = %ticket.id,
             "{log_label} failed — pipeline reservation set for rework priority",
-            log_label = log_label,
         );
     }
 }
