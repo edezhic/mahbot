@@ -2509,6 +2509,9 @@ impl EditorState {
         self.saved_tabs_gen = saved_gen;
         self.clear_workspace_editor_state();
 
+        // Register the root generation so DirExpanded can validate it.
+        self.dir_generations.insert(String::new(), r#gen);
+
         // ── Task 1: read root directory ───────────────────────
         let root_path = path.unwrap_or_default().to_string();
         let root_gen = r#gen;
@@ -2673,14 +2676,12 @@ impl EditorState {
         entries: Result<Vec<FsEntry>, String>,
         quiet: bool,
     ) -> Task<EditorMessage> {
-        if !dir_path.is_empty() && self.dir_generations.get(dir_path) != Some(&r#gen) {
+        if self.dir_generations.get(dir_path) != Some(&r#gen) {
             return Task::none();
         }
         // Consume the generation slot (mirroring the pattern in rename_completed).
         // The entry is no longer needed once the matching result has been accepted.
-        if !dir_path.is_empty() {
-            self.dir_generations.remove(dir_path);
-        }
+        self.dir_generations.remove(dir_path);
 
         self.loading_dirs.remove(dir_path);
 
@@ -3689,7 +3690,7 @@ impl EditorState {
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        if !re_path.is_empty() && self.dir_generations.get(&re_path) != Some(&rename_gen) {
+        if self.dir_generations.get(&re_path) != Some(&rename_gen) {
             return Task::none();
         }
         // Own the generation — consume it so a future operation can
@@ -8187,6 +8188,10 @@ mod tests {
         );
 
         // Simulate a rename of "src" -> "lib" completing successfully.
+        // Pre-populate dir_generations so the staleness guard passes
+        // (rename_submit would have registered this generation before
+        // firing the async operation).
+        state.dir_generations.insert(String::new(), 0);
         let _ = state.update(EditorMessage::RenameCompleted {
             old_path: "src".into(),
             new_path: "lib".into(),
@@ -8198,7 +8203,7 @@ mod tests {
                 is_dir: true,
                 error: None,
             }]),
-            rename_gen: 0, // matches default dir_generations for ""
+            rename_gen: 0,
         });
 
         // The directory's own dir_entries entry should be migrated.
