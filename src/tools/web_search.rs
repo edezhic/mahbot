@@ -17,6 +17,14 @@ pub enum WebSearchBackend {
     Exa { key: String },
 }
 
+impl WebSearchBackend {
+    fn key(&self) -> &str {
+        match self {
+            Self::Firecrawl { key } | Self::Exa { key } => key,
+        }
+    }
+}
+
 // ── Firecrawl API types ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -370,9 +378,7 @@ impl WebSearchTool {
     }
 
     async fn firecrawl_search(&self, query: &str) -> anyhow::Result<String> {
-        let WebSearchBackend::Firecrawl { key } = &self.backend else {
-            unreachable!("firecrawl_search called for non-Firecrawl backend");
-        };
+        let key = self.backend.key();
 
         let res = crate::util::http::media_http_client()
             .post("https://api.firecrawl.dev/v2/search")
@@ -423,9 +429,7 @@ impl WebSearchTool {
     }
 
     async fn exa_search(&self, query: &str) -> anyhow::Result<String> {
-        let WebSearchBackend::Exa { key } = &self.backend else {
-            unreachable!("exa_search called for non-Exa backend");
-        };
+        let key = self.backend.key();
 
         let res = crate::util::http::media_http_client()
             .post("https://api.exa.ai/search")
