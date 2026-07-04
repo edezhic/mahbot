@@ -276,17 +276,31 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> Result<CommitInf
     })
 }
 
+/// A single entry from `git diff --numstat` or `git show --numstat` output.
+///
+/// `additions` and `deletions` are `None` for binary files (where git outputs `-`
+/// instead of a line count). Regular files always have `Some` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumstatEntry {
+    /// Lines added, or `None` if the file is binary.
+    pub additions: Option<i64>,
+    /// Lines deleted, or `None` if the file is binary.
+    pub deletions: Option<i64>,
+    /// File path as printed by git.
+    pub path: String,
+}
+
 /// Parse the output of `git diff --numstat` or `git show --numstat`.
 ///
-/// Returns a vector of `(additions, deletions, path)` tuples for each file.
-/// Binary files (displayed as `-\t-\t<path>`) are returned as `(-1, -1, path)`
-/// so callers can distinguish them from regular entries with zero changes.
-/// Lines that don't match the expected 3-field format are silently skipped.
+/// Returns a vector of [`NumstatEntry`] values for each file.
+/// Binary files (displayed as `-\t-\t<path>`) have `additions` and `deletions`
+/// set to `None` so callers can distinguish them from regular entries with zero
+/// changes. Lines that don't match the expected 3-field format are silently skipped.
 ///
 /// This is a pure parsing function with no I/O — callers run git themselves
 /// and pass the captured stdout here.
 #[must_use]
-pub fn parse_numstat_lines(stdout: &str) -> Vec<(i64, i64, String)> {
+pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
     let mut result = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();
@@ -304,14 +318,25 @@ pub fn parse_numstat_lines(stdout: &str) -> Vec<(i64, i64, String)> {
         let path = parts[2].to_string();
 
         // Binary files are displayed as "-\t-\t<path>"
+        // If either field is "-", treat the file as binary (both fields None).
+        // This is defensive: git always outputs "-\t-" for both fields on binary
+        // files, but we handle the mixed case conservatively.
         if additions_str == "-" || deletions_str == "-" {
-            result.push((-1, -1, path));
+            result.push(NumstatEntry {
+                additions: None,
+                deletions: None,
+                path,
+            });
             continue;
         }
 
         let additions: i64 = additions_str.parse().unwrap_or(0);
         let deletions: i64 = deletions_str.parse().unwrap_or(0);
-        result.push((additions, deletions, path));
+        result.push(NumstatEntry {
+            additions: Some(additions),
+            deletions: Some(deletions),
+            path,
+        });
     }
     result
 }
@@ -326,12 +351,12 @@ async fn parse_numstat(repo_path: &Path, args: &[&str]) -> Result<(i64, i64), St
     let mut lines_added: i64 = 0;
     let mut lines_removed: i64 = 0;
 
-    for (added, removed, _path) in parse_numstat_lines(&stdout) {
-        // Binary files have negative values — they contribute 0 lines.
-        if added >= 0 {
+    for entry in parse_numstat_lines(&stdout) {
+        // Binary files have None values — they contribute 0 lines.
+        if let Some(added) = entry.additions {
             lines_added += added;
         }
-        if removed >= 0 {
+        if let Some(removed) = entry.deletions {
             lines_removed += removed;
         }
     }
@@ -817,19 +842,54 @@ AM staged_then_modified.js
         let output = "10\t3\tsrc/main.rs\n0\t1\tsrc/lib.rs\n42\t7\tCargo.toml\n";
         let entries = parse_numstat_lines(output);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], (10, 3, "src/main.rs".to_string()));
-        assert_eq!(entries[1], (0, 1, "src/lib.rs".to_string()));
-        assert_eq!(entries[2], (42, 7, "Cargo.toml".to_string()));
+        assert_eq!(
+            entries[0],
+            NumstatEntry {
+                additions: Some(10),
+                deletions: Some(3),
+                path: "src/main.rs".to_string()
+            }
+        );
+        assert_eq!(
+            entries[1],
+            NumstatEntry {
+                additions: Some(0),
+                deletions: Some(1),
+                path: "src/lib.rs".to_string()
+            }
+        );
+        assert_eq!(
+            entries[2],
+            NumstatEntry {
+                additions: Some(42),
+                deletions: Some(7),
+                path: "Cargo.toml".to_string()
+            }
+        );
     }
 
-    /// Binary files are represented as (-1, -1).
+    /// Binary files are represented as (None, None).
     #[test]
     fn parse_numstat_lines_binary() {
         let output = "-\t-\timage.png\n42\t7\tsrc/main.rs\n";
         let entries = parse_numstat_lines(output);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], (-1, -1, "image.png".to_string()));
-        assert_eq!(entries[1], (42, 7, "src/main.rs".to_string()));
+        assert_eq!(
+            entries[0],
+            NumstatEntry {
+                additions: None,
+                deletions: None,
+                path: "image.png".to_string()
+            }
+        );
+        assert_eq!(
+            entries[1],
+            NumstatEntry {
+                additions: Some(42),
+                deletions: Some(7),
+                path: "src/main.rs".to_string()
+            }
+        );
     }
 
     /// Empty lines and malformed lines are silently skipped.
@@ -838,7 +898,14 @@ AM staged_then_modified.js
         let output = "\n\n10\t3\tsrc/main.rs\n\t\t\nnot-enough-fields\n";
         let entries = parse_numstat_lines(output);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0], (10, 3, "src/main.rs".to_string()));
+        assert_eq!(
+            entries[0],
+            NumstatEntry {
+                additions: Some(10),
+                deletions: Some(3),
+                path: "src/main.rs".to_string()
+            }
+        );
     }
 
     /// Empty output produces an empty vector.

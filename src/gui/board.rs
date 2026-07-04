@@ -540,18 +540,21 @@ impl BoardState {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut files: Vec<FileStat> = Vec::new();
 
-        for (additions, deletions, path) in parse_numstat_lines(&stdout) {
-            // Skip binary files (represented as -1, -1)
-            if additions < 0 || deletions < 0 {
+        for entry in parse_numstat_lines(&stdout) {
+            // Skip binary files (additions/deletions are None)
+            let Some(additions) = entry.additions else {
                 continue;
-            }
+            };
+            let Some(deletions) = entry.deletions else {
+                continue;
+            };
             // Skip rename-only (0 additions, 0 deletions)
             if additions == 0 && deletions == 0 {
                 continue;
             }
 
             files.push(FileStat {
-                path,
+                path: entry.path,
                 additions,
                 deletions,
             });
