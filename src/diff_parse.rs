@@ -102,12 +102,19 @@ struct DiffParser {
 }
 
 impl DiffParser {
+    /// Flush any pending hunk into the current file (if both exist).
+    fn flush_hunk(&mut self) {
+        if let Some(hunk) = self.current_hunk.take()
+            && let Some(f) = &mut self.current_file
+        {
+            f.hunks.push(hunk);
+        }
+    }
+
     /// Flush the current file (with optional pending hunk) into the files vec.
     fn flush(&mut self) {
-        if let Some(mut file) = self.current_file.take() {
-            if let Some(hunk) = self.current_hunk.take() {
-                file.hunks.push(hunk);
-            }
+        self.flush_hunk();
+        if let Some(file) = self.current_file.take() {
             self.files.push(file);
         }
     }
@@ -160,11 +167,7 @@ impl DiffParser {
     /// Handle a hunk header line (`@@ -old,count +new,count @@`): flush previous hunk,
     /// parse the header, and set up a new hunk with fresh line counters.
     fn handle_hunk_header(&mut self, line: &str) {
-        if let Some(hunk) = self.current_hunk.take()
-            && let Some(f) = &mut self.current_file
-        {
-            f.hunks.push(hunk);
-        }
+        self.flush_hunk();
         let (old_start, new_start) = parse_hunk_header(line);
         self.old_counter = old_start;
         self.new_counter = new_start;
