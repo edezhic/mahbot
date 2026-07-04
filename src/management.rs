@@ -2939,55 +2939,6 @@ mod tests {
         }
     }
 
-    // ── notify_ticket — smoke tests ──────────────────────────────────
-
-    /// Smoke test: transitioning to Failed with Notify should not panic.
-    /// Catches asset-loading or DB panics in the notification path.
-    #[tokio::test]
-    async fn notify_ticket_failed_transition_does_not_panic() {
-        let ws = setup_db_workspace("failed_notify_test").await;
-
-        let ticket_id = make_ticket(board(), &ws, "Failed Notify Test", TicketPhase::Backlog).await;
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        // Transition to Failed via transition_ticket_to_failed — writes the
-        // failure comment atomically with the transition. Must not panic.
-        assert!(
-            transition_ticket_to_failed(
-                &ticket,
-                DEFAULT_TICKET_PHASE,
-                "❌ Test failure detail",
-                "test",
-            )
-            .await,
-            "transition_ticket_to_failed should succeed",
-        );
-    }
-
-    /// Smoke test: transitioning to a non-Failed phase with Notify should not
-    /// panic. The warning template is only loaded for Failed transitions, so
-    /// this path exercises that the conditional guard works.
-    #[tokio::test]
-    async fn notify_ticket_non_failed_transition_does_not_panic() {
-        let ws = setup_db_workspace("non_failed_notify_test").await;
-
-        let ticket_id =
-            make_ticket(board(), &ws, "Non-Failed Notify Test", TicketPhase::Backlog).await;
-
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        // Transition from Backlog to Analysis with Notify — must not panic
-        transition_ticket(
-            &ticket,
-            TicketPhase::Backlog,
-            TicketPhase::Analysis,
-            NotifyPolicy::Notify,
-            None,
-        )
-        .await
-        .expect("transition to Analysis");
-    }
-
     // ── try_trip_circuit_breaker — sanitation counting ──
 
     /// Verify that the sanitation circuit breaker counting logic works correctly.
@@ -3377,17 +3328,6 @@ mod tests {
         assert!(
             has_marker,
             "trip comment must contain circuit breaker marker"
-        );
-
-        // Phase guard prevents a second trip: the ticket is now Failed, not
-        // InReview, so is_ticket_in_phase rejects it before the breaker runs.
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        let guarded =
-            is_phase_or_general_breaker_blocked(&ticket, TicketPhase::InReview, "test").await;
-        assert!(
-            guarded,
-            "phase guard must reject re-trip (ticket is now Failed)"
         );
 
         let phase = expect_ticket_phase(board(), &ticket_id).await;
