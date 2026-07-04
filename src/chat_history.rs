@@ -107,6 +107,25 @@ fn rows_to_history_entries(rows: Vec<Row>) -> Result<Vec<ChatHistoryEntry>> {
     Ok(entries)
 }
 
+/// Process rows from a `LIMIT HISTORY_LIMIT + 1` query into a page of entries
+/// with a `has_more` flag. Entries are returned in chronological order.
+/// The extra over-fetched row (if any) is dropped from the front (oldest
+/// entries) so the returned vector contains at most `HISTORY_LIMIT` entries.
+fn rows_to_page(rows: Vec<Row>) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+    let mut entries = rows_to_history_entries(rows)?;
+    // SAFETY: HISTORY_LIMIT is 100, always fits in usize on all targets.
+    #[allow(clippy::cast_possible_truncation)]
+    let limit = HISTORY_LIMIT as usize;
+    let has_more = entries.len() > limit;
+    if has_more {
+        // Entries are in chronological order (oldest first).
+        // We over-fetched by 1 to detect has_more; remove the oldest entry
+        // (at the front) so we return exactly HISTORY_LIMIT entries.
+        entries.drain(0..(entries.len() - limit));
+    }
+    Ok((entries, has_more))
+}
+
 impl ChatHistoryStore {
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
     /// Silently ignores duplicate `message_id` values (UPSERT no-op).
@@ -133,14 +152,16 @@ impl ChatHistoryStore {
         Ok(())
     }
 
-    /// Load the 100 most recent messages for a user + workspace pair,
+    /// Load the most recent messages for a user + workspace pair,
     /// returned in chronological order (oldest first).
+    /// Returns `(entries, has_more)` where `has_more` is `true` if older
+    /// entries exist beyond the loaded window.
     pub async fn load_for_user(
         &self,
         user_name: &str,
         workspace: &str,
-    ) -> Result<Vec<ChatHistoryEntry>> {
-        // Query newest first (DESC), then reverse in memory for display order.
+    ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+        let query_limit = HISTORY_LIMIT + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
             .query(
@@ -151,22 +172,23 @@ impl ChatHistoryStore {
                      ORDER BY id DESC \
                      LIMIT ?3",
                 ),
-                turso::params![user_name, workspace, HISTORY_LIMIT],
+                turso::params![user_name, workspace, query_limit],
             )
             .await?;
-        rows_to_history_entries(rows)
+        rows_to_page(rows)
     }
 
     /// Load messages older than `before_id` for a user + workspace pair.
-    /// Queries `LIMIT limit + 1` to detect whether more entries exist.
-    /// Returns entries in chronological order (oldest first).
+    /// Returns `(entries, has_more)` where `has_more` is `true` if even older
+    /// entries exist beyond the loaded window. Returns entries in chronological
+    /// order (oldest first).
     pub async fn load_older_for_user(
         &self,
         user_name: &str,
         workspace: &str,
         before_id: i64,
-    ) -> Result<Vec<ChatHistoryEntry>> {
-        let limit = HISTORY_LIMIT + 1; // fetch one extra to detect has_more
+    ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+        let query_limit = HISTORY_LIMIT + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
             .query(
@@ -177,10 +199,10 @@ impl ChatHistoryStore {
                      ORDER BY id DESC \
                      LIMIT ?4",
                 ),
-                turso::params![user_name, workspace, before_id, limit],
+                turso::params![user_name, workspace, before_id, query_limit],
             )
             .await?;
-        rows_to_history_entries(rows)
+        rows_to_page(rows)
     }
 
     /// Delete all chat history entries for a specific user + workspace pair.
@@ -241,11 +263,12 @@ mod tests {
             })
             .await
             .expect("insert should succeed");
-        let history = store
+        let (history, has_more) = store
             .load_for_user("user", "ws")
             .await
             .expect("load should succeed");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "hello");
+        assert!(!has_more);
     }
 }

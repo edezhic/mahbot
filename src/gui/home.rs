@@ -152,8 +152,8 @@ pub enum HomeMessage {
     InputChanged(text_editor::Action),
     /// Send button pressed or Enter key in editor.
     SendMessage,
-    /// Chat history loaded from the store.
-    HistoryLoaded(Vec<ChatHistoryEntry>),
+    /// Chat history loaded from the store (entries, has_more).
+    HistoryLoaded(Vec<ChatHistoryEntry>, bool),
     /// History load failed.
     HistoryLoadError(String),
     /// Live chat event from CHAT_BROADCAST subscription.
@@ -164,8 +164,8 @@ pub enum HomeMessage {
     ScrollChanged(scrollable::Viewport),
     /// User clicked "Load older messages" button.
     LoadOlderMessages,
-    /// Older history loaded (entries, current pagination_gen for staleness check).
-    OlderHistoryLoaded(Vec<ChatHistoryEntry>, u64),
+    /// Older history loaded (entries, has_more, pagination_gen for staleness check).
+    OlderHistoryLoaded(Vec<ChatHistoryEntry>, bool, u64),
     /// Older history load failed.
     OlderHistoryLoadError(String),
     /// User list loaded for the picker.
@@ -453,7 +453,7 @@ impl HomeState {
                     .map_err(|e| e.to_string())
             },
             |result| match result {
-                Ok(entries) => HomeMessage::HistoryLoaded(entries),
+                Ok((entries, has_more)) => HomeMessage::HistoryLoaded(entries, has_more),
                 Err(e) => HomeMessage::HistoryLoadError(e),
             },
         )
@@ -1073,10 +1073,10 @@ impl HomeState {
                 self.refresh_history()
             }
             HomeMessage::SendMessage => self.send_message(),
-            HomeMessage::HistoryLoaded(entries) => {
+            HomeMessage::HistoryLoaded(entries, has_more) => {
                 // Track oldest loaded ID and whether more exist for pagination.
                 self.oldest_loaded_id = entries.first().map(|e| e.id);
-                self.has_more = entries.len() >= 100;
+                self.has_more = has_more;
                 for entry in entries {
                     let msg_id = self.push_message(entry);
                     self.seen_ids.insert(msg_id);
@@ -1279,29 +1279,23 @@ impl HomeState {
                         store
                             .load_older_for_user(&sender, &workspace, before_id)
                             .await
-                            .map(|entries| (entries, generation))
+                            .map(|(entries, has_more)| (entries, has_more, generation))
                             .map_err(|e| e.to_string())
                     },
                     |result| match result {
-                        Ok((entries, generation)) => {
-                            HomeMessage::OlderHistoryLoaded(entries, generation)
+                        Ok((entries, has_more, generation)) => {
+                            HomeMessage::OlderHistoryLoaded(entries, has_more, generation)
                         }
                         Err(e) => HomeMessage::OlderHistoryLoadError(e),
                     },
                 )
             }
-            HomeMessage::OlderHistoryLoaded(entries, generation) => {
+            HomeMessage::OlderHistoryLoaded(display_entries, has_more, generation) => {
                 // Guard against stale callbacks.
                 if generation != self.pagination_gen {
                     self.loading_older = false;
                     return Task::none();
                 }
-                let has_more = entries.len() > 100;
-                let display_entries: Vec<ChatHistoryEntry> = if has_more {
-                    entries.into_iter().take(100).collect()
-                } else {
-                    entries
-                };
                 // Prepend entries to the beginning of messages.
                 let mut prepended: Vec<ChatMessage> = display_entries
                     .into_iter()
