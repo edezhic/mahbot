@@ -42,38 +42,28 @@ pub fn reasoning_plaintext_for_roundtrip(
     None
 }
 
-/// After extracting reasoning fields, fill `reasoning_content` when missing.
+/// Augment reasoning fields for replay, filling `reasoning_content` when missing.
 ///
 /// `DeepSeek` (and some OpenRouter-routed thinking models) reject follow-up requests unless prior
 /// assistant turns echo chain-of-thought in `reasoning_content`. We derive it from `reasoning`
 /// and/or `reasoning_details` using [`reasoning_plaintext_for_roundtrip`].
-pub(crate) fn augment_native_reasoning_triple_for_replay(
-    reasoning: Option<String>,
-    reasoning_content: Option<String>,
-    reasoning_details: Option<Value>,
-    has_tool_calls: bool,
-) -> (Option<String>, Option<String>, Option<Value>) {
-    if reasoning_content.is_some() {
-        return (reasoning, reasoning_content, reasoning_details);
-    }
-    let synthesized = reasoning_plaintext_for_roundtrip(
-        reasoning.as_deref(),
-        reasoning_details.as_ref(),
-        has_tool_calls,
-    );
-    (reasoning, synthesized, reasoning_details)
-}
-
 pub(crate) fn native_reasoning_triple_for_replay(
     reasoning: Option<&Reasoning>,
     has_tool_calls: bool,
 ) -> (Option<String>, Option<String>, Option<Value>) {
-    augment_native_reasoning_triple_for_replay(
-        reasoning.and_then(|r| r.reasoning.clone()),
-        reasoning.and_then(|r| r.reasoning_content.clone()),
-        reasoning.and_then(|r| r.reasoning_details.clone()),
+    let r_reasoning = reasoning.and_then(|r| r.reasoning.clone());
+    let r_content = reasoning.and_then(|r| r.reasoning_content.clone());
+    let r_details = reasoning.and_then(|r| r.reasoning_details.clone());
+
+    if r_content.is_some() {
+        return (r_reasoning, r_content, r_details);
+    }
+    let synthesized = reasoning_plaintext_for_roundtrip(
+        r_reasoning.as_deref(),
+        r_details.as_ref(),
         has_tool_calls,
-    )
+    );
+    (r_reasoning, synthesized, r_details)
 }
 
 /// `reasoning_details` when present (opaque JSON).
@@ -306,14 +296,19 @@ mod tests {
     #[test]
     fn augment_fills_reasoning_content_from_reasoning_or_details() {
         let d = json!([{"type": "reasoning.text", "text": "x", "format": "f", "index": 0}]);
-        let (r, rc, rd) =
-            augment_native_reasoning_triple_for_replay(Some("openrouter".into()), None, None, true);
+
+        // reasoning present, no reasoning_content → synthesized from reasoning
+        let reasoning = Reasoning::from_optional_parts(Some("openrouter".into()), None, None)
+            .expect("reasoning");
+        let (r, rc, rd) = native_reasoning_triple_for_replay(Some(&reasoning), true);
         assert_eq!(r.as_deref(), Some("openrouter"));
         assert_eq!(rc.as_deref(), Some("openrouter"));
         assert!(rd.is_none());
 
-        let (r, rc, rd) =
-            augment_native_reasoning_triple_for_replay(None, None, Some(d.clone()), true);
+        // details present, no reasoning → synthesized from details
+        let reasoning =
+            Reasoning::from_optional_parts(None, None, Some(d.clone())).expect("reasoning_details");
+        let (r, rc, rd) = native_reasoning_triple_for_replay(Some(&reasoning), true);
         assert!(r.is_none());
         assert_eq!(rc.as_deref(), Some("x"));
         assert_eq!(rd.as_ref(), Some(&d));
