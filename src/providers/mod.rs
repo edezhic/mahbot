@@ -50,7 +50,7 @@ pub(crate) fn ensure_base_url(endpoint: &str) -> String {
 /// Splits `order` on commas, trims whitespace, and filters empty strings.
 /// Returns `None` when the resulting provider list is empty, so callers can
 /// skip inserting the routing block entirely (matching the pre-existing
-/// behaviour in [`compatible::build_chat_request_raw`]).
+/// behaviour in [`compatible::build_http_request`]).
 ///
 /// This works for both comma-separated provider lists (chat completions) and
 /// single-provider strings (transcription) — a single slug survives the

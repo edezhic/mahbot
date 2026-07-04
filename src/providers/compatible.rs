@@ -569,8 +569,9 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Build the HTTP request for synchronous [`Provider::chat`] calls.
-    fn build_chat_request_raw(&self, request: &ProviderChatRequest) -> RequestBuilder {
+    /// Build the HTTP request for [`Provider::chat`].
+    /// This function itself is synchronous; the caller (chat) sends the request asynchronously.
+    fn build_http_request(&self, request: &ProviderChatRequest) -> RequestBuilder {
         let native =
             Self::convert_messages_for_native(&request.messages, request.allow_image_parts);
         let tool_specs = Self::convert_tool_specs(request.tools.as_deref());
@@ -625,7 +626,7 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     async fn chat(&self, request: ProviderChatRequest) -> anyhow::Result<ProviderChatResponse> {
-        let req_builder = self.build_chat_request_raw(&request);
+        let req_builder = self.build_http_request(&request);
         let model = request.model;
 
         let response = crate::shutdown::race_shutdown(req_builder.send())
@@ -1169,7 +1170,7 @@ mod tests {
             provider_allow_fallbacks: None,
         };
 
-        let builder = provider.build_chat_request_raw(&chat_request);
+        let builder = provider.build_http_request(&chat_request);
         let http_request = builder.build().unwrap();
         let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
         let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
@@ -1208,7 +1209,7 @@ mod tests {
             provider_allow_fallbacks: None,
         };
 
-        let builder = provider.build_chat_request_raw(&chat_request);
+        let builder = provider.build_http_request(&chat_request);
         let http_request = builder.build().unwrap();
         let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
         let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
