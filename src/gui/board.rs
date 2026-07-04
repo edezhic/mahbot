@@ -1124,7 +1124,7 @@ impl BoardState {
             let role_color = theme::role_badge_color(&comment.role).0;
 
             // For diagnostics comments, optionally show only the summary
-            let is_diag = comment.role == "diagnostics";
+            let is_diag = comment.role == crate::role::DIAGNOSTICS_ROLE;
             let is_expanded = expanded.contains(&i);
 
             let summary = if is_diag {
