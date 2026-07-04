@@ -1895,16 +1895,42 @@ struct ParallelVerdict {
     verdict: Option<crate::Verdict>,
 }
 
-/// Extract structured verdicts from parallel agent results.
+/// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
+/// from their responses.
+///
+/// Session keys are formatted as `ticket_{ticket.id}_{role}_{i}_{suffix}`
+/// where `suffix` is a unique 6-char NanoID for retry-cycle disambiguation.
+/// Each agent creates its own CancellationToken and auto-registers.
+///
 /// Agents with empty responses get `verdict: None`; others are parsed via
 /// [`crate::extraction::retry_extract_structured::<Verdict>`] using the provided extraction prompt.
 /// All non-empty extractions run concurrently via [`join_all`].
-async fn extract_parallel_verdicts(
-    results: Vec<(crate::Agent, String)>,
+async fn run_parallel_agents(
+    ticket: &Arc<Ticket>,
+    ws: &Workspace,
+    role: Role,
+    prompt: &str,
     extraction_prompt: &str,
 ) -> Vec<ParallelVerdict> {
-    let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
+    let suffix = crate::generate_suffix();
+    let futures: Vec<_> = (0..PARALLEL_AGENT_COUNT)
+        .map(move |i| {
+            let ticket = Arc::clone(ticket);
+            let prompt = prompt.to_string();
+            let ws = ws.clone();
+            let base = ticket_session_key(&ticket.id, role.as_str());
+            let session_key = format!("{base}_{i}_{suffix}");
+            async move {
+                let (agent, response) =
+                    run_agent(session_key, role, &ws, Some(&ticket), &prompt).await;
+                (agent, response.unwrap_or_default())
+            }
+        })
+        .collect();
+    let results = join_all(futures).await;
 
+    // Extract structured verdicts from parallel agent results.
+    let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
     let futures: Vec<_> = results
         .into_iter()
         .map(|(agent, response)| {
@@ -1932,37 +1958,6 @@ async fn extract_parallel_verdicts(
         .collect();
 
     join_all(futures).await
-}
-
-/// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
-/// using the provided extraction prompt.
-/// Session keys are formatted as `ticket_{ticket.id}_{role}_{i}_{suffix}`
-/// where `suffix` is a unique 6-char NanoID for retry-cycle disambiguation.
-/// Each agent creates its own CancellationToken and auto-registers.
-async fn run_parallel_with_extraction(
-    ticket: &Arc<Ticket>,
-    ws: &Workspace,
-    role: Role,
-    prompt: &str,
-    extraction_prompt: &str,
-) -> Vec<ParallelVerdict> {
-    let suffix = crate::generate_suffix();
-    let futures: Vec<_> = (0..PARALLEL_AGENT_COUNT)
-        .map(move |i| {
-            let ticket = Arc::clone(ticket);
-            let prompt = prompt.to_string();
-            let ws = ws.clone();
-            let base = ticket_session_key(&ticket.id, role.as_str());
-            let session_key = format!("{base}_{i}_{suffix}");
-            async move {
-                let (agent, response) =
-                    run_agent(session_key, role, &ws, Some(&ticket), &prompt).await;
-                (agent, response.unwrap_or_default())
-            }
-        })
-        .collect();
-    let results = join_all(futures).await;
-    extract_parallel_verdicts(results, extraction_prompt).await
 }
 
 /// Check whether a review or QA verdict passes (score at or above
@@ -2080,7 +2075,7 @@ async fn record_verdict_comments(
 /// agents and then process results via extraction.
 ///
 /// 1. Runs [`is_phase_or_general_breaker_blocked`] (phase check + circuit breaker)
-/// 2. Spawns agents via [`run_parallel_with_extraction`]
+/// 2. Spawns agents via [`run_parallel_agents`]
 /// 3. Runs a post-dispatch phase check (guard against race conditions)
 ///
 /// Returns `None` if either guard failed — the caller should bail out.
@@ -2099,7 +2094,7 @@ async fn dispatch_parallel_with_guard(
     if is_phase_or_general_breaker_blocked(ticket, expected_phase, log_label).await {
         return None;
     }
-    let results = run_parallel_with_extraction(ticket, ws, role, prompt, extraction_prompt).await;
+    let results = run_parallel_agents(ticket, ws, role, prompt, extraction_prompt).await;
     if !is_ticket_in_phase(&ticket.id, expected_phase).await {
         return None;
     }
