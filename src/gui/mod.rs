@@ -495,22 +495,23 @@ impl Dashboard {
         }
     }
 
-    /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
-    fn paused(&self) -> bool {
+    /// Look up a boolean flag for the currently selected workspace.
+    fn workspace_flag(&self, map: &HashMap<String, bool>) -> bool {
         self.selected_workspace_name
             .as_ref()
-            .and_then(|name| self.workspace_paused.get(name))
+            .and_then(|name| map.get(name))
             .copied()
             .unwrap_or(false)
     }
 
+    /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
+    fn paused(&self) -> bool {
+        self.workspace_flag(&self.workspace_paused)
+    }
+
     /// Whether the selected workspace's maintainer is enabled.
     fn maintenance(&self) -> bool {
-        self.selected_workspace_name
-            .as_ref()
-            .and_then(|name| self.workspace_maintenance.get(name))
-            .copied()
-            .unwrap_or(false)
+        self.workspace_flag(&self.workspace_maintenance)
     }
 
     pub const fn theme(&self) -> iced::Theme {
