@@ -1193,36 +1193,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_empty_content() {
-        let (sent, _lock) = setup_mirror_test_env().await;
-        setup_user_with_telegram_binding("skip_empty", "target_empty").await;
-
-        let msg = gui_msg("skip_empty", "");
-        super::mirror_gui_message_to_telegram(&msg).await;
-        let guard = sent.lock().unwrap_poison();
-        let our_msgs: Vec<_> = guard
-            .iter()
-            .filter(|m| m.recipient == "target_empty")
-            .collect();
-        assert!(our_msgs.is_empty(), "empty content should not send");
-    }
-
-    #[tokio::test]
-    async fn skip_whitespace_content() {
-        let (sent, _lock) = setup_mirror_test_env().await;
-        setup_user_with_telegram_binding("skip_ws", "target_ws").await;
-
-        let msg = gui_msg("skip_ws", "   \t\n  ");
-        super::mirror_gui_message_to_telegram(&msg).await;
-        let guard = sent.lock().unwrap_poison();
-        let our_msgs: Vec<_> = guard
-            .iter()
-            .filter(|m| m.recipient == "target_ws")
-            .collect();
-        assert!(
-            our_msgs.is_empty(),
-            "whitespace-only content should not send"
-        );
+    async fn skip_empty_or_whitespace_content() {
+        // Both inputs exercise the same guard — `msg.content.trim().is_empty()`.
+        // Each iteration acquires the serialization lock independently; this
+        // is safe because the global stores (OnceCell) and the spy channel
+        // (OnceLock) are identical across calls to `setup_mirror_test_env()`.
+        for content in ["", "   \t\n  "] {
+            let (sent, _lock) = setup_mirror_test_env().await;
+            setup_user_with_telegram_binding("skip_ew", "target_empty_ws").await;
+            let msg = gui_msg("skip_ew", content);
+            super::mirror_gui_message_to_telegram(&msg).await;
+            let guard = sent.lock().unwrap_poison();
+            let our_msgs: Vec<_> = guard
+                .iter()
+                .filter(|m| m.recipient == "target_empty_ws")
+                .collect();
+            assert!(
+                our_msgs.is_empty(),
+                "content {content:?} should not send, got {} message(s)",
+                our_msgs.len()
+            );
+        }
     }
 
     #[tokio::test]
