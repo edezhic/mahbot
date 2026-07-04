@@ -2054,12 +2054,22 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "chained cargo test uses state machine",
+                name: "chained cargo test falls through to GEN_FALLBACK",
                 command: "cd project && cargo test",
                 stdout: "Compiling foo v1.0.0\ntest test1 ... ok\ntest test2 ... FAILED\n\nfailures:\n\n---- test2 stdout ----\npanic!\n\nfailures:\n    test2\n\ntest result: FAILED. 1 passed; 1 failed\n",
                 exit_code: 1,
-                contains: &["test2 ... FAILED"],
-                not_contains: &["Compiling", "test1 ... ok"],
+                contains: &["test2 ... FAILED", "Compiling", "test1 ... ok"],
+                ..Default::default()
+            },
+            // Regression: chained cargo test with compile errors and exit_code=0
+            // must NOT produce the misleading "[cargo test: ok]" (mahbot-1163).
+            ShellOutputCase {
+                name: "chained cargo test compile error regression",
+                command: "cargo test --lib || true",
+                stdout: "",
+                stderr: "error[E0425]: cannot find value `x` in this scope\n  --> src/lib.rs:2:21\n   |\n2 |     let y = x + 1;\n   |             ^ not found in this scope\n",
+                exit_code: 0,
+                not_contains: &["[cargo test: ok]"],
                 ..Default::default()
             },
             ShellOutputCase {

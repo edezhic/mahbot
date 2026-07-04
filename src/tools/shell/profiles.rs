@@ -419,9 +419,10 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .tail(15)
             .max(40)
             .on_empty("[terraform: ok]"),
-        // ── Cargo test / nextest ──────────────────────────────────────────
+        // ── Cargo test / nextest ────────────────────────────────────────
         Profile::new(r"^cargo\s+(test|nextest)\b")
-            .output_transform(super::filter_cargo_test_output),
+            .output_transform(super::filter_cargo_test_output)
+            .standalone_only(),
         // ── ls ─────────────────────────────────────────────────────────────
         Profile::new(r"^ls\b")
             .output_transform(super::compact_ls)

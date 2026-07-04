@@ -1110,7 +1110,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         _ => "failed",
     };
 
-    comment_and_transition(TransitionParams {
+    if !comment_and_transition(TransitionParams {
         ticket: &ticket,
         comment: (Role::Engineer.as_str(), comment_text),
         extra: None,
@@ -1121,7 +1121,16 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         verb,
         pipeline_reservation: None,
     })
-    .await;
+    .await
+    {
+        return;
+    }
+
+    info!(
+        ticket = %ticket.id,
+        target = %target_phase,
+        "Engineer finished — transitioned ticket",
+    );
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
