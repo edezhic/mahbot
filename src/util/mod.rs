@@ -266,7 +266,7 @@ pub(crate) async fn load_reference_image(
 }
 
 /// Map a file path's extension to a MIME type string.
-pub(crate) fn mime_for_extension(path: &std::path::Path) -> &'static str {
+fn mime_for_extension(path: &std::path::Path) -> &'static str {
     match path
         .extension()
         .and_then(|e| e.to_str())
