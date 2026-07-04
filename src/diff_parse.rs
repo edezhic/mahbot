@@ -240,8 +240,11 @@ impl DiffParser {
             || line.starts_with("deleted file mode ")
             || line.starts_with("old mode ")
             || line.starts_with("new mode ")
+            || line.starts_with("rename to ")
         {
-            // Metadata lines — currently just skip
+            // Metadata lines — currently just skip.
+            // rename to is safe to skip because diff --git already captures the b-path,
+            // and rename from already set the status.
         } else if line.starts_with("--- ") || line.starts_with("+++ ") {
             if let Some(ref mut f) = self.current_file {
                 if line.starts_with("--- /dev/null") {
@@ -252,8 +255,6 @@ impl DiffParser {
             }
         } else if line.starts_with("rename from ") {
             self.handle_rename_from(line);
-        } else if line.starts_with("rename to ") {
-            // The path is already captured from diff --git; status already set at rename from.
         } else if line.starts_with("Binary files ") {
             if let Some(ref mut f) = self.current_file {
                 f.is_binary = true;
