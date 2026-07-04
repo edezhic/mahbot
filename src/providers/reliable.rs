@@ -259,7 +259,7 @@ impl Provider for ReliableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChatMessage, ToolSpec};
+    use crate::ChatMessage;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
