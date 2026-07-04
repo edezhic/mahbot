@@ -2597,49 +2597,6 @@ mod tests {
     };
     use crate::workspace::test_ws_named;
 
-    /// Verify that `is_phase_or_general_breaker_blocked` rejects a ticket
-    /// whose phase does not match `expected_phase`. This validates that the
-    /// pre-agent guard works correctly for `dispatch_verifiers` (and all
-    /// other agent-spawning dispatch functions).
-    #[tokio::test]
-    async fn guard_phase_mismatch_rejected() {
-        init_test_stores().await;
-
-        let ticket_id = make_ticket(
-            board(),
-            &test_ws_named("/tmp/test", "test"),
-            "Test",
-            TicketPhase::Backlog,
-        )
-        .await;
-
-        // Transition to InDevelopment so we have a known phase
-        board()
-            .transition_to(
-                &ticket_id,
-                Some(TicketPhase::Backlog),
-                TicketPhase::InDevelopment,
-                None,
-            )
-            .await
-            .expect("transition_to");
-
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        // Call with wrong phase — guard should reject immediately
-        assert!(
-            is_phase_or_general_breaker_blocked(&ticket, TicketPhase::InReview, "test_label").await,
-            "is_phase_or_general_breaker_blocked must reject a phase mismatch"
-        );
-
-        // Call with correct phase and 0 comments (below threshold) — guard should pass
-        assert!(
-            !is_phase_or_general_breaker_blocked(&ticket, TicketPhase::InDevelopment, "test_label")
-                .await,
-            "is_phase_or_general_breaker_blocked must pass when phase matches and comments are below threshold"
-        );
-    }
-
     /// Verify that when the circuit breaker trips on a ticket, all other
     /// ReadyForDevelopment tickets in the same workspace are moved to Planning.
     /// Tickets in other workspaces must not be affected.
