@@ -90,8 +90,8 @@ const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 /// from comment text.
 const SANITATION_FAILED_PREFIX: &str = "Sanitation failed";
 
-/// Minimum acceptable verification score (0-10) for analysis phase.
-const ANALYSIS_THRESHOLD: u8 = 7;
+/// Minimum acceptable verification score (0-10) for analyst verdicts.
+const ANALYST_PASS_THRESHOLD: u8 = 7;
 
 /// Minimum acceptable verification score (0-10) for review and QA phases.
 const REVIEW_QA_THRESHOLD: u8 = 9;
@@ -2161,7 +2161,7 @@ async fn dispatch_parallel_with_guard(
 
 /// Spawn 3 parallel analyst agents to research a backlog ticket.
 /// All verdicts are recorded as comments, then the ticket transitions to:
-/// - Planning (notify) when ALL analysts pass (≥ `ANALYSIS_THRESHOLD`/10)
+/// - Planning (notify) when ALL analysts pass (≥ `ANALYST_PASS_THRESHOLD`/10)
 /// - Planning (notify) when any analyst fails, with a comment listing the counts
 ///
 /// Before spawning agents, [`is_phase_or_general_breaker_blocked`] checks the phase and
@@ -2196,7 +2196,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// Records per-analyst comments (if verdict exists), counts responses and
 /// extractions via post-loop iterators, then transitions:
-/// - to Planning (notify) if ALL analysts passed (≥ `ANALYSIS_THRESHOLD`/10)
+/// - to Planning (notify) if ALL analysts passed (≥ `ANALYST_PASS_THRESHOLD`/10)
 /// - to Planning (notify) if any analyst failed, with a comment listing the counts
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
@@ -2221,8 +2221,10 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
 
     for r in results {
         match &r.verdict {
-            Some(v) if v.score >= ANALYSIS_THRESHOLD && v.issues_detected.is_empty() => lgtm += 1,
-            Some(v) if v.score >= ANALYSIS_THRESHOLD => minor_issues += 1,
+            Some(v) if v.score >= ANALYST_PASS_THRESHOLD && v.issues_detected.is_empty() => {
+                lgtm += 1;
+            }
+            Some(v) if v.score >= ANALYST_PASS_THRESHOLD => minor_issues += 1,
             Some(_) => potential_blockers += 1,
             None => missing_analysis += 1,
         }
@@ -2265,7 +2267,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
         info!(
             ticket = %ticket.id,
             nonempty_count,
-            "Backlog analysis complete — all analysts passed (≥ {ANALYSIS_THRESHOLD}/10)",
+            "Backlog analysis complete — all analysts passed (≥ {ANALYST_PASS_THRESHOLD}/10)",
         );
     } else {
         info!(
