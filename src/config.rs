@@ -272,15 +272,15 @@ macro_rules! string_config_fields {
             /// Set a string field by its database key. Returns `true` if the key was
             /// recognised and the field was updated, `false` for unknown keys.
             ///
-            /// The value is passed through `non_empty` so that empty strings are
-            /// stored as `None` (matching the read-path semantics of [`reload_from_db`]).
+            /// The value is stored as-is without normalization — call [`Self::finalize`]
+            /// before using the config to collapse empty/whitespace-only values to `None`.
             ///
             /// `per_role_configs` and `model_routings` are **not** handled here —
             /// they live in separate database tables (`config_role` and `config_model_routing`).
             #[must_use]
             pub fn set_string_field(&mut self, key: &str, value: &str) -> bool {
                 match key {
-                    $(stringify!($field) => self.$field = non_empty(Some(value.to_owned())),)*
+                    $(stringify!($field) => self.$field = Some(value.to_owned()),)*
                     _ => return false,
                 }
                 true
@@ -289,9 +289,9 @@ macro_rules! string_config_fields {
             /// Normalise all string fields in place: trim whitespace and collapse
             /// empty or whitespace-only values to `None`.
             ///
-            /// This is equivalent to passing every field through [`set_string_field`]
-            /// but avoids the intermediate enumeration, allocation, and key dispatch.
-            /// The behaviour is identical — each field is run through [`non_empty`].
+            /// Unlike [`set_string_field`], which stores values as-is, this is the
+            /// canonical normalization point — callers that set individual fields
+            /// should ensure [`Self::finalize`] is called before using the config.
             pub(crate) fn normalize_string_fields(&mut self) {
                 $(self.$field = non_empty(self.$field.take());)*
             }
@@ -915,26 +915,40 @@ mod tests {
             );
         }
 
-        // Setting an empty string should result in None (non_empty semantics).
+        // ── Normalization is handled by finalize(), not set_string_field ──
+        // set_string_field stores the raw value as-is.
         let _ = config.set_string_field("provider_key", "");
         let pk = config
             .string_fields()
             .iter()
             .find(|(k, _)| *k == "provider_key")
             .and_then(|(_, v)| *v);
-        assert!(pk.is_none(), "empty string should be stored as None");
+        assert_eq!(
+            pk,
+            Some(""),
+            "empty string stored as-is by set_string_field"
+        );
 
-        // Whitespace-only should also be None.
         let _ = config.set_string_field("provider_key", "   ");
         let pk = config
             .string_fields()
             .iter()
             .find(|(k, _)| *k == "provider_key")
             .and_then(|(_, v)| *v);
-        assert!(
-            pk.is_none(),
-            "whitespace-only string should be stored as None"
+        assert_eq!(
+            pk,
+            Some("   "),
+            "whitespace-only string stored as-is by set_string_field"
         );
+
+        // After finalize(), empty/whitespace values are collapsed to None.
+        config.finalize();
+        let pk = config
+            .string_fields()
+            .iter()
+            .find(|(k, _)| *k == "provider_key")
+            .and_then(|(_, v)| *v);
+        assert!(pk.is_none(), "finalize() collapses empty string to None");
 
         // Unknown key returns false.
         assert!(!config.set_string_field("nonexistent_key", "value"));
@@ -1020,7 +1034,7 @@ mod tests {
         assert!(reload.set_string_field_and_apply("image_gen_model", "test-model"));
         assert_eq!(reload.image_gen_model(), "test-model");
 
-        // Empty string stores as None (via non_empty)
+        // Empty string — typed accessor normalizes on read, so returns default
         assert!(reload.set_string_field_and_apply("image_gen_model", ""));
         assert_eq!(
             reload.image_gen_model(),
