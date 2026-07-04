@@ -13,67 +13,6 @@ pub(crate) fn details_has_preservable_blocks(details: &Value) -> bool {
     }
 }
 
-fn flattened_detail_items(patches: &[Value]) -> Vec<Value> {
-    let mut out = Vec::new();
-    for patch in patches {
-        match patch {
-            Value::Null => {}
-            Value::Array(items) => out.extend(items.clone()),
-            other => out.push(other.clone()),
-        }
-    }
-    out
-}
-
-/// Try to merge `item` into the last element of `items` when both share the
-/// same type and carry the named `field`. When not mergeable, the item is
-/// pushed onto `items` as-is.
-fn try_merge_detail_field(items: &mut Vec<Value>, item: Value, ty: &str, field: &str, join: &str) {
-    let Some(value) = item.get(field).and_then(Value::as_str) else {
-        items.push(item);
-        return;
-    };
-    if let Some(last) = items.last_mut()
-        && last.get("type").and_then(Value::as_str) == Some(ty)
-        && let Some(existing) = last.get(field).and_then(Value::as_str)
-    {
-        let mut merged = existing.to_string();
-        if !join.is_empty() && !merged.is_empty() && !value.is_empty() {
-            merged.push_str(join);
-        }
-        merged.push_str(value);
-        *last.get_mut(field).expect("field exists") = Value::String(merged);
-    } else {
-        items.push(item);
-    }
-}
-
-fn merge_adjacent_textual_detail_items(items: Vec<Value>) -> Vec<Value> {
-    // Fields eligible for consecutive merging, with their join separator.
-    // A newline between consecutive summaries improves readability.
-    const MERGE_SPECS: &[(&str, &str)] = &[("text", ""), ("summary", "\n")];
-
-    let mut out: Vec<Value> = Vec::new();
-
-    'outer: for item in items {
-        let Some(ty) = item.get("type").and_then(Value::as_str).map(str::to_string) else {
-            out.push(item);
-            continue;
-        };
-
-        for &(field, join) in MERGE_SPECS {
-            if ty.contains(field) {
-                try_merge_detail_field(&mut out, item, &ty, field, join);
-                continue 'outer;
-            }
-        }
-
-        out.push(item);
-    }
-
-    out
-}
-
 /// Plain `reasoning_content` string to store on assistant messages and send back to the API.
 ///
 /// When the model only streams structured `reasoning_details` (no `reasoning` / `reasoning_content`
@@ -135,36 +74,6 @@ pub(crate) fn native_reasoning_triple_for_replay(
         reasoning.and_then(|r| r.reasoning_details.clone()),
         has_tool_calls,
     )
-}
-
-/// Coalesce streamed `reasoning_details` patches into one value suitable for storage/replay.
-///
-/// Preserves append-only ordering; only merges *consecutive* textual blocks of the same type
-/// to avoid token-level patch explosion (same logical sequence per `OpenRouter` guidance).
-#[must_use]
-pub fn coalesce_streamed_reasoning_details(patches: &[Value]) -> Option<Value> {
-    let items = merge_adjacent_textual_detail_items(flattened_detail_items(patches));
-    (!items.is_empty()).then_some(Value::Array(items))
-}
-
-/// Accumulate a reasoning/reasoning_content delta into an `Option<String>`.
-///
-/// Both `reasoning` and `reasoning_content` fields arrive as a series of
-/// `Option<String>` deltas that need to be concatenated.  This helper avoids
-/// duplicating the `get_or_insert_with(String::new).push_str()` pattern.
-pub fn push_reasoning_delta(acc: &mut Option<String>, s: Option<String>) {
-    if let Some(s) = s {
-        acc.get_or_insert_with(String::new).push_str(&s);
-    }
-}
-
-/// Append streaming `reasoning_details` deltas (arrays or single objects) in order.
-pub fn merge_reasoning_details_delta(into: &mut Vec<serde_json::Value>, patch: serde_json::Value) {
-    match patch {
-        serde_json::Value::Array(items) => into.extend(items),
-        serde_json::Value::Null => {}
-        other => into.push(other),
-    }
 }
 
 /// `reasoning_details` when present (opaque JSON).
@@ -285,27 +194,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn push_reasoning_delta_accumulates() {
-        let mut acc: Option<String> = None;
-        // Starting from None, pushed Some("hello") → becomes Some("hello")
-        push_reasoning_delta(&mut acc, Some("hello".to_string()));
-        assert_eq!(acc.as_deref(), Some("hello"));
-
-        // Second delta appends → Some("hello world")
-        push_reasoning_delta(&mut acc, Some(" world".to_string()));
-        assert_eq!(acc.as_deref(), Some("hello world"));
-
-        // None is a no-op → unchanged
-        push_reasoning_delta(&mut acc, None);
-        assert_eq!(acc.as_deref(), Some("hello world"));
-
-        // Accumulation on an already-Some value with no prior content
-        let mut empty: Option<String> = Some(String::new());
-        push_reasoning_delta(&mut empty, Some("x".to_string()));
-        assert_eq!(empty.as_deref(), Some("x"));
-    }
-
-    #[test]
     fn plaintext_from_reasoning_details_behavior() {
         let d = json!([
             {"type": "reasoning.summary", "summary": "Plan: step A", "format": "x", "index": 0},
@@ -354,23 +242,6 @@ mod tests {
         assert_eq!(
             reasoning_plaintext_for_roundtrip(Some(""), Some(&json!([])), true).as_deref(),
             Some("")
-        );
-    }
-
-    #[test]
-    fn coalesce_streamed_reasoning_details_merges_textual_blocks() {
-        let patches = vec![
-            json!({"type": "reasoning.text", "text": "Now", "format": "x", "index": 0}),
-            json!({"type": "reasoning.text", "text": " let", "format": "x", "index": 1}),
-            json!({"type": "reasoning.text", "text": " me", "format": "x", "index": 2}),
-        ];
-        let details = coalesce_streamed_reasoning_details(&patches).expect("reasoning_details");
-
-        let arr = details.as_array().cloned().unwrap_or_default();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(
-            arr[0].get("text").and_then(Value::as_str),
-            Some("Now let me")
         );
     }
 
