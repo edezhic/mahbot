@@ -35,7 +35,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -303,11 +303,7 @@ pub fn is_update_available() -> bool {
 /// Global mutex ensuring only one update runs at a time.
 /// A second trigger while an update is in progress gets an immediate error
 /// via [`try_lock`](Mutex::try_lock).
-static UPDATE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn update_mutex() -> &'static Mutex<()> {
-    UPDATE_MUTEX.get_or_init(|| Mutex::new(()))
-}
+static UPDATE_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // ── Execute update ────────────────────────────────────────────────────────
 
@@ -321,7 +317,7 @@ fn update_mutex() -> &'static Mutex<()> {
 /// On failure, returns an error.
 pub async fn execute_update() -> Result<()> {
     // Concurrent guard — only one update at a time.
-    let Some(_guard) = update_mutex().try_lock().ok() else {
+    let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
         anyhow::bail!("An update is already in progress. Please wait for it to complete.");
     };
 
