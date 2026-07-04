@@ -14,7 +14,6 @@ pub mod shell;
 pub mod ticket;
 pub mod video_gen;
 pub mod web_search;
-pub mod web_search_shared;
 
 /// Maximum file size allowed for read, edit, search tool operations, and the dashboard editor (10 MB).
 /// Guards against OOM when agents or the GUI attempt to read very large files.
