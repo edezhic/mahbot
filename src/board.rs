@@ -1988,6 +1988,21 @@ mod tests {
     use strum::IntoEnumIterator;
     use tempfile::TempDir;
 
+    /// Scenarios for testing invalid prerequisite/supersede inputs.
+    enum InvalidInputScenario {
+        /// Prerequisite/supersede references a nonexistent ticket.
+        NonExistent,
+        /// Prerequisite/supersede references a ticket in a different workspace.
+        CrossWorkspace,
+        /// Prerequisite/supersede references the ticket itself (self-reference).
+        SelfReference,
+    }
+
+    struct Case {
+        name: &'static str,
+        scenario: InvalidInputScenario,
+    }
+
     /// Open a test store and create a default ticket.
     /// Returns (store, temp_dir, ticket_id).
     async fn setup() -> (BoardStore, TempDir, String) {
@@ -2817,32 +2832,18 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// Table-driven tests for `create_ticket` with invalid prerequisite inputs.
     #[tokio::test]
     async fn test_create_ticket_invalid_inputs() {
-        enum Scenario {
-            /// Prerequisite references a nonexistent ticket.
-            NonExistent,
-            /// Prerequisite references the ticket about to be created (self-reference).
-            SelfReference,
-            /// Prerequisite references a ticket in a different workspace.
-            CrossWorkspace,
-        }
-
-        struct Case {
-            name: &'static str,
-            scenario: Scenario,
-        }
-
         let cases = [
             Case {
                 name: "nonexistent prerequisite",
-                scenario: Scenario::NonExistent,
+                scenario: InvalidInputScenario::NonExistent,
             },
             Case {
                 name: "self-referencing prerequisite",
-                scenario: Scenario::SelfReference,
+                scenario: InvalidInputScenario::SelfReference,
             },
             Case {
                 name: "cross-workspace prerequisite",
-                scenario: Scenario::CrossWorkspace,
+                scenario: InvalidInputScenario::CrossWorkspace,
             },
         ];
 
@@ -2856,9 +2857,9 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         for case in &cases {
             let expected_error = match case.scenario {
-                Scenario::NonExistent => "not found",
-                Scenario::SelfReference => "cannot depend on itself",
-                Scenario::CrossWorkspace => "Cross-workspace",
+                InvalidInputScenario::NonExistent => "not found",
+                InvalidInputScenario::SelfReference => "cannot depend on itself",
+                InvalidInputScenario::CrossWorkspace => "Cross-workspace",
             };
 
             // Create a seed ticket for scenarios that need one.
@@ -2869,19 +2870,19 @@ with a comment explaining why no agent is mid-execution in that state.\
             //   `ws_sr` to advance the counter so the next ticket will
             //   have ID `ws_sr-1`.
             let seed: Option<String> = match &case.scenario {
-                Scenario::NonExistent => None,
-                Scenario::CrossWorkspace => {
+                InvalidInputScenario::NonExistent => None,
+                InvalidInputScenario::CrossWorkspace => {
                     Some(make_ticket(&store, &ws, "Existing", TicketPhase::Backlog).await)
                 }
-                Scenario::SelfReference => {
+                InvalidInputScenario::SelfReference => {
                     Some(make_ticket(&store, &ws_sr, "First", TicketPhase::Backlog).await)
                 }
             };
 
             let target_ws = match case.scenario {
-                Scenario::CrossWorkspace => &ws_b,
-                Scenario::SelfReference => &ws_sr,
-                Scenario::NonExistent => &ws,
+                InvalidInputScenario::CrossWorkspace => &ws_b,
+                InvalidInputScenario::SelfReference => &ws_sr,
+                InvalidInputScenario::NonExistent => &ws,
             };
 
             // Build prerequisites for each scenario.
@@ -2890,11 +2891,11 @@ with a comment explaining why no agent is mid-execution in that state.\
             // SelfReference: hardcoded `{ws_sr}-1` — the ID the next ticket
             //   receives in the isolated workspace, creating a self-reference.
             let prereqs: Vec<String> = match &case.scenario {
-                Scenario::NonExistent => vec!["nonexistent-1".to_string()],
-                Scenario::CrossWorkspace => {
+                InvalidInputScenario::NonExistent => vec!["nonexistent-1".to_string()],
+                InvalidInputScenario::CrossWorkspace => {
                     vec![seed.clone().expect("seed must exist for CrossWorkspace")]
                 }
-                Scenario::SelfReference => {
+                InvalidInputScenario::SelfReference => {
                     // After creating exactly one seed ticket above, the next
                     // ticket in this isolated workspace receives ID `ws_sr-1`.
                     vec![format!("{}-1", ws_sr.name)]
@@ -3322,32 +3323,18 @@ with a comment explaining why no agent is mid-execution in that state.\
     /// Table-driven tests for `supersede_and_create` with invalid inputs.
     #[tokio::test]
     async fn test_supersede_invalid_inputs() {
-        enum Scenario {
-            /// Supersede a nonexistent ticket.
-            NonExistent,
-            /// Supersede a ticket from a different workspace.
-            CrossWorkspace,
-            /// Supersede a ticket with a self-referencing prerequisite.
-            SelfReference,
-        }
-
-        struct Case {
-            name: &'static str,
-            scenario: Scenario,
-        }
-
         let cases = [
             Case {
                 name: "nonexistent original",
-                scenario: Scenario::NonExistent,
+                scenario: InvalidInputScenario::NonExistent,
             },
             Case {
                 name: "cross-workspace supersede",
-                scenario: Scenario::CrossWorkspace,
+                scenario: InvalidInputScenario::CrossWorkspace,
             },
             Case {
                 name: "self-referencing prerequisites",
-                scenario: Scenario::SelfReference,
+                scenario: InvalidInputScenario::SelfReference,
             },
         ];
 
@@ -3357,34 +3344,34 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         for case in &cases {
             let expected_error = match case.scenario {
-                Scenario::NonExistent => "not found",
-                Scenario::CrossWorkspace => "Cross-workspace",
-                Scenario::SelfReference => "supersede and depend",
+                InvalidInputScenario::NonExistent => "not found",
+                InvalidInputScenario::CrossWorkspace => "Cross-workspace",
+                InvalidInputScenario::SelfReference => "supersede and depend",
             };
 
             let original_id = match case.scenario {
-                Scenario::NonExistent => None,
-                Scenario::CrossWorkspace | Scenario::SelfReference => {
+                InvalidInputScenario::NonExistent => None,
+                InvalidInputScenario::CrossWorkspace | InvalidInputScenario::SelfReference => {
                     let id = make_ticket(&store, &ws, "A", TicketPhase::Backlog).await;
                     Some(id)
                 }
             };
 
             let target_ws = match case.scenario {
-                Scenario::CrossWorkspace => &ws_b,
-                Scenario::NonExistent | Scenario::SelfReference => &ws,
+                InvalidInputScenario::CrossWorkspace => &ws_b,
+                InvalidInputScenario::NonExistent | InvalidInputScenario::SelfReference => &ws,
             };
             let supersede_id: &str = original_id.as_deref().unwrap_or("nonexistent");
             // prereqs include the original id only for SelfReference.
             let prereqs: Vec<String> = match &case.scenario {
-                Scenario::SelfReference => {
+                InvalidInputScenario::SelfReference => {
                     vec![
                         original_id
                             .clone()
                             .expect("original must exist for SelfReference"),
                     ]
                 }
-                Scenario::NonExistent | Scenario::CrossWorkspace => vec![],
+                InvalidInputScenario::NonExistent | InvalidInputScenario::CrossWorkspace => vec![],
             };
 
             let err = TicketBuilder::new(&store, target_ws)
