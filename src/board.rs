@@ -3455,45 +3455,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert_superseded_ticket(&old);
     }
 
-    // ── set_commit_info ───────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_set_commit_info() {
-        // Successfully set commit info
-        let (store, _tmp, id) = setup().await;
-
-        store
-            .set_commit_info(&id, "abcdef0123456789abcdef0123456789abcd0123", 10, 5)
-            .await
-            .expect("set commit info");
-
-        let ticket = crate::util::test::expect_ticket(&store, &id).await;
-        assert_eq!(
-            ticket.commit_hash.as_deref(),
-            Some("abcdef0123456789abcdef0123456789abcd0123")
-        );
-        assert_eq!(ticket.lines_added, Some(10));
-        assert_eq!(ticket.lines_removed, Some(5));
-
-        // Non-existent ticket fails with appropriate error
-        let (store2, _tmp2) = open_test_store().await;
-        let result = store2
-            .set_commit_info(
-                "nonexistent",
-                "0000000000000000000000000000000000000000",
-                0,
-                0,
-            )
-            .await;
-
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("nonexistent"),
-            "error should mention ticket id: {msg}"
-        );
-    }
-
     #[tokio::test]
     async fn test_transactional_triple_write() {
         for should_commit in [false, true] {
@@ -3505,7 +3466,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             // as subsumed); the commit_hash, lines_added, and lines_removed
             // assertions below verify its behavior under both commit and
             // rollback, complementing the non-transactional coverage in
-            // test_set_commit_info.
+            // test_ticket_roundtrip_all_fields.
             // Now delegates to the real production method BoardStore::finalize_done_tx.
             let (store, _tmp) = open_test_store().await;
             let ws = test_ws_named("/ws", "ws");
