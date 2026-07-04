@@ -277,7 +277,7 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
         };
 
         // No inline-button options are extracted from agent responses.
-        // The callback parsing infrastructure (`extraction::decode_callback`,
+        // The callback parsing infrastructure (`crate::channels::telegram::decode_callback`,
         // `handle_option_callback`)
         // remains available for future flows that produce their own reply markup.
         let reply_markup: Option<serde_json::Value> = None;

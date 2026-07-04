@@ -1,4 +1,3 @@
-use crate::extraction::ACTION_PREFIX;
 use crate::util::TELEGRAM_MEDIA_MARKER_RE;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::{Channel, ChannelMessage, SendMessage};
@@ -15,6 +14,66 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// Reserve space for continuation markers added by `send_text_chunks`:
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
+
+// ── Telegram callback/action button decoding ─────────────────────────
+
+/// Callback data prefix for dynamic option buttons.
+pub(crate) const CALLBACK_PREFIX: &str = "__opt__";
+
+/// Decode callback data from inline keyboard interactions.
+///
+/// Returns `(ticket_id, label)` on success (`ticket_id` is `None` when the
+/// callback data was generated without one).  Returns `None` when `content`
+/// does not carry the `CALLBACK_PREFIX`.
+///
+/// # Format contract
+///
+/// The callback data uses `|` as a delimiter between the optional ticket-id
+/// and the label.  The join and split therefore assume that `ticket_id` must
+/// not contain `|`; the label may contain `|`.
+///
+/// **Examples:**
+/// - `__opt__ticket-id|Label` → `(Some("ticket-id"), "Label")`
+/// - `__opt__|Label` → `(None, "Label")`
+/// - `__opt__BareLabel` → `(None, "BareLabel")`
+#[must_use]
+pub fn decode_callback(content: &str) -> Option<(Option<String>, String)> {
+    let rest = content.strip_prefix(CALLBACK_PREFIX)?;
+    Some(match rest.split_once('|') {
+        Some((tid, lbl)) if !tid.is_empty() => (Some(tid.to_string()), lbl.to_string()),
+        Some((_, lbl)) => (None, lbl.to_string()),
+        None => (None, rest.to_string()),
+    })
+}
+
+// ── Action prefixes (__act__) ───────────────────────────────────────
+
+/// Callback data prefix for action callbacks (e.g., model selection, clear session).
+pub(crate) const ACTION_PREFIX: &str = "__act__";
+
+/// Decode action callback data.
+///
+/// Returns `(action, payload)` on success, `None` when `content` does not
+/// carry the `ACTION_PREFIX`.
+///
+/// # Format
+///
+/// `__act__<action>|<payload>` where `<action>` is the action name and
+/// `<payload>` is the action-specific data (may be empty).
+///
+/// **Examples:**
+/// - `__act__set_image_model|google/gemini-3.1-flash-image-preview`
+///   → `("set_image_model", "google/gemini-3.1-flash-image-preview")`
+/// - `__act__clear_session|` → `("clear_session", "")`
+/// - `__act__clear_session` → `("clear_session", "")`
+#[must_use]
+pub fn decode_action(content: &str) -> Option<(String, String)> {
+    let rest = content.strip_prefix(ACTION_PREFIX)?;
+    match rest.split_once('|') {
+        Some((action, payload)) => Some((action.to_string(), payload.to_string())),
+        None => Some((rest.to_string(), String::new())),
+    }
+}
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2968,6 +3027,119 @@ mod tests {
         for case in cases {
             let result = extend_past_open_tag(case.input, case.pos);
             assert_eq!(result, case.expected, "case: {}", case.name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::{decode_action, decode_callback};
+
+    // ── decode_callback ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_callback() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: Option<(Option<&'static str>, &'static str)>,
+        }
+
+        let cases = [
+            Case {
+                name: "with ticket id",
+                input: "__opt__mahbot-123|Option A",
+                expected: Some((Some("mahbot-123"), "Option A")),
+            },
+            Case {
+                name: "empty ticket id",
+                input: "__opt__|Label",
+                expected: Some((None, "Label")),
+            },
+            Case {
+                name: "no delimiter",
+                input: "__opt__BareLabel",
+                expected: Some((None, "BareLabel")),
+            },
+            Case {
+                name: "rejects non prefix",
+                input: "random_text",
+                expected: None,
+            },
+            Case {
+                name: "rejects empty",
+                input: "",
+                expected: None,
+            },
+            Case {
+                name: "label with extra pipes",
+                input: "__opt__ticket|A|B|C",
+                expected: Some((Some("ticket"), "A|B|C")),
+            },
+            // Labels containing '|' test a deliberate `split_once` behavior:
+            // `split_once('|')` splits on the *first* pipe only, so the label
+            // captures everything after it.  Neither ticket_id nor label should
+            // contain `|` in practice (per the format contract in the doc comment).
+            Case {
+                name: "only prefix and pipe",
+                input: "__opt__|",
+                expected: Some((None, "")),
+            },
+        ];
+
+        for case in &cases {
+            let result = decode_callback(case.input);
+            let expected = case
+                .expected
+                .map(|(tid, lbl)| (tid.map(String::from), lbl.to_string()));
+            assert_eq!(result, expected, "case: {}", case.name);
+        }
+    }
+
+    // ── decode_action ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_action() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: Option<(&'static str, &'static str)>,
+        }
+
+        let cases = [
+            Case {
+                name: "with payload",
+                input: "__act__set_image_model|google/gemini-3.1-flash-image-preview",
+                expected: Some(("set_image_model", "google/gemini-3.1-flash-image-preview")),
+            },
+            Case {
+                name: "empty payload pipe",
+                input: "__act__clear_session|",
+                expected: Some(("clear_session", "")),
+            },
+            Case {
+                name: "no pipe",
+                input: "__act__clear_session",
+                expected: Some(("clear_session", "")),
+            },
+            Case {
+                name: "rejects non prefix",
+                input: "random_text",
+                expected: None,
+            },
+            Case {
+                name: "rejects empty",
+                input: "",
+                expected: None,
+            },
+        ];
+
+        for case in &cases {
+            let result = decode_action(case.input);
+            let expected = case
+                .expected
+                .map(|(action, payload)| (action.to_string(), payload.to_string()));
+            assert_eq!(result, expected, "case: {}", case.name);
         }
     }
 }

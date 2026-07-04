@@ -14,11 +14,11 @@ use std::future::Future;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use mahbot::channels::telegram::{decode_action, decode_callback};
 use mahbot::channels::{
     send_channel_reply, spawn_scoped_typing_task, stop_typing, write_incoming_to_broadcast,
 };
 use mahbot::config::CONFIG;
-use mahbot::extraction::{decode_action, decode_callback};
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::is_start_command;
 use mahbot::manager_queue;
