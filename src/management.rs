@@ -3145,6 +3145,9 @@ mod tests {
     /// Verify the circuit breaker trips at the threshold boundary:
     /// - `> CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → trips (ticket → Failed)
     /// - `= CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → does NOT trip
+    ///
+    /// When the breaker trips, also verifies the trip comment contains the
+    /// "circuit breaker" marker as produced by [`general_breaker_comment`].
     #[tokio::test]
     async fn circuit_breaker_comment_boundary() {
         struct Case {
@@ -3216,70 +3219,24 @@ mod tests {
                 "case {}: expected phase {:?}, got {:?}",
                 case.name, case.expected_phase, phase,
             );
+
+            // When the breaker trips, verify the trip comment contains the
+            // circuit breaker marker as produced by `general_breaker_comment`.
+            if tripped {
+                let comments = board()
+                    .get_comments(&ticket_id)
+                    .await
+                    .expect("get_comments");
+                let has_marker = comments
+                    .iter()
+                    .any(|c| c.content.to_lowercase().contains("circuit breaker"));
+                assert!(
+                    has_marker,
+                    "case {}: trip comment must contain circuit breaker marker",
+                    case.name,
+                );
+            }
         }
-    }
-
-    /// The general circuit breaker's count_fn (`<[TicketComment]>::len`) does
-    /// *not* filter out its own trip comment (unlike the diagnostics breaker
-    /// which has explicit self-counting prevention). Cascade prevention relies
-    /// on the phase guard: after tripping, the ticket transitions to Failed,
-    /// and `is_phase_or_general_breaker_blocked` rejects the next cycle via
-    /// phase mismatch before the breaker is called.
-    #[tokio::test]
-    async fn circuit_breaker_guard_prevents_retrip() {
-        init_management_test_stores().await;
-        let ticket_id = make_ticket(
-            board(),
-            &test_ws_named("/tmp/test", "cb_guard"),
-            "CB Guard",
-            TicketPhase::InReview,
-        )
-        .await;
-
-        for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
-            board()
-                .add_comment(&ticket_id, "user", &format!("Comment {i}"))
-                .await
-                .expect("add_comment");
-        }
-
-        // Trip the breaker
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        let tripped = try_trip_circuit_breaker(
-            &ticket,
-            TicketPhase::InReview,
-            CIRCUIT_BREAKER_COMMENT_THRESHOLD,
-            <[TicketComment]>::len,
-            general_breaker_comment,
-            "test",
-        )
-        .await;
-        assert!(tripped, "breaker should trip");
-
-        let phase = expect_ticket_phase(board(), &ticket_id).await;
-        assert_eq!(
-            phase,
-            TicketPhase::Failed,
-            "ticket should be Failed after trip"
-        );
-
-        // The trip comment contains the circuit breaker marker for consistency
-        // with other circuit breaker trip messages.
-        let comments = board()
-            .get_comments(&ticket_id)
-            .await
-            .expect("get_comments");
-        let has_marker = comments
-            .iter()
-            .any(|c| c.content.to_lowercase().contains("circuit breaker"));
-        assert!(
-            has_marker,
-            "trip comment must contain circuit breaker marker"
-        );
-
-        let phase = expect_ticket_phase(board(), &ticket_id).await;
-        assert_eq!(phase, TicketPhase::Failed, "ticket must remain Failed");
     }
 
     // ── process_analyst_verdicts — analyst scoring and transitions ─────────
