@@ -314,7 +314,7 @@ fn update_mutex() -> &'static Mutex<()> {
 /// Execute a self-update: build from source, swap binary, install to cargo bin,
 /// notify admin, restart.
 ///
-/// Called from both the Telegram `/update` handler and the GUI update button.
+/// Called from the GUI update button.
 /// Only one update runs at a time — concurrent calls return an error immediately.
 ///
 /// On success, this function never returns (`std::process::exit(0)`).
