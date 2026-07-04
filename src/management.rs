@@ -326,6 +326,11 @@ async fn transition_ticket(
     notify: NotifyPolicy,
     pipeline_reservation: Option<bool>,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        target != TicketPhase::Failed,
+        "Use transition_ticket_to_failed() to transition to Failed — \
+         it enforces the failure-comment invariant"
+    );
     let result = board()
         .transition_to(&ticket.id, Some(source), target, pipeline_reservation)
         .await;
@@ -558,10 +563,10 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 /// Because all four production failure paths go through one of these two entry
 /// points, the failure comment is always written atomically with the transition
 /// and committed to the database before [`dispatch_notification`] →
-/// [`notify_ticket`] runs. The generic [`transition_ticket()`] function does
-/// not enforce this invariant (it accepts any `TicketPhase` target without
-/// requiring a comment), but no production caller uses it to transition to
-/// `Failed`.
+/// [`notify_ticket`] runs. The generic [`transition_ticket()`] function now
+/// enforces this invariant at runtime — it returns an error if called with
+/// `TicketPhase::Failed`, directing callers to use
+/// [`transition_ticket_to_failed()`] instead.
 ///
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
@@ -2909,9 +2914,22 @@ mod tests {
             let ticket_id = make_ticket(board(), &ws, "Test Ticket", TicketPhase::Backlog).await;
             let ticket = expect_ticket(board(), &ticket_id).await;
 
-            transition_ticket(&ticket, case.source, case.target, case.policy, None)
-                .await
-                .expect("transition_ticket");
+            if case.target == TicketPhase::Failed {
+                assert!(
+                    transition_ticket_to_failed(
+                        &ticket,
+                        case.source,
+                        "transition_never_pauses_workspace test",
+                        "test",
+                    )
+                    .await,
+                    "transition_ticket_to_failed should succeed",
+                );
+            } else {
+                transition_ticket(&ticket, case.source, case.target, case.policy, None)
+                    .await
+                    .expect("transition_ticket");
+            }
 
             let ws = crate::workspace::get_by_name(case.ws_suffix)
                 .await
@@ -2934,24 +2952,20 @@ mod tests {
         let ws = setup_db_workspace("failed_notify_test").await;
 
         let ticket_id = make_ticket(board(), &ws, "Failed Notify Test", TicketPhase::Backlog).await;
-
-        // Add a comment mimicking the actual failure path
-        let _ = board()
-            .add_comment(&ticket_id, SYSTEM_ROLE, "❌ Test failure detail")
-            .await;
-
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        // Transition to Failed with Notify — must not panic
-        transition_ticket(
-            &ticket,
-            DEFAULT_TICKET_PHASE,
-            TicketPhase::Failed,
-            NotifyPolicy::Notify,
-            None,
-        )
-        .await
-        .expect("transition to Failed");
+        // Transition to Failed via transition_ticket_to_failed — writes the
+        // failure comment atomically with the transition. Must not panic.
+        assert!(
+            transition_ticket_to_failed(
+                &ticket,
+                DEFAULT_TICKET_PHASE,
+                "❌ Test failure detail",
+                "test",
+            )
+            .await,
+            "transition_ticket_to_failed should succeed",
+        );
     }
 
     /// Smoke test: transitioning to a non-Failed phase with Notify should not
