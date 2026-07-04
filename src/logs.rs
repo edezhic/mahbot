@@ -88,28 +88,6 @@ pub fn store() -> &'static LogStore {
         .expect("LOG_STORE not initialized — call init_tracing() first")
 }
 
-/// Guardrail: do NOT call this function.
-///
-/// The log store is initialized by [`init_tracing()`], not by this function.
-/// See [`LOG_STORE`] for details on the bootstrap ordering constraint.
-///
-/// This function exists only to prevent refactoring mistakes that would add
-/// `logs::init_global()` to a `try_join!` of other store initialization calls.
-///
-/// # Panics
-///
-/// Always panics with a message directing the developer to [`init_tracing()`].
-#[doc(hidden)]
-#[allow(clippy::unused_async)]
-pub async fn init_global() -> anyhow::Result<()> {
-    panic!(
-        "logs::init_global() is not the correct way to initialize the log store.\n\
-         The log store is initialized by logs::init_tracing() during bootstrap.\n\
-         Do NOT call logs::init_global() — call logs::init_tracing() instead.\n\
-         See the LOG_STORE documentation for details."
-    )
-}
-
 const LOGS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
