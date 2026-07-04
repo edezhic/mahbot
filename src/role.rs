@@ -28,16 +28,8 @@ pub(crate) const SYSTEM_ROLE: &str = "system";
 /// the match statements that were previously scattered across the codebase
 /// for role metadata lookups. Icon widgets live in `theme::role_icon()`.
 ///
-/// **Important:** [`crate::Agent::new()`] may inject additional tools
-/// after [`Role::tools()`] returns — for example, the Manager role receives
-/// an async `AskTool` there because it needs the session key for async
-/// dispatch (which [`Role::tools()`] doesn't have access to). If adding a
-/// role that needs agent-identity data for its tools, check there too.
-///
 /// Adding a new role requires updating the [`Role`] enum in `lib.rs`,
-/// this match, the [`Role::tools()`] method,
-/// [`crate::Agent::new()`] (for roles that need session-key-dependent
-/// tools), and the `theme::role_icon()` match.
+/// this match, the [`Role::tools()`] method, and the `theme::role_icon()` match.
 /// The compiler will catch missing arms in exhaustive matches, but it
 /// cannot catch an arm that returns an empty tool set or silently uses
 /// struct update defaults — the tests in this module guard against those:
@@ -296,6 +288,7 @@ impl Role {
                     Box::new(GetTicketTool),
                     Box::new(AddCommentTool),
                     Box::new(SearchArchivedTicketsTool),
+                    Box::new(AskTool::new(vec![Role::Analyst], DispatchMode::Async)),
                 ]
             }
             Role::Analyst => {

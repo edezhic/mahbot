@@ -4,11 +4,11 @@ use crate::providers::chat;
 use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
-    AskTool, DispatchMode, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
-    normalize_tool_call, sanitize_success_tool_output,
+    ToolExecutionOutcome, find_tool, format_tool_failure_feedback, normalize_tool_call,
+    sanitize_success_tool_output,
 };
 use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
-use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Role, Tool, ToolCall, ToolOutputPhase};
+use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall, ToolOutputPhase};
 use std::fmt::Write;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -58,8 +58,7 @@ fn extract_media_from_outcomes(
 impl Agent {
     /// Create a new agent with the given session_key, role, workspace, and optional ticket.
     ///
-    /// Tools are derived from the [`Role`] via [`Role::tools`], with the Manager
-    /// role receiving its async [`AskTool`] here where the agent identity is known.
+    /// Tools are derived from the [`Role`] via [`Role::tools`].
     /// Automatically registers with [`crate::registry::AGENT_REGISTRY`] and creates an
     /// internal [`CancellationToken`]. The agent is deregistered on [`Drop`].
     #[must_use]
@@ -69,15 +68,7 @@ impl Agent {
         ws: &crate::Workspace,
         ticket: Option<crate::board::Ticket>,
     ) -> Self {
-        let mut tools = role.tools();
-        // Manager gets an async AskTool — Analyst-only dispatching, results
-        // delivered via wake-up (run_agent). Does not block the caller.
-        if role == Role::Manager {
-            tools.push(Box::new(AskTool::new(
-                vec![Role::Analyst],
-                DispatchMode::Async,
-            )));
-        }
+        let tools = role.tools();
         let tool_specs = tools.iter().map(|t| t.spec()).collect();
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
