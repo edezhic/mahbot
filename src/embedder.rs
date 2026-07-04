@@ -470,22 +470,16 @@ fn models_dir() -> Option<PathBuf> {
 
 // ── GGUF metadata helpers ────────────────────────────────────────────
 
-/// Extract a `u32` value from GGUF metadata.
-fn get_meta_u32(metadata: &HashMap<String, gguf_file::Value>, key: &str) -> Result<u32> {
-    metadata
+/// Extract a typed value from GGUF metadata.
+fn get_meta<T>(
+    metadata: &HashMap<String, gguf_file::Value>,
+    key: &str,
+    extract: impl FnOnce(&gguf_file::Value) -> std::result::Result<T, candle_core::Error>,
+) -> Result<T> {
+    let value = metadata
         .get(key)
-        .ok_or_else(|| anyhow!("Missing metadata key '{key}'"))?
-        .to_u32()
-        .map_err(|e| anyhow!("Failed to read metadata '{key}': {e}"))
-}
-
-/// Extract an `f32` value from GGUF metadata.
-fn get_meta_f32(metadata: &HashMap<String, gguf_file::Value>, key: &str) -> Result<f32> {
-    metadata
-        .get(key)
-        .ok_or_else(|| anyhow!("Missing metadata key '{key}'"))?
-        .to_f32()
-        .map_err(|e| anyhow!("Failed to read metadata '{key}': {e}"))
+        .ok_or_else(|| anyhow!("Missing metadata key '{key}'"))?;
+    extract(value).map_err(|e| anyhow!("Failed to read metadata '{key}': {e}"))
 }
 
 // ── EuroBERT / LLaMA-style encoder model ────────────────────────────
@@ -690,11 +684,17 @@ impl Embedder {
             .map_err(|e| anyhow!("Failed to read GGUF file: {e}"))?;
 
         // Read architecture metadata
-        let hidden_size = get_meta_u32(&content.metadata, "eurobert.embedding_length")? as usize;
-        let n_head = get_meta_u32(&content.metadata, "eurobert.attention.head_count")? as usize;
-        let head_dim = get_meta_u32(&content.metadata, "eurobert.attention.value_length")? as usize;
-        let rope_freq_base =
-            get_meta_f32(&content.metadata, "eurobert.rope.freq_base").unwrap_or(ROPE_FREQ_BASE);
+        let hidden_size = get_meta(&content.metadata, "eurobert.embedding_length", |v| {
+            v.to_u32()
+        })? as usize;
+        let n_head = get_meta(&content.metadata, "eurobert.attention.head_count", |v| {
+            v.to_u32()
+        })? as usize;
+        let head_dim = get_meta(&content.metadata, "eurobert.attention.value_length", |v| {
+            v.to_u32()
+        })? as usize;
+        let rope_freq_base = get_meta(&content.metadata, "eurobert.rope.freq_base", candle_core::quantized::gguf_file::Value::to_f32)
+            .unwrap_or(ROPE_FREQ_BASE);
 
         // Count layers by scanning tensor names
         let n_layers = content
