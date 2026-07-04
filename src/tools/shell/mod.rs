@@ -619,7 +619,7 @@ Use this tool only for inspection: reading files, listing directories, running c
         &self,
         phase: ToolOutputPhase,
         args: &serde_json::Value,
-        outcome: Option<&crate::tools::ToolExecutionOutcome>,
+        outcome: Option<(&str, bool)>,
     ) -> Option<String> {
         match phase {
             ToolOutputPhase::Before => {
@@ -627,8 +627,8 @@ Use this tool only for inspection: reading files, listing directories, running c
                 Some(cmd.to_owned())
             }
             ToolOutputPhase::After => {
-                let outcome = outcome?;
-                let trimmed = outcome.output.trim();
+                let (output, _success) = outcome?;
+                let trimmed = output.trim();
                 if trimmed.is_empty() {
                     return None;
                 }

@@ -148,7 +148,7 @@ impl Tool for ReadTool {
         &self,
         phase: ToolOutputPhase,
         args: &serde_json::Value,
-        outcome: Option<&crate::tools::ToolExecutionOutcome>,
+        outcome: Option<(&str, bool)>,
     ) -> Option<String> {
         match phase {
             ToolOutputPhase::Before => {
@@ -161,8 +161,8 @@ impl Tool for ReadTool {
                 }
             }
             ToolOutputPhase::After => {
-                let outcome = outcome?;
-                if outcome.success {
+                let (_output, success) = outcome?;
+                if success {
                     None
                 } else {
                     let path = super::find_path_arg(args).unwrap_or("?");

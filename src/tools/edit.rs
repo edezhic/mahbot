@@ -199,19 +199,19 @@ impl Tool for EditTool {
         &self,
         phase: ToolOutputPhase,
         args: &serde_json::Value,
-        outcome: Option<&crate::tools::ToolExecutionOutcome>,
+        outcome: Option<(&str, bool)>,
     ) -> Option<String> {
         match phase {
             ToolOutputPhase::Before => None,
             ToolOutputPhase::After => {
-                let outcome = outcome?;
+                let (_output, success) = outcome?;
                 let old_string = super::get_opt_str(args, "old_string").filter(|s| !s.is_empty());
                 let new_string = super::get_opt_str(args, "new_string").unwrap_or("?");
                 if let Some(old) = old_string {
                     let combined = format!("{old}\n-----------\n{new_string}");
-                    Some(format_file_tool_result("Edit", &combined, args, outcome))
+                    Some(format_file_tool_result("Edit", &combined, args, success))
                 } else {
-                    Some(format_file_tool_result("Write", new_string, args, outcome))
+                    Some(format_file_tool_result("Write", new_string, args, success))
                 }
             }
         }
@@ -226,10 +226,10 @@ fn format_file_tool_result(
     action: &str,
     content: &str,
     args: &serde_json::Value,
-    outcome: &super::ToolExecutionOutcome,
+    success: bool,
 ) -> String {
     let path = super::find_path_arg(args).unwrap_or("?");
-    if !outcome.success {
+    if !success {
         return format!("❌ {action} attempted on {path}");
     }
 

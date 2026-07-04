@@ -454,7 +454,7 @@ impl Tool for BrowserTool {
         &self,
         phase: ToolOutputPhase,
         args: &serde_json::Value,
-        outcome: Option<&crate::tools::ToolExecutionOutcome>,
+        outcome: Option<(&str, bool)>,
     ) -> Option<String> {
         let tab = args.get("tab").and_then(|v| v.as_str()).unwrap_or("?");
         match phase {
@@ -490,11 +490,11 @@ impl Tool for BrowserTool {
                 Some(format!("🌐 ({tab}) {action_name}{extra}"))
             }
             ToolOutputPhase::After => {
-                let outcome = outcome?;
-                if outcome.success {
+                let (output, success) = outcome?;
+                if success {
                     None
                 } else {
-                    let output = outcome.output.trim();
+                    let output = output.trim();
                     let err = if output.is_empty() {
                         "unknown error"
                     } else {

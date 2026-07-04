@@ -485,7 +485,11 @@ impl Agent {
         for (i, call) in calls.iter().enumerate() {
             let outcome = outcomes.and_then(|o| o.get(i));
             let msg = if let Some(tool) = find_tool(tools, &call.name) {
-                tool.debug_output(phase, &call.arguments, outcome)
+                tool.debug_output(
+                    phase,
+                    &call.arguments,
+                    outcome.map(|o| (o.output.as_str(), o.success)),
+                )
             } else {
                 let args_preview = crate::util::summarize_args(&call.arguments);
                 match outcome {

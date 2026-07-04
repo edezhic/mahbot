@@ -635,7 +635,7 @@ impl Tool for SearchTool {
         &self,
         phase: ToolOutputPhase,
         args: &serde_json::Value,
-        outcome: Option<&crate::tools::ToolExecutionOutcome>,
+        outcome: Option<(&str, bool)>,
     ) -> Option<String> {
         match phase {
             ToolOutputPhase::Before => None,
@@ -651,14 +651,14 @@ impl Tool for SearchTool {
                     None => String::new(),
                 };
 
-                let outcome = outcome?;
-                if outcome.success {
+                let (output, success) = outcome?;
+                if success {
                     // Detect zero results by checking for the `── diagnostics ──` marker.
                     // Both zero-result output paths (`search_files()` and
                     // `build_grep_zero_diag()`) append this structured block.
                     // Using a structural delimiter avoids false-positives from file
                     // paths or grep content that happen to start with "No ".
-                    let is_empty = outcome.output.contains("\n── diagnostics ──\n");
+                    let is_empty = output.contains("\n── diagnostics ──\n");
                     if is_empty {
                         // Enrich zero-result log entries with call arguments for
                         // debugging — mode, path/ext constraints, offset, case_sensitivity.
@@ -693,7 +693,7 @@ impl Tool for SearchTool {
                         Some(format!("🔍 {prefix}{query}"))
                     }
                 } else {
-                    let output = outcome.output.trim();
+                    let output = output.trim();
                     let err = if output.is_empty() {
                         "unknown error"
                     } else {

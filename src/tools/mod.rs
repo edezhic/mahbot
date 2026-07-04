@@ -17,13 +17,14 @@ pub mod web_search;
 
 /// Maximum file size allowed for read, edit, search tool operations, and the dashboard editor (10 MB).
 /// Guards against OOM when agents or the GUI attempt to read very large files.
-/// Used directly or via `check_file_size()` by ReadTool, EditTool, SearchTool, and the Iced Editor.
+/// Used by ReadTool and EditTool via `check_file_size()`;
+/// SearchTool and the Iced Editor use `MAX_FILE_SIZE_BYTES` directly.
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Maximum size for a single reference image in bytes.
 /// OpenRouter enforces a ~2 MB request body limit; base64 adds ~33% overhead so
 /// we cap raw image data at 1.5 MB (1_500_000 bytes) to stay well under.
-pub(crate) const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
+const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 
 /// Canonical list of argument aliases for file path parameters.
 ///
@@ -33,11 +34,11 @@ pub(crate) const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 ///
 /// If a new alias needs to be added, update this list — all path resolution
 /// goes through [`find_path_arg`] which picks it up automatically.
-pub(crate) const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
+const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
 /// Check that a file's size is within the allowed limit.
 /// Returns `Ok(())` or bails with a descriptive error.
-pub(crate) fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
+fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
     if meta.len() > MAX_FILE_SIZE_BYTES {
         anyhow::bail!(
             "File too large: {} bytes (limit: {} bytes)",
@@ -84,7 +85,7 @@ pub(crate) use crate::util::json::{
 /// `Option<&str>` (borrowed, optional) while [`require_path_arg`] returns
 /// `Result<String>` (owned, required).
 #[must_use]
-pub(crate) fn find_path_arg(args: &serde_json::Value) -> Option<&str> {
+fn find_path_arg(args: &serde_json::Value) -> Option<&str> {
     std::iter::once("path")
         .chain(PATH_ALIAS_KEYS.iter().copied())
         .find_map(|k| args.get(k))
@@ -99,7 +100,7 @@ pub(crate) fn find_path_arg(args: &serde_json::Value) -> Option<&str> {
 /// This is the owned counterpart of [`find_path_arg`] — it returns
 /// `Result<String>` (owned, required) while [`find_path_arg`] returns
 /// `Option<&str>` (borrowed, optional).
-pub(crate) fn require_path_arg(args: &serde_json::Value) -> anyhow::Result<String> {
+fn require_path_arg(args: &serde_json::Value) -> anyhow::Result<String> {
     find_path_arg(args).map(ToString::to_string).ok_or_else(|| {
         anyhow::anyhow!(
             "Missing required field: 'path'. \
@@ -110,7 +111,7 @@ pub(crate) fn require_path_arg(args: &serde_json::Value) -> anyhow::Result<Strin
 
 /// Returns true when the path looks like a glob rather than a literal file path.
 #[must_use]
-pub(crate) fn path_contains_wildcard(path: &str) -> bool {
+fn path_contains_wildcard(path: &str) -> bool {
     path.contains(['*', '?', '[', ']'])
 }
 
@@ -125,10 +126,7 @@ pub(crate) fn path_contains_wildcard(path: &str) -> bool {
 /// they may still use it internally as a building block (e.g.,
 /// BrowserTool's `action_schema` calls it for each inner entry).
 #[must_use]
-pub(crate) fn tool_params_schema(
-    properties: &serde_json::Value,
-    required: &[&str],
-) -> serde_json::Value {
+fn tool_params_schema(properties: &serde_json::Value, required: &[&str]) -> serde_json::Value {
     let mut schema = serde_json::json!({
         "type": "object",
         "properties": properties,
@@ -145,7 +143,7 @@ use crate::util::scrub_credentials;
 
 /// Scrub successful tool output; delegates the scrubbing policy to the tool.
 #[must_use]
-pub fn sanitize_success_tool_output(
+pub(crate) fn sanitize_success_tool_output(
     tool: &dyn Tool,
     call_arguments: &serde_json::Value,
     output: &str,
@@ -158,7 +156,7 @@ pub fn sanitize_success_tool_output(
 }
 
 #[must_use]
-pub fn format_tool_failure_feedback(
+pub(crate) fn format_tool_failure_feedback(
     tool_name: &str,
     tool_args: &serde_json::Value,
     reason: &str,
@@ -178,7 +176,7 @@ pub fn format_tool_failure_feedback(
 
 /// Outcome for a tool execution.
 #[derive(Debug, Clone)]
-pub struct ToolExecutionOutcome {
+pub(crate) struct ToolExecutionOutcome {
     pub output: String,
     pub success: bool,
 }
@@ -188,7 +186,10 @@ pub struct ToolExecutionOutcome {
 /// Returns `(normalized_name, normalized_args)`. Stats and dispatch should use
 /// the normalized values so recovered calls are attributed to the real tool.
 #[must_use]
-pub fn normalize_tool_call(name: &str, mut args: serde_json::Value) -> (String, serde_json::Value) {
+pub(crate) fn normalize_tool_call(
+    name: &str,
+    mut args: serde_json::Value,
+) -> (String, serde_json::Value) {
     if name == "glob"
         && let Some(obj) = args.as_object_mut()
         && !obj.contains_key("mode")
@@ -256,7 +257,7 @@ fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &st
 /// callers benefit from the same alias mapping.  Prefer [`normalize_tool_call`]
 /// before dispatch when full argument normalization is also desired.
 #[must_use]
-pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
+pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     let normalized = normalize_tool_name(name);
     tools
         .iter()
@@ -273,7 +274,7 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
 /// This function deliberately bypasses path security (no `resolve_write_target`
 /// check) because `generated/` is an ephemeral tool-owned directory within the
 /// workspace. Do not use this function for user-uploaded or arbitrary content.
-pub(crate) async fn save_generated_file(
+async fn save_generated_file(
     ws: &Workspace,
     bytes: &[u8],
     prefix: &str,

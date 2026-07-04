@@ -658,7 +658,7 @@ pub trait Tool: Send + Sync {
         &self,
         phase: ToolOutputPhase,
         args: &serde_json::Value,
-        outcome: Option<&crate::tools::ToolExecutionOutcome>,
+        outcome: Option<(&str, bool)>,
     ) -> Option<String> {
         match phase {
             ToolOutputPhase::Before => {
@@ -666,10 +666,10 @@ pub trait Tool: Send + Sync {
                 Some(format!("🔧 `{}`({})", self.name(), args_preview))
             }
             ToolOutputPhase::After => {
-                let outcome = outcome?;
-                let status = if outcome.success { "✅" } else { "❌" };
+                let (output, success) = outcome?;
+                let status = if success { "✅" } else { "❌" };
                 let name = self.name();
-                let preview: String = outcome.output.chars().take(600).collect();
+                let preview: String = output.chars().take(600).collect();
                 let preview = preview.trim();
                 if preview.is_empty() {
                     Some(format!("{status} `{name}`"))
