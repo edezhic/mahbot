@@ -41,7 +41,7 @@ use iced::widget::Space;
 use iced::widget::rule;
 use iced::widget::{Column, Row, button, column, container, row, scrollable, text, tooltip};
 use iced::window;
-use iced::{Alignment, Element, Length, Task};
+use iced::{Alignment, Color, Element, Length, Task};
 
 use self::context_menu::ContextMenu;
 
@@ -1617,6 +1617,22 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
 
 // ── Navigation sidebar ──────────────────────────────────────────
 
+/// Map a [`Page`] variant to its corresponding Lucide icon element.
+///
+/// Exhaustive match — adding a new `Page` variant produces a compile error
+/// until its icon is assigned here.
+fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
+    let text = match page {
+        Page::Home => lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
+        Page::Editor => lucide::pencil_line::<iced::Theme, iced::Renderer>(),
+        Page::Shell => lucide::terminal::<iced::Theme, iced::Renderer>(),
+        Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>(),
+        Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>(),
+        Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>(),
+    };
+    text.size(size).color(color).into()
+}
+
 impl Dashboard {
     fn sidebar_view(&self) -> Element<'_, Message> {
         container(
@@ -1658,21 +1674,7 @@ impl Dashboard {
             } else {
                 theme::TEXT_MUTED
             };
-            let icon: iced::Element<'_, Message> = match page {
-                Page::Home => lucide::layout_dashboard::<iced::Theme, iced::Renderer>()
-                    .size(28)
-                    .color(color)
-                    .into(),
-                Page::Shell => lucide::terminal::<iced::Theme, iced::Renderer>()
-                    .size(28)
-                    .color(color)
-                    .into(),
-                Page::Editor => lucide::pencil_line::<iced::Theme, iced::Renderer>()
-                    .size(28)
-                    .color(color)
-                    .into(),
-                _ => text("").into(),
-            };
+            let icon: iced::Element<'_, Message> = page_icon(*page, 28, color);
             let btn = button(
                 container(icon)
                     .width(Length::Fill)
@@ -1838,21 +1840,7 @@ impl Dashboard {
             } else {
                 theme::TEXT_MUTED
             };
-            let icon: Element<'_, Message> = match page {
-                Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>()
-                    .size(24)
-                    .color(color)
-                    .into(),
-                Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>()
-                    .size(24)
-                    .color(color)
-                    .into(),
-                Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>()
-                    .size(24)
-                    .color(color)
-                    .into(),
-                _ => text("").into(),
-            };
+            let icon: Element<'_, Message> = page_icon(*page, 24, color);
             let btn = button(icon)
                 .style(theme::button_text)
                 .padding(3)
