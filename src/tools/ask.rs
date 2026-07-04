@@ -97,14 +97,13 @@ impl Tool for AskTool {
         let role_str = super::get_str(&args, "role")?;
         let ask = super::get_str(&args, "ask")?;
 
+        let allowed_str = self.formatted_allowed_roles();
         let role: Role = match role_str.parse() {
             Ok(r) if self.allowed_roles.contains(&r) => r,
             Ok(_) => {
-                let allowed_str = self.formatted_allowed_roles();
                 anyhow::bail!("Cannot delegate to '{role_str}'. Only {allowed_str} are supported.");
             }
             Err(_) => {
-                let allowed_str = self.formatted_allowed_roles();
                 anyhow::bail!("Unknown role '{role_str}'. Use {allowed_str}.");
             }
         };
