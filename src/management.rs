@@ -2697,7 +2697,7 @@ mod tests {
     /// Verify that `record_verdict_comments` correctly writes comments
     /// based on verdict filter.
     #[tokio::test]
-    async fn record_verdict_comments_counts() {
+    async fn record_verdict_comments_filtering() {
         init_test_stores().await;
 
         let ticket_id = make_ticket(
