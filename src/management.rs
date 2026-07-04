@@ -20,6 +20,7 @@
 //! bounce back to ReadyForDevelopment; clean files proceed to Done via commit.
 
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -1243,6 +1244,33 @@ async fn transition_ticket_to_failed(
     .await
 }
 
+/// Check git availability and transition to Done if unavailable.
+///
+/// Returns `true` if the caller should return immediately (git not available,
+/// transition to Done already performed).
+#[must_use]
+async fn check_git_or_done(ticket: &Ticket, repo_path: &Path, source: TicketPhase) -> bool {
+    if !crate::git_commands::git_is_installed().await {
+        transition_ticket_to_done(
+            ticket,
+            source,
+            "Git not installed — moving to Done without commit",
+        )
+        .await;
+        return true;
+    }
+    if !crate::git_commands::is_git_repo(repo_path) {
+        transition_ticket_to_done(
+            ticket,
+            source,
+            "Not a git repo — moving to Done without commit",
+        )
+        .await;
+        return true;
+    }
+    false
+}
+
 /// Auto-commit changes and move the ticket to Done.
 ///
 /// Parameterized by source phase so both the QaPassed→Done and
@@ -1257,22 +1285,7 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    if !crate::git_commands::git_is_installed().await {
-        transition_ticket_to_done(
-            &ticket,
-            source,
-            "Git not installed — moving to Done without commit",
-        )
-        .await;
-        return;
-    }
-    if !crate::git_commands::is_git_repo(repo_path) {
-        transition_ticket_to_done(
-            &ticket,
-            source,
-            "Not a git repo — moving to Done without commit",
-        )
-        .await;
+    if check_git_or_done(&ticket, repo_path, source).await {
         return;
     }
 
@@ -1408,14 +1421,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
     // Git not available or not a git repo — transition to Done directly.
-    let git_installed = crate::git_commands::git_is_installed().await;
-    if !git_installed || !crate::git_commands::is_git_repo(repo_path) {
-        let reason = if git_installed {
-            "Not a git repo — moving to Done without commit"
-        } else {
-            "Git not installed — moving to Done without commit"
-        };
-        transition_ticket_to_done(&ticket, TicketPhase::QaPassed, reason).await;
+    if check_git_or_done(&ticket, repo_path, TicketPhase::QaPassed).await {
         return;
     }
 
