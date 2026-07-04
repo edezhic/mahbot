@@ -125,21 +125,27 @@ fn augment_replay_payload_reasoning_content(payload: &mut Value, has_tool_calls:
 
     let explicit = payload.get("reasoning").and_then(serde_json::Value::as_str);
     let details = json_reasoning_details(payload);
-    let Some(reasoning_content) =
-        reasoning_plaintext_for_roundtrip(explicit, details.as_ref(), has_tool_calls)
-    else {
-        return;
+    let reasoning_content =
+        reasoning_plaintext_for_roundtrip(explicit, details.as_ref(), has_tool_calls);
+
+    let content = match reasoning_content {
+        Some(s) => s,
+        // reasoning was entirely absent (no `reasoning` or `reasoning_details` fields in the
+        // payload) but tool calls exist → DeepSeek still expects `reasoning_content: ""` on the wire.
+        None if has_tool_calls && explicit.is_none() && details.is_none() => String::new(),
+        None => return,
     };
 
     if let Some(value) = payload.as_object_mut() {
         value.insert(
             "reasoning_content".to_string(),
-            serde_json::Value::String(reasoning_content),
+            serde_json::Value::String(content),
         );
     }
 }
 
 /// Build assistant replay payload with reasoning fields preserved for roundtrip.
+#[must_use]
 pub fn assistant_replay_payload(
     text: Option<&str>,
     tool_calls: &[ToolCall],
@@ -169,21 +175,8 @@ pub fn assistant_replay_payload(
 
     if let Some(r) = reasoning {
         apply_reasoning_to_payload(&mut payload, r);
-        augment_replay_payload_reasoning_content(&mut payload, !tool_calls.is_empty());
-    } else if !tool_calls.is_empty() {
-        // Provider may send `reasoning: null` on tool turns; nothing parses into [`Reasoning`], but
-        // DeepSeek still expects `reasoning_content` on the wire for replay.
-        if !payload
-            .get("reasoning_content")
-            .is_some_and(Value::is_string)
-            && let Some(obj) = payload.as_object_mut()
-        {
-            obj.insert(
-                "reasoning_content".to_string(),
-                Value::String(String::new()),
-            );
-        }
     }
+    augment_replay_payload_reasoning_content(&mut payload, !tool_calls.is_empty());
 
     payload
 }
