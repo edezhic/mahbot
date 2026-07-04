@@ -231,7 +231,11 @@ impl Agent {
                          — model may be stuck in a tool-calling loop"
                     );
                 }
-                let (mut display_text, tool_calls, history_content) = match self.llm_call().await {
+                let PreparedAssistantTurn {
+                    mut display_text,
+                    tool_calls,
+                    history_content,
+                } = match self.llm_call().await {
                     Ok(resp) => prepare_assistant_turn(resp),
                     Err(e) => {
                         return Err(e.context(format!("LLM step failed at iteration {iteration}")));
@@ -655,8 +659,11 @@ impl Agent {
 }
 
 /// Result of preparing an assistant turn from the LLM response.
-/// `(display_text, tool_calls, history_content)`
-type PreparedAssistantTurn = (String, Vec<ToolCall>, String);
+struct PreparedAssistantTurn {
+    display_text: String,
+    tool_calls: Vec<ToolCall>,
+    history_content: String,
+}
 
 /// Prepare assistant response data from the LLM response.
 fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
@@ -692,7 +699,11 @@ fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
         (false, _) => (String::new(), json_payload),
     };
 
-    (display_text, tool_calls, history_content)
+    PreparedAssistantTurn {
+        display_text,
+        tool_calls,
+        history_content,
+    }
 }
 
 /// Core agent lifecycle: create agent (auto-registers with its own
