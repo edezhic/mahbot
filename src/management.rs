@@ -2042,7 +2042,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 /// Result from a single parallel verifier agent.
 #[derive(Clone)]
 struct ParallelVerdict {
-    response: String,
+    has_response: bool,
     verdict: Option<crate::Verdict>,
 }
 
@@ -2090,7 +2090,7 @@ async fn run_parallel_agents(
             async move {
                 if response.is_empty() {
                     return ParallelVerdict {
-                        response,
+                        has_response: false,
                         verdict: None,
                     };
                 }
@@ -2103,7 +2103,10 @@ async fn run_parallel_agents(
                     .extract_structured::<crate::Verdict>(&extraction_prompt, &retry_prompt, 5)
                     .await
                     .ok();
-                ParallelVerdict { response, verdict }
+                ParallelVerdict {
+                    has_response: !response.is_empty(),
+                    verdict,
+                }
             }
         })
         .collect();
@@ -2174,14 +2177,14 @@ fn format_verdict_comment(
         }
         return Some(comment);
     }
-    if r.response.is_empty() {
-        Some(format!(
-            "{comment_role} agent failed to produce a response — counting as a failure."
-        ))
-    } else {
+    if r.has_response {
         Some(format!(
             "{comment_role} produced a response but verdict extraction failed — \
              treating as a failure."
+        ))
+    } else {
+        Some(format!(
+            "{comment_role} agent failed to produce a response — counting as a failure."
         ))
     }
 }
@@ -2307,7 +2310,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     )
     .await;
 
-    let nonempty_count = results.iter().filter(|r| !r.response.is_empty()).count();
+    let nonempty_count = results.iter().filter(|r| r.has_response).count();
     let total = results.len();
     let mut lgtm = 0usize;
     let mut minor_issues = 0usize;
@@ -2789,7 +2792,7 @@ mod tests {
 
         // ── FailingOnly with all-passing verdicts ──
         // Should produce 0 comments (nothing to write).
-        let results = vec![pass_result("Looks good.")];
+        let results = vec![pass_result()];
         record_verdict_comments(
             &ticket_id,
             &results,
@@ -2810,7 +2813,7 @@ mod tests {
 
         // ── FailingOnly with a failing verdict ──
         // Should produce 1 comment.
-        let results = vec![fail_result("Has issues.")];
+        let results = vec![fail_result()];
         record_verdict_comments(
             &ticket_id,
             &results,
@@ -2833,13 +2836,8 @@ mod tests {
         // ── All filter (analyst path) ──
         // Should produce 2 comments (both verdicts recorded).
         let results = vec![
-            analyst_verdict("Agent 1 response.", 10, "Excellent analysis.", &[]),
-            analyst_verdict(
-                "Agent 2 response.",
-                4,
-                "Needs more research.",
-                &["Missing citations"],
-            ),
+            analyst_verdict(10, "Excellent analysis.", &[]),
+            analyst_verdict(4, "Needs more research.", &["Missing citations"]),
         ];
         record_verdict_comments(
             &ticket_id,
@@ -3073,36 +3071,31 @@ mod tests {
     /// Helper: a `ParallelVerdict` with no verdict (agent produced no response).
     fn no_verdict() -> ParallelVerdict {
         ParallelVerdict {
-            response: String::new(),
+            has_response: false,
             verdict: None,
         }
     }
 
     /// Helper: wrap a passing verdict with a response string (reviewer/QA flow).
-    fn pass_result(response: &str) -> ParallelVerdict {
+    fn pass_result() -> ParallelVerdict {
         ParallelVerdict {
-            response: response.into(),
+            has_response: true,
             verdict: Some(pass_verdict()),
         }
     }
 
     /// Helper: wrap a failing verdict with a response string (reviewer/QA flow).
-    fn fail_result(response: &str) -> ParallelVerdict {
+    fn fail_result() -> ParallelVerdict {
         ParallelVerdict {
-            response: response.into(),
+            has_response: true,
             verdict: Some(fail_verdict()),
         }
     }
 
     /// Helper: construct an analyst verdict with explicit score / critique / issues.
-    fn analyst_verdict(
-        response: &str,
-        score: u8,
-        critique: &str,
-        issues: &[&str],
-    ) -> ParallelVerdict {
+    fn analyst_verdict(score: u8, critique: &str, issues: &[&str]) -> ParallelVerdict {
         ParallelVerdict {
-            response: response.into(),
+            has_response: true,
             verdict: Some(crate::Verdict {
                 score,
                 critique: Some(critique.into()),
@@ -3149,11 +3142,7 @@ mod tests {
                 ws_suffix: "vp_any_fail",
                 title: "VP Any Failed",
                 phase: TicketPhase::InReview,
-                results: vec![
-                    pass_result("Good."),
-                    fail_result("Issues found."),
-                    pass_result("Looks fine."),
-                ],
+                results: vec![pass_result(), fail_result(), pass_result()],
                 vi: REVIEWER_VI,
                 expected_phase: TicketPhase::ReadyForDevelopment,
                 expected_pipeline_reservation: true,
@@ -3163,11 +3152,7 @@ mod tests {
                 ws_suffix: "vp_all_pass",
                 title: "VP All Pass",
                 phase: TicketPhase::InReview,
-                results: vec![
-                    pass_result("Good."),
-                    pass_result("Fine."),
-                    pass_result("OK."),
-                ],
+                results: vec![pass_result(), pass_result(), pass_result()],
                 vi: REVIEWER_VI,
                 expected_phase: TicketPhase::Reviewed,
                 expected_pipeline_reservation: false,
@@ -3177,11 +3162,7 @@ mod tests {
                 ws_suffix: "vp_qa_pass",
                 title: "VP QA Pass",
                 phase: TicketPhase::InQa,
-                results: vec![
-                    pass_result("QA pass."),
-                    pass_result("OK."),
-                    pass_result("Good."),
-                ],
+                results: vec![pass_result(), pass_result(), pass_result()],
                 vi: QA_VI,
                 expected_phase: TicketPhase::QaPassed,
                 expected_pipeline_reservation: false,
@@ -3338,9 +3319,9 @@ mod tests {
                 ws_suffix: "an_all_pass",
                 title: "Analyst All Pass",
                 results: vec![
-                    analyst_verdict("Analysis A", 10, "Great analysis.", &[]),
-                    analyst_verdict("Analysis B", 9, "Solid work.", &[]),
-                    analyst_verdict("Analysis C", 8, "Good analysis.", &[]),
+                    analyst_verdict(10, "Great analysis.", &[]),
+                    analyst_verdict(9, "Solid work.", &[]),
+                    analyst_verdict(8, "Good analysis.", &[]),
                 ],
                 expected_comment_substring: "All LGTM",
             },
@@ -3349,9 +3330,9 @@ mod tests {
                 ws_suffix: "an_partial",
                 title: "Analyst Partial Fail",
                 results: vec![
-                    analyst_verdict("Analysis A", 10, "Great.", &[]),
-                    analyst_verdict("Analysis B", 3, "Poor analysis.", &["Missing data"]),
-                    analyst_verdict("Analysis C", 8, "Decent.", &["Minor issue"]),
+                    analyst_verdict(10, "Great.", &[]),
+                    analyst_verdict(3, "Poor analysis.", &["Missing data"]),
+                    analyst_verdict(8, "Decent.", &["Minor issue"]),
                 ],
                 expected_comment_substring: "blockers",
             },
