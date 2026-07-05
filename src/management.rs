@@ -961,10 +961,13 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 
 /// Run the given action for each ticket in `phase` for the named workspace.
 ///
-/// Lists tickets via [`BoardStore::list_tickets_in_phase`], iterates, and logs
-/// a structured error on failure.
+/// Lists tickets via [`BoardStore::list_all_tickets`] with both filters set.
+/// Does NOT load comments — lightweight enough for poll loops.
 async fn for_tickets_in_phase(phase: TicketPhase, workspace_name: &str, action: impl Fn(Ticket)) {
-    match board().list_tickets_in_phase(phase, workspace_name).await {
+    match board()
+        .list_all_tickets(Some(workspace_name), Some(phase))
+        .await
+    {
         Ok(tickets) => {
             for ticket in tickets {
                 action(ticket);

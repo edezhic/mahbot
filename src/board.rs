@@ -941,22 +941,6 @@ impl BoardStore {
         }
     }
 
-    /// List all tickets in a given phase for a workspace, ordered by created_at
-    /// descending. Does NOT load comments — lightweight enough for poll loops.
-    ///
-    /// Delegates to [`BoardStore::list_all_tickets`] with both filters set — this function
-    /// is a convenience wrapper with non-optional parameters. Because it shares
-    /// the same query path, future changes to `list_all_tickets` (sorting,
-    /// filtering, comment loading) will affect this function too.
-    pub(crate) async fn list_tickets_in_phase(
-        &self,
-        phase: TicketPhase,
-        workspace_name: &str,
-    ) -> Result<Vec<Ticket>> {
-        self.list_all_tickets(Some(workspace_name), Some(phase))
-            .await
-    }
-
     /// Build a [`PreparedUpdate`] for an `UPDATE tickets` statement, appending
     /// `updated_at = ?` and `WHERE id = ?` as the last two parameters.
     ///
