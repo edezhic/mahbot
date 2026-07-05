@@ -864,6 +864,15 @@ fn truncate_to_last_64k(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Make a file executable (0o755) on Unix; no-op on other platforms.
+    fn make_executable(_path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(_path, PermissionsExt::from_mode(0o755)).unwrap();
+        }
+    }
+
     #[test]
     fn test_truncate_to_last_64k_no_truncation() {
         let s = "hello world";
@@ -1098,11 +1107,7 @@ mod tests {
 
         // Create a source binary.
         std::fs::write(&source, "binary content").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&source, PermissionsExt::from_mode(0o755)).unwrap();
-        }
+        make_executable(&source);
 
         // Copy should succeed.
         let result = copy_to_cargo_bin(&source, &dest, None).await;
@@ -1246,11 +1251,7 @@ mod tests {
 
         // Create an executable source binary.
         std::fs::write(&source, "binary payload").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&source, PermissionsExt::from_mode(0o755)).unwrap();
-        }
+        make_executable(&source);
 
         // On success, resolve_spawn_path should return the cargo bin path
         // (the dest path), not current_exe().
