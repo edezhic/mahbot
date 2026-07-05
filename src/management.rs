@@ -1309,12 +1309,16 @@ async fn transition_ticket_to_failed(
     .await
 }
 
-/// Check git availability and transition to Done if unavailable.
+/// Transition the ticket to Done if git is not available.
 ///
-/// Returns `true` if the caller should return immediately (git not available,
-/// transition to Done already performed).
+/// Returns `true` if the caller should return immediately (transition to Done
+/// already performed), `false` if git is usable and normal operations should proceed.
 #[must_use]
-async fn check_git_or_done(ticket: &Ticket, repo_path: &Path, source: TicketPhase) -> bool {
+async fn transition_ticket_to_done_if_no_git(
+    ticket: &Ticket,
+    repo_path: &Path,
+    source: TicketPhase,
+) -> bool {
     if !crate::git_commands::git_is_installed().await {
         transition_ticket_to_done(
             ticket,
@@ -1345,12 +1349,12 @@ async fn check_git_or_done(ticket: &Ticket, repo_path: &Path, source: TicketPhas
 /// - **Clean tree:** skips commit, transitions directly to Done with notification.
 /// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::git_commands::run_git_commit`].
 /// - **Commit failure:** ticket stays in `source`, poller retries next cycle.
-/// - **Not a git repo / no git installed:** transitions to Done without commit.
+/// - **No git:** delegated to [`transition_ticket_to_done_if_no_git`].
 async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    if check_git_or_done(&ticket, repo_path, source).await {
+    if transition_ticket_to_done_if_no_git(&ticket, repo_path, source).await {
         return;
     }
 
@@ -1486,7 +1490,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
     // Git not available or not a git repo — transition to Done directly.
-    if check_git_or_done(&ticket, repo_path, TicketPhase::QaPassed).await {
+    if transition_ticket_to_done_if_no_git(&ticket, repo_path, TicketPhase::QaPassed).await {
         return;
     }
 
