@@ -375,7 +375,7 @@ impl Ticket {
     /// Timestamps are truncated to seconds (`[..19]` of the RFC 3339 string),
     /// with a defensive `min()` guard against abnormally short strings.
     #[must_use]
-    pub fn format_comments(&self) -> String {
+    fn format_comments(&self) -> String {
         let mut s = String::from("Comments:");
         if self.comments.is_empty() {
             s.push_str("\n  (no comments)");
@@ -426,7 +426,7 @@ impl TicketPhase {
     /// accidentally diverge from the definition used in coverage tests.
     #[cfg(test)]
     #[must_use]
-    pub fn is_transitory_handoff(&self) -> bool {
+    fn is_transitory_handoff(&self) -> bool {
         TRANSITORY_HANDOFF_PHASES.contains(self)
     }
 

@@ -287,7 +287,7 @@ impl SearchTool {
     }
 
     /// Return relative file paths matching a fuzzy/glob query (for read recovery).
-    pub(crate) fn find_file_path_list(
+    fn find_file_path_list(
         handle: &search_engine::EngineHandle,
         query: &str,
         max_results: usize,
