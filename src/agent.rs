@@ -5,7 +5,7 @@ use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
     ToolExecutionOutcome, find_tool, format_tool_failure_feedback, normalize_tool_call,
-    sanitize_success_tool_output,
+    scrub_tool_output,
 };
 use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall, ToolOutputPhase};
@@ -408,11 +408,7 @@ impl Agent {
                         );
                         (
                             ToolExecutionOutcome {
-                                output: sanitize_success_tool_output(
-                                    tool,
-                                    &tool_arguments,
-                                    &output_text,
-                                ),
+                                output: scrub_tool_output(tool, &tool_arguments, &output_text),
                                 success: true,
                             },
                             None,

@@ -937,7 +937,7 @@ fn finish_shell_output(
     full_output_for_spill: Option<&str>,
 ) -> String {
     // Scrub credentials from the combined output. For stdout this is the only
-    // scrub pass (the agent layer's `sanitize_success_tool_output` is a further
+    // scrub pass (the agent layer's `scrub_tool_output` is a further
     // safety net regardless of call site).  Stderr was already scrubbed at
     // `apply_profile_pipeline` entry, so this is a secondary pass there —
     // double-scrubbing is idempotent because the redacted marker (*[REDACTED])

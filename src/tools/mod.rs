@@ -137,13 +137,13 @@ fn tool_params_schema(properties: &serde_json::Value, required: &[&str]) -> serd
     schema
 }
 
-// ── sanitize ───────────────────────────────────────────────────────────
+// ── scrub ────────────────────────────────────────────────────────────
 
 use crate::util::scrub_credentials;
 
-/// Scrub successful tool output; delegates the scrubbing policy to the tool.
+/// Scrub credentials from tool output; delegates the scrubbing policy to the tool.
 #[must_use]
-pub(crate) fn sanitize_success_tool_output(
+pub(crate) fn scrub_tool_output(
     tool: &dyn Tool,
     call_arguments: &serde_json::Value,
     output: &str,
