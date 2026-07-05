@@ -2608,6 +2608,16 @@ impl EditorState {
         Task::batch(tasks)
     }
 
+    /// Insert a newly created tab into the editor state: push the tab,
+    /// store its content, and record the file mtime (if available).
+    fn insert_tab(&mut self, path: String, tab: Tab, tab_data: TabData, mtime: Option<SystemTime>) {
+        self.tabs.push(tab);
+        self.tab_contents.insert(path.clone(), tab_data);
+        if let Some(mtime) = mtime {
+            self.file_mtimes.insert(path, mtime);
+        }
+    }
+
     /// Handle saved tabs loaded from the database — deserializes tab data,
     /// builds Tab/TabData structures.
     fn saved_tabs_loaded(
@@ -2648,11 +2658,7 @@ impl EditorState {
                 saved.was_dirty,
                 saved_hash,
             );
-            self.tabs.push(tab);
-            self.tab_contents.insert(saved.file_path.clone(), td);
-            if let Some(mtime) = mtime {
-                self.file_mtimes.insert(saved.file_path, mtime);
-            }
+            self.insert_tab(saved.file_path, tab, td, mtime);
         }
 
         if !self.tabs.is_empty() {
@@ -2740,11 +2746,7 @@ impl EditorState {
                     false,
                     saved_hash,
                 );
-                self.tabs.push(tab);
-                self.tab_contents.insert(data.path.clone(), tab_data);
-                if let Some(mtime) = mtime {
-                    self.file_mtimes.insert(data.path, mtime);
-                }
+                self.insert_tab(data.path, tab, tab_data, mtime);
                 self.active_tab_index = self.tabs.len().saturating_sub(1);
                 self.session_initialized = true;
 
