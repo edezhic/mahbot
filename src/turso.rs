@@ -599,8 +599,8 @@ pub async fn ensure_fts_index(
     tokenizer: &str,
     ddl: &str,
 ) -> anyhow::Result<()> {
-    let existing_sql: Option<String> = match conn
-        .query_row(
+    let existing_sql: Option<String> = conn
+        .query_optional(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1 LIMIT 1",
             params![index_name],
             |row| match row.get_value(0)? {
@@ -608,13 +608,8 @@ pub async fn ensure_fts_index(
                 _ => Ok::<_, ::turso::Error>(String::new()),
             },
         )
-        .await
-    {
-        Ok(sql) if !sql.is_empty() => Some(sql),
-        Err(turso::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-        _ => None,
-    };
+        .await?
+        .filter(|s| !s.is_empty());
 
     let needs_rebuild = existing_sql
         .as_deref()
