@@ -1255,6 +1255,18 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
     info!(ticket = %ticket.id, "{comment}");
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
+    let log_label = match source {
+        TicketPhase::QaPassed => "QA",
+        TicketPhase::SanitationPassed => "Sanitation",
+        _ => {
+            warn!(
+                ticket = %ticket.id,
+                phase = %source.as_ref(),
+                "transition_ticket_to_done called from unexpected source phase",
+            );
+            source.as_ref()
+        }
+    };
     let _ = comment_and_transition(TransitionParams::new(
         ticket,
         CommentParam {
@@ -1264,7 +1276,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
         source,
         TicketPhase::Done,
         notify_policy,
-        source.as_ref(),
+        log_label,
         "passed",
     ))
     .await;
