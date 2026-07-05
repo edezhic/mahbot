@@ -1439,7 +1439,7 @@ impl BoardStore {
     /// `ReadyForDevelopment` ticket — this preserves the rework priority across restarts.
     ///
     /// Excludes `TRANSITORY_HANDOFF_PHASES` — these are transitory handoff states
-    /// that the poller picks up within 2 seconds of restart.
+    /// that the poller picks up within the next poll cycle.
     ///
     /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests
     /// can verify coverage against `PIPELINE_BLOCKING_STATUSES`).
