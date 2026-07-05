@@ -177,8 +177,8 @@ impl Agent {
         // Summarize if context window is getting long.
         // KV-cache preservation: self.summarize() keeps all parameters
         // identical (see build_chat_request) so the cached prefix is reusable.
-        let history_tokens = crate::session::summarization::estimate_tokens(self.session.history());
-        if history_tokens > crate::session::summarization::SUMMARIZATION_THRESHOLD {
+        let history_tokens = crate::session::estimate_tokens(self.session.history());
+        if history_tokens > crate::session::SUMMARIZATION_THRESHOLD {
             match self.summarize().await {
                 Ok(summary) => {
                     self.session

@@ -16,7 +16,7 @@ use anyhow::Result;
 
 use crate::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
-use crate::session::summarization::PREVIOUS_CONVERSATION_SUMMARY_PREFIX;
+use crate::session::PREVIOUS_CONVERSATION_SUMMARY_PREFIX;
 use crate::skills;
 use crate::{ChatMessage, ChatRole, Role, Workspace};
 
@@ -57,7 +57,7 @@ impl Session {
     ///
     /// Summarization is **not** handled here. It is run separately by
     /// `Agent::work` when the conversation exceeds the token budget.
-    /// See [`summarization`](crate::session::summarization) for details.
+    /// See [`crate::session`] for the summarization constants and helpers.
     pub async fn init(
         &mut self,
         session_key: &str,

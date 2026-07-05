@@ -3,12 +3,33 @@
 pub mod manager;
 pub use manager::Session;
 
-pub mod summarization;
-
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, ChatRole, Reasoning, ToolCall};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+
+// ── Summarization constants ──────────────────────────────────
+//
+// The summarization LLM call lives in `crate::Agent::summarize` so that all
+// parameters (model, temperature, reasoning_effort, tools, provider routing)
+// are byte-identical to the agent's work loop.  This section keeps only the
+// constants and helpers used by `Session::apply_summary`.
+
+/// History-length threshold (in estimated tokens) that triggers summarization.
+pub const SUMMARIZATION_THRESHOLD: usize = 400_000;
+
+/// Stored session rows and second `history` entry after compaction use this prefix so channel
+/// orchestration can re-inject the summary on later turns (baseline `system` rows stay excluded).
+pub const PREVIOUS_CONVERSATION_SUMMARY_PREFIX: &str = "Previous conversation summary:\n\n";
+
+/// Rough token count for history (~4 chars/token + 4 tokens per-message overhead)
+#[must_use]
+pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|m| m.content.len().div_ceil(4) + 4)
+        .sum()
+}
 
 crate::define_store! {
     /// Global session store.
