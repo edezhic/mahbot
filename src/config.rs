@@ -830,7 +830,6 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
 /// (which `finalize` calls unconditionally for **every** field regardless
 /// of its per-field annotation — `non_empty`, `or(…)`, or `list_or(…)`).
 fn validate_config(config: &ConfigData) -> Result<()> {
-    // Validate endpoint URL — basic sanity check
     if let Some(ref ep) = config.provider_endpoint
         && !ep.starts_with("https://")
         && !ep.starts_with("http://")
@@ -838,9 +837,8 @@ fn validate_config(config: &ConfigData) -> Result<()> {
         anyhow::bail!("Provider endpoint must be a valid URL starting with https:// or http://");
     }
 
-    // Validate API key — reject placeholder patterns (starting with "sk-..")
     if let Some(ref key) = config.provider_key
-        && key.trim().starts_with("sk-..")
+        && key.starts_with("sk-..")
     {
         anyhow::bail!("Provider key is still the placeholder value — please set a real key");
     }
