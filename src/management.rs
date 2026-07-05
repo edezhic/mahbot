@@ -1988,7 +1988,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
 //
-// Why `process_analyst_verdicts` and `process_verdict_results` are separate
+// Why `process_analyst_verdicts` and `process_verifier_verdicts` are separate
 // -----------------------------------------------------------------------
 // Both follow the same skeleton (record comments -> classify -> transition)
 // but differ in four ways that make a single unified function awkward:
@@ -2275,7 +2275,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 /// - to Planning (notify) if any analyst failed, with a comment listing the counts
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
-/// from [`process_verdict_results`].
+/// from [`process_verifier_verdicts`].
 async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     // Record per-analyst comments.
     // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
@@ -2553,7 +2553,7 @@ async fn try_trip_circuit_breaker(
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_analyst_verdicts`].
-async fn process_verdict_results(
+async fn process_verifier_verdicts(
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
@@ -2651,7 +2651,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         return;
     };
 
-    process_verdict_results(&ticket, &results, vi).await;
+    process_verifier_verdicts(&ticket, &results, vi).await;
 }
 
 #[cfg(test)]
@@ -3076,7 +3076,7 @@ mod tests {
         }
     }
 
-    // ── process_verdict_results — verdict processing ─────────────────────
+    // ── process_verifier_verdicts — verdict processing ─────────────────────
 
     /// Verify all verdict-processing outcomes:
     /// - All failed → Failed
@@ -3084,7 +3084,7 @@ mod tests {
     /// - All passed (Reviewer) → Reviewed
     /// - All passed (QA) → QaPassed
     #[tokio::test]
-    async fn process_verdict_results_cases() {
+    async fn process_verifier_verdicts_cases() {
         struct Case {
             name: &'static str,
             ws_suffix: &'static str,
@@ -3152,7 +3152,7 @@ mod tests {
 
             let ticket = expect_ticket(board(), &ticket_id).await;
 
-            process_verdict_results(&ticket, &case.results, case.vi).await;
+            process_verifier_verdicts(&ticket, &case.results, case.vi).await;
 
             let ticket = expect_ticket(board(), &ticket_id).await;
             assert_eq!(
