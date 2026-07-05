@@ -66,7 +66,12 @@ pub struct ChatHistoryEntry {
 }
 
 /// Maximum number of history entries to load at once.
-const HISTORY_LIMIT: i64 = 100;
+const HISTORY_LIMIT: usize = 100;
+
+/// SQL query limit derived from `HISTORY_LIMIT`.
+/// SAFETY: `as i64` cast is infallible — `HISTORY_LIMIT` values are well below `i64::MAX`.
+#[allow(clippy::cast_possible_wrap)]
+const HISTORY_LIMIT_SQL: i64 = HISTORY_LIMIT as i64;
 
 // Column definitions for `chat_history` SELECT queries.
 crate::columns! {
@@ -107,21 +112,19 @@ fn rows_to_history_entries(rows: Vec<Row>) -> Result<Vec<ChatHistoryEntry>> {
     Ok(entries)
 }
 
-/// Process rows from a `LIMIT HISTORY_LIMIT + 1` query into a page of entries
-/// with a `has_more` flag. Entries are returned in chronological order.
-/// The extra over-fetched row (if any) is dropped from the front (oldest
-/// entries) so the returned vector contains at most `HISTORY_LIMIT` entries.
+/// Process rows from a query that over-fetched by one row (limit = history
+/// limit + 1) into a page of entries with a `has_more` flag. Entries are
+/// returned in chronological order. The extra over-fetched row (if any) is
+/// dropped from the front (oldest entries) so the returned vector contains
+/// at most [`HISTORY_LIMIT`] entries.
 fn rows_to_page(rows: Vec<Row>) -> Result<(Vec<ChatHistoryEntry>, bool)> {
     let mut entries = rows_to_history_entries(rows)?;
-    // SAFETY: HISTORY_LIMIT is 100, always fits in usize on all targets.
-    #[allow(clippy::cast_possible_truncation)]
-    let limit = HISTORY_LIMIT as usize;
-    let has_more = entries.len() > limit;
+    let has_more = entries.len() > HISTORY_LIMIT;
     if has_more {
         // Entries are in chronological order (oldest first).
         // We over-fetched by 1 to detect has_more; remove the oldest entry
         // (at the front) so we return exactly HISTORY_LIMIT entries.
-        entries.drain(0..(entries.len() - limit));
+        entries.drain(0..(entries.len() - HISTORY_LIMIT));
     }
     Ok((entries, has_more))
 }
@@ -161,7 +164,7 @@ impl ChatHistoryStore {
         user_name: &str,
         workspace: &str,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        let query_limit = HISTORY_LIMIT + 1; // fetch one extra to detect has_more
+        let query_limit = HISTORY_LIMIT_SQL + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
             .query(
@@ -188,7 +191,7 @@ impl ChatHistoryStore {
         workspace: &str,
         before_id: i64,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        let query_limit = HISTORY_LIMIT + 1; // fetch one extra to detect has_more
+        let query_limit = HISTORY_LIMIT_SQL + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
             .query(
