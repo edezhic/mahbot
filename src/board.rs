@@ -1,6 +1,5 @@
 //! Ticket/board system — Turso-backed task management.
 
-use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
 use crate::turso::{self, IntoParams, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -1198,18 +1197,19 @@ impl BoardStore {
 
     /// Atomically claim a ticket for diagnostics execution.
     ///
-    /// Sets `assigned_to = 'diagnostics'` only when the ticket is unassigned
-    /// AND still in [`TicketPhase::InDiagnostics`] — a single atomic SQL guard
-    /// that prevents the TOCTOU race between the poll listing pre-filter and the
-    /// subsequent claim. The assignee set and phase check are fused into one
-    /// UPDATE; callers do not need a separate `set_assigned_to` after claiming.
+    /// Sets `assigned_to` to the caller-provided value, only when the ticket
+    /// is unassigned AND still in [`TicketPhase::InDiagnostics`] — a single
+    /// atomic SQL guard that prevents the TOCTOU race between the poll
+    /// listing pre-filter and the subsequent claim. The assignee set and phase
+    /// check are fused into one UPDATE; callers do not need a separate
+    /// `set_assigned_to` after claiming.
     ///
     /// Returns `Ok(true)` if a row was updated (claim succeeded), `Ok(false)`
     /// if no row matched (already claimed by another dispatch or ticket moved
     /// out of [`TicketPhase::InDiagnostics`]). On a successful claim, cancels
     /// any agent registered on this ticket as a safety-in-depth measure against
     /// stale dispatches.
-    pub async fn claim_diagnostics(&self, ticket_id: &str) -> Result<bool> {
+    pub async fn claim_diagnostics(&self, ticket_id: &str, assigned_to: &str) -> Result<bool> {
         let now = turso::now();
         let rows = self
             .conn
@@ -1220,7 +1220,7 @@ impl BoardStore {
                  AND assigned_to IS NULL \
                  AND status = ?4",
                 turso::params![
-                    DIAGNOSTICS_ROLE,
+                    assigned_to,
                     now,
                     ticket_id,
                     TicketPhase::InDiagnostics.as_ref()
@@ -1238,9 +1238,9 @@ impl BoardStore {
     /// Claim a QaPassed ticket for sanitation processing.
     ///
     /// Atomically transitions the ticket from [`TicketPhase::QaPassed`] to
-    /// [`TicketPhase::InSanitation`], sets `assigned_to` to the sanitation
-    /// session key, and enforces the per-workspace serialization invariant:
-    /// only one ticket at a time may be in [`TicketPhase::InSanitation`] or
+    /// [`TicketPhase::InSanitation`], sets `assigned_to` to the caller-provided
+    /// value, and enforces the per-workspace serialization invariant: only one
+    /// ticket at a time may be in [`TicketPhase::InSanitation`] or
     /// [`TicketPhase::SanitationPassed`].
     ///
     /// Returns `Ok(true)` if the claim succeeded, `Ok(false)` if:
@@ -1250,10 +1250,8 @@ impl BoardStore {
     /// Unlike [`transition_to`](Self::transition_to), this method does NOT
     /// cancel registered agents — QaPassed is a transitory handoff phase
     /// with no running agent, so cancellation is unnecessary.
-    pub async fn claim_sanitation(&self, ticket_id: &str) -> Result<bool> {
+    pub async fn claim_sanitation(&self, ticket_id: &str, assigned_to: &str) -> Result<bool> {
         let now = turso::now();
-        let session_key =
-            crate::session::ticket_session_key(ticket_id, crate::Role::Sanitation.as_str());
         let blocker =
             status_list_sql_fragment(&[TicketPhase::InSanitation, TicketPhase::SanitationPassed]);
         let sql = format!(
@@ -1271,7 +1269,7 @@ impl BoardStore {
                 &sql,
                 turso::params![
                     TicketPhase::InSanitation.as_ref(),
-                    session_key,
+                    assigned_to,
                     now,
                     ticket_id,
                     TicketPhase::QaPassed.as_ref(),
@@ -1373,8 +1371,10 @@ impl BoardStore {
     /// * `hash` — git commit hash to record
     /// * `lines_added` — lines added in the commit
     /// * `lines_removed` — lines removed in the commit
-    /// * `comment` — comment body to add (the role is fixed to [`SYSTEM_ROLE`])
+    /// * `comment` — comment body to add
     /// * `source` — the ticket's expected current phase (e.g. `QaPassed`)
+    /// * `role` — the role identifier to record on the comment
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finalize_done_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
@@ -1383,9 +1383,10 @@ impl BoardStore {
         lines_removed: i64,
         comment: &str,
         source: TicketPhase,
+        role: &str,
     ) -> Result<()> {
         Self::set_commit_info_tx(tx, ticket_id, hash, lines_added, lines_removed).await?;
-        Self::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, comment).await?;
+        Self::add_comment_tx(tx, ticket_id, role, comment).await?;
         Self::transition_to_tx(tx, ticket_id, Some(source), TicketPhase::Done, None).await?;
         Ok(())
     }
@@ -2026,6 +2027,7 @@ mod tests {
     use crate::Tool;
     use crate::Workspace;
     use crate::role::DIAGNOSTICS_ROLE;
+    use crate::role::SYSTEM_ROLE;
     use crate::util::test::TicketBuilder;
     use crate::util::test::assert_superseded_ticket;
     use crate::util::test::expect_ticket;
@@ -3516,6 +3518,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                 5,
                 "triple write comment",
                 TicketPhase::QaPassed,
+                SYSTEM_ROLE,
             )
             .await
             .unwrap();
@@ -3741,7 +3744,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             }
 
             let claimed = store
-                .claim_diagnostics(&id)
+                .claim_diagnostics(&id, DIAGNOSTICS_ROLE)
                 .await
                 .expect("claim_diagnostics");
 
@@ -3765,7 +3768,10 @@ with a comment explaining why no agent is mid-execution in that state.\
                     );
 
                     // Verify idempotency (second claim returns false).
-                    let second = store.claim_diagnostics(&id).await.expect("second claim");
+                    let second = store
+                        .claim_diagnostics(&id, DIAGNOSTICS_ROLE)
+                        .await
+                        .expect("second claim");
                     assert!(
                         !second,
                         "Case '{}': second claim should return false (idempotent)",
@@ -3816,7 +3822,14 @@ with a comment explaining why no agent is mid-execution in that state.\
             let title = format!("san-claim-{i}");
             let id = make_ticket(&store, &ws, &title, case.phase).await;
 
-            let claimed = store.claim_sanitation(&id).await.expect("claim_sanitation");
+            // Compute before the call (needed as parameter even for non-claim cases).
+            let expected_key =
+                crate::session::ticket_session_key(&id, crate::Role::Sanitation.as_str());
+
+            let claimed = store
+                .claim_sanitation(&id, &expected_key)
+                .await
+                .expect("claim_sanitation");
             assert_eq!(
                 claimed, case.expected_claim,
                 "Case '{}': unexpected claim result",
@@ -3826,8 +3839,6 @@ with a comment explaining why no agent is mid-execution in that state.\
             if case.expected_claim {
                 let ticket = crate::util::test::expect_ticket(&store, &id).await;
                 assert_eq!(ticket.phase, TicketPhase::InSanitation);
-                let expected_key =
-                    crate::session::ticket_session_key(&id, crate::Role::Sanitation.as_str());
                 assert_eq!(
                     ticket.assigned_to.as_deref(),
                     Some(expected_key.as_str()),
@@ -3849,16 +3860,22 @@ with a comment explaining why no agent is mid-execution in that state.\
         // Second ticket in QaPassed — same workspace
         let second_id = make_ticket(&store, &ws, "Second", TicketPhase::QaPassed).await;
 
+        // Compute session keys before the calls (needed as parameters).
+        let first_key =
+            crate::session::ticket_session_key(&first_id, crate::Role::Sanitation.as_str());
+        let second_key =
+            crate::session::ticket_session_key(&second_id, crate::Role::Sanitation.as_str());
+
         // Claim the first — should succeed
         let first_claimed = store
-            .claim_sanitation(&first_id)
+            .claim_sanitation(&first_id, &first_key)
             .await
             .expect("first claim");
         assert!(first_claimed, "first claim should succeed");
 
         // Claim the second while first is in InSanitation — should fail (serialized)
         let second_claimed = store
-            .claim_sanitation(&second_id)
+            .claim_sanitation(&second_id, &second_key)
             .await
             .expect("second claim");
         assert!(
@@ -3877,7 +3894,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Now second claim should succeed
         let second_claimed_retry = store
-            .claim_sanitation(&second_id)
+            .claim_sanitation(&second_id, &second_key)
             .await
             .expect("second claim retry");
         assert!(
@@ -3896,11 +3913,21 @@ with a comment explaining why no agent is mid-execution in that state.\
         let id_a = make_ticket(&store, &ws_a, "Workspace A", TicketPhase::QaPassed).await;
         let id_b = make_ticket(&store, &ws_b, "Workspace B", TicketPhase::QaPassed).await;
 
+        // Compute session keys before the calls (needed as parameters).
+        let key_a = crate::session::ticket_session_key(&id_a, crate::Role::Sanitation.as_str());
+        let key_b = crate::session::ticket_session_key(&id_b, crate::Role::Sanitation.as_str());
+
         // Both should succeed independently (different workspaces)
-        let claimed_a = store.claim_sanitation(&id_a).await.expect("claim a");
+        let claimed_a = store
+            .claim_sanitation(&id_a, &key_a)
+            .await
+            .expect("claim a");
         assert!(claimed_a, "workspace A claim should succeed");
 
-        let claimed_b = store.claim_sanitation(&id_b).await.expect("claim b");
+        let claimed_b = store
+            .claim_sanitation(&id_b, &key_b)
+            .await
+            .expect("claim b");
         assert!(
             claimed_b,
             "workspace B claim should succeed independently of workspace A"

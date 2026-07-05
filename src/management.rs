@@ -1435,6 +1435,7 @@ async fn commit_and_transition_ticket_from(
                 commit_info.lines_removed,
                 &comment,
                 source,
+                SYSTEM_ROLE,
             )
             .await
         },
@@ -1500,7 +1501,8 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
         Ok(untracked) if !untracked.is_empty() => {
             // Untracked files exist — claim this specific ticket to InSanitation
             // via the dedicated claim_sanitation method (see BoardStore docs).
-            let claimed = match board().claim_sanitation(&ticket.id).await {
+            let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
+            let claimed = match board().claim_sanitation(&ticket.id, &session_key).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
@@ -1860,7 +1862,10 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     // Circuit breaker check happens in spawn_dispatch before entering this
     // function — consistent with all other dispatchers.
 
-    match board().claim_diagnostics(&ticket.id).await {
+    match board()
+        .claim_diagnostics(&ticket.id, DIAGNOSTICS_ROLE)
+        .await
+    {
         Err(e) => {
             error!(
                 ticket = %ticket.id,
