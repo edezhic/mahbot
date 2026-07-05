@@ -428,10 +428,7 @@ pub async fn close_all_browser_sessions() {
 /// otherwise (as with `snapshot` and `get_url`) it is omitted.
 fn action_schema(name: &str, description: &str, required: &[&str], properties: &Value) -> Value {
     let mut inner = super::tool_params_schema(properties, required);
-    inner
-        .as_object_mut()
-        .expect("tool_params_schema returns an object")
-        .insert("additionalProperties".into(), json!(false));
+    inner["additionalProperties"] = json!(false);
 
     json!({
         "type": "object",
