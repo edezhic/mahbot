@@ -179,14 +179,9 @@ impl DiffParser {
     /// Handle a content line within a hunk: classify as Added/Removed/Context, track
     /// line numbers, and push to the hunk.
     ///
-    /// Annotation lines (`\ No newline at end of file`) are filtered early, before the
-    /// hunk guard, since they are not diff content. Unknown lines are also silently
-    /// skipped — the caller continues normally.
+    /// Non-content lines are filtered by the caller before reaching this function.
+    /// Unknown lines are silently skipped — the caller continues normally.
     fn handle_diff_content_line(&mut self, line: &str) {
-        if line == r"\ No newline at end of file" {
-            return;
-        }
-
         // If no hunk is active, this line falls outside any diff hunk — skip.
         let Some(hunk) = self.current_hunk.as_mut() else {
             return;
@@ -241,6 +236,8 @@ impl DiffParser {
             || line.starts_with("old mode ")
             || line.starts_with("new mode ")
             || line.starts_with("rename to ")
+            || line.starts_with("\\ ")
+        // e.g. "\ No newline at end of file"
         {
             // rename to is safe to skip because diff --git already captures the b-path,
             // and rename from already set the status.
