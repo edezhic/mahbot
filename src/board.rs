@@ -1117,7 +1117,8 @@ impl BoardStore {
     /// cancellation. Use [`execute_and_cancel`](Self::execute_and_cancel) when
     /// agent cancellation is needed.
     ///
-    /// Used by [`set_commit_info`](Self::set_commit_info).
+    /// Used by [`execute_and_cancel`](Self::execute_and_cancel) and (in test
+    /// builds) [`set_commit_info`](Self::set_commit_info).
     async fn execute_update(&self, ticket_id: &str, prepared: PreparedUpdate) -> Result<()> {
         let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
         Self::ensure_ticket_found(rows, ticket_id, &prepared.action)?;
@@ -1282,8 +1283,8 @@ impl BoardStore {
     }
 
     /// Build the SQL, params, and action description for setting commit info.
-    /// Shared by [`set_commit_info`](Self::set_commit_info) and
-    /// [`set_commit_info_tx`](Self::set_commit_info_tx).
+    /// Shared by [`set_commit_info_tx`](Self::set_commit_info_tx) and (in test
+    /// builds) [`set_commit_info`](Self::set_commit_info).
     fn build_set_commit_info_sql(
         ticket_id: &str,
         hash: &str,
@@ -1313,10 +1314,25 @@ impl BoardStore {
 
     /// Record commit metadata on a ticket.
     ///
+    /// **Test-only wrapper** — retained to exercise
+    /// [`build_set_commit_info_sql`](Self::build_set_commit_info_sql) and
+    /// [`execute_update`](Self::execute_update) for commit-info operations.
+    /// Production code uses [`set_commit_info_tx`](Self::set_commit_info_tx)
+    /// inside transactions.
+    ///
     /// This is pure metadata — it does NOT cancel running agents or check
     /// ticket phase (unlike `set_assigned_to`, which cancels running agents). Non-negative line counts are
     /// enforced by debug assertions; the caller is responsible for providing
     /// valid values in production.
+    ///
+    /// # Maintenance warning
+    /// If a future feature needs this in production, remove the `#[cfg(test)]`
+    /// gate and add a real caller. Note that the non-transactional variant
+    /// skips agent cancellation (unlike [`execute_and_cancel`](Self::execute_and_cancel));
+    /// prefer using [`set_commit_info_tx`](Self::set_commit_info_tx) inside a
+    /// transaction instead. The tests will validate correctness before any
+    /// production use.
+    #[cfg(test)]
     pub async fn set_commit_info(
         &self,
         ticket_id: &str,
