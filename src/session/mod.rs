@@ -580,13 +580,9 @@ fn parse_ts_or_now_invalid_fallback() {
 
 #[derive(Debug)]
 pub(crate) enum DecodedNativeHistoryMessage {
-    AssistantToolCalls {
+    Assistant {
         content: Option<String>,
-        tool_calls: Vec<ProviderToolCall>,
-        reasoning: Option<Reasoning>,
-    },
-    AssistantReasoning {
-        content: Option<String>,
+        tool_calls: Option<Vec<ProviderToolCall>>,
         reasoning: Option<Reasoning>,
     },
     ToolResult {
@@ -611,7 +607,7 @@ pub(crate) struct NativeMessageParts {
 impl DecodedNativeHistoryMessage {
     pub(crate) fn into_parts(self) -> NativeMessageParts {
         match self {
-            DecodedNativeHistoryMessage::AssistantToolCalls {
+            DecodedNativeHistoryMessage::Assistant {
                 content,
                 tool_calls,
                 reasoning,
@@ -619,18 +615,9 @@ impl DecodedNativeHistoryMessage {
                 role: "assistant".to_string(),
                 content,
                 tool_call_id: None,
-                tool_calls: Some(tool_calls),
+                tool_calls,
                 reasoning,
             },
-            DecodedNativeHistoryMessage::AssistantReasoning { content, reasoning } => {
-                NativeMessageParts {
-                    role: "assistant".to_string(),
-                    content,
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning,
-                }
-            }
             DecodedNativeHistoryMessage::ToolResult {
                 tool_call_id,
                 content,
@@ -677,16 +664,18 @@ pub(crate) fn decode_native_history_message(
                 }
             }
 
-            return Some(DecodedNativeHistoryMessage::AssistantToolCalls {
+            return Some(DecodedNativeHistoryMessage::Assistant {
                 content,
-                tool_calls: parsed_calls,
+                tool_calls: Some(parsed_calls),
                 reasoning,
             });
         }
 
-        if reasoning.is_some() {
-            return Some(DecodedNativeHistoryMessage::AssistantReasoning { content, reasoning });
-        }
+        return Some(DecodedNativeHistoryMessage::Assistant {
+            content,
+            tool_calls: None,
+            reasoning,
+        });
     }
 
     if message.role == ChatRole::Tool

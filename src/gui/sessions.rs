@@ -383,49 +383,51 @@ impl SessionsState {
 
             let kind = if let Some(ref d) = decoded {
                 match d {
-                    DecodedNativeHistoryMessage::AssistantToolCalls {
+                    DecodedNativeHistoryMessage::Assistant {
                         content,
                         tool_calls,
                         reasoning,
                     } => {
-                        let reasoning_text = crate::util::plaintext_for_display(reasoning.as_ref());
+                        if let Some(tool_calls) = tool_calls {
+                            let reasoning_text =
+                                crate::util::plaintext_for_display(reasoning.as_ref());
 
-                        let calls: Vec<ToolCallInfo> = tool_calls
-                            .iter()
-                            .map(|tc| ToolCallInfo {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                arguments: crate::util::summarize_args(&tc.arguments),
-                            })
-                            .collect();
+                            let calls: Vec<ToolCallInfo> = tool_calls
+                                .iter()
+                                .map(|tc| ToolCallInfo {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    arguments: crate::util::summarize_args(&tc.arguments),
+                                })
+                                .collect();
 
-                        let text_content: Option<String> = match content {
-                            Some(c) if !c.is_empty() => Some(c.clone()),
-                            _ => None,
-                        };
+                            let text_content: Option<String> = match content {
+                                Some(c) if !c.is_empty() => Some(c.clone()),
+                                _ => None,
+                            };
 
-                        DecodedMsgKind::AssistantToolCalls {
-                            calls,
-                            reasoning_text,
-                            text_content,
+                            DecodedMsgKind::AssistantToolCalls {
+                                calls,
+                                reasoning_text,
+                                text_content,
+                            }
+                        } else {
+                            let mut parts = Vec::new();
+                            if let Some(reasoning_text) =
+                                crate::util::plaintext_for_display(reasoning.as_ref())
+                            {
+                                parts.push(format!("[thinking]\n{reasoning_text}\n[/thinking]"));
+                            }
+                            if let Some(c) = content
+                                && !c.is_empty()
+                            {
+                                parts.push(c.clone());
+                            }
+                            let content_str = parts.join("\n");
+                            let content_parts = parse_thinking_blocks(content_str);
+
+                            DecodedMsgKind::Regular { content_parts }
                         }
-                    }
-                    DecodedNativeHistoryMessage::AssistantReasoning { content, reasoning } => {
-                        let mut parts = Vec::new();
-                        if let Some(reasoning_text) =
-                            crate::util::plaintext_for_display(reasoning.as_ref())
-                        {
-                            parts.push(format!("[thinking]\n{reasoning_text}\n[/thinking]"));
-                        }
-                        if let Some(c) = content
-                            && !c.is_empty()
-                        {
-                            parts.push(c.clone());
-                        }
-                        let content_str = parts.join("\n");
-                        let content_parts = parse_thinking_blocks(content_str);
-
-                        DecodedMsgKind::Regular { content_parts }
                     }
                     DecodedNativeHistoryMessage::ToolResult {
                         tool_call_id,
@@ -1023,8 +1025,7 @@ fn parse_messages_to_md_items(messages: &[ChatMessage]) -> Vec<Vec<markdown::Ite
         .map(|m| {
             let display_text = decode_native_history_message(m)
                 .and_then(|d| match d {
-                    DecodedNativeHistoryMessage::AssistantToolCalls { content, .. }
-                    | DecodedNativeHistoryMessage::AssistantReasoning { content, .. } => content,
+                    DecodedNativeHistoryMessage::Assistant { content, .. } => content,
                     DecodedNativeHistoryMessage::ToolResult { content, .. } => Some(content),
                 })
                 .unwrap_or_else(|| m.content.clone());
