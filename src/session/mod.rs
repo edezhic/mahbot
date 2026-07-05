@@ -460,12 +460,15 @@ mod tests {
 //    starting with a prefix registered in [`TRANSIENT_SESSION_PREFIXES`];
 //    an unregistered prefix means transient sessions never get cleaned up (leak).
 //
-// Limitations: only covers `direct_session_key()` and `manager_session_key()`
-// patterns. A future role with a novel session key builder won't be tested
-// unless updated here. Channel-name collision (a channel registered as
-// "ticket" or "ask") is an orthogonal risk — `starts_with` matches the first
-// key segment (channel name), which cannot be guarded by assertion because
-// channel names are dynamic. Awareness during channel registration is required.
+// Limitations: `forward_no_collision_with_user_facing_sessions` covers
+// `direct_session_key()` and `manager_session_key()` patterns.
+// `reverse_transient_builders_use_registered_prefixes` covers all transient
+// builders (ticket, ask, maintainer, discovery). If a new transient role
+// adds a session key builder, add it to the reverse test.
+// Channel-name collision (a channel registered as "ticket" or "ask") is an
+// orthogonal risk — `starts_with` matches the first key segment (channel
+// name), which cannot be guarded by assertion because channel names are
+// dynamic. Awareness during channel registration is required.
 //
 // All builders are pure string functions — these are cheap synchronous tests.
 // Assertion `Fix:` messages guide corrective action when an invariant breaks.
