@@ -1264,7 +1264,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
                 phase = %source.as_ref(),
                 "transition_ticket_to_done called from unexpected source phase",
             );
-            source.as_ref()
+            "Unexpected"
         }
     };
     let _ = comment_and_transition(TransitionParams::new(
