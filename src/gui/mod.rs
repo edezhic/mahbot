@@ -600,12 +600,7 @@ impl Dashboard {
                         self.selected_workspace_name = Some(name.clone());
                         name.clone()
                     }
-                    None => {
-                        // Unreachable: load_workspace_options always produces Some.
-                        // Defensive fallback — treat as Personal workspace.
-                        self.selected_workspace_name = None;
-                        String::new()
-                    }
+                    None => unreachable!(),
                 };
                 Task::batch([self.propagate_workspace_selection(&ws_name), load_users])
             }
