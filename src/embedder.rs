@@ -109,9 +109,10 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// | `LOADING`  | `UNINIT`   | CONFIG not yet initialised → `models_dir()` returns  |
 /// |            |            | `None`. STATE is rolled back so the next `embed()`   |
 /// |            |            | call can retry.                                      |
-/// | `LOADING`  | (stuck)    | **Terminal conditions** leaving `LOADING` forever:   |
-/// |            |            | • No Tokio runtime available — no background         |
-/// |            |            |   download task is spawned.                          |
+/// | `LOADING`  | `UNINIT`   | No Tokio runtime available — no background download  |
+/// |            |            | task can be spawned. STATE is rolled back so a       |
+/// |            |            | future call running under a runtime can retry.       |
+/// | `LOADING`  | (stuck)    | **Terminal condition** leaving `LOADING` forever:    |
 /// |            |            | • Freshly downloaded, SHA256-verified files fail     |
 /// |            |            |   to load (code-level bug in [`Embedder::load()`]);  |
 /// |            |            |   [`download_retry_loop`] returns without any        |
@@ -176,10 +177,8 @@ fn ensure_embedder() -> bool {
     // Thread-local: try to load cached files synchronously
     let Some(models_dir) = models_dir() else {
         // CONFIG not initialized yet — can't locate model cache.
-        // Unlike the no-runtime case below, this condition IS transient:
-        // CONFIG will be initialized during bootstrap. Stay UNINIT so the
-        // next embed() call (which will run under a tokio runtime post-
-        // bootstrap) can retry initialization.
+        // This condition IS transient: CONFIG will be initialized during
+        // bootstrap. Roll back to UNINIT so the next embed() call can retry.
         STATE.store(STATE_UNINIT, Ordering::Release);
         return false;
     };
@@ -206,9 +205,10 @@ fn ensure_embedder() -> bool {
         tokio::spawn(download_retry_loop());
     } else {
         // No tokio runtime available (e.g., in unit tests without runtime).
-        // STATE stays LOADING from the CAS above — subsequent calls
-        // short-circuit at the `!= STATE_UNINIT` guard above
-        // without re-entering the initialization path.
+        // Roll back to UNINIT so a future call with a runtime can retry.
+        // This is safe because the CAS at the top ensures only one thread
+        // can be in the LOADING state at a time.
+        STATE.store(STATE_UNINIT, Ordering::Release);
     }
 
     false
@@ -1093,6 +1093,52 @@ mod tests {
         // Verify the global embedder is still empty
         let guard = global_embedder().read().unwrap_poison();
         assert!(guard.is_none(), "global embedder should remain None");
+    }
+
+    #[test]
+    fn test_ensure_embedder_recovers_from_no_runtime() {
+        // Regression test: ensure_embedder() without a tokio runtime
+        // should reset STATE to UNINIT so a future call can retry
+        // (rather than being permanently stuck in LOADING).
+
+        // This test uses a plain `#[test]` (not tokio::test), so
+        // tokio::runtime::Handle::try_current() returns Err,
+        // exercising the no-runtime branch.
+        let _root = init_test_config();
+        reset_global_state();
+
+        // First call: no runtime → should roll back to UNINIT
+        let r1 = ensure_embedder();
+        assert!(!r1, "ensure_embedder should return false without a runtime");
+        assert_eq!(
+            STATE.load(Ordering::Acquire),
+            STATE_UNINIT,
+            "STATE should be UNINIT after no-runtime attempt (not stuck in LOADING)"
+        );
+
+        // Second call: should re-enter the init path (not fast-path return false)
+        let r2 = ensure_embedder();
+        assert!(!r2, "ensure_embedder should return false again");
+        assert_eq!(
+            STATE.load(Ordering::Acquire),
+            STATE_UNINIT,
+            "STATE should be UNINIT again after second no-runtime attempt"
+        );
+
+        // Verify we can still CAS UNINIT→LOADING (i.e. not permanently stuck)
+        assert!(
+            STATE
+                .compare_exchange(
+                    STATE_UNINIT,
+                    STATE_LOADING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok(),
+            "should be able to CAS UNINIT→LOADING (state is not stuck)"
+        );
+        // Clean up state
+        STATE.store(STATE_UNINIT, Ordering::Release);
     }
 
     #[test]
