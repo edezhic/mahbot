@@ -206,6 +206,15 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// Returns `true` when the caller MUST bail (phase mismatch, ticket moved or
 /// failed, or circuit breaker tripped). Returns `false` when it's safe to
 /// proceed.
+///
+/// # Side effects
+///
+/// When the circuit breaker trips, [`try_trip_circuit_breaker`] drains all
+/// other [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) tickets in
+/// the same workspace to [`Planning`](TicketPhase::Planning). These drained
+/// siblings are **not** auto-claimed by the poll loop — `Planning` tickets
+/// require Manager intervention to advance, so they will not silently proceed
+/// until the Manager acts.
 #[must_use]
 async fn is_phase_or_breaker_blocked(
     ticket: &Ticket,
@@ -246,6 +255,14 @@ async fn is_phase_or_breaker_blocked(
 ///
 /// Callers that need a domain-specific circuit breaker (sanitation, diagnostics)
 /// should use [`is_phase_or_breaker_blocked`] directly with custom parameters.
+///
+/// # Side effects
+///
+/// When the circuit breaker trips, all other
+/// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) tickets in the
+/// same workspace are moved to
+/// [`Planning`](TicketPhase::Planning). See the
+/// [`is_phase_or_breaker_blocked`] doc comment for details.
 #[must_use]
 async fn is_phase_or_general_breaker_blocked(
     ticket: &Ticket,
