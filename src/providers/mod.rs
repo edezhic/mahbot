@@ -146,24 +146,18 @@ async fn setup_provider_and_transcribers(
     warmup_mode: WarmupMode,
     config: &crate::config::ConfigData,
 ) -> anyhow::Result<()> {
-    let api_key = non_empty(config.provider_key.clone());
     let endpoint_str = resolve_or(
         config.provider_endpoint.clone(),
         crate::config::DEFAULT_PROVIDER_ENDPOINT,
     );
-    let endpoint_opt = if endpoint_str == crate::config::DEFAULT_PROVIDER_ENDPOINT {
-        None
-    } else {
-        Some(endpoint_str.as_str())
-    };
-
-    let provider: Arc<dyn Provider> = create_provider(api_key.as_deref(), endpoint_opt)?.into();
+    let provider: Arc<dyn Provider> =
+        create_provider(config.provider_key.as_deref(), Some(endpoint_str.as_str()))?.into();
 
     // Construct transcribers early — purely synchronous CPU work with no I/O,
     // so there's no reason to wait until after the warmup HTTP call.
     let image_transcriber = create_transcriber(
         Some(&endpoint_str),
-        api_key.as_deref(),
+        config.provider_key.as_deref(),
         Some(
             resolve_or(
                 config.image_transcription_model.clone(),
@@ -176,7 +170,7 @@ async fn setup_provider_and_transcribers(
     );
     let audio_transcriber = create_transcriber(
         Some(&endpoint_str),
-        api_key.as_deref(),
+        config.provider_key.as_deref(),
         Some(
             resolve_or(
                 config.audio_transcription_model.clone(),
@@ -229,8 +223,7 @@ pub async fn warmup_provider_from_config(config: &crate::config::ConfigData) -> 
         .provider_endpoint
         .as_deref()
         .and_then(trimmed_or_none);
-    let endpoint_opt = endpoint.filter(|e| e.as_str() != crate::config::DEFAULT_PROVIDER_ENDPOINT);
-    let provider = create_provider(config.provider_key.as_deref(), endpoint_opt.as_deref())?;
+    let provider = create_provider(config.provider_key.as_deref(), endpoint.as_deref())?;
     provider.warmup().await?;
     Ok(())
 }
