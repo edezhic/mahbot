@@ -151,14 +151,10 @@ fn set_embedder_ready(emb: Embedder) {
 /// Called on every [`embed_query()`] / [`embed_document()`] invocation. Returns `true` if the embedder is
 /// ready, `false` if it's still loading or permanently unavailable.
 fn ensure_embedder() -> bool {
-    if STATE.load(Ordering::Acquire) == STATE_READY {
-        return true;
-    }
-
-    // Already loading (or failed) — return false, embed_query/embed_document will return None.
-    // The background retry loop will eventually set state to READY.
-    if STATE.load(Ordering::Acquire) != STATE_UNINIT {
-        return false;
+    match STATE.load(Ordering::Acquire) {
+        STATE_READY => return true,
+        STATE_UNINIT => {} // proceed to initialize
+        _ => return false, // STATE_LOADING or unexpected state
     }
 
     // Try to become the initializer (atomic CAS to prevent races)
