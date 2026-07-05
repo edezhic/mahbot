@@ -184,7 +184,6 @@ impl DiffParser {
     /// hunk guard, since they are not diff content. Unknown lines are also silently
     /// skipped — the caller continues normally.
     fn handle_diff_content_line(&mut self, line: &str) {
-        // Annotation lines are not diff content — skip regardless of hunk state.
         if line == r"\ No newline at end of file" {
             return;
         }
@@ -201,7 +200,6 @@ impl DiffParser {
         } else if line.starts_with(' ') {
             DiffLineKind::Context
         } else {
-            // Unknown line — skip
             return;
         };
 
@@ -245,7 +243,6 @@ impl DiffParser {
             || line.starts_with("new mode ")
             || line.starts_with("rename to ")
         {
-            // Metadata lines — currently just skip.
             // rename to is safe to skip because diff --git already captures the b-path,
             // and rename from already set the status.
         } else if line.starts_with("--- ") || line.starts_with("+++ ") {
@@ -344,7 +341,6 @@ pub fn make_untracked_diff_file(path: &str, content: &str) -> DiffFile {
 ///   these, and they are not handled by this parser.
 fn parse_diff_git_line(line: &str) -> Option<String> {
     let rest = line.strip_prefix("diff --git ")?;
-    // Locate the b-part of the two space-separated tokens.
     let b_part = find_b_part(rest)?;
     extract_b_path(b_part)
 }
@@ -373,7 +369,6 @@ fn find_b_part(rest: &str) -> Option<&str> {
                 i += 1;
             }
         }
-        // Skip whitespace between the two parts.
         while i < bytes.len() && bytes[i] == b' ' {
             i += 1;
         }
@@ -436,7 +431,6 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
     //   @@ -0,0 +1,3 @@
     //   @@ -10,7 +10,9 @@ fn process() -> Result<()>
 
-    // Strip the opening @@ delimiter.
     let after_open = header.trim_start_matches('@');
 
     let mut old_start = 1;

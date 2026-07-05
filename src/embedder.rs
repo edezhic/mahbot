@@ -150,7 +150,6 @@ fn set_embedder_ready(emb: Embedder) {
 /// Called on every [`embed()`] invocation. Returns `true` if the embedder is
 /// ready, `false` if it's still loading or permanently unavailable.
 fn ensure_embedder() -> bool {
-    // Fast path: already ready
     if STATE.load(Ordering::Acquire) == STATE_READY {
         return true;
     }
