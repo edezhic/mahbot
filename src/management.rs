@@ -2523,7 +2523,7 @@ async fn try_trip_circuit_breaker(
         ticket,
         source_phase,
         &comment_text(count),
-        "Circuit breaker",
+        &format!("{log_label} circuit breaker"),
     )
     .await
     {
