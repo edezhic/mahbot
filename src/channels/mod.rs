@@ -959,37 +959,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_strips_video_but_not_image_markers() {
-        // Verify that multimodal mode preserves IMAGE markers (needed for
-        // to_message_content) while stripping VIDEO markers.
-        let mut msg =
-            test_msg("before [IMAGE:https://example.com/i.png] mid [VIDEO:/tmp/v.mp4] after");
-        let strategy = EnrichmentStrategy::Multimodal {
-            workspace_path: None,
-        };
-        enrich_message(&mut msg, &strategy).await;
-
-        // IMAGE marker preserved (HTTP URL)
-        assert!(
-            msg.content.contains("[IMAGE:https://example.com/i.png]"),
-            "IMAGE HTTP URL must be preserved in multimodal"
-        );
-        // VIDEO marker stripped
-        assert!(
-            !msg.content.contains("[VIDEO:"),
-            "VIDEO marker must be stripped"
-        );
-        assert!(
-            !msg.content.contains("[Video:"),
-            "No Video annotation in multimodal"
-        );
-        // Text preserved
-        assert!(msg.content.contains("before"), "Text preserved");
-        assert!(msg.content.contains("mid"), "Text preserved");
-        assert!(msg.content.contains("after"), "Text preserved");
-    }
-
-    #[tokio::test]
     async fn enrich_multimodal_combined_image_preserved_audio_video_stripped() {
         // Verify the multimodal invariant: all three marker kinds in one message,
         // IMAGE is preserved, AUDIO and VIDEO are stripped (with annotations).
