@@ -874,43 +874,63 @@ mod tests {
         assert!(BrowserTool::validate_url("https://other.com").is_ok());
     }
 
-    #[test]
-    fn build_args_for_open_validates_url() {
-        let action = BrowserAction::Open {
-            url: "https://example.com".into(),
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["open", "https://example.com"]);
-    }
+    // ── build_args: simple actions ───────────────────────────────────────
 
     #[test]
-    fn build_args_for_snapshot() {
-        let action = BrowserAction::Snapshot {
-            interactive_only: true,
-            compact: true,
-            depth: Some(5),
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["snapshot", "-i", "-c", "-d", "5"]);
+    fn build_args_for_simple_actions() {
+        struct Case {
+            name: &'static str,
+            action: BrowserAction,
+            expected: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "open",
+                action: BrowserAction::Open {
+                    url: "https://example.com".into(),
+                },
+                expected: &["open", "https://example.com"],
+            },
+            Case {
+                name: "snapshot",
+                action: BrowserAction::Snapshot {
+                    interactive_only: true,
+                    compact: true,
+                    depth: Some(5),
+                },
+                expected: &["snapshot", "-i", "-c", "-d", "5"],
+            },
+            Case {
+                name: "click",
+                action: BrowserAction::Click {
+                    selector: "@e1".into(),
+                },
+                expected: &["click", "@e1"],
+            },
+            Case {
+                name: "get_text",
+                action: BrowserAction::GetText {
+                    selector: "@e3".into(),
+                },
+                expected: &["get", "text", "@e3"],
+            },
+            Case {
+                name: "get_url",
+                action: BrowserAction::GetUrl {},
+                expected: &["get", "url"],
+            },
+        ];
+
+        for case in &cases {
+            let args = BrowserTool::build_args(&case.action).unwrap_or_else(|e| {
+                panic!("{}: build_args failed: {}", case.name, e);
+            });
+            assert_eq!(args, case.expected, "{}", case.name);
+        }
     }
 
-    #[test]
-    fn build_args_for_click() {
-        let action = BrowserAction::Click {
-            selector: "@e1".into(),
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["click", "@e1"]);
-    }
-
-    #[test]
-    fn build_args_for_get_text() {
-        let action = BrowserAction::GetText {
-            selector: "@e3".into(),
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["get", "text", "@e3"]);
-    }
+    // ── build_args: GetInnerText error ──────────────────────────────────
 
     #[test]
     fn build_args_rejects_get_innertext() {
@@ -940,165 +960,153 @@ mod tests {
         assert!(refr.contains("document.querySelector('@e1')"));
     }
 
-    #[test]
-    fn build_args_for_get_url() {
-        let args = BrowserTool::build_args(&BrowserAction::GetUrl {}).unwrap();
-        assert_eq!(args, ["get", "url"]);
-    }
+    // ── build_args: Find variants ────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     #[test]
-    fn build_args_for_find_by_text() {
-        let action = BrowserAction::Find {
-            by: "text".into(),
-            value: "Sign In".into(),
-            action: "click".into(),
-            text: None,
-            name: None,
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "text", "Sign In", "click"]);
-    }
+    fn build_args_for_find_variants() {
+        struct Case {
+            name: &'static str,
+            by: &'static str,
+            value: &'static str,
+            action: &'static str,
+            text: Option<&'static str>,
+            find_name: Option<&'static str>,
+            exact: Option<bool>,
+            index: Option<u32>,
+            expected: &'static [&'static str],
+        }
 
-    #[test]
-    fn build_args_for_find_by_text_with_typing() {
-        let action = BrowserAction::Find {
-            by: "text".into(),
-            value: "Search".into(),
-            action: "fill".into(),
-            text: Some("tokio".into()),
-            name: None,
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "text", "Search", "fill", "tokio"]);
-    }
+        let cases = [
+            Case {
+                name: "find_by_text_click",
+                by: "text",
+                value: "Sign In",
+                action: "click",
+                text: None,
+                find_name: None,
+                exact: None,
+                index: None,
+                expected: &["find", "text", "Sign In", "click"],
+            },
+            Case {
+                name: "find_by_text_fill",
+                by: "text",
+                value: "Search",
+                action: "fill",
+                text: Some("tokio"),
+                find_name: None,
+                exact: None,
+                index: None,
+                expected: &["find", "text", "Search", "fill", "tokio"],
+            },
+            Case {
+                name: "find_by_first",
+                by: "first",
+                value: "a",
+                action: "fill",
+                text: None,
+                find_name: None,
+                exact: None,
+                index: None,
+                expected: &["find", "first", "a", "fill"],
+            },
+            Case {
+                name: "find_by_nth_with_index",
+                by: "nth",
+                value: ".card",
+                action: "hover",
+                text: None,
+                find_name: None,
+                exact: None,
+                index: Some(2),
+                expected: &["find", "nth", "2", ".card", "hover"],
+            },
+            Case {
+                name: "find_by_nth_default_index",
+                by: "nth",
+                value: "a",
+                action: "click",
+                text: None,
+                find_name: None,
+                exact: None,
+                index: None,
+                expected: &["find", "nth", "0", "a", "click"],
+            },
+            Case {
+                name: "find_with_name_and_exact",
+                by: "role",
+                value: "button",
+                action: "click",
+                text: None,
+                find_name: Some("Submit"),
+                exact: Some(true),
+                index: None,
+                expected: &[
+                    "find", "role", "button", "click", "--name", "Submit", "--exact",
+                ],
+            },
+            Case {
+                name: "find_with_name_only",
+                by: "role",
+                value: "link",
+                action: "click",
+                text: None,
+                find_name: Some("Docs.rs"),
+                exact: None,
+                index: None,
+                expected: &["find", "role", "link", "click", "--name", "Docs.rs"],
+            },
+            Case {
+                name: "find_check",
+                by: "text",
+                value: "Accept",
+                action: "check",
+                text: None,
+                find_name: None,
+                exact: None,
+                index: None,
+                expected: &["find", "text", "Accept", "check"],
+            },
+            Case {
+                name: "find_uncheck",
+                by: "text",
+                value: "Subscribe",
+                action: "uncheck",
+                text: None,
+                find_name: None,
+                exact: None,
+                index: None,
+                expected: &["find", "text", "Subscribe", "uncheck"],
+            },
+            Case {
+                name: "find_text_action",
+                by: "first",
+                value: ".result",
+                action: "text",
+                text: None,
+                find_name: None,
+                exact: None,
+                index: None,
+                expected: &["find", "first", ".result", "text"],
+            },
+        ];
 
-    #[test]
-    fn build_args_for_find_by_first() {
-        let action = BrowserAction::Find {
-            by: "first".into(),
-            value: "a".into(),
-            action: "fill".into(),
-            text: None,
-            name: None,
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "first", "a", "fill"]);
-    }
-
-    #[test]
-    fn build_args_for_find_by_nth() {
-        let action = BrowserAction::Find {
-            by: "nth".into(),
-            value: ".card".into(),
-            action: "hover".into(),
-            text: None,
-            name: None,
-            exact: None,
-            index: Some(2),
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "nth", "2", ".card", "hover"]);
-    }
-
-    #[test]
-    fn build_args_for_find_by_nth_defaults_index_to_zero() {
-        let action = BrowserAction::Find {
-            by: "nth".into(),
-            value: "a".into(),
-            action: "click".into(),
-            text: None,
-            name: None,
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "nth", "0", "a", "click"]);
-    }
-
-    #[test]
-    fn build_args_for_find_with_name_and_exact() {
-        let action = BrowserAction::Find {
-            by: "role".into(),
-            value: "button".into(),
-            action: "click".into(),
-            text: None,
-            name: Some("Submit".into()),
-            exact: Some(true),
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(
-            args,
-            [
-                "find", "role", "button", "click", "--name", "Submit", "--exact"
-            ]
-        );
-    }
-
-    #[test]
-    fn build_args_for_find_with_name_only() {
-        let action = BrowserAction::Find {
-            by: "role".into(),
-            value: "link".into(),
-            action: "click".into(),
-            text: None,
-            name: Some("Docs.rs".into()),
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "role", "link", "click", "--name", "Docs.rs"]);
-    }
-
-    #[test]
-    fn build_args_for_find_check() {
-        let action = BrowserAction::Find {
-            by: "text".into(),
-            value: "Accept".into(),
-            action: "check".into(),
-            text: None,
-            name: None,
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "text", "Accept", "check"]);
-    }
-
-    #[test]
-    fn build_args_for_find_uncheck() {
-        let action = BrowserAction::Find {
-            by: "text".into(),
-            value: "Subscribe".into(),
-            action: "uncheck".into(),
-            text: None,
-            name: None,
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "text", "Subscribe", "uncheck"]);
-    }
-
-    #[test]
-    fn build_args_for_find_text_action() {
-        let action = BrowserAction::Find {
-            by: "first".into(),
-            value: ".result".into(),
-            action: "text".into(),
-            text: None,
-            name: None,
-            exact: None,
-            index: None,
-        };
-        let args = BrowserTool::build_args(&action).unwrap();
-        assert_eq!(args, ["find", "first", ".result", "text"]);
+        for case in &cases {
+            let action = BrowserAction::Find {
+                by: case.by.into(),
+                value: case.value.into(),
+                action: case.action.into(),
+                text: case.text.map(String::from),
+                name: case.find_name.map(String::from),
+                exact: case.exact,
+                index: case.index,
+            };
+            let args = BrowserTool::build_args(&action).unwrap_or_else(|e| {
+                panic!("{}: build_args failed: {}", case.name, e);
+            });
+            assert_eq!(args, case.expected, "{}", case.name);
+        }
     }
 
     #[test]
