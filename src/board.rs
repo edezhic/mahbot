@@ -187,7 +187,7 @@ pub const UNBLOCKING_STATUSES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase
 fn status_list_sql_fragment(statuses: &[TicketPhase]) -> String {
     statuses
         .iter()
-        .map(|p| format!("'{p}'"))
+        .map(|p| format!("'{}'", p.as_ref()))
         .collect::<Vec<_>>()
         .join(", ")
 }
