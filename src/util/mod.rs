@@ -934,61 +934,64 @@ mod strip_think_tag_tests {
     use super::strip_think_tags;
 
     #[test]
-    fn strips_inline_think_block() {
-        assert_eq!(
-            strip_think_tags("visible<think>hidden"),
-            Some("visible".to_string())
-        );
-    }
+    fn table() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: Option<&'static str>,
+        }
 
-    #[test]
-    fn strips_multiple_think_blocks() {
-        assert_eq!(
-            strip_think_tags("Answer A <think>hidden 1</think> and B <think>hidden 2</think> done"),
-            Some("Answer A  and B  done".to_string())
-        );
-    }
+        let cases = [
+            Case {
+                name: "inline think block",
+                input: "visible<think>hidden",
+                expected: Some("visible"),
+            },
+            Case {
+                name: "multiple think blocks",
+                input: "Answer A <think>hidden 1</think> and B <think>hidden 2</think> done",
+                expected: Some("Answer A  and B  done"),
+            },
+            Case {
+                name: "unclosed think tag",
+                input: "Visible<think>hidden tail",
+                expected: Some("Visible"),
+            },
+            Case {
+                name: "multiline think block",
+                input: "Hello<think>\nmulti\nline\n</think>world",
+                expected: Some("Helloworld"),
+            },
+            Case {
+                name: "multiple multiline blocks",
+                input: "<think>\nblock 1\n</think>A<think>\nblock 2\n</think>B",
+                expected: Some("AB"),
+            },
+            Case {
+                name: "empty think block",
+                input: "before<think></think>after",
+                expected: Some("beforeafter"),
+            },
+            Case {
+                name: "only think tags returns none",
+                input: "<think>hidden</think>",
+                expected: None,
+            },
+            Case {
+                name: "whitespace only returns none",
+                input: "  <think>content</think>  ",
+                expected: None,
+            },
+        ];
 
-    #[test]
-    fn strips_unclosed_think_tag() {
-        assert_eq!(
-            strip_think_tags("Visible<think>hidden tail"),
-            Some("Visible".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_multiline_think_block() {
-        assert_eq!(
-            strip_think_tags("Hello<think>\nmulti\nline\n</think>world"),
-            Some("Helloworld".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_multiple_multiline_blocks() {
-        assert_eq!(
-            strip_think_tags("<think>\nblock 1\n</think>A<think>\nblock 2\n</think>B"),
-            Some("AB".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_empty_think_block() {
-        assert_eq!(
-            strip_think_tags("before<think></think>after"),
-            Some("beforeafter".to_string())
-        );
-    }
-
-    #[test]
-    fn returns_none_when_only_think_tags() {
-        assert_eq!(strip_think_tags("<think>hidden</think>"), None);
-    }
-
-    #[test]
-    fn returns_none_for_whitespace_only() {
-        assert_eq!(strip_think_tags("  <think>content</think>  "), None);
+        for case in &cases {
+            assert_eq!(
+                strip_think_tags(case.input).as_deref(),
+                case.expected,
+                "case: {}",
+                case.name
+            );
+        }
     }
 }
 
