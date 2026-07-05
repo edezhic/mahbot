@@ -113,6 +113,17 @@ pub enum ToastKind {
     Error,
 }
 
+/// Whether a self-update is available or in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateStatus {
+    /// Self-update not available (button hidden).
+    Unavailable,
+    /// Self-update available and idle (button visible, clickable).
+    Available,
+    /// Self-update in progress (button visible, disabled).
+    InProgress,
+}
+
 /// A floating toast notification.
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -414,10 +425,9 @@ pub struct Dashboard {
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
     selected_user_name: Option<String>,
-    /// Whether a self-update is in progress (button disabled while building).
-    updating: bool,
-    /// Whether self-update is available on this installation (controls button visibility).
-    update_available: bool,
+    /// Whether a self-update is available or in progress.
+    /// Controls button visibility/disabled state.
+    update_status: UpdateStatus,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
@@ -450,8 +460,11 @@ impl Dashboard {
             workspace_maintenance: HashMap::new(),
             selected_workspace_name: None,
             selected_user_name: None,
-            updating: false,
-            update_available,
+            update_status: if update_available {
+                UpdateStatus::Available
+            } else {
+                UpdateStatus::Unavailable
+            },
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -943,7 +956,10 @@ impl Dashboard {
                 }
             }
             Message::UpdateBot if self.ready => {
-                self.updating = true;
+                if self.update_status != UpdateStatus::Available {
+                    return Task::none();
+                }
+                self.update_status = UpdateStatus::InProgress;
                 // Save window state before update (synchronous).
                 self.persist_window_state();
                 Task::perform(
@@ -961,7 +977,7 @@ impl Dashboard {
                 // actually reach this branch for the Ok case. The window
                 // closes as the only success signal to the user.
                 if let Err(err) = result {
-                    self.updating = false;
+                    self.update_status = UpdateStatus::Available;
                     self.toasts
                         .push(Toast::from_toast_msg(&ToastMessage::Error(err)));
                 }
@@ -1796,13 +1812,10 @@ impl Dashboard {
     /// Render the self-update button in the footer bar.
     /// Returns `None` when self-update is not available on this installation.
     fn render_update_button(&self) -> Option<Element<'_, Message>> {
-        if !self.update_available {
-            return None;
-        }
-        let update_color = if self.updating {
-            theme::TEXT_FAINT
-        } else {
-            theme::ACCENT
+        let (update_color, tooltip_text, clickable) = match self.update_status {
+            UpdateStatus::Unavailable => return None,
+            UpdateStatus::Available => (theme::ACCENT, "Update MahBot", true),
+            UpdateStatus::InProgress => (theme::TEXT_FAINT, "Updating…", false),
         };
         let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
             .size(24)
@@ -1810,16 +1823,12 @@ impl Dashboard {
         let update_btn = button(update_icon)
             .style(theme::button_text)
             .padding(3)
-            .on_press_maybe(if self.updating {
-                None
-            } else {
+            .on_press_maybe(if clickable {
                 Some(Message::UpdateBot)
+            } else {
+                None
             });
-        let update_tooltip = if self.updating {
-            "Updating…"
-        } else {
-            "Update MahBot"
-        };
+        let update_tooltip = tooltip_text;
         Some(
             tooltip(
                 update_btn,
