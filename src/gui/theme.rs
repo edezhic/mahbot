@@ -308,8 +308,6 @@ pub fn workspace_status_color(status: &str) -> (Color, Color) {
 
 /// Log entry fade‑in duration (ms).
 pub const ANIM_LOG_FADE_MS: u64 = 100;
-/// Sort‑indicator rotation duration (ms).
-pub const ANIM_SORT_MS: u64 = 200;
 /// Selected row background transition (ms).
 pub const ANIM_SELECTED_MS: u64 = 150;
 
