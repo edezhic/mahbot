@@ -3013,10 +3013,6 @@ mod tests {
             .await;
 
         // Now with 4 failures, should trip (4 > 3).
-        // Re-fetch ticket with fresh comments (try_trip_circuit_breaker fetches comments
-        // from DB internally, so we just need the ticket id).
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
         let tripped = try_trip_circuit_breaker(
             &ticket,
             TicketPhase::InSanitation,
