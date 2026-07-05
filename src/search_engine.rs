@@ -60,8 +60,10 @@ pub(crate) fn registry_initialized() -> bool {
 
 /// Per-workspace shared search engine state.
 ///
-/// Created once per workspace, shared across all agents searching that
-/// workspace.
+/// Created once per workspace (by [`get_or_init_engine`]), shared across all
+/// agents searching that workspace. The caller should ensure the background
+/// scan is complete (via [`ensure_scanned`]) before using the engine for
+/// searches — this is handled by the search tool's `resolve_engine` helper.
 #[derive(Debug)]
 pub(crate) struct SearchEngineEntry {
     /// Shared file picker used for both `files` and `grep` modes.
@@ -262,27 +264,6 @@ pub(crate) fn get_engine_if_exists(ws: &Workspace) -> Option<Arc<SearchEngineEnt
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
-
-/// A convenience handle that wraps an `Arc<SearchEngineEntry>` and provides
-/// direct field access for the search tool.
-///
-/// Created by `resolve_engine` in the search tool after ensuring the scan
-/// is complete.
-pub struct EngineHandle {
-    pub picker: SharedFilePicker,
-    pub query_tracker: SharedQueryTracker,
-    _entry: Arc<SearchEngineEntry>,
-}
-
-impl EngineHandle {
-    pub(crate) fn new(entry: Arc<SearchEngineEntry>) -> Self {
-        Self {
-            picker: entry.picker.clone(),
-            query_tracker: entry.query_tracker.clone(),
-            _entry: entry,
-        }
-    }
-}
 
 /// Remove a workspace's search engine from the registry.
 ///

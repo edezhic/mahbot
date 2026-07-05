@@ -14,6 +14,7 @@ use fff_search::parse_grep_query;
 use fff_search::{Constraint, GitStatusFilter};
 use serde_json::json;
 use std::fmt::Write;
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
@@ -202,22 +203,27 @@ pub struct SearchTool;
 impl SearchTool {
     /// Resolve the shared engine for a workspace and ensure the background
     /// scan has finished.
-    async fn resolve_engine(ws: &crate::Workspace) -> Result<search_engine::EngineHandle, String> {
+    ///
+    /// Returns an `Arc<SearchEngineEntry>` whose background scan is guaranteed
+    /// to be complete (or an error if the scan timed out).
+    async fn resolve_engine(
+        ws: &crate::Workspace,
+    ) -> Result<Arc<search_engine::SearchEngineEntry>, String> {
         let entry = search_engine::get_or_init_engine(&ws.name, std::path::Path::new(&ws.path))?;
         search_engine::ensure_scanned(&entry).await?;
-        Ok(search_engine::EngineHandle::new(entry))
+        Ok(entry)
     }
 
     fn search_files(
-        handle: &search_engine::EngineHandle,
+        entry: &search_engine::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,
         constraints: &[Constraint<'_>],
     ) -> anyhow::Result<String> {
-        let paths = Self::find_file_path_list(handle, query, max_results, offset)?;
+        let paths = Self::find_file_path_list(entry, query, max_results, offset)?;
         if paths.is_empty() {
-            return Self::format_files_zero_result(handle, query, offset, max_results, constraints);
+            return Self::format_files_zero_result(entry, query, offset, max_results, constraints);
         }
 
         let mut output = paths.join("\n");
@@ -227,7 +233,7 @@ impl SearchTool {
     }
 
     fn format_files_zero_result(
-        handle: &search_engine::EngineHandle,
+        entry: &search_engine::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,
@@ -245,11 +251,11 @@ impl SearchTool {
                 limit: max_results,
             },
         };
-        let guard = handle.picker.read().unwrap();
+        let guard = entry.picker.read().unwrap();
         let Some(picker) = guard.as_ref() else {
             anyhow::bail!("Search engine not yet initialized.")
         };
-        let qt_guard = handle.query_tracker.read().unwrap();
+        let qt_guard = entry.query_tracker.read().unwrap();
         let qt_ref = qt_guard.as_ref();
         let result = picker.fuzzy_search(&fff_query, qt_ref, search_opts);
 
@@ -288,7 +294,7 @@ impl SearchTool {
 
     /// Return relative file paths matching a fuzzy/glob query (for read recovery).
     fn find_file_path_list(
-        handle: &search_engine::EngineHandle,
+        entry: &search_engine::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,
@@ -305,11 +311,11 @@ impl SearchTool {
                 limit: max_results,
             },
         };
-        let guard = handle.picker.read().unwrap();
+        let guard = entry.picker.read().unwrap();
         let Some(picker) = guard.as_ref() else {
             anyhow::bail!("Search engine not yet initialized.")
         };
-        let qt_guard = handle.query_tracker.read().unwrap();
+        let qt_guard = entry.query_tracker.read().unwrap();
         let qt_ref = qt_guard.as_ref();
         let result = picker.fuzzy_search(&fff_query, qt_ref, search_opts);
         Ok(result
@@ -328,14 +334,14 @@ impl SearchTool {
         if !crate::search_engine::registry_initialized() {
             return Ok(vec![]);
         }
-        let handle = Self::resolve_engine(ws)
+        let entry = Self::resolve_engine(ws)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        Self::find_file_path_list(&handle, query, max_results, 0)
+        Self::find_file_path_list(&entry, query, max_results, 0)
     }
 
     fn search_greps(
-        handle: &search_engine::EngineHandle,
+        entry: &search_engine::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,
@@ -376,7 +382,7 @@ impl SearchTool {
             abort_signal: None,
         };
 
-        let guard = handle.picker.read().unwrap();
+        let guard = entry.picker.read().unwrap();
         let Some(picker) = guard.as_ref() else {
             anyhow::bail!("Search engine not yet initialized.")
         };
@@ -605,14 +611,14 @@ impl Tool for SearchTool {
 
         let offset = super::get_usize(&args, "offset", 0);
 
-        let handle = Self::resolve_engine(ws)
+        let entry = Self::resolve_engine(ws)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
         let mut output = match mode.as_str() {
-            "files" => Self::search_files(&handle, &query, max_results, offset, &query_constraints),
+            "files" => Self::search_files(&entry, &query, max_results, offset, &query_constraints),
             "grep" => Self::search_greps(
-                &handle,
+                &entry,
                 &query,
                 max_results,
                 offset,
