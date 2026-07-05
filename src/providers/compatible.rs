@@ -1143,8 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn default_tool_stream_omits_field() {
-        let provider = make_provider("generic", "https://api.example.com/v1", None);
+    fn test_tool_stream_behavior() {
         let tool_spec = ToolSpec {
             name: "shell".to_string(),
             description: "Run a shell command".to_string(),
@@ -1155,57 +1154,41 @@ mod tests {
                 },
             }),
         };
-        let chat_request = ChatRequest {
-            model: "test-model".to_string(),
-            temperature: 0.7,
-            ..test_request(vec![ChatMessage::user("hello")], Some(vec![tool_spec]))
-        };
 
-        let builder = provider.build_http_request(&chat_request);
-        let http_request = builder.build().unwrap();
-        let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
-        let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
+        for tool_stream_enabled in [false, true] {
+            let provider = make_provider("generic", "https://api.example.com/v1", None)
+                .with_tool_stream(tool_stream_enabled);
+            let chat_request = ChatRequest {
+                model: "test-model".to_string(),
+                temperature: 0.7,
+                ..test_request(
+                    vec![ChatMessage::user("hello")],
+                    Some(vec![tool_spec.clone()]),
+                )
+            };
 
-        assert!(
-            body.get("tool_stream").is_none(),
-            "tool_stream should be absent when default false"
-        );
-        assert!(
-            body.get("tools").is_some(),
-            "tools should be present in request"
-        );
-    }
+            let builder = provider.build_http_request(&chat_request);
+            let http_request = builder.build().unwrap();
+            let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
 
-    #[test]
-    fn tool_stream_enabled_by_flag() {
-        let provider =
-            make_provider("generic", "https://api.example.com/v1", None).with_tool_stream(true);
-        let tool_spec = ToolSpec {
-            name: "shell".to_string(),
-            description: "Run a shell command".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                },
-            }),
-        };
-        let chat_request = ChatRequest {
-            model: "test-model".to_string(),
-            temperature: 0.7,
-            ..test_request(vec![ChatMessage::user("hello")], Some(vec![tool_spec]))
-        };
-
-        let builder = provider.build_http_request(&chat_request);
-        let http_request = builder.build().unwrap();
-        let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
-        let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
-
-        assert_eq!(
-            body["tool_stream"],
-            serde_json::json!(true),
-            "tool_stream should be true when flag is enabled"
-        );
+            if tool_stream_enabled {
+                assert_eq!(
+                    body["tool_stream"],
+                    serde_json::json!(true),
+                    "tool_stream should be true when flag is enabled ({tool_stream_enabled})",
+                );
+            } else {
+                assert!(
+                    body.get("tool_stream").is_none(),
+                    "tool_stream should be absent when default false ({tool_stream_enabled})",
+                );
+            }
+            assert!(
+                body.get("tools").is_some(),
+                "tools should be present in request ({tool_stream_enabled})",
+            );
+        }
     }
 
     #[test]
