@@ -12,14 +12,14 @@
 //! causal masking) loaded via the Candle framework. The model and tokenizer are
 //! downloaded on first use and cached in `~/.mahbot/models/`.
 //!
-//! The embedder is loaded **lazily on first `embed()` call** and cached in a global
-//! [`RwLock`]; embedding is computed at **ticket creation time** (to pre-compute a
-//! vector for future archived search) and at **search-query time** (to vectorize
-//! the query for `SearchArchivedTicketsTool`). Both paths gracefully degrade: if
-//! the model files haven't been downloaded yet (or download fails), `embed()`
-//! returns `None` and the caller falls back to FTS-only search. A background retry
-//! loop downloads the model with exponential backoff, making the embedder available
-//! without requiring a restart.
+//! The embedder is loaded **lazily on first `embed_query()` / `embed_document()` call**
+//! and cached in a global [`RwLock`]; embedding is computed at **ticket creation time**
+//! (to pre-compute a vector for future archived search via `embed_document()`) and at
+//! **search-query time** (to vectorize the query for `SearchArchivedTicketsTool` via
+//! `embed_query()`). Both paths gracefully degrade: if the model files haven't been
+//! downloaded yet (or download fails), both functions return `None` and the caller
+//! falls back to FTS-only search. A background retry loop downloads the model with
+//! exponential backoff, making the embedder available without requiring a restart.
 //!
 //! ## Product decision
 //!
@@ -92,8 +92,9 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 ///
 /// | Value | Name     | Meaning                                          |
 /// |-------|----------|--------------------------------------------------|
-/// | 0     | UNINIT   | Embedder not loaded yet; first [`embed()`] call  |
-/// |       |          | triggers initialization via [`ensure_embedder()`].|
+/// | 0     | UNINIT   | Embedder not loaded yet; first [`embed_query()`] or     |
+/// |       |          | [`embed_document()`] call triggers initialization via   |
+/// |       |          | [`ensure_embedder()`].                                  |
 /// | 1     | LOADING  | Initialization in progress (sync cache load or   |
 /// |       |          | background download with retries).               |
 /// | 2     | READY    | A usable [`Embedder`] instance is available.     |
@@ -107,8 +108,8 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// | `LOADING`  | `READY`    | [`set_embedder_ready()`] after a successful load     |
 /// |            |            | (sync cache hit, cached re-load, or fresh download). |
 /// | `LOADING`  | `UNINIT`   | CONFIG not yet initialised → `models_dir()` returns  |
-/// |            |            | `None`. STATE is rolled back so the next `embed()`   |
-/// |            |            | call can retry.                                      |
+/// |            |            | `None`. STATE is rolled back so the next [`embed_query()`] |
+/// |            |            | or [`embed_document()`] call can retry.                  |
 /// | `LOADING`  | `UNINIT`   | No Tokio runtime available — no background download  |
 /// |            |            | task can be spawned. STATE is rolled back so a       |
 /// |            |            | future call running under a runtime can retry.       |
@@ -147,14 +148,14 @@ fn set_embedder_ready(emb: Embedder) {
 
 /// Try to initialize the embedder (sync load from cache or spawn background download).
 ///
-/// Called on every [`embed()`] invocation. Returns `true` if the embedder is
+/// Called on every [`embed_query()`] / [`embed_document()`] invocation. Returns `true` if the embedder is
 /// ready, `false` if it's still loading or permanently unavailable.
 fn ensure_embedder() -> bool {
     if STATE.load(Ordering::Acquire) == STATE_READY {
         return true;
     }
 
-    // Already loading (or failed) — return false, embed() will return None.
+    // Already loading (or failed) — return false, embed_query/embed_document will return None.
     // The background retry loop will eventually set state to READY.
     if STATE.load(Ordering::Acquire) != STATE_UNINIT {
         return false;
@@ -177,7 +178,7 @@ fn ensure_embedder() -> bool {
     let Some(models_dir) = models_dir() else {
         // CONFIG not initialized yet — can't locate model cache.
         // This condition IS transient: CONFIG will be initialized during
-        // bootstrap. Roll back to UNINIT so the next embed() call can retry.
+        // bootstrap. Roll back to UNINIT so the next embed_query/embed_document call can retry.
         STATE.store(STATE_UNINIT, Ordering::Release);
         return false;
     };
@@ -195,8 +196,7 @@ fn ensure_embedder() -> bool {
     }
     // Don't delete files on the sync-load path — the background retry
     // loop (spawned below) will handle load failures by deleting and
-    // re-downloading. The sync path is intentionally conservative
-    // because a transient filesystem glitch on every embed() call
+    // re-downloading. The sync path is intentionally conservative            // because a transient filesystem glitch on every embed_query/embed_document call
     // should not force a 167 MB re-download.
 
     // Spawn background download
@@ -215,31 +215,36 @@ fn ensure_embedder() -> bool {
 
 // ── Public API ───────────────────────────────────────────────────────
 
-/// Embed a single text using the global embedder singleton.
+/// Embed `text` as a query (prefixed with `"Query: "` internally).
 ///
-/// `is_query` controls whether the text is embedded as a query (prefixed with
-/// `"Query: "`) or as a document (prefixed with `"Document: "`), as required
-/// by the embedding model's training.
-///
-/// Returns `None` if:
-/// - The model hasn't been downloaded yet (first call triggers background download).
-/// - Download is in progress.
-/// - Model loading failed (corrupted file, etc.).
-/// - The embedder mutex is poisoned.
+/// Returns `None` if the embedder isn't available (graceful degradation).
 #[must_use]
-pub fn embed(text: &str, is_query: bool) -> Option<Vec<f32>> {
+pub fn embed_query(text: &str) -> Option<Vec<f32>> {
+    with_embedder(|emb| emb.embed_queries(&[text]).ok()?.into_iter().next())
+}
+
+/// Embed `text` as a document (prefixed with `"Document: "` internally).
+///
+/// Returns `None` if the embedder isn't available (graceful degradation).
+#[must_use]
+pub fn embed_document(text: &str) -> Option<Vec<f32>> {
+    with_embedder(|emb| emb.embed_documents(&[text]).ok()?.into_iter().next())
+}
+
+/// Common preamble for [`embed_query`] and [`embed_document`]: ensure the
+/// embedder is initialized, acquire the read lock, and pass a reference to
+/// the inner [`Embedder`] to the given closure.
+fn with_embedder<F>(f: F) -> Option<Vec<f32>>
+where
+    F: FnOnce(&Embedder) -> Option<Vec<f32>>,
+{
     if !ensure_embedder() {
         return None;
     }
 
     let guard = global_embedder().read().unwrap_poison();
     let emb = guard.as_ref()?;
-    let v = if is_query {
-        emb.embed_queries(&[text]).ok()?
-    } else {
-        emb.embed_documents(&[text]).ok()?
-    };
-    v.into_iter().next()
+    f(emb)
 }
 
 // ── Background download with retry ────────────────────────────────────
@@ -1082,11 +1087,11 @@ mod tests {
         let _root = init_test_config();
         reset_global_state();
 
-        // verify: without model files, embed() returns None
-        let result = embed("test", false);
+        // verify: without model files, embed_document() returns None
+        let result = embed_document("test");
         assert!(
             result.is_none(),
-            "embed() should return None when model not available"
+            "embed_document() should return None when model not available"
         );
 
         // Verify the global embedder is still empty

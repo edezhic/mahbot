@@ -105,7 +105,7 @@ impl Tool for CreateTicketTool {
 
         let store = crate::board::store();
         let embedding_bytes: Option<Vec<u8>> =
-            crate::embedder::embed(title, false).map(|v| crate::vector::vec_to_bytes(&v));
+            crate::embedder::embed_document(title).map(|v| crate::vector::vec_to_bytes(&v));
 
         let prereq_note = if prerequisites.is_empty() {
             String::new()

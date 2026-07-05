@@ -16,7 +16,7 @@ use tracing::debug;
 /// Search archived tickets only, by keyword + semantic similarity.
 ///
 /// Uses the board's FTS index (`BoardStore::search_archived_by_fts`) and local
-/// embeddings (`embedder::embed()`) with RRF merge (`vector::hybrid_merge`).
+/// embeddings (`embedder::embed_query()`) with RRF merge (`vector::hybrid_merge`).
 pub struct SearchArchivedTicketsTool;
 
 #[async_trait]
@@ -88,7 +88,7 @@ impl SearchArchivedTicketsTool {
         board: &crate::board::BoardStore,
         query: &str,
     ) -> Result<Vec<(String, f32)>> {
-        let Some(q_emb) = crate::embedder::embed(query, true) else {
+        let Some(q_emb) = crate::embedder::embed_query(query) else {
             debug!("Embedding model failed — skipping vector search");
             return Ok(Vec::new());
         };
