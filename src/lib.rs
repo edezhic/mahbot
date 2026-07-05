@@ -287,8 +287,10 @@ pub struct ChannelMessage {
 /// The `reply_markup` field carries Telegram inline_keyboard JSON. Non-Telegram
 /// channels ignore it. Inline keyboard construction happens in `main.rs`
 /// (e.g. `build_start_keyboard`) — other channels receive empty or harmless
-/// payloads. The self-update path stores `reply_target` for admin Telegram
-/// notifications during the update process.
+/// payloads. The self-update path stores `reply_target` (via
+/// `ChannelMessage::reply_target`) into `recipient` for admin Telegram
+/// notifications during the update process — see the channel's
+/// `resolve_recipient()` method which bridges the two fields.
 #[derive(Debug, Clone)]
 pub struct SendMessage {
     pub content: String,
