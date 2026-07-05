@@ -332,6 +332,11 @@ async fn transition_ticket(
         "Use transition_ticket_to_failed() to transition to Failed — \
          it enforces the failure-comment invariant"
     );
+    anyhow::ensure!(
+        target != TicketPhase::Done,
+        "Use transition_ticket_to_done() to transition to Done — \
+         it enforces the done-comment invariant"
+    );
     let result = board()
         .transition_to(&ticket.id, Some(source), target, pipeline_reservation)
         .await;
