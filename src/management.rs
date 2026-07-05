@@ -86,9 +86,9 @@ const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 /// Marker appended when diagnostics fail (includes the failed-at label after it).
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 
-/// Prefix for sanitation failure system comments — the circuit breaker's
-/// `count_fn` depends on substring matching this value, so it must not drift
-/// from comment text.
+/// Prefix for sanitation failure system comments — [`CircuitBreakerKind::Sanitation`]'s
+/// [`trip_count`](CircuitBreakerKind::trip_count) depends on substring matching
+/// this value, so it must not drift from comment text.
 const SANITATION_FAILED_PREFIX: &str = "Sanitation failed";
 
 /// Minimum acceptable verification score (0-10) for analyst verdicts.
@@ -103,52 +103,72 @@ fn board() -> &'static BoardStore {
     crate::board::store()
 }
 
-// ── Circuit breaker helper functions ──────────────────────────────────────────
+// ── Circuit breaker kind ──────────────────────────────────────────────────────
 
-/// Count only sanitation-failure system comments (role == `SYSTEM_ROLE`, content
-/// contains [`SANITATION_FAILED_PREFIX`]). Used by the sanitation circuit breaker.
-fn count_sanitation_failures(comments: &[TicketComment]) -> usize {
-    comments
-        .iter()
-        .filter(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_PREFIX))
-        .count()
+/// Identifies which circuit breaker variant to use for phase-guard checks
+/// and trip logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitBreakerKind {
+    /// General comment-count breaker: trips when total comments exceed
+    /// [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`].
+    General,
+    /// Sanitation-failure breaker: trips when consecutive sanitation failures
+    /// exceed [`SANITATION_CIRCUIT_BREAKER_THRESHOLD`].
+    Sanitation,
+    /// Diagnostics-failure breaker: trips when cumulative diagnostics failures
+    /// exceed [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`].
+    Diagnostics,
 }
 
-fn general_breaker_comment(count: usize) -> String {
-    format!(
-        "Failed after {count} comments — ticket has accumulated too many comments \
-         (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
-         Ticket failed — Manager will triage."
-    )
-}
+impl CircuitBreakerKind {
+    /// Returns the trip-count threshold for this breaker variant.
+    /// The breaker trips when `trip_count > threshold()`.
+    fn threshold(self) -> usize {
+        match self {
+            Self::General => CIRCUIT_BREAKER_COMMENT_THRESHOLD,
+            Self::Sanitation => SANITATION_CIRCUIT_BREAKER_THRESHOLD,
+            Self::Diagnostics => DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
+        }
+    }
 
-fn sanitation_breaker_comment(count: usize) -> String {
-    format!(
-        "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
-         (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
-    )
-}
+    /// Extract the relevant trip count from the ticket's comments for
+    /// this breaker variant.
+    fn trip_count(self, comments: &[TicketComment]) -> usize {
+        match self {
+            Self::General => comments.len(),
+            Self::Sanitation => comments
+                .iter()
+                .filter(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_PREFIX))
+                .count(),
+            Self::Diagnostics => comments
+                .iter()
+                .filter(|c| {
+                    c.role == DIAGNOSTICS_ROLE
+                        && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
+                        && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
+                })
+                .count(),
+        }
+    }
 
-/// Count prior diagnostics failure comments (role == `DIAGNOSTICS_ROLE`, content
-/// starts with [`DIAGNOSTICS_COMMENT_PREFIX`] and contains [`DIAGNOSTICS_FAILED_MARKER`]).
-/// Used by the diagnostics circuit breaker.
-fn count_diagnostics_failures(comments: &[TicketComment]) -> usize {
-    comments
-        .iter()
-        .filter(|c| {
-            c.role == DIAGNOSTICS_ROLE
-                && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
-                && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
-        })
-        .count()
-}
-
-/// Format the circuit-breaker trip comment for diagnostics failures.
-fn diagnostics_breaker_comment(count: usize) -> String {
-    format!(
-        "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
-         failures. Failing ticket."
-    )
+    /// Format the circuit-breaker trip comment body for this breaker variant.
+    fn comment(self, count: usize) -> String {
+        match self {
+            Self::General => format!(
+                "Failed after {count} comments — ticket has accumulated too many comments \
+                 (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
+                 Ticket failed — Manager will triage."
+            ),
+            Self::Sanitation => format!(
+                "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+                 (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
+            ),
+            Self::Diagnostics => format!(
+                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
+                 failures. Failing ticket."
+            ),
+        }
+    }
 }
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
@@ -187,19 +207,15 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// failure threshold to prevent dispatch thrashing).
 ///
 /// This is the recommended entry point for all dispatch-phase guard logic.
-/// See [`is_phase_or_general_breaker_blocked`] for the default general-breaker variant.
 ///
 /// # Parameters
 ///
 /// * `ticket` — the ticket being guarded.
 /// * `expected_phase` — the phase the ticket must still be in.
-/// * `threshold` — the count at which the circuit breaker trips (passed to
-///   [`try_trip_circuit_breaker`]; uses `>` comparison).
-/// * `count_fn` — extracts the failure count from comments (passed to
-///   [`try_trip_circuit_breaker`]).
-/// * `comment_text` — formats the system comment body given the count
-///   (passed to [`try_trip_circuit_breaker`]).
-/// * `log_label` — human-readable label used in logs to identify the caller.
+/// * `kind` — identifies which circuit breaker variant to use (determines
+///   threshold, failure-counting logic, and trip-comment format).
+/// * `log_label` — human-readable label used in logs to identify the
+///   caller (e.g., `"Engineer"`, `"Sanitation"`, `"Diagnostics"`).
 ///
 /// # Return value
 ///
@@ -219,65 +235,16 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 async fn is_phase_or_breaker_blocked(
     ticket: &Ticket,
     expected_phase: TicketPhase,
-    threshold: usize,
-    count_fn: fn(&[TicketComment]) -> usize,
-    comment_text: fn(usize) -> String,
+    kind: CircuitBreakerKind,
     log_label: &str,
 ) -> bool {
     if !is_ticket_in_phase(&ticket.id, expected_phase).await {
         return true;
     }
-    if try_trip_circuit_breaker(
-        ticket,
-        expected_phase,
-        threshold,
-        count_fn,
-        comment_text,
-        log_label,
-    )
-    .await
-    {
+    if try_trip_circuit_breaker(ticket, expected_phase, kind, log_label).await {
         return true;
     }
     false
-}
-
-/// Shared pre-flight guard that combines a phase check with the general
-/// comment-count circuit breaker.
-///
-/// Thin wrapper around [`is_phase_or_breaker_blocked`] that passes the general
-/// default parameters: [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`], standard
-/// `Vec::len` (counting all comments), and [`general_breaker_comment`].
-///
-/// Used directly by [`dispatch_engineer`] and by [`dispatch_parallel_with_guard`]
-/// (which wraps the guard + dispatch + post-check skeleton shared by
-/// [`dispatch_backlog_analysts`] and [`dispatch_verifiers`]).
-///
-/// Callers that need a domain-specific circuit breaker (sanitation, diagnostics)
-/// should use [`is_phase_or_breaker_blocked`] directly with custom parameters.
-///
-/// # Side effects
-///
-/// When the circuit breaker trips, all other
-/// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) tickets in the
-/// same workspace are moved to
-/// [`Planning`](TicketPhase::Planning). See the
-/// [`is_phase_or_breaker_blocked`] doc comment for details.
-#[must_use]
-async fn is_phase_or_general_breaker_blocked(
-    ticket: &Ticket,
-    expected_phase: TicketPhase,
-    log_label: &str,
-) -> bool {
-    is_phase_or_breaker_blocked(
-        ticket,
-        expected_phase,
-        CIRCUIT_BREAKER_COMMENT_THRESHOLD,
-        <[TicketComment]>::len,
-        general_breaker_comment,
-        log_label,
-    )
-    .await
 }
 
 /// Controls whether a ticket transition triggers an immediate notification
@@ -1143,7 +1110,7 @@ async fn poll_round() -> anyhow::Result<()> {
 
 /// Run an Engineer agent to implement the ticket.
 ///
-/// Guards with [`is_phase_or_general_breaker_blocked`] (phase check + comment-count
+/// Guards with [`is_phase_or_breaker_blocked`] (phase check + comment-count
 /// circuit breaker) before starting. Gathers feedback comments from all roles
 /// since the last engineer run and includes them in the agent prompt. After the
 /// agent finishes, performs a post-run phase check to catch race conditions,
@@ -1153,7 +1120,14 @@ async fn poll_round() -> anyhow::Result<()> {
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Engineer.as_str());
 
-    if is_phase_or_general_breaker_blocked(&ticket, TicketPhase::InDevelopment, "Engineer").await {
+    if is_phase_or_breaker_blocked(
+        &ticket,
+        TicketPhase::InDevelopment,
+        CircuitBreakerKind::General,
+        "Engineer",
+    )
+    .await
+    {
         return;
     }
 
@@ -1603,9 +1577,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     if is_phase_or_breaker_blocked(
         &ticket,
         TicketPhase::InSanitation,
-        SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-        count_sanitation_failures,
-        sanitation_breaker_comment,
+        CircuitBreakerKind::Sanitation,
         "Sanitation",
     )
     .await
@@ -1908,9 +1880,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     if is_phase_or_breaker_blocked(
         &ticket,
         TicketPhase::InDiagnostics,
-        DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
-        count_diagnostics_failures,
-        diagnostics_breaker_comment,
+        CircuitBreakerKind::Diagnostics,
         "Diagnostics",
     )
     .await
@@ -2228,7 +2198,7 @@ async fn record_verdict_comments(
 /// Shared orchestration skeleton for dispatch functions that spawn parallel
 /// agents and then process results via extraction.
 ///
-/// 1. Runs [`is_phase_or_general_breaker_blocked`] (phase check + circuit breaker)
+/// 1. Runs [`is_phase_or_breaker_blocked`] with [`CircuitBreakerKind::General`] (phase check + circuit breaker)
 /// 2. Spawns agents via [`run_parallel_agents`]
 /// 3. Runs a post-dispatch phase check (guard against race conditions)
 ///
@@ -2245,7 +2215,14 @@ async fn dispatch_parallel_with_guard(
     prompt: &str,
     extraction_prompt: &str,
 ) -> Option<Vec<ParallelVerdict>> {
-    if is_phase_or_general_breaker_blocked(ticket, expected_phase, log_label).await {
+    if is_phase_or_breaker_blocked(
+        ticket,
+        expected_phase,
+        CircuitBreakerKind::General,
+        log_label,
+    )
+    .await
+    {
         return None;
     }
     let results = run_parallel_agents(ticket, ws, role, prompt, extraction_prompt).await;
@@ -2262,7 +2239,7 @@ async fn dispatch_parallel_with_guard(
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYST_PASS_THRESHOLD`/10)
 /// - Planning (notify) when any analyst fails, with a comment listing the counts
 ///
-/// Before spawning agents, [`is_phase_or_general_breaker_blocked`] checks the phase and
+/// Before spawning agents, [`is_phase_or_breaker_blocked`] with [`CircuitBreakerKind::General`] checks the phase and
 /// trips the comment-count circuit breaker (which may transition the ticket to
 /// Failed for Manager triage). Returns `true` when the caller should abort.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
@@ -2455,39 +2432,42 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
     }
 }
 
-/// Shared circuit breaker skeleton: fetch comments, count, compare to threshold,
-/// add a system comment, then transition to
+/// Shared circuit breaker skeleton: fetch comments, count via
+/// [`CircuitBreakerKind::trip_count`], compare to [`CircuitBreakerKind::threshold`],
+/// add a system comment via [`CircuitBreakerKind::comment`], then transition to
 /// [`TicketPhase::Failed`].
 ///
-/// Both concrete breakers (diagnostics and general) delegate to this helper,
-/// supplying their counting logic, threshold, comment format, and log label via
-/// parameters and closures. This eliminates ~80% structural duplication while
-/// preserving exact behavioral semantics.
+/// All three concrete breakers (General, Sanitation, Diagnostics) delegate to this
+/// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum. This
+/// eliminates ~80% structural duplication while preserving exact behavioral semantics.
 ///
 /// The Manager is notified via [`transition_ticket_to_failed`] when the ticket
 /// transitions to [`TicketPhase::Failed`].
 ///
 /// # Self-counting prevention
 ///
-/// The `count_fn` closure must not count the breaker's own trip comment.
-/// Each domain-specific breaker naturally excludes its trip comment:
+/// Each breaker variant naturally excludes its own trip comment from counting:
 ///
-/// * **Diagnostics breaker** — filters comments by role `"diagnostics"`,
-///   but trip comments always use role `SYSTEM_ROLE` (set by this function).
-/// * **Sanitation breaker** — filters comments by content containing
-///   `"Sanitation failed"`, but trip comments use different text.
-/// * **General breaker** — counts all comments (`len`); it prevents
-///   re-dispatch by transitioning to the terminal `Failed` phase.
+/// * **General breaker** — counts all comments via `comments.len()`; it prevents
+///   re-dispatch by transitioning to the terminal `Failed` phase before the
+///   breaker could re-read the same trip comment.
+/// * **Sanitation breaker** — filters comments by role `"system"` and content
+///   containing [`SANITATION_FAILED_PREFIX`], but trip comments use different
+///   text, so they are never counted.
+/// * **Diagnostics breaker** — filters comments by role `"diagnostics"` and content
+///   starting with [`DIAGNOSTICS_COMMENT_PREFIX`] and containing [`DIAGNOSTICS_FAILED_MARKER`];
+///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
+///   are never counted.
 ///
-/// The `comment_text` closure should produce output consistent with
-/// `count_fn`'s filters to avoid accidental self-counting.
+/// See each variant's [`CircuitBreakerKind::trip_count`] implementation for
+/// the exact filtering logic.
 ///
 /// # Return value
 ///
 /// Returns `true` if the breaker tripped — the caller MUST abort dispatch.
 /// Returns `true` even on transition failure (the caller should still abort
 /// rather than dispatching an agent to a stale or unreachable ticket).
-/// Returns `false` only when the count does not exceed `threshold`.
+/// Returns `false` only when the count does not exceed the variant's threshold.
 ///
 /// This transitions the ticket to `Failed` (and drains ReadyForDevelopment
 /// siblings) when the breaker trips. The `try_trip` verb clearly communicates
@@ -2498,19 +2478,15 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// * `ticket` — the ticket being evaluated for the circuit breaker.
 /// * `source_phase` — the phase the ticket must currently be in for the transition
 ///   to succeed (passed to [`transition_ticket_to_failed`] as the `source` parameter).
-/// * `threshold` — the count at which the breaker trips (using `>` comparison).
-/// * `count_fn` — extracts the count from the fetched comment list. Responsible
-///   for its own filtering (including self-counting prevention).
-/// * `comment_text` — formats the system comment body given the count.
+/// * `kind` — identifies which circuit breaker variant to use. Determines
+///   threshold, failure-counting logic, and trip-comment format.
 /// * `log_label` — human-readable label used in log messages to identify the
-///   circuit breaker caller.
+///   circuit breaker caller (e.g., `"Engineer"`, `"Sanitation"`, `"Diagnostics"`).
 #[must_use]
 async fn try_trip_circuit_breaker(
     ticket: &Ticket,
     source_phase: TicketPhase,
-    threshold: usize,
-    count_fn: fn(&[TicketComment]) -> usize,
-    comment_text: fn(usize) -> String,
+    kind: CircuitBreakerKind,
     log_label: &str,
 ) -> bool {
     let comments = match board().get_comments(&ticket.id).await {
@@ -2525,7 +2501,8 @@ async fn try_trip_circuit_breaker(
         }
     };
 
-    let count = count_fn(&comments);
+    let count = kind.trip_count(&comments);
+    let threshold = kind.threshold();
 
     if count <= threshold {
         return false;
@@ -2542,7 +2519,7 @@ async fn try_trip_circuit_breaker(
     if transition_ticket_to_failed(
         ticket,
         source_phase,
-        &comment_text(count),
+        &kind.comment(count),
         &format!("{log_label} circuit breaker"),
     )
     .await
@@ -2566,7 +2543,7 @@ async fn try_trip_circuit_breaker(
 /// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
 ///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (via
 ///    [`bounce_back_to_development`]). The circuit
-///    breaker is checked *before* dispatch by [`is_phase_or_general_breaker_blocked`], so only
+///    breaker is checked *before* dispatch by [`is_phase_or_breaker_blocked`] with [`CircuitBreakerKind::General`], so only
 ///    the bounce-back is needed here.
 ///
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
@@ -2724,21 +2701,22 @@ mod tests {
         )
         .await;
 
-        // Add a comment to ticket A so the circuit breaker has something to count.
-        board()
-            .add_comment(&trip_id, SYSTEM_ROLE, "Some comment")
-            .await
-            .expect("add_comment to A");
+        // Add comments to ticket A so the circuit breaker has something to count
+        // (CIRCUIT_BREAKER_COMMENT_THRESHOLD + 1 = 31 comments, enough to trip).
+        for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
+            board()
+                .add_comment(&trip_id, SYSTEM_ROLE, &format!("Comment {i}"))
+                .await
+                .expect("add_comment to A");
+        }
 
-        // Fetch ticket A and trip the circuit breaker with threshold 0.
+        // Fetch ticket A and trip the circuit breaker.
         let ticket_a = expect_ticket(board(), &trip_id).await;
 
         let tripped = try_trip_circuit_breaker(
             &ticket_a,
             TicketPhase::ReadyForDevelopment,
-            0,                      // threshold = 0, so 1 comment > 0 trips
-            <[TicketComment]>::len, // count all comments
-            |count| format!("Breaker tripped at {count}"),
+            CircuitBreakerKind::General,
             "test",
         )
         .await;
@@ -2991,22 +2969,18 @@ mod tests {
 
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        // Should NOT trip (2 <= 3)
         assert!(
             !try_trip_circuit_breaker(
                 &ticket,
                 TicketPhase::InSanitation,
-                SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-                count_sanitation_failures,
-                sanitation_breaker_comment,
+                CircuitBreakerKind::Sanitation,
                 "Sanitation",
             )
             .await,
             "Should NOT trip with 2 failures (threshold: 3)"
         );
 
-        // Add a 3rd failure comment (should still not trip — runs the count_fn
-        // which counts by the "Sanitation failed" substring, using fresh comments
+        // Add a 3rd failure comment (should still not trip — reads fresh comments
         // from DB, not the stale in-memory ticket.comments).
         let _ = board()
             .add_comment(
@@ -3031,9 +3005,7 @@ mod tests {
         let tripped = try_trip_circuit_breaker(
             &ticket,
             TicketPhase::InSanitation,
-            SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-            count_sanitation_failures,
-            sanitation_breaker_comment,
+            CircuitBreakerKind::Sanitation,
             "Sanitation",
         )
         .await;
@@ -3203,7 +3175,7 @@ mod tests {
     /// - `= CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → does NOT trip
     ///
     /// When the breaker trips, also verifies the trip comment contains the
-    /// "circuit breaker" marker as produced by [`general_breaker_comment`].
+    /// "circuit breaker" marker as produced by [`CircuitBreakerKind::comment`].
     #[tokio::test]
     async fn circuit_breaker_comment_boundary() {
         struct Case {
@@ -3257,9 +3229,7 @@ mod tests {
             let tripped = try_trip_circuit_breaker(
                 &ticket,
                 TicketPhase::InReview,
-                CIRCUIT_BREAKER_COMMENT_THRESHOLD,
-                <[TicketComment]>::len,
-                general_breaker_comment,
+                CircuitBreakerKind::General,
                 "test",
             )
             .await;
@@ -3277,7 +3247,7 @@ mod tests {
             );
 
             // When the breaker trips, verify the trip comment contains the
-            // circuit breaker marker as produced by `general_breaker_comment`.
+            // circuit breaker marker as produced by `CircuitBreakerKind::comment`.
             if tripped {
                 let comments = board()
                     .get_comments(&ticket_id)

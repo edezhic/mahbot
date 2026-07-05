@@ -16,8 +16,8 @@ pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 
 /// Role string for system comments — used when posting system comments on
 /// tickets (notifications, circuit breaker trip comments, agent summaries)
-/// and when filtering comments in circuit breaker `count_fn` closures.
-/// Must stay in sync between all sites to prevent silent miscounting.
+/// and when filtering comments in circuit breaker [`CircuitBreakerKind::trip_count`]
+/// implementations. Must stay in sync between all sites to prevent silent miscounting.
 pub(crate) const SYSTEM_ROLE: &str = "system";
 
 // ── RoleInfo ──────────────────────────────────────────────────────────────
