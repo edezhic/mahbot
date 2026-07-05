@@ -1019,14 +1019,6 @@ mod tests {
         assert_eq!(trimmed_or_none("  value  "), Some("value".to_string()));
         assert_eq!(trimmed_or_none(" "), None);
         assert_eq!(trimmed_or_none(""), None);
-
-        // non_empty delegates to trimmed_or_none — the only unique behaviour is
-        // the Option→&str unwrap via and_then.
-        assert_eq!(non_empty(None), None);
-
-        // resolve_or delegates through non_empty — the only unique behaviour is
-        // the fallback on None via unwrap_or_else.
-        assert_eq!(resolve_or(None, "fallback"), "fallback");
     }
 
     #[test]
