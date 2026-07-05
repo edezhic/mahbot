@@ -43,12 +43,11 @@ crate::columns! {
     }
 }
 
-// Session list with metadata (4-column SELECT: sm.session_key, sm.created_at,
-// sm.last_activity, COUNT(s.id))
+// Session list with metadata (3-column SELECT: sm.session_key, sm.last_activity,
+// COUNT(s.id))
 crate::columns! {
     SESSION_LIST_COLUMNS [SL] {
         SESSION_KEY    => "sm.session_key",
-        CREATED_AT     => "sm.created_at",
         LAST_ACTIVITY  => "sm.last_activity",
         MESSAGE_COUNT  => "COUNT(s.id)",
     }
@@ -74,8 +73,6 @@ pub(crate) const TRANSIENT_SESSION_PREFIXES: &[&str] =
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
     pub key: String,
-    #[expect(dead_code)]
-    pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
 }
@@ -97,15 +94,9 @@ fn parse_ts_or_now(s: &str, label: &str) -> DateTime<Utc> {
     })
 }
 
-fn session_metadata_from_row(
-    key: &str,
-    created_str: &str,
-    activity_str: &str,
-    count: i64,
-) -> SessionMetadata {
+fn session_metadata_from_row(key: &str, activity_str: &str, count: i64) -> SessionMetadata {
     SessionMetadata {
         key: key.to_string(),
-        created_at: parse_ts_or_now(created_str, "created_at"),
         last_activity: parse_ts_or_now(activity_str, "last_activity"),
         message_count: usize::try_from(count).unwrap_or(0),
     }
@@ -268,7 +259,6 @@ impl SessionStore {
             |row| {
                 Ok::<_, anyhow::Error>(session_metadata_from_row(
                     &row.get::<String>(COL_SL_SESSION_KEY)?,
-                    &row.get::<String>(COL_SL_CREATED_AT)?,
                     &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
                     row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
                 ))
