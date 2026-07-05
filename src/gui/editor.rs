@@ -5969,29 +5969,18 @@ mod tests {
     // ── validate_file_content ─────────────────────────────────────
 
     #[test]
-    fn test_validate_file_content_empty() {
+    fn test_validate_file_content_accepts_valid_input() {
         assert!(validate_file_content(b"").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_content_text() {
         assert!(validate_file_content(b"hello world").is_ok());
-    }
-
-    #[test]
-    fn test_validate_file_content_unicode() {
         assert!(validate_file_content("Привет мир 👋".as_bytes()).is_ok());
     }
 
     #[test]
-    fn test_validate_file_content_too_large() {
+    fn test_validate_file_content_rejects_invalid_input() {
         let big = vec![b'a'; usize::try_from(MAX_FILE_SIZE).unwrap() + 1];
         let err = validate_file_content(&big).unwrap_err();
         assert!(err.starts_with("File too large"), "unexpected error: {err}");
-    }
 
-    #[test]
-    fn test_validate_file_content_null_bytes() {
         let bytes = b"hello\0world";
         let err = validate_file_content(bytes).unwrap_err();
         assert!(
