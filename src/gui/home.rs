@@ -573,13 +573,17 @@ impl HomeState {
     ///   only (re-enables the send button). Does **not** clear `typing`
     ///   — the typing indicator persists until an agent response arrives.
     ///
-    /// # Known limitation
+    /// Clear sending/typing state based on direction, sender, and workspace.
     ///
-    /// No workspace guard here (unlike the display filter in
-    /// [`append_message`](Self::append_message)) — an invisible agent
-    /// response from workspace B could prematurely clear typing/sending
-    /// for workspace A.  A follow-up ticket should add a workspace guard.
-    fn update_sending_state(&mut self, direction: ChatDirection, user_name: &str) {
+    /// Does nothing when `workspace` does not match
+    /// [`resolve_workspace_name()`](Self::resolve_workspace_name) — this
+    /// prevents an agent response from workspace B from clearing the
+    /// typing/sending indicators for workspace A.
+    fn update_sending_state(&mut self, direction: ChatDirection, user_name: &str, workspace: &str) {
+        if Some(workspace) != self.resolve_workspace_name().as_deref() {
+            return;
+        }
+
         if direction == ChatDirection::Agent && Some(user_name) == self.selected_user.as_deref() {
             self.typing = false;
             self.sending = false;
@@ -1187,8 +1191,8 @@ impl HomeState {
                         return Task::none();
                     }
 
-                    // 3. Clear sending/typing state based on direction and sender.
-                    self.update_sending_state(direction, &user_name);
+                    // 3. Clear sending/typing state based on direction, sender, and workspace.
+                    self.update_sending_state(direction, &user_name, &workspace);
 
                     // 4. Append the message (filtered by selected user + workspace).
                     self.append_message(
@@ -1706,7 +1710,7 @@ mod tests {
         state.sending = true;
         state.typing = true;
 
-        state.update_sending_state(ChatDirection::Agent, "alice");
+        state.update_sending_state(ChatDirection::Agent, "alice", "ws1");
 
         assert!(!state.sending, "agent response should clear sending");
         assert!(!state.typing, "agent response should clear typing");
@@ -1718,7 +1722,7 @@ mod tests {
         state.sending = true;
         state.typing = true;
 
-        state.update_sending_state(ChatDirection::User, "alice");
+        state.update_sending_state(ChatDirection::User, "alice", "ws1");
 
         assert!(!state.sending, "user echo should clear sending");
         assert!(state.typing, "user echo should NOT clear typing");
@@ -1730,7 +1734,7 @@ mod tests {
         state.sending = true;
         state.typing = true;
 
-        state.update_sending_state(ChatDirection::Agent, "bob");
+        state.update_sending_state(ChatDirection::Agent, "bob", "ws1");
 
         assert!(
             state.sending,
@@ -1739,6 +1743,24 @@ mod tests {
         assert!(
             state.typing,
             "other user's agent msg should not clear typing"
+        );
+    }
+
+    #[test]
+    fn test_update_sending_state_no_match_workspace() {
+        let mut state = make_home_state("alice", "ws1");
+        state.sending = true;
+        state.typing = true;
+
+        state.update_sending_state(ChatDirection::Agent, "alice", "ws2");
+
+        assert!(
+            state.sending,
+            "matching user but wrong workspace should not clear sending"
+        );
+        assert!(
+            state.typing,
+            "matching user but wrong workspace should not clear typing"
         );
     }
 
