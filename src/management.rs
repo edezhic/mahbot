@@ -619,7 +619,7 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 ///
 /// # Invariant: failure comment before Failed transition
 ///
-/// When `phase == TicketPhase::Failed`, the warning template loads
+/// When `target_phase == TicketPhase::Failed`, the warning template loads
 /// failure-specific details from the **latest comment** on the ticket (via
 /// [`BoardStore::get_comments`]). Every code path that transitions a ticket to
 /// `Failed` MUST write a relevant comment first — otherwise the warning will
@@ -652,7 +652,7 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 /// — it would either break context continuity or nuke user conversation history.
 ///
 /// Never panics — errors are logged and discarded.
-async fn notify_ticket(ticket: &Ticket, phase: TicketPhase) {
+async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
             ticket = %ticket.id,
@@ -667,7 +667,7 @@ async fn notify_ticket(ticket: &Ticket, phase: TicketPhase) {
         ticket.reporter,
         ticket.id,
         ticket.phase,
-        phase.as_ref()
+        target_phase.as_ref()
     );
 
     // Drain buffered non-critical transitions before rendering the
@@ -684,13 +684,13 @@ async fn notify_ticket(ticket: &Ticket, phase: TicketPhase) {
         &[
             ("{{ticket_id}}", &ticket.id),
             ("{{ticket_title}}", &ticket.title),
-            ("{{ticket_status}}", phase.as_ref()),
+            ("{{ticket_status}}", target_phase.as_ref()),
             ("{{transition_log}}", &transition_log),
             ("{{ticket_updates}}", &drained),
         ],
     );
 
-    if phase == TicketPhase::Failed {
+    if target_phase == TicketPhase::Failed {
         let failure_details = match board().get_comments(&ticket.id).await {
             Ok(comments) => comments
                 .last()
