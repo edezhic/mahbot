@@ -544,7 +544,10 @@ pub(crate) fn make_provider_tool_call(
 }
 
 impl OpenAiCompatibleProvider {
-    fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
+    fn parse_native_response(
+        message: ResponseMessage,
+        usage: Option<ProviderUsage>,
+    ) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning = Reasoning::from_optional_parts(
             message.reasoning,
@@ -565,7 +568,7 @@ impl OpenAiCompatibleProvider {
         ProviderChatResponse {
             text,
             tool_calls,
-            usage: None,
+            usage,
             reasoning,
         }
     }
@@ -672,8 +675,7 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let mut result = Self::parse_native_response(message);
-        result.usage = usage;
+        let result = Self::parse_native_response(message, usage);
 
         if !result.tool_calls.is_empty() && result.reasoning.is_none() {
             tracing::debug!(
@@ -889,7 +891,7 @@ mod tests {
             reasoning_details: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
@@ -1335,7 +1337,7 @@ mod tests {
             }]),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
         let rc = parsed
             .reasoning
             .as_ref()
@@ -1355,7 +1357,7 @@ mod tests {
             tool_calls: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
         assert!(parsed.reasoning.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
     }
