@@ -18,7 +18,7 @@ use super::widgets;
 use super::widgets::selectable_text;
 
 #[derive(Debug, Clone)]
-pub enum SessionsMessage {
+pub(crate) enum SessionsMessage {
     Refreshed(Vec<SessionMetadata>),
     RefreshError(String),
     SelectSession(String),
@@ -53,7 +53,7 @@ struct CachedSessionItem {
     timestamp_label: String,
 }
 
-pub struct SessionsState {
+pub(crate) struct SessionsState {
     sessions: Vec<SessionMetadata>,
     pub(crate) load_state: super::common::AsyncLoadState,
     selected_session: Option<String>,
@@ -105,7 +105,7 @@ impl SessionsState {
         }
     }
 
-    pub fn subscription(&self) -> iced::Subscription<SessionsMessage> {
+    pub(crate) fn subscription(&self) -> iced::Subscription<SessionsMessage> {
         // Emit a 1-second timer for auto-refresh when the page is active and
         // a session is selected.
         if self.page_active && self.selected_session.is_some() {
@@ -126,7 +126,8 @@ impl SessionsState {
         self.page_active = active;
     }
 
-    pub fn refresh(&self) -> Task<SessionsMessage> {
+    #[allow(clippy::unused_self)]
+    pub(crate) fn refresh(&self) -> Task<SessionsMessage> {
         Task::perform(
             async {
                 let store = crate::session::store();
@@ -141,7 +142,7 @@ impl SessionsState {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
+    pub(crate) fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
         match msg {
             SessionsMessage::AnimTick(instant) => {
                 self.selected_anim.tick(instant);
@@ -871,7 +872,7 @@ impl SessionsState {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn view(&self) -> Element<'_, SessionsMessage> {
+    pub(crate) fn view(&self) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 
         if let Some(err) = self.load_state.error() {

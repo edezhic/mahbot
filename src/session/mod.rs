@@ -72,8 +72,9 @@ pub(crate) const TRANSIENT_SESSION_PREFIXES: &[&str] =
     &["ticket_", "ask_", "maintainer_", "discovery_"];
 
 #[derive(Debug, Clone)]
-pub struct SessionMetadata {
+pub(crate) struct SessionMetadata {
     pub key: String,
+    #[expect(dead_code)]
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
@@ -362,7 +363,7 @@ pub fn direct_session_key(channel: &str, user_name: &str, role: &str, ws_name: &
 ///   for disambiguation, producing keys like
 ///   `ticket_{ticket_id}_{role}_0_nano`.
 #[must_use]
-pub fn ticket_session_key(ticket_id: &str, role: &str) -> String {
+pub(crate) fn ticket_session_key(ticket_id: &str, role: &str) -> String {
     format!("ticket_{ticket_id}_{role}")
 }
 
@@ -380,7 +381,7 @@ pub fn manager_session_key(ws_name: &str) -> String {
 /// Each run gets a fresh key (via random suffix) — maintainer runs should not
 /// accumulate conversation history across maintenance cycles.
 #[must_use]
-pub fn maintainer_session_key(ws_name: &str) -> String {
+pub(crate) fn maintainer_session_key(ws_name: &str) -> String {
     format!("maintainer_{}_{}", ws_name, crate::generate_suffix())
 }
 
@@ -388,7 +389,7 @@ pub fn maintainer_session_key(ws_name: &str) -> String {
 ///
 /// Format: `ask_{ws_name}_{role}_{suffix}`
 #[must_use]
-pub fn ask_session_key(ws_name: &str, role: &str) -> String {
+pub(crate) fn ask_session_key(ws_name: &str, role: &str) -> String {
     format!("ask_{}_{}_{}", ws_name, role, crate::generate_suffix())
 }
 
@@ -396,7 +397,7 @@ pub fn ask_session_key(ws_name: &str, role: &str) -> String {
 ///
 /// Format: `discovery_{ws_name}_{role}_{suffix}`
 #[must_use]
-pub fn discovery_session_key(ws_name: &str, role: &str) -> String {
+pub(crate) fn discovery_session_key(ws_name: &str, role: &str) -> String {
     format!(
         "discovery_{}_{}_{}",
         ws_name,

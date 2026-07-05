@@ -168,6 +168,7 @@ impl Toast {
 }
 
 #[derive(Debug, Clone)]
+#[allow(private_interfaces)]
 pub enum Message {
     /// MahBot finished async startup (or failed). On success, [`BOOT_LOG_STORE`] is set.
     Boot(Result<(), String>),
