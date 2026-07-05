@@ -970,7 +970,7 @@ impl BoardStore {
     /// # Example
     ///
     /// ```ignore
-    /// let prep = Self::update_tickets_with_updated_at(
+    /// let prep = Self::build_ticket_update_with_updated_at(
     ///     "assigned_to = ?",
     ///     vec![Value::from("user-123")],
     ///     "set assigned_to",
@@ -979,7 +979,7 @@ impl BoardStore {
     /// // SQL:  "UPDATE tickets SET assigned_to = ?, updated_at = ? WHERE id = ?"
     /// // params: [user-123, now, ticket-456]
     /// ```
-    fn update_tickets_with_updated_at(
+    fn build_ticket_update_with_updated_at(
         set_clause: &str,
         set_params: Vec<turso::Value>,
         action: String,
@@ -1001,7 +1001,7 @@ impl BoardStore {
     /// transition. Shared by [`transition_to`](Self::transition_to) and
     /// [`transition_to_tx`](Self::transition_to_tx).
     ///
-    /// Note: this does **not** use [`Self::update_tickets_with_updated_at`]
+    /// Note: this does **not** use [`Self::build_ticket_update_with_updated_at`]
     /// because it has extra SET columns (`assigned_to = NULL`,
     /// `pipeline_reservation = COALESCE(?5, pipeline_reservation)`) and an
     /// additional WHERE condition (`AND (?4 IS NULL OR status = ?4)`) that
@@ -1158,7 +1158,7 @@ impl BoardStore {
         } else {
             "clear assigned_to"
         };
-        Self::update_tickets_with_updated_at(
+        Self::build_ticket_update_with_updated_at(
             "assigned_to = ?",
             vec![Value::from(assigned_to)],
             action.to_string(),
@@ -1300,7 +1300,7 @@ impl BoardStore {
             "lines_removed must be non-negative: {lines_removed}"
         );
 
-        Self::update_tickets_with_updated_at(
+        Self::build_ticket_update_with_updated_at(
             "commit_hash = ?, lines_added = ?, lines_removed = ?",
             vec![
                 Value::from(hash),
@@ -1793,7 +1793,7 @@ impl BoardStore {
     /// already clears the assignee, and a single-ticket archive on an assigned
     /// ticket is intentionally allowed to resolve stale assignments.
     pub async fn set_archived(&self, ticket_id: &str) -> Result<()> {
-        let prepared = Self::update_tickets_with_updated_at(
+        let prepared = Self::build_ticket_update_with_updated_at(
             "is_archived = 1, assigned_to = NULL",
             vec![],
             "set archived".to_string(),
