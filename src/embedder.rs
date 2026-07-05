@@ -573,9 +573,12 @@ impl Layer {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // Apply RoPE
-        let q = Self::apply_rotary_emb(&q, cos, sin)?;
-        let k = Self::apply_rotary_emb(&k, cos, sin)?;
+        // Apply RoPE via rope_slow.
+        // cos/sin have shape [MAX_SEQ_LEN, head_dim/2] as produced by
+        // precompute_freqs_cis; rope_slow internally duplicates them along
+        // the last dimension to match head_dim.
+        let q = rope_slow(&q, cos, sin)?;
+        let k = rope_slow(&k, cos, sin)?;
 
         // Scaled dot-product attention (no causal mask — full bidirectional)
         #[allow(clippy::cast_precision_loss)]
@@ -590,15 +593,6 @@ impl Layer {
         // Reshape back: [batch, n_head, seq, head_dim] -> [batch, seq, n_embd]
         let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, n_embd))?;
         Ok(y)
-    }
-
-    /// Apply rotary position embeddings via [`candle_nn::rotary_emb::rope_slow`].
-    ///
-    /// `cos`/`sin` must have shape `[MAX_SEQ_LEN, head_dim/2]` as produced by
-    /// [`precompute_freqs_cis`]; `rope_slow` internally duplicates them along
-    /// the last dimension via `cat([cos, cos], -1)` to match `head_dim`.
-    fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        Ok(rope_slow(x, cos, sin)?)
     }
 }
 
@@ -888,6 +882,10 @@ impl Embedder {
 // ── RoPE ─────────────────────────────────────────────────────────────
 
 /// Precompute cosine and sine tables for rotary position embeddings.
+///
+/// Returns `(cos, sin)` each with shape `[MAX_SEQ_LEN, head_dim/2]`.
+/// These are consumed by `rope_slow` which internally duplicates them
+/// along the last dimension to match `head_dim`.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
