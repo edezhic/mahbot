@@ -653,8 +653,7 @@ impl BoardStore {
         // Validate prerequisites using the transaction's query method —
         // tx.query() uses the upstream connection through the MutexGuard
         // so it doesn't deadlock with the mutex held by TxGuard.
-        self.validate_prerequisites(&tx, prerequisites, workspace_name)
-            .await?;
+        Self::validate_prerequisites(&tx, prerequisites, workspace_name).await?;
         Ok((tx, id))
     }
 
@@ -1646,7 +1645,6 @@ impl BoardStore {
     /// A and B where B already depends on A) are allowed — they do not form
     /// a cycle.
     async fn validate_prerequisites(
-        &self,
         tx: &TxGuard<'_>,
         prerequisite_ids: &[String],
         workspace_name: &str,
@@ -1659,7 +1657,7 @@ impl BoardStore {
         // Batch query: fetch id + workspace_name for all prerequisites in one
         // round trip. Uses tx.query() — the transaction's query method operates
         // on the upstream connection through the MutexGuard, avoiding mutex
-        // deadlock with self.conn.query().
+        // deadlock with conn.query().
         let sql = format!(
             "SELECT id, workspace_name FROM tickets WHERE id IN ({})",
             turso::sql_in_placeholders(prerequisite_ids.len()),
