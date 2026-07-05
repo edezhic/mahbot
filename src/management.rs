@@ -2394,9 +2394,6 @@ fn build_analyst_summary(
 /// tickets in the same workspace to Planning so the Manager can triage the
 /// failure without new tickets auto-starting.
 ///
-/// Uses a single atomic UPDATE (with a `WHERE status = ?` guard) — there is no
-/// TOCTOU race or crash window unlike the previous loop-per-ticket approach.
-///
 /// Does not push individual buffer entries for the moved tickets; the user is
 /// already notified about the primary ticket's circuit breaker failure, so
 /// per-sibling notifications are noise.
@@ -2405,19 +2402,8 @@ fn build_analyst_summary(
 /// `ticket` must already be in the `Failed` phase before calling this function.
 /// Callers must transition the ticket to `Failed` first.
 async fn drain_ready_for_development_siblings(ticket: &Ticket) {
-    let now = crate::turso::now();
     match board()
-        .conn
-        .execute(
-            "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2 \
-             WHERE status = ?3 AND workspace_name = ?4 AND is_archived = 0",
-            crate::turso::params![
-                TicketPhase::Planning.as_ref(),
-                now,
-                TicketPhase::ReadyForDevelopment.as_ref(),
-                ticket.workspace_name.clone(),
-            ],
-        )
+        .drain_ready_for_development_to_planning(&ticket.workspace_name)
         .await
     {
         Ok(updated) if updated > 0 => {

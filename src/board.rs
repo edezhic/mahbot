@@ -1786,6 +1786,40 @@ impl BoardStore {
         self.execute_and_cancel(ticket_id, prepared).await
     }
 
+    /// Move all non-archived ReadyForDevelopment tickets in the given workspace
+    /// to Planning, clearing their assignments.
+    ///
+    /// Used by the circuit breaker to drain sibling ReadyForDevelopment tickets
+    /// when a ticket in the same workspace fails, ensuring pipeline reservation
+    /// ordering is preserved (bounced tickets get priority over fresh ones).
+    ///
+    /// Uses a single atomic UPDATE so there is no TOCTOU window between reading
+    /// current ReadyForDevelopment tickets and updating them. Per-sibling
+    /// notifications are intentionally suppressed — each sibling will discover
+    /// its new phase on the next poll cycle via the standard poll loop.
+    ///
+    /// Returns the number of tickets moved.
+    pub(crate) async fn drain_ready_for_development_to_planning(
+        &self,
+        workspace_name: &str,
+    ) -> Result<u64> {
+        let now = turso::now();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2 \
+                 WHERE status = ?3 AND workspace_name = ?4 AND is_archived = 0",
+                turso::params![
+                    TicketPhase::Planning.as_ref(),
+                    now,
+                    TicketPhase::ReadyForDevelopment.as_ref(),
+                    workspace_name,
+                ],
+            )
+            .await?;
+        Ok(updated)
+    }
+
     pub async fn archive_stale_cancelled(&self, hours: i64) -> Result<u64> {
         let cutoff = (Utc::now() - Duration::hours(hours)).to_rfc3339();
         let to_archive = self
