@@ -756,6 +756,19 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let ticket_for_failure = Arc::clone(&ticket);
 
     tokio::spawn(async move {
+        // ── Centralized phase/breaker guard ──
+        //
+        // Every dispatch path goes through spawn_dispatch, so a single guard
+        // here enforces completeness: adding a new PollPhase variant requires
+        // deciding its circuit_breaker_kind().
+        //
+        // The post-agent is_ticket_in_phase check in each dispatch function is
+        // a separate concern (race-condition guard) and is preserved there.
+        let (kind, log_label) = phase.circuit_breaker_kind();
+        if is_phase_or_breaker_blocked(&ticket, active_phase, kind, log_label).await {
+            return;
+        }
+
         // Correctness: AssertUnwindSafe is sound because:
         //   - `ticket` is Arc<Ticket> (atomic refcount, panic-safe); the inner
         //     Ticket data may be inconsistent after a panic, but it is consumed
@@ -902,6 +915,20 @@ impl PollPhase {
                 require_clear_pipeline: false,
                 role_label: vi.role.as_str(),
             },
+        }
+    }
+
+    /// Returns the circuit breaker kind and log label for this phase.
+    ///
+    /// The log label matches the current convention (PascalCase for roles, "QA"
+    /// for the QA verifier) to preserve log output consistency.
+    fn circuit_breaker_kind(self) -> (CircuitBreakerKind, &'static str) {
+        match self {
+            Self::BacklogAnalysis => (CircuitBreakerKind::General, "Analyst"),
+            Self::EngineerDevelopment => (CircuitBreakerKind::General, "Engineer"),
+            Self::SanitationCheck => (CircuitBreakerKind::Sanitation, "Sanitation"),
+            Self::DiagnosticsCheck => (CircuitBreakerKind::Diagnostics, "Diagnostics"),
+            Self::VerifierCheck(vi) => (CircuitBreakerKind::General, vi.log_label),
         }
     }
 }
@@ -1110,26 +1137,13 @@ async fn poll_round() -> anyhow::Result<()> {
 
 /// Run an Engineer agent to implement the ticket.
 ///
-/// Guards with [`is_phase_or_breaker_blocked`] (phase check + comment-count
-/// circuit breaker) before starting. Gathers feedback comments from all roles
-/// since the last engineer run and includes them in the agent prompt. After the
-/// agent finishes, performs a post-run phase check to catch race conditions,
-/// then transitions:
+/// Gathers feedback comments from all roles since the last engineer run and
+/// includes them in the agent prompt. After the agent finishes, performs a
+/// post-run phase check to catch race conditions, then transitions:
 /// - InDiagnostics (buffer) on successful completion
 /// - Failed (notify) if the agent failed or returned no output
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Engineer.as_str());
-
-    if is_phase_or_breaker_blocked(
-        &ticket,
-        TicketPhase::InDevelopment,
-        CircuitBreakerKind::General,
-        "Engineer",
-    )
-    .await
-    {
-        return;
-    }
 
     let last_eng_pos = ticket
         .comments
@@ -1569,24 +1583,6 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
 
-    // Phase check + sanitation-specific circuit breaker (threshold: 3
-    // consecutive failures). Combined into a single guard for consistent
-    // pattern usage across all dispatch functions.
-    //
-    // The sanitation breaker (threshold=3) will always trip before the general
-    // comment-count breaker (threshold=30), so the general breaker is not needed
-    // here — see the compile-time invariant at line 69.
-    if is_phase_or_breaker_blocked(
-        &ticket,
-        TicketPhase::InSanitation,
-        CircuitBreakerKind::Sanitation,
-        "Sanitation",
-    )
-    .await
-    {
-        return;
-    }
-
     //
     // Unlike handle_qa_passed (which fails closed on git errors — returning early
     // to stay in QaPassed for retry), dispatch_sanitation takes a fail-open approach:
@@ -1874,21 +1870,8 @@ async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
 /// trips (see [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
 #[allow(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
-    // Check circuit breaker before claiming the ticket, consistent with all
-    // other dispatchers. This eliminates a correctness risk: if the circuit
-    // breaker trips after the claim (the previous ordering), the ticket is left
-    // with `assigned_to` set but no agent running, stranding it until the
-    // re-dispatch guard in the next poll cycle recovers it.
-    if is_phase_or_breaker_blocked(
-        &ticket,
-        TicketPhase::InDiagnostics,
-        CircuitBreakerKind::Diagnostics,
-        "Diagnostics",
-    )
-    .await
-    {
-        return;
-    }
+    // Circuit breaker check happens in spawn_dispatch before entering this
+    // function — consistent with all other dispatchers.
 
     match board().claim_diagnostics(&ticket.id).await {
         Err(e) => {
@@ -2200,33 +2183,24 @@ async fn record_verdict_comments(
 /// Shared orchestration skeleton for dispatch functions that spawn parallel
 /// agents and then process results via extraction.
 ///
-/// 1. Runs [`is_phase_or_breaker_blocked`] with [`CircuitBreakerKind::General`] (phase check + circuit breaker)
-/// 2. Spawns agents via [`run_parallel_agents`]
-/// 3. Runs a post-dispatch phase check (guard against race conditions)
+/// 1. Spawns agents via [`run_parallel_agents`]
+/// 2. Runs a post-dispatch phase check (guard against race conditions)
 ///
-/// Returns `None` if either guard failed — the caller should bail out.
+/// The pre-dispatch circuit-breaker guard is handled centrally by
+/// [`spawn_dispatch`] — this function only needs the post-check.
+///
+/// Returns `None` if the post-check failed (ticket moved externally).
 /// Returns `Some(results)` when it's safe to process the verdicts.
 ///
 /// Used by [`dispatch_backlog_analysts`] and [`dispatch_verifiers`].
-async fn dispatch_parallel_with_guard(
+async fn dispatch_parallel_agents(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     expected_phase: TicketPhase,
-    log_label: &str,
     role: Role,
     prompt: &str,
     extraction_prompt: &str,
 ) -> Option<Vec<ParallelVerdict>> {
-    if is_phase_or_breaker_blocked(
-        ticket,
-        expected_phase,
-        CircuitBreakerKind::General,
-        log_label,
-    )
-    .await
-    {
-        return None;
-    }
     let results = run_parallel_agents(ticket, ws, role, prompt, extraction_prompt).await;
     if !is_ticket_in_phase(&ticket.id, expected_phase).await {
         return None;
@@ -2241,9 +2215,7 @@ async fn dispatch_parallel_with_guard(
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYST_PASS_THRESHOLD`/10)
 /// - Planning (notify) when any analyst fails, with a comment listing the counts
 ///
-/// Before spawning agents, [`is_phase_or_breaker_blocked`] with [`CircuitBreakerKind::General`] checks the phase and
-/// trips the comment-count circuit breaker (which may transition the ticket to
-/// Failed for Manager triage). Returns `true` when the caller should abort.
+/// The circuit-breaker guard is handled centrally by [`spawn_dispatch`].
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     let prompt_key = if ticket.reporter == Role::Maintainer.as_str() {
         "analyze/maintainer_ticket.md"
@@ -2252,11 +2224,10 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     };
     let message = load_prompt(prompt_key);
     let extraction_prompt = load_prompt("extraction/analyst.md");
-    let Some(results) = dispatch_parallel_with_guard(
+    let Some(results) = dispatch_parallel_agents(
         &ticket,
         &ws,
         TicketPhase::Analysis,
-        "Analyst",
         Role::Analyst,
         &message,
         &extraction_prompt,
@@ -2545,7 +2516,7 @@ async fn try_trip_circuit_breaker(
 /// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
 ///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (via
 ///    [`bounce_back_to_development`]). The circuit
-///    breaker is checked *before* dispatch by [`is_phase_or_breaker_blocked`] with [`CircuitBreakerKind::General`], so only
+///    breaker is already checked in [`spawn_dispatch`] before agents start, so only
 ///    the bounce-back is needed here.
 ///
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
@@ -2639,11 +2610,10 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     );
 
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
-    let Some(results) = dispatch_parallel_with_guard(
+    let Some(results) = dispatch_parallel_agents(
         &ticket,
         &ws,
         vi.active_phase,
-        vi.log_label,
         vi.role,
         &prompt,
         &extraction_prompt,
