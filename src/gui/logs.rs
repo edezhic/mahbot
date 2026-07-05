@@ -175,7 +175,9 @@ impl LogsState {
         let level = match self.active_tab {
             LogsTab::AllLogs => None,
             LogsTab::Issues => Some("ERROR,WARN".to_string()),
-            LogsTab::ToolFailures => return LogQuery::default(),
+            LogsTab::ToolFailures => {
+                unreachable!("build_query is never called on the ToolFailures tab")
+            }
         };
 
         LogQuery {
@@ -331,11 +333,14 @@ impl LogsState {
                     self.refresh(log_store)
                 }
                 LogsTab::ToolFailures => {
-                    self.role_filter.clone_from(&v);
+                    self.role_filter = v;
+                    self.tool_failures_state.reset_pagination();
                     self.tool_failures_state
-                        .update(super::tool_failures::ToolFailuresMessage::RoleFilterInput(
-                            v,
-                        ))
+                        .refresh(
+                            &self.role_filter,
+                            &self.workspace_filter,
+                            &self.search_filter,
+                        )
                         .map(LogMessage::ToolFailures)
                 }
             },
@@ -346,9 +351,14 @@ impl LogsState {
                     self.refresh(log_store)
                 }
                 LogsTab::ToolFailures => {
-                    self.workspace_filter.clone_from(&v);
+                    self.workspace_filter = v;
+                    self.tool_failures_state.reset_pagination();
                     self.tool_failures_state
-                        .update(super::tool_failures::ToolFailuresMessage::WorkspaceInput(v))
+                        .refresh(
+                            &self.role_filter,
+                            &self.workspace_filter,
+                            &self.search_filter,
+                        )
                         .map(LogMessage::ToolFailures)
                 }
             },
@@ -359,30 +369,59 @@ impl LogsState {
                     self.debounce.trigger(300).map(LogMessage::DebouncedRefresh)
                 }
                 LogsTab::ToolFailures => {
-                    self.search_filter.clone_from(&v);
-                    self.tool_failures_state
-                        .update(super::tool_failures::ToolFailuresMessage::SearchInput(v))
-                        .map(LogMessage::ToolFailures)
+                    self.search_filter = v;
+                    self.tool_failures_state.reset_pagination();
+                    self.debounce.trigger(300).map(LogMessage::DebouncedRefresh)
                 }
             },
             LogMessage::DebouncedRefresh(generation) => {
-                if self.debounce.should_process(generation) {
-                    return self.refresh(log_store);
+                if !self.debounce.should_process(generation) {
+                    return Task::none();
                 }
-                Task::none()
-            }
-            LogMessage::PrevPage => {
-                if self.pagination.prev_page() {
-                    return self.refresh(log_store);
+                match self.active_tab {
+                    LogsTab::AllLogs | LogsTab::Issues => self.refresh(log_store),
+                    LogsTab::ToolFailures => self
+                        .tool_failures_state
+                        .refresh(
+                            &self.role_filter,
+                            &self.workspace_filter,
+                            &self.search_filter,
+                        )
+                        .map(LogMessage::ToolFailures),
                 }
-                Task::none()
             }
-            LogMessage::NextPage => {
-                if self.pagination.next_page() {
-                    return self.refresh(log_store);
+            LogMessage::PrevPage => match self.active_tab {
+                LogsTab::AllLogs | LogsTab::Issues => {
+                    if self.pagination.prev_page() {
+                        return self.refresh(log_store);
+                    }
+                    Task::none()
                 }
-                Task::none()
-            }
+                LogsTab::ToolFailures => self
+                    .tool_failures_state
+                    .prev_page(
+                        &self.role_filter,
+                        &self.workspace_filter,
+                        &self.search_filter,
+                    )
+                    .map(LogMessage::ToolFailures),
+            },
+            LogMessage::NextPage => match self.active_tab {
+                LogsTab::AllLogs | LogsTab::Issues => {
+                    if self.pagination.next_page() {
+                        return self.refresh(log_store);
+                    }
+                    Task::none()
+                }
+                LogsTab::ToolFailures => self
+                    .tool_failures_state
+                    .next_page(
+                        &self.role_filter,
+                        &self.workspace_filter,
+                        &self.search_filter,
+                    )
+                    .map(LogMessage::ToolFailures),
+            },
             LogMessage::TogglePause => {
                 self.paused = !self.paused;
                 if !self.paused {
@@ -402,19 +441,39 @@ impl LogsState {
             LogMessage::TabSelected(tab) => {
                 self.active_tab = tab;
                 if tab == LogsTab::ToolFailures {
-                    // Refresh the tool failures data when switching to that tab
                     self.tool_failures_state
-                        .refresh()
+                        .refresh(
+                            &self.role_filter,
+                            &self.workspace_filter,
+                            &self.search_filter,
+                        )
                         .map(LogMessage::ToolFailures)
                 } else {
-                    // Refresh logs when switching to AllLogs or Issues
                     self.refresh(log_store)
                 }
             }
-            LogMessage::ToolFailures(msg) => self
-                .tool_failures_state
-                .update(msg)
-                .map(LogMessage::ToolFailures),
+            LogMessage::ToolFailures(msg) => match msg {
+                super::tool_failures::ToolFailuresMessage::PrevPage => self
+                    .tool_failures_state
+                    .prev_page(
+                        &self.role_filter,
+                        &self.workspace_filter,
+                        &self.search_filter,
+                    )
+                    .map(LogMessage::ToolFailures),
+                super::tool_failures::ToolFailuresMessage::NextPage => self
+                    .tool_failures_state
+                    .next_page(
+                        &self.role_filter,
+                        &self.workspace_filter,
+                        &self.search_filter,
+                    )
+                    .map(LogMessage::ToolFailures),
+                _ => self
+                    .tool_failures_state
+                    .update(msg)
+                    .map(LogMessage::ToolFailures),
+            },
         }
     }
 

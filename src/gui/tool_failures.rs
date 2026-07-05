@@ -21,14 +21,6 @@ pub enum ToolFailuresMessage {
     Refreshed(Vec<ToolErrorEntry>, usize),
     /// Refresh query failed.
     RefreshError(String),
-    /// Role filter changed.
-    RoleFilterInput(String),
-    /// Workspace filter changed.
-    WorkspaceInput(String),
-    /// Search text filter changed (debounced).
-    SearchInput(String),
-    /// Debounced refresh triggered after 300ms of inactivity.
-    DebouncedRefresh(u64),
     /// Go to previous page.
     PrevPage,
     /// Go to next page.
@@ -45,17 +37,6 @@ pub struct ToolFailuresState {
 
     // Pagination
     pagination: super::common::PaginationState,
-
-    // Filters
-    /// Role name filter (empty = all roles).
-    role_filter: String,
-    /// Workspace name filter (empty = all workspaces).
-    workspace_filter: String,
-    /// Search text filter (empty = no search).
-    search_filter: String,
-
-    /// Debounce state for the search text input.
-    debounce: super::common::DebounceState,
 }
 
 impl ToolFailuresState {
@@ -64,27 +45,28 @@ impl ToolFailuresState {
             entries: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
             pagination: super::common::PaginationState::new(50),
-            role_filter: String::new(),
-            workspace_filter: String::new(),
-            search_filter: String::new(),
-            debounce: super::common::DebounceState::new(),
         }
     }
 
-    fn build_query(&self) -> ToolErrorQuery {
+    fn build_query(role_filter: &str, workspace_filter: &str, search: &str) -> ToolErrorQuery {
         ToolErrorQuery {
-            role_filter: super::common::none_if_empty(&self.role_filter),
-            workspace_filter: super::common::none_if_empty(&self.workspace_filter),
-            search: super::common::none_if_empty(&self.search_filter),
+            role_filter: super::common::none_if_empty(role_filter),
+            workspace_filter: super::common::none_if_empty(workspace_filter),
+            search: super::common::none_if_empty(search),
         }
     }
 
     /// Request a refresh from the stats store.
     ///
     /// Delegates to `AsyncLoadState::start_loading`.
-    pub fn refresh(&mut self) -> Task<ToolFailuresMessage> {
+    pub fn refresh(
+        &mut self,
+        role_filter: &str,
+        workspace_filter: &str,
+        search: &str,
+    ) -> Task<ToolFailuresMessage> {
         self.load_state.start_loading();
-        let query = self.build_query();
+        let query = Self::build_query(role_filter, workspace_filter, search);
         let page = self.pagination.page;
         let page_size = self.pagination.page_size;
         Task::perform(
@@ -117,42 +99,45 @@ impl ToolFailuresState {
                 self.load_state.set_has_loaded();
                 Task::none()
             }
-            ToolFailuresMessage::RoleFilterInput(v) => {
-                self.role_filter = v;
-                self.pagination.reset();
-                self.refresh()
-            }
-            ToolFailuresMessage::WorkspaceInput(v) => {
-                self.workspace_filter = v;
-                self.pagination.reset();
-                self.refresh()
-            }
-            ToolFailuresMessage::SearchInput(v) => {
-                self.search_filter = v;
-                self.pagination.reset();
-                self.debounce
-                    .trigger(300)
-                    .map(ToolFailuresMessage::DebouncedRefresh)
-            }
-            ToolFailuresMessage::DebouncedRefresh(generation) => {
-                if self.debounce.should_process(generation) {
-                    return self.refresh();
-                }
-                Task::none()
-            }
-            ToolFailuresMessage::PrevPage => {
-                if self.pagination.prev_page() {
-                    return self.refresh();
-                }
-                Task::none()
-            }
-            ToolFailuresMessage::NextPage => {
-                if self.pagination.next_page() {
-                    return self.refresh();
-                }
-                Task::none()
-            }
-            ToolFailuresMessage::Escape | ToolFailuresMessage::Toast(_) => Task::none(),
+            // PrevPage and NextPage are handled by LogsState which passes
+            // filter parameters directly via prev_page()/next_page() methods.
+            ToolFailuresMessage::Escape
+            | ToolFailuresMessage::Toast(_)
+            | ToolFailuresMessage::PrevPage
+            | ToolFailuresMessage::NextPage => Task::none(),
+        }
+    }
+
+    /// Reset pagination to the first page.
+    pub fn reset_pagination(&mut self) {
+        self.pagination.reset();
+    }
+
+    /// Go to the previous page and refresh with the given filter parameters.
+    pub fn prev_page(
+        &mut self,
+        role_filter: &str,
+        workspace_filter: &str,
+        search: &str,
+    ) -> Task<ToolFailuresMessage> {
+        if self.pagination.prev_page() {
+            self.refresh(role_filter, workspace_filter, search)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Go to the next page and refresh with the given filter parameters.
+    pub fn next_page(
+        &mut self,
+        role_filter: &str,
+        workspace_filter: &str,
+        search: &str,
+    ) -> Task<ToolFailuresMessage> {
+        if self.pagination.next_page() {
+            self.refresh(role_filter, workspace_filter, search)
+        } else {
+            Task::none()
         }
     }
 
