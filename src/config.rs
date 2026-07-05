@@ -838,9 +838,9 @@ fn validate_config(config: &ConfigData) -> Result<()> {
         anyhow::bail!("Provider endpoint must be a valid URL starting with https:// or http://");
     }
 
-    // Validate API key — reject the placeholder "sk-..." pattern
+    // Validate API key — reject placeholder patterns (starting with "sk-..")
     if let Some(ref key) = config.provider_key
-        && (key.trim() == "sk-..." || key.trim().starts_with("sk-.."))
+        && key.trim().starts_with("sk-..")
     {
         anyhow::bail!("Provider key is still the placeholder value — please set a real key");
     }
