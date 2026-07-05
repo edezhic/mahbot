@@ -221,20 +221,16 @@ impl ToolFailuresState {
         };
 
         row![
-            // Timestamp
             text(timestamp).size(10).color(theme::TEXT_MUTED),
             Space::new().width(8),
-            // Tool name badge
             container(text(&entry.tool_name).size(10).color(theme::TEXT_SECONDARY))
                 .padding([1, 6])
                 .style(badge_style),
             Space::new().width(4),
-            // Duration badge
             container(text(duration_label).size(10).color(theme::TEXT_MUTED))
                 .padding([1, 6])
                 .style(badge_style),
             Space::new().width(4),
-            // Role badge
             container(text(&entry.role).size(10).color(fg))
                 .padding([1, 6])
                 .style(move |_t: &iced::Theme| container::Style {
@@ -246,7 +242,6 @@ impl ToolFailuresState {
                     ..container::Style::default()
                 }),
             Space::new().width(Length::Fill),
-            // Workspace (if present)
             if !entry.workspace.is_empty() {
                 text(&entry.workspace).size(10).color(theme::TEXT_MUTED)
             } else {

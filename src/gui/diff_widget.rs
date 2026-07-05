@@ -681,12 +681,10 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
             let start = text.len();
             let line_start = start;
 
-            // Prefix
             text.push(line.kind.prefix());
             text.push(' ');
             let content_start = text.len();
 
-            // Content
             text.push_str(&line.content);
             text.push('\n');
             let end = text.len();
