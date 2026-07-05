@@ -1695,10 +1695,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         ))
         .await
         {
-            warn!(
-                ticket = %ticket.id,
-                "Sanitation passed but transition to SanitationPassed failed — ticket stranded in InSanitation",
-            );
             return;
         }
 
@@ -1744,10 +1740,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         )
         .await
         {
-            warn!(
-                ticket = %ticket.id,
-                "Sanitation failed but transition to ReadyForDevelopment failed — ticket stranded in InSanitation",
-            );
             return;
         }
 
