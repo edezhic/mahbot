@@ -603,7 +603,7 @@ impl DecodedNativeHistoryMessage {
                 tool_calls,
                 reasoning,
             } => NativeMessageParts {
-                role: "assistant".to_string(),
+                role: ChatRole::Assistant.to_string(),
                 content,
                 tool_call_id: None,
                 tool_calls,
@@ -613,7 +613,7 @@ impl DecodedNativeHistoryMessage {
                 tool_call_id,
                 content,
             } => NativeMessageParts {
-                role: "tool".to_string(),
+                role: ChatRole::Tool.to_string(),
                 content: Some(content),
                 tool_call_id,
                 tool_calls: None,
