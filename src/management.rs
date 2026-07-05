@@ -2332,48 +2332,52 @@ fn build_analyst_summary(
 /// tickets in the same workspace to Planning so the Manager can triage the
 /// failure without new tickets auto-starting.
 ///
+/// Uses a single atomic UPDATE (with a `WHERE status = ?` guard) — there is no
+/// TOCTOU race or crash window unlike the previous loop-per-ticket approach.
+///
+/// Does not push individual buffer entries for the moved tickets; the user is
+/// already notified about the primary ticket's circuit breaker failure, so
+/// per-sibling notifications are noise.
+///
 /// # Precondition
 /// `ticket` must already be in the `Failed` phase before calling this function.
 /// Callers must transition the ticket to `Failed` first.
 async fn drain_ready_for_development_siblings(ticket: &Ticket) {
-    let other_tickets = match board()
-        .list_tickets_in_phase(TicketPhase::ReadyForDevelopment, &ticket.workspace_name)
+    let now = crate::turso::now();
+    match board()
+        .conn
+        .execute(
+            "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2 \
+             WHERE status = ?3 AND workspace_name = ?4 AND is_archived = 0",
+            crate::turso::params![
+                TicketPhase::Planning.as_ref(),
+                now,
+                TicketPhase::ReadyForDevelopment.as_ref(),
+                ticket.workspace_name.clone(),
+            ],
+        )
         .await
     {
-        Ok(tickets) => tickets,
+        Ok(updated) if updated > 0 => {
+            info!(
+                tickets = updated,
+                workspace = %ticket.workspace_name,
+                "Moved {updated} ReadyForDevelopment ticket(s) to Planning after circuit breaker trip",
+            );
+        }
+        Ok(_) => {
+            debug!(
+                workspace = %ticket.workspace_name,
+                "No ReadyForDevelopment siblings to drain after circuit breaker trip",
+            );
+        }
         Err(e) => {
             warn!(
                 ticket = %ticket.id,
                 workspace = %ticket.workspace_name,
                 error = %e,
-                "Failed to list ReadyForDevelopment tickets for moving to planning \
+                "Failed to move ReadyForDevelopment tickets to Planning \
                  — breaker trip proceeds without moving siblings",
-            );
-            return;
-        }
-    };
-
-    // There is a small race window: between listing ReadyForDevelopment
-    // tickets here and transitioning them individually, a concurrent poll
-    // cycle could claim one. This is rare in practice (dispatch tasks spawn
-    // after the claim loop completes) and the CAS guard in transition_to
-    // handles the transition gracefully.
-    for other in &other_tickets {
-        // If the transition fails (e.g., ticket was already claimed or moved
-        // externally), skip it and continue with the remaining tickets.
-        if let Err(e) = transition_ticket(
-            other,
-            TicketPhase::ReadyForDevelopment,
-            TicketPhase::Planning,
-            NotifyPolicy::Buffer,
-            None,
-        )
-        .await
-        {
-            debug!(
-                other_ticket = %other.id,
-                error = %e,
-                "Failed to move other ReadyForDevelopment ticket to planning — likely raced by external move",
             );
         }
     }
