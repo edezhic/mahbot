@@ -18,7 +18,7 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::git_commands::run_git_raw;
+use crate::git_commands::run_git_output;
 use crate::turso::{self, TxGuard};
 use anyhow::Result;
 use serde::Serialize;
@@ -410,7 +410,7 @@ async fn init_personal_workspace_dir(name: &str) {
         );
     }
     // Try git init; non-fatal on failure.
-    match run_git_raw(&path, &["init", "-q"]).await {
+    match run_git_output(&path, &["init", "-q"]).await {
         Ok(o) if o.status.success() => {}
         Ok(_) => warn!(
             path = %path.display(),

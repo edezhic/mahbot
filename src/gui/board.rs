@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use crate::Role;
 use crate::board::{Ticket, TicketPhase};
-use crate::git_commands::{parse_numstat_lines, run_git_raw};
+use crate::git_commands::{parse_numstat_lines, run_git_output};
 
 use iced::widget::{
     Column, Row, Space, button, column, container, markdown, row, scrollable, text, tooltip,
@@ -506,7 +506,7 @@ impl BoardState {
     ) -> Result<CommitStats, anyhow::Error> {
         // Detect merge commits: `git rev-list --parents -n 1 <hash>` outputs
         // `<hash> <parent>` for non-merge, or `<hash> <parent1> <parent2> ...` for merges.
-        let is_merge = match run_git_raw(
+        let is_merge = match run_git_output(
             Path::new(ws_path),
             &["rev-list", "--parents", "-n", "1", commit_hash],
         )
@@ -526,7 +526,7 @@ impl BoardState {
         }
         args.push(commit_hash);
 
-        let output = run_git_raw(Path::new(ws_path), &args)
+        let output = run_git_output(Path::new(ws_path), &args)
             .await
             .map_err(|e| anyhow::anyhow!("git show failed: {e}"))?;
 

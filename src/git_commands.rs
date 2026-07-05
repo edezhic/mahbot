@@ -112,7 +112,7 @@ fn git_command() -> tokio::process::Command {
 /// inherited. This is consistent with the shell tool's behavior — use
 /// SSH config (`~/.ssh/config`) for SSH-based git remotes rather than
 /// environment variables.
-pub(crate) async fn run_git_raw(
+pub(crate) async fn run_git_output(
     repo_path: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
@@ -127,7 +127,7 @@ pub(crate) async fn run_git_raw(
 ///
 /// Returns an error if git exits with a non-zero status.
 pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = run_git_raw(repo_path, args).await?;
+    let output = run_git_output(repo_path, args).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -139,14 +139,14 @@ pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, 
 
 /// Run a git command with data piped to stdin.
 ///
-/// Like [`run_git_raw`], but pipes the given lines to the subprocess's stdin
+/// Like [`run_git_output`], but pipes the given lines to the subprocess's stdin
 /// before collecting output. Returns the raw [`std::process::Output`] so
 /// callers can interpret exit codes as appropriate for their use case.
 ///
 /// The `name` parameter is used to identify the subcommand in error messages
 /// (e.g., `"check-ignore"`).
 ///
-/// **Environment sanitization**: Same as [`run_git_raw`] — the subprocess
+/// **Environment sanitization**: Same as [`run_git_output`] — the subprocess
 /// environment is cleared and re-populated with only a safe set of variables.
 pub(crate) async fn run_git_with_stdin(
     repo_path: &Path,
@@ -373,7 +373,7 @@ pub async fn git_is_installed() -> bool {
 
 /// Check if a git repo has any commits.
 pub async fn git_has_commits(repo_path: &Path) -> Result<bool, String> {
-    let output = run_git_raw(repo_path, &["rev-list", "-n", "1", "HEAD"]).await?;
+    let output = run_git_output(repo_path, &["rev-list", "-n", "1", "HEAD"]).await?;
 
     // If the command fails, there are no commits or something is wrong
     if !output.status.success() {
