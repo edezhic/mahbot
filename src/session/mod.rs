@@ -6,7 +6,7 @@ pub use manager::Session;
 pub mod summarization;
 
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
-use crate::{ChatMessage, ChatRole, Reasoning, ToolCall as ProviderToolCall};
+use crate::{ChatMessage, ChatRole, Reasoning, ToolCall};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 
@@ -576,7 +576,7 @@ fn parse_ts_or_now_invalid_fallback() {
 pub(crate) enum DecodedNativeHistoryMessage {
     Assistant {
         content: Option<String>,
-        tool_calls: Option<Vec<ProviderToolCall>>,
+        tool_calls: Option<Vec<ToolCall>>,
         reasoning: Option<Reasoning>,
     },
     ToolResult {
@@ -587,14 +587,14 @@ pub(crate) enum DecodedNativeHistoryMessage {
 
 /// Shared fields extracted from a [`DecodedNativeHistoryMessage`] that providers
 /// use to build their local native message types.
-/// Tool calls are returned as `Vec<ProviderToolCall>` so each provider can convert them
+/// Tool calls are returned as `Vec<ToolCall>` so each provider can convert them
 /// to its own tool-call type.
 #[derive(Debug)]
 pub(crate) struct NativeMessageParts {
     pub role: String,
     pub content: Option<String>,
     pub tool_call_id: Option<String>,
-    pub tool_calls: Option<Vec<ProviderToolCall>>,
+    pub tool_calls: Option<Vec<ToolCall>>,
     pub reasoning: Option<Reasoning>,
 }
 
@@ -648,7 +648,7 @@ pub(crate) fn decode_native_history_message(
 
         if let Some(tool_calls_value) = value.get("tool_calls")
             && let Ok(mut parsed_calls) =
-                serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
+                serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
         {
             for call in &mut parsed_calls {
                 if let Some(s) = call.arguments.as_str()
