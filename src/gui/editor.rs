@@ -3080,11 +3080,8 @@ impl EditorState {
     /// Toggle directory expansion in the file tree — collapses if already expanded,
     /// otherwise loads and expands.
     fn toggle_dir(&mut self, dir_path: &str) -> Task<EditorMessage> {
-        // Cancel inline rename (clicking a tree row while renaming
-        // means the user is dismissing the rename).
-        if matches!(self.active_modal, Some(ModalKind::Rename(_))) {
-            self.active_modal = None;
-        }
+        // Clicking a tree row while renaming means the user is dismissing the rename.
+        self.dismiss_rename();
         // Clear any previously-selected file highlight — navigating
         // to a directory should visually show the directory as focused,
         // not the previously-selected file.
@@ -3116,11 +3113,8 @@ impl EditorState {
         // Clicking a file tree row transfers keyboard focus to the tree
         // so that arrow keys navigate the tree instead of the editor.
         self.file_tree.tree_focused = true;
-        // Cancel inline rename (clicking a tree row while renaming
-        // means the user is dismissing the rename).
-        if matches!(self.active_modal, Some(ModalKind::Rename(_))) {
-            self.active_modal = None;
-        }
+        // Clicking a tree row while renaming means the user is dismissing the rename.
+        self.dismiss_rename();
         self.pending_enter_dir = None;
         // Remember the clicked file's position for Ctrl+B re-focus.
         self.file_tree.focus_path(path);
@@ -3154,9 +3148,7 @@ impl EditorState {
         // tree to the editor, matching Escape handler behavior.
         self.file_tree.tree_focused = false;
         self.pending_enter_dir = None;
-        if matches!(self.active_modal, Some(ModalKind::Rename(_))) {
-            self.active_modal = None;
-        }
+        self.dismiss_rename();
 
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
@@ -3661,6 +3653,14 @@ impl EditorState {
             },
             |msg| msg,
         )
+    }
+
+    /// Cancel inline rename — clicking any other UI element while a rename
+    /// input is active dismisses the rename.
+    fn dismiss_rename(&mut self) {
+        if matches!(self.active_modal, Some(ModalKind::Rename(_))) {
+            self.active_modal = None;
+        }
     }
 
     /// Handle rename-cancel — dismisses the inline rename modal.
