@@ -260,6 +260,7 @@ impl Provider for ReliableProvider {
 mod tests {
     use super::*;
     use crate::ChatMessage;
+    use crate::providers::test_request;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -401,17 +402,7 @@ mod tests {
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
         let result = provider
-            .chat(ChatRequest {
-                messages: messages.clone(),
-                tools: None,
-                model: "test".to_string(),
-                allow_image_parts: false,
-                temperature: 0.1,
-                reasoning_effort: None,
-                max_tokens: None,
-                provider_order: None,
-                provider_allow_fallbacks: None,
-            })
+            .chat(test_request(messages.clone(), None))
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("history ok"));
@@ -561,17 +552,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let request = ChatRequest {
-            messages: messages.clone(),
-            tools: None,
-            model: "test".to_string(),
-            allow_image_parts: false,
-            temperature: 0.1,
-            reasoning_effort: None,
-            max_tokens: None,
-            provider_order: None,
-            provider_allow_fallbacks: None,
-        };
+        let request = test_request(messages.clone(), None);
         let err = provider
             .chat(request)
             .await
@@ -641,19 +622,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("test")];
-        let result = provider
-            .chat(ChatRequest {
-                messages: messages.clone(),
-                tools: None,
-                model: "test".to_string(),
-                allow_image_parts: false,
-                temperature: 0.1,
-                reasoning_effort: None,
-                max_tokens: None,
-                provider_order: None,
-                provider_allow_fallbacks: None,
-            })
-            .await;
+        let result = provider.chat(test_request(messages.clone(), None)).await;
         assert!(
             result.is_err(),
             "context window errors are non-retryable, should fail immediately"
@@ -709,19 +678,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("test")];
-        let result = provider
-            .chat(ChatRequest {
-                messages: messages.clone(),
-                tools: None,
-                model: "test".to_string(),
-                allow_image_parts: false,
-                temperature: 0.1,
-                reasoning_effort: None,
-                max_tokens: None,
-                provider_order: None,
-                provider_allow_fallbacks: None,
-            })
-            .await;
+        let result = provider.chat(test_request(messages.clone(), None)).await;
         assert!(
             result.is_err(),
             "tool schema errors are non-retryable, should fail immediately"

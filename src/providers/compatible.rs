@@ -701,6 +701,7 @@ impl Provider for OpenAiCompatibleProvider {
 mod tests {
     use super::*;
     use crate::ChatRequest;
+    use crate::providers::test_request;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key)
@@ -710,17 +711,7 @@ mod tests {
     async fn chat_without_key_attempts_request() {
         let p = make_provider("Local", "http://127.0.0.1:1", None);
         let result = p
-            .chat(ChatRequest {
-                messages: vec![ChatMessage::user("hello")],
-                tools: None,
-                model: "test".to_string(),
-                allow_image_parts: false,
-                temperature: 0.1,
-                reasoning_effort: None,
-                max_tokens: None,
-                provider_order: None,
-                provider_allow_fallbacks: None,
-            })
+            .chat(test_request(vec![ChatMessage::user("hello")], None))
             .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -1152,25 +1143,20 @@ mod tests {
     #[test]
     fn default_tool_stream_omits_field() {
         let provider = make_provider("generic", "https://api.example.com/v1", None);
+        let tool_spec = ToolSpec {
+            name: "shell".to_string(),
+            description: "Run a shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                },
+            }),
+        };
         let chat_request = ChatRequest {
-            messages: vec![ChatMessage::user("hello")],
-            tools: Some(vec![ToolSpec {
-                name: "shell".to_string(),
-                description: "Run a shell command".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                    },
-                }),
-            }]),
             model: "test-model".to_string(),
-            allow_image_parts: false,
             temperature: 0.7,
-            max_tokens: None,
-            reasoning_effort: None,
-            provider_order: None,
-            provider_allow_fallbacks: None,
+            ..test_request(vec![ChatMessage::user("hello")], Some(vec![tool_spec]))
         };
 
         let builder = provider.build_http_request(&chat_request);
@@ -1192,25 +1178,20 @@ mod tests {
     fn tool_stream_enabled_by_flag() {
         let provider =
             make_provider("generic", "https://api.example.com/v1", None).with_tool_stream(true);
+        let tool_spec = ToolSpec {
+            name: "shell".to_string(),
+            description: "Run a shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                },
+            }),
+        };
         let chat_request = ChatRequest {
-            messages: vec![ChatMessage::user("hello")],
-            tools: Some(vec![ToolSpec {
-                name: "shell".to_string(),
-                description: "Run a shell command".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                    },
-                }),
-            }]),
             model: "test-model".to_string(),
-            allow_image_parts: false,
             temperature: 0.7,
-            max_tokens: None,
-            reasoning_effort: None,
-            provider_order: None,
-            provider_allow_fallbacks: None,
+            ..test_request(vec![ChatMessage::user("hello")], Some(vec![tool_spec]))
         };
 
         let builder = provider.build_http_request(&chat_request);
