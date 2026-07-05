@@ -137,20 +137,19 @@ impl DiffParser {
         }
     }
 
-    /// Handle a `rename from` line: set rename status and parse the old path.
-    /// Falls back to `Modified` status when the rename path is malformed.
+    /// Handle a `rename from` line: parse the old path and, if successful, set the
+    /// file status to `Renamed`. The status remains `Modified` (the default) when
+    /// the rename line is malformed.
     fn handle_rename_from(&mut self, line: &str) {
         let Some(f) = self.current_file.as_mut() else {
             return;
         };
 
-        f.status = DiffFileStatus::Renamed;
         let Some(raw) = line.strip_prefix("rename from ") else {
             warn!(
                 line = %line,
                 "rename from: unexpected format, dropping rename info"
             );
-            f.status = DiffFileStatus::Modified;
             return;
         };
         let Some(old_path) = unquote_c_style(raw) else {
@@ -158,9 +157,9 @@ impl DiffParser {
                 line = %line,
                 "rename from: malformed C-style escape, dropping rename info"
             );
-            f.status = DiffFileStatus::Modified;
             return;
         };
+        f.status = DiffFileStatus::Renamed;
         f.old_path = Some(old_path);
     }
 
@@ -657,6 +656,22 @@ rename to new name.rs
                 "case {i} ({name}): path mismatch"
             );
         }
+    }
+
+    #[test]
+    fn test_rename_from_malformed_c_style_escape() {
+        // Malformed C-style escape (\x is unrecognized) causes unquote_c_style to
+        // return None, so the file should retain the default Modified status.
+        let diff = r#"diff --git "a/old.rs" "b/new.rs"
+similarity index 100%
+rename from "old\xname.rs"
+rename to "new.rs"
+"#;
+        let output = parse_git_diff(diff);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].status, DiffFileStatus::Modified);
+        assert_eq!(output[0].old_path, None);
+        assert_eq!(output[0].path, "new.rs");
     }
 
     #[test]
