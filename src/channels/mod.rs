@@ -131,16 +131,11 @@ pub async fn write_incoming_to_broadcast(msg: &ChannelMessage) {
 
 /// Send a reply through a channel.
 pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_role: Option<String>) {
-    let Some(channel) = crate::channel_registry().get(&msg.source_channel) else {
-        tracing::warn!(
-            source_channel = %msg.source_channel,
-            "Channel not found in registry — cannot send reply"
-        );
-        return;
-    };
     let reply_markup = None;
 
     // ── Broadcast agent response for live GUI display and chat_history ──
+    // Must happen before the channel registry check -- broadcast_and_persist
+    // does not depend on the channel object, only on fields from `msg`.
     broadcast_and_persist_agent_response(
         &msg.user_name,
         &msg.source_channel,
@@ -150,6 +145,14 @@ pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_rol
         reply_markup.clone(),
     )
     .await;
+
+    let Some(channel) = crate::channel_registry().get(&msg.source_channel) else {
+        tracing::warn!(
+            source_channel = %msg.source_channel,
+            "Channel not found in registry -- reply not delivered via transport (already broadcast & persisted)"
+        );
+        return;
+    };
 
     let reply = SendMessage {
         content,
