@@ -426,8 +426,8 @@ impl TicketPhase {
     /// accidentally diverge from the definition used in coverage tests.
     #[cfg(test)]
     #[must_use]
-    fn is_transitory_handoff(&self) -> bool {
-        TRANSITORY_HANDOFF_PHASES.contains(self)
+    fn is_transitory_handoff(self) -> bool {
+        TRANSITORY_HANDOFF_PHASES.contains(&self)
     }
 
     /// Returns `true` for phases that unblock dependent tickets.
