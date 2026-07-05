@@ -267,6 +267,12 @@ enum NotifyPolicy {
 /// Parameters follow the `(source, target)` convention shared with
 /// [`transition_ticket`], [`transition_ticket_to_done`], and others.
 ///
+/// `failure_comment` is meaningful only when `target == TicketPhase::Failed` and
+/// `notify == NotifyPolicy::Notify` — it carries the failure detail text that
+/// was already written to the DB atomically with the transition, avoiding a
+/// redundant DB round-trip in [`notify_ticket`]. Callers transitioning to
+/// non-Failed phases should pass `None`.
+///
 /// The `log_label` string is forwarded to [`resolve_ticket_workspace`] to
 /// distinguish callers in log messages.
 async fn dispatch_notification(
@@ -275,9 +281,10 @@ async fn dispatch_notification(
     target: TicketPhase,
     notify: NotifyPolicy,
     log_label: &str,
+    failure_comment: Option<&str>,
 ) {
     match notify {
-        NotifyPolicy::Notify => notify_ticket(ticket, target).await,
+        NotifyPolicy::Notify => notify_ticket(ticket, target, failure_comment).await,
         NotifyPolicy::Buffer => {
             if let Some(ws) = resolve_ticket_workspace(ticket, log_label).await {
                 ticket_buffer::push(&ws.name, &ticket.id, source, target);
@@ -325,7 +332,7 @@ async fn transition_ticket(
         .transition_to(&ticket.id, Some(source), target, pipeline_reservation)
         .await;
     if result.is_ok() {
-        dispatch_notification(ticket, source, target, notify, "transition_ticket").await;
+        dispatch_notification(ticket, source, target, notify, "transition_ticket", None).await;
     }
     result
 }
@@ -472,6 +479,12 @@ impl<'a> TransitionParams<'a> {
 /// re-dispatch over fresh tickets, or `None` for all other transitions.
 #[must_use]
 async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
+    // Extract failure_comment before the with_tx closure, which consumes
+    // params.comment (CommentParam is not Copy, but the underlying &str is
+    // Copy). Used exclusively for Failed-target transitions to avoid a
+    // redundant DB round-trip in notify_ticket.
+    let failure_comment = (params.target == TicketPhase::Failed).then_some(params.comment.content);
+
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
         &params.ticket.id,
@@ -522,6 +535,7 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
         params.target,
         params.notify,
         params.log_label,
+        failure_comment,
     )
     .await;
 
@@ -603,31 +617,14 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 ///
 /// # Invariant: failure comment before Failed transition
 ///
-/// When `target_phase == TicketPhase::Failed`, the warning template loads
-/// failure-specific details from the **latest comment** on the ticket (via
-/// [`BoardStore::get_comments`]). Every code path that transitions a ticket to
-/// `Failed` MUST write a relevant comment first — otherwise the warning will
-/// surface unrelated or stale content (or "No failure details available."
-/// if no comment exists).
-///
-/// This invariant IS enforced at the API level:
-///
-/// * [`transition_ticket_to_failed()`] takes a required `comment: &str`
-///   and delegates to [`comment_and_transition()`], which writes the comment
-///   and performs the phase transition atomically in a single transaction.
-///   It is used by the dispatch-panic, circuit-breaker, and all-verifiers-failed
-///   paths.
-/// * The inline [`comment_and_transition()`] call in [`dispatch_engineer()`]
-///   (agent-failure path) also always writes a comment before transitioning to
-///   `Failed`.
-///
-/// Because all four production failure paths go through one of these two entry
-/// points, the failure comment is always written atomically with the transition
-/// and committed to the database before [`dispatch_notification`] →
-/// [`notify_ticket`] runs. The generic [`transition_ticket()`] function now
-/// enforces this invariant at runtime — it returns an error if called with
-/// `TicketPhase::Failed`, directing callers to use
-/// [`transition_ticket_to_failed()`] instead.
+/// When `target_phase == TicketPhase::Failed`, the failure details are passed
+/// directly via `failure_comment` instead of re-reading from the database.
+/// The caller MUST ensure `failure_comment` is `Some` when `target == Failed` —
+/// this is enforced by [`comment_and_transition()`] which extracts the comment
+/// text before its inner closure consumes `params.comment`, and by the
+/// compile-time guard on [`transition_ticket()`] which prevents it from
+/// producing `Failed`. See [`comment_and_transition()`] for full detail on the
+/// call-chain mechanics.
 ///
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
@@ -635,8 +632,12 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 /// session. Do NOT change this key or add `manager_` to `TRANSIENT_SESSION_PREFIXES`
 /// — it would either break context continuity or nuke user conversation history.
 ///
-/// Never panics — errors are logged and discarded.
-async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
+/// # Panics
+///
+/// Panics if `target == TicketPhase::Failed` and `failure_comment` is `None`,
+/// indicating a programming error in a caller that failed to provide the
+/// required failure detail text.
+async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase, failure_comment: Option<&str>) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
             ticket = %ticket.id,
@@ -675,24 +676,17 @@ async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
     );
 
     if target_phase == TicketPhase::Failed {
-        let failure_details = match board().get_comments(&ticket.id).await {
-            Ok(comments) => comments
-                .last()
-                .map_or("No failure details available.", |c| c.content.as_str())
-                .to_string(),
-            Err(e) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to load comments for failure notification",
-                );
-                "No failure details available.".to_string()
-            }
-        };
+        // failure_comment must be Some when target is Failed — all call paths
+        // that transition to Failed write the comment atomically with the
+        // transition and pass it through the call chain (via
+        // comment_and_transition → dispatch_notification → notify_ticket).
+        // A None here indicates a programming error in a new or modified caller.
+        let failure_details =
+            failure_comment.expect("failure_comment must be Some when target is Failed");
 
         let warning = substitute(
             &load_prompt("warning.md"),
-            &[("{{failure_details}}", &failure_details)],
+            &[("{{failure_details}}", failure_details)],
         );
         message.push_str("\n\n");
         message.push_str(&warning);
@@ -1457,6 +1451,7 @@ async fn commit_and_transition_ticket_from(
             TicketPhase::Done,
             notify_policy,
             "commit_and_transition_ticket_from",
+            None,
         )
         .await;
     } else {
