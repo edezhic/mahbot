@@ -600,8 +600,8 @@ impl BoardStore {
             if changed {
                 let new_json = serde_json::to_string(&prereqs)?;
                 tx.execute(
-                    "UPDATE tickets SET prerequisites = ?1 WHERE id = ?2",
-                    turso::params![new_json, dep_id],
+                    "UPDATE tickets SET prerequisites = ?1, updated_at = ?2 WHERE id = ?3",
+                    turso::params![new_json, turso::now(), dep_id],
                 )
                 .await?;
             }
