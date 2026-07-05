@@ -145,9 +145,8 @@ async fn insert_messages_in_transaction(
 /// Execute a `query_map`, logging warnings on failure and skipping unparseable rows.
 /// Returns an empty [`Vec`] on query error.
 ///
-/// When `session_key` is `Some`, it is included as a structured tracing field in both
-/// the query-failure and row-decode warnings, enabling log-aggregation filtering and
-/// cross-correlation with other session-scoped events.
+/// `session_key` is passed as a structured tracing field; when `None`, tracing
+/// automatically suppresses it from the output.
 async fn query_map_collect<T, E>(
     conn: &turso::Connection,
     sql: &str,
@@ -163,11 +162,7 @@ where
     let rows = match conn.query_map(sql, params, row_parser).await {
         Ok(rows) => rows,
         Err(e) => {
-            if let Some(sk) = session_key {
-                tracing::warn!(error = %e, session_key = sk, "{warn_context}: query failed, returning empty");
-            } else {
-                tracing::warn!(error = %e, "{warn_context}: query failed, returning empty");
-            }
+            tracing::warn!(error = %e, session_key, "{warn_context}: query failed, returning empty");
             return Vec::new();
         }
     };
@@ -175,11 +170,7 @@ where
         .filter_map(|r| match r {
             Ok(val) => Some(val),
             Err(e) => {
-                if let Some(sk) = session_key {
-                    tracing::warn!(error = %e, session_key = sk, "{warn_context}: row decode failed, skipping");
-                } else {
-                    tracing::warn!(error = %e, "{warn_context}: row decode failed, skipping");
-                }
+                tracing::warn!(error = %e, session_key, "{warn_context}: row decode failed, skipping");
                 None
             }
         })
