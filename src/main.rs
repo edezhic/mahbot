@@ -742,15 +742,15 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // msg.workspace for broadcast filtering).
     msg.workspace = ws.name.clone();
 
-    // Broadcast incoming user message to GUI dashboard and persist to
-    // chat_history. Workspace resolution must happen first so the
-    // workspace field is correct.
-    write_incoming_to_broadcast(&msg).await;
-
-    // Mirror GUI messages to the user's Telegram chats as blockquotes,
-    // so conversation history is readable from both surfaces. This runs
-    // before enrichment so the original user-typed text is preserved.
-    mahbot::channels::mirror_gui_message_to_telegram(&msg).await;
+    // Broadcast incoming user message to GUI dashboard + persist to
+    // chat_history, and mirror GUI messages to the user's Telegram
+    // chats as blockquotes. Workspace resolution must happen first so
+    // the workspace field is correct. Both run before enrichment so
+    // the original user-typed text is preserved.
+    tokio::join!(
+        write_incoming_to_broadcast(&msg),
+        mahbot::channels::mirror_gui_message_to_telegram(&msg),
+    );
 
     // Personal workspaces do not support the Manager agent — no board
     // pipeline, no maintainer. If the role is Manager and we're in a
