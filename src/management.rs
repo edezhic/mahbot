@@ -1249,7 +1249,6 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 
 /// Transition a ticket to Done with a descriptive reason from the given source phase.
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
-    info!(ticket = %ticket.id, "{comment}");
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
     let log_label = match source {
         TicketPhase::QaPassed => "QA",
@@ -1263,7 +1262,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
             "Unexpected"
         }
     };
-    let _ = comment_and_transition(TransitionParams::new(
+    if comment_and_transition(TransitionParams::new(
         ticket,
         CommentParam {
             role: SYSTEM_ROLE,
@@ -1275,7 +1274,10 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
         log_label,
         "passed",
     ))
-    .await;
+    .await
+    {
+        info!(ticket = %ticket.id, "{comment}");
+    }
 }
 
 #[must_use]
