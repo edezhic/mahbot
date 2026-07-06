@@ -652,16 +652,13 @@ impl Provider for OpenAiCompatibleProvider {
                 anyhow::Error::from(e).context(format!("{} error reading response body", self.name))
             })?;
 
-        let body_value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        let native_response: ApiChatResponse = serde_json::from_str(&body).map_err(|e| {
             anyhow::anyhow!(
-                "{} chat completions JSON parse error: {e}; body={}",
+                "{} chat completions parse error: {e}; body={}",
                 self.name,
                 body
             )
         })?;
-
-        let native_response: ApiChatResponse = serde_json::from_value(body_value)
-            .map_err(|e| anyhow::anyhow!("{} chat completions response shape: {e}", self.name))?;
 
         let usage = native_response.usage.map(|u| ProviderUsage {
             input_tokens: u.prompt_tokens,
