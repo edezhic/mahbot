@@ -128,10 +128,9 @@ async fn load_skill(path: &Path, skill_dir: &Path) -> Result<Skill> {
 
     Ok(Skill {
         name: meta.name.unwrap_or_else(|| {
-            skill_dir.file_name().map_or_else(
-                || "unnamed".to_string(),
-                |s| s.to_string_lossy().into_owned(),
-            )
+            skill_dir
+                .file_name()
+                .map_or("unnamed".to_string(), |s| s.to_string_lossy().into_owned())
         }),
         description: meta
             .description
