@@ -80,7 +80,7 @@ impl Agent {
         } else {
             role.to_string()
         };
-        let generation = crate::registry::AGENT_REGISTRY.register_unguarded(
+        let generation = crate::registry::AGENT_REGISTRY.register(
             session_key.clone(),
             role.to_string(),
             ticket.as_ref().map(|t| t.id.clone()),

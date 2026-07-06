@@ -47,7 +47,7 @@ impl AgentRegistry {
     ///
     /// Used by [`crate::Agent::new`] where deregistration is handled by [`crate::Agent::drop`]
     /// instead of a guard.
-    pub fn register_unguarded(
+    pub fn register(
         &self,
         run_id: String,
         role: String,
@@ -81,7 +81,12 @@ impl AgentRegistry {
     }
 
     /// Cancel a specific agent by run_id. Removes it from the registry.
-    pub fn cancel(&self, run_id: &str) {
+    ///
+    /// Prefer [`cancel_by_ticket_id`](AgentRegistry::cancel_by_ticket_id) or
+    /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path)
+    /// for external callers — this method bypasses the generation-based safety check
+    /// that guards against stale `run_id` references.
+    fn cancel(&self, run_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.remove(run_id) {
             entry.cancel_token.cancel();
