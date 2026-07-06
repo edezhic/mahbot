@@ -34,6 +34,7 @@
 //! periodic) ensures that under normal operation no writes are lost, and
 //! crash data loss is bounded to the auto-checkpoint interval (5 minutes).
 
+use futures_util::future::join_all;
 use tracing::{error, info, warn};
 
 /// Checkpoint all Turso database stores before hard process termination.
@@ -48,15 +49,18 @@ use tracing::{error, info, warn};
 /// The store entries come from [`crate::turso::iter_checkpoint_stores`] — the
 /// single source of truth for which stores get checkpointed.
 pub async fn checkpoint_all_databases() {
-    for (name, conn_opt) in crate::turso::iter_checkpoint_stores() {
-        let Some(conn) = conn_opt else {
-            continue;
-        };
-        match conn.checkpoint().await {
-            Ok(()) => info!(db = %name, "Database WAL checkpointed"),
-            Err(e) => warn!(error = %e, db = %name, "Failed to checkpoint database WAL"),
-        }
-    }
+    let futs: Vec<_> = crate::turso::iter_checkpoint_stores()
+        .filter_map(|(name, conn_opt)| {
+            let conn = conn_opt?;
+            Some(async move {
+                match conn.checkpoint().await {
+                    Ok(()) => info!(db = %name, "Database WAL checkpointed"),
+                    Err(e) => warn!(error = %e, db = %name, "Failed to checkpoint database WAL"),
+                }
+            })
+        })
+        .collect();
+    join_all(futs).await;
 }
 
 /// How often to auto-checkpoint all databases as defense-in-depth.
