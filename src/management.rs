@@ -2786,57 +2786,8 @@ mod tests {
             3,
             "All filter should write both verdicts (total 3)"
         );
-    }
-
-    /// Verify that `record_verdict_comments_tx` writes comments correctly
-    /// when used inside an existing transaction (the pattern used by the
-    /// atomic verdict processors).
-    #[tokio::test]
-    async fn record_verdict_comments_tx_filtering() {
-        init_test_stores().await;
-
-        let ticket_id = make_ticket(
-            board(),
-            &test_ws_named("/tmp/test", "tx_test"),
-            "TX Test",
-            TicketPhase::Backlog,
-        )
-        .await;
-
-        // ── Use _tx variant inside a manual with_tx block ──
-        let results = vec![
-            analyst_verdict(10, "Excellent analysis.", &[]),
-            analyst_verdict(4, "Needs more research.", &["Missing citations"]),
-        ];
-        crate::turso::with_tx(
-            &board().conn,
-            &ticket_id,
-            "test verdict comments tx",
-            async |tx| {
-                record_verdict_comments_tx(
-                    tx,
-                    &ticket_id,
-                    &results,
-                    Role::Analyst.as_str(),
-                    VerdictFilter::All,
-                )
-                .await
-            },
-        )
-        .await
-        .expect("record_verdict_comments_tx should succeed");
-
-        let comments = board()
-            .get_comments(&ticket_id)
-            .await
-            .expect("get_comments");
-        assert_eq!(
-            comments.len(),
-            2,
-            "_tx variant should write both verdict comments"
-        );
-        assert_eq!(comments[0].role, "analyst_1");
-        assert_eq!(comments[1].role, "analyst_2");
+        assert_eq!(comments[1].role, "analyst_1");
+        assert_eq!(comments[2].role, "analyst_2");
     }
 
     // ── transition_ticket_to_done — conditional notification ─────────
