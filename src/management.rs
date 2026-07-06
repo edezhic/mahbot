@@ -199,12 +199,13 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// Generalized pre-flight guard for dispatch functions that spawn agents.
+/// Pre-flight abort check for dispatch functions that spawn agents.
 ///
-/// Verifies the ticket is still in `expected_phase` (avoids wasted DB writes
-/// and LLM API costs if the ticket was moved externally) and runs a
-/// configurable circuit breaker (fails tickets that exceed a domain-specific
-/// failure threshold to prevent dispatch thrashing).
+/// Returns `true` (and this function will **not** guarantee it is side-effect
+/// free) when the caller MUST abort dispatching — either because the ticket
+/// is no longer in `expected_phase` (avoids wasted DB writes and LLM API
+/// costs if the ticket was moved externally) or the circuit breaker has
+/// tripped for the given domain and failed the ticket.
 ///
 /// This is the recommended entry point for all dispatch-phase guard logic.
 ///
@@ -219,9 +220,9 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 ///
 /// # Return value
 ///
-/// Returns `true` when the caller MUST bail (phase mismatch, ticket moved or
-/// failed, or circuit breaker tripped). Returns `false` when it's safe to
-/// proceed.
+/// Returns `true` when the caller MUST abort the dispatch (phase mismatch,
+/// ticket moved or failed, or circuit breaker tripped). Returns `false`
+/// when it is safe to proceed.
 ///
 /// # Side effects
 ///
@@ -232,7 +233,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// require Manager intervention to advance, so they will not silently proceed
 /// until the Manager acts.
 #[must_use]
-async fn is_phase_or_breaker_blocked(
+async fn should_abort_dispatch(
     ticket: &Ticket,
     expected_phase: TicketPhase,
     kind: CircuitBreakerKind,
@@ -759,7 +760,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // The post-agent is_ticket_in_phase check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         let (kind, log_label) = phase.circuit_breaker_kind();
-        if is_phase_or_breaker_blocked(&ticket, active_phase, kind, log_label).await {
+        if should_abort_dispatch(&ticket, active_phase, kind, log_label).await {
             return;
         }
 
