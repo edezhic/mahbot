@@ -865,12 +865,11 @@ mod tests {
     use super::*;
 
     /// Make a file executable (0o755) on Unix; no-op on other platforms.
-    #[allow(unused_variables)]
-    fn make_executable(path: &Path) {
+    fn make_executable(_path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(_path, PermissionsExt::from_mode(0o755)).unwrap();
         }
     }
 
