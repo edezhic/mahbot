@@ -15,6 +15,7 @@ crate::define_store! {
     db_name = "board",
     schema = SCHEMA,
     post_open = after_open,
+    expect = "BOARD not initialized — call init_global() first",
 }
 
 /// Background task: auto-archive cancelled tickets older than 1 hour.

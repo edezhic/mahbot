@@ -31,6 +31,7 @@ crate::define_store! {
     db_name = "users",
     schema = SCHEMA,
     post_open = ensure_admin_user,
+    expect = "USER_STORE not initialized — call init_global() first",
 }
 
 const SCHEMA: &str = "\

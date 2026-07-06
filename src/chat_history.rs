@@ -14,6 +14,7 @@ crate::define_store! {
     pub static CHAT_HISTORY: ChatHistoryStore,
     db_name = "chat_history",
     schema = SCHEMA,
+    expect = "CHAT_HISTORY not initialized — call init_global() first",
 }
 
 const SCHEMA: &str = "\

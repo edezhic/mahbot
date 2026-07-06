@@ -15,6 +15,7 @@ crate::define_store! {
     pub static CONFIG_STORE: ConfigStore,
     db_name = "config",
     schema = SCHEMA,
+    expect = "CONFIG_STORE not initialized — call init_global() first",
 }
 
 const SCHEMA: &str = "\

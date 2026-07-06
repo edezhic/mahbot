@@ -118,7 +118,7 @@ macro_rules! columns {
 ///     pub static STORE_NAME: StoreType,
 ///     db_name = "db_file_name",
 ///     schema = SCHEMA,
-///     // optional: expect = "custom panic message",
+///     expect = "custom panic message",
 /// }
 /// ```
 ///
@@ -129,6 +129,7 @@ macro_rules! columns {
 ///     db_name = "users",
 ///     schema = SCHEMA,
 ///     post_open = ensure_admin_user,
+///     expect = "custom panic message",
 /// }
 /// ```
 /// The method is called via `this.$method().await?` after store construction.
@@ -149,26 +150,7 @@ macro_rules! columns {
 /// The `init`-method approach (Form 2) avoids this limitation entirely.
 #[macro_export]
 macro_rules! define_store {
-    // ── Form 1: Simple (no post-open, auto expect) ──────────────────────
-    (
-        $(#[$attr:meta])*
-        pub static $name:ident: $ty:ident,
-        db_name = $db_name:literal,
-        schema = $schema:ident,
-    ) => {
-        $crate::define_store! {
-            $(#[$attr])*
-            pub static $name: $ty,
-            db_name = $db_name,
-            schema = $schema,
-            expect = concat!(
-                stringify!($name),
-                " not initialized — call init_global() first"
-            ),
-        }
-    };
-
-    // ── Form 1b: Simple with custom expect ──────────────────────────────
+    // ── Form 1: Simple (no post-open) ──────────────────────────────────
     (
         $(#[$attr:meta])*
         pub static $name:ident: $ty:ident,
@@ -200,28 +182,7 @@ macro_rules! define_store {
         }
     };
 
-    // ── Form 2: Post-open via init method (auto expect) ─────────────────
-    (
-        $(#[$attr:meta])*
-        pub static $name:ident: $ty:ident,
-        db_name = $db_name:literal,
-        schema = $schema:ident,
-        post_open = $method:ident,
-    ) => {
-        $crate::define_store! {
-            $(#[$attr])*
-            pub static $name: $ty,
-            db_name = $db_name,
-            schema = $schema,
-            post_open = $method,
-            expect = concat!(
-                stringify!($name),
-                " not initialized — call init_global() first"
-            ),
-        }
-    };
-
-    // ── Form 2b: Post-open via init method with custom expect ───────────
+    // ── Form 2: Post-open via init method ───────────────────────────────
     (
         $(#[$attr:meta])*
         pub static $name:ident: $ty:ident,
