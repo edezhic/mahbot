@@ -16,7 +16,7 @@ use crate::board::TicketPhase;
 use crate::util::UnwrapPoison;
 
 /// A single buffered ticket phase transition entry.
-#[derive(Clone)]
+#[derive(Debug)]
 struct Entry {
     id: String,
     source: TicketPhase,
