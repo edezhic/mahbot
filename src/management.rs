@@ -1710,8 +1710,11 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// the shared parameters (`DIAGNOSTICS_ROLE`, source/target phases,
 /// notify policy, and log label), leaving only the caller-specific
 /// `comment` text and `verb` string.
-async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
-    let _ = comment_and_transition(TransitionParams::new(
+///
+/// Returns `true` if the transition succeeded, `false` otherwise.
+#[must_use]
+async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) -> bool {
+    comment_and_transition(TransitionParams::new(
         ticket,
         CommentParam {
             role: DIAGNOSTICS_ROLE,
@@ -1723,7 +1726,7 @@ async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) {
         "Diagnostics",
         verb,
     ))
-    .await;
+    .await
 }
 
 /// Run diagnostics commands after the engineer completes development.
@@ -1784,7 +1787,12 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
             if all_passed {
                 // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                finish_diagnostics(&ticket, &comment, "completed").await;
+                if !finish_diagnostics(&ticket, &comment, "completed").await {
+                    warn!(
+                        ticket = %ticket.id,
+                        "Failed to transition to DiagnosticsDone after diagnostics passed",
+                    );
+                }
             } else {
                 // Path C2: Diagnostics failed — write the failure comment and
                 // bounce back to development for rework.
@@ -1824,12 +1832,18 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         }
         Ok(_) => {
             // Path B: No diagnostics commands configured (or empty list) — skip.
-            finish_diagnostics(
+            if !finish_diagnostics(
                 &ticket,
                 "No diagnostics commands are configured for this workspace — diagnostics skipped.",
                 "skipped (no commands configured)",
             )
-            .await;
+            .await
+            {
+                warn!(
+                    ticket = %ticket.id,
+                    "Failed to transition to DiagnosticsDone (no commands configured)",
+                );
+            }
         }
         Err(e) => {
             // Path A: DB error loading diagnostics — log and skip.
@@ -1838,12 +1852,18 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 error = %e,
                 "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
             );
-            finish_diagnostics(
+            if !finish_diagnostics(
                 &ticket,
                 &format!("Could not load diagnostics commands due to a database error: {e}"),
                 "skipped (DB error)",
             )
-            .await;
+            .await
+            {
+                warn!(
+                    ticket = %ticket.id,
+                    "Failed to transition to DiagnosticsDone after DB error",
+                );
+            }
         }
     }
 }
