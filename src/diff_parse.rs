@@ -1,7 +1,7 @@
 //! Git diff parsing — parse unified diff output into structured data.
 //!
-//! Handles `git diff HEAD --no-color --find-renames` or `git show -m` output plus
-//! untracked files from `git status --porcelain`.
+//! Handles `git diff HEAD --no-color --find-renames` or `git show -m` output.
+//! Untracked / new file content is assembled into synthetic DiffFile entries.
 //!
 //! For git subprocess wrappers that produce diff output or manage
 //! repository state, see [`crate::git_commands`].
@@ -21,7 +21,7 @@ pub enum DiffFileStatus {
     Deleted,
     /// File renamed (from `rename from`/`rename to`).
     Renamed,
-    /// Untracked file (from `git status --porcelain`).
+    /// Untracked/new file (assembled via `make_untracked_diff_file` from raw content).
     Untracked,
 }
 
