@@ -493,9 +493,9 @@ impl std::str::FromStr for TicketPhase {
 // manually above to produce user-friendly error messages.
 
 /// Bundles a SQL mutation statement with its parameters and a human-readable
-/// action description. Returned by [`BoardStore::build_transition_sql`] and
-/// [`BoardStore::build_set_commit_info_sql`]; executed via
-/// [`PreparedUpdate::execute_tx`] or [`PreparedUpdate::execute_and_cancel`].
+/// action description. Returned by [`BoardStore::build_transition_sql`];
+/// executed via [`PreparedUpdate::execute_tx`] or
+/// [`PreparedUpdate::execute_and_cancel`].
 struct PreparedUpdate {
     sql: String,
     params: Vec<turso::Value>,
@@ -1279,35 +1279,6 @@ impl BoardStore {
         Ok(rows > 0)
     }
 
-    /// Build the SQL, params, and action description for setting commit info.
-    /// Used by [`set_commit_info_tx`](Self::set_commit_info_tx).
-    fn build_set_commit_info_sql(
-        ticket_id: &str,
-        hash: &str,
-        lines_added: i64,
-        lines_removed: i64,
-    ) -> PreparedUpdate {
-        debug_assert!(
-            lines_added >= 0,
-            "lines_added must be non-negative: {lines_added}"
-        );
-        debug_assert!(
-            lines_removed >= 0,
-            "lines_removed must be non-negative: {lines_removed}"
-        );
-
-        Self::build_ticket_update_with_updated_at(
-            "commit_hash = ?, lines_added = ?, lines_removed = ?",
-            vec![
-                Value::from(hash),
-                Value::from(lines_added),
-                Value::from(lines_removed),
-            ],
-            "set commit info".to_string(),
-            ticket_id,
-        )
-    }
-
     /// Record commit metadata on a ticket using an existing transaction.
     /// Does NOT commit or rollback the transaction; the caller controls that.
     pub(crate) async fn set_commit_info_tx(
@@ -1317,7 +1288,25 @@ impl BoardStore {
         lines_added: i64,
         lines_removed: i64,
     ) -> Result<()> {
-        let prepared = Self::build_set_commit_info_sql(ticket_id, hash, lines_added, lines_removed);
+        debug_assert!(
+            lines_added >= 0,
+            "lines_added must be non-negative: {lines_added}"
+        );
+        debug_assert!(
+            lines_removed >= 0,
+            "lines_removed must be non-negative: {lines_removed}"
+        );
+        // Build the SQL, params, and action description for setting commit info.
+        let prepared = Self::build_ticket_update_with_updated_at(
+            "commit_hash = ?, lines_added = ?, lines_removed = ?",
+            vec![
+                Value::from(hash),
+                Value::from(lines_added),
+                Value::from(lines_removed),
+            ],
+            "set commit info".to_string(),
+            ticket_id,
+        );
         prepared.execute_tx(tx).await
     }
 
