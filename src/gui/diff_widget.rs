@@ -42,16 +42,16 @@ use super::theme;
 // ── Constants ───────────────────────────────────────────────────────
 
 /// Hunk header text color — ayu dark sky blue (matches HighlightClass::Type).
-pub(crate) const HUNK_HEADER_COLOR: Color = Color::from_rgb(0.349, 0.761, 1.0);
+const HUNK_HEADER_COLOR: Color = Color::from_rgb(0.349, 0.761, 1.0);
 
 /// Added line foreground color.
-pub(crate) const ADDED_COLOR: Color = theme::STATUS_SUCCESS;
+const ADDED_COLOR: Color = theme::STATUS_SUCCESS;
 
 /// Removed line foreground color.
-pub(crate) const REMOVED_COLOR: Color = theme::STATUS_ERROR;
+const REMOVED_COLOR: Color = theme::STATUS_ERROR;
 
 /// Context line foreground color.
-pub(crate) const CONTEXT_COLOR: Color = theme::TEXT_SECONDARY;
+const CONTEXT_COLOR: Color = theme::TEXT_SECONDARY;
 
 /// Approximate pixel width of one monospace digit at [`GUTTER_FONT_SIZE`].
 const GUTTER_DIGIT_WIDTH: f32 = GUTTER_FONT_SIZE * 0.62;
@@ -129,7 +129,7 @@ pub(crate) fn compute_gutter_digits(line_numbers: &[(Option<usize>, Option<usize
 /// Pixel width for a dual-column old/new line-number gutter.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub(crate) const fn gutter_width_from_digits(digits: usize) -> f32 {
+const fn gutter_width_from_digits(digits: usize) -> f32 {
     digits as f32 * GUTTER_DIGIT_WIDTH * 2.0 + 14.0
 }
 
