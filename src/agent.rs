@@ -615,12 +615,16 @@ impl Agent {
     ) -> anyhow::Result<T> {
         // Bind to local so the borrow lives across the .await.
         let model = self.model();
+        let routing = self.provider_routing();
         let config = crate::extraction::ExtractionConfig {
             model: &model,
-            tool_specs: Some(&self.tool_specs),
+            tool_specs: &self.tool_specs,
             temperature: self.temperature(),
             reasoning_effort: Some(self.reasoning_effort()),
             max_attempts,
+            max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
+            provider_order: routing.provider_order,
+            provider_allow_fallbacks: routing.allow_fallbacks,
         };
         crate::extraction::retry_extract_structured(
             self.session.history(),
