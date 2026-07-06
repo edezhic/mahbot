@@ -497,8 +497,7 @@ impl std::str::FromStr for TicketPhase {
 /// Bundles a SQL mutation statement with its parameters and a human-readable
 /// action description. Returned by [`BoardStore::build_transition_sql`] and
 /// [`BoardStore::build_set_commit_info_sql`]; executed via
-/// [`PreparedUpdate::execute`], [`PreparedUpdate::execute_tx`], or
-/// [`PreparedUpdate::execute_and_cancel`].
+/// [`PreparedUpdate::execute_tx`] or [`PreparedUpdate::execute_and_cancel`].
 struct PreparedUpdate {
     sql: String,
     params: Vec<turso::Value>,
@@ -507,14 +506,6 @@ struct PreparedUpdate {
 }
 
 impl PreparedUpdate {
-    /// Execute this update on a connection, verifying that a row was affected.
-    #[cfg(test)]
-    async fn execute(self, conn: &turso::Connection) -> Result<()> {
-        let rows = conn.execute(&self.sql, self.params).await?;
-        BoardStore::ensure_ticket_found(rows, &self.ticket_id, &self.action)?;
-        Ok(())
-    }
-
     /// Execute within an existing transaction, verifying that a row was
     /// affected. Does NOT cancel registered agents — the caller manages
     /// transaction lifecycle and should cancel agents before starting the
@@ -534,7 +525,6 @@ impl PreparedUpdate {
     /// # When NOT to use
     ///
     /// Do **not** use this helper for operations with different semantics:
-    /// - **`PreparedUpdate::execute`** — for updates that should not cancel agents.
     /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
     /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
     ///   before commit via a different pattern.
@@ -1266,8 +1256,7 @@ impl BoardStore {
     }
 
     /// Build the SQL, params, and action description for setting commit info.
-    /// Shared by [`set_commit_info_tx`](Self::set_commit_info_tx) and (in test
-    /// builds) [`set_commit_info`](Self::set_commit_info).
+    /// Used by [`set_commit_info_tx`](Self::set_commit_info_tx).
     fn build_set_commit_info_sql(
         ticket_id: &str,
         hash: &str,
@@ -1295,40 +1284,7 @@ impl BoardStore {
         )
     }
 
-    /// Record commit metadata on a ticket.
-    ///
-    /// **Test-only wrapper** — retained to exercise
-    /// [`build_set_commit_info_sql`](Self::build_set_commit_info_sql) and
-    /// [`PreparedUpdate::execute`] for commit-info operations.
-    /// Production code uses [`set_commit_info_tx`](Self::set_commit_info_tx)
-    /// inside transactions.
-    ///
-    /// This is pure metadata — it does NOT cancel running agents or check
-    /// ticket phase (unlike `set_assigned_to`, which cancels running agents). Non-negative line counts are
-    /// enforced by debug assertions; the caller is responsible for providing
-    /// valid values in production.
-    ///
-    /// # Maintenance warning
-    /// If a future feature needs this in production, remove the `#[cfg(test)]`
-    /// gate and add a real caller. Note that the non-transactional variant
-    /// skips agent cancellation (unlike [`PreparedUpdate::execute_and_cancel`]);
-    /// prefer using [`set_commit_info_tx`](Self::set_commit_info_tx) inside a
-    /// transaction instead. The tests will validate correctness before any
-    /// production use.
-    #[cfg(test)]
-    pub async fn set_commit_info(
-        &self,
-        ticket_id: &str,
-        hash: &str,
-        lines_added: i64,
-        lines_removed: i64,
-    ) -> Result<()> {
-        let prepared = Self::build_set_commit_info_sql(ticket_id, hash, lines_added, lines_removed);
-        prepared.execute(&self.conn).await
-    }
-
-    /// Transactional variant of [`set_commit_info`](Self::set_commit_info) —
-    /// uses an existing transaction instead of its own connection write.
+    /// Record commit metadata on a ticket using an existing transaction.
     /// Does NOT commit or rollback the transaction; the caller controls that.
     pub(crate) async fn set_commit_info_tx(
         tx: &TxGuard<'_>,
@@ -4088,10 +4044,11 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("set_assigned_to");
 
         // Set commit_hash, lines_added, lines_removed with non-default values.
-        store
-            .set_commit_info(&id, "abcdef0123456789abcdef0123456789abcd0123", 42, 7)
+        let tx = store.conn.begin_tx().await.unwrap();
+        BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 42, 7)
             .await
-            .expect("set_commit_info");
+            .expect("set_commit_info_tx");
+        tx.commit().await.unwrap();
 
         // Read back BEFORE archiving (which clears assigned_to).
         let ticket = store
