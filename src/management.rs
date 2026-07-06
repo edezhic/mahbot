@@ -3306,21 +3306,18 @@ mod tests {
                 .await
                 .expect("get_comments");
 
-            let system = comments.iter().find(|c| c.role == SYSTEM_ROLE);
+            let system = comments
+                .iter()
+                .find(|c| c.role == SYSTEM_ROLE)
+                .unwrap_or_else(|| {
+                    panic!("case {}: system summary comment should exist", case.name)
+                });
             assert!(
-                system.is_some(),
-                "case {}: system summary comment should exist",
-                case.name,
-            );
-            assert!(
-                system
-                    .unwrap()
-                    .content
-                    .contains(case.expected_comment_substring),
+                system.content.contains(case.expected_comment_substring),
                 "case {}: system comment should contain {:?}, got: {}",
                 case.name,
                 case.expected_comment_substring,
-                system.unwrap().content,
+                system.content,
             );
         }
     }
