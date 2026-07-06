@@ -122,15 +122,12 @@ impl UserStore {
         Ok(())
     }
 
-    /// Get a single TEXT column from the `users` table for a user.
-    ///
-    /// The `column` parameter MUST be a compile-time-known column name literal
-    /// to prevent SQL injection.
-    async fn get_user_column(&self, user_name: &str, column: &str) -> Result<Option<String>> {
+    /// Get the selected workspace name for a user, if any.
+    pub async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
         let rows = self
             .conn
             .query(
-                &format!("SELECT {column} FROM users WHERE name = ?1"),
+                "SELECT selected_workspace FROM users WHERE name = ?1",
                 turso::params![user_name],
             )
             .await?;
@@ -140,14 +137,19 @@ impl UserStore {
         }
     }
 
-    /// Get the selected workspace name for a user, if any.
-    pub async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
-        self.get_user_column(user_name, "selected_workspace").await
-    }
-
     /// Get the active role for a user, if any.
     pub async fn get_active_role(&self, user_name: &str) -> Result<Option<String>> {
-        self.get_user_column(user_name, "selected_role").await
+        let rows = self
+            .conn
+            .query(
+                "SELECT selected_role FROM users WHERE name = ?1",
+                turso::params![user_name],
+            )
+            .await?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(row.get::<Option<String>>(0)?),
+            None => Ok(None),
+        }
     }
 
     // ── Channel bindings ──────────────────────────────────────
@@ -307,9 +309,9 @@ impl UserStore {
     ) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
 
-        upsert_user_field(&tx, name, "selected_role", role_name).await?;
-        upsert_user_field(&tx, name, "selected_workspace", workspace_name).await?;
-        upsert_user_field(&tx, name, "permissions", permissions).await?;
+        upsert_user_column(&tx, name, "selected_role", role_name).await?;
+        upsert_user_column(&tx, name, "selected_workspace", workspace_name).await?;
+        upsert_user_column(&tx, name, "permissions", permissions).await?;
 
         tx.commit().await?;
         Ok(())
@@ -334,7 +336,7 @@ pub enum FieldUpdate<'a> {
 /// Upsert a single user column within an existing transaction.
 ///
 /// The `field` parameter MUST be a compile-time string literal to prevent SQL injection.
-async fn upsert_user_field(
+async fn upsert_user_column(
     tx: &TxGuard<'_>,
     name: &str,
     field: &str,
