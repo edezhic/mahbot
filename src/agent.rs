@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use anyhow::Context;
+
 use crate::providers::chat;
 use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
@@ -235,12 +237,11 @@ impl Agent {
                     mut display_text,
                     tool_calls,
                     history_content,
-                } = match self.llm_call().await {
-                    Ok(resp) => prepare_assistant_turn(resp),
-                    Err(e) => {
-                        return Err(e.context(format!("LLM step failed at iteration {iteration}")));
-                    }
-                };
+                } = prepare_assistant_turn(
+                    self.llm_call()
+                        .await
+                        .with_context(|| format!("LLM step failed at iteration {iteration}"))?,
+                );
 
                 if tool_calls.is_empty() {
                     self.session.push_assistant(history_content);
