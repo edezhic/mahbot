@@ -3,7 +3,7 @@
 //! Iced owns the process Tokio runtime (`iced` feature `tokio`). MahBot
 //! bootstraps via a startup [`iced::Task`] before the UI becomes interactive.
 
-#![allow(
+#![expect(
     clippy::must_use_candidate,
     clippy::new_without_default,
     clippy::struct_excessive_bools,
