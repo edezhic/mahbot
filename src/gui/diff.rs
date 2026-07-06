@@ -1582,7 +1582,7 @@ fn compute_highlights_for_content(
         return None;
     }
     let mut parser = tree_sitter::Parser::new();
-    let ts_lang = lang.tree_sitter_language();
+    let ts_lang = lang.language_and_query().0;
     let _ = parser.set_language(&ts_lang);
     Some(parse_file_highlights(&mut parser, content, lang))
 }

@@ -1,13 +1,19 @@
 //! Shared mapping from file extensions to tree-sitter [`Language`] objects.
 //!
-//! This is the single source of truth for which `tree_sitter::Language` corresponds
-//! to each file extension. Both the `read` tool (symbol extraction) and the GUI
-//! editor (syntax highlighting) use this function instead of maintaining separate
-//! extension-to-language mappings.
+//! The [`tree_sitter_language_for_extension`] function in this module is used by the
+//! `read` tool (`crate::tools::read`) for symbol extraction. The GUI editor's syntax
+//! highlighting uses [`crate::gui::highlight::HighlightLanguage::from_extension`]
+//! instead — keep the two mappings in sync when adding new languages.
 
 use tree_sitter::Language;
 
 /// Map a file extension to its corresponding tree-sitter [`Language`].
+///
+/// This function is used by the `read` tool (`crate::tools::read`) for symbol
+/// extraction.
+///
+/// See also [`crate::gui::highlight::HighlightLanguage::from_extension`] for the
+/// equivalent mapping used by the GUI editor's syntax highlighting.
 ///
 /// Supported extensions and their languages:
 ///

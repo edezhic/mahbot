@@ -160,7 +160,7 @@ pub fn parse_file_highlights(
         return parse_markdown_highlights(source);
     }
 
-    let ts_lang = lang.tree_sitter_language();
+    let ts_lang = lang.language_and_query().0;
     let _ = parser.set_language(&ts_lang);
 
     let tree = parser.parse(source, None);
@@ -508,6 +508,11 @@ pub enum HighlightLanguage {
 
 impl HighlightLanguage {
     /// Determine language from a file extension.
+    ///
+    /// This map is for the GUI editor's syntax highlighting.
+    ///
+    /// See also [`crate::util::tree_sitter::tree_sitter_language_for_extension`]
+    /// for the equivalent mapping used by the `read` tool's symbol extraction.
     #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
@@ -576,39 +581,6 @@ impl HighlightLanguage {
             HighlightLanguage::Markdown => {
                 (tree_sitter_md::LANGUAGE.into(), MD_HIGHLIGHT_QUERY_BLOCK)
             }
-        }
-    }
-
-    /// Return the tree-sitter Language for this language.
-    ///
-    /// A thin wrapper over [`Self::language_and_query`] for callers that only need
-    /// the language (e.g., creating a parser).
-    pub(crate) fn tree_sitter_language(self) -> Language {
-        self.language_and_query().0
-    }
-
-    /// Return the canonical file extension for this language variant.
-    ///
-    /// Used to look up the shared tree-sitter [`Language`] via
-    /// [`crate::util::tree_sitter::tree_sitter_language_for_extension`].
-    #[must_use]
-    pub const fn extension(self) -> &'static str {
-        match self {
-            HighlightLanguage::Rust => "rs",
-            HighlightLanguage::JavaScript => "js",
-            HighlightLanguage::TypeScript => "ts",
-            HighlightLanguage::TSX => "tsx",
-            HighlightLanguage::Python => "py",
-            HighlightLanguage::Json => "json",
-            HighlightLanguage::Toml => "toml",
-            HighlightLanguage::Bash => "sh",
-            HighlightLanguage::Css => "css",
-            HighlightLanguage::Html => "html",
-            HighlightLanguage::Go => "go",
-            HighlightLanguage::Ruby => "rb",
-            HighlightLanguage::C => "c",
-            HighlightLanguage::Sql => "sql",
-            HighlightLanguage::Markdown => "md",
         }
     }
 }
