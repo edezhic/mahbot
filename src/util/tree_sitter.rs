@@ -1,19 +1,22 @@
-//! Shared mapping from file extensions to tree-sitter [`Language`] objects.
+//! Canonical mapping from file extensions to tree-sitter [`Language`] objects.
 //!
-//! The [`tree_sitter_language_for_extension`] function in this module is used by the
-//! `read` tool (`crate::tools::read`) for symbol extraction. The GUI editor's syntax
-//! highlighting uses [`crate::gui::highlight::HighlightLanguage::from_extension`]
-//! instead — keep the two mappings in sync when adding new languages.
+//! This is the **single source of truth** for which file extension maps to which
+//! tree-sitter grammar. Both the `read` tool's symbol extraction
+//! ([`crate::tools::read`]) and the GUI editor's syntax highlighting
+//! ([`crate::gui::highlight::HighlightLanguage::from_extension`]) delegate here.
+//!
+//! When adding support for a new language:
+//! 1. Add the extension(s) to [`tree_sitter_language_for_extension`] (this file).
+//! 2. Add a variant to [`HighlightLanguage`] and a `language_and_query` arm in
+//!    [`crate::gui::highlight`] — the reverse-lookup map is derived automatically.
 
 use tree_sitter::Language;
 
 /// Map a file extension to its corresponding tree-sitter [`Language`].
 ///
-/// This function is used by the `read` tool (`crate::tools::read`) for symbol
-/// extraction.
-///
-/// See also [`crate::gui::highlight::HighlightLanguage::from_extension`] for the
-/// equivalent mapping used by the GUI editor's syntax highlighting.
+/// This is the **canonical** extension-to-language mapping used by both the
+/// `read` tool ([`crate::tools::read`]) and the GUI editor's syntax
+/// highlighting ([`crate::gui::highlight::HighlightLanguage::from_extension`]).
 ///
 /// Supported extensions and their languages:
 ///

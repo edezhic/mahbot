@@ -10,8 +10,10 @@
 //! for block comments, docstrings, and multi-line strings.
 
 use iced::Color;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use strum::EnumCount;
+use strum::VariantArray;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 use tree_sitter_md::{INLINE_LANGUAGE as MD_INLINE_LANG, MarkdownParser, MarkdownTree};
 // Built-in highlight queries for new languages (ticket mahbot-1244).
@@ -486,7 +488,7 @@ fn capture_class(capture_name: &str) -> HighlightClass {
 // ── Language definitions ──────────────────────────────────────────────
 
 /// Supported languages for syntax highlighting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, strum::VariantArray)]
 #[repr(usize)]
 pub enum HighlightLanguage {
     Rust,
@@ -506,33 +508,27 @@ pub enum HighlightLanguage {
     Markdown,
 }
 
+/// Lazy reverse-lookup map: tree-sitter [`Language`] → [`HighlightLanguage`].
+///
+/// Each grammar `Language` value is a process-lifetime singleton (pointer
+/// identity), so the map is stable for the lifetime of the process.
+static LANGUAGE_TO_HIGHLIGHT: OnceLock<HashMap<Language, HighlightLanguage>> = OnceLock::new();
+
 impl HighlightLanguage {
     /// Determine language from a file extension.
     ///
-    /// This map is for the GUI editor's syntax highlighting.
-    ///
-    /// See also [`crate::util::tree_sitter::tree_sitter_language_for_extension`]
-    /// for the equivalent mapping used by the `read` tool's symbol extraction.
+    /// Delegates to the canonical mapping in
+    /// [`crate::util::tree_sitter::tree_sitter_language_for_extension`],
+    /// then looks up the returned tree-sitter [`Language`] in the
+    /// reverse-lookup map to obtain the corresponding [`HighlightLanguage`]
+    /// variant.
     #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext {
-            "rs" => Some(HighlightLanguage::Rust),
-            "js" | "jsx" | "mjs" | "cjs" => Some(HighlightLanguage::JavaScript),
-            "ts" => Some(HighlightLanguage::TypeScript),
-            "tsx" => Some(HighlightLanguage::TSX),
-            "py" | "pyi" | "pyx" => Some(HighlightLanguage::Python),
-            "json" => Some(HighlightLanguage::Json),
-            "toml" => Some(HighlightLanguage::Toml),
-            "sh" | "bash" | "zsh" => Some(HighlightLanguage::Bash),
-            "css" => Some(HighlightLanguage::Css),
-            "html" | "htm" => Some(HighlightLanguage::Html),
-            "go" => Some(HighlightLanguage::Go),
-            "rb" => Some(HighlightLanguage::Ruby),
-            "c" | "h" => Some(HighlightLanguage::C),
-            "sql" => Some(HighlightLanguage::Sql),
-            "md" | "markdown" => Some(HighlightLanguage::Markdown),
-            _ => None,
-        }
+        let lang = crate::util::tree_sitter::tree_sitter_language_for_extension(ext)?;
+        LANGUAGE_TO_HIGHLIGHT
+            .get_or_init(Self::build_language_map)
+            .get(&lang)
+            .copied()
     }
 
     /// Determine language from a file path.
@@ -542,6 +538,22 @@ impl HighlightLanguage {
             .extension()
             .and_then(|e| e.to_str())
             .and_then(HighlightLanguage::from_extension)
+    }
+
+    /// Populate [`LANGUAGE_TO_HIGHLIGHT`] with the inverse of
+    /// [`language_and_query`].
+    ///
+    /// Because this iterates over all [`HighlightLanguage`] variants and calls
+    /// [`language_and_query`] for each, the map is automatically maintained
+    /// when a new language is added — no manual insert calls needed.
+    #[must_use]
+    fn build_language_map() -> HashMap<Language, HighlightLanguage> {
+        let mut map = HashMap::new();
+        for variant in HighlightLanguage::VARIANTS {
+            let (lang, _) = variant.language_and_query();
+            map.insert(lang, *variant);
+        }
+        map
     }
 
     /// Return the tree-sitter Language and highlight query string for this language.
