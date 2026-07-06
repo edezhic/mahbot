@@ -1647,6 +1647,36 @@ fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
     text.size(size).color(color).into()
 }
 
+/// Shared sidebar toggle wrapper — wraps an icon inside a centered,
+/// full-width button with a tooltip appearing above it.
+///
+/// Used by [`Dashboard::render_maintainer_toggle`] and
+/// [`Dashboard::render_pause_toggle`].
+/// Does **not** handle [`Dashboard::render_sidebar_nav`] which uses
+/// [`tooltip::Position::Right`] instead of [`tooltip::Position::Top`].
+fn render_sidebar_toggle<'a>(
+    icon: Element<'a, Message>,
+    tooltip_text: &'a str,
+    action: Option<Message>,
+) -> Element<'a, Message> {
+    tooltip(
+        button(
+            container(icon)
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+                .padding([4, 0]),
+        )
+        .width(Length::Fill)
+        .padding(0)
+        .style(theme::button_text)
+        .on_press_maybe(action),
+        text(tooltip_text).size(11),
+        tooltip::Position::Top,
+    )
+    .style(theme::tooltip_style)
+    .into()
+}
+
 impl Dashboard {
     fn sidebar_view(&self) -> Element<'_, Message> {
         container(
@@ -1735,33 +1765,22 @@ impl Dashboard {
         ]
         .spacing(0)
         .align_x(Alignment::Center);
-        tooltip(
-            button(
-                container(maint_icon)
-                    .width(Length::Fill)
-                    .center_x(Length::Fill)
-                    .padding([4, 0]),
-            )
-            .width(Length::Fill)
-            .padding(0)
-            .style(theme::button_text)
-            .on_press_maybe(if has_ws {
+        let tooltip_text = if !has_ws {
+            "Select a workspace to toggle maintainer"
+        } else if self.maintenance_enabled() {
+            "Maintainer ON"
+        } else {
+            "Maintainer OFF"
+        };
+        render_sidebar_toggle(
+            maint_icon.into(),
+            tooltip_text,
+            if has_ws {
                 Some(Message::ToggleMaintenance)
             } else {
                 None
-            }),
-            text(if !has_ws {
-                "Select a workspace to toggle maintainer"
-            } else if self.maintenance_enabled() {
-                "Maintainer ON"
-            } else {
-                "Maintainer OFF"
-            })
-            .size(11),
-            tooltip::Position::Top,
+            },
         )
-        .style(theme::tooltip_style)
-        .into()
     }
 
     /// Per-workspace pipeline pause/unpause toggle button.
@@ -1781,33 +1800,22 @@ impl Dashboard {
                 .size(28)
                 .color(theme::TEXT_MUTED)
         };
-        tooltip(
-            button(
-                container(pause_icon)
-                    .width(Length::Fill)
-                    .center_x(Length::Fill)
-                    .padding([4, 0]),
-            )
-            .width(Length::Fill)
-            .padding(0)
-            .style(theme::button_text)
-            .on_press_maybe(if has_ws {
+        let tooltip_text = if !has_ws {
+            "Select a workspace to pause"
+        } else if self.paused() {
+            "Resume pipeline"
+        } else {
+            "Pause pipeline"
+        };
+        render_sidebar_toggle(
+            pause_icon.into(),
+            tooltip_text,
+            if has_ws {
                 Some(Message::TogglePause)
             } else {
                 None
-            }),
-            text(if !has_ws {
-                "Select a workspace to pause"
-            } else if self.paused() {
-                "Resume pipeline"
-            } else {
-                "Pause pipeline"
-            })
-            .size(11),
-            tooltip::Position::Top,
+            },
         )
-        .style(theme::tooltip_style)
-        .into()
     }
 
     /// Render the self-update button in the footer bar.
