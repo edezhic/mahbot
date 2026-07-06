@@ -1193,12 +1193,12 @@ async fn transition_ticket_to_failed(
     .await
 }
 
-/// Transition the ticket to Done if git is not available.
+/// Transition the ticket to Done if git is unavailable.
 ///
 /// Returns `true` if the caller should return immediately (transition to Done
 /// already performed), `false` if git is usable and normal operations should proceed.
 #[must_use]
-async fn transition_ticket_to_done_if_no_git(
+async fn transition_ticket_to_done_if_git_unavailable(
     ticket: &Ticket,
     repo_path: &Path,
     source: TicketPhase,
@@ -1233,12 +1233,12 @@ async fn transition_ticket_to_done_if_no_git(
 /// - **Clean tree:** skips commit, transitions directly to Done with notification.
 /// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::git_commands::run_git_commit`].
 /// - **Commit failure:** ticket stays in `source`, poller retries next cycle.
-/// - **No git:** delegated to [`transition_ticket_to_done_if_no_git`].
+/// - **Git unavailable:** delegated to [`transition_ticket_to_done_if_git_unavailable`].
 async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    if transition_ticket_to_done_if_no_git(&ticket, repo_path, source).await {
+    if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
         return;
     }
 
@@ -1378,7 +1378,8 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
     // Git not available or not a git repo — transition to Done directly.
-    if transition_ticket_to_done_if_no_git(&ticket, repo_path, TicketPhase::QaPassed).await {
+    if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, TicketPhase::QaPassed).await
+    {
         return;
     }
 
