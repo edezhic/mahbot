@@ -805,10 +805,15 @@ struct VerifierInfo {
     ///   `"Reviewers"` (3 parallel agents)
     log_label: &'static str,
     success_phase: TicketPhase,
-    /// The ticket phase during which this verifier is active — the phase
-    /// a ticket must be in for the verifier to run (e.g.
-    /// [`TicketPhase::InReview`] for reviewers, [`TicketPhase::InQa`] for QA).
-    active_phase: TicketPhase,
+    /// The ticket phase that the verifier treats as its *source* — the phase a
+    /// ticket must be in for the verifier to run (e.g. [`TicketPhase::InReview`]
+    /// for reviewers, [`TicketPhase::InQa`] for QA).  This is the phase that
+    /// transitions *from* when the verifier finishes (to [`success_phase`] on
+    /// success, or to Failed/ReadyForDevelopment on failure).
+    ///
+    /// Contrast with [`PollPhaseInfo::active_phase`] which serves as the
+    /// *target* phase for claim transitions in the poll loop.
+    source_phase: TicketPhase,
     prompt_template: &'static str,
     extraction_prompt_path: &'static str,
 }
@@ -817,7 +822,7 @@ const REVIEWER_VI: VerifierInfo = VerifierInfo {
     role: Role::Reviewer,
     log_label: "Reviewers",
     success_phase: TicketPhase::Reviewed,
-    active_phase: TicketPhase::InReview,
+    source_phase: TicketPhase::InReview,
     prompt_template: "review.md",
     extraction_prompt_path: "extraction/reviewer.md",
 };
@@ -826,7 +831,7 @@ const QA_VI: VerifierInfo = VerifierInfo {
     role: Role::Qa,
     log_label: "QA",
     success_phase: TicketPhase::QaPassed,
-    active_phase: TicketPhase::InQa,
+    source_phase: TicketPhase::InQa,
     prompt_template: "qa.md",
     extraction_prompt_path: "extraction/qa.md",
 };
@@ -890,7 +895,7 @@ impl PollPhase {
                 role_label: DIAGNOSTICS_ROLE,
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
-                active_phase: vi.active_phase,
+                active_phase: vi.source_phase,
                 pipeline_check: PipelineCheck::Skip,
                 role_label: vi.role.as_str(),
             },
@@ -2522,7 +2527,7 @@ async fn process_verifier_verdicts(
     if all_failed {
         let _ = transition_ticket_to_failed(
             ticket,
-            verifier.active_phase,
+            verifier.source_phase,
             &format!(
                 "❌ All {label} agents failed to produce verdicts — \
                  ticket marked as Failed.",
@@ -2536,14 +2541,14 @@ async fn process_verifier_verdicts(
 
     // Priority 2: any verifier failed — bounce back to development.
     if results.iter().any(|r| !verdict_passes(r.verdict.as_ref())) {
-        bounce_back_to_development(ticket, verifier.active_phase, verifier.log_label).await;
+        bounce_back_to_development(ticket, verifier.source_phase, verifier.log_label).await;
         return;
     }
 
     // Priority 3: all passed — transition to the success phase (buffered).
     if let Err(e) = transition_ticket(
         ticket,
-        verifier.active_phase,
+        verifier.source_phase,
         verifier.success_phase,
         NotifyPolicy::Buffer,
         None,
@@ -2552,7 +2557,7 @@ async fn process_verifier_verdicts(
     {
         warn_transition_failed(
             ticket,
-            verifier.active_phase,
+            verifier.source_phase,
             verifier.success_phase,
             verifier.log_label,
             "completed",
@@ -2588,7 +2593,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     let Some(results) = dispatch_parallel_agents(
         &ticket,
         &ws,
-        vi.active_phase,
+        vi.source_phase,
         vi.role,
         &prompt,
         &extraction_prompt,
