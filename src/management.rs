@@ -259,23 +259,15 @@ enum NotifyPolicy {
     Buffer,
 }
 
-/// Dispatch a ticket transition notification, either immediately or buffered.
-///
-/// Called after a successful transition to handle the notification side-effect.
-/// `source` is the phase the ticket transitioned *from* (used for the buffer
-/// entry).
-///
-/// Parameters follow the `(source, target)` convention shared with
-/// [`transition_ticket`], [`transition_ticket_to_done`], and others.
+/// Notification side-effect after a successful ticket transition. Parameters
+/// follow the `(source, target)` convention; `source` feeds the buffer entry
+/// when buffering, and `log_label` distinguishes callers in logs.
 ///
 /// `failure_comment` is meaningful only when `target == TicketPhase::Failed` and
 /// `notify == NotifyPolicy::Notify` — it carries the failure detail text that
 /// was already written to the DB atomically with the transition, avoiding a
 /// redundant DB round-trip in [`notify_ticket`]. Callers transitioning to
 /// non-Failed phases should pass `None`.
-///
-/// The `log_label` string is forwarded to [`resolve_ticket_workspace`] to
-/// distinguish callers in log messages.
 async fn dispatch_notification(
     ticket: &Ticket,
     source: TicketPhase,
@@ -295,14 +287,11 @@ async fn dispatch_notification(
 }
 
 /// Transition a ticket to `target` phase if it's still in `source` phase.
-///
-/// Returns `Ok(())` if the transition was applied (ticket was still in source
-/// phase). Returns `Err(anyhow::Error)` with a descriptive message if the ticket was
-/// moved externally (phase mismatch) **or** a DB error occurred. On failure,
-/// does **not** clear `assigned_to` — doing so would either steal the new
-/// owner's assignment (phase mismatch) or orphan the ticket (DB error), and
-/// [`BoardStore::transition_to`] already handles agent cancellation on the
-/// success path.
+/// Returns `Ok(())` on success, or an error if the ticket was moved externally
+/// (phase mismatch) **or** a DB error occurred. On failure, does **not** clear
+/// `assigned_to` — doing so would either steal the new owner's assignment (phase
+/// mismatch) or orphan the ticket (DB error), and [`BoardStore::transition_to`]
+/// already handles agent cancellation on the success path.
 ///
 /// The `pipeline_reservation` parameter is forwarded to
 /// [`BoardStore::transition_to`]: pass `Some(true)` for bounce-back transitions
@@ -607,12 +596,6 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
     }
 }
 
-/// Prepare and dispatch a notification for a ticket transition.
-///
-/// Renders the notification message and enqueues a Manager job via the
-/// serialized [`crate::manager_queue::MANAGER_QUEUE`]. The consumer loop handles user lookup
-/// and delivery (broadcasts to all users with this workspace active).
-///
 /// This is a pure notification function — it does NOT pause the workspace.
 /// The Manager handles failed tickets autonomously via the triage prompt.
 ///
