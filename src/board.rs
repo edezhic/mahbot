@@ -3563,7 +3563,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     // ── Integration test: corrupt prerequisites in the database ──
 
     #[tokio::test]
-    async fn corrupt_prerequisites_causes_get_ticket_error() {
+    async fn corrupt_prerequisites_causes_query_errors() {
         let (store, _tmp, id) = setup().await;
 
         // Directly corrupt the prerequisites column via raw SQL
@@ -3576,7 +3576,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .await
             .expect("corrupt update");
 
-        // get_ticket should now return an error
+        // get_ticket should fail when prerequisites are corrupt
         let result = store.get_ticket(&id).await;
         assert!(
             result.is_err(),
@@ -3592,26 +3592,22 @@ with a comment explaining why no agent is mid-execution in that state.\
             msg.contains(&id),
             "error should include ticket ID {id}: {msg}"
         );
-    }
 
-    #[tokio::test]
-    async fn corrupt_prerequisites_causes_list_all_tickets_error() {
-        let (store, _tmp, id) = setup().await;
-        // Corrupt its prerequisites
-        store
-            .conn
-            .execute(
-                "UPDATE tickets SET prerequisites = ?1 WHERE id = ?2",
-                crate::turso::params!["garbage{{{", id.clone()],
-            )
-            .await
-            .expect("corrupt update");
-
-        // list_all_tickets should fail entirely
+        // list_all_tickets should also fail entirely
         let result = store.list_all_tickets(Some("ws"), None).await;
         assert!(
             result.is_err(),
             "list_all_tickets should fail when any ticket has corrupt prerequisites"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Corrupt prerequisites JSON"),
+            "list_all_tickets error should mention corrupt JSON: {msg}"
+        );
+        assert!(
+            msg.contains(&id),
+            "list_all_tickets error should include ticket ID {id}: {msg}"
         );
     }
 
