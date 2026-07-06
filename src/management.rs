@@ -1712,7 +1712,6 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// `comment` text and `verb` string.
 ///
 /// Returns `true` if the transition succeeded, `false` otherwise.
-#[must_use]
 async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) -> bool {
     comment_and_transition(TransitionParams::new(
         ticket,
@@ -1787,12 +1786,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
             if all_passed {
                 // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                if !finish_diagnostics(&ticket, &comment, "completed").await {
-                    warn!(
-                        ticket = %ticket.id,
-                        "Failed to transition to DiagnosticsDone after diagnostics passed",
-                    );
-                }
+                finish_diagnostics(&ticket, &comment, "completed").await;
             } else {
                 // Path C2: Diagnostics failed — write the failure comment and
                 // bounce back to development for rework.
@@ -1832,18 +1826,12 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         }
         Ok(_) => {
             // Path B: No diagnostics commands configured (or empty list) — skip.
-            if !finish_diagnostics(
+            finish_diagnostics(
                 &ticket,
                 "No diagnostics commands are configured for this workspace — diagnostics skipped.",
                 "skipped (no commands configured)",
             )
-            .await
-            {
-                warn!(
-                    ticket = %ticket.id,
-                    "Failed to transition to DiagnosticsDone (no commands configured)",
-                );
-            }
+            .await;
         }
         Err(e) => {
             // Path A: DB error loading diagnostics — log and skip.
@@ -1852,18 +1840,12 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 error = %e,
                 "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
             );
-            if !finish_diagnostics(
+            finish_diagnostics(
                 &ticket,
                 &format!("Could not load diagnostics commands due to a database error: {e}"),
                 "skipped (DB error)",
             )
-            .await
-            {
-                warn!(
-                    ticket = %ticket.id,
-                    "Failed to transition to DiagnosticsDone after DB error",
-                );
-            }
+            .await;
         }
     }
 }
