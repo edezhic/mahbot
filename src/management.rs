@@ -2040,34 +2040,6 @@ async fn record_verdict_comments_tx(
     Ok(())
 }
 
-/// Record per-agent verdict comments on a ticket, managing its own transaction.
-///
-/// Thin wrapper over [`record_verdict_comments_tx`] for callers that don't
-/// need atomic composition with other operations.
-#[cfg_attr(not(test), allow(dead_code))]
-async fn record_verdict_comments(
-    ticket_id: &str,
-    results: &[ParallelVerdict],
-    role_str: &str,
-    filter: VerdictFilter,
-) {
-    if let Err(e) = crate::turso::with_tx(
-        &board().conn,
-        ticket_id,
-        "write verdict comments",
-        async |tx| record_verdict_comments_tx(tx, ticket_id, results, role_str, filter).await,
-    )
-    .await
-    {
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "Failed to write verdict comments batch ({} results)",
-            results.len(),
-        );
-    }
-}
-
 /// Shared orchestration skeleton for dispatch functions that spawn parallel
 /// agents and then process results via extraction.
 ///
@@ -2702,7 +2674,7 @@ mod tests {
         }
     }
 
-    /// Verify that `record_verdict_comments` correctly writes comments
+    /// Verify that `record_verdict_comments_tx` correctly writes comments
     /// based on verdict filter.
     #[tokio::test]
     async fn record_verdict_comments_filtering() {
@@ -2719,13 +2691,23 @@ mod tests {
         // ── FailingOnly with all-passing verdicts ──
         // Should produce 0 comments (nothing to write).
         let results = vec![pass_result()];
-        record_verdict_comments(
+        crate::turso::with_tx(
+            &board().conn,
             &ticket_id,
-            &results,
-            Role::Reviewer.as_str(),
-            VerdictFilter::FailingOnly,
+            "test verdict comments",
+            async |tx| {
+                record_verdict_comments_tx(
+                    tx,
+                    &ticket_id,
+                    &results,
+                    Role::Reviewer.as_str(),
+                    VerdictFilter::FailingOnly,
+                )
+                .await
+            },
         )
-        .await;
+        .await
+        .expect("record_verdict_comments_tx should succeed");
 
         let comments = board()
             .get_comments(&ticket_id)
@@ -2740,13 +2722,23 @@ mod tests {
         // ── FailingOnly with a failing verdict ──
         // Should produce 1 comment.
         let results = vec![fail_result()];
-        record_verdict_comments(
+        crate::turso::with_tx(
+            &board().conn,
             &ticket_id,
-            &results,
-            Role::Reviewer.as_str(),
-            VerdictFilter::FailingOnly,
+            "test verdict comments",
+            async |tx| {
+                record_verdict_comments_tx(
+                    tx,
+                    &ticket_id,
+                    &results,
+                    Role::Reviewer.as_str(),
+                    VerdictFilter::FailingOnly,
+                )
+                .await
+            },
         )
-        .await;
+        .await
+        .expect("record_verdict_comments_tx should succeed");
 
         let comments = board()
             .get_comments(&ticket_id)
@@ -2765,13 +2757,23 @@ mod tests {
             analyst_verdict(10, "Excellent analysis.", &[]),
             analyst_verdict(4, "Needs more research.", &["Missing citations"]),
         ];
-        record_verdict_comments(
+        crate::turso::with_tx(
+            &board().conn,
             &ticket_id,
-            &results,
-            Role::Analyst.as_str(),
-            VerdictFilter::All,
+            "test verdict comments",
+            async |tx| {
+                record_verdict_comments_tx(
+                    tx,
+                    &ticket_id,
+                    &results,
+                    Role::Analyst.as_str(),
+                    VerdictFilter::All,
+                )
+                .await
+            },
         )
-        .await;
+        .await
+        .expect("record_verdict_comments_tx should succeed");
 
         let comments = board()
             .get_comments(&ticket_id)
