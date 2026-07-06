@@ -2407,109 +2407,111 @@ mod tests {
     }
 
     #[test]
-    fn test_truncation_no_limits() {
-        let files = vec![make_file_with_hunks("a.rs", 200, 200)];
-        assert_eq!(compute_truncation_index(&files, None, None), None);
-    }
+    fn test_truncation_index() {
+        struct Case {
+            name: &'static str,
+            files: Vec<DiffFile>,
+            selected_file: Option<&'static str>,
+            limits: Option<(usize, usize)>,
+            expected: Option<usize>,
+        }
 
-    #[test]
-    fn test_truncation_empty_slice() {
-        let files: Vec<DiffFile> = Vec::new();
-        assert_eq!(
-            compute_truncation_index(&files, None, Some((100, 5000))),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_truncation_all_files_fit() {
-        let files = vec![
-            make_file_with_hunks("a.rs", 30, 40),
-            make_file_with_hunks("b.rs", 30, 40),
+        let cases: &[Case] = &[
+            Case {
+                name: "no_limits",
+                files: vec![make_file_with_hunks("a.rs", 200, 200)],
+                selected_file: None,
+                limits: None,
+                expected: None,
+            },
+            Case {
+                name: "empty_slice",
+                files: Vec::new(),
+                selected_file: None,
+                limits: Some((100, 5000)),
+                expected: None,
+            },
+            Case {
+                name: "all_files_fit — 60 hunks, 2400 lines, both under limits",
+                files: vec![
+                    make_file_with_hunks("a.rs", 30, 40),
+                    make_file_with_hunks("b.rs", 30, 40),
+                ],
+                selected_file: None,
+                limits: Some((100, 5000)),
+                expected: None,
+            },
+            Case {
+                name: "hunk_cap — a has 60 hunks, adding b makes 110 > 100",
+                files: vec![
+                    make_file_with_hunks("a.rs", 60, 10),
+                    make_file_with_hunks("b.rs", 50, 10),
+                ],
+                selected_file: None,
+                limits: Some((100, 5000)),
+                expected: Some(1),
+            },
+            Case {
+                name: "line_cap — a+b=2000 lines, adding c makes 7000 > 5000",
+                files: vec![
+                    make_file_with_hunks("a.rs", 10, 100),
+                    make_file_with_hunks("b.rs", 10, 100),
+                    make_file_with_hunks("c.rs", 10, 500),
+                ],
+                selected_file: None,
+                limits: Some((100, 5000)),
+                expected: Some(2),
+            },
+            Case {
+                name: "binary_files_skipped — binary at idx=0 consumes no capacity",
+                files: vec![
+                    make_binary_file("binary.bin"),
+                    make_file_with_hunks("a.rs", 60, 10),
+                    make_file_with_hunks("b.rs", 50, 10),
+                ],
+                selected_file: None,
+                limits: Some((100, 5000)),
+                expected: Some(2),
+            },
+            Case {
+                name: "selected_file_filter — only b.rs passes, 10 hunks 100 lines within cap",
+                files: vec![
+                    make_file_with_hunks("a.rs", 80, 50),
+                    make_file_with_hunks("b.rs", 10, 10),
+                    make_file_with_hunks("c.rs", 80, 50),
+                ],
+                selected_file: Some("b.rs"),
+                limits: Some((100, 5000)),
+                expected: None,
+            },
+            Case {
+                name: "selected_file_exceeds_cap — b.rs has 6000 lines > 5000",
+                files: vec![make_file_with_hunks("b.rs", 60, 100)],
+                selected_file: Some("b.rs"),
+                limits: Some((100, 5000)),
+                expected: Some(0),
+            },
+            Case {
+                name: "too_large_files_skipped — large.bin skipped, a.rs+b.rs within cap",
+                files: vec![
+                    make_too_large_file("large.bin"),
+                    make_file_with_hunks("a.rs", 40, 30),
+                    make_file_with_hunks("b.rs", 40, 30),
+                ],
+                selected_file: None,
+                limits: Some((100, 5000)),
+                expected: None,
+            },
         ];
-        // 60 hunks, 2400 lines — both under limits
-        assert_eq!(
-            compute_truncation_index(&files, None, Some((100, 5000))),
-            None,
-        );
-    }
 
-    #[test]
-    fn test_truncation_hunk_cap() {
-        let files = vec![
-            make_file_with_hunks("a.rs", 60, 10),
-            make_file_with_hunks("b.rs", 50, 10),
-        ];
-        // After a: 60 hunks, 600 lines. Adding b: 60+50=110 > 100 → truncate at b (idx=1)
-        assert_eq!(
-            compute_truncation_index(&files, None, Some((100, 5000))),
-            Some(1),
-        );
-    }
-
-    #[test]
-    fn test_truncation_line_cap() {
-        let files = vec![
-            make_file_with_hunks("a.rs", 10, 100), // 1000 lines
-            make_file_with_hunks("b.rs", 10, 100), // +1000 = 2000
-            make_file_with_hunks("c.rs", 10, 500), // +5000 = 7000 > 5000 → truncate at c
-        ];
-        assert_eq!(
-            compute_truncation_index(&files, None, Some((100, 5000))),
-            Some(2),
-        );
-    }
-
-    #[test]
-    fn test_truncation_binary_files_skipped() {
-        let files = vec![
-            make_binary_file("binary.bin"),
-            make_file_with_hunks("a.rs", 60, 10), // 600 lines
-            make_file_with_hunks("b.rs", 50, 10), // +500 = 1100 (under cap, but 110 > 100 hunks)
-        ];
-        // Binary at idx=0 consumes no capacity.
-        // idx=1 (a.rs): 60 hunks, 600 lines — within cap
-        // idx=2 (b.rs): 60+50=110 > 100 hunks → truncate at idx=2
-        assert_eq!(
-            compute_truncation_index(&files, None, Some((100, 5000))),
-            Some(2),
-        );
-    }
-
-    #[test]
-    fn test_truncation_selected_file_filter() {
-        let files = vec![
-            make_file_with_hunks("a.rs", 80, 50),
-            make_file_with_hunks("b.rs", 10, 10), // <-- selected
-            make_file_with_hunks("c.rs", 80, 50),
-        ];
-        // Only b.rs passes the filter — 10 hunks, 100 lines — within cap
-        assert_eq!(
-            compute_truncation_index(&files, Some("b.rs"), Some((100, 5000))),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_truncation_selected_file_exceeds_cap() {
-        let files = vec![make_file_with_hunks("b.rs", 60, 100)]; // 6000 lines
-        assert_eq!(
-            compute_truncation_index(&files, Some("b.rs"), Some((100, 5000))),
-            Some(0),
-        );
-    }
-
-    #[test]
-    fn test_truncation_too_large_files_skipped() {
-        let files = vec![
-            make_too_large_file("large.bin"),
-            make_file_with_hunks("a.rs", 40, 30), // 1200 lines
-            make_file_with_hunks("b.rs", 40, 30), // +1200 = 2400 (within)
-        ];
-        assert_eq!(
-            compute_truncation_index(&files, None, Some((100, 5000))),
-            None,
-        );
+        for case in cases {
+            assert_eq!(
+                compute_truncation_index(&case.files, case.selected_file, case.limits),
+                case.expected,
+                "case: {}",
+                case.name,
+            );
+        }
     }
 
     // ── Stale-data regression tests ───────────────────────────────────
