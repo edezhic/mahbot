@@ -93,7 +93,7 @@ fn board() -> &'static BoardStore {
 
 /// Identifies which circuit breaker variant to use for phase-guard checks
 /// and trip logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 enum CircuitBreakerKind {
     /// General comment-count breaker: trips when the total number of comments
     /// exceeds 30.
@@ -2561,6 +2561,26 @@ mod tests {
         init_test_stores,
     };
     use crate::workspace::test_ws_named;
+    use strum::IntoEnumIterator;
+
+    /// All non-General circuit breaker variants must have a threshold strictly
+    /// less than [`CircuitBreakerKind::General`]'s threshold. This prevents
+    /// specialized breakers from letting a ticket accumulate more comments
+    /// than the general breaker would allow in a single phase.
+    #[test]
+    fn all_non_general_circuit_breakers_trip_before_general() {
+        let general = CircuitBreakerKind::General.threshold();
+        for kind in CircuitBreakerKind::iter() {
+            if kind == CircuitBreakerKind::General {
+                continue;
+            }
+            assert!(
+                kind.threshold() < general,
+                "{kind:?}.threshold() ({}) must be less than General.threshold() ({general})",
+                kind.threshold(),
+            );
+        }
+    }
 
     /// Verify that when the circuit breaker trips on a ticket, all other
     /// ReadyForDevelopment tickets in the same workspace are moved to Planning.
