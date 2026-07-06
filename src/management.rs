@@ -30,7 +30,9 @@ use futures_util::future::join_all;
 
 use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
-use crate::git_commands::list_new_or_untracked_files;
+use crate::git_commands::{
+    list_new_or_untracked_files, parse_new_files_from_porcelain, run_git_status,
+};
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
@@ -985,7 +987,7 @@ async fn poll_round() -> anyhow::Result<()> {
         // 3. SanitationPassed → Done (auto-commit), following the same pattern
         // as the QaPassed→Done commit flow.
         spawn_for_each_ticket_in_phase(TicketPhase::SanitationPassed, ws, |ticket, ws| {
-            finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed)
+            finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed, None)
         })
         .await;
 
@@ -1229,29 +1231,44 @@ async fn transition_ticket_to_done_if_git_unavailable(
 /// Parameterized by source phase so both the QaPassed→Done and
 /// SanitationPassed→Done flows share the same implementation.
 ///
+/// When `precomputed_porcelain` is `Some`, the caller has already verified git
+/// availability and run `git status --porcelain`. The function skips redundant
+/// git checks and uses the provided output directly. When `None`, it performs
+/// the full git availability check and status call.
+///
 /// Checks for a dirty working tree via `git status --porcelain`:
 /// - **Clean tree:** skips commit, transitions directly to Done with notification.
 /// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::git_commands::run_git_commit`].
 /// - **Commit failure:** ticket stays in `source`, poller retries next cycle.
 /// - **Git unavailable:** delegated to [`transition_ticket_to_done_if_git_unavailable`].
-async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
+async fn finalize_ticket_from_phase(
+    ticket: Ticket,
+    ws: Workspace,
+    source: TicketPhase,
+    precomputed_porcelain: Option<&str>,
+) {
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
-        return;
-    }
-
-    let has_changes = match crate::git_commands::run_git_status(repo_path).await {
-        Ok(output) => !output.trim().is_empty(),
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to check git status — staying in {phase_label} for retry"
-            );
+    // If no precomputed output was provided, check git availability first.
+    if precomputed_porcelain.is_none()
+        && transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
             return;
         }
+
+    let has_changes = match precomputed_porcelain {
+        Some(out) => !out.trim().is_empty(),
+        None => match crate::git_commands::run_git_status(repo_path).await {
+            Ok(output) => !output.trim().is_empty(),
+            Err(e) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to check git status — staying in {phase_label} for retry"
+                );
+                return;
+            }
+        },
     };
 
     if !has_changes {
@@ -1374,6 +1391,10 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 /// the ticket to InSanitation with `assigned_to` set (no TOCTOU window
 /// between transition and assignment), and dispatches the sanitation agent.
 /// Otherwise, commits and transitions to Done (existing behavior).
+///
+/// Runs `git status --porcelain` exactly once — the output is shared with
+/// [`finalize_ticket_from_phase`] to avoid a redundant ~50–500ms subprocess
+/// call and a redundant git-availability check.
 async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let repo_path = ws.as_path();
 
@@ -1383,51 +1404,61 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
         return;
     }
 
-    match list_new_or_untracked_files(repo_path).await {
-        Ok(untracked) if !untracked.is_empty() => {
-            // Untracked files exist — claim this specific ticket to InSanitation
-            // via the dedicated claim_sanitation method (see BoardStore docs).
-            let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
-            let claimed = match board().claim_sanitation(&ticket.id, &session_key).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        ticket = %ticket.id,
-                        error = %e,
-                        "Failed to transition QaPassed ticket to InSanitation"
-                    );
-                    return;
-                }
-            };
-
-            if !claimed {
-                debug!(
-                    ticket = %ticket.id,
-                    "QaPassed ticket moved externally — skipping sanitation dispatch",
-                );
-                return;
-            }
-
-            ticket_buffer::push(
-                &ticket.workspace_name,
-                &ticket.id,
-                TicketPhase::QaPassed,
-                TicketPhase::InSanitation,
-            );
-
-            spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
-        }
-        Ok(_) => {
-            // No untracked/new files — finalize to Done.
-            finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
-        }
+    // Run git status once. The porcelain output is used for both untracked-file
+    // detection (to decide whether to dispatch sanitation) and commit logic
+    // (when passing to finalize_ticket_from_phase). Sharing the output avoids a
+    // redundant ~50–500ms subprocess call.
+    let porcelain = match run_git_status(repo_path).await {
+        Ok(out) => out,
         Err(e) => {
             warn!(
                 ticket = %ticket.id,
                 error = %e,
                 "Failed to check git status for untracked files — staying in QaPassed for retry"
             );
+            return;
         }
+    };
+
+    let untracked = parse_new_files_from_porcelain(&porcelain);
+
+    if untracked.is_empty() {
+        // No untracked/new files — finalize to Done, reusing the porcelain
+        // output to skip the redundant git availability check and git status
+        // call inside finalize_ticket_from_phase.
+        finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed, Some(&porcelain)).await;
+    } else {
+        // Untracked files exist — claim this specific ticket to InSanitation
+        // via the dedicated claim_sanitation method (see BoardStore docs).
+        let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
+        let claimed = match board().claim_sanitation(&ticket.id, &session_key).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to transition QaPassed ticket to InSanitation"
+                );
+                return;
+            }
+        };
+
+        if !claimed {
+            debug!(
+                ticket = %ticket.id,
+                "QaPassed ticket moved externally — skipping sanitation dispatch",
+            );
+            return;
+        }
+
+        ticket_buffer::push(
+            &ticket.workspace_name,
+            &ticket.id,
+            TicketPhase::QaPassed,
+            TicketPhase::InSanitation,
+        );
+
+        spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
     }
 }
 
