@@ -18,10 +18,11 @@ use tracing::Instrument;
 
 /// Maximum LLM iterations per agent turn.
 ///
-/// A misbehaving/adversarial model that keeps emitting tool calls will loop
-/// indefinitely without this guard.  1000 iterations is generous enough for
-/// any legitimate run (typical agents finish in 3–8 turns) while catching
-/// truly stuck loops.
+/// A model that keeps emitting tool calls will loop indefinitely without
+/// this guard. Common causes: weaker models stuck in tool-calling loops,
+/// broken prompt configurations, or genuinely adversarial behavior.
+/// 1000 iterations is generous enough for any legitimate run (typical agents
+/// finish in 3–8 turns) while catching truly stuck loops.
 const MAX_LLM_ITERATIONS: usize = 1000;
 
 /// Maximum length of serialized arguments stored in per-call stats.
