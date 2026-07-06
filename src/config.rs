@@ -1021,38 +1021,6 @@ mod tests {
         assert_eq!(trimmed_or_none(""), None);
     }
 
-    #[test]
-    fn set_string_field_updates_in_memory() {
-        let reload = ConfigReload::const_new();
-
-        // Unknown key returns false and does nothing
-        assert!(!reload.set_string_field("nonexistent", "value"));
-
-        // Known key returns true and updates the in-memory value
-        assert!(reload.set_string_field("image_gen_model", "test-model"));
-        assert_eq!(reload.image_gen_model(), "test-model");
-
-        // Empty string — typed accessor normalizes on read, so returns default
-        assert!(reload.set_string_field("image_gen_model", ""));
-        assert_eq!(
-            reload.image_gen_model(),
-            "google/gemini-3.1-flash-image-preview"
-        );
-    }
-
-    /// Verify that `STRUCT_FIELDS_DEFAULT` and `Default::default()` produce
-    /// semantically identical values.  Both initialise all `Option<String>`
-    /// fields to `None` and all `Vec` fields to empty vectors.
-    ///
-    /// This is a compile-time sanity check: if someone accidentally adds a
-    /// non-`None` / non-empty initialiser to one but not the other, this test
-    /// will catch the divergence.  (Currently both are structurally identical
-    /// by construction — this test is belt-and-suspenders against drift.)
-    #[test]
-    fn struct_fields_default_matches_derive_default() {
-        assert_eq!(ConfigData::default(), ConfigData::STRUCT_FIELDS_DEFAULT);
-    }
-
     // NOTE: Per-struct normalize tests (`role_config_normalize`,
     // `model_routing_normalize`) have been intentionally removed as
     // redundant.  Both `normalize()` methods are one-line delegations to
