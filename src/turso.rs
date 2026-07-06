@@ -157,45 +157,19 @@ where
 /// - `#[must_use] pub fn store()` — returns `&'static $Type`, panicking if
 ///   not yet initialized.
 ///
-/// # Two-arm syntax
+/// # Syntax
 ///
-/// Standard form — auto-generates expect message:
+/// Invocation with a required custom expect message:
 /// ```ignore
 /// global_store! {
 ///     /// Doc comment for the static.
 ///     pub static $NAME: $Type,
 ///     constructor = $constructor_expr,
-/// }
-/// ```
-///
-/// Custom expect form — for non-standard panic messages:
-/// ```ignore
-/// global_store! {
-///     /// Doc comment for the static.
-///     pub static $NAME: $Type,
-///     constructor = $constructor_expr,
-///     expect = $custom_message,
+///     expect = $expect_message,
 /// }
 /// ```
 #[macro_export]
 macro_rules! global_store {
-    // Standard form — auto-generates expect message.
-    (
-        $(#[$attr:meta])*
-        pub static $name:ident: $ty:ty,
-        constructor = $constructor:expr,
-    ) => {
-        $crate::global_store! {
-            $(#[$attr])*
-            pub static $name: $ty,
-            constructor = $constructor,
-            expect = concat!(
-                stringify!($name),
-                " not initialized — call init_global() first"
-            ),
-        }
-    };
-
     // Custom expect form.
     (
         $(#[$attr:meta])*
