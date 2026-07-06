@@ -468,7 +468,7 @@ impl<'a> TransitionParams<'a> {
 /// compile-time error, not a runtime panic.
 ///
 /// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
-/// agents (unlike [`BoardStore::transition_to`] / `execute_and_cancel`).
+/// agents (unlike [`BoardStore::transition_to`]).
 /// This is correct because `comment_and_transition` is only called from post-agent
 /// paths (verdict handling, diagnostics completion, sanitation verdict, etc.) —
 /// no agents should be running on this ticket at any call site that reaches

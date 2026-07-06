@@ -496,13 +496,58 @@ impl std::str::FromStr for TicketPhase {
 
 /// Bundles a SQL mutation statement with its parameters and a human-readable
 /// action description. Returned by [`BoardStore::build_transition_sql`] and
-/// [`BoardStore::build_set_commit_info_sql`]; also accepted by
-/// [`BoardStore::execute_and_cancel`], [`BoardStore::execute_update`], and
-/// [`BoardStore::execute_prepared_tx`].
+/// [`BoardStore::build_set_commit_info_sql`]; executed via
+/// [`PreparedUpdate::execute`], [`PreparedUpdate::execute_tx`], or
+/// [`PreparedUpdate::execute_and_cancel`].
 struct PreparedUpdate {
     sql: String,
     params: Vec<turso::Value>,
     action: String,
+    ticket_id: String,
+}
+
+impl PreparedUpdate {
+    /// Execute this update on a connection, verifying that a row was affected.
+    #[cfg(test)]
+    async fn execute(self, conn: &turso::Connection) -> Result<()> {
+        let rows = conn.execute(&self.sql, self.params).await?;
+        BoardStore::ensure_ticket_found(rows, &self.ticket_id, &self.action)?;
+        Ok(())
+    }
+
+    /// Execute within an existing transaction, verifying that a row was
+    /// affected. Does NOT cancel registered agents — the caller manages
+    /// transaction lifecycle and should cancel agents before starting the
+    /// transaction when needed.
+    async fn execute_tx(self, tx: &turso::TxGuard<'_>) -> Result<()> {
+        let rows = tx.execute(&self.sql, self.params).await?;
+        BoardStore::ensure_ticket_found(rows, &self.ticket_id, &self.action)?;
+        Ok(())
+    }
+
+    /// Execute the update, verify it affected a row, then cancel any agent
+    /// registered on this ticket.
+    ///
+    /// This is a convenience for single-ticket mutations that follow the
+    /// pattern: execute → verify → cancel stale agent.
+    ///
+    /// # When NOT to use
+    ///
+    /// Do **not** use this helper for operations with different semantics:
+    /// - **`PreparedUpdate::execute`** — for updates that should not cancel agents.
+    /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
+    /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
+    ///   before commit via a different pattern.
+    /// - **`BoardStore::batch_set_archived`** — batch operation, handles
+    ///   zero-affected-rows gracefully (no error).
+    /// - **`BoardStore::claim_sanitation`** — returns `Result<bool>`, does NOT cancel
+    ///   (QaPassed has no running agent).
+    async fn execute_and_cancel(self, conn: &turso::Connection) -> Result<()> {
+        let rows = conn.execute(&self.sql, self.params).await?;
+        BoardStore::ensure_ticket_found(rows, &self.ticket_id, &self.action)?;
+        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&self.ticket_id);
+        Ok(())
+    }
 }
 
 /// A single reset transition: when a ticket in `from` phase is found on startup,
@@ -994,6 +1039,7 @@ impl BoardStore {
             sql,
             params,
             action,
+            ticket_id: ticket_id.to_string(),
         }
     }
 
@@ -1036,6 +1082,7 @@ impl BoardStore {
             sql: sql.to_string(),
             params,
             action,
+            ticket_id: ticket_id.to_string(),
         }
     }
 
@@ -1062,7 +1109,7 @@ impl BoardStore {
     ) -> Result<()> {
         let prepared =
             Self::build_transition_sql(ticket_id, expected_phase, target_phase, reservation);
-        self.execute_and_cancel(ticket_id, prepared).await
+        prepared.execute_and_cancel(&self.conn).await
     }
 
     /// Transactional variant of [`transition_to`](Self::transition_to) —
@@ -1079,76 +1126,13 @@ impl BoardStore {
     ) -> Result<()> {
         let prepared =
             Self::build_transition_sql(ticket_id, expected_phase, target_phase, reservation);
-        Self::execute_prepared_tx(tx, prepared, ticket_id).await
+        prepared.execute_tx(tx).await
     }
 
     /// Verify that a mutation query affected at least one row, returning an
     /// error with a descriptive message if the ticket was not found.
     fn ensure_ticket_found(rows: u64, ticket_id: &str, action: &str) -> Result<()> {
         anyhow::ensure!(rows > 0, "Ticket {ticket_id} not found — cannot {action}");
-        Ok(())
-    }
-
-    /// Execute a prepared UPDATE within an existing transaction, verify it
-    /// affected a row, and return success.
-    ///
-    /// This is the transactional counterpart of
-    /// [`execute_update`](Self::execute_update) — it skips agent
-    /// cancellation because the caller manages transaction lifecycle and must
-    /// cancel agents before starting the transaction when needed.
-    ///
-    /// Used by [`transition_to_tx`](Self::transition_to_tx),
-    /// [`set_assigned_to_tx`](Self::set_assigned_to_tx), and
-    /// [`set_commit_info_tx`](Self::set_commit_info_tx).
-    async fn execute_prepared_tx(
-        tx: &TxGuard<'_>,
-        prepared: PreparedUpdate,
-        ticket_id: &str,
-    ) -> Result<()> {
-        let rows = tx.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, ticket_id, &prepared.action)?;
-        Ok(())
-    }
-
-    /// Execute a prepared UPDATE and verify it affected a row.
-    ///
-    /// This is the non-transactional counterpart of
-    /// [`execute_prepared_tx`](Self::execute_prepared_tx) — it skips agent
-    /// cancellation. Use [`execute_and_cancel`](Self::execute_and_cancel) when
-    /// agent cancellation is needed.
-    ///
-    /// Used by [`execute_and_cancel`](Self::execute_and_cancel) and (in test
-    /// builds) [`set_commit_info`](Self::set_commit_info).
-    async fn execute_update(&self, ticket_id: &str, prepared: PreparedUpdate) -> Result<()> {
-        let rows = self.conn.execute(&prepared.sql, prepared.params).await?;
-        Self::ensure_ticket_found(rows, ticket_id, &prepared.action)?;
-        Ok(())
-    }
-
-    /// Execute a mutation SQL, verify it affected a row, then cancel any agent
-    /// registered on the ticket.
-    ///
-    /// This is a convenience helper for single-ticket mutation methods that
-    /// follow the pattern: execute UPDATE → `ensure_ticket_found` → cancel stale
-    /// agent. Used by [`transition_to`](Self::transition_to),
-    /// [`set_assigned_to`](Self::set_assigned_to), and
-    /// [`set_archived`](Self::set_archived).
-    ///
-    /// # When NOT to use
-    ///
-    /// Do **not** use this helper for methods with different semantics:
-    /// - **`execute_update`** — for updates that should not cancel agents.
-    /// - **`claim_diagnostics`** — returns `Result<bool>` (conditional success),
-    ///   only cancels on successful claim.
-    /// - **`supersede_and_create`** — runs inside a transaction, cancels before
-    ///   commit via a different pattern.
-    /// - **`batch_set_archived`** — batch operation on many tickets, handles
-    ///   zero-affected-rows gracefully (no error).
-    /// - **`claim_sanitation`** — returns `Result<bool>` (conditional success),
-    ///   does NOT cancel registered agents (QaPassed has no running agent).
-    async fn execute_and_cancel(&self, ticket_id: &str, prepared: PreparedUpdate) -> Result<()> {
-        self.execute_update(ticket_id, prepared).await?;
-        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
         Ok(())
     }
 
@@ -1178,7 +1162,7 @@ impl BoardStore {
     /// a now-unassigned ticket.
     pub async fn set_assigned_to(&self, ticket_id: &str, assigned_to: Option<&str>) -> Result<()> {
         let prepared = Self::build_set_assigned_to_sql(ticket_id, assigned_to);
-        self.execute_and_cancel(ticket_id, prepared).await
+        prepared.execute_and_cancel(&self.conn).await
     }
 
     /// Transactional variant of [`set_assigned_to`](Self::set_assigned_to) —
@@ -1194,7 +1178,7 @@ impl BoardStore {
         assigned_to: Option<&str>,
     ) -> Result<()> {
         let prepared = Self::build_set_assigned_to_sql(ticket_id, assigned_to);
-        Self::execute_prepared_tx(tx, prepared, ticket_id).await
+        prepared.execute_tx(tx).await
     }
 
     /// Atomically claim a ticket for diagnostics execution.
@@ -1315,7 +1299,7 @@ impl BoardStore {
     ///
     /// **Test-only wrapper** — retained to exercise
     /// [`build_set_commit_info_sql`](Self::build_set_commit_info_sql) and
-    /// [`execute_update`](Self::execute_update) for commit-info operations.
+    /// [`PreparedUpdate::execute`] for commit-info operations.
     /// Production code uses [`set_commit_info_tx`](Self::set_commit_info_tx)
     /// inside transactions.
     ///
@@ -1327,7 +1311,7 @@ impl BoardStore {
     /// # Maintenance warning
     /// If a future feature needs this in production, remove the `#[cfg(test)]`
     /// gate and add a real caller. Note that the non-transactional variant
-    /// skips agent cancellation (unlike [`execute_and_cancel`](Self::execute_and_cancel));
+    /// skips agent cancellation (unlike [`PreparedUpdate::execute_and_cancel`]);
     /// prefer using [`set_commit_info_tx`](Self::set_commit_info_tx) inside a
     /// transaction instead. The tests will validate correctness before any
     /// production use.
@@ -1340,7 +1324,7 @@ impl BoardStore {
         lines_removed: i64,
     ) -> Result<()> {
         let prepared = Self::build_set_commit_info_sql(ticket_id, hash, lines_added, lines_removed);
-        self.execute_update(ticket_id, prepared).await
+        prepared.execute(&self.conn).await
     }
 
     /// Transactional variant of [`set_commit_info`](Self::set_commit_info) —
@@ -1354,7 +1338,7 @@ impl BoardStore {
         lines_removed: i64,
     ) -> Result<()> {
         let prepared = Self::build_set_commit_info_sql(ticket_id, hash, lines_added, lines_removed);
-        Self::execute_prepared_tx(tx, prepared, ticket_id).await
+        prepared.execute_tx(tx).await
     }
 
     /// Finalize a ticket with commit info, comment, and transition to Done
@@ -1800,7 +1784,7 @@ impl BoardStore {
             "set archived".to_string(),
             ticket_id,
         );
-        self.execute_and_cancel(ticket_id, prepared).await
+        prepared.execute_and_cancel(&self.conn).await
     }
 
     /// Move all non-archived ReadyForDevelopment tickets in the given workspace
