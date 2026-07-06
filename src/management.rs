@@ -37,6 +37,7 @@ use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
 use crate::session::ticket_session_key;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
+use crate::turso::TxGuard;
 use crate::util::panic_message;
 use crate::util::scrub_credentials;
 use crate::{DiagnosticsCommands, Role, Tool, Workspace};
@@ -286,47 +287,6 @@ async fn dispatch_notification(
     }
 }
 
-/// Transition a ticket to `target` phase if it's still in `source` phase.
-/// Returns `Ok(())` on success, or an error if the ticket was moved externally
-/// (phase mismatch) **or** a DB error occurred. On failure, does **not** clear
-/// `assigned_to` — doing so would either steal the new owner's assignment (phase
-/// mismatch) or orphan the ticket (DB error), and [`BoardStore::transition_to`]
-/// already handles agent cancellation on the success path.
-///
-/// The `pipeline_reservation` parameter is forwarded to
-/// [`BoardStore::transition_to`]: pass `Some(true)` for bounce-back transitions
-/// (back to [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets
-/// priority re-dispatch over fresh tickets, or `None` for all other transitions.
-///
-/// On success, delegates to [`dispatch_notification`] (which dispatches or buffers
-/// based on the `notify` policy); errors from notification are logged and discarded
-/// (not propagated).
-async fn transition_ticket(
-    ticket: &Ticket,
-    source: TicketPhase,
-    target: TicketPhase,
-    notify: NotifyPolicy,
-    pipeline_reservation: Option<bool>,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        target != TicketPhase::Failed,
-        "Use transition_ticket_to_failed() to transition to Failed — \
-         it enforces the failure-comment invariant"
-    );
-    anyhow::ensure!(
-        target != TicketPhase::Done,
-        "Use transition_ticket_to_done() to transition to Done — \
-         it enforces the done-comment invariant"
-    );
-    let result = board()
-        .transition_to(&ticket.id, Some(source), target, pipeline_reservation)
-        .await;
-    if result.is_ok() {
-        dispatch_notification(ticket, source, target, notify, "transition_ticket", None).await;
-    }
-    result
-}
-
 /// Log a warning when a ticket transition fails, using `source` and `target`
 /// phases directly so hardcoded phase-name strings can't drift.
 ///
@@ -564,38 +524,6 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
     }
 }
 
-/// Bounce a ticket back to ReadyForDevelopment with pipeline reservation,
-/// logging success/failure. Used when a verifier (reviewer/QA) fails and
-/// the ticket needs priority re-dispatch.
-///
-/// Note: This does NOT support atomic comment+transition. The diagnostics
-/// failure path uses `comment_and_transition` (1 comment), sanitation uses
-/// `comment_and_transition` with a second optional comment (2 comments including
-/// a system marker). Those paths have different crash-safety requirements and
-/// should not be unified here — see the callers for their respective patterns.
-async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_label: &str) {
-    if let Err(e) = transition_ticket(
-        ticket,
-        source,
-        TicketPhase::ReadyForDevelopment,
-        NotifyPolicy::Buffer,
-        Some(true),
-    )
-    .await
-    {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "{log_label} failed but transition to ReadyForDevelopment also failed",
-        );
-    } else {
-        info!(
-            ticket = %ticket.id,
-            "{log_label} failed — pipeline reservation set for rework priority",
-        );
-    }
-}
-
 /// This is a pure notification function — it does NOT pause the workspace.
 /// The Manager handles failed tickets autonomously via the triage prompt.
 ///
@@ -603,13 +531,7 @@ async fn bounce_back_to_development(ticket: &Ticket, source: TicketPhase, log_la
 ///
 /// When `target_phase == TicketPhase::Failed`, the failure details are passed
 /// directly via `failure_comment` instead of re-reading from the database.
-/// The caller MUST ensure `failure_comment` is `Some` when `target == Failed` —
-/// this is enforced by [`comment_and_transition()`] which extracts the comment
-/// text before its inner closure consumes `params.comment`, and by the
-/// compile-time guard on [`transition_ticket()`] which prevents it from
-/// producing `Failed`. See [`comment_and_transition()`] for full detail on the
-/// call-chain mechanics.
-///
+/// The caller MUST ensure `failure_comment` is `Some` when `target == Failed`.
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
 /// must see both notification context and user conversation history in a unified
@@ -2124,11 +2046,32 @@ fn format_verdict_comment(
     }
 }
 
-/// Record per-agent verdict comments on a ticket.
+/// Record per-agent verdict comments on a ticket (inside an existing transaction).
 ///
 /// Analysts record ALL verdicts (passing + failing) so that every
 /// verdict is visible in the ticket discussion — this differs from
 /// verifiers (reviewers / QA), which only record failing comments.
+async fn record_verdict_comments_tx(
+    tx: &TxGuard<'_>,
+    ticket_id: &str,
+    results: &[ParallelVerdict],
+    role_str: &str,
+    filter: VerdictFilter,
+) -> anyhow::Result<()> {
+    for (i, r) in results.iter().enumerate() {
+        let role_label = format!("{role_str}_{}", i + 1);
+        if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
+            BoardStore::add_comment_tx(tx, ticket_id, &role_label, &comment).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Record per-agent verdict comments on a ticket, managing its own transaction.
+///
+/// Thin wrapper over [`record_verdict_comments_tx`] for callers that don't
+/// need atomic composition with other operations.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn record_verdict_comments(
     ticket_id: &str,
     results: &[ParallelVerdict],
@@ -2139,15 +2082,7 @@ async fn record_verdict_comments(
         &board().conn,
         ticket_id,
         "write verdict comments",
-        async |tx| {
-            for (i, r) in results.iter().enumerate() {
-                let role_label = format!("{role_str}_{}", i + 1);
-                if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-                    BoardStore::add_comment_tx(tx, ticket_id, &role_label, &comment).await?;
-                }
-            }
-            Ok(())
-        },
+        async |tx| record_verdict_comments_tx(tx, ticket_id, results, role_str, filter).await,
     )
     .await
     {
@@ -2230,16 +2165,6 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
 async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
-    // Record per-analyst comments.
-    // Analysts record ALL verdicts (passing + failing) — see `record_verdict_comments`.
-    record_verdict_comments(
-        &ticket.id,
-        results,
-        Role::Analyst.as_str(),
-        VerdictFilter::All,
-    )
-    .await;
-
     let nonempty_count = results.iter().filter(|r| r.has_response).count();
     let total = results.len();
     let mut lgtm = 0usize;
@@ -2273,22 +2198,65 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     // analysts must produce passing verdicts for the ticket to proceed.
     let all_passed = passing_count == PARALLEL_AGENT_COUNT;
 
-    if !comment_and_transition(TransitionParams::new(
-        ticket,
-        CommentParam {
-            role: SYSTEM_ROLE,
-            content: &summary,
+    // Write verdict comments, summary comment, and transition in a single
+    // transaction so a crash between verdict comments and the transition
+    // cannot leave orphan comments.
+    //
+    // We use [`BoardStore::transition_to_tx`] (no agent cancellation) rather
+    // than [`BoardStore::transition_to`] (which cancels agents). This is safe
+    // because analyst agents have already completed — no agents are running
+    // on this ticket at this point.
+    if let Err(e) = crate::turso::with_tx(
+        &board().conn,
+        &ticket.id,
+        "analyst verdict processing",
+        async |tx| {
+            record_verdict_comments_tx(
+                tx,
+                &ticket.id,
+                results,
+                Role::Analyst.as_str(),
+                VerdictFilter::All,
+            )
+            .await?;
+
+            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &summary).await?;
+            BoardStore::transition_to_tx(
+                tx,
+                &ticket.id,
+                Some(TicketPhase::Analysis),
+                TicketPhase::Planning,
+                None,
+            )
+            .await?;
+            Ok(())
         },
+    )
+    .await
+    {
+        warn_transition_failed(
+            ticket,
+            TicketPhase::Analysis,
+            TicketPhase::Planning,
+            "Analyst",
+            "completed",
+            &e,
+        );
+        return;
+    }
+
+    // Notification fires after the transaction commits so the user
+    // always sees the new phase in the database.
+    dispatch_notification(
+        ticket,
         TicketPhase::Analysis,
         TicketPhase::Planning,
         NotifyPolicy::Notify,
         "Analyst",
-        "completed",
-    ))
-    .await
-    {
-        return;
-    }
+        None,
+    )
+    .await;
+
     if all_passed {
         info!(
             ticket = %ticket.id,
@@ -2494,8 +2462,8 @@ async fn try_trip_circuit_breaker(
 ///    credits on a fundamentally broken dispatch.
 ///
 /// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
-///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (via
-///    [`bounce_back_to_development`]). The circuit
+///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (directly via
+///    [`transition_to_tx`](BoardStore::transition_to_tx)). The circuit
 ///    breaker is already checked in [`spawn_dispatch`] before agents start, so only
 ///    the bounce-back is needed here.
 ///
@@ -2511,62 +2479,113 @@ async fn process_verifier_verdicts(
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
 ) {
-    // Record per-agent comments for ALL outcomes (including the all-failed case).
-    // Previously the all-failed case skipped this and only wrote a summary comment;
-    // the per-agent comments provide more diagnostic information.
-    record_verdict_comments(
-        &ticket.id,
-        results,
-        verifier.role.as_str(),
-        VerdictFilter::FailingOnly,
-    )
-    .await;
-
-    // Priority 1: all agents failed to produce verdicts — terminal failure.
     let all_failed = results.iter().all(|r| r.verdict.is_none());
-    if all_failed {
-        let _ = transition_ticket_to_failed(
-            ticket,
-            verifier.source_phase,
-            &format!(
-                "❌ All {label} agents failed to produce verdicts — \
-                 ticket marked as Failed.",
-                label = verifier.log_label,
-            ),
-            verifier.log_label,
+    let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
+
+    // Determine transition parameters based on the three-way branch:
+    //   all-failed → Failed (notify, with failure comment)
+    //   any-failed → ReadyForDevelopment (buffer, pipeline reservation)
+    //   all-passed → verifier.success_phase (buffer)
+    let (target, notify, verb) = if all_failed {
+        (TicketPhase::Failed, NotifyPolicy::Notify, "failed")
+    } else if any_failed {
+        (
+            TicketPhase::ReadyForDevelopment,
+            NotifyPolicy::Buffer,
+            "failed",
         )
-        .await;
-        return;
-    }
+    } else {
+        (verifier.success_phase, NotifyPolicy::Buffer, "completed")
+    };
 
-    // Priority 2: any verifier failed — bounce back to development.
-    if results.iter().any(|r| !verdict_passes(r.verdict.as_ref())) {
-        bounce_back_to_development(ticket, verifier.source_phase, verifier.log_label).await;
-        return;
-    }
+    let pipeline_reservation = (target == TicketPhase::ReadyForDevelopment).then_some(true);
 
-    // Priority 3: all passed — transition to the success phase (buffered).
-    if let Err(e) = transition_ticket(
-        ticket,
-        verifier.source_phase,
-        verifier.success_phase,
-        NotifyPolicy::Buffer,
-        None,
+    // Build the failure comment string (only used in the all-failed branch).
+    let failure_comment = if all_failed {
+        Some(format!(
+            "❌ All {} agents failed to produce verdicts — \
+             ticket marked as Failed.",
+            verifier.log_label,
+        ))
+    } else {
+        None
+    };
+
+    // Write per-agent verdict comments AND the transition in a single
+    // transaction so a crash between the two cannot leave orphan comments.
+    //
+    // Note: we use [`BoardStore::transition_to_tx`] (which does NOT cancel
+    // registered agents) rather than [`BoardStore::transition_to`] (which
+    // does via `execute_and_cancel`). This is safe because the verifier
+    // agents have already completed and produced verdicts — no agents
+    // should be running on this ticket at this point. The same reasoning
+    // applies to [`comment_and_transition`] per its documentation.
+    if let Err(e) = crate::turso::with_tx(
+        &board().conn,
+        &ticket.id,
+        "verifier verdict processing",
+        async |tx| {
+            record_verdict_comments_tx(
+                tx,
+                &ticket.id,
+                results,
+                verifier.role.as_str(),
+                VerdictFilter::FailingOnly,
+            )
+            .await?;
+
+            // For the all-failed case, also write the system failure comment
+            // (matching what transition_ticket_to_failed did via comment_and_transition).
+            if let Some(ref fc) = failure_comment {
+                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, fc).await?;
+            }
+
+            BoardStore::transition_to_tx(
+                tx,
+                &ticket.id,
+                Some(verifier.source_phase),
+                target,
+                pipeline_reservation,
+            )
+            .await?;
+            Ok(())
+        },
     )
     .await
     {
         warn_transition_failed(
             ticket,
             verifier.source_phase,
-            verifier.success_phase,
+            target,
             verifier.log_label,
-            "completed",
+            verb,
             &e,
         );
-    } else {
+        return;
+    }
+
+    // Notification fires after the transaction commits so the user
+    // always sees the new phase in the database.
+    dispatch_notification(
+        ticket,
+        verifier.source_phase,
+        target,
+        notify,
+        verifier.log_label,
+        failure_comment.as_deref(),
+    )
+    .await;
+
+    if !all_failed && !any_failed {
         info!(
             ticket = %ticket.id,
             "{log_label}: all passed (≥ {REVIEW_QA_THRESHOLD}/10)",
+            log_label = verifier.log_label,
+        );
+    } else if any_failed {
+        info!(
+            ticket = %ticket.id,
+            "{log_label} failed — pipeline reservation set for rework priority",
             log_label = verifier.log_label,
         );
     }
@@ -2786,6 +2805,57 @@ mod tests {
             3,
             "All filter should write both verdicts (total 3)"
         );
+    }
+
+    /// Verify that `record_verdict_comments_tx` writes comments correctly
+    /// when used inside an existing transaction (the pattern used by the
+    /// atomic verdict processors).
+    #[tokio::test]
+    async fn record_verdict_comments_tx_filtering() {
+        init_test_stores().await;
+
+        let ticket_id = make_ticket(
+            board(),
+            &test_ws_named("/tmp/test", "tx_test"),
+            "TX Test",
+            TicketPhase::Backlog,
+        )
+        .await;
+
+        // ── Use _tx variant inside a manual with_tx block ──
+        let results = vec![
+            analyst_verdict(10, "Excellent analysis.", &[]),
+            analyst_verdict(4, "Needs more research.", &["Missing citations"]),
+        ];
+        crate::turso::with_tx(
+            &board().conn,
+            &ticket_id,
+            "test verdict comments tx",
+            async |tx| {
+                record_verdict_comments_tx(
+                    tx,
+                    &ticket_id,
+                    &results,
+                    Role::Analyst.as_str(),
+                    VerdictFilter::All,
+                )
+                .await
+            },
+        )
+        .await
+        .expect("record_verdict_comments_tx should succeed");
+
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert_eq!(
+            comments.len(),
+            2,
+            "_tx variant should write both verdict comments"
+        );
+        assert_eq!(comments[0].role, "analyst_1");
+        assert_eq!(comments[1].role, "analyst_2");
     }
 
     // ── transition_ticket_to_done — conditional notification ─────────

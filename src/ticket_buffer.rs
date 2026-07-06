@@ -1,8 +1,7 @@
 //! Ticket phase transition buffer — piggyback non-critical transitions
 //! onto critical notifications and user messages.
 //!
-//! Non-critical transitions (where `transition_ticket` is called with
-//! `NotifyPolicy::Buffer`) are buffered here and drained when a critical
+//! Non-critical transitions (called with [`NotifyPolicy::Buffer`]) are buffered here and drained when a critical
 //! notification triggers `notify_ticket` or when the user sends a
 //! Manager message. This ensures the Manager sees all ticket state changes
 //! without requiring a fresh `build_board_context` snapshot on every turn.

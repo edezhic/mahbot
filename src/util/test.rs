@@ -440,9 +440,8 @@ pub async fn init_test_stores() {
     .await;
 }
 
-/// Initialize all stores needed by management tests that call
-/// [`transition_ticket`](crate::management::transition_ticket) or interact
-/// with the ticket buffer.
+/// Initialize all stores needed by management tests that interact with
+/// the ticket buffer.
 ///
 /// Calls [`init_test_stores`] (all test DBs) then initializes the global
 /// manager queue. The manager queue consumer is required by callers that
