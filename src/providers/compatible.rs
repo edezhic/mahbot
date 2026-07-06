@@ -724,44 +724,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_function_resolution() {
-        // Name falls back to top-level name
-        let call: ApiToolCall = serde_json::from_value(serde_json::json!({
-            "name": "recall",
-            "arguments": "{\"query\":\"latest roadmap\"}"
-        }))
-        .unwrap();
-        assert_eq!(call.function_name().as_deref(), Some("recall"));
-
-        // Arguments fall back to parameters object
-        let call: ApiToolCall = serde_json::from_value(serde_json::json!({
-            "name": "shell",
-            "parameters": {"command": "pwd"}
-        }))
-        .unwrap();
-        assert_eq!(
-            call.function_arguments().as_deref(),
-            Some("{\"command\":\"pwd\"}")
-        );
-
-        // Nested function field preferred over top-level
-        let call: ApiToolCall = serde_json::from_value(serde_json::json!({
-            "name": "ignored_name",
-            "arguments": "{\"query\":\"ignored\"}",
-            "function": {
-                "name": "recall",
-                "arguments": "{\"query\":\"preferred\"}"
-            }
-        }))
-        .unwrap();
-        assert_eq!(call.function_name().as_deref(), Some("recall"));
-        assert_eq!(
-            call.function_arguments().as_deref(),
-            Some("{\"query\":\"preferred\"}")
-        );
-    }
-
-    #[test]
     #[allow(clippy::type_complexity)]
     fn resolve_tool_call_name_cases() {
         let cases: &[(&str, Option<&str>, Option<&str>, Option<&str>)] = &[
