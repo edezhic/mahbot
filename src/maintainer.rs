@@ -49,7 +49,7 @@ pub async fn run_maintainer_loop() {
             }
 
             // Skip workspace if maintainer is not explicitly enabled
-            if !ws.maintenance {
+            if !ws.maintenance_enabled {
                 continue;
             }
 

@@ -420,7 +420,7 @@ pub struct Dashboard {
     /// Maps workspace name → paused state (for sidebar toggle).
     workspace_paused: HashMap<String, bool>,
     /// Maps workspace name → maintenance state (for sidebar toggle).
-    workspace_maintenance: HashMap<String, bool>,
+    workspace_maintenance_enabled: HashMap<String, bool>,
     /// Currently selected workspace name from the global picker.
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
@@ -457,7 +457,7 @@ impl Dashboard {
             toasts: Vec::new(),
             workspace_paths: HashMap::new(),
             workspace_paused: HashMap::new(),
-            workspace_maintenance: HashMap::new(),
+            workspace_maintenance_enabled: HashMap::new(),
             selected_workspace_name: None,
             selected_user_name: None,
             update_status: if update_available {
@@ -524,8 +524,8 @@ impl Dashboard {
     }
 
     /// Whether the selected workspace's maintainer is enabled.
-    fn maintenance(&self) -> bool {
-        self.workspace_flag(&self.workspace_maintenance)
+    fn maintenance_enabled(&self) -> bool {
+        self.workspace_flag(&self.workspace_maintenance_enabled)
     }
 
     pub const fn theme(&self) -> iced::Theme {
@@ -577,10 +577,10 @@ impl Dashboard {
 
         match message {
             Message::Boot(result) => self.finish_boot(result),
-            Message::BootWorkspaces(paths, paused_map, maintenance_map, restored_name) => {
+            Message::BootWorkspaces(paths, paused_map, maintenance_enabled_map, restored_name) => {
                 self.workspace_paths = paths;
                 self.workspace_paused = paused_map;
-                self.workspace_maintenance = maintenance_map;
+                self.workspace_maintenance_enabled = maintenance_enabled_map;
                 // Pre-set Home's selected_user from persisted window state
                 // so UsersLoaded doesn't auto-select the first user when
                 // a previous user was saved.
@@ -1017,14 +1017,14 @@ impl Dashboard {
                     ));
                     return Task::none();
                 };
-                let new_enabled = !self.maintenance();
+                let new_enabled = !self.maintenance_enabled();
                 // Persist to DB; refresh state from DB on completion.
                 let ws_name_clone = ws_name.clone();
                 Task::perform(
                     async move {
                         let store = crate::workspace::store();
                         store
-                            .set_maintenance(&ws_name_clone, new_enabled)
+                            .set_maintenance_enabled(&ws_name_clone, new_enabled)
                             .await
                             .map_err(|e| e.to_string())
                     },
@@ -1040,9 +1040,11 @@ impl Dashboard {
                     "Maintainer disabled",
                     "Failed to toggle maintainer",
                 ),
-            Message::WorkspaceStatesRefreshed(paused_map, maintenance_map) if self.ready => {
+            Message::WorkspaceStatesRefreshed(paused_map, maintenance_enabled_map)
+                if self.ready =>
+            {
                 self.workspace_paused = paused_map;
-                self.workspace_maintenance = maintenance_map;
+                self.workspace_maintenance_enabled = maintenance_enabled_map;
                 Task::none()
             }
             Message::Home(_)
@@ -1719,13 +1721,17 @@ impl Dashboard {
         let has_ws = self.has_active_workspace();
         let maint_icon = column![
             text("Maint").size(8).color(theme::TEXT_MUTED),
-            text(if self.maintenance() { "ON" } else { "OFF" })
-                .size(9)
-                .color(if self.maintenance() {
-                    theme::ACCENT
-                } else {
-                    theme::TEXT_MUTED
-                }),
+            text(if self.maintenance_enabled() {
+                "ON"
+            } else {
+                "OFF"
+            })
+            .size(9)
+            .color(if self.maintenance_enabled() {
+                theme::ACCENT
+            } else {
+                theme::TEXT_MUTED
+            }),
         ]
         .spacing(0)
         .align_x(Alignment::Center);
@@ -1746,7 +1752,7 @@ impl Dashboard {
             }),
             text(if !has_ws {
                 "Select a workspace to toggle maintainer"
-            } else if self.maintenance() {
+            } else if self.maintenance_enabled() {
                 "Maintainer ON"
             } else {
                 "Maintainer OFF"
@@ -2197,12 +2203,12 @@ fn refresh_workspace_states_task() -> Task<Message> {
             match store.list_states().await {
                 Ok(states) => {
                     let mut paused = HashMap::with_capacity(states.len());
-                    let mut maintenance = HashMap::with_capacity(states.len());
+                    let mut maintenance_enabled = HashMap::with_capacity(states.len());
                     for (name, is_paused, is_maint) in states {
                         paused.insert(name.clone(), is_paused);
-                        maintenance.insert(name, is_maint);
+                        maintenance_enabled.insert(name, is_maint);
                     }
-                    Message::WorkspaceStatesRefreshed(paused, maintenance)
+                    Message::WorkspaceStatesRefreshed(paused, maintenance_enabled)
                 }
                 Err(e) => {
                     tracing::warn!("Failed to refresh workspace states: {e}");
@@ -2225,14 +2231,14 @@ async fn load_workspace_options(prev_selection: Option<String>) -> Message {
     let store = crate::workspace::store();
     let mut paths = HashMap::new();
     let mut paused_map = HashMap::new();
-    let mut maintenance_map = HashMap::new();
+    let mut maintenance_enabled_map = HashMap::new();
     let mut restored_name = None;
 
     if let Ok(ws_list) = store.list().await {
         for ws in &ws_list {
             paths.insert(ws.name.clone(), ws.path.clone());
             paused_map.insert(ws.name.clone(), ws.paused);
-            maintenance_map.insert(ws.name.clone(), ws.maintenance);
+            maintenance_enabled_map.insert(ws.name.clone(), ws.maintenance_enabled);
         }
     }
 
@@ -2246,7 +2252,7 @@ async fn load_workspace_options(prev_selection: Option<String>) -> Message {
         restored_name = Some(String::new());
     }
 
-    Message::BootWorkspaces(paths, paused_map, maintenance_map, restored_name)
+    Message::BootWorkspaces(paths, paused_map, maintenance_enabled_map, restored_name)
 }
 
 /// Open a URL in the system browser (fire-and-forget).

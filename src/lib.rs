@@ -121,13 +121,13 @@ pub struct Workspace {
     /// `false` — the maintainer skips this workspace entirely (default).
     ///
     /// Unlike [`Self::paused`] (which blocks development dispatch but allows all other
-    /// pipeline phases to run normally), `maintenance` specifically controls only
+    /// pipeline phases to run normally), `maintenance_enabled` specifically controls only
     /// the maintainer loop. A paused workspace can still be maintained if
-    /// `maintenance` is `true`, and vice versa.
+    /// `maintenance_enabled` is `true`, and vice versa.
     ///
     /// Persisted in the `workspaces` table with a `DEFAULT 0` schema default.
     /// Toggled via the settings panel in the GUI.
-    pub maintenance: bool,
+    pub maintenance_enabled: bool,
     /// Whether development dispatch is paused for this workspace (blocks
     /// ready_for_development → in_development). All other pipeline phases
     /// (analysis, review, QA, diagnostics, sanitation, maintainer) run normally.
@@ -156,7 +156,7 @@ impl Default for Workspace {
             status: String::default(),
             created_at: String::default(),
             updated_at: String::default(),
-            maintenance: bool::default(),
+            maintenance_enabled: bool::default(),
             paused: bool::default(),
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: Option::default(),

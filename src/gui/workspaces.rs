@@ -10,7 +10,7 @@ use iced::widget::markdown;
 /// Returns `None` when maintenance is disabled.
 #[must_use]
 pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
-    if !ws.maintenance {
+    if !ws.maintenance_enabled {
         return None;
     }
     let Some(ref last_str) = ws.maintainer_last_run_at else {
@@ -197,7 +197,7 @@ impl WorkspacesState {
             WorkspacesMessage::ToggleMaintainer(name, enabled) => Task::perform(
                 async move {
                     crate::workspace::store()
-                        .set_maintenance(&name, enabled)
+                        .set_maintenance_enabled(&name, enabled)
                         .await
                         .map_err(|e| e.to_string())
                 },

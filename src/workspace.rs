@@ -69,7 +69,7 @@ crate::columns! {
         STATUS                => "status",
         CREATED_AT            => "created_at",
         UPDATED_AT            => "updated_at",
-        MAINTENANCE           => "maintenance",
+        MAINTENANCE_ENABLED    => "maintenance",
         PAUSED                => "paused",
         MAINTAINER_DEBOUNCE_MINS => "maintainer_debounce_mins",
         MAINTAINER_LAST_RUN_AT  => "maintainer_last_run_at",
@@ -96,7 +96,7 @@ crate::columns! {
     WS_STATE_COLUMNS [WSST] {
         NAME         => "name",
         PAUSED       => "paused",
-        MAINTENANCE  => "maintenance",
+        MAINTENANCE_ENABLED => "maintenance",
     }
 }
 
@@ -425,7 +425,7 @@ fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
         status: row.get(COL_WS_STATUS)?,
         created_at: row.get(COL_WS_CREATED_AT)?,
         updated_at: row.get(COL_WS_UPDATED_AT)?,
-        maintenance: row.get::<bool>(COL_WS_MAINTENANCE)?,
+        maintenance_enabled: row.get::<bool>(COL_WS_MAINTENANCE_ENABLED)?,
         paused: row.get::<bool>(COL_WS_PAUSED)?,
         maintainer_debounce_mins: row.get::<i64>(COL_WS_MAINTAINER_DEBOUNCE_MINS)?,
         maintainer_last_run_at: row.get::<Option<String>>(COL_WS_MAINTAINER_LAST_RUN_AT)?,
@@ -469,7 +469,7 @@ impl WorkspaceStore {
             status: "pending".to_string(),
             created_at: now.clone(),
             updated_at: now.clone(),
-            maintenance: false,
+            maintenance_enabled: false,
             paused: true,
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: None,
@@ -506,7 +506,7 @@ impl WorkspaceStore {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Lightweight fetch of only name, paused, and maintenance columns.
+    /// Lightweight fetch of only name, paused, and maintenance_enabled columns.
     /// Used by the GUI sidebar's periodic state refresh — avoids fetching
     /// all workspace columns when only toggle state is needed.
     pub async fn list_states(&self) -> Result<Vec<(String, bool, bool)>> {
@@ -521,8 +521,8 @@ impl WorkspaceStore {
         for row in &rows {
             let name: String = row.get(COL_WSST_NAME)?;
             let paused: bool = row.get(COL_WSST_PAUSED)?;
-            let maintenance: bool = row.get(COL_WSST_MAINTENANCE)?;
-            states.push((name, paused, maintenance));
+            let maintenance_enabled: bool = row.get(COL_WSST_MAINTENANCE_ENABLED)?;
+            states.push((name, paused, maintenance_enabled));
         }
         Ok(states)
     }
@@ -558,7 +558,7 @@ impl WorkspaceStore {
     }
 
     /// Set or clear the maintenance toggle for a workspace.
-    pub async fn set_maintenance(&self, name: &str, enabled: bool) -> Result<()> {
+    pub async fn set_maintenance_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         let now = turso::now();
         let val: i64 = i64::from(enabled);
         if enabled {
@@ -898,12 +898,12 @@ mod tests {
         name: &str,
         path: &str,
         paused: bool,
-        maintenance: bool,
+        maintenance_enabled: bool,
         discovery_generation: i64,
     ) -> Workspace {
         let now = crate::turso::now();
         let paused_int: i64 = i64::from(paused);
-        let maint_int: i64 = i64::from(maintenance);
+        let maint_int: i64 = i64::from(maintenance_enabled);
         store
             .conn
             .execute(
@@ -919,7 +919,7 @@ mod tests {
             status: "pending".to_string(),
             created_at: now.clone(),
             updated_at: now.clone(),
-            maintenance,
+            maintenance_enabled,
             paused,
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: None,
@@ -1007,27 +1007,33 @@ mod tests {
         insert_direct(&store, "maint_test", "/tmp/maint_test", true, false, 0).await;
 
         // Enable maintenance
-        store.set_maintenance("maint_test", true).await.unwrap();
+        store
+            .set_maintenance_enabled("maint_test", true)
+            .await
+            .unwrap();
         let fetched = store
             .get_by_name("maint_test")
             .await
             .expect("fetch")
             .expect("exists");
         assert!(
-            fetched.maintenance,
-            "Should have maintenance enabled after set_maintenance(true)"
+            fetched.maintenance_enabled,
+            "Should have maintenance enabled after set_maintenance_enabled(true)"
         );
 
         // Disable maintenance
-        store.set_maintenance("maint_test", false).await.unwrap();
+        store
+            .set_maintenance_enabled("maint_test", false)
+            .await
+            .unwrap();
         let fetched = store
             .get_by_name("maint_test")
             .await
             .expect("fetch")
             .expect("exists");
         assert!(
-            !fetched.maintenance,
-            "Should have maintenance disabled after set_maintenance(false)"
+            !fetched.maintenance_enabled,
+            "Should have maintenance disabled after set_maintenance_enabled(false)"
         );
     }
 
@@ -1037,10 +1043,10 @@ mod tests {
 
         // Insert two workspaces with different toggle states.
         insert_direct(&store, "alice", "/tmp/alice", true, false, 0).await;
-        store.set_maintenance("alice", false).await.unwrap();
+        store.set_maintenance_enabled("alice", false).await.unwrap();
 
         insert_direct(&store, "bob", "/tmp/bob", false, false, 0).await;
-        store.set_maintenance("bob", true).await.unwrap();
+        store.set_maintenance_enabled("bob", true).await.unwrap();
 
         let states = store.list_states().await.expect("list_states");
         assert_eq!(states.len(), 2, "Should return both workspaces");
@@ -1048,19 +1054,19 @@ mod tests {
         // Build a map for assertion.
         let mut map: std::collections::HashMap<&str, (bool, bool)> =
             std::collections::HashMap::new();
-        for (name, paused, maintenance) in &states {
-            map.insert(name.as_str(), (*paused, *maintenance));
+        for (name, paused, maintenance_enabled) in &states {
+            map.insert(name.as_str(), (*paused, *maintenance_enabled));
         }
 
         assert_eq!(
             map.get("alice").copied(),
             Some((true, false)),
-            "Alice: paused=true, maintenance=false"
+            "Alice: paused=true, maintenance_enabled=false"
         );
         assert_eq!(
             map.get("bob").copied(),
             Some((false, true)),
-            "Bob: paused=false, maintenance=true"
+            "Bob: paused=false, maintenance_enabled=true"
         );
     }
 

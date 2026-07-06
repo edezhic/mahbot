@@ -713,7 +713,7 @@ impl SettingsState {
         } else {
             for (row_index, ws_item) in ws.workspaces.iter().enumerate() {
                 let (status_color, status_bg) = theme::workspace_status_color(&ws_item.status);
-                let maintainer_on = ws_item.maintenance;
+                let maintainer_on = ws_item.maintenance_enabled;
 
                 let delete_btn = if ws.delete_target == Some(ws_item.name.clone()) {
                     row![
