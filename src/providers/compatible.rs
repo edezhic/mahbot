@@ -859,9 +859,7 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_maps_tool_result_payload() {
-        let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_abc","content":"done"}"#,
-        )];
+        let input = vec![ChatMessage::tool_result("call_abc", "done")];
 
         let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));

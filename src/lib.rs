@@ -766,22 +766,16 @@ impl ChatMessage {
         }
     }
 
-    fn tool(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::Tool,
-            content: content.into(),
-        }
-    }
-
-    /// Construct a tool-role message with a structured `tool_call_id` + `content` payload.
-    /// Used to attach a tool result to a specific assistant tool-call.
     #[must_use]
     pub fn tool_result(tool_call_id: &str, content: &str) -> Self {
         let payload = serde_json::json!({
             "tool_call_id": tool_call_id,
             "content": content,
         });
-        Self::tool(payload.to_string())
+        Self {
+            role: ChatRole::Tool,
+            content: payload.to_string(),
+        }
     }
 }
 
