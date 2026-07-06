@@ -1252,9 +1252,10 @@ async fn finalize_ticket_from_phase(
 
     // If no precomputed output was provided, check git availability first.
     if precomputed_porcelain.is_none()
-        && transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
-            return;
-        }
+        && transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await
+    {
+        return;
+    }
 
     let has_changes = match precomputed_porcelain {
         Some(out) => !out.trim().is_empty(),

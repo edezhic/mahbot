@@ -202,9 +202,6 @@ fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
     })
 }
 
-/// The default phase assigned to newly created tickets.
-pub const DEFAULT_TICKET_PHASE: TicketPhase = TicketPhase::Backlog;
-
 /// Bundled parameters for ticket creation.
 ///
 /// Reduces parameter explosion across [`BoardStore::insert_ticket_tx`],
