@@ -16,7 +16,7 @@ use strum::EnumCount;
 use strum::VariantArray;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 use tree_sitter_md::{INLINE_LANGUAGE as MD_INLINE_LANG, MarkdownParser, MarkdownTree};
-// Built-in highlight queries for new languages (ticket mahbot-1244).
+// Built-in highlight queries for new languages.
 use tree_sitter_bash::HIGHLIGHT_QUERY as BASH_HIGHLIGHT_QUERY;
 use tree_sitter_c::HIGHLIGHT_QUERY as C_HIGHLIGHT_QUERY;
 use tree_sitter_css::HIGHLIGHTS_QUERY as CSS_HIGHLIGHTS_QUERY;

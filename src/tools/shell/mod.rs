@@ -2071,7 +2071,7 @@ mod tests {
                 ..Default::default()
             },
             // Regression: chained cargo test with compile errors and exit_code=0
-            // must NOT produce the misleading "[cargo test: ok]" (mahbot-1163).
+            // must NOT produce the misleading "[cargo test: ok]".
             ShellOutputCase {
                 name: "chained cargo test compile error regression",
                 command: "cargo test --lib || true",

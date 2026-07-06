@@ -540,7 +540,7 @@ const FLAG_CHECKS: &[FlagCheck] = &[
 /// This replaces the previous implementation that used [`canonical_command`],
 /// which truncated to the first non-flag argument only, meaning multiple
 /// path arguments (e.g. `tee /tmp/a /etc/passwd`) had only the first one
-/// validated — a security bypass (see mahbot-396).
+/// validated — a security bypass.
 ///
 /// The function skips:
 /// - Shell flags (tokens starting with `-`)
@@ -1259,8 +1259,8 @@ mod tests {
 
     // ── Heredoc quote-state tracking ────────────────────────────
 
-    /// Tests that `<<` inside quotes is not treated as a heredoc start
-    /// (fix for mahbot-73).  Without quote-state tracking in
+    /// Tests that `<<` inside quotes is not treated as a heredoc start.
+    /// Without quote-state tracking in
     /// [`strip_heredoc_bodies`], a quoted `<<` would cause everything
     /// after it — including real unquoted redirect operators — to be
     /// stripped from the redirect scan string, creating a false-negative
@@ -1512,7 +1512,7 @@ mod tests {
             ("mkdir -p /tmp/scratch_dir", true),
             ("tee output.log", false),
             ("rm /tmp/scratch.txt", false),
-            // ── Multiple path arguments (mahbot-396 security bypass) ──
+            // ── Multiple path arguments (security bypass) ──
             // Multiple path args under temp → should be allowed
             ("tee /tmp/scratch.log /tmp/out.txt", true),
             ("touch /tmp/a.txt /tmp/b.txt", true),

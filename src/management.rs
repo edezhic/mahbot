@@ -3527,7 +3527,7 @@ mod tests {
     /// failure comment and bounces the ticket back to `ReadyForDevelopment` with
     /// `pipeline_reservation = true`. This exercises Path C2 through the complete
     /// transaction (comment + transition), complementing the Path B test above
-    /// and verifying the with_tx crash-consistency fix for mahbot-847.
+    /// and verifying the with_tx crash-consistency fix.
     #[tokio::test]
     async fn diagnostics_failure_bounces_to_ready_for_development() {
         init_management_test_stores().await;

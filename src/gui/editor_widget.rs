@@ -3748,7 +3748,7 @@ mod tests {
 
     #[test]
     fn test_enter_at_end_of_highlighted_file_with_trailing_newline() {
-        // Regression test for mahbot-531: Enter at end of a highlighted file
+        // Regression test: Enter at end of a highlighted file
         // that *has* a trailing newline must place cursor on a new blank line,
         // not jump to the start of the last content line.
         let buf = EditorBuffer::with_text("fn main() {}\n", Some(HighlightLanguage::Rust));

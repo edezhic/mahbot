@@ -407,7 +407,7 @@ impl HomeState {
     /// NOTE: We deliberately do NOT write the sidebar workspace to the
     /// impersonated user's DB record.  The GUI sidebar is a per-session
     /// context — persisting it would silently overwrite the user's real
-    /// workspace choice (see mahbot-557).
+    /// workspace choice.
     async fn resolve_user_workspace_sync(user: String, current_ws: Option<String>) -> HomeMessage {
         match crate::users::get_raw_selected_workspace(&user).await {
             Ok(Some(ws_name)) => {
