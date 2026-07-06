@@ -657,10 +657,12 @@ pub fn role_badge_pill_style(_theme: &iced::Theme, color: Color) -> container::S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Role;
+    use strum::IntoEnumIterator;
 
     #[test]
     fn canonical_names_match() {
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let name = role.as_str();
             assert_eq!(
                 role_badge_color_for(&role),
@@ -680,7 +682,7 @@ mod tests {
 
     #[test]
     fn derivative_other_role_names_get_correct_color() {
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let name = role.as_str();
             let expected = role_badge_color_for(&role);
             assert_eq!(

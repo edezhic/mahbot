@@ -12,6 +12,7 @@
 use crate::Role;
 use crate::Workspace;
 use crate::config::{CONFIG, ConfigData, ModelRouting, RoleConfig};
+use strum::IntoEnumIterator;
 
 use iced::widget::{
     Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable, stack,
@@ -784,8 +785,8 @@ impl SettingsState {
                             // Agent icons column (FillPortion: 25)
                             {
                                 let mut role_btns = Row::new().spacing(2);
-                                for role in <crate::Role as strum::IntoEnumIterator>::iter()
-                                    .filter(|r| crate::role::role_info(r).has_discovery)
+                                for role in
+                                    Role::iter().filter(|r| crate::role::role_info(r).has_discovery)
                                 {
                                     let name = role.as_str();
                                     let (color, _bg) = theme::role_badge_color_for(&role);

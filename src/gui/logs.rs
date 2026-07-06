@@ -1,7 +1,10 @@
 //! Logs dashboard page — live log viewing with streaming, filters, pagination,
 //! plus a Tool Failures tab for browsing tool error entries.
 
+use crate::Role;
 use crate::logs::{LogEntry, LogQuery, LogStore};
+
+use strum::IntoEnumIterator;
 
 use iced::widget::{
     Column, Row, Space, button, column, container, pick_list, row, scrollable, text, text_input,
@@ -147,7 +150,7 @@ impl LogsState {
             role_filter: String::new(),
             workspace_filter: String::new(),
             search_filter: String::new(),
-            role_options: <crate::Role as strum::IntoEnumIterator>::iter()
+            role_options: Role::iter()
                 .map(|r| {
                     let name = r.to_string();
                     super::widgets::PickOption {

@@ -1,6 +1,9 @@
 //! Users dashboard page — manage user preferences.
 
+use crate::Role;
 use crate::users::{FieldUpdate, UserRecord, UserStore};
+
+use strum::IntoEnumIterator;
 
 use iced::Task;
 
@@ -123,7 +126,7 @@ impl UsersState {
                 self.workspace_options = ws_options;
 
                 // Build role options from Role::iter()
-                self.role_options = <crate::Role as strum::IntoEnumIterator>::iter()
+                self.role_options = Role::iter()
                     .map(|r| {
                         let name = r.to_string();
                         super::widgets::PickOption {

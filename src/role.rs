@@ -7,6 +7,8 @@
 
 use std::sync::LazyLock;
 
+use strum::IntoEnumIterator;
+
 use crate::Role;
 
 /// Role string for diagnostics comments — used both when posting diagnostics
@@ -160,7 +162,7 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
 
 /// Valid role names, pre-computed once to avoid re-iteration in error paths.
 static ALL_ROLE_NAMES: LazyLock<String> = LazyLock::new(|| {
-    <Role as strum::IntoEnumIterator>::iter()
+    Role::iter()
         .map(|r| r.as_str())
         .collect::<Vec<_>>()
         .join(", ")
@@ -171,11 +173,9 @@ impl std::str::FromStr for Role {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let lower = s.to_ascii_lowercase();
-        <Role as strum::IntoEnumIterator>::iter()
-            .find(|r| r.as_str() == lower)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Unknown role '{s}', expected one of: {}", *ALL_ROLE_NAMES)
-            })
+        Role::iter().find(|r| r.as_str() == lower).ok_or_else(|| {
+            anyhow::anyhow!("Unknown role '{s}', expected one of: {}", *ALL_ROLE_NAMES)
+        })
     }
 }
 
@@ -198,10 +198,13 @@ impl Role {
         role_info(self).requires_multimodal
     }
 
-    /// All roles as an iterator.
+    /// Collects all roles into a [`Vec<Role>`].
+    ///
+    /// Uses [`Role::iter()`] internally and collects into a `Vec`.
+    /// Prefer using [`Role::iter()`] directly in most cases to avoid allocation.
     #[must_use]
     pub fn all_roles() -> Vec<Role> {
-        <Role as strum::IntoEnumIterator>::iter().collect()
+        Role::iter().collect()
     }
 
     /// Role description loaded from embedded prompt files.
@@ -364,10 +367,12 @@ impl Role {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn role_roundtrip() {
         // FromStr for every variant by lowercase name
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let parsed: crate::Role = role.as_str().parse().unwrap();
             assert_eq!(parsed, role, "roundtrip failed for '{}'", role.as_str());
             // Display (strum-generated) must match the canonical as_str()
@@ -387,7 +392,7 @@ mod tests {
     #[test]
     fn requires_multimodal_only_artist() {
         // Only Artist should require multimodal; every other role should not.
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let info = super::role_info(&role);
             let expected = matches!(role, crate::Role::Artist);
             assert_eq!(
@@ -404,7 +409,7 @@ mod tests {
     fn badge_colors_set() {
         // Guards against the BASE_ROLE_INFO default of (0,0,0) — a new role
         // added with struct update syntax must set badge_fg explicitly.
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let info = super::role_info(&role);
             let (r, g, b) = info.badge_fg;
             let is_black = r == 0.0 && g == 0.0 && b == 0.0;
@@ -421,7 +426,7 @@ mod tests {
         // Guards against empty default_model or default_reasoning_effort — a new
         // role added with struct update syntax must set them if they differ from
         // the BASE_ROLE_INFO defaults, and even the base must be non-empty.
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let info = super::role_info(&role);
             assert!(
                 !info.default_model.is_empty(),
@@ -440,7 +445,7 @@ mod tests {
     fn display_labels_set() {
         // Guards against the BASE_ROLE_INFO sentinel of "" — every role must
         // set a display_label explicitly.
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let info = super::role_info(&role);
             assert!(
                 !info.display_label.is_empty(),
@@ -455,7 +460,7 @@ mod tests {
         // Guards against an empty Vec in Role::tools() — the compiler catches
         // missing arms in the match, but cannot catch an arm that returns
         // vec![]. Every role needs at least one tool to function.
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let tools = role.tools();
             assert!(
                 !tools.is_empty(),
@@ -474,7 +479,7 @@ mod tests {
 
     #[test]
     fn all_roles_have_summary_prompt() {
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             let prompt = role.summary_prompt();
             assert!(
                 !prompt.trim().is_empty(),
@@ -491,7 +496,7 @@ mod tests {
 
     #[test]
     fn all_roles_have_discovery_prompt() {
-        for role in <crate::Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             if !super::role_info(&role).has_discovery {
                 continue;
             }

@@ -10,6 +10,7 @@ use crate::session::discovery_session_key;
 use crate::turso::{self};
 use anyhow::{Context, Result};
 use futures_util::future::join_all;
+use strum::IntoEnumIterator;
 use tracing::warn;
 
 crate::define_store! {
@@ -300,7 +301,7 @@ pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
             // Run role discovery and diagnostics discovery concurrently.
             let (role_results, diagnostics_result) = tokio::join!(
                 join_all(
-                    <crate::Role as strum::IntoEnumIterator>::iter()
+                    Role::iter()
                         .filter(|r| crate::role::role_info(r).has_discovery)
                         .map(|role| {
                             let ws = ws.clone();

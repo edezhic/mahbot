@@ -312,9 +312,10 @@ mod tests {
         // not appear in tests — we add it explicitly.
         use crate::Role;
         use std::collections::HashSet;
+        use strum::IntoEnumIterator;
 
         let mut expected: HashSet<String> = HashSet::new();
-        for role in <Role as strum::IntoEnumIterator>::iter() {
+        for role in Role::iter() {
             for tool in role.tools() {
                 expected.insert(tool.name().to_string());
             }
