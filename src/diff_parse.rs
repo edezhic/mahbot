@@ -357,7 +357,12 @@ fn find_b_part(rest: &str) -> Option<&str> {
         let mut i: usize = 1;
         while i < bytes.len() {
             if bytes[i] == b'\\' {
-                i += 2; // skip escape sequence (backslash + one char)
+                // Skip past the escape sequence. Git's C-quoting uses single-char
+                // escapes (\t, \n, \\, \") or multi-byte octal escapes (\377, \342,
+                // etc.); skipping 2 bytes (backslash + next byte) is sufficient
+                // because remaining octal digits are plain bytes that can't match
+                // `\` or `"`.
+                i += 2;
             } else if bytes[i] == b'"' {
                 i += 1; // skip closing quote
                 break;
@@ -574,6 +579,15 @@ Binary files a/image.png and b/image.png differ
             (
                 r#"diff --git a/normal.rs "b/file\"x.rs""#,
                 Some("file\"x.rs"),
+            ),
+            // ── multi-byte octal escape (git's `\377` = byte 0xFF) ──
+            // Tests that `find_b_part`'s 2-byte escape skip (`i += 2`)
+            // correctly handles 4-byte octal escapes (`\377` = backslash +
+            // 3 octal digits): `\3` is skipped, remaining `77` are processed
+            // as ordinary non-delimiter bytes.
+            (
+                r#"diff --git "a/file\377name.rs" "b/file\377name.rs""#,
+                Some("file\u{FFFD}name.rs"), // 0xFF → replacement character
             ),
         ];
         for (i, (input, expected)) in cases.iter().enumerate() {
