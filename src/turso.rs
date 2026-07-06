@@ -348,42 +348,33 @@ impl Connection {
         })
     }
 
-    /// Handle a dangling transaction from a dropped TxGuard.
-    /// Called at the start of every write operation.
-    ///
-    /// The ROLLBACK is best-effort: if it fails (e.g., the database engine
-    /// already aborted the transaction on a constraint violation), the
-    /// error is silently ignored. The flag has already been cleared, so
-    /// sibling operations will not attempt another rollback.
-    async fn maybe_rollback_dangling_tx(&self) -> turso::Result<()> {
-        let conn = self.conn.lock().await;
-        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
-            let _ = conn.execute("ROLLBACK", ()).await;
-        }
-        Ok(())
-    }
-
     pub async fn execute(
         &self,
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<u64> {
-        self.maybe_rollback_dangling_tx().await?;
         let conn = self.conn.lock().await;
+        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
+            let _ = conn.execute("ROLLBACK", ()).await;
+        }
         conn.execute(sql, params).await
     }
 
     pub(crate) async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
-        self.maybe_rollback_dangling_tx().await?;
         let conn = self.conn.lock().await;
+        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
+            let _ = conn.execute("ROLLBACK", ()).await;
+        }
         conn.execute_batch(sql).await
     }
 
     /// Begin a transaction and return a guard that keeps the connection locked
     /// until the transaction is committed or rolled back.
     pub async fn begin_tx(&self) -> turso::Result<TxGuard<'_>> {
-        self.maybe_rollback_dangling_tx().await?;
         let conn = self.conn.lock().await;
+        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
+            let _ = conn.execute("ROLLBACK", ()).await;
+        }
         conn.execute("BEGIN", ()).await?;
         Ok(TxGuard {
             conn,
