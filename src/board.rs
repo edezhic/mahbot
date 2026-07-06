@@ -3518,7 +3518,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     #[tokio::test]
     async fn test_transactional_triple_write() {
         for should_commit in [false, true] {
-            // Exercise the full pattern used by commit_and_transition_ticket:
+            // Exercise the full pattern used by finalize_commit_and_transition:
             // all three _tx writes (set_commit_info_tx, transition_to_tx,
             // add_comment_tx) in one transaction → commit → all visible
             // (or rollback → none persist).  This is the sole transactional

@@ -1383,7 +1383,7 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
 
     match crate::git_commands::run_git_commit(repo_path, &ticket.title).await {
         Ok(commit_info) => {
-            commit_and_transition_ticket_from(&ticket, commit_info, source).await;
+            finalize_commit_and_transition(&ticket, commit_info, source).await;
         }
         Err(e) => {
             error!(
@@ -1400,7 +1400,7 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
 ///
 /// Parameterized by source phase so both the QaPassed→Done and
 /// SanitationPassed→Done flows share the same implementation.
-async fn commit_and_transition_ticket_from(
+async fn finalize_commit_and_transition(
     ticket: &Ticket,
     commit_info: crate::git_commands::CommitInfo,
     source: TicketPhase,
@@ -1451,7 +1451,7 @@ async fn commit_and_transition_ticket_from(
             source,
             TicketPhase::Done,
             notify_policy,
-            "commit_and_transition_ticket_from",
+            "finalize_commit_and_transition",
             None,
         )
         .await;
