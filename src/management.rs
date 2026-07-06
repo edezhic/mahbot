@@ -263,7 +263,7 @@ fn warn_transition_failed(
 /// risk of accidentally swapping the two fields — the same bug class that
 /// [`TransitionParams`] already prevents for `source`/`target` via named
 /// fields.
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct CommentParam<'a> {
     role: &'a str,
     content: &'a str,
@@ -329,9 +329,8 @@ struct TransitionParams<'a> {
 /// re-dispatch over fresh tickets, or `None` for all other transitions.
 #[must_use]
 async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
-    // Extract failure_comment before the with_tx closure, which consumes
-    // params.comment (CommentParam is not Copy, but the underlying &str is
-    // Copy). Used exclusively for Failed-target transitions to avoid a
+    // Extract failure_comment before the with_tx closure, which captures
+    // params by move. Used exclusively for Failed-target transitions to avoid a
     // redundant DB round-trip in notify_ticket.
     let failure_comment = (params.target == TicketPhase::Failed).then_some(params.comment.content);
 
@@ -340,17 +339,15 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
         &params.ticket.id,
         &format!("{} {}", params.log_label, params.verb),
         async |tx| {
-            let CommentParam {
-                role,
-                content: comment_text,
-            } = params.comment;
-            BoardStore::add_comment_tx(tx, &params.ticket.id, role, comment_text).await?;
-            if let Some(CommentParam {
-                role: extra_role,
-                content: extra_comment,
-            }) = params.extra
-            {
-                BoardStore::add_comment_tx(tx, &params.ticket.id, extra_role, extra_comment)
+            BoardStore::add_comment_tx(
+                tx,
+                &params.ticket.id,
+                params.comment.role,
+                params.comment.content,
+            )
+            .await?;
+            if let Some(extra) = params.extra {
+                BoardStore::add_comment_tx(tx, &params.ticket.id, extra.role, extra.content)
                     .await?;
             }
             BoardStore::transition_to_tx(
