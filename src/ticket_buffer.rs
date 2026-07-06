@@ -34,16 +34,20 @@ pub fn init_global() {
         .expect("TICKET_BUFFER already initialized");
 }
 
+/// Access the underlying mutex, panicking if the buffer is not initialized.
+fn buffer() -> &'static Mutex<HashMap<String, VecDeque<Entry>>> {
+    TICKET_BUFFER
+        .get()
+        .expect("ticket_buffer not initialized — call init_global() first")
+}
+
 /// Push a non-critical ticket transition into the buffer.
 ///
 /// # Panics
 ///
 /// Panics if the buffer has not been initialized via [`init_global`].
 pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketPhase) {
-    let mutex = TICKET_BUFFER
-        .get()
-        .expect("ticket_buffer not initialized — call init_global() first");
-    let mut map = mutex.lock().unwrap_poison();
+    let mut map = buffer().lock().unwrap_poison();
     let deque = map.entry(workspace_name.to_string()).or_default();
     deque.push_back(Entry {
         id: id.to_string(),
@@ -67,11 +71,9 @@ pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketP
 /// • mahbot-42: in_development → in_diagnostics
 /// • mahbot-43: in_diagnostics → diagnostics_done
 /// ```
+#[must_use]
 pub fn drain(workspace_name: &str) -> String {
-    let mutex = TICKET_BUFFER
-        .get()
-        .expect("ticket_buffer not initialized — call init_global() first");
-    let mut map = mutex.lock().unwrap_poison();
+    let mut map = buffer().lock().unwrap_poison();
     let Some(entries) = map.remove(workspace_name) else {
         return String::new();
     };
