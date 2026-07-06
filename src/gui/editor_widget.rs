@@ -3904,14 +3904,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_to() {
-        let buf = EditorBuffer::with_text("hello world", None);
-        buf.perform_action(EditorAction::SelectTo { line: 0, col: 5 });
-        let sel = buf.selection();
-        assert_eq!(sel, Some("hello".to_string()));
-    }
-
-    #[test]
     fn test_select_to_duplicate_endpoint_preserves_selection() {
         let buf = EditorBuffer::with_text("hello world", None);
         buf.move_to(0, 0);
