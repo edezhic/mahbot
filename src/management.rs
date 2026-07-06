@@ -200,39 +200,12 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// Pre-flight abort check for dispatch functions that spawn agents.
+/// Pre-flight guard that aborts dispatch when the ticket is no longer in
+/// `expected_phase` or the circuit breaker has tripped. Combining the two
+/// checks avoids wasted DB writes and LLM costs on stale tickets.
 ///
-/// Returns `true` (and this function will **not** guarantee it is side-effect
-/// free) when the caller MUST abort dispatching — either because the ticket
-/// is no longer in `expected_phase` (avoids wasted DB writes and LLM API
-/// costs if the ticket was moved externally) or the circuit breaker has
-/// tripped for the given domain and failed the ticket.
-///
-/// This is the recommended entry point for all dispatch-phase guard logic.
-///
-/// # Parameters
-///
-/// * `ticket` — the ticket being guarded.
-/// * `expected_phase` — the phase the ticket must still be in.
-/// * `kind` — identifies which circuit breaker variant to use (determines
-///   threshold, failure-counting logic, and trip-comment format).
-/// * `log_label` — human-readable label used in logs to identify the
-///   caller (e.g., `"Engineer"`, `"Sanitation"`, `"Diagnostics"`).
-///
-/// # Return value
-///
-/// Returns `true` when the caller MUST abort the dispatch (phase mismatch,
-/// ticket moved or failed, or circuit breaker tripped). Returns `false`
-/// when it is safe to proceed.
-///
-/// # Side effects
-///
-/// When the circuit breaker trips, [`try_trip_circuit_breaker`] drains all
-/// other [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) tickets in
-/// the same workspace to [`Planning`](TicketPhase::Planning). These drained
-/// siblings are **not** auto-claimed by the poll loop — `Planning` tickets
-/// require Manager intervention to advance, so they will not silently proceed
-/// until the Manager acts.
+/// For circuit-breaker side effects (draining ReadyForDevelopment siblings
+/// to Planning), see [`try_trip_circuit_breaker`].
 #[must_use]
 async fn should_abort_dispatch(
     ticket: &Ticket,
@@ -2315,6 +2288,10 @@ fn build_analyst_summary(
 /// After a ticket fails via circuit breaker, move all other ReadyForDevelopment
 /// tickets in the same workspace to Planning so the Manager can triage the
 /// failure without new tickets auto-starting.
+///
+/// `Planning` tickets are **not** auto-claimed by the poll loop — they require
+/// Manager intervention to advance. This prevents new tickets from silently
+/// proceeding while existing failures are investigated.
 ///
 /// Does not push individual buffer entries for the moved tickets; the user is
 /// already notified about the primary ticket's circuit breaker failure, so
