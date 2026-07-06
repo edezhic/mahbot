@@ -566,6 +566,24 @@ pub(crate) enum PipelineCheck {
     Enforce,
 }
 
+/// Whether to load comments when fetching tickets.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LoadComments {
+    /// Load comments alongside the ticket.
+    Yes,
+    /// Skip loading comments.
+    No,
+}
+
+/// Whether to filter active tickets by pipeline reservation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReservationFilter {
+    /// Check for any active tickets, regardless of pipeline reservation.
+    Any,
+    /// Only consider tickets that have a pipeline reservation.
+    ReservedOnly,
+}
+
 impl BoardStore {
     /// Post-open FTS index setup.
     async fn after_open(&self) -> anyhow::Result<()> {
@@ -814,9 +832,13 @@ impl BoardStore {
 
     /// Build a [`Ticket`] from a row returned by a
     /// [`TICKET_COLUMNS`] SELECT, optionally including its comments.
-    async fn ticket_from_row(&self, row: &turso::Row, load_comments: bool) -> Result<Ticket> {
+    async fn ticket_from_row(
+        &self,
+        row: &turso::Row,
+        load_comments: LoadComments,
+    ) -> Result<Ticket> {
         let id: String = row.get(COL_TICKET_ID)?;
-        let comments = if load_comments {
+        let comments = if load_comments == LoadComments::Yes {
             self.get_comments(&id).await?
         } else {
             Vec::new()
@@ -943,7 +965,7 @@ impl BoardStore {
             )
             .await?;
         match rows.into_iter().next() {
-            Some(row) => Ok(Some(self.ticket_from_row(&row, true).await?)),
+            Some(row) => Ok(Some(self.ticket_from_row(&row, LoadComments::Yes).await?)),
             None => Ok(None),
         }
     }
@@ -959,7 +981,7 @@ impl BoardStore {
         &self,
         suffix: &str,
         params: impl IntoParams + Send + 'static,
-        load_comments: bool,
+        load_comments: LoadComments,
     ) -> Result<Vec<Ticket>> {
         let sql = format!("SELECT {TICKET_COLUMNS} FROM tickets {suffix}");
         let rows = self.conn.query(&sql, params).await?;
@@ -973,7 +995,11 @@ impl BoardStore {
     /// Get a ticket by id, loading its comments.
     pub async fn get_ticket(&self, ticket_id: &str) -> Result<Option<Ticket>> {
         Ok(self
-            .select_tickets("WHERE id = ?1", turso::params![ticket_id], true)
+            .select_tickets(
+                "WHERE id = ?1",
+                turso::params![ticket_id],
+                LoadComments::Yes,
+            )
             .await?
             .into_iter()
             .next())
@@ -1433,10 +1459,10 @@ impl BoardStore {
     /// # Parameters
     ///
     /// * `workspace_name` — The workspace to check.
-    /// * `require_reservation` — When `true`, only `ReadyForDevelopment` tickets
-    ///   with `pipeline_reservation = 1` count as active (used by the test-only
-    ///   pipeline-blocker query). When `false`, all `ReadyForDevelopment` tickets
-    ///   count regardless of reservation.
+    /// * `reservation_filter` — [`ReservationFilter::ReservedOnly`] to only count
+    ///   `ReadyForDevelopment` tickets with `pipeline_reservation = 1` (used by the
+    ///   test-only pipeline-blocker query). [`ReservationFilter::Any`] to count all
+    ///   `ReadyForDevelopment` tickets regardless of reservation.
     /// * `exclude_ticket_id` — When `Some(id)`, that ticket is excluded from
     ///   the check (e.g., when checking if other active tickets remain after one
     ///   ticket completes). When `None`, no exclusion is applied.
@@ -1447,11 +1473,11 @@ impl BoardStore {
     async fn has_active_tickets_internal(
         &self,
         workspace_name: &str,
-        require_reservation: bool,
+        reservation_filter: ReservationFilter,
         exclude_ticket_id: Option<&str>,
     ) -> Result<bool> {
         let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_STATUSES);
-        let reservation_clause = if require_reservation {
+        let reservation_clause = if reservation_filter == ReservationFilter::ReservedOnly {
             " AND pipeline_reservation = 1"
         } else {
             ""
@@ -1487,7 +1513,7 @@ impl BoardStore {
     /// `PIPELINE_BLOCKING_STATUSES`, so this is a defensive consistency measure.
     #[cfg(test)]
     pub async fn has_pipeline_blocker_for_workspace(&self, workspace_name: &str) -> Result<bool> {
-        self.has_active_tickets_internal(workspace_name, true, None)
+        self.has_active_tickets_internal(workspace_name, ReservationFilter::ReservedOnly, None)
             .await
     }
 
@@ -1500,8 +1526,8 @@ impl BoardStore {
     /// fully drained).
     ///
     /// Delegates to `has_active_tickets_internal` with
-    /// `require_reservation = false`. The test-only
-    /// `has_pipeline_blocker_for_workspace` uses `require_reservation = true`,
+    /// [`ReservationFilter::Any`]. The test-only
+    /// `has_pipeline_blocker_for_workspace` uses `ReservationFilter::ReservedOnly`,
     /// requiring `pipeline_reservation = 1` for `ReadyForDevelopment` tickets.
     ///
     /// Non-active statuses (not matched by the query): `Done`, `Cancelled`,
@@ -1521,8 +1547,12 @@ impl BoardStore {
         workspace_name: &str,
         exclude_ticket_id: &str,
     ) -> Result<bool> {
-        self.has_active_tickets_internal(workspace_name, false, Some(exclude_ticket_id))
-            .await
+        self.has_active_tickets_internal(
+            workspace_name,
+            ReservationFilter::Any,
+            Some(exclude_ticket_id),
+        )
+        .await
     }
 
     /// Add a comment to a ticket (append-only).
@@ -1646,7 +1676,7 @@ impl BoardStore {
              AND is_archived = 0 \
              ORDER BY created_at DESC",
             turso::params![workspace_name, status_str],
-            false,
+            LoadComments::No,
         )
         .await
     }
@@ -2415,7 +2445,7 @@ mod tests {
     ///
     /// Active tickets include all ReadyForDevelopment tickets regardless of
     /// `pipeline_reservation`, unlike [`has_pipeline_blocker_for_workspace`] which
-    /// uses `require_reservation = true` (requires reservation=1). This is
+    /// uses `ReservationFilter::ReservedOnly` (requires reservation=1). This is
     /// intentional — unstarted backlog tickets
     /// are considered active to suppress Done notifications until the pipeline
     /// is fully drained.

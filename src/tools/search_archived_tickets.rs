@@ -133,7 +133,11 @@ impl SearchArchivedTicketsTool {
             .map(|id| crate::turso::Value::Text(id.clone()))
             .collect();
         let tickets = board
-            .select_tickets(&sql, crate::turso::params_from_iter(params), false)
+            .select_tickets(
+                &sql,
+                crate::turso::params_from_iter(params),
+                crate::board::LoadComments::No,
+            )
             .await?;
 
         let mut output = String::from("Search results (top 10, highest score first):\n");
