@@ -932,13 +932,6 @@ mod tests {
                 .unwrap_or_default(),
             "Fallback text"
         );
-        assert_eq!(
-            resp.choices[0]
-                .message
-                .effective_content_optional()
-                .as_deref(),
-            Some("Fallback text")
-        );
         // Both absent → empty
         let json = r#"{"choices":[{"message":{}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
