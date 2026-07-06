@@ -654,8 +654,9 @@ impl Provider for OpenAiCompatibleProvider {
 
         let native_response: ApiChatResponse = serde_json::from_str(&body).map_err(|e| {
             anyhow::anyhow!(
-                "{} chat completions parse error: {e}; body={}",
+                "{} chat completions parse error: {e}; body ({}): {:.500}",
                 self.name,
+                body.len(),
                 body
             )
         })?;
