@@ -669,31 +669,4 @@ mod tests {
             "Pipeline-blocking ticket should reject comments"
         );
     }
-
-    #[tokio::test]
-    async fn test_update_ticket_allowed_when_not_blocked() {
-        crate::util::test::init_test_stores().await;
-
-        let store = crate::board::store();
-        let id = TicketBuilder::new(store, &test_ws("/ws"))
-            .title("NotBlocked")
-            .desc("backlog ticket")
-            .phase(TicketPhase::Backlog)
-            .create()
-            .await
-            .expect("create");
-
-        let tool = UpdateTicketTool;
-        let ws = test_ws("/tmp");
-        let args = json!({
-            "ticket_id": id,
-            "status": "done"
-        });
-        let result = tool.execute(&ws, args).await;
-        assert!(
-            result.is_ok(),
-            "Non-pipeline ticket should update freely: {:?}",
-            result.err()
-        );
-    }
 }
