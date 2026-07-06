@@ -896,8 +896,9 @@ fn combine_output(
     exit_code: i32,
     keep_stderr: Option<&RegexSet>,
 ) -> String {
+    let stderr_trimmed = stderr.trim();
     let exit_ok = exit_code == 0;
-    if stderr.trim().is_empty() {
+    if stderr_trimmed.is_empty() {
         return stdout.to_string();
     }
     if exit_ok {
@@ -915,9 +916,9 @@ fn combine_output(
     }
     // Non-zero exit: show all stderr
     if stdout.is_empty() {
-        return format!("stderr:\n{}", stderr.trim());
+        return format!("stderr:\n{stderr_trimmed}");
     }
-    format!("{stdout}\nstderr:\n{}", stderr.trim())
+    format!("{stdout}\nstderr:\n{stderr_trimmed}")
 }
 
 /// Shared tail: append elapsed timing (if ≥1s), then spill to file.
