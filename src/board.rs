@@ -516,6 +516,23 @@ struct ResetTransition {
     pipeline_reservation: bool,
 }
 
+/// Controls whether the pipeline-occupancy check is enforced when claiming tickets.
+///
+/// Pipeline-blocking tickets (those in [`PIPELINE_BLOCKING_STATUSES`]) prevent
+/// multiple tickets from being worked concurrently in the same workspace.
+///
+/// - [`Skip`](Self::Skip): claim the next available ticket without checking
+///   for pipeline blockers (used by parallel phases like analysis, review, QA).
+/// - [`Enforce`](Self::Enforce): only claim if no pipeline-blocking ticket exists
+///   in the workspace (used by serial phases like development, diagnostics, sanitation).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PipelineCheck {
+    /// Skip pipeline occupancy check — claim the next available ticket.
+    Skip,
+    /// Only claim if no pipeline-blocking ticket exists in the workspace.
+    Enforce,
+}
+
 impl BoardStore {
     /// Post-open FTS index setup.
     async fn after_open(&self) -> anyhow::Result<()> {
@@ -807,8 +824,8 @@ impl BoardStore {
     /// providing CAS-style atomicity for phase transitions — if no ticket
     /// matches the expected phase, the claim returns `None`.
     ///
-    /// When `require_clear_pipeline` is `true`, the claim is rejected (returns `None`)
-    /// if any pipeline-blocking ticket exists in the same workspace. The
+    /// When `pipeline_check` is [`PipelineCheck::Enforce`], the claim is rejected
+    /// (returns `None`) if any pipeline-blocking ticket exists in the same workspace. The
     /// occupancy check is part of the same atomic SQL UPDATE statement (no
     /// separate SELECT + UPDATE window). Pipeline-blocking statuses are defined
     /// in [`PIPELINE_BLOCKING_STATUSES`].
@@ -822,9 +839,10 @@ impl BoardStore {
     /// on claim, so a reserved ticket at ReadyForDevelopment will be claimed
     /// before any other ticket at the same phase — no pipeline blocking needed.
     ///
-    /// When `require_clear_pipeline` is `false`, the claim uses a simple LIMIT 1
-    /// subquery with no pipeline gating. This is used for phases that should
-    /// not be blocked by in-flight pipeline tickets (e.g., analysis, review, and QA).
+    /// When `pipeline_check` is [`PipelineCheck::Skip`], the claim uses a
+    /// simple LIMIT 1 subquery with no pipeline gating. This is used for phases
+    /// that should not be blocked by in-flight pipeline tickets (e.g., analysis,
+    /// review, and QA).
     ///
     /// The subquery orders by `pipeline_reservation DESC, created_at ASC` so that
     /// tickets bounced back from review/QA/diagnostics (reservation = 1) are claimed
@@ -843,7 +861,7 @@ impl BoardStore {
         expected_phase: TicketPhase,
         target_phase: TicketPhase,
         workspace_name: &str,
-        require_clear_pipeline: bool,
+        pipeline_check: PipelineCheck,
     ) -> Result<Option<Ticket>> {
         let now = turso::now();
 
@@ -857,7 +875,7 @@ impl BoardStore {
             status_list_sql_fragment(UNBLOCKING_STATUSES),
         );
 
-        let pipeline_blocker_clause = if require_clear_pipeline {
+        let pipeline_blocker_clause = if pipeline_check == PipelineCheck::Enforce {
             let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_STATUSES);
             format!(
                 "AND NOT EXISTS (SELECT 1 FROM tickets t2 \
@@ -2143,7 +2161,7 @@ mod tests {
                 TicketPhase::Backlog,
                 TicketPhase::InDevelopment,
                 "ws",
-                false,
+                PipelineCheck::Skip,
             )
             .await
             .expect("claim")
@@ -2375,13 +2393,13 @@ mod tests {
             .await
             .expect("set reservation");
 
-        // When claiming with require_clear_pipeline, the reserved ticket should be picked first
+        // When claiming with PipelineCheck::Enforce, the reserved ticket should be picked first
         let claimed = store
             .claim_ticket_in_workspace(
                 TicketPhase::ReadyForDevelopment,
                 TicketPhase::InDevelopment,
                 "ws",
-                true,
+                PipelineCheck::Enforce,
             )
             .await
             .expect("claim")
@@ -2680,7 +2698,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                 TicketPhase::Backlog,
                 TicketPhase::InDevelopment,
                 "workspace_a",
-                false,
+                PipelineCheck::Skip,
             )
             .await
             .expect("claim in ws_a")
@@ -2697,7 +2715,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                     TicketPhase::Backlog,
                     TicketPhase::InDevelopment,
                     "workspace_a",
-                    false,
+                    PipelineCheck::Skip,
                 )
                 .await
                 .expect("second claim in ws_a")
@@ -2711,7 +2729,7 @@ with a comment explaining why no agent is mid-execution in that state.\
                 TicketPhase::Backlog,
                 TicketPhase::InDevelopment,
                 "workspace_b",
-                false,
+                PipelineCheck::Skip,
             )
             .await
             .expect("claim in ws_b")
@@ -2720,7 +2738,8 @@ with a comment explaining why no agent is mid-execution in that state.\
         assert_eq!(claimed_b.workspace_name, "workspace_b");
     }
 
-    /// Table-driven tests for `claim_ticket_in_workspace` with `require_clear_pipeline: true`.
+    /// Table-driven tests for [`PipelineCheck::Enforce`] — claims with pipeline occupancy
+    /// checking enabled.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_claim_ticket_in_workspace_if_pipeline_free() {
@@ -2806,13 +2825,13 @@ with a comment explaining why no agent is mid-execution in that state.\
             )
             .await;
 
-            // Claim with require_clear_pipeline=true
+            // Claim with PipelineCheck::Enforce
             let claimed = store
                 .claim_ticket_in_workspace(
                     TicketPhase::ReadyForDevelopment,
                     TicketPhase::InDevelopment,
                     &claim_ws_name,
-                    true,
+                    PipelineCheck::Enforce,
                 )
                 .await
                 .expect("claim should not error");
@@ -3002,7 +3021,12 @@ with a comment explaining why no agent is mid-execution in that state.\
         // C should be blocked even though B is done — A is still blocking
         // First claim: A is the only unblocked one
         let claimed = store
-            .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
+            .claim_ticket_in_workspace(
+                TicketPhase::Backlog,
+                TicketPhase::Analysis,
+                "ws",
+                PipelineCheck::Skip,
+            )
             .await
             .expect("claim")
             .expect("should claim A");
@@ -3010,7 +3034,12 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // B should still be blocked — A is in Analysis, not Done yet
         let second = store
-            .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
+            .claim_ticket_in_workspace(
+                TicketPhase::Backlog,
+                TicketPhase::Analysis,
+                "ws",
+                PipelineCheck::Skip,
+            )
             .await
             .expect("claim");
         assert!(
@@ -3026,7 +3055,12 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Now B should be claimable
         let claimed2 = store
-            .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
+            .claim_ticket_in_workspace(
+                TicketPhase::Backlog,
+                TicketPhase::Analysis,
+                "ws",
+                PipelineCheck::Skip,
+            )
             .await
             .expect("claim")
             .expect("should claim B");
@@ -3040,7 +3074,12 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Now C should be claimable
         let claimed3 = store
-            .claim_ticket_in_workspace(TicketPhase::Backlog, TicketPhase::Analysis, "ws", false)
+            .claim_ticket_in_workspace(
+                TicketPhase::Backlog,
+                TicketPhase::Analysis,
+                "ws",
+                PipelineCheck::Skip,
+            )
             .await
             .expect("claim")
             .expect("should claim C");

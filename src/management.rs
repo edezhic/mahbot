@@ -29,7 +29,7 @@ use futures_util::FutureExt;
 use futures_util::future::join_all;
 
 use crate::agent::run_agent;
-use crate::board::{BOARD, BoardStore, Ticket, TicketComment, TicketPhase};
+use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
 use crate::git_commands::list_new_or_untracked_files;
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
@@ -855,9 +855,10 @@ const QA_VI: VerifierInfo = VerifierInfo {
 #[derive(Copy, Clone)]
 struct PollPhaseInfo {
     active_phase: TicketPhase,
-    /// Whether this phase requires a clear pipeline (only one ticket at a
-    /// time through development → review → QA).
-    require_clear_pipeline: bool,
+    /// How this phase checks pipeline occupancy. [`Enforce`](PipelineCheck::Enforce)
+    /// blocks claims when another pipeline ticket is active in the workspace;
+    /// [`Skip`](PipelineCheck::Skip) allows concurrent claims.
+    pipeline_check: PipelineCheck,
     role_label: &'static str,
 }
 
@@ -882,12 +883,12 @@ impl PollPhase {
         match self {
             Self::BacklogAnalysis => PollPhaseInfo {
                 active_phase: TicketPhase::Analysis,
-                require_clear_pipeline: false,
+                pipeline_check: PipelineCheck::Skip,
                 role_label: Role::Analyst.as_str(),
             },
             Self::EngineerDevelopment => PollPhaseInfo {
                 active_phase: TicketPhase::InDevelopment,
-                require_clear_pipeline: true,
+                pipeline_check: PipelineCheck::Enforce,
                 role_label: Role::Engineer.as_str(),
             },
             Self::SanitationCheck => PollPhaseInfo {
@@ -897,17 +898,17 @@ impl PollPhase {
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
                 // claim_sanitation in handle_qa_passed.
-                require_clear_pipeline: false,
+                pipeline_check: PipelineCheck::Skip,
                 role_label: Role::Sanitation.as_str(),
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
                 active_phase: TicketPhase::InDiagnostics,
-                require_clear_pipeline: false,
+                pipeline_check: PipelineCheck::Skip,
                 role_label: DIAGNOSTICS_ROLE,
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
                 active_phase: vi.active_phase,
-                require_clear_pipeline: false,
+                pipeline_check: PipelineCheck::Skip,
                 role_label: vi.role.as_str(),
             },
         }
@@ -1038,7 +1039,7 @@ async fn dispatch_unassigned_in_phase(
 /// phases, then handle DiagnosticsCheck and QaPassed. Previously phase-major
 /// (all workspaces claim Backlog, then all claim Engineer, …); now workspace-major
 /// (workspace A claims all phases, then workspace B, …). Correctness is preserved
-/// because claims are atomic per-workspace and `require_clear_pipeline` gates
+/// because claims are atomic per-workspace and `PipelineCheck` gates
 /// are checked within each workspace independently.
 async fn poll_round() -> anyhow::Result<()> {
     let board = board();
@@ -1069,12 +1070,7 @@ async fn poll_round() -> anyhow::Result<()> {
             }
             let info = phase.info();
             let ticket = match board
-                .claim_ticket_in_workspace(
-                    source,
-                    info.active_phase,
-                    &ws.name,
-                    info.require_clear_pipeline,
-                )
+                .claim_ticket_in_workspace(source, info.active_phase, &ws.name, info.pipeline_check)
                 .await
             {
                 Ok(Some(t)) => {
