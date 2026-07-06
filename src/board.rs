@@ -957,7 +957,7 @@ impl BoardStore {
     /// Accepts the full suffix — typically starting with `WHERE` and optionally
     /// including `ORDER BY`, `LIMIT`, etc. — and forwards `params` directly to
     /// the underlying query so callers can use `turso::params![]` without conversions.
-    async fn select_tickets(
+    pub(crate) async fn select_tickets(
         &self,
         suffix: &str,
         params: impl IntoParams + Send + 'static,
@@ -1893,60 +1893,6 @@ impl BoardStore {
             candidates.push((id, emb));
         }
         Ok(candidates)
-    }
-}
-
-/// Minimal ticket info for display purposes (id, title, status).
-#[derive(Debug, Clone)]
-pub(crate) struct TicketMinimal {
-    pub id: String,
-    pub title: String,
-    pub phase: String,
-}
-
-impl BoardStore {
-    /// Batch fetch minimal ticket info (id, title, status) by ID list.
-    ///
-    /// Results are returned in the same order as `ids`. Missing IDs are
-    /// silently omitted (no error).
-    ///
-    /// This method exists specifically for the search-archived-ticket
-    /// formatting path, which needs just `id`, `title`, and `status` for
-    /// display purposes after hybrid ranking.
-    pub(crate) async fn list_tickets_minimal(&self, ids: &[String]) -> Result<Vec<TicketMinimal>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let sql = format!(
-            "SELECT id, title, status FROM tickets WHERE id IN ({})",
-            turso::sql_in_placeholders(ids.len()),
-        );
-        let params: Vec<Value> = ids.iter().map(|id| Value::Text(id.clone())).collect();
-
-        let rows = self.conn.query(&sql, params_from_iter(params)).await?;
-
-        let mut map: HashMap<String, TicketMinimal> = HashMap::new();
-        for row in &rows {
-            let ticket_id: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let phase: String = row.get(2)?;
-            map.insert(
-                ticket_id.clone(),
-                TicketMinimal {
-                    id: ticket_id,
-                    title,
-                    phase,
-                },
-            );
-        }
-
-        let mut results = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(entry) = map.get(id) {
-                results.push(entry.clone());
-            }
-        }
-        Ok(results)
     }
 }
 
@@ -4195,53 +4141,6 @@ with a comment explaining why no agent is mid-execution in that state.\
             results.is_empty(),
             "query with only special chars becomes empty after sanitize"
         );
-    }
-
-    /// Tests for `list_tickets_minimal`: found by ID, nonexistent IDs omitted,
-    /// empty-ids early-return guard, and input order preservation.
-    #[tokio::test]
-    async fn test_list_tickets_minimal() {
-        let (store, _tmp) = open_test_store().await;
-
-        // Create 3 archived tickets in a shared store.
-        let id_a = create_archived_ticket(&store, "Alpha", "ws").await;
-        let id_b = create_archived_ticket(&store, "Beta", "ws").await;
-        let id_c = create_archived_ticket(&store, "Gamma", "ws").await;
-
-        // 1. Found by ID.
-        let rows = store
-            .list_tickets_minimal(std::slice::from_ref(&id_a))
-            .await
-            .expect("list minimal");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, id_a);
-        assert_eq!(rows[0].title, "Alpha");
-        assert_eq!(rows[0].phase, "done");
-
-        // 2. Nonexistent IDs omitted.
-        let rows = store
-            .list_tickets_minimal(&[id_a.clone(), "nonexistent".to_string()])
-            .await
-            .expect("list minimal");
-        assert_eq!(rows.len(), 1, "nonexistent IDs should be omitted");
-        assert_eq!(rows[0].id, id_a);
-
-        // 3. Empty ids returns empty (early-return guard).
-        let rows: Vec<crate::board::TicketMinimal> = store
-            .list_tickets_minimal(&[] as &[String])
-            .await
-            .expect("list minimal");
-        assert!(rows.is_empty(), "empty ids should return empty results");
-
-        // 4. Preserves input order.
-        let rows = store
-            .list_tickets_minimal(&[id_c.clone(), id_a.clone(), id_b.clone()])
-            .await
-            .expect("list minimal");
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].id, id_c, "first result should be Gamma");
-        assert_eq!(rows[1].id, id_a, "second result should be Alpha");
-        assert_eq!(rows[2].id, id_b, "third result should be Beta");
     }
 
     /// Basic field layout of `detailed_display`: fields present, negative
