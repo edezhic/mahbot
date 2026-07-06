@@ -2932,13 +2932,7 @@ mod tests {
 
         // Add 2 sanitation failure comments (below threshold of 3).
         for _ in 0..2 {
-            let _ = board()
-                .add_comment(
-                    &ticket_id,
-                    SYSTEM_ROLE,
-                    &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
-                )
-                .await;
+            add_sanitation_failure(&ticket_id).await;
         }
 
         let ticket = expect_ticket(board(), &ticket_id).await;
@@ -2956,24 +2950,12 @@ mod tests {
 
         // Add a 3rd failure comment (should still not trip — reads fresh comments
         // from DB, not the stale in-memory ticket.comments).
-        let _ = board()
-            .add_comment(
-                &ticket_id,
-                SYSTEM_ROLE,
-                &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
-            )
-            .await;
+        add_sanitation_failure(&ticket_id).await;
 
         // ... actually 3 <= 3 means the breaker does NOT trip yet.
         // The breaker trips when count > threshold, i.e., at 4 failures.
         // Add a 4th failure.
-        let _ = board()
-            .add_comment(
-                &ticket_id,
-                SYSTEM_ROLE,
-                &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
-            )
-            .await;
+        add_sanitation_failure(&ticket_id).await;
 
         // Now with 4 failures, should trip (4 > 3).
         let tripped = try_trip_circuit_breaker(
@@ -3020,6 +3002,17 @@ mod tests {
             has_response: false,
             verdict: None,
         }
+    }
+
+    /// Add a sanitation failure comment for circuit breaker testing.
+    async fn add_sanitation_failure(ticket_id: &str) {
+        let _ = board()
+            .add_comment(
+                ticket_id,
+                SYSTEM_ROLE,
+                &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
+            )
+            .await;
     }
 
     /// Helper: wrap a passing verdict with a response string (reviewer/QA flow).
