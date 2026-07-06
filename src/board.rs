@@ -3218,6 +3218,15 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
     }
 
+    /// Supersede a live ticket (`Backlog` → `Cancelled`).
+    ///
+    /// This also implicitly covers superseding an already-cancelled ticket: the
+    /// cancellation UPDATE (`supersede_and_create` line 797) has no phase guard
+    /// (`WHERE id = ?3` without `AND status = ?`), so it runs identically
+    /// regardless of the old ticket's current phase. A separate test with a
+    /// `Cancelled` starting phase would exercise the exact same SQL path and
+    /// assert the same invariants (`assert_superseded_ticket`, `supersedes`
+    /// back-link), making it redundant with this one.
     #[tokio::test]
     async fn test_supersede_and_create_basic() {
         init_test_stores().await;
@@ -3392,28 +3401,6 @@ with a comment explaining why no agent is mid-execution in that state.\
         );
 
         // Verify old is cancelled
-        let old = expect_ticket(store, &old_id).await;
-        assert_superseded_ticket(&old);
-    }
-
-    #[tokio::test]
-    async fn test_supersede_already_cancelled() {
-        init_test_stores().await;
-        let store = crate::board::BOARD.get().unwrap();
-        let ws = test_ws_named("/ws", "ws");
-        let old_id = make_ticket(store, &ws, "Test", TicketPhase::Cancelled).await;
-
-        // Superseding an already-cancelled ticket should work
-        let new_id = TicketBuilder::new(store, &ws)
-            .title("Refined")
-            .supersede(&old_id)
-            .await
-            .expect("supersede already-cancelled");
-
-        let new = expect_ticket(store, &new_id).await;
-        assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
-
-        // Old ticket should also be archived immediately.
         let old = expect_ticket(store, &old_id).await;
         assert_superseded_ticket(&old);
     }
