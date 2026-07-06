@@ -47,22 +47,6 @@ use crate::{DiagnosticsCommands, Role, Tool, Workspace};
 /// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
 const PARALLEL_AGENT_COUNT: usize = 3;
 
-/// Compile-time invariant: the sanitation circuit breaker must always trip
-/// before the general comment-count breaker, otherwise a ticket could
-/// accumulate `General.threshold()` comments during repeated sanitation
-/// loops before tripping.
-const _: () =
-    assert!(CircuitBreakerKind::Sanitation.threshold() < CircuitBreakerKind::General.threshold());
-
-/// Compile-time invariant: the diagnostics circuit breaker must also always
-/// trip before the general comment-count breaker, otherwise a ticket could
-/// accumulate `General.threshold()` comments during repeated diagnostics
-/// loops before tripping. This is a conservative approximation because the
-/// general breaker counts all comments (not just diagnostics), but it
-/// guarantees that diagnostics-only chatter cannot bypass the general breaker.
-const _: () =
-    assert!(CircuitBreakerKind::Diagnostics.threshold() < CircuitBreakerKind::General.threshold());
-
 /// Prefix for all auto-diagnostics comments on tickets.
 const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 /// Comment-formatting constant — appended to the diagnostics comment body when
@@ -2564,9 +2548,24 @@ mod tests {
     use strum::IntoEnumIterator;
 
     /// All non-General circuit breaker variants must have a threshold strictly
-    /// less than [`CircuitBreakerKind::General`]'s threshold. This prevents
-    /// specialized breakers from letting a ticket accumulate more comments
-    /// than the general breaker would allow in a single phase.
+    /// less than [`CircuitBreakerKind::General`]'s threshold.
+    ///
+    /// ## Rationale
+    ///
+    /// - **Sanitation breaker** (`threshold = 3`): must trip before the general
+    ///   breaker (`threshold = 30`), otherwise a ticket could accumulate 30+
+    ///   comments during repeated sanitation loops without tripping.
+    /// - **Diagnostics breaker** (`threshold = 4`): must also trip before the
+    ///   general breaker. This is a conservative approximation — the general
+    ///   breaker counts *all* comments (not just diagnostics), but guaranteeing
+    ///   that diagnostics-only chatter cannot bypass the general breaker prevents
+    ///   pathological ticket growth from repeated diagnostic cycles.
+    ///
+    /// > **Note:** This test replaces previous compile-time `const _: () = assert!(...)`
+    /// > declarations that provided slightly earlier feedback (at `cargo build` vs
+    /// > `cargo test`). The test is strictly more robust: it uses `IntoEnumIterator`
+    /// > to exhaustively check all non-General variants, so newly added variants
+    /// > are automatically covered without manual line additions.
     #[test]
     fn all_non_general_circuit_breakers_trip_before_general() {
         let general = CircuitBreakerKind::General.threshold();
