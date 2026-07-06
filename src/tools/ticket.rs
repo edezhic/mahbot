@@ -197,7 +197,7 @@ impl Tool for ListTicketsTool {
         )
     }
 
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         false // read-only board query
     }
 
@@ -269,7 +269,7 @@ impl Tool for GetTicketTool {
         )
     }
 
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         false // read-only board query
     }
 

@@ -100,7 +100,7 @@ impl Tool for ReadTool {
         }
     }
 
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         false // read-only file inspection
     }
 

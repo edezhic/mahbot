@@ -529,7 +529,7 @@ Use this tool only for inspection: reading files, listing directories, running c
         )
     }
 
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         // ReadOnly mode validates commands against a mutating-command blocklist
         // — best-effort guard, not a sandbox, but sufficient for grouping.
         self.mode != ShellMode::ReadOnly

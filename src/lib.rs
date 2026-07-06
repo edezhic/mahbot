@@ -617,10 +617,7 @@ pub trait Tool: Send + Sync {
     /// Returns `true` by default (conservative — assume mutating). Override to
     /// `false` for read-only tools (read, search, web_search, etc.) so they can
     /// be grouped for parallel execution within a single LLM turn.
-    ///
-    /// Takes `args` so tools can inspect parameters (e.g. ShellTool checking
-    /// its mode), but most tools ignore it and return a constant.
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         true
     }
 

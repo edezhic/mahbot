@@ -299,10 +299,7 @@ impl Agent {
         // conservatively treated as side-effecting (default: true).
         let side_flags: Vec<bool> = tool_calls
             .iter()
-            .map(|call| {
-                find_tool(&self.tools, &call.name)
-                    .is_none_or(|tool| tool.side_effects(&call.arguments))
-            })
+            .map(|call| find_tool(&self.tools, &call.name).is_none_or(super::Tool::side_effects))
             .collect();
 
         let mut outcomes: Vec<ToolExecutionOutcome> = Vec::with_capacity(tool_calls.len());

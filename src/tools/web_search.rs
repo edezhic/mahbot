@@ -504,7 +504,7 @@ impl Tool for WebSearchTool {
         output.to_string()
     }
 
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         false // web search has no workspace side effects
     }
 

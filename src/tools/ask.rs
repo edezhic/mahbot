@@ -89,7 +89,7 @@ impl Tool for AskTool {
     /// read-only shell, which reports [`Self::side_effects`] = false). This
     /// classification is coupled to `Role::tools()`; if Analyst ever gains
     /// side-effecting tools, this must be reconsidered.
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         false
     }
 

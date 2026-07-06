@@ -37,7 +37,7 @@ impl Tool for SearchArchivedTicketsTool {
         )
     }
 
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         false
     }
 

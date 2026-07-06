@@ -518,7 +518,7 @@ impl Tool for SearchTool {
         false // source code, not secrets
     }
 
-    fn side_effects(&self, _args: &serde_json::Value) -> bool {
+    fn side_effects(&self) -> bool {
         false // indexed search, no mutations
     }
 
