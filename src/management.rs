@@ -47,38 +47,21 @@ use crate::{DiagnosticsCommands, Role, Tool, Workspace};
 /// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
 const PARALLEL_AGENT_COUNT: usize = 3;
 
-/// Comments threshold — tickets accumulating more than this number of comments
-/// are tripped by the circuit breaker (i.e., the trip point is > threshold),
-/// transitioning to Failed for Manager triage.
-const CIRCUIT_BREAKER_COMMENT_THRESHOLD: usize = 30;
-
-/// Maximum number of cumulative diagnostics failures allowed before the circuit
-/// breaker trips. The breaker trips when `count > DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`
-/// (i.e., at ≥5 failures), failing the ticket to prevent thrashing.
-const DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD: usize = 4;
-
-/// Maximum number of consecutive sanitation failures allowed before the
-/// sanitation circuit breaker trips. The breaker trips when a ticket's
-/// sanitation failure count exceeds this threshold, failing the ticket.
-///
-/// This is a separate, lower threshold than the general comment-count
-/// circuit breaker — sanitation failures are cheap to detect and should
-/// not consume 30 comments before tripping.
-const SANITATION_CIRCUIT_BREAKER_THRESHOLD: usize = 3;
-
 /// Compile-time invariant: the sanitation circuit breaker must always trip
 /// before the general comment-count breaker, otherwise a ticket could
-/// accumulate `CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments during repeated
-/// sanitation loops before tripping.
-const _: () = assert!(SANITATION_CIRCUIT_BREAKER_THRESHOLD < CIRCUIT_BREAKER_COMMENT_THRESHOLD);
+/// accumulate `General.threshold()` comments during repeated sanitation
+/// loops before tripping.
+const _: () =
+    assert!(CircuitBreakerKind::Sanitation.threshold() < CircuitBreakerKind::General.threshold());
 
 /// Compile-time invariant: the diagnostics circuit breaker must also always
 /// trip before the general comment-count breaker, otherwise a ticket could
-/// accumulate `CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments during repeated
-/// diagnostics loops before tripping. This is a conservative approximation
-/// because the general breaker counts all comments (not just diagnostics), but
-/// it guarantees that diagnostics-only chatter cannot bypass the general breaker.
-const _: () = assert!(DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD < CIRCUIT_BREAKER_COMMENT_THRESHOLD);
+/// accumulate `General.threshold()` comments during repeated diagnostics
+/// loops before tripping. This is a conservative approximation because the
+/// general breaker counts all comments (not just diagnostics), but it
+/// guarantees that diagnostics-only chatter cannot bypass the general breaker.
+const _: () =
+    assert!(CircuitBreakerKind::Diagnostics.threshold() < CircuitBreakerKind::General.threshold());
 
 /// Prefix for all auto-diagnostics comments on tickets.
 const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
@@ -112,25 +95,25 @@ fn board() -> &'static BoardStore {
 /// and trip logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CircuitBreakerKind {
-    /// General comment-count breaker: trips when total comments exceed
-    /// [`CIRCUIT_BREAKER_COMMENT_THRESHOLD`].
+    /// General comment-count breaker: trips when the total number of comments
+    /// exceeds 30.
     General,
     /// Sanitation-failure breaker: trips when consecutive sanitation failures
-    /// exceed [`SANITATION_CIRCUIT_BREAKER_THRESHOLD`].
+    /// exceed 3.
     Sanitation,
     /// Diagnostics-failure breaker: trips when cumulative diagnostics failures
-    /// exceed [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`].
+    /// exceed 4.
     Diagnostics,
 }
 
 impl CircuitBreakerKind {
     /// Returns the trip-count threshold for this breaker variant.
     /// The breaker trips when `trip_count > threshold()`.
-    fn threshold(self) -> usize {
+    const fn threshold(self) -> usize {
         match self {
-            Self::General => CIRCUIT_BREAKER_COMMENT_THRESHOLD,
-            Self::Sanitation => SANITATION_CIRCUIT_BREAKER_THRESHOLD,
-            Self::Diagnostics => DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD,
+            Self::General => 30,
+            Self::Sanitation => 3,
+            Self::Diagnostics => 4,
         }
     }
 
@@ -157,15 +140,21 @@ impl CircuitBreakerKind {
     /// Format the circuit-breaker trip comment body for this breaker variant.
     fn comment(self, count: usize) -> String {
         match self {
-            Self::General => format!(
-                "Failed after {count} comments — ticket has accumulated too many comments \
-                 (circuit breaker, threshold: {CIRCUIT_BREAKER_COMMENT_THRESHOLD}). \
-                 Ticket failed — Manager will triage."
-            ),
-            Self::Sanitation => format!(
-                "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
-                 (threshold: {SANITATION_CIRCUIT_BREAKER_THRESHOLD})",
-            ),
+            Self::General => {
+                let threshold = self.threshold();
+                format!(
+                    "Failed after {count} comments — ticket has accumulated too many comments \
+                     (circuit breaker, threshold: {threshold}). \
+                     Ticket failed — Manager will triage."
+                )
+            }
+            Self::Sanitation => {
+                let threshold = self.threshold();
+                format!(
+                    "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+                     (threshold: {threshold})",
+                )
+            }
             Self::Diagnostics => format!(
                 "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
                  failures. Failing ticket."
@@ -1740,7 +1729,7 @@ async fn transition_ticket_to_diagnostics_done(ticket: &Ticket, comment: &str, v
 /// sequentially via [`run_diagnostics_commands`]. Stops at the first failure.
 /// After execution, transitions the ticket to either `DiagnosticsDone` (all
 /// passed) or `ReadyForDevelopment` (any failure), unless the circuit breaker
-/// trips (see [`DIAGNOSTICS_CIRCUIT_BREAKER_THRESHOLD`]).
+/// trips (see [`CircuitBreakerKind::Diagnostics`]).
 #[allow(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     // Circuit breaker check happens in spawn_dispatch before entering this
@@ -2622,8 +2611,8 @@ mod tests {
         .await;
 
         // Add comments to ticket A so the circuit breaker has something to count
-        // (CIRCUIT_BREAKER_COMMENT_THRESHOLD + 1 = 31 comments, enough to trip).
-        for i in 0..=CIRCUIT_BREAKER_COMMENT_THRESHOLD {
+        // (CircuitBreakerKind::General.threshold() + 1 = 31 comments, enough to trip).
+        for i in 0..=CircuitBreakerKind::General.threshold() {
             board()
                 .add_comment(&trip_id, SYSTEM_ROLE, &format!("Comment {i}"))
                 .await
@@ -3116,8 +3105,8 @@ mod tests {
     // ── try_trip_circuit_breaker — general circuit breaker ────────
 
     /// Verify the circuit breaker trips at the threshold boundary:
-    /// - `> CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → trips (ticket → Failed)
-    /// - `= CIRCUIT_BREAKER_COMMENT_THRESHOLD` comments → does NOT trip
+    /// - `> CircuitBreakerKind::General.threshold()` comments → trips (ticket → Failed)
+    /// - `= CircuitBreakerKind::General.threshold()` comments → does NOT trip
     ///
     /// When the breaker trips, also verifies the trip comment contains the
     /// "circuit breaker" marker as produced by [`CircuitBreakerKind::comment`].
@@ -3139,7 +3128,7 @@ mod tests {
                 name: "> threshold trips",
                 ws_suffix: "cb_thresh",
                 title: "CB Threshold",
-                comment_count: CIRCUIT_BREAKER_COMMENT_THRESHOLD + 1,
+                comment_count: CircuitBreakerKind::General.threshold() + 1,
                 expected_trip: true,
                 expected_phase: TicketPhase::Failed,
             },
@@ -3147,7 +3136,7 @@ mod tests {
                 name: "= threshold does not trip",
                 ws_suffix: "cb_no_trip",
                 title: "CB No Trip",
-                comment_count: CIRCUIT_BREAKER_COMMENT_THRESHOLD,
+                comment_count: CircuitBreakerKind::General.threshold(),
                 expected_trip: false,
                 expected_phase: TicketPhase::InReview,
             },
