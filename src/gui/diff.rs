@@ -1524,8 +1524,12 @@ async fn compute_highlights(
     };
 
     // Build parsers for this file (created in the async task, not on UI thread).
-    let old_hl = compute_old_highlights(dfile, ws_path, lang, commit_ref).await;
-    let new_hl = compute_new_highlights(dfile, ws_path, lang, commit_ref).await;
+    // Run old and new highlight computation concurrently to overlap I/O
+    // (git subprocess for old version, git/disk read for new version).
+    let (old_hl, new_hl) = tokio::join!(
+        compute_old_highlights(dfile, ws_path, lang, commit_ref),
+        compute_new_highlights(dfile, ws_path, lang, commit_ref),
+    );
 
     (old_hl, new_hl)
 }
