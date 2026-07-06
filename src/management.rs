@@ -1883,6 +1883,7 @@ async fn run_parallel_agents(
     extraction_prompt: &str,
 ) -> Vec<ParallelVerdict> {
     let suffix = crate::generate_suffix();
+    let retry_prompt = load_prompt("extraction/retry.md");
     let futures: Vec<_> = (0..PARALLEL_AGENT_COUNT)
         .map(move |i| {
             let ticket = Arc::clone(ticket);
@@ -1890,23 +1891,12 @@ async fn run_parallel_agents(
             let ws = ws.clone();
             let base = ticket_session_key(&ticket.id, role.as_str());
             let session_key = format!("{base}_{i}_{suffix}");
-            async move {
-                let (agent, response) =
-                    run_agent(session_key, role, &ws, Some(&ticket), &prompt).await;
-                (agent, response.unwrap_or_default())
-            }
-        })
-        .collect();
-    let results = join_all(futures).await;
-
-    // Extract structured verdicts from parallel agent results.
-    let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
-    let futures: Vec<_> = results
-        .into_iter()
-        .map(|(agent, response)| {
             let extraction_prompt = extraction_prompt.to_string();
             let retry_prompt = retry_prompt.clone();
             async move {
+                let (agent, response) =
+                    run_agent(session_key, role, &ws, Some(&ticket), &prompt).await;
+                let response = response.unwrap_or_default();
                 if response.is_empty() {
                     return ParallelVerdict {
                         has_response: false,
@@ -1923,13 +1913,12 @@ async fn run_parallel_agents(
                     .await
                     .ok();
                 ParallelVerdict {
-                    has_response: !response.is_empty(),
+                    has_response: true,
                     verdict,
                 }
             }
         })
         .collect();
-
     join_all(futures).await
 }
 
