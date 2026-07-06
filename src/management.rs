@@ -1713,7 +1713,11 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// `comment` text and `verb` string.
 ///
 /// Returns `true` if the transition succeeded, `false` otherwise.
-async fn finish_diagnostics(ticket: &Ticket, comment: &str, verb: &str) -> bool {
+///
+/// This was previously named `finish_diagnostics` — renamed to match the
+/// `transition_ticket_to_*` naming convention used by the sibling wrappers
+/// [`transition_ticket_to_done`], [`transition_ticket_to_failed`], etc.
+async fn transition_ticket_to_diagnostics_done(ticket: &Ticket, comment: &str, verb: &str) -> bool {
     comment_and_transition(TransitionParams::new(
         ticket,
         CommentParam {
@@ -1787,7 +1791,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
             if all_passed {
                 // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                finish_diagnostics(&ticket, &comment, "completed").await;
+                transition_ticket_to_diagnostics_done(&ticket, &comment, "completed").await;
             } else {
                 // Path C2: Diagnostics failed — write the failure comment and
                 // bounce back to development for rework.
@@ -1827,7 +1831,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         }
         Ok(_) => {
             // Path B: No diagnostics commands configured (or empty list) — skip.
-            finish_diagnostics(
+            transition_ticket_to_diagnostics_done(
                 &ticket,
                 "No diagnostics commands are configured for this workspace — diagnostics skipped.",
                 "skipped (no commands configured)",
@@ -1841,7 +1845,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 error = %e,
                 "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
             );
-            finish_diagnostics(
+            transition_ticket_to_diagnostics_done(
                 &ticket,
                 &format!("Could not load diagnostics commands due to a database error: {e}"),
                 "skipped (DB error)",
