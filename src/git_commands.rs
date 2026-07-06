@@ -21,6 +21,15 @@ pub struct CommitInfo {
     pub lines_removed: i64,
 }
 
+impl CommitInfo {
+    /// Return the first 7 characters of the commit hash, or the full hash
+    /// if it's shorter than 7 characters.
+    #[must_use]
+    pub fn short_hash(&self) -> &str {
+        self.hash.get(..7).unwrap_or(&self.hash)
+    }
+}
+
 /// Check if a directory contains a `.git` entry (file for worktrees, directory otherwise).
 #[must_use]
 pub fn is_git_repo(path: &Path) -> bool {
@@ -533,6 +542,38 @@ pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::util::test::init_temp_repo;
+
+    // ── Unit tests for CommitInfo::short_hash ────────────────────
+
+    #[test]
+    fn short_hash_truncates_long_hash() {
+        let info = CommitInfo {
+            hash: "abc1234def5678".to_string(),
+            lines_added: 0,
+            lines_removed: 0,
+        };
+        assert_eq!(info.short_hash(), "abc1234");
+    }
+
+    #[test]
+    fn short_hash_returns_full_hash_when_short() {
+        let info = CommitInfo {
+            hash: "abc12".to_string(),
+            lines_added: 0,
+            lines_removed: 0,
+        };
+        assert_eq!(info.short_hash(), "abc12");
+    }
+
+    #[test]
+    fn short_hash_returns_full_hash_when_exactly_7() {
+        let info = CommitInfo {
+            hash: "abc1234".to_string(),
+            lines_added: 0,
+            lines_removed: 0,
+        };
+        assert_eq!(info.short_hash(), "abc1234");
+    }
 
     // ── Integration tests for run_git_* functions ────────────────
 

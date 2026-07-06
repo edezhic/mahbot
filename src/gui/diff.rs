@@ -560,20 +560,11 @@ impl DiffState {
                         self.error = None;
                         let toast_msg = match (info.lines_added, info.lines_removed) {
                             (0, 0) => {
-                                format!("Committed {}", &info.hash.get(..7).unwrap_or(&info.hash))
+                                format!("Committed {}", info.short_hash())
                             }
-                            (a, 0) => format!(
-                                "Committed {} (+{a})",
-                                &info.hash.get(..7).unwrap_or(&info.hash)
-                            ),
-                            (0, r) => format!(
-                                "Committed {} (-{r})",
-                                &info.hash.get(..7).unwrap_or(&info.hash)
-                            ),
-                            (a, r) => format!(
-                                "Committed {} (+{a}/-{r})",
-                                &info.hash.get(..7).unwrap_or(&info.hash)
-                            ),
+                            (a, 0) => format!("Committed {} (+{a})", info.short_hash()),
+                            (0, r) => format!("Committed {} (-{r})", info.short_hash()),
+                            (a, r) => format!("Committed {} (+{a}/-{r})", info.short_hash()),
                         };
                         // Immediately refresh the diff.
                         if let Some(ref ws_name) = self.selected_workspace_name.clone() {

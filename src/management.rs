@@ -1288,9 +1288,8 @@ async fn finalize_commit_and_transition(
     commit_info: crate::git_commands::CommitInfo,
     source: TicketPhase,
 ) {
-    let short_hash = commit_info.hash.get(..7).unwrap_or(&commit_info.hash);
     let comment = format_commit_summary(
-        short_hash,
+        commit_info.short_hash(),
         commit_info.lines_added,
         commit_info.lines_removed,
     );
@@ -1308,7 +1307,10 @@ async fn finalize_commit_and_transition(
     if crate::turso::with_tx(
         &board().conn,
         &ticket.id,
-        &format!("finalize Done transition from {phase_label} ({short_hash})"),
+        &format!(
+            "finalize Done transition from {phase_label} ({})",
+            commit_info.short_hash()
+        ),
         async |tx| {
             BoardStore::finalize_done_tx(
                 tx,
@@ -1326,7 +1328,7 @@ async fn finalize_commit_and_transition(
     .await
     .is_ok()
     {
-        info!(ticket = %ticket.id, "Committed {short_hash}, moving to Done");
+        info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
 
         let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
         dispatch_notification(
@@ -1341,7 +1343,7 @@ async fn finalize_commit_and_transition(
     } else {
         warn!(
             ticket = %ticket.id,
-            short_hash,
+            short_hash = commit_info.short_hash(),
             "Commit was written to git but board transaction failed — \
              orphan commit in repo, will retry on next poll cycle",
         );
