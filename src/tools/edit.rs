@@ -52,7 +52,7 @@ impl Tool for EditTool {
         )
     }
 
-    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
         // ── 1. Extract parameters ──────────────────────────────────
         let path = super::require_path_arg(&args)?;
 
@@ -448,7 +448,7 @@ fn map_norm_span(
 /// - `Ok(None)` — pattern not found after normalization.
 /// - `Err(...)` — ambiguous (pattern matches multiple times after
 ///   normalization) or a normalization bug in `map_norm_span`.
-fn find_ws_insensitive(content: &str, old_string: &str) -> anyhow::Result<Option<WsMatch>> {
+fn find_ws_insensitive(content: &str, old_string: &str) -> Result<Option<WsMatch>> {
     if old_string.is_empty() || content.is_empty() {
         return Ok(None);
     }

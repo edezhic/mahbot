@@ -483,7 +483,7 @@ fn main() -> Result<()> {
 async fn run_cleanup_loop<F, Fut>(label: &'static str, cleanup: F)
 where
     F: Fn(String) -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<u64>> + Send,
+    Fut: Future<Output = Result<u64>> + Send,
 {
     loop {
         if !mahbot::shutdown::sleep_or_shutdown(Duration::from_mins(10)).await {
