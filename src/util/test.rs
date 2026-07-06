@@ -386,10 +386,10 @@ impl<'a> TicketBuilder<'a> {
 /// # Stores initialized
 ///
 /// Note: The canonical list of all store names lives in
-/// [`crate::turso::ALL_STORE_NAMES`].  This function intentionally excludes
+/// `turso::iter_checkpoint_stores` / `turso::store_names()`.  This function intentionally excludes
 /// `logs` (not needed for most tests) and initializes stores sequentially
 /// (not concurrently like the production bootstrap).  Keep this list in sync
-/// with `ALL_STORE_NAMES` when adding or removing stores.
+/// with the iterator in `turso.rs` when adding or removing stores.
 ///
 /// Also initializes the search engine registry (required by workspace store)
 /// and sets the CONFIG storage root.

@@ -23,16 +23,10 @@ use anyhow::{Context, Result, bail};
 use turso::core::{Database, IO, OpenFlags, PlatformIO};
 use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabaseConfig};
 
-use crate::turso::ALL_STORE_NAMES;
+use crate::turso as turso_mod;
 
 /// Row limit per query to prevent unbounded output.
 const ROW_LIMIT: usize = 10_000;
-
-/// Valid `--db` argument values.
-///
-/// Derived from the canonical [`ALL_STORE_NAMES`] constant in `turso.rs`.
-/// Any store added there is automatically available in the debug CLI.
-const VALID_DB_NAMES: &[&str] = ALL_STORE_NAMES;
 
 /// Mutation keywords blocked by the read-only validator.
 /// Case-insensitive whole-word match (not substring).
@@ -203,15 +197,16 @@ pub async fn run_debug() -> Result<()> {
 
 /// Map a `--db` argument to a list of `(label, filename)` pairs.
 fn resolve_db_list(name: &str) -> Result<Vec<(String, String)>> {
+    let names = turso_mod::store_names();
     if name == "all" {
-        Ok(VALID_DB_NAMES
+        Ok(names
             .iter()
-            .map(|n| ((*n).to_string(), format!("db/{n}.db")))
+            .map(|n| (n.to_string(), format!("db/{n}.db")))
             .collect())
-    } else if VALID_DB_NAMES.contains(&name) {
+    } else if names.contains(&name) {
         Ok(vec![(name.to_string(), format!("db/{name}.db"))])
     } else {
-        let valid = VALID_DB_NAMES.join(", ");
+        let valid = names.join(", ");
         bail!("invalid database name '{name}'. Valid names: {valid}, all");
     }
 }
@@ -332,7 +327,7 @@ fn print_truncation_row(column_count: usize) {
 
 fn print_usage() {
     eprintln!("Usage: mahbot debug --db <name> \"SQL query\"");
-    let names = ALL_STORE_NAMES.join(" | ");
+    let names = turso_mod::store_names().join(" | ");
     eprintln!("  --db <name>  {names} | all");
     eprintln!("  SQL query    read-only SQL, quoted as a single argument");
     eprintln!();

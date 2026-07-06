@@ -66,39 +66,50 @@ pub fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::ParseError>
 /// listed here.
 pub const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];
 
-/// Canonical list of all database store names, alphabetically ordered.
+/// Return an iterator over all checkpointable database stores.
 ///
-/// This is the **single source of truth** for which store databases exist.
-/// Each entry matches the `db_name` parameter in the corresponding
-/// [`define_store!`](crate::define_store!) invocation (or the equivalent
-/// manual open path for `logs`).
+/// Each item is `(name, Option<&'static Connection>)` where `None` means the
+/// store has not been initialized yet.
+///
+/// This is the **single source of truth** for which stores exist and are
+/// checkpointed.  [`store_names`] derives the name list from this iterator,
+/// guaranteeing no drift between the name list and the checkpoint list.
+pub(crate) fn iter_checkpoint_stores()
+-> impl Iterator<Item = (&'static str, Option<&'static crate::turso::Connection>)> {
+    [
+        ("board", crate::board::BOARD.get().map(|s| &s.conn)),
+        (
+            "chat_history",
+            crate::chat_history::CHAT_HISTORY.get().map(|s| &s.conn),
+        ),
+        (
+            "config",
+            crate::config_db::CONFIG_STORE.get().map(|s| &s.conn),
+        ),
+        ("logs", crate::logs::LOG_STORE.get().map(|s| &s.conn)),
+        ("sessions", crate::session::SESSIONS.get().map(|s| &s.conn)),
+        ("stats", crate::stats::STATS_STORE.get().map(|s| &s.conn)),
+        ("users", crate::users::USER_STORE.get().map(|s| &s.conn)),
+        (
+            "workspaces",
+            crate::workspace::WORKSPACES.get().map(|s| &s.conn),
+        ),
+    ]
+    .into_iter()
+}
+
+/// Return all canonical store names, derived from [`iter_checkpoint_stores`].
+///
+/// This replaces the former `ALL_STORE_NAMES` constant — the name list is now
+/// derived from the same single-source-of-truth iterator that drives
+/// checkpointing, so no drift is possible.
 ///
 /// Used by:
-/// - [`crate::checkpoint::checkpoint_all_databases`] — iterates all stores for WAL checkpointing.
 /// - `mahbot debug` — validates `--db` argument values.
-///
-/// When adding a new store, add its canonical name here to ensure it is
-/// picked up by checkpointing and the debug CLI.
-///
-/// # Naming
-///
-/// These are the `db_name` values (the part before `.db` in filenames like
-/// `board.db`, `sessions.db`), **not** the Rust static variable names
-/// (e.g., `BOARD`, `SESSIONS`).  Use `db_name` from the store's
-/// [`define_store!`](crate::define_store!) invocation.
-///
-/// See the test `all_store_names_appear_in_checkpoint` which verifies that this
-/// list and [`crate::checkpoint::checkpoint_all_databases`]'s store array are equal as sets.
-pub const ALL_STORE_NAMES: &[&str] = &[
-    "board",
-    "chat_history",
-    "config",
-    "logs",
-    "sessions",
-    "stats",
-    "users",
-    "workspaces",
-];
+/// - Callers that previously referenced `ALL_STORE_NAMES`.
+pub(crate) fn store_names() -> Vec<&'static str> {
+    iter_checkpoint_stores().map(|(name, _)| name).collect()
+}
 
 /// Create [`turso::core::DatabaseOpts`] with all experimental features enabled.
 ///

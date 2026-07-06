@@ -36,39 +36,6 @@
 
 use tracing::{error, info, warn};
 
-/// Return an iterator over all checkpointable database stores.
-///
-/// Each item is `(name, Option<&'static Connection>)` where `None` means the
-/// store has not been initialized yet.
-///
-/// This is the single source of truth for which stores are checkpointed.
-/// Both [`checkpoint_all_databases`] and the test
-/// `all_store_names_appear_in_checkpoint` derive their data from this
-/// function.
-fn iter_checkpoint_stores()
--> impl Iterator<Item = (&'static str, Option<&'static crate::turso::Connection>)> {
-    [
-        ("board", crate::board::BOARD.get().map(|s| &s.conn)),
-        (
-            "chat_history",
-            crate::chat_history::CHAT_HISTORY.get().map(|s| &s.conn),
-        ),
-        (
-            "config",
-            crate::config_db::CONFIG_STORE.get().map(|s| &s.conn),
-        ),
-        ("logs", crate::logs::LOG_STORE.get().map(|s| &s.conn)),
-        ("sessions", crate::session::SESSIONS.get().map(|s| &s.conn)),
-        ("stats", crate::stats::STATS_STORE.get().map(|s| &s.conn)),
-        ("users", crate::users::USER_STORE.get().map(|s| &s.conn)),
-        (
-            "workspaces",
-            crate::workspace::WORKSPACES.get().map(|s| &s.conn),
-        ),
-    ]
-    .into_iter()
-}
-
 /// Checkpoint all Turso database stores before hard process termination.
 ///
 /// `std::process::exit(0)` bypasses Rust destructors, so Turso WAL connections
@@ -78,13 +45,10 @@ fn iter_checkpoint_stores()
 /// Skips stores that haven't been initialized yet. Logs and swallows per-store
 /// errors to avoid blocking shutdown.
 ///
-/// The store entries come from `iter_checkpoint_stores` — the single source
-/// of truth for which stores get checkpointed. The test
-/// `all_store_names_appear_in_checkpoint` uses the same function to verify
-/// that every entry in [`crate::turso::ALL_STORE_NAMES`] has a corresponding
-/// entry here.
+/// The store entries come from [`crate::turso::iter_checkpoint_stores`] — the
+/// single source of truth for which stores get checkpointed.
 pub async fn checkpoint_all_databases() {
-    for (name, conn_opt) in iter_checkpoint_stores() {
+    for (name, conn_opt) in crate::turso::iter_checkpoint_stores() {
         let Some(conn) = conn_opt else {
             continue;
         };
@@ -174,49 +138,5 @@ mod tests {
         // No stores initialized — all get() calls return None.
         // This should not panic or error.
         checkpoint_all_databases().await;
-    }
-
-    /// Verify that every name in [`crate::turso::ALL_STORE_NAMES`] appears in
-    /// [`checkpoint_all_databases`]'s store list, and vice-versa (the two
-    /// lists are equal as sets).
-    ///
-    /// Instead of maintaining its own hardcoded copy of the store names, this
-    /// test reads from [`iter_checkpoint_stores`] — the same function that
-    /// [`checkpoint_all_databases`] uses — so the store list is never
-    /// duplicated.
-    ///
-    /// If this test fails, either:
-    /// - A store was added to [`crate::turso::ALL_STORE_NAMES`] but forgotten in
-    ///   [`checkpoint_all_databases`], meaning its WAL frames are never flushed
-    ///   on hard exit — leading to data loss.
-    /// - A store was added to [`checkpoint_all_databases`] but forgotten in
-    ///   [`crate::turso::ALL_STORE_NAMES`], meaning it's missing from the
-    ///   canonical store list.
-    #[test]
-    fn all_store_names_appear_in_checkpoint() {
-        // Names come from the shared iterator — no duplication.
-        let checkpoint_stores: Vec<&'static str> =
-            iter_checkpoint_stores().map(|(name, _)| name).collect();
-
-        // Every store in ALL_STORE_NAMES must be checkpointed.
-        for name in crate::turso::ALL_STORE_NAMES {
-            assert!(
-                checkpoint_stores.contains(name),
-                "store '{name}' is in ALL_STORE_NAMES but missing from \
-                 checkpoint_all_databases — WAL frames for this store will \
-                 never be flushed on hard exit, causing data loss"
-            );
-        }
-
-        // Every checkpointed store must be in ALL_STORE_NAMES (catches
-        // stores added to the checkpoint function but not to the canonical
-        // list).
-        for name in &checkpoint_stores {
-            assert!(
-                crate::turso::ALL_STORE_NAMES.contains(name),
-                "store '{name}' is checkpointed but missing from \
-                 ALL_STORE_NAMES — add it to the canonical list"
-            );
-        }
     }
 }

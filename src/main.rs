@@ -156,10 +156,10 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     tokio::try_join!(
         // NOTE: The canonical list of all store names lives in
-        // `crate::turso::ALL_STORE_NAMES`.  This block intentionally
+        // `turso::iter_checkpoint_stores` / `turso::store_names()`.  This block intentionally
         // excludes `logs` (initialized above via `init_tracing`) and
         // uses `try_join!` for concurrent init.  Keep this list in
-        // sync with `ALL_STORE_NAMES` when adding or removing stores.
+        // sync with the iterator in `turso.rs` when adding or removing stores.
         mahbot::session::init_global(),
         mahbot::workspace::init_global(),
         mahbot::users::init_global(),
