@@ -10,7 +10,7 @@
 //! the diff to just that file; click again to show all files.
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
-use super::diff_widget::{self, ADDED_COLOR, DiffBufferWidget, DiffFileBuffer, REMOVED_COLOR};
+use super::diff_widget::{self, DiffBufferWidget, DiffFileBuffer};
 use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
 use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 
@@ -1122,7 +1122,7 @@ impl DiffState {
                     parts.push(
                         text(format!("+{}", f.add_count))
                             .size(10)
-                            .color(ADDED_COLOR)
+                            .color(theme::STATUS_SUCCESS)
                             .into(),
                     );
                 }
@@ -1133,7 +1133,7 @@ impl DiffState {
                     parts.push(
                         text(format!("-{}", f.remove_count))
                             .size(10)
-                            .color(REMOVED_COLOR)
+                            .color(theme::STATUS_ERROR)
                             .into(),
                     );
                 }
