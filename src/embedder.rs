@@ -37,8 +37,8 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, warn};
@@ -125,7 +125,7 @@ const STATE_LOADING: u8 = 1;
 const STATE_READY: u8 = 2;
 
 /// Global embedder singleton, wrapped in an Option for graceful degradation.
-static GLOBAL_EMBEDDER: OnceLock<RwLock<Option<Embedder>>> = OnceLock::new();
+static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
 
 /// Atomic state tracker to coordinate lazy initialization.
 static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
@@ -133,7 +133,7 @@ static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 /// Returns a reference to the global singleton [`Embedder`] RwLock. Never panics.
 #[must_use]
 pub fn global_embedder() -> &'static RwLock<Option<Embedder>> {
-    GLOBAL_EMBEDDER.get_or_init(|| RwLock::new(None))
+    &GLOBAL_EMBEDDER
 }
 
 /// Atomically store a ready [`Embedder`] and transition state to [`STATE_READY`].
