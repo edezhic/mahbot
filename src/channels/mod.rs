@@ -26,7 +26,6 @@ struct BroadcastPersistEntry {
     agent_role: Option<String>,
     workspace: String,
     optimistic_id: Option<String>,
-    reply_markup: Option<serde_json::Value>,
 }
 
 impl BroadcastPersistEntry {
@@ -59,7 +58,7 @@ impl BroadcastPersistEntry {
                 agent_role: self.agent_role.clone(),
                 workspace: self.workspace.clone(),
                 optimistic_id: self.optimistic_id,
-                reply_markup: self.reply_markup,
+                reply_markup: None,
             });
         }
 
@@ -95,7 +94,6 @@ pub async fn broadcast_and_persist_agent_response(
     content: &str,
     agent_role: Option<String>,
     workspace: &str,
-    reply_markup: Option<serde_json::Value>,
 ) {
     BroadcastPersistEntry {
         user_name: user_name.to_string(),
@@ -105,7 +103,6 @@ pub async fn broadcast_and_persist_agent_response(
         agent_role,
         workspace: workspace.to_string(),
         optimistic_id: None, // agent messages must not carry one
-        reply_markup,
     }
     .broadcast_and_persist()
     .await;
@@ -123,7 +120,6 @@ pub async fn write_incoming_to_broadcast(msg: &ChannelMessage) {
         agent_role: None, // user messages have no agent role
         workspace: msg.workspace.clone(),
         optimistic_id: msg.message_id.clone(), // GUI uses this for replacement
-        reply_markup: None,                    // user messages have no reply markup
     }
     .broadcast_and_persist()
     .await;
@@ -131,8 +127,6 @@ pub async fn write_incoming_to_broadcast(msg: &ChannelMessage) {
 
 /// Send a reply through a channel.
 pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_role: Option<String>) {
-    let reply_markup = None;
-
     // ── Broadcast agent response for live GUI display and chat_history ──
     // Must happen before the channel registry check -- broadcast_and_persist
     // does not depend on the channel object, only on fields from `msg`.
@@ -142,7 +136,6 @@ pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_rol
         &content,
         agent_role.clone(),
         &msg.workspace,
-        reply_markup.clone(),
     )
     .await;
 
@@ -157,7 +150,7 @@ pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_rol
     let reply = SendMessage {
         content,
         recipient: msg.reply_target.clone(),
-        reply_markup,
+        reply_markup: None,
         agent_role,
         workspace: msg.workspace.clone(),
     };

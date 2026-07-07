@@ -280,7 +280,6 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
         // The callback parsing infrastructure (`crate::channels::telegram::decode_callback`,
         // `handle_option_callback`)
         // remains available for future flows that produce their own reply markup.
-        let reply_markup: Option<serde_json::Value> = None;
 
         if users.is_empty() {
             warn!(
@@ -313,7 +312,6 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
                     content,
                     agent_role.clone(),
                     workspace,
-                    reply_markup.clone(),
                 )
                 .await;
             }
@@ -339,7 +337,7 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
                         .send(&SendMessage {
                             content: content.clone(),
                             recipient,
-                            reply_markup: reply_markup.clone(),
+                            reply_markup: None,
                             agent_role: agent_role.clone(),
                             workspace: workspace.clone(),
                         })
