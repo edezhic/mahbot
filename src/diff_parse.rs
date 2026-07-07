@@ -53,6 +53,13 @@ impl DiffFile {
             too_large_size,
         }
     }
+    /// Whether this file has parseable hunk content.
+    /// Binary files and files that are too large to diff have no parseable
+    /// content lines — they are represented as file headers only.
+    #[must_use]
+    pub(crate) fn has_parseable_content(&self) -> bool {
+        !self.is_binary && self.too_large_size.is_none()
+    }
 }
 
 /// One hunk within a file diff.

@@ -33,7 +33,6 @@ use iced::{Color, Event, Length, Point, Rectangle, Size};
 
 use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 
-use super::diff::is_diff_file_renderable;
 use super::text_rendering::{
     GUTTER_FONT_SIZE, compute_total_height, font_metrics, gutter_clip_rect, iced_color_to_cosmic,
     push_or_merge, text_area_rect, with_font_system,
@@ -641,7 +640,7 @@ pub fn build_file_buffers(
         // File headers, binary, too-large — these are rendered as Iced
         // widgets interleaved with DiffBufferWidgets. We skip buffer
         // construction for binary and too-large files.
-        if !is_diff_file_renderable(file) {
+        if !file.has_parseable_content() {
             continue;
         }
 
