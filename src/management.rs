@@ -1825,7 +1825,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 //
 //   * Classification — analysts use 4 categories
 //     (lgtm/minor_issues/potential_blockers/missing_analysis) that feed
-//     `build_analyst_summary`; reviewers/QA use a binary pass/fail via
+//     `format_analyst_summary`; reviewers/QA use a binary pass/fail via
 //     `verdict_passes` against `REVIEW_QA_THRESHOLD`.
 //   * Transition policy — analysts always advance to `Planning` regardless
 //     of outcome (even failures proceed, just with a comment listing the
@@ -2096,7 +2096,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
         }
     }
 
-    let summary = build_analyst_summary(
+    let summary = format_analyst_summary(
         total,
         lgtm,
         minor_issues,
@@ -2188,14 +2188,14 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     }
 }
 
-/// Build a natural-language summary of analyst verdict categories.
+/// Format a natural-language summary of analyst verdict categories.
 ///
 /// Categorizes each analyst as LGTM, minor issues, potential blockers, or missing
 /// analysis. Only categories with non-zero counts appear in the description.
 ///
 /// Label strings must not start with a leading space — `format!` inserts one
 /// between count and label automatically when using the "All {label}" form.
-fn build_analyst_summary(
+fn format_analyst_summary(
     total: usize,
     lgtm: usize,
     minor_issues: usize,
