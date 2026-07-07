@@ -1,5 +1,6 @@
 //! Ticket/board system — Turso-backed task management.
 
+use crate::role::SYSTEM_ROLE;
 use crate::turso::{self, IntoParams, TxGuard, Value, params_from_iter};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -1326,8 +1327,6 @@ impl BoardStore {
     /// * `lines_removed` — lines removed in the commit
     /// * `comment` — comment body to add
     /// * `source` — the ticket's expected current phase (e.g. `QaPassed`)
-    /// * `role` — the role identifier to record on the comment
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finalize_done_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
@@ -1336,10 +1335,9 @@ impl BoardStore {
         lines_removed: i64,
         comment: &str,
         source: TicketPhase,
-        role: &str,
     ) -> Result<()> {
         Self::set_commit_info_tx(tx, ticket_id, hash, lines_added, lines_removed).await?;
-        Self::add_comment_tx(tx, ticket_id, role, comment).await?;
+        Self::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, comment).await?;
         Self::transition_to_tx(tx, ticket_id, Some(source), TicketPhase::Done, None).await?;
         Ok(())
     }
@@ -1890,7 +1888,6 @@ mod tests {
     use crate::Tool;
     use crate::Workspace;
     use crate::role::DIAGNOSTICS_ROLE;
-    use crate::role::SYSTEM_ROLE;
     use crate::util::test::TicketBuilder;
     use crate::util::test::assert_superseded_ticket;
     use crate::util::test::expect_ticket;
@@ -3389,7 +3386,6 @@ with a comment explaining why no agent is mid-execution in that state.\
                 5,
                 "triple write comment",
                 TicketPhase::QaPassed,
-                SYSTEM_ROLE,
             )
             .await
             .unwrap();

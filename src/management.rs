@@ -1266,7 +1266,6 @@ async fn finalize_commit_and_transition(
                 commit_info.lines_removed,
                 &comment,
                 source,
-                SYSTEM_ROLE,
             )
             .await
         },
