@@ -2045,6 +2045,7 @@ mod tests {
         check_cargo_test_filter(cases);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn profile_selection_cases() {
         // Profile selection/dispatch tests — consolidated table.
