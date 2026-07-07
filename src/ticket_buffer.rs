@@ -67,8 +67,8 @@ pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketP
 /// Format:
 /// ```text
 /// Ticket updates:
-/// • mahbot-42: in_development → in_diagnostics
-/// • mahbot-43: in_diagnostics → diagnostics_done
+/// • mahbot-1: in_development → in_diagnostics
+/// • mahbot-2: in_diagnostics → diagnostics_done
 /// ```
 #[must_use]
 pub fn drain(workspace_name: &str) -> String {
