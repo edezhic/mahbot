@@ -37,6 +37,13 @@ const MAX_DIFF_LINES: usize = 5000;
 const MAX_HUNKS: usize = 100;
 const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 
+///   Returns `true` if the diff file should be rendered as line-buffers
+///   (i.e., is not binary and not too large). Files that fail this check
+///   are still shown as file headers in the diff view, but without hunk content.
+pub(super) fn is_diff_file_renderable(file: &crate::diff_parse::DiffFile) -> bool {
+    !file.is_binary && file.too_large_size.is_none()
+}
+
 /// Compute the index of the first [`DiffFile`] to exclude due to truncation limits.
 ///
 /// Iterates over `diff_files`, applying the same `selected_file` filter and
@@ -71,7 +78,7 @@ pub(super) fn compute_truncation_index(
         }
 
         // Binary and too-large files consume no hunk/line capacity.
-        if file.is_binary || file.too_large_size.is_some() {
+        if !is_diff_file_renderable(file) {
             continue;
         }
 
@@ -1470,10 +1477,10 @@ async fn load_diff(
     let mut enhanced: Vec<DiffFile> = Vec::with_capacity(parsed.len());
     for dfile in parsed {
         let (add_count, remove_count) = count_lines(&dfile);
-        let (old_hl, new_hl) = if dfile.is_binary || dfile.too_large_size.is_some() {
-            (None, None)
-        } else {
+        let (old_hl, new_hl) = if is_diff_file_renderable(&dfile) {
             compute_highlights(&dfile, &ws_path, commit_ref.as_deref()).await
+        } else {
+            (None, None)
         };
         enhanced.push(DiffFile {
             dfile,
