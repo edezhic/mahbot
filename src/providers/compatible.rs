@@ -486,7 +486,7 @@ impl OpenAiCompatibleProvider {
 
 /// Parse tool-call arguments JSON with repair fallback and fallback to empty object on parse failure.
 #[must_use]
-pub(crate) fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_json::Value {
+fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|parse_err| {
         if let Some(value) = try_repair_json::<serde_json::Value>(arguments) {
             tracing::debug!(
@@ -511,11 +511,7 @@ pub(crate) fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_js
 /// Handles empty/whitespace-only arguments, JSON parsing with repair fallback,
 /// and generates a fallback ID when none is provided.
 #[must_use]
-pub(crate) fn make_provider_tool_call(
-    id: Option<String>,
-    name: String,
-    arguments: &str,
-) -> ProviderToolCall {
+fn make_provider_tool_call(id: Option<String>, name: String, arguments: &str) -> ProviderToolCall {
     let arguments = if arguments.trim().is_empty() {
         "{}".to_string()
     } else {
