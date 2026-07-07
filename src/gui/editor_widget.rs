@@ -168,6 +168,54 @@ pub enum EditorAction {
     MoveLineDown,
 }
 
+impl EditorAction {
+    /// Returns `true` if this action modifies the editor content.
+    #[must_use]
+    pub const fn is_edit_action(&self) -> bool {
+        matches!(
+            self,
+            Self::Insert(_)
+                | Self::Enter
+                | Self::Backspace
+                | Self::Delete
+                | Self::Paste(_)
+                | Self::Indent
+                | Self::Unindent
+                | Self::DeleteWordBack
+                | Self::DeleteWordForward
+                | Self::ToggleLineComment
+                | Self::DeleteLine
+                | Self::DuplicateLine
+                | Self::MoveLineUp
+                | Self::MoveLineDown
+        )
+    }
+
+    /// Returns `true` if this action moves the cursor (including extending selection).
+    #[must_use]
+    pub const fn is_cursor_movement(&self) -> bool {
+        matches!(
+            self,
+            Self::MoveLeft { .. }
+                | Self::MoveRight { .. }
+                | Self::MoveUp { .. }
+                | Self::MoveDown { .. }
+                | Self::MoveHome { .. }
+                | Self::MoveEnd { .. }
+                | Self::MoveWordLeft { .. }
+                | Self::MoveWordRight { .. }
+                | Self::MoveDocStart { .. }
+                | Self::MoveDocEnd { .. }
+                | Self::MovePageUp { .. }
+                | Self::MovePageDown { .. }
+                | Self::SelectWordAt { .. }
+                | Self::JumpToMatchingBracket
+                | Self::MoveLineUp
+                | Self::MoveLineDown
+        )
+    }
+}
+
 // ── EditorBuffer ────────────────────────────────────────────────────
 
 /// A text buffer backed by [`cosmic_text::Buffer`] with manual cursor and
@@ -3024,7 +3072,7 @@ where
                 if let Some(ref action) = action {
                     // Cursor-movement actions re-enable auto-scroll (catches emacs
                     // shortcuts that aren't Named keys).
-                    let is_cursor_move = is_action_cursor_movement(action);
+                    let is_cursor_move = action.is_cursor_movement();
                     if is_cursor_move {
                         state.auto_scroll_enabled = true;
                         state.last_blink = std::time::Instant::now();
@@ -3431,29 +3479,6 @@ const fn is_cursor_movement_key(key: &key::Key) -> bool {
                 | key::Named::PageUp
                 | key::Named::PageDown
         )
-    )
-}
-
-/// Returns `true` when the action moves the cursor (including extending selection).
-const fn is_action_cursor_movement(action: &EditorAction) -> bool {
-    matches!(
-        action,
-        EditorAction::MoveLeft { .. }
-            | EditorAction::MoveRight { .. }
-            | EditorAction::MoveUp { .. }
-            | EditorAction::MoveDown { .. }
-            | EditorAction::MoveHome { .. }
-            | EditorAction::MoveEnd { .. }
-            | EditorAction::MoveWordLeft { .. }
-            | EditorAction::MoveWordRight { .. }
-            | EditorAction::MoveDocStart { .. }
-            | EditorAction::MoveDocEnd { .. }
-            | EditorAction::MovePageUp { .. }
-            | EditorAction::MovePageDown { .. }
-            | EditorAction::SelectWordAt { .. }
-            | EditorAction::JumpToMatchingBracket
-            | EditorAction::MoveLineUp
-            | EditorAction::MoveLineDown
     )
 }
 

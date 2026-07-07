@@ -3153,23 +3153,7 @@ impl EditorState {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
         };
-        let is_edit = matches!(
-            action,
-            super::editor_widget::EditorAction::Insert(_)
-                | super::editor_widget::EditorAction::Enter
-                | super::editor_widget::EditorAction::Backspace
-                | super::editor_widget::EditorAction::Delete
-                | super::editor_widget::EditorAction::Paste(_)
-                | super::editor_widget::EditorAction::Indent
-                | super::editor_widget::EditorAction::Unindent
-                | super::editor_widget::EditorAction::DeleteWordBack
-                | super::editor_widget::EditorAction::DeleteWordForward
-                | super::editor_widget::EditorAction::ToggleLineComment
-                | super::editor_widget::EditorAction::DeleteLine
-                | super::editor_widget::EditorAction::DuplicateLine
-                | super::editor_widget::EditorAction::MoveLineUp
-                | super::editor_widget::EditorAction::MoveLineDown
-        );
+        let is_edit = action.is_edit_action();
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if is_edit {
                 tab_data
