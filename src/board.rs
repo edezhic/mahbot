@@ -482,7 +482,7 @@ impl std::str::FromStr for TicketPhase {
             .find(|p| p.as_ref() == s)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid status '{s}'. Valid statuses: {}",
+                    "Invalid phase '{s}'. Valid phases: {}",
                     *ALL_TICKET_PHASE_NAMES
                 )
             })
@@ -1984,8 +1984,8 @@ mod tests {
         let msg = format!("{err}");
 
         assert!(
-            msg.contains("Invalid status"),
-            "error should mention 'Invalid status', got: {msg}"
+            msg.contains("Invalid phase"),
+            "error should mention 'Invalid phase', got: {msg}"
         );
         assert!(
             msg.contains("bogus_status"),
