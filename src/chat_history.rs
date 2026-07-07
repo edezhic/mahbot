@@ -69,11 +69,6 @@ pub struct ChatHistoryEntry {
 /// Maximum number of history entries to load at once.
 const HISTORY_LIMIT: usize = 100;
 
-/// SQL query limit derived from `HISTORY_LIMIT`.
-/// SAFETY: `as i64` cast is infallible — `HISTORY_LIMIT` values are well below `i64::MAX`.
-#[allow(clippy::cast_possible_wrap)]
-const HISTORY_LIMIT_SQL: i64 = HISTORY_LIMIT as i64;
-
 // Column definitions for `chat_history` SELECT queries.
 crate::columns! {
     CHAT_HISTORY_COLUMNS [CH] {
@@ -130,6 +125,7 @@ fn rows_to_page(rows: Vec<Row>) -> Result<(Vec<ChatHistoryEntry>, bool)> {
     Ok((entries, has_more))
 }
 
+#[allow(clippy::cast_possible_wrap)]
 impl ChatHistoryStore {
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
     /// Silently ignores duplicate `message_id` values (UPSERT no-op).
@@ -165,7 +161,7 @@ impl ChatHistoryStore {
         user_name: &str,
         workspace: &str,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        let query_limit = HISTORY_LIMIT_SQL + 1; // fetch one extra to detect has_more
+        let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
             .query(
@@ -192,7 +188,7 @@ impl ChatHistoryStore {
         workspace: &str,
         before_id: i64,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        let query_limit = HISTORY_LIMIT_SQL + 1; // fetch one extra to detect has_more
+        let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
             .query(
