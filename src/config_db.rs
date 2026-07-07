@@ -191,9 +191,11 @@ impl ConfigStore {
     ) -> Result<()> {
         tx.execute("DELETE FROM config_role", turso::params![])
             .await?;
+        let insert_role_sql =
+            format!("INSERT INTO config_role ({ROLE_CONFIG_COLUMNS}) VALUES (?1, ?2, ?3)");
         for rc in role_configs {
             tx.execute(
-                "INSERT INTO config_role (role, model, reasoning_effort) VALUES (?1, ?2, ?3)",
+                &insert_role_sql,
                 turso::params![
                     rc.role.as_str(),
                     rc.model.as_deref(),
@@ -204,11 +206,13 @@ impl ConfigStore {
         }
         tx.execute("DELETE FROM config_model_routing", turso::params![])
             .await?;
+        let insert_routing_sql = format!(
+            "INSERT INTO config_model_routing ({MODEL_ROUTING_COLUMNS}) VALUES (?1, ?2, ?3)"
+        );
         for mr in model_routings {
             let allow_int = mr.allow_fallbacks.map(i32::from);
             tx.execute(
-                "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
-                 VALUES (?1, ?2, ?3)",
+                &insert_routing_sql,
                 turso::params![mr.model.as_str(), mr.provider_order.as_deref(), allow_int],
             )
             .await?;
