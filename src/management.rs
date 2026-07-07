@@ -1029,7 +1029,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// If other active tickets remain in the workspace, the notification is
 /// buffered so the Manager only gets one notification when the last ticket
-/// finishes. Active tickets = `PIPELINE_BLOCKING_STATUSES` + `ReadyForDevelopment`.
+/// finishes. Active tickets = `PIPELINE_BLOCKING_PHASES` + `ReadyForDevelopment`.
 ///
 /// # Race condition
 ///
