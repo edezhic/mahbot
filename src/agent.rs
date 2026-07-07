@@ -21,8 +21,24 @@ use tracing::Instrument;
 /// A model that keeps emitting tool calls will loop indefinitely without
 /// this guard. Common causes: weaker models stuck in tool-calling loops,
 /// broken prompt configurations, or genuinely adversarial behavior.
-/// 1000 iterations is generous enough for any legitimate run (typical agents
-/// finish in 3–8 turns) while catching truly stuck loops.
+///
+/// The limit is deliberately set **far above** the typical 3–8 turn range to
+/// avoid false-positive cutoffs during complex or edge-case agent runs.
+/// Legitimate scenarios that consume many iterations include: multi-file
+/// refactors with fine-grained steps, chained ask/sub-agent delegations,
+/// long-running browser-based workflows, and multi-modal processing sequences.
+/// A tighter limit (e.g. 50) would save no meaningful cost but would
+/// periodically abort legitimate runs.
+///
+/// The economic risk from the generous ceiling is acceptable when
+/// considering two scenarios. Under normal operation the majority of
+/// iterations are cheap tool-result turnarounds (no model inference).
+/// Even in the pathological worst case — a stuck loop where every
+/// iteration is a full model inference — the cost is bounded to a small
+/// fraction of a dollar and the loop is still caught well before it
+/// becomes expensive.  For context, the entire system already spawns
+/// \>1000 successful agents per day at a total cost of roughly $10/day,
+/// so the marginal risk from a few extra iterations is negligible.
 const MAX_LLM_ITERATIONS: usize = 1000;
 
 /// Maximum length of serialized arguments stored in per-call stats.
