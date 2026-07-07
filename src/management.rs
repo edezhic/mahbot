@@ -1841,10 +1841,17 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 //     difference alone prevents a shared function signature without closures.
 
 /// Result from a single parallel verifier agent.
+///
+/// Three mutually-exclusive states — the type system guarantees
+/// that "no response" and "parse failure" cannot be confused.
 #[derive(Clone)]
-struct ParallelVerdict {
-    has_response: bool,
-    verdict: Option<crate::Verdict>,
+enum ParallelVerdict {
+    /// Agent failed to produce any response (crashed, timed out, empty output).
+    NoResponse,
+    /// Agent produced a response but structured verdict extraction failed.
+    ParseFailed,
+    /// Agent produced a successfully-parsed verdict.
+    Verdict(crate::Verdict),
 }
 
 /// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
@@ -1854,9 +1861,10 @@ struct ParallelVerdict {
 /// where `suffix` is a unique 6-char NanoID for retry-cycle disambiguation.
 /// Each agent creates its own CancellationToken and auto-registers.
 ///
-/// Agents with empty responses get `verdict: None`; others are parsed via
-/// [`crate::extraction::retry_extract_structured::<Verdict>`] using the provided extraction prompt.
-/// All non-empty extractions run concurrently via [`join_all`].
+/// Agents with empty responses get [`ParallelVerdict::NoResponse`]; agents that
+/// respond but fail to parse get [`ParallelVerdict::ParseFailed`]; successful
+/// agents get [`ParallelVerdict::Verdict`]. All extraction attempts run
+/// concurrently via [`join_all`].
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -1880,10 +1888,7 @@ async fn run_parallel_agents(
                     run_agent(session_key, role, &ws, Some(&ticket), &prompt).await;
                 let response = response.unwrap_or_default();
                 if response.is_empty() {
-                    return ParallelVerdict {
-                        has_response: false,
-                        verdict: None,
-                    };
+                    return ParallelVerdict::NoResponse;
                 }
                 // KV cache preservation: `agent.extract_structured` uses the
                 // agent's own parameters (model, temperature, reasoning_effort,
@@ -1894,9 +1899,9 @@ async fn run_parallel_agents(
                     .extract_structured::<crate::Verdict>(&extraction_prompt, &retry_prompt, 5)
                     .await
                     .ok();
-                ParallelVerdict {
-                    has_response: true,
-                    verdict,
+                match verdict {
+                    Some(v) => ParallelVerdict::Verdict(v),
+                    None => ParallelVerdict::ParseFailed,
                 }
             }
         })
@@ -1953,29 +1958,28 @@ fn format_verdict_comment(
     comment_role: &str,
     filter: VerdictFilter,
 ) -> Option<String> {
-    if let Some(v) = &r.verdict {
-        // Analysts want ALL verdicts recorded; verifiers only want failing ones.
-        if filter == VerdictFilter::FailingOnly && verdict_passes(Some(v)) {
-            return None; // passing verdict, verifier path only
+    match r {
+        ParallelVerdict::Verdict(v) => {
+            // Analysts want ALL verdicts recorded; verifiers only want failing ones.
+            if filter == VerdictFilter::FailingOnly && verdict_passes(Some(v)) {
+                return None; // passing verdict, verifier path only
+            }
+            let comment = format_verdict_body(v);
+            if comment.is_empty() {
+                return Some(format!(
+                    "{} agent scored {}/10 with no specific critique provided.",
+                    comment_role, v.score
+                ));
+            }
+            Some(comment)
         }
-        let comment = format_verdict_body(v);
-        if comment.is_empty() {
-            return Some(format!(
-                "{} agent scored {}/10 with no specific critique provided.",
-                comment_role, v.score
-            ));
-        }
-        return Some(comment);
-    }
-    if r.has_response {
-        Some(format!(
+        ParallelVerdict::ParseFailed => Some(format!(
             "{comment_role} produced a response but verdict extraction failed — \
              treating as a failure."
-        ))
-    } else {
-        Some(format!(
+        )),
+        ParallelVerdict::NoResponse => Some(format!(
             "{comment_role} agent failed to produce a response — counting as a failure."
-        ))
+        )),
     }
 }
 
@@ -2070,7 +2074,10 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
 async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
-    let nonempty_count = results.iter().filter(|r| r.has_response).count();
+    let nonempty_count = results
+        .iter()
+        .filter(|r| !matches!(r, ParallelVerdict::NoResponse))
+        .count();
     let total = results.len();
     let mut lgtm = 0usize;
     let mut minor_issues = 0usize;
@@ -2078,13 +2085,15 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     let mut missing_analysis = 0usize;
 
     for r in results {
-        match &r.verdict {
-            Some(v) if v.score >= ANALYST_PASS_THRESHOLD && v.issues_detected.is_empty() => {
+        match r {
+            ParallelVerdict::Verdict(v)
+                if v.score >= ANALYST_PASS_THRESHOLD && v.issues_detected.is_empty() =>
+            {
                 lgtm += 1;
             }
-            Some(v) if v.score >= ANALYST_PASS_THRESHOLD => minor_issues += 1,
-            Some(_) => potential_blockers += 1,
-            None => missing_analysis += 1,
+            ParallelVerdict::Verdict(v) if v.score >= ANALYST_PASS_THRESHOLD => minor_issues += 1,
+            ParallelVerdict::Verdict(_) => potential_blockers += 1,
+            ParallelVerdict::NoResponse | ParallelVerdict::ParseFailed => missing_analysis += 1,
         }
     }
 
@@ -2388,8 +2397,13 @@ async fn process_verifier_verdicts(
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
 ) {
-    let all_failed = results.iter().all(|r| r.verdict.is_none());
-    let any_failed = results.iter().any(|r| !verdict_passes(r.verdict.as_ref()));
+    let all_failed = results
+        .iter()
+        .all(|r| !matches!(r, ParallelVerdict::Verdict(_)));
+    let any_failed = results.iter().any(|r| match r {
+        ParallelVerdict::Verdict(v) => !verdict_passes(Some(v)),
+        _ => true,
+    });
 
     // Determine transition parameters based on the three-way branch:
     //   all-failed → Failed (notify, with failure comment)
@@ -2969,12 +2983,9 @@ mod tests {
         }
     }
 
-    /// Helper: a `ParallelVerdict` with no verdict (agent produced no response).
+    /// Helper: a `ParallelVerdict` with no response.
     fn no_verdict() -> ParallelVerdict {
-        ParallelVerdict {
-            has_response: false,
-            verdict: None,
-        }
+        ParallelVerdict::NoResponse
     }
 
     /// Add a sanitation failure comment for circuit breaker testing.
@@ -2988,32 +2999,23 @@ mod tests {
             .await;
     }
 
-    /// Helper: wrap a passing verdict with a response string (reviewer/QA flow).
+    /// Helper: wrap a passing verdict (reviewer/QA flow).
     fn pass_result() -> ParallelVerdict {
-        ParallelVerdict {
-            has_response: true,
-            verdict: Some(pass_verdict()),
-        }
+        ParallelVerdict::Verdict(pass_verdict())
     }
 
-    /// Helper: wrap a failing verdict with a response string (reviewer/QA flow).
+    /// Helper: wrap a failing verdict (reviewer/QA flow).
     fn fail_result() -> ParallelVerdict {
-        ParallelVerdict {
-            has_response: true,
-            verdict: Some(fail_verdict()),
-        }
+        ParallelVerdict::Verdict(fail_verdict())
     }
 
     /// Helper: construct an analyst verdict with explicit score / critique / issues.
     fn analyst_verdict(score: u8, critique: &str, issues: &[&str]) -> ParallelVerdict {
-        ParallelVerdict {
-            has_response: true,
-            verdict: Some(crate::Verdict {
-                score,
-                critique: Some(critique.into()),
-                issues_detected: issues.iter().map(|&s| s.into()).collect(),
-            }),
-        }
+        ParallelVerdict::Verdict(crate::Verdict {
+            score,
+            critique: Some(critique.into()),
+            issues_detected: issues.iter().map(|&s| s.into()).collect(),
+        })
     }
 
     // ── process_verifier_verdicts — verdict processing ─────────────────────
