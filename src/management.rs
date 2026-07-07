@@ -537,7 +537,7 @@ pub async fn run_management() {
 /// notification so the manager can investigate.
 fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let phase_info = phase.info();
-    let active_phase = phase_info.active_phase;
+    let expected_phase = phase_info.expected_phase;
 
     info!(
         ticket = %ticket.id,
@@ -562,7 +562,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // The post-agent is_ticket_in_phase check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         let (kind, log_label) = phase.circuit_breaker_kind();
-        if should_abort_dispatch(&ticket, active_phase, kind, log_label).await {
+        if should_abort_dispatch(&ticket, expected_phase, kind, log_label).await {
             return;
         }
 
@@ -597,7 +597,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             // externally while the dispatch was running.
             let _ = transition_ticket_to_failed(
                 &ticket_for_failure,
-                active_phase,
+                expected_phase,
                 &format!("❌ Dispatch panicked: {msg}"),
                 "dispatch panic",
             )
@@ -630,7 +630,7 @@ struct VerifierInfo {
     /// transitions *from* when the verifier finishes (to [`success_phase`] on
     /// success, or to Failed/ReadyForDevelopment on failure).
     ///
-    /// Contrast with [`PollPhaseInfo::active_phase`] which serves as the
+    /// Contrast with [`PollPhaseInfo::expected_phase`] which serves as the
     /// *target* phase for claim transitions in the poll loop.
     source_phase: TicketPhase,
     prompt_template: &'static str,
@@ -661,7 +661,7 @@ const QA_VI: VerifierInfo = VerifierInfo {
 /// match — adding any phase requires one row in that match.
 #[derive(Copy, Clone)]
 struct PollPhaseInfo {
-    active_phase: TicketPhase,
+    expected_phase: TicketPhase,
     /// How this phase checks pipeline occupancy. [`Enforce`](PipelineCheck::Enforce)
     /// blocks claims when another pipeline ticket is active in the workspace;
     /// [`Skip`](PipelineCheck::Skip) allows concurrent claims.
@@ -689,19 +689,19 @@ impl PollPhase {
     fn info(self) -> PollPhaseInfo {
         match self {
             Self::BacklogAnalysis => PollPhaseInfo {
-                active_phase: TicketPhase::Analysis,
+                expected_phase: TicketPhase::Analysis,
                 pipeline_check: PipelineCheck::Skip,
                 role_label: Role::Analyst.as_str(),
             },
             Self::EngineerDevelopment => PollPhaseInfo {
-                active_phase: TicketPhase::InDevelopment,
+                expected_phase: TicketPhase::InDevelopment,
                 pipeline_check: PipelineCheck::Enforce,
                 role_label: Role::Engineer.as_str(),
             },
             Self::SanitationCheck => PollPhaseInfo {
-                active_phase: TicketPhase::InSanitation,
-                // Note: active_phase is consumed by spawn_dispatch's
-                // panic-recovery transition (active_phase → Failed).
+                expected_phase: TicketPhase::InSanitation,
+                // Note: expected_phase is consumed by spawn_dispatch's
+                // panic-recovery transition (expected_phase → Failed).
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
                 // claim_sanitation in handle_qa_passed.
@@ -709,12 +709,12 @@ impl PollPhase {
                 role_label: Role::Sanitation.as_str(),
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
-                active_phase: TicketPhase::InDiagnostics,
+                expected_phase: TicketPhase::InDiagnostics,
                 pipeline_check: PipelineCheck::Skip,
                 role_label: DIAGNOSTICS_ROLE,
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
-                active_phase: vi.source_phase,
+                expected_phase: vi.source_phase,
                 pipeline_check: PipelineCheck::Skip,
                 role_label: vi.role.as_str(),
             },
@@ -736,7 +736,7 @@ impl PollPhase {
     }
 }
 
-/// Pipeline phases that use atomic source→active_phase claim transitions.
+/// Pipeline phases that use atomic source→expected_phase claim transitions.
 ///
 /// Each tuple is `(source_phase, poll_phase)` — the `source_phase` is the
 /// expected current phase of the ticket before claiming, and `poll_phase`
@@ -877,12 +877,17 @@ async fn poll_round() -> anyhow::Result<()> {
             }
             let info = phase.info();
             let ticket = match board
-                .claim_ticket_in_workspace(source, info.active_phase, &ws.name, info.pipeline_check)
+                .claim_ticket_in_workspace(
+                    source,
+                    info.expected_phase,
+                    &ws.name,
+                    info.pipeline_check,
+                )
                 .await
             {
                 Ok(Some(t)) => {
                     // Buffer the claim transition. The returned ticket already
-                    // has status = info.active_phase (from SQL RETURNING), so record
+                    // has status = info.expected_phase (from SQL RETURNING), so record
                     // the transition from source.
                     ticket_buffer::push(&ws.name, &t.id, source, t.phase);
                     t
