@@ -564,26 +564,6 @@ impl Agent {
         Ok(())
     }
 
-    pub(crate) fn model(&self) -> String {
-        crate::config::CONFIG.role_model(self.role)
-    }
-
-    /// Resolve reasoning effort for this agent's role from current config.
-    fn reasoning_effort(&self) -> String {
-        crate::config::CONFIG.role_reasoning_effort(self.role)
-    }
-
-    /// Resolve temperature for this agent's role from static role metadata.
-    const fn temperature(&self) -> f32 {
-        crate::role::role_info(&self.role).temperature
-    }
-
-    /// Resolve provider order and allow_fallbacks for this agent's model from live config.
-    /// Lazily resolved each call to respect runtime hot-reload.
-    fn provider_routing(model: &str) -> crate::config::ModelRouting {
-        crate::config::CONFIG.model_routing(model)
-    }
-
     /// Build a [`ChatRequest`] from the given messages and image-parts flag,
     /// using the agent's current model, tools, temperature, reasoning-effort,
     /// and provider-routing settings.
@@ -607,16 +587,17 @@ impl Agent {
         messages: Vec<ChatMessage>,
         allow_image_parts: bool,
     ) -> ChatRequest {
-        let model = self.model();
-        let routing = Self::provider_routing(&model);
+        let model = crate::config::CONFIG.role_model(self.role);
+        let routing = crate::config::CONFIG.model_routing(&model);
         ChatRequest {
             messages,
             tools: Some(self.tool_specs.clone()),
             model,
             allow_image_parts,
-            temperature: self.temperature(),
+            // temperature is a compile-time constant from role metadata — not hot-reloadable
+            temperature: crate::role::role_info(&self.role).temperature,
             max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
-            reasoning_effort: Some(self.reasoning_effort()),
+            reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(self.role)),
             provider_order: routing.provider_order,
             provider_allow_fallbacks: routing.allow_fallbacks,
         }
