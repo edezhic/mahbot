@@ -526,8 +526,6 @@ impl PreparedUpdate {
     /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
     /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
     ///   before commit via a different pattern.
-    /// - **`BoardStore::batch_set_archived`** — batch operation, handles
-    ///   zero-affected-rows gracefully (no error).
     /// - **`BoardStore::claim_sanitation`** — returns `Result<bool>`, does NOT cancel
     ///   (QaPassed has no running agent).
     async fn execute_and_cancel(self, conn: &turso::Connection) -> Result<()> {
@@ -1694,51 +1692,6 @@ impl BoardStore {
             .map_err(Into::into)
     }
 
-    /// Execute a SELECT query and collect the first column as candidate IDs
-    /// for archival. All returned rows are included as-is; no status or phase
-    /// validation is performed.
-    async fn collect_archive_candidates(
-        &self,
-        sql: &str,
-        params: impl turso::IntoParams + Send + 'static,
-    ) -> Result<Vec<String>> {
-        let rows = self.conn.query(sql, params).await?;
-        let mut candidates = Vec::new();
-        for row in rows {
-            let id: String = row.get(0)?;
-            candidates.push(id);
-        }
-        Ok(candidates)
-    }
-
-    /// Maximum IDs per batch to stay well under SQLite's
-    /// `SQLITE_MAX_VARIABLE_NUMBER` limit (default 999), with one
-    /// placeholder reserved for the timestamp.
-    const ARCHIVE_CHUNK_SIZE: usize = 500;
-
-    async fn batch_set_archived(&self, items: &[String]) -> Result<u64> {
-        if items.is_empty() {
-            return Ok(0);
-        }
-        let now = turso::now();
-        let mut total: u64 = 0;
-        for chunk in items.chunks(Self::ARCHIVE_CHUNK_SIZE) {
-            let sql = format!(
-                "UPDATE tickets SET is_archived = 1, updated_at = ? \
-                 WHERE id IN ({}) AND assigned_to IS NULL",
-                turso::sql_in_placeholders(chunk.len()),
-            );
-            let mut params: Vec<Value> = vec![Value::Text(now.clone())];
-            params.extend(chunk.iter().map(|id| Value::Text(id.clone())));
-            total += self
-                .conn
-                .execute(&sql, params_from_iter(params))
-                .await
-                .context("Failed to batch-archive tickets")?;
-        }
-        Ok(total)
-    }
-
     /// Archive a single ticket by ID.
     ///
     /// Sets `is_archived = 1` and clears `assigned_to` (archived tickets should
@@ -1746,8 +1699,7 @@ impl BoardStore {
     ///
     /// **Ordering constraint:** The caller must transition the ticket to a
     /// terminal state (`done` or `cancelled`) *before* calling this method.
-    /// Unlike `batch_set_archived` there is no
-    /// `assigned_to IS NULL` guard — [`transition_to`](Self::transition_to)
+    /// There is no `assigned_to IS NULL` guard — [`transition_to`](Self::transition_to)
     /// already clears the assignee, and a single-ticket archive on an assigned
     /// ticket is intentionally allowed to resolve stale assignments.
     pub async fn set_archived(&self, ticket_id: &str) -> Result<()> {
@@ -1795,33 +1747,39 @@ impl BoardStore {
     }
 
     pub async fn archive_stale_cancelled(&self, hours: i64) -> Result<u64> {
+        let now = turso::now();
         let cutoff = (Utc::now() - Duration::hours(hours)).to_rfc3339();
-        let to_archive = self
-            .collect_archive_candidates(
-                "SELECT id FROM tickets \
-             WHERE status = ?1 AND updated_at < ?2 AND assigned_to IS NULL \
-             AND is_archived = 0",
-                turso::params![TicketPhase::Cancelled.as_ref(), cutoff],
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
+                 WHERE status = ?2 AND updated_at < ?3 AND assigned_to IS NULL \
+                 AND is_archived = 0",
+                turso::params![now, TicketPhase::Cancelled.as_ref(), cutoff],
             )
-            .await?;
-        self.batch_set_archived(&to_archive).await
+            .await
+            .context("Failed to archive stale cancelled tickets")?;
+        Ok(updated)
     }
 
     pub async fn archive_all_done_and_cancelled(
         &self,
         workspace_name: Option<&str>,
     ) -> Result<u64> {
+        let now = turso::now();
         let done_cancelled = [TicketPhase::Done, TicketPhase::Cancelled];
-        let select_sql = format!(
-            "SELECT id FROM tickets WHERE status IN ({}) \
-             AND assigned_to IS NULL AND is_archived = 0 \
-             AND (?1 IS NULL OR workspace_name = ?1)",
+        let sql = format!(
+            "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
+             WHERE status IN ({}) AND assigned_to IS NULL AND is_archived = 0 \
+             AND (?2 IS NULL OR workspace_name = ?2)",
             status_list_sql_fragment(&done_cancelled),
         );
-        let to_archive = self
-            .collect_archive_candidates(&select_sql, turso::params![workspace_name])
-            .await?;
-        self.batch_set_archived(&to_archive).await
+        let updated = self
+            .conn
+            .execute(&sql, turso::params![now, workspace_name])
+            .await
+            .context("Failed to archive done/cancelled tickets")?;
+        Ok(updated)
     }
 
     // ── Archived ticket search methods ────────────────────────────────────
