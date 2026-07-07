@@ -1497,7 +1497,10 @@ impl BoardStore {
     /// `Done` and `Cancelled`, neither of which appears in
     /// `PIPELINE_BLOCKING_STATUSES`, so this is a defensive consistency measure.
     #[cfg(test)]
-    pub async fn has_pipeline_blocker_for_workspace(&self, workspace_name: &str) -> Result<bool> {
+    pub(crate) async fn has_pipeline_blocker_for_workspace(
+        &self,
+        workspace_name: &str,
+    ) -> Result<bool> {
         self.has_active_tickets_internal(workspace_name, ReservationFilter::ReservedOnly, None)
             .await
     }
