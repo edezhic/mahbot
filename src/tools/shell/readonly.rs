@@ -204,44 +204,14 @@ fn strip_heredoc_bodies(command: &str) -> String {
     let chars: Vec<(usize, char)> = command.char_indices().collect();
 
     while i < chars.len() {
-        // ── Escape tracking ────────────────────────────────────────
-        // Must come before quote state tracking so escaped quotes
-        // (`\'`, `\"`) don't toggle in_single/in_double.  The
-        // `!in_single` guard means backslash is treated as escape both
-        // outside quotes and inside double quotes (inside double quotes,
-        // `\` should only escape `\`, `$`, `` ` ``, `"`, and newline,
-        // but treating any backslash as escape is a safe over-approximation:
-        // the escaped char is preserved in output and skipped for quote
-        // state / heredoc detection; at worst it causes a false negative
-        // (missed redirect) which is acceptable for a best-effort layer).
-        // Inside single quotes, backslash is always literal.
-        //
-        // When a character is escaped, we still push it to the output
-        // (to preserve the command string for redirect scanning), but we
-        // skip quote-state tracking and heredoc detection for it.
-        // This mirrors the philosophy of [`has_disallowed_redirect`]'s
-        // escape handling: over-escaping is safe (false negative = allow,
-        // which is acceptable for this best-effort safety layer).
-        if escaped {
-            escaped = false;
-            out.push(chars[i].1);
-            i += 1;
-            continue;
-        }
-        if chars[i].1 == '\\' && !in_single {
-            escaped = true;
-            out.push(chars[i].1);
-            i += 1;
-            continue;
-        }
-
-        // ── Quote state tracking ───────────────────────────────────
-        // [`check_outside_quotes`] returns `false` both for quote
-        // characters (`'`, `"`) and for characters inside quotes.
-        // When inside quotes, we push the character to output and
-        // skip heredoc detection — `<<` inside quotes is literal text,
-        // not a heredoc start.
-        if !super::check_outside_quotes(chars[i].1, &mut in_single, &mut in_double) {
+        // ── Escape + quote state tracking ──────────────────────────
+        // [`super::track_char_context`] handles both backslash escaping
+        // and quote state transitions, returning `false` when the
+        // character should not be examined for heredoc detection
+        // (escaped, backslash, quote char, or inside quotes). We still
+        // push all such characters to the output to preserve the command
+        // string for redirect scanning.
+        if !super::track_char_context(chars[i].1, &mut in_single, &mut in_double, &mut escaped) {
             out.push(chars[i].1);
             i += 1;
             continue;
@@ -355,28 +325,11 @@ fn has_disallowed_redirect(command_str: &str) -> bool {
     let mut chars = scan_str.char_indices();
 
     while let Some((i, c)) = chars.next() {
-        // Handle escape tracking locally — backslash escaping is independent
-        // of the quote state machine.  The `!in_single` guard ensures that
-        // backslashes inside single quotes are literal (matching real shell
-        // behavior).
-        //
-        // # Known limitation
-        //
-        // Inside double quotes, `\` should only escape `\`, `$`, `` ` ``,
-        // `"`, and newline in a real shell.  This code treats any backslash
-        // inside double quotes as an escape, which is safe for redirect
-        // detection: a quoted redirect operator is harmless, and an escaped
-        // actual redirect would be a false negative (allow), also harmless.
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if c == '\\' && !in_single {
-            escaped = true;
-            continue;
-        }
-
-        if !super::check_outside_quotes(c, &mut in_single, &mut in_double) {
+        // [`super::track_char_context`] handles both backslash escaping
+        // and quote state transitions, returning `false` when the
+        // character should be skipped for redirect detection (escaped,
+        // backslash, quote char, or inside quotes).
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
             continue;
         }
 

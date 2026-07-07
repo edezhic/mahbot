@@ -645,24 +645,12 @@ static SPILL_DIR_CLEANED: AtomicBool = AtomicBool::new(false);
 
 // ── Pipeline functions ────────────────────────────────────────────────
 
-/// Shared quote-tracking state machine used by both [`extract_command_segments`]
-/// and `super::readonly::has_disallowed_redirect` to avoid duplicating shell
-/// quoting logic. Returns `true` when `c` is outside quotes and should be
-/// examined for shell operators or redirect patterns.
+/// Quote-tracking state machine. Returns `true` when `c` is outside quotes
+/// and should be examined for shell operators or redirect patterns.
 ///
 /// This function tracks ONLY quote state — escape handling is the caller's
-/// responsibility. Callers that need backslash escape semantics must handle
-/// `\\` detection before invoking this function.
-///
-/// # Known limitation
-///
-/// Inside double quotes, `\` should only escape `\`, `$`, `` ` ``, `"`, and
-/// newline in a real shell. The escape handling in both callers treats any
-/// backslash as an escape, which is acceptable for our use cases (segment
-/// splitting and redirect detection), where over-escaping is safe (false
-/// negative for redirect detection = allows command; no redirect inside
-/// double-quoted strings is actually harmful since the redirect operator is
-/// quoted).
+/// responsibility. Most callers should use [`track_char_context`] instead,
+/// which combines both escape and quote tracking.
 const fn check_outside_quotes(c: char, in_single: &mut bool, in_double: &mut bool) -> bool {
     match c {
         '\'' if !*in_double => {
@@ -675,6 +663,47 @@ const fn check_outside_quotes(c: char, in_single: &mut bool, in_double: &mut boo
         }
         _ => !*in_single && !*in_double,
     }
+}
+
+/// Combined escape and quote tracking for shell command scanning.
+///
+/// Handles backslash escaping (with the `escaped` flag) and quote state
+/// transitions (via [`check_outside_quotes`]). Returns `true` when `c` is
+/// a normal unescaped character outside quotes that the caller should
+/// examine for shell operators or redirect patterns. Returns `false` when:
+///
+/// * `c` was preceded by an escape backslash (the `escaped` flag was set)
+/// * `c` is itself a backslash starting an escape
+/// * `c` is a quote character or inside quotes
+///
+/// After a `false` return, the caller may still need to push the character
+/// to an output buffer (e.g., [`super::readonly::strip_heredoc_bodies`]
+/// preserves the command string for redirect scanning, but
+/// [`super::readonly::has_disallowed_redirect`] simply continues without
+/// pushing).
+///
+/// # Known limitation
+///
+/// Inside double quotes, `\` should only escape `\`, `$`, `` ` ``, `"`, and
+/// newline in a real shell. This function treats any backslash inside double
+/// quotes as an escape, which is acceptable for redirect detection: a quoted
+/// redirect operator is harmless, and an escaped actual redirect would be a
+/// false negative (allow), also harmless.
+const fn track_char_context(
+    c: char,
+    in_single: &mut bool,
+    in_double: &mut bool,
+    escaped: &mut bool,
+) -> bool {
+    if *escaped {
+        *escaped = false;
+        return false;
+    }
+    if c == '\\' && !*in_single {
+        *escaped = true;
+        return false;
+    }
+    check_outside_quotes(c, in_single, in_double)
 }
 
 /// Split a shell command string into logical segments at shell operators.
@@ -3088,6 +3117,77 @@ mod tests {
                 assert_eq!(
                     d, exp_d,
                     "{name} step {i}: after {ch:?}, in_double={d}, expected {exp_d}",
+                );
+            }
+        }
+    }
+
+    // ── track_char_context ───────────────────────────────────────────
+    // Combined escape + quote tracking state machine.
+
+    type ContextStep = (char, bool, bool, bool, bool);
+
+    #[test]
+    fn track_char_context_cases() {
+        // Each case: (char, expected_return, in_single, in_double, escaped)
+        // The `escaped` column shows the flag AFTER processing the character.
+        let cases: &[(&str, &[ContextStep])] = &[
+            (
+                "backslash escapes outside quotes",
+                &[
+                    ('\\', false, false, false, true), // backslash sets escaped
+                    ('a', false, false, false, false), // escaped 'a' consumed, skip
+                    ('a', true, false, false, false),  // normal 'a' outside quotes
+                ],
+            ),
+            (
+                "escaped backslash",
+                &[
+                    ('\\', false, false, false, true),  // first backslash sets escaped
+                    ('\\', false, false, false, false), // second backslash: escaped flag was set, consume it; does NOT start new escape
+                    ('a', true, false, false, false),   // normal 'a' outside quotes
+                ],
+            ),
+            (
+                "escaped quote inside double does not toggle",
+                &[
+                    ('"', false, false, true, false),  // double opens
+                    ('\\', false, false, true, true),  // backslash inside double, sets escaped
+                    ('"', false, false, true, false), // escaped quote consumed, doesn't toggle double
+                    ('"', false, false, false, false), // unescaped quote closes double
+                ],
+            ),
+            (
+                "backslash inside single is literal",
+                &[
+                    ('\'', false, true, false, false),  // single opens
+                    ('\\', false, true, false, false), // backslash inside single: not escape, still inside
+                    ('a', false, true, false, false),  // inside single quotes
+                    ('\'', false, false, false, false), // single closes
+                    ('>', true, false, false, false),  // outside quotes again
+                ],
+            ),
+        ];
+
+        for (name, steps) in cases {
+            let (mut s, mut d, mut e) = (false, false, false);
+            for (i, &(ch, exp_out, exp_s, exp_d, exp_e)) in steps.iter().enumerate() {
+                let result = track_char_context(ch, &mut s, &mut d, &mut e);
+                assert_eq!(
+                    result, exp_out,
+                    "{name} step {i}: track_char_context({ch:?}) returned {result}, expected {exp_out}",
+                );
+                assert_eq!(
+                    s, exp_s,
+                    "{name} step {i}: after {ch:?}, in_single={s}, expected {exp_s}",
+                );
+                assert_eq!(
+                    d, exp_d,
+                    "{name} step {i}: after {ch:?}, in_double={d}, expected {exp_d}",
+                );
+                assert_eq!(
+                    e, exp_e,
+                    "{name} step {i}: after {ch:?}, escaped={e}, expected {exp_e}",
                 );
             }
         }
