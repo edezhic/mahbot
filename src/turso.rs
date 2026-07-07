@@ -333,33 +333,34 @@ impl Connection {
         })
     }
 
+    /// Lock the inner connection and rollback any dangling transaction.
+    /// Read-only callers should use `self.conn.lock().await` directly.
+    async fn lock_and_cleanup(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
+        let conn = self.conn.lock().await;
+        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
+            let _ = conn.execute("ROLLBACK", ()).await;
+        }
+        conn
+    }
+
     pub async fn execute(
         &self,
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<u64> {
-        let conn = self.conn.lock().await;
-        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
-            let _ = conn.execute("ROLLBACK", ()).await;
-        }
+        let conn = self.lock_and_cleanup().await;
         conn.execute(sql, params).await
     }
 
     pub(crate) async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
-        let conn = self.conn.lock().await;
-        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
-            let _ = conn.execute("ROLLBACK", ()).await;
-        }
+        let conn = self.lock_and_cleanup().await;
         conn.execute_batch(sql).await
     }
 
     /// Begin a transaction and return a guard that keeps the connection locked
     /// until the transaction is committed or rolled back.
     pub async fn begin_tx(&self) -> turso::Result<TxGuard<'_>> {
-        let conn = self.conn.lock().await;
-        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
-            let _ = conn.execute("ROLLBACK", ()).await;
-        }
+        let conn = self.lock_and_cleanup().await;
         conn.execute("BEGIN", ()).await?;
         Ok(TxGuard {
             conn,
