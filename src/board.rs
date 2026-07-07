@@ -133,7 +133,7 @@ crate::columns! {
 ///
 /// Note: [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
 /// of these (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) plus Analysis — see its
-/// docs for rationale. The remaining four phases (`TRANSITORY_HANDOFF_PHASES`) are transitory
+/// docs for rationale. The remaining four phases (DiagnosticsDone, SanitationPassed, Reviewed, QaPassed) are transitory
 /// handoff states intentionally excluded from reset. The `tests::test_pipeline_blockers_coverage`
 /// test enforces that every non-transitory pipeline blocker has a corresponding reset transition.
 const PIPELINE_BLOCKING_PHASES: &[TicketPhase] = &[
@@ -1355,7 +1355,7 @@ impl BoardStore {
     /// but `Analysis` is intentionally NOT in [`PIPELINE_BLOCKING_PHASES`] (it's a pre-flight
     /// phase, not a pipeline blocker).
     ///
-    /// Transitory handoff phases (see `TRANSITORY_HANDOFF_PHASES`) are pipeline
+    /// Transitory handoff phases (DiagnosticsDone, SanitationPassed, Reviewed, QaPassed) are pipeline
     /// blocking but don't need a reset entry — the poller picks them up within seconds
     /// of restart, so no agent session is mid-execution in those states.
     const RESET_TRANSITIONS: &[ResetTransition] = &[
@@ -1407,7 +1407,7 @@ impl BoardStore {
     /// get `pipeline_reservation = 1` so they are claimed before any fresh
     /// `ReadyForDevelopment` ticket — this preserves the rework priority across restarts.
     ///
-    /// Excludes `TRANSITORY_HANDOFF_PHASES` — these are transitory handoff states
+    /// Excludes DiagnosticsDone, SanitationPassed, Reviewed, and QaPassed — these are transitory handoff states
     /// that the poller picks up within the next poll cycle.
     ///
     /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests
