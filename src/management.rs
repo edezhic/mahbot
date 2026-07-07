@@ -292,7 +292,6 @@ struct TransitionParams<'a> {
     notify: NotifyPolicy,
     log_label: &'a str,
     verb: &'a str,
-    pipeline_reservation: Option<bool>,
 }
 
 /// Write one or more comments to a ticket, then transition it to a new phase.
@@ -323,16 +322,17 @@ struct TransitionParams<'a> {
 /// no agents should be running on this ticket at any call site that reaches
 /// this function.
 ///
-/// `pipeline_reservation` is forwarded to [`BoardStore::transition_to_tx`]; pass
-/// `Some(true)` for bounce-back transitions (back to
-/// [`TicketPhase::ReadyForDevelopment`]) to ensure the ticket gets priority
-/// re-dispatch over fresh tickets, or `None` for all other transitions.
+/// `pipeline_reservation` is automatically derived from the target phase:
+/// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
+/// (bounce-back transitions get priority re-dispatch over fresh tickets),
+/// `None` for all other transitions.
 #[must_use]
 async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
     // Extract failure_comment before the with_tx closure, which captures
     // params by move. Used exclusively for Failed-target transitions to avoid a
     // redundant DB round-trip in notify_ticket.
     let failure_comment = (params.target == TicketPhase::Failed).then_some(params.comment.content);
+    let pipeline_reservation = (params.target == TicketPhase::ReadyForDevelopment).then_some(true);
 
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
@@ -355,7 +355,7 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
                 &params.ticket.id,
                 Some(params.source),
                 params.target,
-                params.pipeline_reservation,
+                pipeline_reservation,
             )
             .await?;
             Ok(())
@@ -1011,7 +1011,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         notify,
         log_label: "Engineer",
         verb,
-        pipeline_reservation: None,
     })
     .await
     {
@@ -1091,7 +1090,6 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
         notify: notify_policy,
         log_label,
         verb: "passed",
-        pipeline_reservation: None,
     })
     .await
     {
@@ -1118,7 +1116,6 @@ async fn transition_ticket_to_failed(
         notify: NotifyPolicy::Notify,
         log_label,
         verb: "failed",
-        pipeline_reservation: None,
     })
     .await
 }
@@ -1540,7 +1537,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             notify: NotifyPolicy::Buffer,
             log_label: "Sanitation",
             verb: "passed",
-            pipeline_reservation: None,
         })
         .await
         {
@@ -1583,7 +1579,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             notify: NotifyPolicy::Buffer,
             log_label: "Sanitation",
             verb: "failed",
-            pipeline_reservation: Some(true),
         })
         .await
         {
@@ -1690,7 +1685,6 @@ async fn transition_ticket_to_diagnostics_done(ticket: &Ticket, comment: &str, v
         notify: NotifyPolicy::Buffer,
         log_label: "Diagnostics",
         verb,
-        pipeline_reservation: None,
     })
     .await
 }
@@ -1759,8 +1753,10 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 // bounce back to development for rework.
                 //
                 // Uses `comment_and_transition` (which wraps both writes in a
-                // single transaction) with `pipeline_reservation: Some(true)` to
-                // ensure the ticket gets priority re-dispatch over fresh tickets.
+                // single transaction). `pipeline_reservation` is automatically
+                // derived as `Some(true)` when bouncing back to
+                // ReadyForDevelopment, ensuring the ticket gets priority
+                // re-dispatch over fresh tickets.
                 // If the process crashes before the transaction commits, neither
                 // the comment nor the transition is persisted — the ticket stays
                 // in InDiagnostics and reset_inflight_tickets on the next startup
@@ -1777,7 +1773,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                     notify: NotifyPolicy::Buffer,
                     log_label: "Diagnostics",
                     verb: "failed",
-                    pipeline_reservation: Some(true),
                 })
                 .await
                 {
