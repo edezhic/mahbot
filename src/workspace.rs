@@ -197,8 +197,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) ->
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
 
     let (agent, response) = run_agent(agent_id, Role::Discovery, ws, None, &prompt).await;
-    let _response = response
-        .context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
+    response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
 
     // Keep the Agent alive after run_agent() for retry_extract_structured —
     // it needs agent.session.history() and agent.tool_specs.

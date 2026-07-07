@@ -313,7 +313,7 @@ fn create_transcriber<T>(
     provider: Option<&str>,
     wrapper: impl FnOnce(transcribe::MediaTranscriber) -> T,
 ) -> Option<T> {
-    let _key = api_key.and_then(trimmed_or_none)?;
+    api_key.and_then(trimmed_or_none)?;
     let model = model.and_then(trimmed_or_none)?;
     let route = provider.and_then(trimmed_or_none);
     let base_url = api_url
