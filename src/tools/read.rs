@@ -834,14 +834,17 @@ mod tests {
         (dir, path)
     }
 
-    /// Every extension listed in the error message must have tree-sitter language support.
-    /// Catches drift when an extension is removed from `language_support` match arms
-    /// without updating the error string.
+    /// Every extension listed in `tree_sitter_language_for_extension` must have
+    /// a `language_support` entry. Catches drift when an extension is removed
+    /// from `language_support` match arms without updating the error string.
+    ///
+    /// NOTE: This list must match the extensions in
+    /// `crate::util::tree_sitter::tree_sitter_language_for_extension`.
     #[test]
     fn all_supported_extensions_have_language() {
         let expected: &[&str] = &[
             "rs", "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "pyi", "pyx", "json", "toml", "sh",
-            "bash", "zsh", "css", "html", "htm", "go", "rb", "c", "h", "sql",
+            "bash", "zsh", "css", "html", "htm", "go", "rb", "c", "h", "sql", "md", "markdown",
         ];
         for ext in expected {
             assert!(

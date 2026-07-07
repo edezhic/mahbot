@@ -5,10 +5,22 @@
 //! ([`crate::tools::read`]) and the GUI editor's syntax highlighting
 //! ([`crate::gui::highlight::HighlightLanguage::from_extension`]) delegate here.
 //!
-//! When adding support for a new language:
+//! ## Adding support for a new language
+//!
 //! 1. Add the extension(s) to [`tree_sitter_language_for_extension`] (this file).
 //! 2. Add a variant to [`HighlightLanguage`] and a `language_and_query` arm in
 //!    [`crate::gui::highlight`] — the reverse-lookup map is derived automatically.
+//! 3. Add a `line_comment_prefix` arm in [`crate::gui::editor_widget`] (if
+//!    applicable for the language).
+//! 4. Add a `language_support` arm in [`crate::tools::read`] if the language
+//!    should have symbol extraction (the `_ => ""` fallback gives empty symbols).
+//! 5. Update [`VARIANT_EXTENSIONS`] in [`crate::gui::highlight`]'s test module
+//!    and [`all_supported_extensions_have_language`] in [`crate::tools::read`]'s
+//!    test module — these test-side reference lists catch drift.
+//!
+//! [`HighlightLanguage`]: crate::gui::highlight::HighlightLanguage
+//! [`VARIANT_EXTENSIONS`]: crate::gui::highlight::tests::VARIANT_EXTENSIONS
+//! [`all_supported_extensions_have_language`]: crate::tools::read::tests::all_supported_extensions_have_language
 
 use tree_sitter::Language;
 

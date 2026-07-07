@@ -737,6 +737,100 @@ mod tests {
         assert!(q.is_ok(), "MD inline query failed: {:?}", q.err());
     }
 
+    /// Mapping from each [`HighlightLanguage`] variant to the file extension(s)
+    /// that [`tree_sitter_language_for_extension`] maps to that variant's Language.
+    ///
+    /// This is the **single test-side reference** for the variant↔extension mapping.
+    /// Both forward and backward synchronization checks are derived from it.
+    ///
+    /// # Maintenance
+    ///
+    /// When adding a new variant to [`HighlightLanguage`]:
+    /// 1. Add extensions to [`tree_sitter_language_for_extension`] in `util/tree_sitter.rs`
+    /// 2. Add a `language_and_query` arm in this file
+    /// 3. Add a `line_comment_prefix` arm in `gui/editor_widget.rs` (if applicable)
+    /// 4. Add a `language_support` arm in `tools/read.rs` (if symbol queries are desired)
+    /// 5. Add variant + extensions to **this array**
+    ///
+    /// When adding a new extension to an existing variant:
+    /// 1. Add it to [`tree_sitter_language_for_extension`]
+    /// 2. Add it to **this array**
+    ///
+    /// [`tree_sitter_language_for_extension`]: crate::util::tree_sitter::tree_sitter_language_for_extension
+    static VARIANT_EXTENSIONS: &[(HighlightLanguage, &[&str])] = &[
+        (HighlightLanguage::Rust, &["rs"]),
+        (HighlightLanguage::JavaScript, &["js", "jsx", "mjs", "cjs"]),
+        (HighlightLanguage::TypeScript, &["ts"]),
+        (HighlightLanguage::TSX, &["tsx"]),
+        (HighlightLanguage::Python, &["py", "pyi", "pyx"]),
+        (HighlightLanguage::Json, &["json"]),
+        (HighlightLanguage::Toml, &["toml"]),
+        (HighlightLanguage::Bash, &["sh", "bash", "zsh"]),
+        (HighlightLanguage::Css, &["css"]),
+        (HighlightLanguage::Html, &["html", "htm"]),
+        (HighlightLanguage::Go, &["go"]),
+        (HighlightLanguage::Ruby, &["rb"]),
+        (HighlightLanguage::C, &["c", "h"]),
+        (HighlightLanguage::Sql, &["sql"]),
+        (HighlightLanguage::Markdown, &["md", "markdown"]),
+    ];
+
+    /// Verify that every [`HighlightLanguage`] variant has a known extension
+    /// and that each extension round-trips via [`HighlightLanguage::from_extension`].
+    ///
+    /// This guards against:
+    /// - Adding a variant without adding extensions to
+    ///   [`tree_sitter_language_for_extension`] (variant unreachable from extension).
+    /// - Adding extensions to [`tree_sitter_language_for_extension`] that don't
+    ///   correspond to any variant's `language_and_query` (extension unmapped).
+    /// - Modifying [`VARIANT_EXTENSIONS`] (adding/removing an extension) without
+    ///   updating the hardcoded count below.
+    #[test]
+    fn test_variant_extension_roundtrip() {
+        // Every HighlightLanguage variant must have exactly one entry.
+        assert_eq!(
+            VARIANT_EXTENSIONS.len(),
+            HighlightLanguage::COUNT,
+            "VARIANT_EXTENSIONS must have exactly one entry per HighlightLanguage variant. \
+             A new variant was likely added without updating VARIANT_EXTENSIONS.",
+        );
+
+        // Each extension must round-trip back to its expected variant.
+        for (variant, exts) in VARIANT_EXTENSIONS {
+            for ext in *exts {
+                assert_eq!(
+                    HighlightLanguage::from_extension(ext),
+                    Some(*variant),
+                    "extension '{ext}' should map to {variant:?}, but from_extension returned \
+                     a different variant or None. Either EXTENSIONS is wrong, or the reverse \
+                     map in from_extension / language_and_query is out of sync.",
+                );
+            }
+        }
+
+        // Hardcoded count guards against accidentally removing or adding an extension
+        // from VARIANT_EXTENSIONS without updating the count (e.g. when removing a
+        // duplicate extension or adding a new variant). This does NOT detect an
+        // extension added to tree_sitter_language_for_extension without updating
+        // VARIANT_EXTENSIONS — that is an inherent limitation of the non-iterable
+        // match architecture in the canonical function.
+        //
+        // Count: rs(1), js/jsx/mjs/cjs(4), ts(1), tsx(1), py/pyi/pyx(3),
+        //        json(1), toml(1), sh/bash/zsh(3), css(1), html/htm(2),
+        //        go(1), rb(1), c/h(2), sql(1), md/markdown(2) = 25
+        let total_exts: usize = VARIANT_EXTENSIONS
+            .iter()
+            .flat_map(|(_, exts)| exts.iter().copied())
+            .count();
+        assert_eq!(
+            total_exts, 25,
+            "total VARIANT_EXTENSIONS extension count mismatch. If you added or removed \
+             an extension from VARIANT_EXTENSIONS, update this expected count. \
+             Note: extensions added to tree_sitter_language_for_extension without also \
+             updating VARIANT_EXTENSIONS are not caught by this count check.",
+        );
+    }
+
     #[test]
     fn test_unsupported_extension() {
         assert!(HighlightLanguage::from_extension("cpp").is_none());
