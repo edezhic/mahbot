@@ -335,11 +335,15 @@ macro_rules! string_config_fields {
 
     // ── Accessor pattern: list_or(fallback = <field>, default = <const>) ──
     //
-    // Returns Vec<String>, parses a newline-separated list, falls back to the
-    // named singular field then the hardcoded default constant.
+    // Returns Vec<String>. Tries parsing `$field` as a newline-separated list.
+    // If non-empty, returns the parsed entries. Otherwise falls back to the
+    // named `$fallback` field, then to the hardcoded `$default` constant.
     (@accessor $field:ident list_or(fallback = $fallback:ident, default = $default:expr)) => {
         #[doc = concat!(
-            "Returns the list of available `", stringify!($field), "`."
+            "Returns the list of available `", stringify!($field), "`.",
+            "\n\nIf unset or the parsed newline-separated list is empty,",
+            " falls back to `", stringify!($fallback),
+            "`, then to a built-in default."
         )]
         #[must_use]
         pub fn $field(&self) -> Vec<String> {
