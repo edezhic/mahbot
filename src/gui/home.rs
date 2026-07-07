@@ -1130,7 +1130,7 @@ impl HomeState {
                         } else {
                             crate::session::direct_session_key("gui", &sender, &role, &ws)
                         };
-                        let _ = crate::session::Session::reset(&session_key).await;
+                        let _ = crate::session::Session::delete(&session_key).await;
                         // Clear chat history so refresh_history doesn't reload old messages.
                         let store = crate::chat_history::store();
                         match store.delete_for_user(&sender, &ws).await {

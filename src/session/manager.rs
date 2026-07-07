@@ -33,7 +33,7 @@ impl Session {
     // ── Session lifecycle ──────────────────────────────────────────────
 
     /// Delete a session. Intended for `/new` command handling.
-    pub async fn reset(session_key: &str) -> String {
+    pub async fn delete(session_key: &str) -> String {
         let _ = crate::session::store().delete(session_key).await;
         "Session cleared. Starting fresh.".to_string()
     }
@@ -51,7 +51,7 @@ impl Session {
     ///
     /// If the system prompt logic changes, existing sessions will not pick up
     /// the change until summarization fires or the user runs `/new`
-    /// ([`Session::reset`]).
+    /// ([`Session::delete`]).
     ///
     /// ## Summarization note
     ///
@@ -96,7 +96,7 @@ impl Session {
             //
             // If you change what goes into the system prompt, existing
             // sessions will not pick up the change until summarization
-            // fires or the user runs /new (Session::reset). This is by
+            // fires or the user runs /new (Session::delete). This is by
             // design, not a bug. Datetime is no longer part of the system
             // prompt — it is prepended per-turn to each user message
             // via `user_msg_with_datetime`.

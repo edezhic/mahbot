@@ -660,7 +660,7 @@ async fn handle_action_callback(msg: ChannelMessage) {
             );
             let session_key =
                 build_session_key(&ws.name, &msg.user_name, role, &msg.source_channel);
-            let reply = Session::reset(&session_key).await;
+            let reply = Session::delete(&session_key).await;
             send_channel_reply(reply, &msg, None).await;
         }
         _ => {
