@@ -226,12 +226,11 @@ pub struct TicketComment {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Ticket {
     pub id: String,
     pub title: String,
     pub description: String,
-    #[serde(rename = "status")]
     pub phase: TicketPhase,
     pub assigned_to: Option<String>,
     pub workspace_name: String,
