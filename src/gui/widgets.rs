@@ -924,104 +924,155 @@ mod tests {
         assert_eq!(tree.focused_parent_path(), Some("a/b/c".into()));
     }
 
-    /// Build the expected guide string from a literal. Makes it easier to
-    /// see the box-drawing characters in test output.
-    fn g(guide: &str) -> String {
-        guide.to_string()
+    // ── tree_guide_prefix tests ────────────────────────────────────────────
+
+    /// A single test case for [`tree_guide_prefix`].
+    struct GuidePrefixCase {
+        /// Human-readable name for failure diagnostics.
+        name: &'static str,
+        /// Which ancestor depths have continuation markers.
+        mask: u64,
+        /// Depth of the current node.
+        depth: usize,
+        /// Whether this is the last child at its depth.
+        is_last: bool,
+        /// Expected guide prefix string.
+        expected: &'static str,
     }
 
     #[test]
-    fn guide_prefix_depth_zero() {
-        // Root-level nodes have no guide lines regardless of mask or is_last.
-        assert_eq!(tree_guide_prefix(0, 0, false), g(""));
-        assert_eq!(tree_guide_prefix(0, 0, true), g(""));
-        assert_eq!(tree_guide_prefix(0b_1111, 0, false), g(""));
-    }
+    fn tree_guide_prefix_cases() {
+        let cases = [
+            // Root-level nodes have no guide lines regardless of mask or is_last.
+            GuidePrefixCase {
+                name: "root, mask=0, not last",
+                mask: 0,
+                depth: 0,
+                is_last: false,
+                expected: "",
+            },
+            GuidePrefixCase {
+                name: "root, mask=0, last",
+                mask: 0,
+                depth: 0,
+                is_last: true,
+                expected: "",
+            },
+            GuidePrefixCase {
+                name: "root, mask=all, not last",
+                mask: 0b_1111,
+                depth: 0,
+                is_last: false,
+                expected: "",
+            },
+            // Depth 1, no ancestor continuation.
+            GuidePrefixCase {
+                name: "depth 1, mask=0, not last",
+                mask: 0,
+                depth: 1,
+                is_last: false,
+                expected: "├ ",
+            },
+            GuidePrefixCase {
+                name: "depth 1, mask=0, last",
+                mask: 0,
+                depth: 1,
+                is_last: true,
+                expected: "└ ",
+            },
+            // Depth 1, ancestor at depth 0 continues.
+            GuidePrefixCase {
+                name: "depth 1, mask=0b01, not last",
+                mask: 0b_01,
+                depth: 1,
+                is_last: false,
+                expected: "├ ",
+            },
+            GuidePrefixCase {
+                name: "depth 1, mask=0b01, last",
+                mask: 0b_01,
+                depth: 1,
+                is_last: true,
+                expected: "└ ",
+            },
+            // Depth 2: ancestor depth 0 continues, depth 1 does not.
+            GuidePrefixCase {
+                name: "depth 2, mask=0b01, not last",
+                mask: 0b_01,
+                depth: 2,
+                is_last: false,
+                expected: "│ ├ ",
+            },
+            // Depth 2: both ancestors continue.
+            GuidePrefixCase {
+                name: "depth 2, mask=0b11, not last",
+                mask: 0b_11,
+                depth: 2,
+                is_last: false,
+                expected: "│ ├ ",
+            },
+            GuidePrefixCase {
+                name: "depth 2, mask=0b11, last",
+                mask: 0b_11,
+                depth: 2,
+                is_last: true,
+                expected: "│ └ ",
+            },
+            // Depth 2: neither ancestor continues.
+            GuidePrefixCase {
+                name: "depth 2, mask=0, not last",
+                mask: 0,
+                depth: 2,
+                is_last: false,
+                expected: "  ├ ",
+            },
+            GuidePrefixCase {
+                name: "depth 2, mask=0, last",
+                mask: 0,
+                depth: 2,
+                is_last: true,
+                expected: "  └ ",
+            },
+            // Depth 5: ancestors at 0,1,3 continue; 2 does not.
+            GuidePrefixCase {
+                name: "depth 5, mask=0b1011, not last",
+                mask: 0b_1011,
+                depth: 5,
+                is_last: false,
+                expected: "│ │   │ ├ ",
+            },
+            GuidePrefixCase {
+                name: "depth 5, mask=0b1011, last",
+                mask: 0b_1011,
+                depth: 5,
+                is_last: true,
+                expected: "│ │   │ └ ",
+            },
+            // Bits beyond depth should be ignored.
+            GuidePrefixCase {
+                name: "high bits, mask=0x100, not last",
+                mask: 0b1_0000_0000,
+                depth: 1,
+                is_last: false,
+                expected: "├ ",
+            },
+            GuidePrefixCase {
+                name: "high bits, mask=0x100, last",
+                mask: 0b1_0000_0000,
+                depth: 1,
+                is_last: true,
+                expected: "└ ",
+            },
+        ];
 
-    #[test]
-    fn guide_prefix_depth_one_not_last() {
-        // Depth 1, no ancestor continuation, non-last child.
-        // Just the connector (no ancestor guide needed — connector replaces
-        // the single ancestor slot).
-        assert_eq!(tree_guide_prefix(0, 1, false), g("├ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_one_last() {
-        // Depth 1, no ancestor continuation, last child → └ connector.
-        assert_eq!(tree_guide_prefix(0, 1, true), g("└ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_one_ancestor_continues_not_last() {
-        // Depth 1, ancestor at depth 0 has continuation (bit 0 = 1).
-        // Connector replaces the depth-0 ancestor slot, showing just ├.
-        assert_eq!(tree_guide_prefix(0b_01, 1, false), g("├ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_one_ancestor_continues_last() {
-        // Depth 1, ancestor continues, current node last → └
-        assert_eq!(tree_guide_prefix(0b_01, 1, true), g("└ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_two_mixed_ancestors() {
-        // Depth 2: ancestor depth 0 continues, depth 1 does NOT continue.
-        // mask = bit 0 set, bit 1 clear.
-        // Only the depth-0 ancestor appears as a guide; depth-1 slot is
-        // replaced by the connector.
-        assert_eq!(tree_guide_prefix(0b_01, 2, false), g("│ ├ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_two_all_ancestors_continue_not_last() {
-        // Both ancestors continue (mask bits 0 and 1 set).
-        // Only depth-0 guide appears; depth-1 replaced by connector.
-        assert_eq!(tree_guide_prefix(0b_11, 2, false), g("│ ├ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_two_all_ancestors_continue_last() {
-        // Both ancestors continue, current node last → "│ └ "
-        assert_eq!(tree_guide_prefix(0b_11, 2, true), g("│ └ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_two_no_ancestor_continuation() {
-        // Depth 2: neither ancestor continues (mask bits 0 and 1 clear).
-        // Current node not last → two spaces for depth 0 + ├ connector.
-        assert_eq!(tree_guide_prefix(0, 2, false), g("  ├ "));
-    }
-
-    #[test]
-    fn guide_prefix_depth_two_no_ancestor_continuation_last() {
-        // Depth 2: no ancestor continuation, last child → "  └ "
-        assert_eq!(tree_guide_prefix(0, 2, true), g("  └ "));
-    }
-
-    #[test]
-    fn guide_prefix_deep_tree() {
-        // Depth 5, ancestors at 0,1,3 continue; 2 does not; 4 is the slot
-        // replaced by the connector.
-        // mask bits set: 0, 1, 3  →  binary 0b_1011
-        // Only 4 ancestor guides (depths 0-3), connector replaces depth 4.
-        //            d0 d1 d2 d3
-        //            │  │  sp │
-        assert_eq!(tree_guide_prefix(0b_1011, 5, false), g("│ │   │ ├ "));
-    }
-
-    #[test]
-    fn guide_prefix_deep_tree_last() {
-        // Same as above but last child → └ instead of ├
-        assert_eq!(tree_guide_prefix(0b_1011, 5, true), g("│ │   │ └ "));
-    }
-
-    #[test]
-    fn guide_prefix_mask_ignores_bits_above_depth() {
-        // Bits beyond depth should be ignored. depth=1 with high bits set.
-        assert_eq!(tree_guide_prefix(0b1_0000_0000, 1, false), g("├ "));
-        assert_eq!(tree_guide_prefix(0b1_0000_0000, 1, true), g("└ "));
+        for case in &cases {
+            assert_eq!(
+                tree_guide_prefix(case.mask, case.depth, case.is_last),
+                case.expected,
+                "case '{}' failed",
+                case.name
+            );
+        }
     }
 
     #[test]
