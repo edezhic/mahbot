@@ -135,7 +135,7 @@ impl ModelRouting {
 /// [`ConfigData::string_fields`], which is macro-generated.  A field missing from
 /// the macro would appear editable in the GUI but silently discard its value on
 /// every save.  The compiler guard on `ConfigData::STRUCT_FIELDS_DEFAULT` prevents this.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConfigData {
     /// API key for the LLM provider.
     pub provider_key: Option<String>,
@@ -882,7 +882,7 @@ mod tests {
     /// [`non_empty`]).
     #[test]
     fn string_fields_roundtrip() {
-        let mut config = ConfigData::default();
+        let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
 
         // ── Structural guard ─────────────────────────────────────
         // Every field declared in string_config_fields! must have a test value
@@ -971,13 +971,13 @@ mod tests {
 
         // ── non_empty: returns None when unset, Some(value) when set ──
         assert_eq!(reload.provider_key(), None, "unset provider_key is None");
-        let mut config = ConfigData::default();
+        let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(config.set_string_field("provider_key", "sk-test"));
         reload.swap(config);
         assert_eq!(reload.provider_key(), Some("sk-test".to_string()));
 
         // ── or: falls back to default when unset ──
-        reload.swap(ConfigData::default());
+        reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(
             reload.provider_endpoint(),
             DEFAULT_PROVIDER_ENDPOINT,
@@ -985,7 +985,7 @@ mod tests {
         );
 
         // ── non_empty: empty/whitespace → None ──
-        let mut empty = ConfigData::default();
+        let mut empty = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(empty.set_string_field("provider_key", ""));
         reload.swap(empty);
         assert_eq!(
@@ -995,7 +995,7 @@ mod tests {
         );
 
         // ── list_or: falls back to active model when list is unset ──
-        reload.swap(ConfigData::default());
+        reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(
             reload.image_gen_models(),
             vec![DEFAULT_IMAGE_GEN_MODEL.to_string()],
@@ -1003,7 +1003,7 @@ mod tests {
         );
 
         // When list is set, returns parsed entries
-        let mut list_config = ConfigData::default();
+        let mut list_config = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(list_config.set_string_field("image_gen_models", "model-a\nmodel-b\nmodel-c"));
         reload.swap(list_config);
         assert_eq!(
@@ -1054,7 +1054,7 @@ mod tests {
                 provider_order: Some("   ".into()),
                 allow_fallbacks: None,
             }],
-            ..ConfigData::default()
+            ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
 
         config.normalize_entries();
@@ -1309,7 +1309,7 @@ mod tests {
     fn validate_config_accepts_valid_url() {
         let mut config = ConfigData {
             provider_endpoint: Some("https://openrouter.ai/api/v1".into()),
-            ..Default::default()
+            ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
         config.finalize();
         validate_config(&config).unwrap();
@@ -1324,7 +1324,7 @@ mod tests {
     fn validate_config_accepts_whitespace_padded_url_after_finalize() {
         let mut config = ConfigData {
             provider_endpoint: Some("  https://openrouter.ai/api/v1   ".into()),
-            ..Default::default()
+            ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
         config.finalize();
         // After finalize the value is trimmed — validation sees the canonical form.
@@ -1336,7 +1336,7 @@ mod tests {
     fn validate_config_rejects_url_without_scheme() {
         let mut config = ConfigData {
             provider_endpoint: Some("not-a-url".into()),
-            ..Default::default()
+            ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
         config.finalize();
         let err = validate_config(&config).unwrap_err();
@@ -1352,7 +1352,7 @@ mod tests {
     fn validate_config_rejects_placeholder_key() {
         let mut config = ConfigData {
             provider_key: Some("sk-...".into()),
-            ..Default::default()
+            ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
         config.finalize();
         let err = validate_config(&config).unwrap_err();

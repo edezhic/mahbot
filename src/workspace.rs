@@ -1214,7 +1214,7 @@ mod tests {
         // panics on double-set, so we only set if not already set).
         let tmp_root = TempDir::new().expect("storage root temp dir");
         let _ = crate::config::CONFIG.try_set_storage_root(tmp_root.path().to_path_buf());
-        crate::config::CONFIG.swap(crate::config::ConfigData::default());
+        crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
 
         let ws = store
             .add("add_test", dir.path().to_str().unwrap())
