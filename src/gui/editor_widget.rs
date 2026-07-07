@@ -4079,110 +4079,182 @@ mod tests {
     // ── Toggle line comment ───────────────────────────────────────
 
     #[test]
-    fn test_toggle_line_comment_add() {
-        let buf = EditorBuffer::with_text("hello", Some(HighlightLanguage::Rust));
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "// hello");
-    }
+    fn test_toggle_line_comment() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: &'static str,
+            language: Option<HighlightLanguage>,
+            /// Set file extension instead of language (fallback path).
+            file_ext: Option<&'static str>,
+            /// Cursor position before toggling (defaults to 0, 0).
+            cursor_line: usize,
+            cursor_col: usize,
+        }
 
-    #[test]
-    fn test_toggle_line_comment_remove() {
-        let buf = EditorBuffer::with_text("// hello", Some(HighlightLanguage::Rust));
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "hello");
-    }
+        let cases: &[Case] = &[
+            Case {
+                name: "add",
+                input: "hello",
+                expected: "// hello",
+                language: Some(HighlightLanguage::Rust),
+                file_ext: None,
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "remove",
+                input: "// hello",
+                expected: "hello",
+                language: Some(HighlightLanguage::Rust),
+                file_ext: None,
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "remove_with_space",
+                input: "//  hello",
+                expected: " hello",
+                language: Some(HighlightLanguage::Rust),
+                file_ext: None,
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "preserves_whitespace",
+                input: "    hello",
+                expected: "    // hello",
+                language: Some(HighlightLanguage::Rust),
+                file_ext: None,
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "noop_unknown",
+                input: "hello",
+                expected: "hello",
+                language: None,
+                file_ext: None,
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "rust_hash",
+                input: "hello",
+                expected: "# hello",
+                language: Some(HighlightLanguage::Python),
+                file_ext: None,
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "yaml_via_extension",
+                input: "hello",
+                expected: "# hello",
+                language: None,
+                file_ext: Some("yaml"),
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "unknown_extension_noop",
+                input: "hello",
+                expected: "hello",
+                language: None,
+                file_ext: Some("xyz"),
+                cursor_line: 0,
+                cursor_col: 0,
+            },
+            Case {
+                name: "preserves_neighbor_lines",
+                input: "first\nsecond\nthird",
+                expected: "first\n// second\nthird",
+                language: Some(HighlightLanguage::Rust),
+                file_ext: None,
+                cursor_line: 1,
+                cursor_col: 0,
+            },
+        ];
 
-    #[test]
-    fn test_toggle_line_comment_remove_with_space() {
-        let buf = EditorBuffer::with_text("//  hello", Some(HighlightLanguage::Rust));
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), " hello");
-    }
-
-    #[test]
-    fn test_toggle_line_comment_preserves_whitespace() {
-        let buf = EditorBuffer::with_text("    hello", Some(HighlightLanguage::Rust));
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "    // hello");
-    }
-
-    #[test]
-    fn test_toggle_line_comment_noop_for_unknown() {
-        let buf = EditorBuffer::with_text("hello", None);
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "hello");
-    }
-
-    #[test]
-    fn test_toggle_line_comment_rust_hash() {
-        let buf = EditorBuffer::with_text("hello", Some(HighlightLanguage::Python));
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "# hello");
-    }
-
-    #[test]
-    fn test_toggle_line_comment_yaml_via_extension() {
-        let buf = EditorBuffer::with_text("hello", None);
-        buf.set_file_extension(Some("yaml"));
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "# hello");
-    }
-
-    #[test]
-    fn test_toggle_line_comment_unknown_extension_noop() {
-        let buf = EditorBuffer::with_text("hello", None);
-        buf.set_file_extension(Some("xyz"));
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "hello");
+        for case in cases {
+            let buf = EditorBuffer::with_text(case.input, case.language);
+            if let Some(ext) = case.file_ext {
+                buf.set_file_extension(Some(ext));
+            }
+            if case.cursor_line != 0 || case.cursor_col != 0 {
+                buf.move_to(case.cursor_line, case.cursor_col);
+            }
+            buf.perform_action(EditorAction::ToggleLineComment);
+            assert_eq!(buf.text(), case.expected, "case: {}", case.name);
+        }
     }
 
     // ── Jump to matching bracket ───────────────────────────────────
 
     #[test]
-    fn test_jump_to_matching_bracket_forward() {
-        let buf = EditorBuffer::with_text("(hello)", None);
-        buf.move_to(0, 1); // Cursor right after '('
-        buf.perform_action(EditorAction::JumpToMatchingBracket);
-        let cursor = buf.cursor();
-        assert_eq!(cursor.line, 0);
-        assert_eq!(cursor.column, 6); // On ')'
-    }
+    fn test_jump_to_matching_bracket() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            cursor_col: usize,
+            expected_line: usize,
+            expected_col: usize,
+        }
 
-    #[test]
-    fn test_jump_to_matching_bracket_backward() {
-        let buf = EditorBuffer::with_text("(hello)", None);
-        buf.move_to(0, 6); // Cursor at ')'
-        buf.perform_action(EditorAction::JumpToMatchingBracket);
-        let cursor = buf.cursor();
-        assert_eq!(cursor.line, 0);
-        assert_eq!(cursor.column, 1); // Right after '('
-    }
+        let cases: &[Case] = &[
+            Case {
+                name: "forward_paren",
+                input: "(hello)",
+                cursor_col: 1,
+                expected_line: 0,
+                expected_col: 6,
+            },
+            Case {
+                name: "backward_paren",
+                input: "(hello)",
+                cursor_col: 6,
+                expected_line: 0,
+                expected_col: 1,
+            },
+            Case {
+                name: "square_bracket",
+                input: "[hello]",
+                cursor_col: 1,
+                expected_line: 0,
+                expected_col: 6,
+            },
+            Case {
+                name: "brace",
+                input: "{hello}",
+                cursor_col: 1,
+                expected_line: 0,
+                expected_col: 6,
+            },
+            Case {
+                name: "none",
+                input: "hello",
+                cursor_col: 3,
+                expected_line: 0,
+                expected_col: 3,
+            },
+        ];
 
-    #[test]
-    fn test_jump_to_matching_bracket_square() {
-        let buf = EditorBuffer::with_text("[hello]", None);
-        buf.move_to(0, 1);
-        buf.perform_action(EditorAction::JumpToMatchingBracket);
-        let cursor = buf.cursor();
-        assert_eq!(cursor.column, 6);
-    }
-
-    #[test]
-    fn test_jump_to_matching_bracket_brace() {
-        let buf = EditorBuffer::with_text("{hello}", None);
-        buf.move_to(0, 1);
-        buf.perform_action(EditorAction::JumpToMatchingBracket);
-        let cursor = buf.cursor();
-        assert_eq!(cursor.column, 6);
-    }
-
-    #[test]
-    fn test_jump_to_matching_bracket_none() {
-        let buf = EditorBuffer::with_text("hello", None);
-        buf.move_to(0, 3);
-        buf.perform_action(EditorAction::JumpToMatchingBracket);
-        let cursor = buf.cursor();
-        assert_eq!(cursor.column, 3); // No movement
+        for case in cases {
+            let buf = EditorBuffer::with_text(case.input, None);
+            buf.move_to(0, case.cursor_col);
+            buf.perform_action(EditorAction::JumpToMatchingBracket);
+            let cursor = buf.cursor();
+            assert_eq!(
+                cursor.line, case.expected_line,
+                "case: {} (line)",
+                case.name
+            );
+            assert_eq!(
+                cursor.column, case.expected_col,
+                "case: {} (col)",
+                case.name
+            );
+        }
     }
 
     // ── Delete line ────────────────────────────────────────────────
@@ -4349,14 +4421,6 @@ mod tests {
         assert_eq!(lines[2].0, "");
         assert_eq!(lines[2].1, "\n");
         assert_eq!(reassemble_lines(&lines), text);
-    }
-
-    #[test]
-    fn test_toggle_line_comment_preserves_neighbor_lines() {
-        let buf = EditorBuffer::from_file("first\nsecond\nthird", "/tmp/test.rs");
-        buf.move_to(1, 0);
-        buf.perform_action(EditorAction::ToggleLineComment);
-        assert_eq!(buf.text(), "first\n// second\nthird");
     }
 
     // ── Multi-line indent/outdent ──────────────────────────────────
