@@ -185,7 +185,7 @@ pub const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::
 ///
 /// The input slice must be non-empty. Passing an empty slice produces
 /// `WHERE status IN ()` which is invalid SQL.
-fn status_list_sql_fragment(phases: &[TicketPhase]) -> String {
+fn phase_list_sql_fragment(phases: &[TicketPhase]) -> String {
     phases
         .iter()
         .map(|p| format!("'{}'", p.as_ref()))
@@ -926,11 +926,11 @@ impl BoardStore {
                JOIN tickets t_pre ON t_pre.id = je.value \
                WHERE t_pre.status NOT IN ({}) \
              )",
-            status_list_sql_fragment(UNBLOCKING_PHASES),
+            phase_list_sql_fragment(UNBLOCKING_PHASES),
         );
 
         let pipeline_blocker_clause = if pipeline_check == PipelineCheck::Enforce {
-            let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
+            let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
             format!(
                 "AND NOT EXISTS (SELECT 1 FROM tickets t2 \
                  WHERE t2.workspace_name = t1.workspace_name \
@@ -1254,7 +1254,7 @@ impl BoardStore {
     pub async fn claim_sanitation(&self, ticket_id: &str, assigned_to: &str) -> Result<bool> {
         let now = turso::now();
         let blocker =
-            status_list_sql_fragment(&[TicketPhase::InSanitation, TicketPhase::SanitationPassed]);
+            phase_list_sql_fragment(&[TicketPhase::InSanitation, TicketPhase::SanitationPassed]);
         let sql = format!(
             "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = ?5 AND is_archived = 0 \
@@ -1463,7 +1463,7 @@ impl BoardStore {
         reservation_filter: ReservationFilter,
         exclude_ticket_id: Option<&str>,
     ) -> Result<bool> {
-        let blocker_sql = status_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
+        let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
         let reservation_clause = if reservation_filter == ReservationFilter::ReservedOnly {
             " AND pipeline_reservation = 1"
         } else {
@@ -1488,7 +1488,7 @@ impl BoardStore {
     /// was bounced back and is awaiting rework.
     ///
     /// **Test-only query** — retained to provide coverage of the pipeline-blocker SQL.
-    /// Production code uses [`has_active_tickets_excluding`] or [`count_by_status`].
+    /// Production code uses [`has_active_tickets_excluding`] or [`count_by_phase`].
     ///
     /// # Maintenance warning
     /// If a future feature needs this in production, remove the `#[cfg(test)]`
@@ -1671,13 +1671,13 @@ impl BoardStore {
         .await
     }
 
-    /// Count how many tickets have the given status, optionally filtered by workspace.
+    /// Count how many tickets have the given phase, optionally filtered by workspace.
     ///
     /// Excludes archived tickets to stay consistent with [`list_all_tickets`](Self::list_all_tickets)
     /// and most other read paths in this module. Currently unused for `Done` or `Cancelled`
     /// (the only phases that ever get archived), so this is a defensive consistency fix —
-    /// callers that pass a terminal status will not see archived tickets in the count.
-    pub async fn count_by_status(
+    /// callers that pass a terminal phase will not see archived tickets in the count.
+    pub async fn count_by_phase(
         &self,
         phase: TicketPhase,
         workspace_name: Option<&str>,
@@ -1775,7 +1775,7 @@ impl BoardStore {
             "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
              WHERE status IN ({}) AND assigned_to IS NULL AND is_archived = 0 \
              AND (?2 IS NULL OR workspace_name = ?2)",
-            status_list_sql_fragment(&done_cancelled),
+            phase_list_sql_fragment(&done_cancelled),
         );
         let updated = self
             .conn
@@ -3115,7 +3115,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     #[tokio::test]
-    async fn test_count_by_status_excludes_archived() {
+    async fn test_count_by_phase_excludes_archived() {
         let (store, _tmp) = open_test_store().await;
         // Create a ticket set to Done.
         let _id = make_ticket(
@@ -3128,7 +3128,7 @@ with a comment explaining why no agent is mid-execution in that state.\
 
         // Before archiving, count includes the Done ticket.
         let count_before = store
-            .count_by_status(TicketPhase::Done, None)
+            .count_by_phase(TicketPhase::Done, None)
             .await
             .expect("count before");
         assert_eq!(count_before, 1, "Should count Done ticket before archive");
@@ -3140,16 +3140,16 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("archive");
         assert_eq!(archived, 1, "Should have archived 1 ticket");
 
-        // After archiving, count_by_status(Done) should return 0.
+        // After archiving, count_by_phase(Done) should return 0.
         let count_after = store
-            .count_by_status(TicketPhase::Done, None)
+            .count_by_phase(TicketPhase::Done, None)
             .await
             .expect("count after");
         assert_eq!(count_after, 0, "Should not count archived Done tickets");
 
         // Archived tickets with other statuses should also be excluded.
         let count_cancelled = store
-            .count_by_status(TicketPhase::Cancelled, None)
+            .count_by_phase(TicketPhase::Cancelled, None)
             .await
             .expect("count cancelled");
         assert_eq!(count_cancelled, 0, "No Cancelled tickets exist");

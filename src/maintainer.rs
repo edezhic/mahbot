@@ -87,7 +87,7 @@ pub async fn run_maintainer_loop() {
             // even if other tickets are in development/review/QA.
             if let Some(board) = crate::board::BOARD.get() {
                 let count_status = |phase: TicketPhase| async move {
-                    match board.count_by_status(phase, Some(&ws.name)).await {
+                    match board.count_by_phase(phase, Some(&ws.name)).await {
                         Ok(c) => c,
                         Err(e) => {
                             warn!(workspace = %ws.name, %phase, error = %e, "Maintainer: failed to count tickets");
