@@ -865,8 +865,8 @@ mod tests {
     use super::*;
 
     /// Make a file executable (0o755) on Unix; no-op on other platforms.
-    #[cfg_attr(not(unix), allow(unused_variables))]
     fn make_executable(path: &Path) {
+        let _ = path; // Used only on Unix; suppresses unused-variable warning on non-Unix.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
