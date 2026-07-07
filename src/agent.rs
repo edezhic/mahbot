@@ -556,8 +556,8 @@ impl Agent {
 
     /// Resolve provider order and allow_fallbacks for this agent's model from live config.
     /// Lazily resolved each call to respect runtime hot-reload.
-    fn provider_routing(&self) -> crate::config::ModelRouting {
-        crate::config::CONFIG.model_routing(&self.model())
+    fn provider_routing(model: &str) -> crate::config::ModelRouting {
+        crate::config::CONFIG.model_routing(model)
     }
 
     /// Build a [`ChatRequest`] from the given messages and image-parts flag,
@@ -584,11 +584,12 @@ impl Agent {
         messages: Vec<ChatMessage>,
         allow_image_parts: bool,
     ) -> ChatRequest {
-        let routing = self.provider_routing();
+        let model = self.model();
+        let routing = Self::provider_routing(&model);
         ChatRequest {
             messages,
             tools: Some(self.tool_specs.clone()),
-            model: self.model(),
+            model,
             allow_image_parts,
             temperature: self.temperature(),
             max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
@@ -615,7 +616,7 @@ impl Agent {
     ) -> anyhow::Result<T> {
         // Bind to local so the borrow lives across the .await.
         let model = self.model();
-        let routing = self.provider_routing();
+        let routing = Self::provider_routing(&model);
         let config = crate::extraction::ExtractionConfig {
             model: &model,
             tool_specs: &self.tool_specs,
