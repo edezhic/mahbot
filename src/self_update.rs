@@ -1060,7 +1060,7 @@ mod tests {
         );
 
         // Set executable bit.
-        std::fs::set_permissions(&file_path, PermissionsExt::from_mode(0o755)).unwrap();
+        make_executable(&file_path);
         assert!(
             is_executable(&file_path),
             "File with mode 755 should be executable"
