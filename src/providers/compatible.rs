@@ -28,9 +28,6 @@ pub struct OpenAiCompatibleProvider {
     timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
-    /// Whether to set `"tool_stream": true` in chat completion requests
-    /// (needed by some providers like z.ai for streaming tool calls).
-    tool_stream: bool,
     /// Cached HTTP client with connection reuse across all API calls.
     /// Initialized lazily on first `http_client()` call.
     http_client: OnceLock<Client>,
@@ -45,7 +42,6 @@ impl OpenAiCompatibleProvider {
             credential: credential.map(ToString::to_string),
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
-            tool_stream: false,
             http_client: OnceLock::new(),
         }
     }
@@ -57,14 +53,6 @@ impl OpenAiCompatibleProvider {
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
         self.extra_headers = headers;
-        self
-    }
-
-    /// Enable or disable `"tool_stream": true` in chat completion requests.
-    /// Required by some providers (e.g. z.ai) for correct streaming of tool calls.
-    #[must_use]
-    pub fn with_tool_stream(mut self, enabled: bool) -> Self {
-        self.tool_stream = enabled;
         self
     }
 
@@ -109,8 +97,6 @@ struct ChatCompletionRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -580,7 +566,6 @@ impl OpenAiCompatibleProvider {
             Self::convert_messages_for_native(&request.messages, request.allow_image_parts);
         let tool_specs = Self::convert_tool_specs(request.tools.as_deref());
 
-        let has_tools = tool_specs.as_ref().is_some_and(|t| !t.is_empty());
         let mut extra = serde_json::Map::new();
 
         // Provider routing — per-request values only; no global fallback.
@@ -606,7 +591,6 @@ impl OpenAiCompatibleProvider {
             messages: native,
             temperature: f64::from(request.temperature),
             max_tokens: request.max_tokens,
-            tool_stream: (has_tools && self.tool_stream).then_some(true),
             tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
             tools: tool_specs,
             extra,
@@ -700,7 +684,6 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ChatRequest;
     use crate::providers::test_request;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
@@ -1082,7 +1065,6 @@ mod tests {
             messages: vec![NativeMessage::user("What is the weather?")],
             temperature: 0.7,
             max_tokens: Some(32000),
-            tool_stream: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
             extra: serde_json::Map::new(),
@@ -1091,55 +1073,6 @@ mod tests {
         assert!(json.contains("\"tools\""));
         assert!(json.contains("get_weather"));
         assert!(json.contains("\"tool_choice\":\"auto\""));
-    }
-
-    #[test]
-    fn test_tool_stream_behavior() {
-        let tool_spec = ToolSpec {
-            name: "shell".to_string(),
-            description: "Run a shell command".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                },
-            }),
-        };
-
-        for tool_stream_enabled in [false, true] {
-            let provider = make_provider("generic", "https://api.example.com/v1", None)
-                .with_tool_stream(tool_stream_enabled);
-            let chat_request = ChatRequest {
-                model: "test-model".to_string(),
-                temperature: 0.7,
-                ..test_request(
-                    vec![ChatMessage::user("hello")],
-                    Some(vec![tool_spec.clone()]),
-                )
-            };
-
-            let builder = provider.build_http_request(&chat_request);
-            let http_request = builder.build().unwrap();
-            let body_bytes = http_request.body().and_then(|b| b.as_bytes()).unwrap();
-            let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
-
-            if tool_stream_enabled {
-                assert_eq!(
-                    body["tool_stream"],
-                    serde_json::json!(true),
-                    "tool_stream should be true when flag is enabled ({tool_stream_enabled})",
-                );
-            } else {
-                assert!(
-                    body.get("tool_stream").is_none(),
-                    "tool_stream should be absent when default false ({tool_stream_enabled})",
-                );
-            }
-            assert!(
-                body.get("tools").is_some(),
-                "tools should be present in request ({tool_stream_enabled})",
-            );
-        }
     }
 
     #[test]
