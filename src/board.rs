@@ -573,15 +573,6 @@ pub(crate) enum LoadComments {
     No,
 }
 
-/// Whether to filter active tickets by pipeline reservation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ReservationFilter {
-    /// Check for any active tickets, regardless of pipeline reservation.
-    Any,
-    /// Only consider tickets that have a pipeline reservation.
-    ReservedOnly,
-}
-
 impl BoardStore {
     /// Post-open FTS index setup.
     async fn after_open(&self) -> anyhow::Result<()> {
@@ -885,12 +876,11 @@ impl BoardStore {
     ///
     /// Note that a reserved ReadyForDevelopment ticket (one with
     /// `pipeline_reservation = 1`) is **not** treated as a pipeline blocker for
-    /// the purpose of this claim. This differs from
-    /// [`has_pipeline_blocker_for_workspace`] (a test-only query that requires
-    /// `pipeline_reservation = 1` for ReadyForDevelopment tickets) because the
-    /// claim subquery orders by `pipeline_reservation DESC` and clears reservation
-    /// on claim, so a reserved ticket at ReadyForDevelopment will be claimed
-    /// before any other ticket at the same phase — no pipeline blocking needed.
+    /// the purpose of this claim — [`has_pipeline_blocker_for_workspace`] (a
+    /// test-only query) considers such tickets blockers, but the claim subquery
+    /// orders by `pipeline_reservation DESC` and clears reservation on claim,
+    /// so a reserved ticket at ReadyForDevelopment will be claimed before any
+    /// other ticket at the same phase — no pipeline blocking needed.
     ///
     /// When `pipeline_check` is [`PipelineCheck::Skip`], the claim uses a
     /// simple LIMIT 1 subquery with no pipeline gating. This is used for phases
@@ -1436,19 +1426,14 @@ impl BoardStore {
     /// Returns `true` if any ticket in the workspace has a pipeline-blocking
     /// status ([`PIPELINE_BLOCKING_PHASES`]), or a
     /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket
-    /// (optionally filtered by `pipeline_reservation`), optionally excluding a
+    /// (regardless of `pipeline_reservation`), optionally excluding a
     /// specific ticket ID.
     ///
-    /// Both [`has_pipeline_blocker_for_workspace`] and
-    /// [`has_active_tickets_excluding`] delegate to this helper.
+    /// [`has_active_tickets_excluding`] delegates to this helper.
     ///
     /// # Parameters
     ///
     /// * `workspace_name` — The workspace to check.
-    /// * `reservation_filter` — [`ReservationFilter::ReservedOnly`] to only count
-    ///   `ReadyForDevelopment` tickets with `pipeline_reservation = 1` (used by the
-    ///   test-only pipeline-blocker query). [`ReservationFilter::Any`] to count all
-    ///   `ReadyForDevelopment` tickets regardless of reservation.
     /// * `exclude_ticket_id` — When `Some(id)`, that ticket is excluded from
     ///   the check (e.g., when checking if other active tickets remain after one
     ///   ticket completes). When `None`, no exclusion is applied.
@@ -1459,21 +1444,15 @@ impl BoardStore {
     async fn has_active_tickets_internal(
         &self,
         workspace_name: &str,
-        reservation_filter: ReservationFilter,
         exclude_ticket_id: Option<&str>,
     ) -> Result<bool> {
         let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
-        let reservation_clause = if reservation_filter == ReservationFilter::ReservedOnly {
-            " AND pipeline_reservation = 1"
-        } else {
-            ""
-        };
+        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR (status = '{rfd}'{reservation_clause})) \
+             (status IN ({blocker_sql}) OR status = '{rfd}') \
              AND workspace_name = ?1 AND is_archived = 0 \
              AND (?2 IS NULL OR id != ?2) LIMIT 1",
-            rfd = TicketPhase::ReadyForDevelopment.as_ref(),
         );
         let rows = self
             .conn
@@ -1489,6 +1468,10 @@ impl BoardStore {
     /// **Test-only query** — retained to provide coverage of the pipeline-blocker SQL.
     /// Production code uses [`has_active_tickets_excluding`] or [`count_by_phase`].
     ///
+    /// Note this includes `AND pipeline_reservation = 1` for ReadyForDevelopment
+    /// tickets, unlike [`has_active_tickets_internal`] which treats all
+    /// ReadyForDevelopment tickets as active regardless of reservation.
+    ///
     /// # Maintenance warning
     /// If a future feature needs this in production, remove the `#[cfg(test)]`
     /// gate and add a real caller. The doc comment and tests will validate the
@@ -1502,8 +1485,18 @@ impl BoardStore {
         &self,
         workspace_name: &str,
     ) -> Result<bool> {
-        self.has_active_tickets_internal(workspace_name, ReservationFilter::ReservedOnly, None)
-            .await
+        let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
+        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
+        let sql = format!(
+            "SELECT 1 FROM tickets WHERE \
+             (status IN ({blocker_sql}) OR (status = '{rfd}' AND pipeline_reservation = 1)) \
+             AND workspace_name = ?1 AND is_archived = 0 LIMIT 1",
+        );
+        let rows = self
+            .conn
+            .query(&sql, turso::params![workspace_name])
+            .await?;
+        Ok(!rows.is_empty())
     }
 
     /// Check if the workspace has any active tickets other than the excluded one.
@@ -1514,10 +1507,9 @@ impl BoardStore {
     /// considered active to suppress Done notifications until the pipeline is
     /// fully drained).
     ///
-    /// Delegates to `has_active_tickets_internal` with
-    /// [`ReservationFilter::Any`]. The test-only
-    /// `has_pipeline_blocker_for_workspace` uses `ReservationFilter::ReservedOnly`,
-    /// requiring `pipeline_reservation = 1` for `ReadyForDevelopment` tickets.
+    /// Delegates to [`has_active_tickets_internal`]. The test-only
+    /// [`has_pipeline_blocker_for_workspace`] additionally requires
+    /// `pipeline_reservation = 1` for ReadyForDevelopment tickets.
     ///
     /// Non-active phases (not matched by the query): `Done`, `Cancelled`,
     /// `Failed`, `Backlog`, `Analysis`, `Planning`.
@@ -1536,12 +1528,8 @@ impl BoardStore {
         workspace_name: &str,
         exclude_ticket_id: &str,
     ) -> Result<bool> {
-        self.has_active_tickets_internal(
-            workspace_name,
-            ReservationFilter::Any,
-            Some(exclude_ticket_id),
-        )
-        .await
+        self.has_active_tickets_internal(workspace_name, Some(exclude_ticket_id))
+            .await
     }
 
     /// Add a comment to a ticket (append-only).
@@ -2393,9 +2381,8 @@ mod tests {
     ///
     /// Active tickets include all ReadyForDevelopment tickets regardless of
     /// `pipeline_reservation`, unlike [`has_pipeline_blocker_for_workspace`] which
-    /// uses `ReservationFilter::ReservedOnly` (requires reservation=1). This is
-    /// intentional — unstarted backlog tickets
-    /// are considered active to suppress Done notifications until the pipeline
+    /// requires `pipeline_reservation = 1`. This is intentional — unstarted backlog
+    /// tickets are considered active to suppress Done notifications until the pipeline
     /// is fully drained.
     #[tokio::test]
     async fn test_has_active_tickets_excluding() {
