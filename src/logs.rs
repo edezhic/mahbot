@@ -74,20 +74,6 @@ pub struct LogStore {
 /// is cheaply cloneable since `Connection` wraps an `Arc` internally).
 pub static LOG_STORE: OnceCell<LogStore> = OnceCell::const_new();
 
-/// Returns a reference to the global log store.
-///
-/// # Panics
-///
-/// Panics if the log store has not been initialized. [`init_tracing()`] is
-/// called during bootstrap — before any code accesses this store — so this
-/// panic only occurs due to a programming error.
-#[must_use]
-pub fn store() -> &'static LogStore {
-    LOG_STORE
-        .get()
-        .expect("LOG_STORE not initialized — call init_tracing() first")
-}
-
 const LOGS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
