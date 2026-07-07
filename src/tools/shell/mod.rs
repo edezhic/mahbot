@@ -46,6 +46,7 @@ pub(super) const SHELL_PREFIXES: &[&str] = &[
     "noglob",
     "nocorrect",
     "eval",
+    "npx",
 ];
 
 /// Corresponding entries in [`SHELL_PREFIXES`] that do NOT forward their
@@ -2117,6 +2118,47 @@ mod tests {
                 contains: &["commit", "Author"],
                 ..Default::default()
             },
+            // ── npx-wrapped tools (profile selection) ─────────────────
+            ShellOutputCase {
+                name: "npx eslint selects eslint profile",
+                command: "npx eslint .",
+                contains: &["[eslint: ok]"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "npx prettier selects prettier profile",
+                command: "npx prettier --check file.js",
+                stdout: "unchanged",
+                contains: &["prettier: ok"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "npx tsc selects tsc profile",
+                command: "npx tsc --noEmit",
+                contains: &["[tsc: ok]"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "npx vitest selects vitest profile",
+                command: "npx vitest --run",
+                stdout: "stdout: Tests passed\nPASS src/test.ts\n",
+                // Vitest profile strips "PASS" prefixed lines but keeps "stdout:" lines
+                not_contains: &["PASS"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "npx with flags before subcommand selects eslint profile",
+                command: "npx --yes eslint .",
+                contains: &["[eslint: ok]"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "unknown npx tool falls through to generic",
+                command: "npx some_obscure_tool --flag",
+                stdout: "some\nrandom\noutput\n",
+                contains: &["some", "output"],
+                ..Default::default()
+            },
         ];
         check_shell_output(cases);
     }
@@ -2939,6 +2981,21 @@ mod tests {
             // subcommand of `poetry`, producing "poetry run".
             ("python -m pytest tests/", "python pytest"),
             ("poetry run pytest tests/", "poetry run"),
+            // ── npx (shell prefix) ─────────────────────────────────────
+            // npx is a shell prefix, so it's stripped before command extraction.
+            // Tool-specific profiles (eslint, prettier, vitest, etc.) now match
+            // correctly instead of being shadowed by the generic npx catch-all.
+            ("npx eslint", "eslint"),
+            ("npx eslint .", "eslint ."),
+            ("npx eslint --fix .", "eslint ."),
+            ("npx --yes eslint .", "eslint ."),
+            ("npx prettier --check file.js", "prettier file.js"),
+            ("npx vitest --run", "vitest"),
+            ("npx tsc --noEmit", "tsc"),
+            (
+                "npx --yes create-react-app my-app",
+                "create-react-app my-app",
+            ),
         ];
         for &(input, expected) in cases {
             assert_eq!(

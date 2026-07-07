@@ -318,7 +318,7 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             )
             .tail(15)
             .max(40),
-        small_util(r"^(?:npx|biome|oxlint|ruff)\b", 30),
+        small_util(r"^(?:biome|oxlint|ruff)\b", 30),
         Profile::new(r"^pnpm\s+install\b")
             .strip(&[
                 r"Already up to date",
