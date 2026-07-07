@@ -872,10 +872,10 @@ impl BoardStore {
     /// `target_phase`. Always filters by `workspace_name` so only tickets from
     /// that workspace are eligible.
     ///
-    /// Only tickets currently in `expected_phase` are eligible for claiming.
-    /// The WHERE clause includes `t1.status = ?` bound to `expected_phase`,
+    /// Only tickets currently in `current_phase` are eligible for claiming.
+    /// The WHERE clause includes `t1.status = ?` bound to `current_phase`,
     /// providing CAS-style atomicity for phase transitions — if no ticket
-    /// matches the expected phase, the claim returns `None`.
+    /// matches the current phase, the claim returns `None`.
     ///
     /// When `pipeline_check` is [`PipelineCheck::Enforce`], the claim is rejected
     /// (returns `None`) if any pipeline-blocking ticket exists in the same workspace. The
@@ -911,7 +911,7 @@ impl BoardStore {
     /// dispatches (analysts, verifiers) intentionally leave `assigned_to` NULL.
     pub(crate) async fn claim_ticket_in_workspace(
         &self,
-        expected_phase: TicketPhase,
+        current_phase: TicketPhase,
         target_phase: TicketPhase,
         workspace_name: &str,
         pipeline_check: PipelineCheck,
@@ -958,7 +958,7 @@ impl BoardStore {
                 turso::params![
                     target_phase.as_ref(),
                     now,
-                    expected_phase.as_ref(),
+                    current_phase.as_ref(),
                     workspace_name,
                 ],
             )
