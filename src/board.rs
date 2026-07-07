@@ -946,6 +946,7 @@ impl BoardStore {
              pipeline_reservation = 0 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
              WHERE t1.status = ?3 AND t1.assigned_to IS NULL AND t1.workspace_name = ?4 \
+             AND t1.is_archived = 0 \
              {pipeline_blocker_clause}{prereq_filter} \
              ORDER BY t1.pipeline_reservation DESC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}"
@@ -1217,7 +1218,8 @@ impl BoardStore {
                  SET assigned_to = ?1, updated_at = ?2 \
                  WHERE id = ?3 \
                  AND assigned_to IS NULL \
-                 AND status = ?4",
+                 AND status = ?4 \
+                 AND is_archived = 0",
                 turso::params![
                     assigned_to,
                     now,
@@ -1255,7 +1257,7 @@ impl BoardStore {
             status_list_sql_fragment(&[TicketPhase::InSanitation, TicketPhase::SanitationPassed]);
         let sql = format!(
             "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
-             WHERE id = ?4 AND status = ?5 \
+             WHERE id = ?4 AND status = ?5 AND is_archived = 0 \
              AND NOT EXISTS (SELECT 1 FROM tickets t2 \
                WHERE t2.workspace_name = \
                  (SELECT workspace_name FROM tickets WHERE id = ?4) \
