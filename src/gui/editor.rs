@@ -87,8 +87,9 @@ const GLOBAL_SEARCH_DEBOUNCE_MS: u64 = 300;
 /// be hidden from the file tree.
 #[must_use]
 fn is_os_file(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower == ".ds_store" || lower == "thumbs.db" || lower == "desktop.ini"
+    name.eq_ignore_ascii_case(".ds_store")
+        || name.eq_ignore_ascii_case("thumbs.db")
+        || name.eq_ignore_ascii_case("desktop.ini")
 }
 
 /// Render a centered empty-state placeholder with text content.
