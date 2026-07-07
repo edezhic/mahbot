@@ -108,11 +108,7 @@ async fn handle_option_callback(mut msg: ChannelMessage) {
 
     // Route directly to Manager session, bypassing resolve_active_role.
     // Enrichment is skipped — synthetic callback text has no media markers or URLs.
-    manager_queue::manager_queue().enqueue(manager_queue::ManagerJob {
-        content: msg.content,
-        workspace_name: ws.name,
-        kind: manager_queue::JobKind::UserMessage,
-    });
+    manager_queue::manager_queue().enqueue_user_message(msg.content, ws.name);
 }
 
 /// Build a session key for a given workspace, role, and source channel.
@@ -767,11 +763,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // Manager messages route through the serialized queue; non-Manager roles
     // use the traditional inline agent dispatch path.
     if effective_role == Role::Manager {
-        manager_queue::manager_queue().enqueue(manager_queue::ManagerJob {
-            content: msg.content,
-            workspace_name: ws.name,
-            kind: manager_queue::JobKind::UserMessage,
-        });
+        manager_queue::manager_queue().enqueue_user_message(msg.content, ws.name);
         return;
     }
 

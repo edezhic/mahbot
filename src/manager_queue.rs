@@ -99,6 +99,19 @@ impl ManagerQueue {
             error!("Failed to enqueue Manager job: {e}");
         }
     }
+
+    /// Convenience method to enqueue a user-message job.
+    ///
+    /// Shorthand for constructing a [`ManagerJob`] with [`JobKind::UserMessage`].
+    /// Used when routing chat messages (or synthetic callbacks) to the Manager
+    /// session — bypasses the inline agent dispatch path.
+    pub fn enqueue_user_message(&self, content: String, workspace_name: String) {
+        self.enqueue(ManagerJob {
+            content,
+            workspace_name,
+            kind: JobKind::UserMessage,
+        });
+    }
 }
 
 // ── Consumer loop ─────────────────────────────────────────────────
