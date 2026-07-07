@@ -663,6 +663,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_retryable_hints_are_classified_non_retryable() {
+        for hint in NON_RETRYABLE_HINTS {
+            let err = anyhow::anyhow!("some error: {hint}");
+            assert!(
+                matches!(classify_err(&err), ErrorClass::NonRetryable),
+                "hint '{hint}' should be classified as NonRetryable"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn chat_tool_schema_error_is_not_retried() {
         let calls = Arc::new(AtomicUsize::new(0));
