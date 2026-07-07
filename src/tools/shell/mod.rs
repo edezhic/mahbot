@@ -2425,9 +2425,7 @@ mod tests {
         // reads $CARGO_HOME — concurrent tests in other modules may write it, so
         // holding the shared lock prevents the theoretical data race.
         let mut cmd = {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _guard = env_lock().lock().unwrap_poison();
             build_shell_command("env", tmp.path())
         };
 

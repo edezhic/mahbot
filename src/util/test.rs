@@ -22,6 +22,7 @@
 
 use crate::board::{BoardStore, Ticket, TicketParams, TicketPhase};
 use crate::turso;
+use crate::util::UnwrapPoison;
 use crate::workspace::test_ws_named;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -91,9 +92,7 @@ impl Drop for EnvVarGuard {
 /// ```
 #[must_use]
 pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
-    let guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = env_lock().lock().unwrap_poison();
     let original = std::env::var_os(key);
     // SAFETY: Protected by the env_lock acquired above — no concurrent
     // env writes can happen from other test threads.
