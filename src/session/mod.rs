@@ -652,33 +652,28 @@ pub(crate) fn decode_native_history_message(
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
 
-        // Extract reasoning fields once, before the tool_calls branch.
+        // Extract reasoning fields for the Assistant variant.
         let (r, rc, rd) =
             crate::providers::reasoning_roundtrip::json_lossless_assistant_reasoning_fields(value);
         let reasoning = Reasoning::from_optional_parts(r, rc, rd);
 
-        if let Some(tool_calls_value) = value.get("tool_calls")
-            && let Ok(mut parsed_calls) =
-                serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
-        {
-            for call in &mut parsed_calls {
-                if let Some(s) = call.arguments.as_str()
-                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
-                {
-                    call.arguments = v;
+        let tool_calls = value
+            .get("tool_calls")
+            .and_then(|v| serde_json::from_value::<Vec<ToolCall>>(v.clone()).ok())
+            .map(|mut parsed_calls| {
+                for call in &mut parsed_calls {
+                    if let Some(s) = call.arguments.as_str()
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        call.arguments = v;
+                    }
                 }
-            }
-
-            return Some(DecodedNativeHistoryMessage::Assistant {
-                content,
-                tool_calls: Some(parsed_calls),
-                reasoning,
+                parsed_calls
             });
-        }
 
         return Some(DecodedNativeHistoryMessage::Assistant {
             content,
-            tool_calls: None,
+            tool_calls,
             reasoning,
         });
     }
