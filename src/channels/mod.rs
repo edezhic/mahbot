@@ -278,7 +278,7 @@ enum MultimodalImageAction {
 
 /// Handle an IMAGE marker in multimodal mode — convert to data URI or invalid
 /// reference. Saves a workspace copy if `uploads_dir` is available.
-/// Always deletes the source temp file.
+/// The caller is responsible for cleaning up the source temp file.
 async fn handle_multimodal_image(
     path: &str,
     path_obj: &std::path::Path,
@@ -292,7 +292,6 @@ async fn handle_multimodal_image(
     let invalid_ref = format!("[Invalid image reference: {path}]");
     if !path_obj.exists() || !path_obj.is_file() {
         tracing::warn!(%path, "Image file not found for multimodal enrichment");
-        remove_temp_file(path_obj).await;
         return MultimodalImageAction::Replace {
             replacement: invalid_ref,
             upload_annotation: None,
@@ -311,7 +310,6 @@ async fn handle_multimodal_image(
         }
     };
 
-    remove_temp_file(path_obj).await;
     MultimodalImageAction::Replace {
         replacement,
         upload_annotation: saved,
@@ -321,7 +319,7 @@ async fn handle_multimodal_image(
 /// Handle an IMAGE marker in non-multimodal mode — transcribe to text
 /// description or fall back to a generic attachment annotation.
 async fn handle_non_multimodal_image(path_obj: &std::path::Path, file_name: &str) -> String {
-    let annotation = if let Some(ref transcriber) = crate::providers::image_transcriber() {
+    if let Some(ref transcriber) = crate::providers::image_transcriber() {
         match transcribe_image_file(path_obj, transcriber).await {
             Ok(description) => format!("[Image: {description}]"),
             Err(e) => {
@@ -331,9 +329,7 @@ async fn handle_non_multimodal_image(path_obj: &std::path::Path, file_name: &str
         }
     } else {
         format!("[Image: {file_name} attached]")
-    };
-    remove_temp_file(path_obj).await;
-    annotation
+    }
 }
 
 /// Extract the file name portion from a media marker path, falling back to
@@ -413,19 +409,16 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
             "AUDIO" => {
                 let annotation = transcribe_audio_marker(path).await;
                 annotations.push(annotation);
-                remove_temp_file(path_obj).await;
             }
             "VIDEO" => match strategy {
                 EnrichmentStrategy::Multimodal { .. } => {
                     // No native video support in chat completions — strip silently.
                     // The marker will be stripped by the marker-stripping logic
                     // below (all non-IMAGE markers are removed in multimodal mode).
-                    remove_temp_file(path_obj).await;
                 }
                 EnrichmentStrategy::NonMultimodal => {
                     let file_name = extract_file_name(path);
                     annotations.push(format!("[Video: {file_name} attached]"));
-                    remove_temp_file(path_obj).await;
                 }
             },
             // NOTE: If a new marker kind is added to MEDIA_MARKER_RE in
@@ -440,6 +433,12 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                 tracing::warn!(kind, %path, "Unknown media marker kind");
             }
         }
+
+        // Single cleanup point — all media marker temp files are removed here,
+        // regardless of kind or strategy. The helper functions (e.g.
+        // handle_multimodal_image, handle_non_multimodal_image) no longer
+        // perform cleanup themselves.
+        remove_temp_file(path_obj).await;
     }
 
     // ── Multimodal-specific post-processing ──
