@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::tools::{ShellMode, ShellTool, search::SearchTool};
+use crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS;
 use crate::{Tool, ToolOutputPhase, Workspace};
 use async_trait::async_trait;
 use serde_json::json;
@@ -503,8 +504,8 @@ async fn read_and_parse(resolved_path: &Path, mode_label: &str) -> anyhow::Resul
     let Some(ls) = language_support(&ext) else {
         anyhow::bail!(
             "Unsupported file extension '.{ext}' for {mode_label}. \
-             Supported: .rs, .js, .jsx, .mjs, .cjs, .ts, .tsx, .py, .pyi, .pyx, .json, .toml, \
-             .sh, .bash, .zsh, .css, .html, .htm, .go, .rb, .c, .h, .sql, .md, .markdown"
+             Supported extensions: .{}",
+            ALL_TREE_SITTER_EXTENSIONS.join(", .")
         );
     };
     let language = ls.language;
@@ -834,19 +835,22 @@ mod tests {
         (dir, path)
     }
 
-    /// Every extension listed in `tree_sitter_language_for_extension` must have
-    /// a `language_support` entry. Catches drift when an extension is removed
-    /// from `language_support` match arms without updating the error string.
+    /// Every extension in the canonical `ALL_TREE_SITTER_EXTENSIONS` constant
+    /// must have a `language_support` entry. Derived automatically from the
+    /// canonical source (`crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS`)
+    /// so that adding an extension to the canonical function automatically
+    /// updates this test.
     ///
-    /// NOTE: This list must match the extensions in
-    /// `crate::util::tree_sitter::tree_sitter_language_for_extension`.
+    /// This is a regression check: `language_support` calls
+    /// `tree_sitter_language_for_extension` first (which returns `None` for
+    /// unsupported extensions), then matches on the extension for a symbol
+    /// query with a `_ => ""` catch-all. As long as those two conditions hold,
+    /// every recognized extension will have a `Some` result — but if someone
+    /// accidentally restructures `language_support` to return `None` for a
+    /// previously supported extension, this test catches the regression.
     #[test]
     fn all_supported_extensions_have_language() {
-        let expected: &[&str] = &[
-            "rs", "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "pyi", "pyx", "json", "toml", "sh",
-            "bash", "zsh", "css", "html", "htm", "go", "rb", "c", "h", "sql", "md", "markdown",
-        ];
-        for ext in expected {
+        for ext in ALL_TREE_SITTER_EXTENSIONS {
             assert!(
                 language_support(ext).is_some(),
                 "expected language support for .{ext}"

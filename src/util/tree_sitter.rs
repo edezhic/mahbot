@@ -7,7 +7,8 @@
 //!
 //! ## Adding support for a new language
 //!
-//! 1. Add the extension(s) to [`tree_sitter_language_for_extension`] (this file).
+//! 1. Add the extension(s) to [`tree_sitter_language_for_extension`] (this file)
+//!    AND to [`ALL_TREE_SITTER_EXTENSIONS`] just below.
 //! 2. Add a variant to [`HighlightLanguage`] and a `language_and_query` arm in
 //!    [`crate::gui::highlight`] — the reverse-lookup map is derived automatically.
 //! 3. Add a `line_comment_prefix` arm in [`crate::gui::editor_widget`] (if
@@ -15,12 +16,11 @@
 //! 4. Add a `language_support` arm in [`crate::tools::read`] if the language
 //!    should have symbol extraction (the `_ => ""` fallback gives empty symbols).
 //! 5. Update [`VARIANT_EXTENSIONS`] in [`crate::gui::highlight`]'s test module
-//!    and [`all_supported_extensions_have_language`] in [`crate::tools::read`]'s
-//!    test module — these test-side reference lists catch drift.
+//!    — this test-side reference list catches drift.
 //!
 //! [`HighlightLanguage`]: crate::gui::highlight::HighlightLanguage
 //! [`VARIANT_EXTENSIONS`]: crate::gui::highlight::tests::VARIANT_EXTENSIONS
-//! [`all_supported_extensions_have_language`]: crate::tools::read::tests::all_supported_extensions_have_language
+//! [`ALL_TREE_SITTER_EXTENSIONS`]: self::ALL_TREE_SITTER_EXTENSIONS
 
 use tree_sitter::Language;
 
@@ -49,6 +49,17 @@ use tree_sitter::Language;
 /// | `c`, `h` | C |
 /// | `sql` | SQL |
 /// | `md`, `markdown` | Markdown |
+/// Every extension that [`tree_sitter_language_for_extension`] can recognize.
+///
+/// **Must be kept in sync with the match arms in the function below.** When a
+/// new extension is added to a match arm, add it here too. This constant
+/// is used by the `read` tool's error message and test to avoid hardcoded
+/// copies elsewhere.
+pub(crate) const ALL_TREE_SITTER_EXTENSIONS: &[&str] = &[
+    "rs", "js", "jsx", "mjs", "cjs", "ts", "tsx", "py", "pyi", "pyx", "json", "toml", "sh", "bash",
+    "zsh", "css", "html", "htm", "go", "rb", "c", "h", "sql", "md", "markdown",
+];
+
 #[must_use]
 pub fn tree_sitter_language_for_extension(ext: &str) -> Option<Language> {
     match ext {
@@ -68,5 +79,33 @@ pub fn tree_sitter_language_for_extension(ext: &str) -> Option<Language> {
         "sql" => Some(tree_sitter_sequel::LANGUAGE.into()),
         "md" | "markdown" => Some(tree_sitter_md::LANGUAGE.into()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every extension listed in [`ALL_TREE_SITTER_EXTENSIONS`] must be
+    /// recognized by [`tree_sitter_language_for_extension`].
+    ///
+    /// This catches the case where an extension is removed from the function
+    /// without being removed from the constant (false-positive constant entry).
+    ///
+    /// **Note:** The reverse check (every extension in the function appears in
+    /// the constant) cannot be automated because the function's match arms
+    /// aren't inspectable at compile time. When adding a new extension to a
+    /// match arm, you must also add it to [`ALL_TREE_SITTER_EXTENSIONS`].
+    #[test]
+    fn all_constant_extensions_are_supported() {
+        for ext in ALL_TREE_SITTER_EXTENSIONS {
+            assert!(
+                tree_sitter_language_for_extension(ext).is_some(),
+                "expected tree_sitter_language_for_extension(\"{ext}\") to return Some, \
+                 but the function returned None. \
+                 If you removed this extension from the function, remove it from \
+                 ALL_TREE_SITTER_EXTENSIONS too."
+            );
+        }
     }
 }
