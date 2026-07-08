@@ -41,6 +41,7 @@ impl std::fmt::Display for PickOption {
 }
 
 /// Flexoki-dark themed style for [`fn@pick_list`] widgets.
+#[must_use]
 pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick_list::Style {
     pick_list::Style {
         text_color: theme::TEXT_PRIMARY,
@@ -57,6 +58,7 @@ pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick
 
 /// Flexoki-dark themed style for [`fn@text_input`] widgets.
 /// Matches [`pick_list_style`] for visual consistency.
+#[must_use]
 pub fn text_input_style(_theme: &iced::Theme, _status: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: iced::Background::Color(theme::BG_ELEVATED),
@@ -73,6 +75,7 @@ pub fn text_input_style(_theme: &iced::Theme, _status: text_input::Status) -> te
 }
 
 /// Render a styled error banner for dashboard panels.
+#[must_use]
 pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
     container(text(err).size(13).color(theme::STATUS_ERROR))
         .padding(8)
@@ -90,6 +93,7 @@ pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
 }
 
 /// Render a centered empty-state placeholder with a lucide icon and label.
+#[must_use]
 pub fn empty_state_placeholder<'a, Message: 'a>(
     icon: iced::widget::Text<'a, iced::Theme, iced::Renderer>,
     label: &'a str,
@@ -129,6 +133,7 @@ pub fn selectable_text<'a>(
 ///
 /// Callers typically wrap this in a styled [`button()`] with an appropriate
 /// action message.
+#[must_use]
 pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> Row<'a, Message> {
     let mut parts: Vec<Element<'a, Message>> = Vec::new();
     if added > 0 {

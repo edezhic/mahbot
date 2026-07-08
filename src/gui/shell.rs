@@ -114,6 +114,7 @@ pub struct ShellState {
 }
 
 impl ShellState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             selected_workspace_name: None,

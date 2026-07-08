@@ -331,6 +331,7 @@ pub struct HomeState {
 }
 
 impl HomeState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             selected_user: None,

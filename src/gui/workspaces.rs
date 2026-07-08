@@ -93,6 +93,7 @@ pub struct WorkspacesState {
 }
 
 impl WorkspacesState {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             workspaces: Vec::new(),

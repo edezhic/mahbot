@@ -109,6 +109,7 @@ pub struct DiffBufferWidget<'a> {
 
 impl<'a> DiffBufferWidget<'a> {
     /// Create a new [`DiffBufferWidget`] from pre-computed buffer data.
+    #[must_use]
     pub const fn new(data: &'a DiffFileBuffer) -> Self {
         Self { data, padding: 8.0 }
     }
@@ -613,6 +614,7 @@ where
 ///
 /// When `limits` is `Some((max_hunks, max_lines))`, stops building buffers once
 /// cumulative hunk/line counts would exceed the caps (matches view truncation).
+#[must_use]
 pub fn build_file_buffers(
     diff_files: &[super::diff::DiffFile],
     selected_file: Option<&str>,

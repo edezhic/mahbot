@@ -58,6 +58,7 @@ pub const STATUS_ERROR: Color = Color::from_rgb(1.0, 0.267, 0.4); // #ff4466
 
 // ── Log level colors (from Logs.tsx) ─────────────────────────────
 
+#[must_use]
 pub fn log_level_color(level: &str) -> (Color, Color) {
     match level.to_uppercase().as_str() {
         "ERROR" => (STATUS_ERROR, Color::from_rgba(0.937, 0.267, 0.267, 0.08)),
@@ -178,6 +179,7 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
 // ── Ticket status badge colors (from Board.tsx STATUS_STYLE) ─────
 // 15 TicketPhase variants, exhaustively matched — no catch-all.
 
+#[must_use]
 pub const fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
         Analysis, Backlog, Cancelled, DiagnosticsDone, Done, Failed, InDevelopment, InDiagnostics,
@@ -283,6 +285,7 @@ pub fn format_timestamp(ts: &str) -> String {
 
 // ── Workspace status colors (from Workspaces.tsx) ────────────────
 
+#[must_use]
 pub fn workspace_status_color(status: &str) -> (Color, Color) {
     match status {
         "ready" => (
@@ -393,6 +396,7 @@ pub fn button_transparent(
 }
 
 /// Primary action button (Save, Submit, Confirm). Uses Flexoki accent green.
+#[must_use]
 pub fn button_primary(
     _: &iced::Theme,
     status: iced::widget::button::Status,
@@ -420,6 +424,7 @@ pub fn button_primary(
 }
 
 /// Danger button (Delete, Purge, Clear). Uses Flexoki error red.
+#[must_use]
 pub fn button_danger(
     _: &iced::Theme,
     status: iced::widget::button::Status,
@@ -447,6 +452,7 @@ pub fn button_danger(
 }
 
 /// Secondary/neutral button (Cancel, Close). Uses Flexoki surface tones.
+#[must_use]
 pub fn button_secondary(
     _: &iced::Theme,
     status: iced::widget::button::Status,
@@ -475,6 +481,7 @@ pub fn button_secondary(
 
 /// Text-only danger button (Cancel in modals, delete triggers). Like [`button_text`]
 /// but with red text. No colored background, subtle hover highlight, red text only.
+#[must_use]
 pub fn button_text_danger(
     _: &iced::Theme,
     status: iced::widget::button::Status,
@@ -501,6 +508,7 @@ pub fn button_text_danger(
 }
 
 /// Text-only button (sidebar nav items, inline actions). Minimal Flexoki styling.
+#[must_use]
 pub fn button_text(
     _: &iced::Theme,
     status: iced::widget::button::Status,

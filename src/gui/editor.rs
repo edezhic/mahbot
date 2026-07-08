@@ -4557,6 +4557,7 @@ impl EditorState {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[must_use]
     pub fn view(&self) -> Element<'_, EditorMessage> {
         // ── No workspace selected — placeholder ──────────────────────
         if self.selected_workspace_name.is_none() {

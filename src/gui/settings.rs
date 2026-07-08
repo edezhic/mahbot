@@ -362,6 +362,7 @@ impl SettingsState {
     }
 
     /// Whether a modal is currently open (for Escape key routing).
+    #[must_use]
     pub const fn is_modal_open(&self) -> bool {
         self.show_add_workspace_modal
             || self.show_add_user_modal

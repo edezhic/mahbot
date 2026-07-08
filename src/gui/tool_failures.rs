@@ -40,6 +40,7 @@ pub struct ToolFailuresState {
 }
 
 impl ToolFailuresState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),

@@ -4,7 +4,6 @@
 //! bootstraps via a startup [`iced::Task`] before the UI becomes interactive.
 
 #![expect(
-    clippy::must_use_candidate,
     clippy::new_without_default,
     clippy::struct_excessive_bools,
     clippy::if_not_else,
@@ -446,6 +445,7 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
+    #[must_use]
     pub fn loading(update_available: bool) -> Self {
         Self {
             ready: false,
@@ -2136,6 +2136,7 @@ pub struct WindowState {
 impl WindowState {
     /// Position to use when restoring the window.
     #[allow(clippy::cast_precision_loss)]
+    #[must_use]
     pub const fn position(&self) -> iced::window::Position {
         iced::window::Position::Specific(iced::Point::new(self.x as f32, self.y as f32))
     }
@@ -2156,6 +2157,7 @@ impl Default for WindowState {
 
 /// Read persisted window state from `~/.mahbot/window-state.json`.
 /// Returns defaults if the file is missing or unreadable.
+#[must_use]
 pub fn read_window_state() -> WindowState {
     let dir = std::env::var("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".mahbot"))

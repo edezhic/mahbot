@@ -105,6 +105,7 @@ pub struct BoardState {
 }
 
 impl BoardState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tickets: Vec::new(),

@@ -70,6 +70,7 @@ pub struct UsersState {
 }
 
 impl UsersState {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             users: Vec::new(),

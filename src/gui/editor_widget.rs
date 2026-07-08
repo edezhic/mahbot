@@ -209,6 +209,7 @@ pub struct EditorBuffer {
 
 impl EditorBuffer {
     /// Create an empty buffer with no language (no syntax highlighting).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_text("", None)
     }
@@ -218,6 +219,7 @@ impl EditorBuffer {
     /// When `language` is `Some` and the text is within
     /// `MAX_HIGHLIGHT_SIZE`, syntax highlighting is applied via tree-sitter.
     /// Otherwise text is rendered with default attributes.
+    #[must_use]
     pub fn with_text(text: &str, language: Option<HighlightLanguage>) -> Self {
         let buffer = with_font_system(|font_sys| {
             let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());

@@ -143,6 +143,7 @@ pub struct LogsState {
 }
 
 impl LogsState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
