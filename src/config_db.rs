@@ -99,8 +99,6 @@ fn kv_from_row(row: &turso::Row) -> Result<(String, String), ::turso::Error> {
 
 // ── UPSERT SQL constants ──────────────────────────────────
 
-const UPSERT_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
 const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
 impl ConfigStore {
@@ -108,9 +106,11 @@ impl ConfigStore {
 
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute(UPSERT_KV_SQL, turso::params![key, value])
-            .await?;
+        let sql = format!(
+            "INSERT INTO config_kv ({KV_COLUMNS}) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        );
+        self.conn.execute(&sql, turso::params![key, value]).await?;
         Ok(())
     }
 
@@ -225,8 +225,11 @@ impl ConfigStore {
     /// Upsert a key-value pair within an existing transaction.
     /// Like [`set_kv`] but executes on the supplied [`turso::TxGuard`].
     pub(crate) async fn set_kv_tx(tx: &turso::TxGuard<'_>, key: &str, value: &str) -> Result<()> {
-        tx.execute(UPSERT_KV_SQL, turso::params![key, value])
-            .await?;
+        let sql = format!(
+            "INSERT INTO config_kv ({KV_COLUMNS}) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        );
+        tx.execute(&sql, turso::params![key, value]).await?;
         Ok(())
     }
 
