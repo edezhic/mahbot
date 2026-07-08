@@ -108,8 +108,8 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 ///
 /// # Caller responsibilities
 ///
-/// This is a shared helper extracted from [`acquire_lock`] and
-/// [`FlockGuard::reacquire`]. Each caller handles its own concerns:
+/// Shared helper used by [`acquire_lock`] and [`FlockGuard::reacquire`]. Each
+/// caller handles its own concerns:
 ///
 /// - **Directory creation**: [`acquire_lock`] ensures the parent directory exists
 ///   before calling this helper.
@@ -121,12 +121,7 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 ///   messages.
 fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     for attempt in 0..3 {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
+        let file = open_lock_file(path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
 
         if try_flock(&file)? {
@@ -139,6 +134,19 @@ fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     }
 
     Ok(None)
+}
+
+/// Open (or create) the lock file with the standard set of options.
+///
+/// Extracted from [`try_acquire_lock`] so the same builder pattern is available
+/// to both production code and tests.
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// Path to the global lock file under the given storage root.
@@ -893,13 +901,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("mahbot.lock");
 
-        let file1 = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
+        let file1 = open_lock_file(&lock_path).unwrap();
 
         // First lock should succeed.
         assert!(try_flock(&file1).unwrap(), "First flock should succeed");
@@ -929,13 +931,7 @@ mod tests {
         let lock_path = dir.path().join("mahbot.lock");
 
         // Hold the lock on this file so try_acquire_lock will fail.
-        let holder = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
+        let holder = open_lock_file(&lock_path).unwrap();
         assert!(try_flock(&holder).unwrap(), "First flock should succeed");
 
         // While the lock is held, try_acquire_lock should exhaust retries.
