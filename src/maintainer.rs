@@ -8,9 +8,15 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::Role;
+use crate::Workspace;
 use crate::agent::run_agent;
 use crate::board::TicketPhase;
 use crate::turso;
+
+/// Maximum number of tickets allowed in Analysis + Planning + ReadyForDevelopment
+/// before the maintainer pauses ticket creation.
+const MAX_PRE_DEV_TICKETS: i64 = 5;
+
 /// Run the maintainer background loop.
 ///
 /// Runs a Maintainer agent per workspace with the investigation prompt.
@@ -19,7 +25,6 @@ use crate::turso;
 /// otherwise (`advance_debounce`: clamps current to [5, 240], doubles,
 /// caps at 240 — producing the sequence 1 → 10 → 20 → … → 240).
 /// On cancellation or error, debounce and last-run timestamp are left unchanged.
-#[allow(clippy::too_many_lines)]
 pub async fn run_maintainer_loop() {
     let interval = Duration::from_mins(1);
     let shutdown = crate::shutdown::shutdown_token();
@@ -59,54 +64,12 @@ pub async fn run_maintainer_loop() {
                 continue;
             }
 
-            // ── Debounce gate check ──────────────────────────────────────
-            {
-                let now = Utc::now();
-                let debounce = ws.maintainer_debounce_mins.clamp(0, 240); // floor+cap guard
-                if let Some(ref last_str) = ws.maintainer_last_run_at {
-                    match crate::turso::parse_utc_timestamp(last_str) {
-                        Ok(last_time) => {
-                            let elapsed = now - last_time;
-                            let mins_elapsed = elapsed.num_minutes();
-                            if mins_elapsed < debounce {
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(maintainer_last_run_at = %last_str, error = %e, "Failed to parse maintainer_last_run_at, letting through");
-                            // If parse fails, let it through — stale data shouldn't block
-                        }
-                    }
-                }
-                // If last_run_at is None, always run (first time).
+            if should_skip_maintainer_debounce(ws) {
+                continue;
             }
 
-            // Skip if the pre-development pipeline has >= 5 tickets (Analysis + Planning + ReadyForDevelopment).
-            // This replaces the previous "pause if any pipeline-blocker exists" guard with a threshold
-            // so the maintainer resumes creating tickets as soon as the pre-dev pipeline drops below 5,
-            // even if other tickets are in development/review/QA.
-            if let Some(board) = crate::board::BOARD.get() {
-                let count_status = |phase: TicketPhase| async move {
-                    match board.count_by_phase(phase, Some(&ws.name)).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!(workspace = %ws.name, %phase, error = %e, "Maintainer: failed to count tickets");
-                            0
-                        }
-                    }
-                };
-
-                let pre_dev_count = {
-                    let analysis = count_status(TicketPhase::Analysis).await;
-                    let planning = count_status(TicketPhase::Planning).await;
-                    let ready = count_status(TicketPhase::ReadyForDevelopment).await;
-                    analysis + planning + ready
-                };
-
-                if pre_dev_count >= 5 {
-                    info!(workspace = %ws.name, pre_dev = pre_dev_count, "Maintainer: skipping — pre-development pipeline has >= 5 tickets");
-                    continue;
-                }
+            if is_maintainer_pipeline_full(ws).await {
+                continue;
             }
 
             // Unique session key per run — don't accumulate history
@@ -142,6 +105,76 @@ pub async fn run_maintainer_loop() {
             // not via explicit notification — no Manager notification needed here.
         }
     }
+}
+
+/// Returns `true` if the maintainer should skip this workspace due to debounce.
+///
+/// Checks whether enough time has passed since the last maintainer run by
+/// parsing `maintainer_last_run_at`, computing elapsed time relative to the
+/// debounce interval. On parse errors (stale data) or when `last_run_at` is
+/// `None` (first run), returns `false` to allow the run.
+fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
+    let now = Utc::now();
+    let debounce = ws.maintainer_debounce_mins.clamp(0, 240);
+    if let Some(ref last_str) = ws.maintainer_last_run_at {
+        match turso::parse_utc_timestamp(last_str) {
+            Ok(last_time) => {
+                let elapsed = now - last_time;
+                let mins_elapsed = elapsed.num_minutes();
+                if mins_elapsed < debounce {
+                    return true;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    maintainer_last_run_at = %last_str,
+                    error = %e,
+                    "Failed to parse maintainer_last_run_at, letting through"
+                );
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` if the maintainer should skip because the pre-dev pipeline
+/// has reached `MAX_PRE_DEV_TICKETS` or more tickets (Analysis + Planning +
+/// ReadyForDevelopment).
+///
+/// If the board is unavailable, returns `false` to allow the run through.
+async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
+    let Some(board) = crate::board::BOARD.get() else {
+        return false;
+    };
+
+    let count_status = |phase: TicketPhase| async move {
+        match board.count_by_phase(phase, Some(&ws.name)).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(workspace = %ws.name, %phase, error = %e, "Maintainer: failed to count tickets");
+                0
+            }
+        }
+    };
+
+    let pre_dev_count = {
+        let analysis = count_status(TicketPhase::Analysis).await;
+        let planning = count_status(TicketPhase::Planning).await;
+        let ready = count_status(TicketPhase::ReadyForDevelopment).await;
+        analysis + planning + ready
+    };
+
+    if pre_dev_count >= MAX_PRE_DEV_TICKETS {
+        info!(
+            workspace = %ws.name,
+            pre_dev = pre_dev_count,
+            "Maintainer: skipping — pre-development pipeline has >= {} tickets",
+            MAX_PRE_DEV_TICKETS,
+        );
+        return true;
+    }
+
+    false
 }
 
 /// Compute the new debounce value based on whether the agent produced tickets.
@@ -180,6 +213,67 @@ fn advance_debounce(mins: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal workspace with only the fields relevant to debounce tests.
+    fn ws_with(last_run_at: Option<&str>, debounce_mins: i64) -> Workspace {
+        Workspace {
+            name: "test-ws".into(),
+            path: "/tmp/test".into(),
+            status: "ready".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            maintenance_enabled: true,
+            paused: false,
+            maintainer_debounce_mins: debounce_mins,
+            maintainer_last_run_at: last_run_at.map(String::from),
+            diagnostics: None,
+            diagnostics_updated_at: None,
+        }
+    }
+
+    #[test]
+    fn should_skip_debounce_none_last_run() {
+        // No prior run — always let through.
+        let ws = ws_with(None, 5);
+        assert!(!should_skip_maintainer_debounce(&ws));
+    }
+
+    #[test]
+    fn should_skip_debounce_parse_error() {
+        // Unparseable timestamp — let through (stale data shouldn't block).
+        let ws = ws_with(Some("garbage-timestamp"), 5);
+        assert!(!should_skip_maintainer_debounce(&ws));
+    }
+
+    #[test]
+    fn should_skip_debounce_elapsed_less_than_debounce() {
+        // last_run_at = "now" → elapsed ~0s < 240 min → skip.
+        let now_str = Utc::now().to_rfc3339();
+        let ws = ws_with(Some(&now_str), 240);
+        assert!(should_skip_maintainer_debounce(&ws));
+    }
+
+    #[test]
+    fn should_skip_debounce_elapsed_gte_debounce() {
+        // Far-past timestamp → many years elapsed ≥ 5 min → let through.
+        let ws = ws_with(Some("2020-01-01T00:00:00Z"), 5);
+        assert!(!should_skip_maintainer_debounce(&ws));
+    }
+
+    #[test]
+    fn should_skip_debounce_zero_debounce() {
+        // debounce clamped to 0 → mins_elapsed < 0 never true → never skip.
+        let ws = ws_with(Some("2020-01-01T00:00:00Z"), -5);
+        assert!(!should_skip_maintainer_debounce(&ws));
+    }
+
+    #[test]
+    fn should_skip_debounce_high_debounce() {
+        // last_run_at = "now" → elapsed ~0s < 240 (clamped from 500) → skip.
+        let now_str = Utc::now().to_rfc3339();
+        let ws = ws_with(Some(&now_str), 500);
+        assert!(should_skip_maintainer_debounce(&ws));
+    }
 
     #[test]
     fn advance_debounce_edges() {
