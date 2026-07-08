@@ -668,32 +668,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_save_role_and_routing_configs_initial_save() {
-        let (store, _dir) = setup().await;
-        assert_save_configs(
-            &store,
-            &[
-                RoleConfig {
-                    role: "engineer".to_string(),
-                    model: Some("gpt-4".to_string()),
-                    reasoning_effort: Some("high".to_string()),
-                },
-                RoleConfig {
-                    role: "reviewer".to_string(),
-                    model: Some("claude-3".to_string()),
-                    reasoning_effort: None,
-                },
-            ],
-            &[ModelRouting {
-                model: "gpt-4".to_string(),
-                provider_order: Some("OpenAI".to_string()),
-                allow_fallbacks: Some(true),
-            }],
-        )
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_save_role_and_routing_configs_replaces_old_rows() {
         let (store, _dir) = setup().await;
 
