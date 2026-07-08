@@ -940,6 +940,7 @@ mod tests {
         expected: &'static str,
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn tree_guide_prefix_cases() {
         let cases = [

@@ -4078,6 +4078,7 @@ mod tests {
 
     // ── Toggle line comment ───────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_toggle_line_comment() {
         struct Case {
