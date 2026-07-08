@@ -167,14 +167,99 @@ pub(crate) async fn resolve_read_target(
     Ok(resolved_path)
 }
 
-/// Check whether a path is under any of the given roots, after tilde expansion.
+/// Lexically normalize a path by resolving `.` and `..` components
+/// without filesystem access (no I/O).
+///
+/// This is a pure lexical transformation — it does not resolve symlinks,
+/// verify existence, or canonicalize. It is safe to call on paths that
+/// do not yet exist (e.g. target paths for write operations).
+///
+/// Algorithm:
+/// - `RootDir` components establish the root anchor.
+/// - `CurDir` (`.`) components are dropped.
+/// - `ParentDir` (`..`) components pop the last `Normal` component if
+///   one exists; if no `Normal` component remains and the path is
+///   absolute (has a root), the `..` is silently dropped (can't go above
+///   root); if relative, excess `..` are preserved.
+/// - `Normal` components are pushed sequentially.
+///
+/// # Limitations
+///
+/// - Does not resolve symlinks. If a symlink within an allowed root
+///   points outside the root, lexical normalization cannot detect the
+///   escape — only filesystem-level canonicalization can.
+/// - Windows prefix semantics (e.g. `C:\` vs `\\?\`) are handled
+///   passably for typical paths but edge cases involving prefix + root
+///   ordering may produce unexpected results. This codebase targets
+///   Unix-like systems (macOS, Linux) where `Prefix` components do not
+///   occur.
+#[must_use]
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized: Vec<Component<'_>> = Vec::new();
+    let mut is_absolute = false;
+
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                is_absolute = true;
+                normalized.push(component);
+            }
+            Component::Prefix(prefix) => {
+                is_absolute = true;
+                normalized.push(Component::Prefix(prefix));
+            }
+            Component::CurDir => {
+                // Skip `.` components
+            }
+            Component::Normal(_) => {
+                normalized.push(component);
+            }
+            Component::ParentDir => {
+                // Try to pop the last Normal component.
+                if let Some(last) = normalized.last() {
+                    if matches!(last, Component::Normal(_)) {
+                        normalized.pop();
+                    } else {
+                        // Last component is RootDir, Prefix, or another ParentDir.
+                        // For absolute paths: can't go above root → drop `..`.
+                        // For relative paths: keep excess `..` as meaningful prefix.
+                        if !is_absolute {
+                            normalized.push(component);
+                        }
+                    }
+                } else {
+                    // Empty normalized — relative path starting with `..`.
+                    if !is_absolute {
+                        normalized.push(component);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = PathBuf::new();
+    for component in &normalized {
+        result.push(component.as_os_str());
+    }
+    result
+}
+
+/// Check whether a path is under any of the given roots, after tilde expansion
+/// and lexical normalization.
 ///
 /// The path may contain a leading `~` (user-provided input before
 /// canonicalization). In that case the `~` is expanded to the user's
 /// home directory before comparing against the (already-expanded) roots.
+///
+/// The input path is normalized (`.`, `..` resolved) *after* tilde expansion
+/// so that `../` segments introduced by tilde expansion or present in the
+/// original path cannot escape the allowed roots via lexical traversal.
 fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    let check_path = crate::config::expand_tilde(&path.to_string_lossy());
-    roots.iter().any(|root| check_path.starts_with(root))
+    let expanded = crate::config::expand_tilde(&path.to_string_lossy());
+    let normalized = normalize_path(&expanded);
+    roots.iter().any(|root| normalized.starts_with(root))
 }
 
 /// Check whether `path` is under an [`EXTRA_READ_ALLOWED`] directory.
@@ -836,6 +921,20 @@ mod tests {
         assert!(is_path_under_allowed_temp(Path::new("/var/tmp/out.txt")));
         assert!(!is_path_under_allowed_temp(Path::new("relative.txt")));
         assert!(!is_path_under_allowed_temp(Path::new("/etc/passwd")));
+        // Path traversal via `..` must be blocked.
+        assert!(
+            !is_path_under_allowed_temp(Path::new("/tmp/../etc/passwd")),
+            "Path traversal via /tmp/../etc/passwd must be blocked"
+        );
+        assert!(
+            !is_path_under_allowed_temp(Path::new("/tmp/../../../etc/passwd")),
+            "Deep path traversal must be blocked"
+        );
+        // Traversal that stays within temp after normalization should be allowed.
+        assert!(
+            is_path_under_allowed_temp(Path::new("/tmp/../tmp/file.txt")),
+            "Traversal back into temp should be allowed"
+        );
     }
 
     // ── check_path_read_allowed: spill / extra-read ────────────────────
@@ -1266,5 +1365,197 @@ mod tests {
             err.to_string().contains("Path not allowed"),
             "Error should mention security policy: {err}"
         );
+    }
+
+    // ── normalize_path tests ──────────────────────────────────────────────
+
+    #[test]
+    fn normalize_path_identity() {
+        // Paths without `.` or `..` should be unchanged.
+        assert_eq!(normalize_path(Path::new("/")), Path::new("/"));
+        assert_eq!(normalize_path(Path::new("/tmp")), Path::new("/tmp"));
+        assert_eq!(
+            normalize_path(Path::new("/tmp/file.txt")),
+            Path::new("/tmp/file.txt")
+        );
+        assert_eq!(
+            normalize_path(Path::new("relative/path")),
+            Path::new("relative/path")
+        );
+        assert_eq!(normalize_path(Path::new("single")), Path::new("single"));
+    }
+
+    #[test]
+    fn normalize_path_removes_dot_components() {
+        assert_eq!(
+            normalize_path(Path::new("/tmp/./file.txt")),
+            Path::new("/tmp/file.txt")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/./tmp/./file.txt")),
+            Path::new("/tmp/file.txt")
+        );
+        assert_eq!(
+            normalize_path(Path::new("./relative/./path")),
+            Path::new("relative/path")
+        );
+        assert_eq!(normalize_path(Path::new("/.")), Path::new("/"));
+        assert_eq!(normalize_path(Path::new(".")), Path::new(""));
+    }
+
+    #[test]
+    fn normalize_path_resolves_simple_dotdot() {
+        assert_eq!(
+            normalize_path(Path::new("/tmp/../etc/passwd")),
+            Path::new("/etc/passwd")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/tmp/foo/../../etc")),
+            Path::new("/etc")
+        );
+        assert_eq!(normalize_path(Path::new("/tmp/..")), Path::new("/"));
+    }
+
+    #[test]
+    fn normalize_path_dotdot_at_root_is_noop() {
+        // Can't go above root — excess `..` after root are dropped.
+        assert_eq!(normalize_path(Path::new("/../tmp")), Path::new("/tmp"));
+        assert_eq!(
+            normalize_path(Path::new("/tmp/../../tmp/file.txt")),
+            Path::new("/tmp/file.txt")
+        );
+        assert_eq!(normalize_path(Path::new("/../../..")), Path::new("/"));
+    }
+
+    #[test]
+    fn normalize_path_preserves_excess_dotdot_for_relative_paths() {
+        // For relative paths, excess `..` are preserved as meaningful prefix.
+        assert_eq!(
+            normalize_path(Path::new("../../foo")),
+            Path::new("../../foo")
+        );
+        assert_eq!(normalize_path(Path::new("../../..")), Path::new("../../.."));
+        assert_eq!(
+            normalize_path(Path::new("foo/../../bar")),
+            Path::new("../bar")
+        );
+        assert_eq!(normalize_path(Path::new("a/b/c/../../d")), Path::new("a/d"));
+    }
+
+    #[test]
+    fn normalize_path_complex_traversal() {
+        // /a/b/c/../d/./e/../../f → /a/b/f
+        assert_eq!(
+            normalize_path(Path::new("/a/b/c/../d/./e/../../f")),
+            Path::new("/a/b/f")
+        );
+        // a/./b/./c/../d/../../e → a/e
+        assert_eq!(
+            normalize_path(Path::new("a/./b/./c/../d/../../e")),
+            Path::new("a/e")
+        );
+        // Relative path with excess `..`: a/b/../../../../c → ../../c
+        // (pop past 'a' into excess `..` preserved for relative paths)
+        assert_eq!(
+            normalize_path(Path::new("a/b/../../../../c")),
+            Path::new("../../c")
+        );
+    }
+
+    #[test]
+    fn normalize_path_empty_and_dot_only() {
+        assert_eq!(normalize_path(Path::new("")), Path::new(""));
+        assert_eq!(normalize_path(Path::new(".")), Path::new(""));
+        assert_eq!(normalize_path(Path::new("/.")), Path::new("/"));
+    }
+
+    /// Helper: assert that a path IS allowed under temp (after normalization),
+    /// typically because it resolves back inside the temp root.
+    fn assert_allowed_under_temp(path: &str) {
+        assert!(
+            is_path_under_allowed_temp(Path::new(path)),
+            "Expected path to be allowed under temp: {path}"
+        );
+    }
+
+    /// Helper: assert that a path is NOT allowed under temp (rejected by
+    /// traversal protection).
+    fn assert_not_allowed_under_temp(path: &str) {
+        assert!(
+            !is_path_under_allowed_temp(Path::new(path)),
+            "Expected path to be rejected under temp: {path}"
+        );
+    }
+
+    #[test]
+    fn is_path_under_allowed_temp_blocks_path_traversal() {
+        // Core traversal: /tmp/../etc/passwd starts with /tmp but normalizes to /etc/passwd
+        assert_not_allowed_under_temp("/tmp/../etc/passwd");
+        assert_not_allowed_under_temp("/tmp/../../../../etc/passwd");
+
+        // Deeper traversal: /tmp/foo/../../etc/passwd → /etc/passwd
+        assert_not_allowed_under_temp("/tmp/foo/../../etc/passwd");
+        assert_not_allowed_under_temp("/tmp/./../etc/shadow");
+
+        // Traversal that stays within temp should still be allowed.
+        // /tmp/../tmp/file.txt → /tmp/file.txt
+        assert_allowed_under_temp("/tmp/../tmp/file.txt");
+        // /tmp/foo/../../tmp/file.txt → /tmp/file.txt
+        assert_allowed_under_temp("/tmp/foo/../../tmp/file.txt");
+        // /tmp/../../tmp/../tmp/bar → /tmp/bar
+        assert_allowed_under_temp("/tmp/../../tmp/../tmp/bar");
+    }
+
+    #[test]
+    fn is_path_under_allowed_temp_blocks_tilde_traversal() {
+        // Tilde expansion + traversal: ~ expands to $HOME (e.g. /Users/username).
+        // ~/../tmp/file.txt → /Users/username/../tmp/file.txt → /Users/tmp/file.txt
+        //   NOT under /tmp → rejected
+        assert_not_allowed_under_temp("~/../tmp/file.txt");
+        // ~/../../tmp/file.txt → /Users/username/../../tmp/file.txt → /tmp/file.txt
+        //   IS under /tmp → allowed
+        assert_allowed_under_temp("~/../../tmp/file.txt");
+        // ~/../etc/passwd → /Users/username/../etc/passwd → /Users/etc/passwd
+        //   NOT under /tmp → rejected
+        assert_not_allowed_under_temp("~/../etc/passwd");
+        // ~/../../etc/passwd → /Users/username/../../etc/passwd → /etc/passwd
+        //   NOT under /tmp → rejected
+        assert_not_allowed_under_temp("~/../../etc/passwd");
+    }
+
+    #[test]
+    fn is_path_under_allowed_temp_allows_clean_paths() {
+        // Ensure normal temp paths still work (no regression).
+        assert_allowed_under_temp("/tmp/out.txt");
+        assert_allowed_under_temp("/private/tmp/out.txt");
+        assert_allowed_under_temp("/var/tmp/out.txt");
+
+        // Relative paths still rejected (can't start_with absolute roots).
+        assert_not_allowed_under_temp("relative.txt");
+        assert_not_allowed_under_temp("../tmp/out.txt");
+    }
+
+    #[test]
+    fn is_path_under_allowed_temp_blocks_absolute_non_temp() {
+        // Absolute paths outside temp are still rejected.
+        assert_not_allowed_under_temp("/etc/passwd");
+        assert_not_allowed_under_temp("/usr/bin/foo");
+        assert_not_allowed_under_temp("/var/log/system.log");
+    }
+
+    #[test]
+    fn is_path_under_allowed_temp_dot_components_are_harmless() {
+        // Dot components in isolation should not affect the result.
+        assert_allowed_under_temp("/tmp/./file.txt");
+        assert_allowed_under_temp("/tmp/./././file.txt");
+        assert_allowed_under_temp("/tmp/foo/./../file.txt");
+        assert_not_allowed_under_temp("/tmp/./../etc/passwd");
+    }
+
+    #[test]
+    fn is_path_under_allowed_temp_handles_root_limit() {
+        // Paths that would normalize to just "/" or above root should be rejected.
+        assert_not_allowed_under_temp("/tmp/../../../");
+        assert_not_allowed_under_temp("/../../../../../");
     }
 }
