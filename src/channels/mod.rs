@@ -58,7 +58,6 @@ impl BroadcastPersistEntry {
                 agent_role: self.agent_role.clone(),
                 workspace: self.workspace.clone(),
                 optimistic_id: self.optimistic_id,
-                reply_markup: None,
             });
         }
 

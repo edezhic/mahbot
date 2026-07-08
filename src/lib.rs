@@ -367,11 +367,6 @@ pub enum ChatEvent {
         /// Optional ID the GUI sender generated (via `ChannelMessage::message_id`) so
         /// the Home page can replace its optimistic message with the confirmed one.
         optimistic_id: Option<String>,
-        /// Optional inline keyboard markup (Telegram `inline_keyboard` JSON).
-        /// `#[serde(default)]` handles missing fields for backward compatibility
-        /// during hot-reload or mixed-version scenarios.
-        #[serde(default)]
-        reply_markup: Option<serde_json::Value>,
     },
     /// Typing indicator event.
     Typing {

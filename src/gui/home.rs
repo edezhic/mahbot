@@ -44,58 +44,9 @@ pub struct ChatMessage {
     /// True when this is an optimistic placeholder pushed before the pipeline
     /// confirmation arrives. The `ChatEvent::Message` handler replaces these.
     pub is_optimistic: bool,
-    /// Inline keyboard buttons parsed from `reply_markup`. Empty for most messages;
-    /// non-empty only for Manager responses that carry decision options.
-    pub reply_buttons: Vec<InlineButton>,
 }
 
-/// A single inline keyboard button parsed from `reply_markup.inline_keyboard`.
-#[derive(Debug, Clone)]
-pub struct InlineButton {
-    pub text: String,
-    pub callback_data: String,
-}
-
-/// Parse `reply_markup` JSON into a flat `Vec<InlineButton>`.
-///
-/// The `reply_markup` JSON has the Telegram `inline_keyboard` structure:
-/// `{ "inline_keyboard": [ [ { "text": "...", "callback_data": "..." }, ... ], ... ] }`
-/// — an array of rows, each row being an array of buttons.  This parser
-/// flattens all rows into a single [`Vec`]; the view function renders each
-/// row as a separate [`iced::widget::Row`] so multi-row keyboards are
-/// preserved visually.
-///
-/// Returns an empty [`Vec`] on malformed JSON, missing fields, or `None` input.
-fn parse_inline_keyboard(reply_markup: Option<&serde_json::Value>) -> Vec<InlineButton> {
-    let Some(markup) = reply_markup else {
-        return Vec::new();
-    };
-    let Some(rows) = markup.get("inline_keyboard").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    let mut buttons = Vec::new();
-    for row in rows {
-        let Some(row_buttons) = row.as_array() else {
-            continue;
-        };
-        for btn in row_buttons {
-            let text = btn.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let callback_data = btn
-                .get("callback_data")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !text.is_empty() || !callback_data.is_empty() {
-                buttons.push(InlineButton {
-                    text: text.to_string(),
-                    callback_data: callback_data.to_string(),
-                });
-            }
-        }
-    }
-    buttons
-}
-
-/// Construct a non-optimistic `ChatMessage` with parsed markdown and keyboard.
+/// Construct a non-optimistic `ChatMessage` with parsed markdown.
 ///
 /// Takes `message_id` by value so the caller can clone when they need to
 /// retain ownership (e.g. for dedup tracking on the optimistic-replacement
@@ -106,7 +57,6 @@ fn build_chat_message(
     content: String,
     direction: ChatDirection,
     agent_role: Option<String>,
-    reply_markup: Option<&serde_json::Value>,
 ) -> ChatMessage {
     use iced::widget::markdown;
     let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
@@ -119,7 +69,6 @@ fn build_chat_message(
         agent_role,
         md_items,
         is_optimistic: false,
-        reply_buttons: parse_inline_keyboard(reply_markup),
     }
 }
 
@@ -202,10 +151,6 @@ pub enum HomeMessage {
     Undo,
     /// Redo a previously undone text edit in the chat input.
     Redo,
-    /// An inline keyboard button was clicked. `callback_data` is the Telegram-style
-    /// callback payload (prefixed `__opt__`), routed through `GUI_MESSAGE_TX` into
-    /// the pipeline where `handle_option_callback()` processes it.
-    InlineButtonClicked(String),
     /// Keyboard modifiers changed (shift, ctrl, alt, etc.).
     /// Used to track shift state for shift+click selection in the text editor.
     ModifiersChanged(keyboard::Modifiers),
@@ -474,7 +419,6 @@ impl HomeState {
             agent_role: entry.agent_role,
             md_items,
             is_optimistic: false,
-            reply_buttons: Vec::new(),
         });
         entry.message_id
     }
@@ -514,7 +458,6 @@ impl HomeState {
         content: &str,
         direction: ChatDirection,
         agent_role: Option<&str>,
-        reply_markup: Option<&serde_json::Value>,
     ) -> Option<Task<HomeMessage>> {
         if let Some(opt_id) = optimistic_id {
             if let Some(pos) = self
@@ -528,7 +471,6 @@ impl HomeState {
                     content.to_string(),
                     direction,
                     agent_role.map(std::string::ToString::to_string),
-                    reply_markup,
                 );
                 // Track the canonical ID for dedup — the optimistic ID was
                 // never added to seen_ids.
@@ -614,7 +556,6 @@ impl HomeState {
         content: String,
         direction: ChatDirection,
         agent_role: Option<String>,
-        reply_markup: Option<&serde_json::Value>,
     ) {
         if Some(user_name.as_str()) != self.selected_user.as_deref() {
             return;
@@ -624,12 +565,7 @@ impl HomeState {
         }
 
         self.messages.push(build_chat_message(
-            message_id,
-            user_name,
-            content,
-            direction,
-            agent_role,
-            reply_markup,
+            message_id, user_name, content, direction, agent_role,
         ));
     }
 
@@ -697,28 +633,10 @@ impl HomeState {
                         }
                     };
 
-                    // If this message carries inline keyboard buttons, stack
-                    // them below the bubble body inside the same bubble container.
-                    let bubble_content: Element<'_, HomeMessage> = if msg.reply_buttons.is_empty() {
-                        bubble_body
-                    } else {
-                        // Group buttons by their original rows.  `parse_inline_keyboard`
-                        // flattens all rows into a single Vec, so every button is a
-                        // single-element "row" — render each as a separate Row widget.
-                        let button_elems: Vec<Element<'_, HomeMessage>> = msg
-                            .reply_buttons
-                            .iter()
-                            .map(|btn| {
-                                let cb = btn.callback_data.clone();
-                                button(text(&btn.text).size(12))
-                                    .style(theme::button_text)
-                                    .on_press(HomeMessage::InlineButtonClicked(cb.clone()))
-                                    .into()
-                            })
-                            .collect();
-                        let button_row = row(button_elems).spacing(4).align_y(Alignment::Center);
-                        column![bubble_body, button_row].spacing(8).into()
-                    };
+                    // Inline keyboard buttons were previously rendered here but
+                    // the `reply_markup` field was removed from `ChatEvent::Message`
+                    // (always `None`), so this branch is always dead.
+                    let bubble_content: Element<'_, HomeMessage> = bubble_body;
 
                     let bubble = container(bubble_content)
                         .padding(10)
@@ -1025,30 +943,6 @@ impl HomeState {
                 }
                 Task::none()
             }
-            HomeMessage::InlineButtonClicked(callback_data) => {
-                // Guard: no user selected → nowhere to route the callback.
-                let Some(ref sender) = self.selected_user else {
-                    tracing::warn!("InlineButtonClicked with no user selected — ignored");
-                    return Task::none();
-                };
-                let msg = crate::ChannelMessage {
-                    user_name: sender.clone(),
-                    reply_target: sender.clone(),
-                    content: callback_data,
-                    source_channel: "gui".to_string(),
-                    workspace: self.selected_workspace.clone().unwrap_or_default(),
-                    message_id: Some(crate::generate_id()),
-                    callback_query_id: None,
-                };
-                if let Some(tx) = crate::GUI_MESSAGE_TX.get() {
-                    if let Err(e) = tx.send(msg) {
-                        tracing::error!(
-                            "InlineButtonClicked: failed to send via GUI_MESSAGE_TX: {e}"
-                        );
-                    }
-                }
-                Task::none()
-            }
             HomeMessage::ResolveUserSelected(workspace) => {
                 // Reverse-sync check completed: either the user's DB workspace
                 // matches the sidebar (no disagreement), or no DB workspace
@@ -1172,7 +1066,6 @@ impl HomeState {
                     agent_role,
                     workspace,
                     optimistic_id,
-                    reply_markup,
                 } => {
                     // 1. Replace optimistic placeholder if present.
                     if let Some(task) = self.replace_optimistic(
@@ -1182,7 +1075,6 @@ impl HomeState {
                         &content,
                         direction,
                         agent_role.as_deref(),
-                        reply_markup.as_ref(),
                     ) {
                         return task;
                     }
@@ -1197,13 +1089,7 @@ impl HomeState {
 
                     // 4. Append the message (filtered by selected user + workspace).
                     self.append_message(
-                        user_name,
-                        &workspace,
-                        message_id,
-                        content,
-                        direction,
-                        agent_role,
-                        reply_markup.as_ref(),
+                        user_name, &workspace, message_id, content, direction, agent_role,
                     );
 
                     self.maybe_snap()
@@ -1307,7 +1193,6 @@ impl HomeState {
                             agent_role: entry.agent_role,
                             md_items,
                             is_optimistic: false,
-                            reply_buttons: Vec::new(),
                         }
                     })
                     .collect();
@@ -1432,7 +1317,6 @@ impl HomeState {
                 agent_role: None,
                 md_items,
                 is_optimistic: true,
-                reply_buttons: Vec::new(),
             });
         }
 
@@ -1557,7 +1441,6 @@ mod tests {
             agent_role: agent_role.map(String::from),
             md_items: Vec::new(),
             is_optimistic,
-            reply_buttons: Vec::new(),
         }
     }
 
@@ -1583,7 +1466,6 @@ mod tests {
             "alice",
             "Hello!",
             ChatDirection::User,
-            None,
             None,
         );
 
@@ -1620,7 +1502,6 @@ mod tests {
             "Hello!",
             ChatDirection::User,
             None,
-            None,
         );
 
         assert!(task.is_none(), "expected None when no optimistic match");
@@ -1641,7 +1522,6 @@ mod tests {
             "alice",
             "Hello!",
             ChatDirection::User,
-            None,
             None,
         );
 
@@ -1781,7 +1661,6 @@ mod tests {
             "Hello!".to_string(),
             ChatDirection::User,
             None,
-            None,
         );
 
         assert_eq!(state.messages.len(), 1);
@@ -1800,7 +1679,6 @@ mod tests {
             "msg-1".to_string(),
             "Hello!".to_string(),
             ChatDirection::User,
-            None,
             None,
         );
 
@@ -1822,7 +1700,6 @@ mod tests {
             "Hello!".to_string(),
             ChatDirection::User,
             None,
-            None,
         );
 
         assert_eq!(
@@ -1843,7 +1720,6 @@ mod tests {
             "Agent answer".to_string(),
             ChatDirection::Agent,
             Some("engineer".to_string()),
-            None,
         );
 
         assert_eq!(state.messages.len(), 1);
