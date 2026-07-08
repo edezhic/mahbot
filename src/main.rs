@@ -91,7 +91,7 @@ async fn enrich_message_for_role(msg: &mut ChannelMessage, role: Role, ws: &Work
 /// Handle a dynamic option callback (prefixed `__opt__`).
 ///
 /// Parses the callback data, constructs an injected user message
-/// (e.g. "MAHBOT-123 - A"), and routes it to the Manager session,
+/// (e.g. "mahbot-123 - A"), and routes it to the Manager session,
 /// bypassing the user's currently active role.
 async fn handle_option_callback(mut msg: ChannelMessage) {
     let Some((ticket_id, label)) = decode_callback(&msg.content) else {
