@@ -764,13 +764,11 @@ fn validate_item_name(name: &str) -> Option<&'static str> {
 
 // ── Helpers — prefix-based collection re-keying ───────────────────
 
-/// Given a key starting with `old_prefix`, compute the new key with
-/// `new_prefix` substituted for the prefix portion.  The caller must
-/// already have verified that the key starts with `old_prefix` (via
-/// `starts_with` or equivalent) — this function uses `unwrap_or("")`
-/// as a safe fallback but assumes the prefix match.
-fn rekey_compute_new_key(key: &str, old_prefix: &str, new_prefix: &str) -> String {
-    let rest = key.strip_prefix(old_prefix).unwrap_or("");
+/// Join a `rest` portion (already stripped of the old prefix) with
+/// `new_prefix` to form the new key.  `rest` is the portion of the
+/// original key after the removed prefix; callers obtain it via
+/// `strip_prefix` before calling this function.
+fn rekey_compute_new_key(rest: &str, new_prefix: &str) -> String {
     if rest.is_empty() {
         new_prefix.to_string()
     } else {
@@ -788,10 +786,10 @@ fn rekey_keys(
     keys: impl IntoIterator<Item = String>,
 ) -> Vec<(String, String)> {
     keys.into_iter()
-        .filter(|k| k.starts_with(old_prefix))
-        .map(|k| {
-            let new_key = rekey_compute_new_key(&k, old_prefix, new_prefix);
-            (k, new_key)
+        .filter_map(|k| {
+            let rest = k.strip_prefix(old_prefix)?;
+            let new_key = rekey_compute_new_key(rest, new_prefix);
+            Some((k, new_key))
         })
         .collect()
 }
@@ -834,8 +832,8 @@ fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &st
 /// directory-rename migrations to keep `FsEntry` paths in sync with their
 /// new directory key.
 fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
-    if entry.full_path.starts_with(old_prefix) {
-        entry.full_path = rekey_compute_new_key(&entry.full_path, old_prefix, new_prefix);
+    if let Some(rest) = entry.full_path.strip_prefix(old_prefix) {
+        entry.full_path = rekey_compute_new_key(rest, new_prefix);
     }
 }
 
@@ -3704,7 +3702,8 @@ impl EditorState {
                     let old_prefix = format!("{old_abs}/");
                     for tab in &mut self.tabs {
                         if tab.path.starts_with(&old_prefix) {
-                            let rest = tab.path.strip_prefix(&old_prefix).unwrap_or("");
+                            let rest = tab.path.strip_prefix(&old_prefix).unwrap();
+
                             tab.path = format!("{new_abs}/{rest}");
                             tab.file_name = Path::new(&tab.path)
                                 .file_name()
