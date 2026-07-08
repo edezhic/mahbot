@@ -492,14 +492,12 @@ impl std::str::FromStr for TicketPhase {
 // Display and AsRefStr are provided by strum derives. FromStr is implemented
 // manually above to produce user-friendly error messages.
 
-/// Bundles a SQL mutation statement with its parameters and a human-readable
-/// action description. Returned by [`BoardStore::build_transition_sql`];
-/// executed via [`PreparedUpdate::execute_tx`] or
-/// [`PreparedUpdate::execute_and_cancel`].
+/// Bundles a SQL mutation statement with its parameters and ticket id.
+/// Returned by [`BoardStore::build_transition_sql`]; executed via
+/// [`PreparedUpdate::execute_tx`] or [`PreparedUpdate::execute_and_cancel`].
 struct PreparedUpdate {
     sql: String,
     params: Vec<turso::Value>,
-    action: String,
     ticket_id: String,
 }
 
@@ -510,7 +508,7 @@ impl PreparedUpdate {
     /// transaction when needed.
     async fn execute_tx(self, tx: &turso::TxGuard<'_>) -> Result<()> {
         let rows = tx.execute(&self.sql, self.params).await?;
-        BoardStore::ensure_ticket_found(rows, &self.ticket_id, &self.action)?;
+        BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         Ok(())
     }
 
@@ -530,7 +528,7 @@ impl PreparedUpdate {
     ///   (QaPassed has no running agent).
     async fn execute_and_cancel(self, conn: &turso::Connection) -> Result<()> {
         let rows = conn.execute(&self.sql, self.params).await?;
-        BoardStore::ensure_ticket_found(rows, &self.ticket_id, &self.action)?;
+        BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&self.ticket_id);
         Ok(())
     }
@@ -793,7 +791,7 @@ impl BoardStore {
                 ],
             )
             .await?;
-        Self::ensure_ticket_found(cancelled_rows, supersede_id, "cancel superseded ticket")?;
+        Self::ensure_ticket_found(cancelled_rows, supersede_id)?;
 
         Self::insert_ticket_tx(&tx, &new_id, params, Some(supersede_id)).await?;
 
@@ -1021,7 +1019,6 @@ impl BoardStore {
     /// let prep = Self::build_ticket_update_with_updated_at(
     ///     "assigned_to = ?",
     ///     vec![Value::from("user-123")],
-    ///     "set assigned_to",
     ///     "ticket-456",
     /// );
     /// // SQL:  "UPDATE tickets SET assigned_to = ?, updated_at = ? WHERE id = ?"
@@ -1030,7 +1027,6 @@ impl BoardStore {
     fn build_ticket_update_with_updated_at(
         set_clause: &str,
         set_params: Vec<turso::Value>,
-        action: String,
         ticket_id: &str,
     ) -> PreparedUpdate {
         let now = turso::now();
@@ -1041,7 +1037,6 @@ impl BoardStore {
         PreparedUpdate {
             sql,
             params,
-            action,
             ticket_id: ticket_id.to_string(),
         }
     }
@@ -1063,14 +1058,6 @@ impl BoardStore {
     ) -> PreparedUpdate {
         let now = turso::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
-        let action = match reservation {
-            Some(v) => format!(
-                "set status to {} (reservation={})",
-                target_phase.as_ref(),
-                v,
-            ),
-            None => format!("set status to {}", target_phase.as_ref()),
-        };
         let sql = "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
                     pipeline_reservation = COALESCE(?5, pipeline_reservation) \
                     WHERE id = ?3 AND (?4 IS NULL OR status = ?4)";
@@ -1084,7 +1071,6 @@ impl BoardStore {
         PreparedUpdate {
             sql: sql.to_string(),
             params,
-            action,
             ticket_id: ticket_id.to_string(),
         }
     }
@@ -1134,21 +1120,15 @@ impl BoardStore {
 
     /// Verify that a mutation query affected at least one row, returning an
     /// error with a descriptive message if the ticket was not found.
-    fn ensure_ticket_found(rows: u64, ticket_id: &str, action: &str) -> Result<()> {
-        anyhow::ensure!(rows > 0, "Ticket {ticket_id} not found — cannot {action}");
+    fn ensure_ticket_found(rows: u64, ticket_id: &str) -> Result<()> {
+        anyhow::ensure!(rows > 0, "Ticket {ticket_id} not found");
         Ok(())
     }
 
     fn build_set_assigned_to_sql(ticket_id: &str, assigned_to: Option<&str>) -> PreparedUpdate {
-        let action = if assigned_to.is_some() {
-            "set assigned_to"
-        } else {
-            "clear assigned_to"
-        };
         Self::build_ticket_update_with_updated_at(
             "assigned_to = ?",
             vec![Value::from(assigned_to)],
-            action.to_string(),
             ticket_id,
         )
     }
@@ -1286,7 +1266,7 @@ impl BoardStore {
             lines_removed >= 0,
             "lines_removed must be non-negative: {lines_removed}"
         );
-        // Build the SQL, params, and action description for setting commit info.
+        // Build the SQL and params for setting commit info.
         let prepared = Self::build_ticket_update_with_updated_at(
             "commit_hash = ?, lines_added = ?, lines_removed = ?",
             vec![
@@ -1294,7 +1274,6 @@ impl BoardStore {
                 Value::from(lines_added),
                 Value::from(lines_removed),
             ],
-            "set commit info".to_string(),
             ticket_id,
         );
         prepared.execute_tx(tx).await
@@ -1696,7 +1675,6 @@ impl BoardStore {
         let prepared = Self::build_ticket_update_with_updated_at(
             "is_archived = 1, assigned_to = NULL",
             vec![],
-            "set archived".to_string(),
             ticket_id,
         );
         prepared.execute_and_cancel(&self.conn).await
