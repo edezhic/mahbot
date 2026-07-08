@@ -16,7 +16,44 @@ use chrono::{DateTime, Utc};
 // constants and helpers used by `Session::apply_summary`.
 
 /// History-length threshold (in estimated tokens) that triggers summarization.
-pub const SUMMARIZATION_THRESHOLD: usize = 400_000;
+///
+/// This is a conservative default chosen to work across models with varying
+/// context window sizes (128K–1M).  The value of **65,000** estimated tokens
+/// translates to roughly 260K characters of message content under the rough
+/// `estimate_tokens` formula (~4 chars/token + 4 tokens per-message overhead).
+///
+/// ## Why 65K?
+///
+/// The actual token consumption at request time is higher than `estimate_tokens`
+/// suggests for several reasons:
+///
+/// * **Tokenization ratio** — Code- and JSON-heavy agent conversations (tool
+///   calls, structured outputs) can tokenize at ~2.5 chars/token rather than
+///   the estimate's 4 chars/token, making the real token count ~1.6× higher.
+/// * **Tool schemas** — The tool definitions injected by `build_chat_request`
+///   consume ~10–20K actual tokens that are **not** counted by `estimate_tokens`
+///   (they live in the `tools` field of the request, not in `messages`).
+/// * **System prompt overhead** — The role instruction + workspace context +
+///   ticket context are part of `history` and *are* counted, but for large
+///   workspaces they add non-trivial context consumption.
+/// * **Intra-turn growth** — After summarization the agent loop can add several
+///   more tool-call rounds (each adding assistant + tool-result messages) before
+///   the next threshold check at the start of the following turn.
+///
+/// ### Context window breakdown for 65K estimated tokens
+///
+/// | Model type         | Context | Effective margin |
+/// |--------------------|---------|-----------------|
+/// | 128K (e.g., GPT-4o) | ~100K actual + ~15K overhead = ~115K → **~13K headroom** |
+/// | 200K (e.g., Claude 3.5) | ~160K actual + ~15K overhead = ~175K → **~25K headroom** |
+/// | 1M (e.g., DeepSeek V4) | Triggers at ~6.5% of context — very early but cheap |
+///
+/// ## Configurability
+///
+/// Per-role overrides (via `RoleConfig.summarization_threshold`) can raise
+/// or lower this value for models with unusually large or small context
+/// windows without changing the global default.
+pub const SUMMARIZATION_THRESHOLD: usize = 65_000;
 
 /// Stored session rows and second `history` entry after compaction use this prefix so channel
 /// orchestration can re-inject the summary on later turns (baseline `system` rows stay excluded).
