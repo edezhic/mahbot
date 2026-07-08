@@ -205,27 +205,32 @@ impl StatsStore {
         workspace: &str,
         stats: &[crate::ToolCallRecord],
     ) -> Result<()> {
-        let recorded_at = turso::now();
-        for record in stats {
-            self.conn
-                .execute(
-                    "INSERT INTO tool_calls \
-                     (agent_id, role, tool_name, arguments, duration_ms, success, error_message, workspace, recorded_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    turso::params![
-                        agent_id,
-                        role,
-                        record.tool_name.clone(),
-                        record.arguments.clone(),
-                        record.duration_ms,
-                        i64::from(record.success),
-                        record.error_message.clone(),
-                        workspace.to_string(),
-                        recorded_at.clone(),
-                    ],
-                )
-                .await?;
+        if stats.is_empty() {
+            return Ok(());
         }
+
+        let recorded_at = turso::now();
+        let tx = self.conn.begin_tx().await?;
+        for record in stats {
+            tx.execute(
+                "INSERT INTO tool_calls \
+                 (agent_id, role, tool_name, arguments, duration_ms, success, error_message, workspace, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                turso::params![
+                    agent_id,
+                    role,
+                    record.tool_name.clone(),
+                    record.arguments.clone(),
+                    record.duration_ms,
+                    i64::from(record.success),
+                    record.error_message.clone(),
+                    workspace.to_string(),
+                    recorded_at.clone(),
+                ],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
