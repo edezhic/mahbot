@@ -177,6 +177,53 @@ impl Toast {
     }
 }
 
+/// Distinguishes between pause-toggle and maintenance-toggle toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToggleKind {
+    /// Pause/unpause the pipeline.
+    Pause,
+    /// Enable/disable the maintainer.
+    Maintenance,
+}
+
+impl ToggleKind {
+    fn label_on(self) -> &'static str {
+        match self {
+            Self::Pause => "Pipeline paused",
+            Self::Maintenance => "Maintainer enabled",
+        }
+    }
+
+    fn label_off(self) -> &'static str {
+        match self {
+            Self::Pause => "Pipeline resumed",
+            Self::Maintenance => "Maintainer disabled",
+        }
+    }
+
+    fn label_err(self) -> &'static str {
+        match self {
+            Self::Pause => "Failed to toggle pipeline pause",
+            Self::Maintenance => "Failed to toggle maintainer",
+        }
+    }
+
+    /// Persist the new toggle state to the workspace store.
+    async fn persist_to_store(self, name: String, state: bool) -> Result<(), String> {
+        let store = crate::workspace::store();
+        match self {
+            Self::Pause => store
+                .set_paused(&name, state)
+                .await
+                .map_err(|e| e.to_string()),
+            Self::Maintenance => store
+                .set_maintenance_enabled(&name, state)
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(private_interfaces)]
 pub enum Message {
@@ -201,15 +248,11 @@ pub enum Message {
     UpdateBot,
     /// Self-update result.
     UpdateResult(Result<String, String>),
-    /// Toggle the selected workspace's pipeline pause state.
-    TogglePause,
-    /// Result of a per-workspace pause toggle DB write. Carries (result, workspace_name, intended_state).
+    /// Toggle the selected workspace's pipeline pause or maintainer state.
+    Toggle(ToggleKind),
+    /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
     /// On success, workspace state is refreshed from DB; on error an error toast is shown.
-    TogglePauseResult(Result<(), String>, String, bool),
-    /// Toggle the selected workspace's maintainer toggle.
-    ToggleMaintenance,
-    /// Result of a per-workspace maintenance toggle DB write.
-    ToggleMaintenanceResult(Result<(), String>, String, bool),
+    ToggleResult(ToggleKind, Result<(), String>, String, bool),
     /// WAL checkpoint complete — safe to exit now.
     CheckpointAndExit,
     /// Periodic refresh of workspace paused/maintenance state from DB.
@@ -978,7 +1021,11 @@ impl Dashboard {
                 }
                 Task::none()
             }
-            Message::TogglePause if self.ready => {
+            Message::Toggle(kind) if self.ready => {
+                let current_state = match kind {
+                    ToggleKind::Pause => self.paused(),
+                    ToggleKind::Maintenance => self.maintenance_enabled(),
+                };
                 let Some(ws_name) = self.active_workspace_name() else {
                     self.toasts.push(Toast::new(
                         "No workspace selected — select a workspace first".to_string(),
@@ -986,60 +1033,36 @@ impl Dashboard {
                     ));
                     return Task::none();
                 };
-                let new_paused = !self.paused();
-                // Persist to DB; refresh state from DB on completion.
+                let new_state = !current_state;
                 let ws_name_clone = ws_name.clone();
                 Task::perform(
-                    async move {
-                        let store = crate::workspace::store();
-                        store
-                            .set_paused(&ws_name_clone, new_paused)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    move |result| Message::TogglePauseResult(result, ws_name, new_paused),
+                    kind.persist_to_store(ws_name_clone, new_state),
+                    move |result| Message::ToggleResult(kind, result, ws_name, new_state),
                 )
             }
-            Message::TogglePauseResult(result, ws_name, intended_state) if self.ready => self
-                .handle_toggle_result(
-                    result,
-                    &ws_name,
-                    intended_state,
-                    "Pipeline paused",
-                    "Pipeline resumed",
-                    "Failed to toggle pipeline pause",
-                ),
-            Message::ToggleMaintenance if self.ready => {
-                let Some(ws_name) = self.active_workspace_name() else {
-                    self.toasts.push(Toast::new(
-                        "No workspace selected — select a workspace first".to_string(),
-                        ToastKind::Warning,
-                    ));
-                    return Task::none();
-                };
-                let new_enabled = !self.maintenance_enabled();
-                // Persist to DB; refresh state from DB on completion.
-                let ws_name_clone = ws_name.clone();
-                Task::perform(
-                    async move {
-                        let store = crate::workspace::store();
-                        store
-                            .set_maintenance_enabled(&ws_name_clone, new_enabled)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    move |result| Message::ToggleMaintenanceResult(result, ws_name, new_enabled),
-                )
+            Message::ToggleResult(kind, result, ws_name, intended_state) if self.ready => {
+                match result {
+                    Ok(()) => {
+                        let label = if intended_state {
+                            kind.label_on()
+                        } else {
+                            kind.label_off()
+                        };
+                        self.toasts.push(Toast::new(
+                            format!("{label} for {ws_name}"),
+                            ToastKind::Success,
+                        ));
+                        refresh_workspace_states_task()
+                    }
+                    Err(e) => {
+                        self.toasts.push(Toast::new(
+                            format!("{}: {e}", kind.label_err()),
+                            ToastKind::Error,
+                        ));
+                        Task::none()
+                    }
+                }
             }
-            Message::ToggleMaintenanceResult(result, ws_name, intended_state) if self.ready => self
-                .handle_toggle_result(
-                    result,
-                    &ws_name,
-                    intended_state,
-                    "Maintainer enabled",
-                    "Maintainer disabled",
-                    "Failed to toggle maintainer",
-                ),
             Message::WorkspaceStatesRefreshed(paused_map, maintenance_enabled_map)
                 if self.ready =>
             {
@@ -1057,41 +1080,12 @@ impl Dashboard {
             | Message::Settings(_)
             | Message::UpdateBot
             | Message::UpdateResult(_)
-            | Message::TogglePause
-            | Message::TogglePauseResult(..)
-            | Message::ToggleMaintenance
-            | Message::ToggleMaintenanceResult(..)
+            | Message::Toggle(_)
+            | Message::ToggleResult(..)
             | Message::WorkspaceStatesRefreshed(..)
             | Message::Nop
             | Message::OpenDiffModal(_)
             | Message::Git(_) => Task::none(),
-        }
-    }
-
-    /// Shared handler for toggle-pause / toggle-maintenance results.
-    fn handle_toggle_result(
-        &mut self,
-        result: Result<(), String>,
-        ws_name: &str,
-        intended_state: bool,
-        on_label: &str,
-        off_label: &str,
-        err_prefix: &str,
-    ) -> Task<Message> {
-        match result {
-            Ok(()) => {
-                let label = if intended_state { on_label } else { off_label };
-                self.toasts.push(Toast::new(
-                    format!("{label} for {ws_name}"),
-                    ToastKind::Success,
-                ));
-                refresh_workspace_states_task()
-            }
-            Err(e) => {
-                self.toasts
-                    .push(Toast::new(format!("{err_prefix}: {e}"), ToastKind::Error));
-                Task::none()
-            }
         }
     }
 
@@ -1773,7 +1767,7 @@ impl Dashboard {
             maint_icon.into(),
             tooltip_text,
             if has_ws {
-                Some(Message::ToggleMaintenance)
+                Some(Message::Toggle(ToggleKind::Maintenance))
             } else {
                 None
             },
@@ -1808,7 +1802,7 @@ impl Dashboard {
             pause_icon.into(),
             tooltip_text,
             if has_ws {
-                Some(Message::TogglePause)
+                Some(Message::Toggle(ToggleKind::Pause))
             } else {
                 None
             },
