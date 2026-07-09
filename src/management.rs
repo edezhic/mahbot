@@ -1640,21 +1640,28 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     (comment, all_passed)
 }
 
-/// Transition from `InDiagnostics` to `DiagnosticsDone` with a comment
-/// explaining the outcome (completed, skipped, or errored).
+/// Transition from `InDiagnostics` to the given target phase with a comment
+/// explaining the outcome.
 ///
 /// This is a thin wrapper around [`comment_and_transition`] that fills in
-/// the shared parameters (`DIAGNOSTICS_ROLE`, source/target phases,
-/// notify policy, and log label), leaving only the caller-specific
-/// `comment` text and `verb` string.
+/// the shared parameters (`DIAGNOSTICS_ROLE`, `InDiagnostics` as source,
+/// `NotifyPolicy::Buffer`, and `"Diagnostics"` as log label), leaving the
+/// caller to specify the `target` phase, `comment` text, and `verb` string.
+///
+/// `pipeline_reservation` is automatically derived as `Some(true)` when
+/// targeting `ReadyForDevelopment` (bounce-back transitions get priority
+/// re-dispatch over fresh tickets) and `None` for all other targets — this
+/// is handled by [`comment_and_transition`] itself, so no special treatment
+/// is needed at this wrapper level.
 ///
 /// Returns `true` if the transition succeeded, `false` otherwise.
-///
-/// This was previously named `finish_diagnostics` — renamed to match the
-/// `transition_ticket_to_*` naming convention used by the sibling wrappers
-/// [`transition_ticket_to_done`], [`transition_ticket_to_failed`], etc.
 #[must_use]
-async fn transition_ticket_to_diagnostics_done(ticket: &Ticket, comment: &str, verb: &str) -> bool {
+async fn transition_ticket_from_diagnostics(
+    ticket: &Ticket,
+    comment: &str,
+    verb: &str,
+    target: TicketPhase,
+) -> bool {
     comment_and_transition(TransitionParams {
         ticket,
         comment: CommentParam {
@@ -1663,7 +1670,7 @@ async fn transition_ticket_to_diagnostics_done(ticket: &Ticket, comment: &str, v
         },
         extra: None,
         source: TicketPhase::InDiagnostics,
-        target: TicketPhase::DiagnosticsDone,
+        target,
         notify: NotifyPolicy::Buffer,
         log_label: "Diagnostics",
         verb,
@@ -1729,7 +1736,13 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
             if all_passed {
                 // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                let _ = transition_ticket_to_diagnostics_done(&ticket, &comment, "completed").await;
+                let _ = transition_ticket_from_diagnostics(
+                    &ticket,
+                    &comment,
+                    "completed",
+                    TicketPhase::DiagnosticsDone,
+                )
+                .await;
             } else {
                 // Path C2: Diagnostics failed — write the failure comment and
                 // bounce back to development for rework.
@@ -1743,19 +1756,12 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 // the comment nor the transition is persisted — the ticket stays
                 // in InDiagnostics and reset_inflight_tickets on the next startup
                 // handles recovery without inflating the circuit breaker counter.
-                if !comment_and_transition(TransitionParams {
-                    ticket: &ticket,
-                    comment: CommentParam {
-                        role: DIAGNOSTICS_ROLE,
-                        content: &comment,
-                    },
-                    extra: None,
-                    source: TicketPhase::InDiagnostics,
-                    target: TicketPhase::ReadyForDevelopment,
-                    notify: NotifyPolicy::Buffer,
-                    log_label: "Diagnostics",
-                    verb: "failed",
-                })
+                if !transition_ticket_from_diagnostics(
+                    &ticket,
+                    &comment,
+                    "failed",
+                    TicketPhase::ReadyForDevelopment,
+                )
                 .await
                 {
                     return;
@@ -1769,10 +1775,11 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         }
         Ok(_) => {
             // Path B: No diagnostics commands configured (or empty list) — skip.
-            let _ = transition_ticket_to_diagnostics_done(
+            let _ = transition_ticket_from_diagnostics(
                 &ticket,
                 "No diagnostics commands are configured for this workspace — diagnostics skipped.",
                 "skipped (no commands configured)",
+                TicketPhase::DiagnosticsDone,
             )
             .await;
         }
@@ -1783,10 +1790,11 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 error = %e,
                 "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
             );
-            let _ = transition_ticket_to_diagnostics_done(
+            let _ = transition_ticket_from_diagnostics(
                 &ticket,
                 &format!("Could not load diagnostics commands due to a database error: {e}"),
                 "skipped (DB error)",
+                TicketPhase::DiagnosticsDone,
             )
             .await;
         }
