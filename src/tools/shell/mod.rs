@@ -991,14 +991,11 @@ fn finish_shell_output(
     elapsed: Duration,
     full_output_for_spill: Option<&str>,
 ) -> String {
-    // Scrub credentials from the combined output. For stdout this is the only
-    // scrub pass (the agent layer's `scrub_tool_output` is a further
-    // safety net regardless of call site).  Stderr was already scrubbed at
-    // `apply_profile_pipeline` entry, so this is a secondary pass there —
-    // double-scrubbing is idempotent because the redacted marker (*[REDACTED])
-    // does not match the credential regex.
-    combined = scrub_credentials(&combined);
-
+    // Combined output is already credential-scrubbed upstream in the
+    // `apply_profile_pipeline` combine closure, so no further scrubbing
+    // is needed here.  The agent layer's `scrub_tool_output` provides a
+    // further safety net regardless of call site.  Stderr was already
+    // scrubbed at `apply_profile_pipeline` entry.
     if elapsed.as_secs_f64() >= 1.0 {
         let _ = write!(combined, "\n[took {:.1}s]", elapsed.as_secs_f64());
     }
@@ -1484,6 +1481,8 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 ///
 /// Upstream processing (`execute()`) handles ANSI stripping and 1 MB truncation.
 /// Stderr is scrubbed at entry so all paths (early-return and main) are consistent.
+/// Stdout is scrubbed inside the `combine` closure so all output paths (JSON preview,
+/// short-circuit, on_empty, main) consistently receive scrubbed output.
 ///
 /// Early-return stages (JSON preview, short-circuit, on_empty) call
 /// `combine_output` only.  The main path continues through `combine_output` →
@@ -1508,22 +1507,26 @@ fn apply_profile_pipeline(
 ) -> String {
     // Scrub stderr once at the top of the pipeline so all early-return
     // paths (JSON preview, short-circuit, on_empty) consistently receive
-    // scrubbed stderr, matching the normal path's behavior through
-    // finish_shell_output. Scrubbing before keep_stderr filtering means
+    // scrubbed stderr.  Scrubbing before keep_stderr filtering means
     // credential lines that matched keep_stderr patterns will be dropped
     // entirely because the redacted version no longer matches — this is
     // acceptable since credentials should never appear in output.
+    // Stdout is scrubbed inside the `combine` closure below so all output
+    // paths uniformly receive scrubbed output at a single convergence point.
     let stderr = scrub_credentials(stderr);
 
     // Local closure capturing the trailing combine_output arguments (stderr,
     // exit_code, keep_stderr) to reduce repetition across all call sites.
-    let combine =
-        |output: &str| combine_output(output, &stderr, exit_code, profile.keep_stderr.as_ref());
+    // Scrubbing stdout here ensures all output paths (JSON preview,
+    // short-circuit, on_empty, main) consistently receive scrubbed output.
+    let combine = |output: &str| {
+        let scrubbed = scrub_credentials(output);
+        combine_output(&scrubbed, &stderr, exit_code, profile.keep_stderr.as_ref())
+    };
 
-    // Stage 1: try JSON preview — early-return path; scrub credentials on
-    // array element serializations which include raw values.
+    // Stage 1: try JSON preview — early-return path; credentials are
+    // scrubbed by the `combine` closure automatically.
     if let Some(json_preview) = try_json_preview(output) {
-        let json_preview = scrub_credentials(&json_preview);
         return combine(&json_preview);
     }
 
@@ -3439,7 +3442,11 @@ mod tests {
         }
     }
 
-    // ── finish_shell_output credential scrubbing tests ────────────────
+    // ── finish_shell_output unit tests ────────────────────────────────
+    // Credential scrubbing is now performed upstream in the `apply_profile_pipeline`
+    // combine closure, so `finish_shell_output` receives pre-scrubbed input.
+    // These tests verify that non-scrubbing behavior (timing, spill, idempotence)
+    // remains correct.
 
     struct FinishCase {
         name: &'static str,
@@ -3455,8 +3462,9 @@ mod tests {
         for case in cases {
             // For pre-truncation spill path: repeat the string enough times to
             // exceed SPILL_THRESHOLD_BYTES, triggering the spill-to-file branch
-            // in finish_shell_output. This lets us verify that the pre-truncation spill
-            // path also scrubs credentials.
+            // in finish_shell_output. The spill content scrubbing is done
+            // separately in finish_shell_output (via line 1012) — this test
+            // verifies that the spill hint is properly appended.
             let pre_owned = case.pre.map(|s| s.repeat(SPILL_THRESHOLD_BYTES + 1));
             let result = finish_shell_output(
                 case.combined.to_string(),
@@ -3474,8 +3482,8 @@ mod tests {
     fn finish_shell_output_cases() {
         check_finish(&[
             FinishCase {
-                name: "scrubs combined inline",
-                combined: "API_KEY=abcdefghijklmnop",
+                name: "pre-scrubbed input passes through",
+                combined: "API_KEY=abcd*[REDACTED]",
                 elapsed: Duration::ZERO,
                 pre: None,
                 check: &["abcd*[REDACTED]"],
@@ -3483,8 +3491,8 @@ mod tests {
                 eq: None,
             },
             FinishCase {
-                name: "scrubs combined in pre-truncation path",
-                combined: "SECRET=wxyz1234abcdefgh",
+                name: "pre-scrubbed combined in spill path",
+                combined: "SECRET=wxyz*[REDACTED]",
                 elapsed: Duration::ZERO,
                 pre: Some("x"),
                 check: &["wxyz*[REDACTED]", "[Output saved to"],
@@ -3501,8 +3509,8 @@ mod tests {
                 eq: Some("no credentials here"),
             },
             FinishCase {
-                name: "appends elapsed timing after scrub",
-                combined: "API_KEY=abcdefghijklmnop",
+                name: "appends elapsed timing with pre-scrubbed input",
+                combined: "API_KEY=abcd*[REDACTED]",
                 elapsed: Duration::from_secs(5),
                 pre: None,
                 check: &["[took 5.0s]", "abcd*[REDACTED]"],
