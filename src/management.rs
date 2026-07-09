@@ -113,9 +113,7 @@ impl CircuitBreakerKind {
             Self::Diagnostics => comments
                 .iter()
                 .filter(|c| {
-                    c.role == DIAGNOSTICS_ROLE
-                        && c.content.starts_with(DIAGNOSTICS_COMMENT_PREFIX)
-                        && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
+                    c.role == DIAGNOSTICS_ROLE && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
                 })
                 .count(),
         }
@@ -2272,7 +2270,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///   containing [`SANITATION_FAILED_PREFIX`], but trip comments use different
 ///   text, so they are never counted.
 /// * **Diagnostics breaker** — filters comments by role `"diagnostics"` and content
-///   starting with [`DIAGNOSTICS_COMMENT_PREFIX`] and containing [`DIAGNOSTICS_FAILED_MARKER`];
+///   containing [`DIAGNOSTICS_FAILED_MARKER`];
 ///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
 ///   are never counted.
 ///
