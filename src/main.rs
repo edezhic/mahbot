@@ -280,9 +280,23 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     // Listen for SIGTERM/SIGINT and trigger shutdown — cancels the global
     // token, which the dashboard subscription picks up to close the window.
     tasks.spawn(async move {
-        if mahbot::shutdown::wait_for_shutdown_signal().await.is_ok() {
-            info!("Received OS signal, triggering shutdown");
-            mahbot::shutdown::shutdown();
+        let result = AssertUnwindSafe(mahbot::shutdown::wait_for_shutdown_signal())
+            .catch_unwind()
+            .await;
+        match result {
+            Ok(Ok(())) => {
+                info!("Received OS signal, triggering shutdown");
+                mahbot::shutdown::shutdown();
+            }
+            Ok(Err(e)) => {
+                error!("Signal handler failed to set up: {e}");
+            }
+            Err(payload) => {
+                error!(
+                    "Signal handler panicked: {}",
+                    mahbot::util::panic_message(&*payload),
+                );
+            }
         }
     });
 
