@@ -633,8 +633,8 @@ impl ConfigReload {
     /// Resolve the configured reasoning effort for a role.
     ///
     /// Priority: per-role override → role info default.
-    /// Always returns a value — the role info default is guaranteed non-empty
-    /// by a compile-time assertion (see [`role_info`]).
+    /// Always returns a value — every role has a non-empty default defined
+    /// in [`role_info`].
     #[must_use]
     pub fn role_reasoning_effort(&self, role: Role) -> String {
         if let Some(rc) = self.find_role_config(role)
