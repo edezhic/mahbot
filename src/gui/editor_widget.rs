@@ -3482,71 +3482,42 @@ fn map_key_to_action(
     #[cfg(target_os = "macos")]
     let altgr_active = false;
 
+    let mv = |dir, sel| {
+        Some(EditorAction::Move {
+            direction: dir,
+            select: sel,
+        })
+    };
+
     match key {
         key::Key::Named(named) => {
             match (named, platform_mod, shift, alt) {
                 // Platform mod + Up/Home → document start
                 (key::Named::ArrowUp | key::Named::Home, true, s, false) => {
-                    Some(EditorAction::Move {
-                        direction: CursorMove::DocStart,
-                        select: s,
-                    })
+                    mv(CursorMove::DocStart, s)
                 }
                 // Platform mod + Down/End → document end
                 (key::Named::ArrowDown | key::Named::End, true, s, false) => {
-                    Some(EditorAction::Move {
-                        direction: CursorMove::DocEnd,
-                        select: s,
-                    })
+                    mv(CursorMove::DocEnd, s)
                 }
-                (key::Named::ArrowLeft, false, s, false) => Some(EditorAction::Move {
-                    direction: CursorMove::Left,
-                    select: s,
-                }),
-                (key::Named::ArrowRight, false, s, false) => Some(EditorAction::Move {
-                    direction: CursorMove::Right,
-                    select: s,
-                }),
-                (key::Named::ArrowUp, false, s, false) => Some(EditorAction::Move {
-                    direction: CursorMove::Up,
-                    select: s,
-                }),
-                (key::Named::ArrowDown, false, s, false) => Some(EditorAction::Move {
-                    direction: CursorMove::Down,
-                    select: s,
-                }),
+                (key::Named::ArrowLeft, false, s, false) => mv(CursorMove::Left, s),
+                (key::Named::ArrowRight, false, s, false) => mv(CursorMove::Right, s),
+                (key::Named::ArrowUp, false, s, false) => mv(CursorMove::Up, s),
+                (key::Named::ArrowDown, false, s, false) => mv(CursorMove::Down, s),
                 (key::Named::Home, false, s, false) | (key::Named::ArrowLeft, true, s, false) => {
-                    Some(EditorAction::Move {
-                        direction: CursorMove::Home,
-                        select: s,
-                    })
+                    mv(CursorMove::Home, s)
                 }
                 (key::Named::End, false, s, false) | (key::Named::ArrowRight, true, s, false) => {
-                    Some(EditorAction::Move {
-                        direction: CursorMove::End,
-                        select: s,
-                    })
+                    mv(CursorMove::End, s)
                 }
 
                 // Page keys
-                (key::Named::PageUp, false, s, false) => Some(EditorAction::Move {
-                    direction: CursorMove::PageUp,
-                    select: s,
-                }),
-                (key::Named::PageDown, false, s, false) => Some(EditorAction::Move {
-                    direction: CursorMove::PageDown,
-                    select: s,
-                }),
+                (key::Named::PageUp, false, s, false) => mv(CursorMove::PageUp, s),
+                (key::Named::PageDown, false, s, false) => mv(CursorMove::PageDown, s),
 
                 // Alt+Left/Right → word boundary navigation
-                (key::Named::ArrowLeft, false, s, true) => Some(EditorAction::Move {
-                    direction: CursorMove::WordLeft,
-                    select: s,
-                }),
-                (key::Named::ArrowRight, false, s, true) => Some(EditorAction::Move {
-                    direction: CursorMove::WordRight,
-                    select: s,
-                }),
+                (key::Named::ArrowLeft, false, s, true) => mv(CursorMove::WordLeft, s),
+                (key::Named::ArrowRight, false, s, true) => mv(CursorMove::WordRight, s),
 
                 // Alt+Up/Down → move line up/down (no selection variant — always moves)
                 (key::Named::ArrowUp, false, false, true) => Some(EditorAction::MoveLineUp),
