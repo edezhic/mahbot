@@ -82,7 +82,7 @@ enum CircuitBreakerKind {
     /// General comment-count breaker: trips when the total number of comments
     /// exceeds 30.
     General,
-    /// Sanitation-failure breaker: trips when consecutive sanitation failures
+    /// Sanitation-failure breaker: trips when cumulative sanitation failures
     /// exceed 3.
     Sanitation,
     /// Diagnostics-failure breaker: trips when cumulative diagnostics failures
@@ -135,7 +135,7 @@ impl CircuitBreakerKind {
             Self::Sanitation => {
                 let threshold = self.threshold();
                 format!(
-                    "❌ Sanitation circuit breaker tripped after {count} consecutive failures. \
+                    "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
                      (threshold: {threshold})",
                 )
             }
