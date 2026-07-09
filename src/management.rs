@@ -2550,12 +2550,7 @@ mod tests {
     ///   breaker counts *all* comments (not just diagnostics), but guaranteeing
     ///   that diagnostics-only chatter cannot bypass the general breaker prevents
     ///   pathological ticket growth from repeated diagnostic cycles.
-    ///
-    /// > **Note:** This test replaces previous compile-time `const _: () = assert!(...)`
-    /// > declarations that provided slightly earlier feedback (at `cargo build` vs
-    /// > `cargo test`). The test is strictly more robust: it uses `IntoEnumIterator`
-    /// > to exhaustively check all non-General variants, so newly added variants
-    /// > are automatically covered without manual line additions.
+
     #[test]
     fn all_non_general_circuit_breakers_trip_before_general() {
         let general = CircuitBreakerKind::General.threshold();
