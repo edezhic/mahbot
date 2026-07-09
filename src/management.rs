@@ -175,28 +175,6 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// Pre-flight guard that aborts dispatch when the ticket is no longer in
-/// `expected_phase` or the circuit breaker has tripped. Combining the two
-/// checks avoids wasted DB writes and LLM costs on stale tickets.
-///
-/// For circuit-breaker side effects (draining ReadyForDevelopment siblings
-/// to Planning), see [`try_trip_circuit_breaker`].
-#[must_use]
-async fn should_abort_dispatch(
-    ticket: &Ticket,
-    expected_phase: TicketPhase,
-    kind: CircuitBreakerKind,
-    log_label: &str,
-) -> bool {
-    if !is_ticket_in_phase(&ticket.id, expected_phase).await {
-        return true;
-    }
-    if try_trip_circuit_breaker(ticket, expected_phase, kind, log_label).await {
-        return true;
-    }
-    false
-}
-
 /// Controls whether a ticket transition triggers an immediate notification
 /// to the Manager (via [`notify_ticket`]) or is buffered for batched delivery.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -553,16 +531,19 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let ticket_for_failure = Arc::clone(&ticket);
 
     tokio::spawn(async move {
-        // ── Centralized phase/breaker guard ──
+        // ── Pre-flight guard checks ──
         //
-        // Every dispatch path goes through spawn_dispatch, so a single guard
-        // here enforces completeness: adding a new PollPhase variant requires
-        // deciding its circuit_breaker_kind().
+        // Adding a new PollPhase variant requires deciding its
+        // circuit_breaker_kind() (enforced by the match in
+        // circuit_breaker_kind()).
         //
         // The post-agent is_ticket_in_phase check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         let (kind, log_label) = phase.circuit_breaker_kind();
-        if should_abort_dispatch(&ticket, expected_phase, kind, log_label).await {
+        if !is_ticket_in_phase(&ticket.id, expected_phase).await {
+            return;
+        }
+        if try_trip_circuit_breaker(&ticket, expected_phase, kind, log_label).await {
             return;
         }
 
