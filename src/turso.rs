@@ -242,31 +242,74 @@ macro_rules! global_store {
 
 /// Remove characters that cause FTS query parser errors.
 ///
-/// Replaces offending characters with spaces (rather than removing them) to
-/// preserve word boundaries — otherwise "user@example.com" would become the
-/// unsearchable blob "userexamplecom" instead of "user example com".
-/// Returns the sanitized query (might be empty).
+/// Tantivy special characters that act as syntax operators in query terms.
+/// Characters not listed here (`.`, `@`, `#`, `_`, `/`, `$`, `%`, `!`, `,`,
+/// `?`, etc.) are safe word characters in Tantivy's query grammar and are
+/// preserved to improve search precision.
+///
+/// Source: Tantivy's `query_grammar.rs`.
+static TANTIVY_SPECIAL: &[char] = &[
+    '+', // Must (term must be present)
+    '^', // Boost modifier
+    '~', // Proximity / fuzzy — conservative guard; Tantivy only treats ~ as
+    // a modifier when it appears after a term/phrase, but stripping it
+    // in other positions is harmless.
+    ':', // Field specifier
+    '{', '}', // Exclusive range
+    '"', '\'', // Phrase query delimiters
+    '`',  // ESCAPE_IN_WORD — strict parser rejects backtick at any position
+    '[', ']', // Inclusive range
+    '(', ')',  // Grouping / sub-query
+    '\\', // Escape character
+    '*',  // Wildcard / prefix operator
+    '-',  // MustNot (negation) at word start; word boundary elsewhere
+];
+
+/// Sanitize a user-supplied query string for Tantivy FTS, stripping syntax
+/// operators that would cause parse errors.
 ///
 /// Required because turso's FTS uses Tantivy, whose query parser treats
-/// certain non-alphanumeric characters (e.g. backtick, braces, parentheses,
-/// colons, brackets, and other punctuation) as syntax operators, causing
-/// parse errors on user-generated queries. This is a Tantivy design decision,
-/// not a turso version bug — upgrading turso will not eliminate this requirement.
-/// Since the ngram tokenizer indexes character substrings, removing syntax
-/// operators from queries does not reduce search quality.
+/// certain characters as syntax operators, causing parse errors on
+/// user-generated queries. This is a Tantivy design decision, not a turso
+/// version bug — upgrading turso will not eliminate this requirement.
+///
+/// The `ngram` tokenizer indexes character substrings, so removing syntax
+/// operators from queries does not reduce search quality. Non-special
+/// punctuation is preserved to improve search precision — e.g. email
+/// addresses like `user@example.com`, identifiers like `my_function`, or
+/// paths like `feature/x` are kept intact.
+///
+/// # Edge cases
+///
+/// * Queries starting with `/` have the leading slash stripped to prevent
+///   Tantivy's lenient parser from interpreting them as regex queries.
+/// * Queries consisting entirely of Tantivy special characters (e.g. `+-~`)
+///   produce an empty string, allowing callers to short-circuit.
 #[must_use]
 pub fn sanitize_fts_query(query: &str) -> String {
-    query
+    // First pass: replace Tantivy syntax operators with spaces.
+    // Non-special punctuation is preserved (improves search precision
+    // without causing parse errors).
+    let sanitized: String = query
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c.is_whitespace() {
-                c
-            } else {
+            if c.is_whitespace() || TANTIVY_SPECIAL.contains(&c) {
                 ' '
+            } else {
+                c
             }
         })
-        .collect::<String>()
+        .collect();
+
+    // Second pass: split into words, strip leading `/` (Tantivy's lenient
+    // parser treats `/`-prefixed terms as regex queries), then rejoin with
+    // single spaces. split_whitespace also collapses runs of spaces and
+    // produces an empty string when the query consisted entirely of Tantivy
+    // special characters — allowing callers to short-circuit on empty input.
+    sanitized
         .split_whitespace()
+        .map(|word| word.trim_start_matches('/'))
+        .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -847,17 +890,42 @@ mod tests {
     #[test]
     fn test_sanitize_fts_query() {
         let cases = [
+            // Basic cases
             ("hello world", "hello world"),
-            ("`Hello ${name}`", "Hello name"),
+            // All Tantivy special chars → empty string (triggers caller short-circuit)
+            ("+-~", ""),
+            // Curly braces and backticks stripped, $ preserved
+            ("`Hello ${name}`", "Hello $ name"),
+            // Email preserved
             (
                 "contact user@example.com now",
-                "contact user example com now",
+                "contact user@example.com now",
             ),
+            // Punctuation preserved except apostrophe (phrase delimiter)
             (
                 "hello, world! How's it going?",
-                "hello world How s it going",
+                "hello, world! How s it going?",
             ),
-            ("!@#$%", ""),
+            // Non-special punctuation all preserved
+            ("!@#$%", "!@#$%"),
+            // Identifiers with underscores preserved
+            ("my_function", "my_function"),
+            // Tags preserved
+            ("#381", "#381"),
+            // Version strings preserved
+            ("v1.2.3", "v1.2.3"),
+            // Paths preserved (no leading slash)
+            ("feature/x", "feature/x"),
+            // Leading slash stripped to prevent Tantivy regex parsing
+            ("/something", "something"),
+            // Leading - (MustNot) stripped via special-char → space → split
+            ("-hello", "hello"),
+            // Hyphen in middle becomes space (word boundary)
+            ("hello-world", "hello world"),
+            // Leading + (Must) stripped
+            ("+term", "term"),
+            // Apostrophe in word stripped (prevents phrase parsing)
+            ("don't", "don t"),
         ];
         for (input, expected) in cases {
             assert_eq!(sanitize_fts_query(input), expected, "input: {input:?}");

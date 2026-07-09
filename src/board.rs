@@ -4082,7 +4082,7 @@ with a comment explaining why no agent is mid-execution in that state.\
     }
 
     #[tokio::test]
-    async fn test_search_archived_by_fts_sanitize_mangles_query() {
+    async fn test_search_archived_by_fts_punctuation_only() {
         let (store, _tmp) = open_test_store().await;
         let results = store
             .search_archived_by_fts("!@#$%", 10)
@@ -4090,7 +4090,7 @@ with a comment explaining why no agent is mid-execution in that state.\
             .expect("FTS search");
         assert!(
             results.is_empty(),
-            "query with only special chars becomes empty after sanitize"
+            "query with only punctuation should produce no matches"
         );
     }
 
