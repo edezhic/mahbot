@@ -941,45 +941,36 @@ mod tests {
     }
 
     #[test]
-    fn is_start_command_matches_slash_start() {
-        assert!(is_start_command("/start"));
-    }
-
-    #[test]
-    fn is_start_command_matches_case_insensitive() {
-        assert!(is_start_command("/STart"));
-        assert!(is_start_command("/Start"));
-        assert!(is_start_command("/START"));
-    }
-
-    #[test]
-    fn is_start_command_matches_with_args() {
-        assert!(is_start_command("/start foo"));
-        assert!(is_start_command("/start   "));
-    }
-
-    #[test]
-    fn is_start_command_matches_with_whitespace() {
-        assert!(is_start_command("  /start"));
-        assert!(is_start_command("/start  "));
-        assert!(is_start_command("  /start  "));
-        assert!(is_start_command("  /start foo  "));
-    }
-
-    #[test]
-    fn is_start_command_rejects_non_start() {
-        assert!(!is_start_command("/"));
-        assert!(!is_start_command("/s"));
-        assert!(!is_start_command("/stard"));
-        assert!(!is_start_command("/started"));
-        assert!(!is_start_command("/ reset"));
-    }
-
-    #[test]
-    fn is_start_command_rejects_missing_slash() {
-        assert!(!is_start_command("start"));
-        assert!(!is_start_command(""));
-        assert!(!is_start_command("  "));
-        assert!(!is_start_command("not a command"));
+    fn is_start_command_coverage() {
+        let cases = [
+            // Positive: exact match
+            ("/start", true),
+            // Positive: case-insensitive
+            ("/STart", true),
+            ("/Start", true),
+            ("/START", true),
+            // Positive: with args/trailing space
+            ("/start foo", true),
+            ("/start   ", true),
+            // Positive: leading/trailing whitespace
+            ("  /start", true),
+            ("/start  ", true),
+            ("  /start  ", true),
+            ("  /start foo  ", true),
+            // Negative: partial /-prefix matches
+            ("/", false),
+            ("/s", false),
+            ("/stard", false),
+            ("/started", false),
+            ("/ reset", false),
+            // Negative: missing slash or empty
+            ("start", false),
+            ("", false),
+            ("  ", false),
+            ("not a command", false),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(is_start_command(input), expected, "input: {input:?}");
+        }
     }
 }
