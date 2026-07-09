@@ -70,7 +70,7 @@ use std::path::PathBuf;
 
 // ── JSON helpers ─────────────────────────────────────────────────────────
 
-pub(crate) use crate::util::json::{
+use crate::util::json::{
     get_bool, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str, get_str_array,
     get_usize,
 };
