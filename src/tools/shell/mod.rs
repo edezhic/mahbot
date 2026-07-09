@@ -327,6 +327,104 @@ impl ShellTool {
     pub const fn new(mode: ShellMode) -> Self {
         Self { mode }
     }
+
+    /// Execute a command and return `(formatted_output, exit_code)`.
+    ///
+    /// `exit_code` is `Some(0)` for success, `Some(n)` for non-zero exit, or
+    /// `None` when the process was terminated by a signal.
+    ///
+    /// The `formatted_output` includes the `[exit status: N]` annotation for
+    /// non-zero exits and signal termination (same format as [`execute()`]).
+    /// Credentials are already scrubbed from the returned output.
+    pub(crate) async fn execute_with_status(
+        &self,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<(String, Option<i32>)> {
+        let command_str = super::get_str(&args, "command")?;
+
+        // Read-only mode: validate command before execution
+        if self.mode == ShellMode::ReadOnly
+            && let Err(rejection) = check_command(command_str)
+        {
+            anyhow::bail!("{rejection}");
+        }
+
+        // Execute with timeout to prevent hanging commands.
+        // Use the ORIGINAL command string (not the stripped version) so that
+        // `cd workspace/subdir && cargo build` actually navigates the shell.
+        let mut cmd = build_shell_command(command_str, ws.as_path());
+
+        let result =
+            run_command_with_timeout(&mut cmd, Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS))
+                .await;
+
+        match result {
+            ShellRunResult::Completed {
+                stdout,
+                stderr,
+                status,
+                elapsed,
+            } => {
+                // Save raw output BEFORE any truncation so agents can access
+                // the full output even when filtered/truncated to fit the context.
+                let raw_hint = save_raw_output_if_large(&stdout, &stderr, command_str);
+
+                let stdout = clean_truncate(&stdout, "output");
+                let stderr = clean_truncate(&stderr, "stderr");
+
+                let exit_code = status.code(); // Option<i32> — None means signal
+                let exit_note = match exit_code {
+                    Some(c) => format!("[exit status: {c}]"),
+                    None => "[exit status: terminated by signal]".to_string(),
+                };
+
+                // All completed commands return output with exit info,
+                // regardless of exit code. Only actual execution failures
+                // (timeout, process launch failure) are tool errors.
+                let processed = process_shell_output(
+                    command_str,
+                    &stdout,
+                    &stderr,
+                    exit_code.unwrap_or(-1),
+                    elapsed,
+                );
+                let mut combined = processed;
+                // Include raw output hint if truncation or spill occurred.
+                if let Some(hint) = &raw_hint {
+                    combined.push('\n');
+                    combined.push_str(hint);
+                }
+                if exit_code != Some(0) {
+                    combined.push_str("\n\n");
+                    combined.push_str(&exit_note);
+                }
+                Ok((combined, exit_code))
+            }
+            ShellRunResult::TimedOut {
+                stdout,
+                stderr,
+                pid,
+                elapsed,
+            } => {
+                tracing::warn!(
+                    command = command_str,
+                    elapsed_secs = elapsed.as_secs_f64(),
+                    ?pid,
+                    stdout_bytes = stdout.len(),
+                    stderr_bytes = stderr.len(),
+                    "Shell command timed out"
+                );
+                let msg = format_timeout_error(command_str, elapsed, pid, &stdout, &stderr);
+                anyhow::bail!("{msg}");
+            }
+            ShellRunResult::SpawnFailed(e) => anyhow::bail!(
+                "Failed to start shell command.\n\
+                 command: {command_str}\n\
+                 reason: {e}"
+            ),
+        }
+    }
 }
 
 /// Extra `PATH` entries prepended for shell subprocesses so developer tools
@@ -537,83 +635,9 @@ Use this tool only for inspection: reading files, listing directories, running c
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        let command_str = super::get_str(&args, "command")?;
-
-        // Read-only mode: validate command before execution
-        if self.mode == ShellMode::ReadOnly
-            && let Err(rejection) = check_command(command_str)
-        {
-            anyhow::bail!("{rejection}");
-        }
-
-        // Execute with timeout to prevent hanging commands.
-        // Use the ORIGINAL command string (not the stripped version) so that
-        // `cd workspace/subdir && cargo build` actually navigates the shell.
-        let mut cmd = build_shell_command(command_str, ws.as_path());
-
-        let result =
-            run_command_with_timeout(&mut cmd, Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS))
-                .await;
-
-        match result {
-            ShellRunResult::Completed {
-                stdout,
-                stderr,
-                status,
-                elapsed,
-            } => {
-                // Save raw output BEFORE any truncation so agents can access
-                // the full output even when filtered/truncated to fit the context.
-                let raw_hint = save_raw_output_if_large(&stdout, &stderr, command_str);
-
-                let stdout = clean_truncate(&stdout, "output");
-                let stderr = clean_truncate(&stderr, "stderr");
-
-                let (exit_code, exit_note) = match status.code() {
-                    Some(c) => (c, format!("[exit status: {c}]")),
-                    None => (-1, "[exit status: terminated by signal]".to_string()),
-                };
-
-                // All completed commands return output with exit info,
-                // regardless of exit code. Only actual execution failures
-                // (timeout, process launch failure) are tool errors.
-                let processed =
-                    process_shell_output(command_str, &stdout, &stderr, exit_code, elapsed);
-                let mut combined = processed;
-                // Include raw output hint if truncation or spill occurred.
-                if let Some(hint) = &raw_hint {
-                    combined.push('\n');
-                    combined.push_str(hint);
-                }
-                if exit_code != 0 {
-                    combined.push_str("\n\n");
-                    combined.push_str(&exit_note);
-                }
-                Ok(combined)
-            }
-            ShellRunResult::TimedOut {
-                stdout,
-                stderr,
-                pid,
-                elapsed,
-            } => {
-                tracing::warn!(
-                    command = command_str,
-                    elapsed_secs = elapsed.as_secs_f64(),
-                    ?pid,
-                    stdout_bytes = stdout.len(),
-                    stderr_bytes = stderr.len(),
-                    "Shell command timed out"
-                );
-                let msg = format_timeout_error(command_str, elapsed, pid, &stdout, &stderr);
-                anyhow::bail!("{msg}");
-            }
-            ShellRunResult::SpawnFailed(e) => anyhow::bail!(
-                "Failed to start shell command.\n\
-                 command: {command_str}\n\
-                 reason: {e}"
-            ),
-        }
+        self.execute_with_status(ws, args)
+            .await
+            .map(|(output, _)| output)
     }
 
     fn debug_output(

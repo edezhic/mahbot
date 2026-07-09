@@ -41,8 +41,8 @@ use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::turso::TxGuard;
 use crate::util::panic_message;
-use crate::util::scrub_credentials;
-use crate::{DiagnosticsCommands, Role, Tool, Workspace};
+
+use crate::{DiagnosticsCommands, Role, Workspace};
 
 /// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
 const PARALLEL_AGENT_COUNT: usize = 3;
@@ -1603,22 +1603,20 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
         let _ = write!(comment, "\n\n{label} ({cmd}):\n");
 
         match ShellTool::new(ShellMode::Full)
-            .execute(ws, serde_json::json!({"command": cmd}))
+            .execute_with_status(ws, serde_json::json!({"command": cmd}))
             .await
         {
-            Ok(output) => {
-                // ShellTool returns Ok(String) for non-zero exits (annotation
-                // appended). Exit 0 produces no annotation, so any occurrence
-                // of "[exit status: " means non-zero exit or signal termination.
-                let failed = output.contains("[exit status: ");
+            Ok((output, exit_code)) => {
                 let display = if output.is_empty() {
                     "(no output)".to_string()
                 } else {
                     output
                 };
-                comment.push_str(&scrub_credentials(&display));
+                // Output is already credential-scrubbed by ShellTool's
+                // finish_shell_output, so no further scrubbing needed.
+                comment.push_str(&display);
 
-                if failed {
+                if exit_code != Some(0) {
                     all_passed = false;
                     failed_at = label;
                     break;
