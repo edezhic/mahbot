@@ -111,6 +111,31 @@ pub(crate) fn store_names() -> Vec<&'static str> {
     iter_checkpoint_stores().map(|(name, _)| name).collect()
 }
 
+/// Initialize all database stores concurrently.
+///
+/// This is the canonical initialization path for the 7 data stores (board,
+/// session, workspace, users, stats, chat_history, config).  The `logs` store
+/// is **not** included here because it must be initialized earlier via
+/// [`crate::logs::init_tracing`], which requires the log store before any
+/// other subsystem is ready.
+///
+/// > **Keep this list in sync with [`iter_checkpoint_stores`]** — every store
+/// > listed here must also appear in that iterator.  The converse is not strictly
+/// > required because `logs` (and any future store initialized outside this path)
+/// > lives only in the checkpoint iterator.
+pub async fn init_all_stores() -> anyhow::Result<()> {
+    tokio::try_join!(
+        crate::session::init_global(),
+        crate::workspace::init_global(),
+        crate::users::init_global(),
+        crate::board::init_global(),
+        crate::stats::init_global(),
+        crate::chat_history::init_global(),
+        crate::config_db::init_global(),
+    )?;
+    Ok(())
+}
+
 /// Create [`turso::core::DatabaseOpts`] with all experimental features enabled.
 ///
 /// This is the **single source of truth** for which experimental features are active.

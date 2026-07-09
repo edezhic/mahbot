@@ -150,20 +150,7 @@ async fn bootstrap_mahbot() -> Result<()> {
     mahbot::ticket_buffer::init_global(); // sync — no I/O
     mahbot::manager_queue::init_global()?;
 
-    tokio::try_join!(
-        // NOTE: The canonical list of all store names lives in
-        // `turso::iter_checkpoint_stores` / `turso::store_names()`.  This block intentionally
-        // excludes `logs` (initialized above via `init_tracing`) and
-        // uses `try_join!` for concurrent init.  Keep this list in
-        // sync with the iterator in `turso.rs` when adding or removing stores.
-        mahbot::session::init_global(),
-        mahbot::workspace::init_global(),
-        mahbot::users::init_global(),
-        mahbot::board::init_global(),
-        mahbot::stats::init_global(),
-        mahbot::chat_history::init_global(),
-        mahbot::config_db::init_global(),
-    )?;
+    mahbot::turso::init_all_stores().await?;
 
     // Config DB must be loaded before providers, so that API keys
     // and model settings take effect.

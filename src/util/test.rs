@@ -380,28 +380,14 @@ impl<'a> TicketBuilder<'a> {
 }
 
 /// Initialize all global test stores (session, board, workspace, users,
-/// config, stats, chat_history) with a shared temp directory.
-///
-/// # Stores initialized
-///
-/// Note: The canonical list of all store names lives in
-/// `turso::iter_checkpoint_stores` / `turso::store_names()`.  This function intentionally excludes
-/// `logs` (not needed for most tests) and initializes stores sequentially
-/// (not concurrently like the production bootstrap).  Keep this list in sync
-/// with the iterator in `turso.rs` when adding or removing stores.
+/// config, stats, chat_history) with a shared temp directory by delegating
+/// to [`turso::init_all_stores`].
 ///
 /// Also initializes the search engine registry (required by workspace store)
 /// and sets the CONFIG storage root.
 ///
 /// Idempotent — subsequent calls are no-ops.
 pub async fn init_test_stores() {
-    use crate::chat_history::ChatHistoryStore;
-    use crate::config_db::ConfigStore;
-    use crate::session::SessionStore;
-    use crate::stats::StatsStore;
-    use crate::users::UserStore;
-    use crate::workspace::WorkspaceStore;
-
     static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     INIT.get_or_init(|| async {
         // Set CONFIG storage root (no-op if already set by another test)
@@ -413,28 +399,9 @@ pub async fn init_test_stores() {
         // ticket_buffer is sync — lightweight allocation, no DB I/O.
         crate::ticket_buffer::init_global();
 
-        macro_rules! init_test_store {
-            ($cell:expr, $store:ty) => {
-                $cell
-                    .set(<$store>::open(test_root()).await.expect(concat!(
-                        "failed to create ",
-                        stringify!($store),
-                        " for tests"
-                    )))
-                    .expect(concat!(
-                        stringify!($cell),
-                        " already initialized by another path"
-                    ));
-            };
-        }
-
-        init_test_store!(crate::session::SESSIONS, SessionStore);
-        init_test_store!(crate::board::BOARD, BoardStore);
-        init_test_store!(crate::workspace::WORKSPACES, WorkspaceStore);
-        init_test_store!(crate::users::USER_STORE, UserStore);
-        init_test_store!(crate::config_db::CONFIG_STORE, ConfigStore);
-        init_test_store!(crate::stats::STATS_STORE, StatsStore);
-        init_test_store!(crate::chat_history::CHAT_HISTORY, ChatHistoryStore);
+        crate::turso::init_all_stores()
+            .await
+            .expect("failed to initialize test stores (see chained error for per-store details)");
     })
     .await;
 }
