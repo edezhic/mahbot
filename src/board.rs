@@ -1426,16 +1426,16 @@ impl BoardStore {
         exclude_ticket_id: Option<&str>,
     ) -> Result<bool> {
         let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
-        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR status = '{rfd}') \
+             (status IN ({blocker_sql}) OR status = ?3) \
              AND workspace_name = ?1 AND is_archived = 0 \
              AND (?2 IS NULL OR id != ?2) LIMIT 1",
         );
+        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
         let rows = self
             .conn
-            .query(&sql, turso::params![workspace_name, exclude_ticket_id])
+            .query(&sql, turso::params![workspace_name, exclude_ticket_id, rfd])
             .await?;
         Ok(!rows.is_empty())
     }
@@ -1465,15 +1465,15 @@ impl BoardStore {
         workspace_name: &str,
     ) -> Result<bool> {
         let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
-        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR (status = '{rfd}' AND pipeline_reservation = 1)) \
+             (status IN ({blocker_sql}) OR (status = ?2 AND pipeline_reservation = 1)) \
              AND workspace_name = ?1 AND is_archived = 0 LIMIT 1",
         );
+        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
         let rows = self
             .conn
-            .query(&sql, turso::params![workspace_name])
+            .query(&sql, turso::params![workspace_name, rfd])
             .await?;
         Ok(!rows.is_empty())
     }
