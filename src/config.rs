@@ -692,8 +692,8 @@ pub async fn load_or_init() -> Result<()> {
 }
 
 /// Reload config from the `config.db` database, atomically swapping the
-/// runtime config. Called both at startup (after config_db init) and after
-/// a GUI-driven save.
+/// runtime config. Called at startup (after config_db init) to overlay
+/// persisted settings on top of hardcoded defaults.
 pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
     let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
