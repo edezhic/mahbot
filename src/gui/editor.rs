@@ -606,8 +606,6 @@ pub enum EditorMessage {
     },
     /// A result was clicked or selected in the global search list.
     GlobalSearchSelect(usize),
-    /// Close the global search panel.
-    GlobalSearchClose,
     // ── Context menu actions ────────────────────────────────────────
     /// Context menu: delete a file (shows confirmation dialog).
     DeleteFileRequested(String),
@@ -2352,8 +2350,6 @@ impl EditorState {
 
             EditorMessage::GlobalSearchSelect(idx) => self.global_search_select(idx),
 
-            EditorMessage::GlobalSearchClose => self.global_search_close(),
-
             // ── Context menu actions ─────────────────────────────────
             EditorMessage::DeleteFileRequested(path) => self.delete_file_requested(path),
 
@@ -3392,12 +3388,6 @@ impl EditorState {
         let file_gen = self.generation.wrapping_add(1);
         self.pending_goto = Some((abs_path.clone(), line_number, file_gen));
         self.open_file_in_editor(&abs_path)
-    }
-
-    /// Handle global search close — closes the search panel.
-    fn global_search_close(&mut self) -> Task<EditorMessage> {
-        self.active_modal = None;
-        Task::none()
     }
 
     /// Handle delete-file-requested — shows the delete confirmation dialog.
@@ -4641,7 +4631,7 @@ impl EditorState {
             }
             Some(ModalKind::GlobalSearch(gs)) => editor_dialog::overlay_dialog(
                 Self::build_global_search_overlay(gs),
-                EditorMessage::GlobalSearchClose,
+                EditorMessage::Escape,
                 0.3,
             ),
             Some(ModalKind::QuickOpen(qo)) => editor_dialog::overlay_dialog(
@@ -5323,7 +5313,7 @@ impl EditorState {
             text_input("Search across workspace…", &gs.query)
                 .on_input(EditorMessage::GlobalSearchInput)
                 .on_submit(if gs.results.is_empty() {
-                    EditorMessage::GlobalSearchClose
+                    EditorMessage::Escape
                 } else {
                     EditorMessage::GlobalSearchSelect(gs.selected_index)
                 })
@@ -5496,7 +5486,7 @@ impl EditorState {
             .padding(12)
             .style(theme::dialog_container_style);
 
-        editor_dialog::overlay_dialog(dialog, EditorMessage::GlobalSearchClose, 0.4)
+        editor_dialog::overlay_dialog(dialog, EditorMessage::Escape, 0.4)
     }
 
     fn build_editor_widget(&self) -> Element<'_, EditorMessage> {
