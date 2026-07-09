@@ -83,7 +83,7 @@ pub(crate) struct SessionsState {
 }
 
 impl SessionsState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             sessions: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
@@ -122,7 +122,7 @@ impl SessionsState {
     /// Notify the sessions state whether the Sessions page is currently visible.
     /// This controls the auto-refresh subscription — when the page is hidden,
     /// polling stops.
-    pub fn set_page_active(&mut self, active: bool) {
+    pub(crate) fn set_page_active(&mut self, active: bool) {
         self.page_active = active;
     }
 

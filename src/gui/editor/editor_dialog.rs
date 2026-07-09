@@ -21,7 +21,7 @@ use super::{
 
 /// Wrap any dialog element in a centered overlay with a semi-transparent
 /// backdrop that closes the dialog on click.
-pub fn overlay_dialog<'a>(
+pub(super) fn overlay_dialog<'a>(
     dialog: impl Into<Element<'a, EditorMessage>>,
     on_backdrop: EditorMessage,
     opacity: f32,
@@ -51,7 +51,7 @@ pub fn overlay_dialog<'a>(
 /// Wrap dialog content in the shared dialog container and overlay it.
 /// All standard dialogs use this to ensure consistent container dimensions,
 /// padding, style, and backdrop behavior.
-pub fn wrap_dialog<'a>(
+pub(super) fn wrap_dialog<'a>(
     content: impl Into<Element<'a, EditorMessage>>,
     width: u32,
     cancel_msg: EditorMessage,
@@ -69,7 +69,7 @@ pub fn wrap_dialog<'a>(
 
 /// Build the quick-open overlay: a centered dialog with search input
 /// and filtered results list.
-pub fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, EditorMessage> {
+pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, EditorMessage> {
     let search_input: iced::widget::TextInput<'_, EditorMessage> =
         text_input("Search files…", &qo.filter)
             .on_input(EditorMessage::QuickOpenInput)
@@ -175,7 +175,7 @@ pub fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, EditorM
 /// Callers supply the button row as a pre-assembled [`Row`] (with its own
 /// `.align_y` / `.width` styling) so each site can freely choose button
 /// composition while reusing the structural boilerplate.
-pub fn confirmation_dialog<'a>(
+fn confirmation_dialog<'a>(
     title: impl Into<String>,
     description: impl Into<String>,
     button_row: impl Into<Element<'a, EditorMessage>>,
@@ -210,7 +210,7 @@ pub fn confirmation_dialog<'a>(
 }
 
 /// Create a styled dialog button with consistent size (13) and center-aligned text.
-pub fn dialog_button(
+fn dialog_button(
     label: &str,
     color: Color,
     style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
@@ -224,7 +224,7 @@ pub fn dialog_button(
 
 /// Create a row of dialog buttons with 8px spacing between them,
 /// right-aligned within the row and filling the available width.
-pub fn dialog_button_row<'a>(
+fn dialog_button_row<'a>(
     buttons: impl IntoIterator<Item = Element<'a, EditorMessage>>,
 ) -> Element<'a, EditorMessage> {
     let mut row = Row::new().align_y(Alignment::End).width(Length::Fill);
@@ -238,7 +238,7 @@ pub fn dialog_button_row<'a>(
 }
 
 /// Build the close-save-discard dialog overlay.
-pub fn build_close_dialog(
+pub(super) fn build_close_dialog(
     on_save: EditorMessage,
     on_discard: EditorMessage,
     on_cancel: EditorMessage,
@@ -271,7 +271,7 @@ pub fn build_close_dialog(
 }
 
 /// Build the delete confirmation dialog overlay.
-pub fn build_delete_confirm_dialog(
+pub(super) fn build_delete_confirm_dialog(
     target: &DeleteConfirmTarget,
 ) -> Element<'static, EditorMessage> {
     let description = if target.is_dir {
@@ -324,7 +324,7 @@ pub fn build_delete_confirm_dialog(
 }
 
 /// Build the new file/directory name input overlay.
-pub fn build_new_item_input(target: &NewItemTarget) -> Element<'_, EditorMessage> {
+pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, EditorMessage> {
     let label = if target.is_dir {
         format!("New directory in \"{}\"", target.parent_dir)
     } else {

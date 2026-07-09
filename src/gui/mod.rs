@@ -325,7 +325,7 @@ impl KeyboardMods {
     ///
     /// On other platforms: Cmd or Ctrl.
     #[must_use]
-    pub fn is_nav_platform_mod(self) -> bool {
+    pub(crate) fn is_nav_platform_mod(self) -> bool {
         #[cfg(target_os = "macos")]
         {
             self.is_cmd
@@ -344,7 +344,7 @@ impl KeyboardMods {
     /// other platforms, AltGr (Ctrl+Alt) is excluded because it produces
     /// text characters for international keyboard layouts.
     #[must_use]
-    pub fn is_text_platform_mod(self) -> bool {
+    pub(crate) fn is_text_platform_mod(self) -> bool {
         #[cfg(target_os = "macos")]
         {
             self.is_cmd && !self.ctrl_held
@@ -364,7 +364,7 @@ impl KeyboardMods {
     /// On other platforms: Cmd or Ctrl is pressed, but not AltGr
     /// (Ctrl+Alt, which produces international text characters).
     #[must_use]
-    pub fn is_shortcut_platform_mod(self) -> bool {
+    pub(crate) fn is_shortcut_platform_mod(self) -> bool {
         self.is_platform_mod && !self.is_emacs_ctrl && !self.altgr_active
     }
 }
