@@ -527,9 +527,17 @@ pub enum EditorMessage {
     /// Fast tick (100 ms) — keeps the editor cursor blinking.
     BlinkTick,
     /// Git status has been loaded for the current workspace's file tree.
-    GitStatusLoaded(Result<HashMap<String, GitFileStatus>, String>),
+    /// `r#gen` is captured at spawn time for stale-result prevention.
+    GitStatusLoaded {
+        r#gen: u64,
+        result: Result<HashMap<String, GitFileStatus>, String>,
+    },
     /// Git ignore status has been loaded for the current workspace's file tree.
-    GitIgnoredLoaded(Result<HashSet<String>, String>),
+    /// `r#gen` is captured at spawn time for stale-result prevention.
+    GitIgnoredLoaded {
+        r#gen: u64,
+        result: Result<HashSet<String>, String>,
+    },
     /// Toast message to show.
     Toast(super::ToastMessage),
     /// Undo the last edit.
@@ -1529,6 +1537,12 @@ pub struct EditorState {
     /// Cached list of all workspace files for quick-open filtering.
     /// Populated on each quick-open toggle from currently expanded dirs.
     all_workspace_files: Vec<String>,
+    /// Generation counter for git status and gitignore stale-result prevention.
+    /// Bumped on workspace switch to invalidate in-flight GitStatusLoaded
+    /// and GitIgnoredLoaded results. Separate from `generation` to avoid
+    /// false-positive discards when `refresh_file_tree` bumps `generation`
+    /// for directory refresh tasks.
+    git_status_gen: u64,
     /// Generation counter for global search stale-result prevention.
     global_search_gen: u64,
     /// When set, the next file load for this path+generation should jump to this line.
@@ -1597,6 +1611,7 @@ impl EditorState {
             active_modal: None,
             all_workspace_files: Vec::new(),
             global_search_gen: 0,
+            git_status_gen: 0,
             pending_goto: None,
         }
     }
@@ -2217,7 +2232,8 @@ impl EditorState {
 
     /// Clear all workspace-scoped editor state when switching workspaces.
     /// Does not touch `selected_workspace_name`, `selected_workspace_path`,
-    /// `generation`, or `saved_tabs_gen` — those are managed at the call site.
+    /// `generation`, `saved_tabs_gen`, or `git_status_gen` — those are
+    /// managed at the call site.
     fn clear_workspace_editor_state(&mut self) {
         self.file_tree.nodes.clear();
         self.file_tree.expanded_dirs.clear();
@@ -2461,9 +2477,13 @@ impl EditorState {
 
             EditorMessage::BlinkTick => self.blink_tick(),
 
-            EditorMessage::GitStatusLoaded(result) => self.git_status_loaded(result),
+            EditorMessage::GitStatusLoaded { r#gen, result } => {
+                self.git_status_loaded(r#gen, result)
+            }
 
-            EditorMessage::GitIgnoredLoaded(result) => self.git_ignored_loaded(result),
+            EditorMessage::GitIgnoredLoaded { r#gen, result } => {
+                self.git_ignored_loaded(r#gen, result)
+            }
 
             EditorMessage::CheckFileChanges => self.check_file_changes(),
 
@@ -2497,11 +2517,13 @@ impl EditorState {
         self.selected_workspace_name = Some(name.to_string());
         self.selected_workspace_path = path.map(std::string::ToString::to_string);
 
-        // Clear previous state and bump both generation counters.
+        // Clear previous state and bump generation counters.
         let r#gen = self.generation.wrapping_add(1);
         self.generation = r#gen;
         let saved_gen = self.saved_tabs_gen.wrapping_add(1);
         self.saved_tabs_gen = saved_gen;
+        let git_gen = self.git_status_gen.wrapping_add(1);
+        self.git_status_gen = git_gen;
         self.clear_workspace_editor_state();
 
         // Register the root generation so DirExpanded can validate it.
@@ -2593,10 +2615,14 @@ impl EditorState {
         tasks.push(load_tabs_task);
 
         // ── Task 3: refresh git status for file tree coloring ──
+        self.git_status_loading = true;
         let git_path = path.unwrap_or_default().to_string();
         let git_task = Task::perform(
             async move { load_git_status(git_path).await },
-            EditorMessage::GitStatusLoaded,
+            move |result| EditorMessage::GitStatusLoaded {
+                r#gen: git_gen,
+                result,
+            },
         );
         tasks.push(git_task);
 
@@ -4238,9 +4264,10 @@ impl EditorState {
         if !self.git_status_loading {
             self.git_status_loading = true;
             let path = root_path.clone();
+            let r#gen = self.git_status_gen;
             tasks.push(Task::perform(
                 async move { load_git_status(path).await },
-                EditorMessage::GitStatusLoaded,
+                move |result| EditorMessage::GitStatusLoaded { r#gen, result },
             ));
         }
 
@@ -4256,9 +4283,10 @@ impl EditorState {
             if !self.git_status_loading {
                 self.git_status_loading = true;
                 let path = ws_path.clone();
+                let r#gen = self.git_status_gen;
                 tasks.push(Task::perform(
                     async move { load_git_status(path).await },
-                    EditorMessage::GitStatusLoaded,
+                    move |result| EditorMessage::GitStatusLoaded { r#gen, result },
                 ));
             }
 
@@ -4266,9 +4294,10 @@ impl EditorState {
                 self.git_ignore_loading = true;
                 let path = ws_path.clone();
                 let tree_paths = collect_tree_paths(&self.file_tree.nodes);
+                let r#gen = self.git_status_gen;
                 tasks.push(Task::perform(
                     async move { load_git_ignore(path, tree_paths).await },
-                    EditorMessage::GitIgnoredLoaded,
+                    move |result| EditorMessage::GitIgnoredLoaded { r#gen, result },
                 ));
             }
 
@@ -4293,9 +4322,14 @@ impl EditorState {
     /// Handle git-status-loaded — updates the git status cache.
     fn git_status_loaded(
         &mut self,
+        r#gen: u64,
         result: Result<HashMap<String, GitFileStatus>, String>,
     ) -> Task<EditorMessage> {
         self.git_status_loading = false;
+        // Stale result from a previous workspace or refresh? Discard.
+        if r#gen != self.git_status_gen {
+            return Task::none();
+        }
         match result {
             Ok(cache) => self.git_status_cache = cache,
             Err(e) => {
@@ -4309,9 +4343,14 @@ impl EditorState {
     /// Handle git-ignored-loaded — updates the git ignore cache.
     fn git_ignored_loaded(
         &mut self,
+        r#gen: u64,
         result: Result<HashSet<String>, String>,
     ) -> Task<EditorMessage> {
         self.git_ignore_loading = false;
+        // Stale result from a previous workspace or refresh? Discard.
+        if r#gen != self.git_status_gen {
+            return Task::none();
+        }
         match result {
             Ok(cache) => self.git_ignore_cache = cache,
             Err(e) => {
