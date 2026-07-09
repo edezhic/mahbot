@@ -229,13 +229,18 @@ impl Role {
         }
     }
 
-    /// Conversation compaction prompt for this role, loaded from embedded prompt files.
+    /// Conversation compaction prompt for this role, composed from two embedded
+    /// prompt files: the role-specific section (`summarize/{role}.md`) and the
+    /// shared OMIT section (`summarize/omit.md`).
     ///
-    /// Falls back to a `[PROMPT MISSING: …]` placeholder if the summarization
-    /// prompt asset is missing (see `load_prompt`).
+    /// Falls back to a `[PROMPT MISSING: …]` placeholder in the relevant section
+    /// if either prompt asset is missing (see `load_prompt`).
     #[must_use]
     pub fn summary_prompt(&self) -> String {
-        crate::prompt::load_prompt(&format!("summarize/{}.md", self.as_str()))
+        let template = crate::prompt::load_prompt(&format!("summarize/{}.md", self.as_str()));
+        let omit = crate::prompt::load_prompt("summarize/omit.md");
+        let omit = omit.trim_end_matches('\n').to_string();
+        crate::prompt::substitute(&template, &[("{{omit_section}}", &omit)])
     }
 }
 
