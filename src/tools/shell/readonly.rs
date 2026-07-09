@@ -675,6 +675,11 @@ fn check_segment(segment: &str) -> Result<(), String> {
 // ── Git-specific checks ──────────────────────────────────────────────────
 
 /// Mutation flags/verbs for `git branch` (any of these makes the command mutating).
+///
+/// NOTE: `-f`/`--force` bypasses safety checks (force-create / force-delete).
+///       `-u`/`--set-upstream-to` sets upstream tracking (requires force with `-f`).
+///       `--set-upstream-to=value` notation is also caught via prefix matching.
+///       `--track`/`--no-track` create tracking branches or override config.
 const GIT_BRANCH_MUTATIONS: &[&str] = &[
     "-d",
     "-D",
@@ -682,6 +687,12 @@ const GIT_BRANCH_MUTATIONS: &[&str] = &[
     "-M",
     "-c",
     "-C",
+    "-f",
+    "--force",
+    "-u",
+    "--set-upstream-to",
+    "--track",
+    "--no-track",
     "--delete",
     "--move",
     "--copy",
@@ -689,12 +700,23 @@ const GIT_BRANCH_MUTATIONS: &[&str] = &[
 ];
 
 /// Mutation flags for `git tag` (any of these makes the command mutating).
+///
+/// NOTE: `-f`/`--force` bypasses safety checks (force-create / force-delete / force-replace).
+///       `-m`/`--message`, `-F`/`--file`, and `-e`/`--edit` attach or edit tag messages.
 const GIT_TAG_MUTATIONS: &[&str] = &[
     "-d",
     "--delete",
     "-a",
     "-s",
     "-u",
+    "-f",
+    "--force",
+    "-m",
+    "--message",
+    "-F",
+    "--file",
+    "-e",
+    "--edit",
     "--annotate",
     "--sign",
     "--local-user",
@@ -763,6 +785,13 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
 /// For a matched git subcommand, check if the next token after the
 /// subcommand name is a mutation flag/verb. Reject if it is.
 ///
+/// For `branch` and `tag`: also reject any non-flag first argument (a bare
+/// name like `git branch my-feature` or `git tag v1.0`), since these create
+/// branches/tags rather than listing them.
+///
+/// Handles both exact flag matches and `flag=value` notation (e.g.,
+/// `--set-upstream-to=origin/main`).
+///
 /// `subcommand` is the pre-extracted subcommand from [`extract_git_subcommand`]
 /// (e.g., `"branch -d feature"`).
 fn check_git_subcommand_mutation(
@@ -772,14 +801,28 @@ fn check_git_subcommand_mutation(
 ) -> Result<(), String> {
     let words: Vec<&str> = subcommand.split_whitespace().collect();
     // words[0] is the subcommand name (e.g., "branch")
-    // Check the first argument for a mutation token
-    if let Some(first_arg) = words.get(1)
-        && mutation_tokens.contains(first_arg)
-    {
-        return Err(format!(
-            "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
-             Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
-        ));
+    if let Some(first_arg) = words.get(1) {
+        // For `branch` and `tag`, a non-flag first argument is a name being created.
+        let is_name_creation = (subcommand_name == "branch" || subcommand_name == "tag")
+            && !first_arg.starts_with('-');
+        if is_name_creation {
+            return Err(format!(
+                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it would create a {subcommand_name}.\n\
+                 Suggestion: use `git {subcommand_name} --list` or `git {subcommand_name} --merged` to list existing ones."
+            ));
+        }
+
+        // Check the first argument for a mutation token (exact match or `flag=value`)
+        let is_mutating = mutation_tokens.contains(first_arg)
+            || mutation_tokens
+                .iter()
+                .any(|mt| first_arg.starts_with(&format!("{mt}=")));
+        if is_mutating {
+            return Err(format!(
+                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
+                 Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
+            ));
+        }
     }
     // Only check the first argument — if it's safe, the command is safe
     // (best-effort: `git branch --sort=-committerdate` passes as read-only)
@@ -1043,6 +1086,30 @@ mod tests {
             ("git stash list", true),
             ("git merge feature", false),
             ("git rebase main", false),
+            // branch/tag name-creation bypass (regression tests)
+            ("git branch my-feature", false),
+            ("git branch --force my-feature", false),
+            ("git branch -f my-feature", false),
+            ("git tag v1.0", false),
+            ("git tag -f v1.0", false),
+            ("git tag --force v1.0", false),
+            ("git branch -u origin/main", false),
+            ("git branch --set-upstream-to=origin/main", false),
+            // --track bypass (flag as first arg, not in name-creation check)
+            ("git branch --track feature", false),
+            ("git branch --no-track feature", false),
+            // tag message flag bypasses
+            ("git tag -m msg v1.0", false),
+            ("git tag --message msg v1.0", false),
+            ("git tag -F file v1.0", false),
+            ("git tag --file file v1.0", false),
+            ("git tag -e v1.0", false),
+            ("git tag --edit v1.0", false),
+            // remote inspection commands
+            ("git remote", true),
+            ("git remote -v", true),
+            ("git remote show origin", true),
+            ("git remote get-url origin", true),
         ];
 
         run_cases(&cases);
@@ -1127,6 +1194,45 @@ mod tests {
         assert_all_rejected(GIT_REMOTE_MUTATIONS, |verb| {
             format!("git remote {verb} origin")
         });
+    }
+
+    /// Tests that safe branch/tag listing commands are accepted (non-regression
+    /// for the name-creation bypass fix — these must NOT be blocked).
+    #[test]
+    fn git_branch_tag_safe_listing() {
+        let cases = [
+            // branch: no args (list local branches)
+            ("git branch", true),
+            // branch: standard listing flags
+            ("git branch --list", true),
+            ("git branch --list feature", true),
+            ("git branch -l", true),
+            ("git branch -l feature", true),
+            ("git branch --merged", true),
+            ("git branch --merged main", true),
+            ("git branch --no-merged", true),
+            ("git branch --no-merged main", true),
+            ("git branch -a", true),
+            ("git branch -r", true),
+            ("git branch -v", true),
+            ("git branch -vv", true),
+            ("git branch --sort=-committerdate", true),
+            ("git branch --contains abc123", true),
+            ("git branch --points-at abc123", true),
+            ("git branch --format='%(refname)'", true),
+            // tag: no args (list tags)
+            ("git tag", true),
+            // tag: standard listing flags
+            ("git tag --list", true),
+            ("git tag -l", true),
+            ("git tag -l v1*", true),
+            ("git tag --contains abc123", true),
+            ("git tag --merged main", true),
+            ("git tag --points-at abc123", true),
+            ("git tag -n", true),
+        ];
+
+        run_cases(&cases);
     }
 
     // ── Flag-dependent tests ──────────────────────────────────────
