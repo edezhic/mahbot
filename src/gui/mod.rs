@@ -1139,11 +1139,11 @@ impl Dashboard {
         // downstream pages clear their state (the workspace picker
         // guards against this in normal operation, but guard for db
         // inconsistency).  Personal workspaces get their resolved path.
-        let (editor_name, editor_path) =
+        let (page_name, page_path) =
             resolve_dashboard_workspace_path(name, ws_path.as_deref(), personal_path.as_deref());
         let editor_task: Task<Message> = Task::done(editor::EditorMessage::WorkspaceSelected(
-            editor_name,
-            editor_path,
+            page_name.clone(),
+            page_path.clone(),
         ))
         .map(Message::Editor);
 
@@ -1162,12 +1162,9 @@ impl Dashboard {
             Task::done(diff::DiffMessage::WorkspaceSelected(diff_name, diff_path))
                 .map(Message::DiffModal);
 
-        let (shell_name, shell_path) =
-            resolve_dashboard_workspace_path(name, ws_path.as_deref(), personal_path.as_deref());
-        let shell_task: Task<Message> = Task::done(shell::ShellMessage::WorkspaceSelected(
-            shell_name, shell_path,
-        ))
-        .map(Message::Shell);
+        let shell_task: Task<Message> =
+            Task::done(shell::ShellMessage::WorkspaceSelected(page_name, page_path))
+                .map(Message::Shell);
 
         // Notify the Home page so it can reload chat history.
         let home_name = name.to_string();
