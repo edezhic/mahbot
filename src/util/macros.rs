@@ -111,84 +111,44 @@ macro_rules! columns {
 ///
 /// Eliminates ~64 lines of boilerplate per store module.
 ///
-/// **Form 1 — simple (no post-open step):**
+/// # Syntax
+///
 /// ```ignore
 /// define_store! {
 ///     /// Doc comment for the global static.
 ///     pub static STORE_NAME: StoreType,
 ///     db_name = "db_file_name",
 ///     schema = SCHEMA,
+///     post_open = ensure_admin_user,  // optional; omitted when not needed
 ///     expect = "custom panic message",
 /// }
 /// ```
 ///
-/// **Form 2 — post-open via `&self` method:**
-/// ```ignore
-/// define_store! {
-///     pub static USER_STORE: UserStore,
-///     db_name = "users",
-///     schema = SCHEMA,
-///     post_open = ensure_admin_user,
-///     expect = "custom panic message",
-/// }
-/// ```
-/// The method is called via `this.$method().await?` after store construction.
-/// It must be `async fn(&self) -> anyhow::Result<()>`.  Defined in a separate
-/// `impl Store { … }` block.
+/// The `post_open` field is optional.  When present, it names an
+/// `async fn(&self) -> anyhow::Result<()>` method that is called after
+/// the database connection is established (via `this.$method().await?`)
+/// but before the store is returned.  The method must be defined in a
+/// separate `impl Store { … }` block.
 ///
 /// # Generated items
 ///
-/// For both forms the macro generates:
+/// The macro generates:
 /// - `#[derive(Clone, Debug)] pub struct $Store { pub(crate) conn: Connection }`
 /// - `impl $Store { pub async fn open(root: &Path) -> anyhow::Result<Self> { … } }`
 /// - A `global_store!` invocation creating the `OnceCell`, `init_global()`, and
 ///   `store()` singleton accessor
 ///
-/// This macro is intentionally limited to these two forms.  An arbitrary-block
-/// form is **not** provided because Rust `macro_rules!` hygiene prevents
-/// user-provided `self` / `conn` tokens inside generated method bodies.
-/// The `init`-method approach (Form 2) avoids this limitation entirely.
+/// An arbitrary-block form is **not** provided because Rust `macro_rules!`
+/// hygiene prevents user-provided `self` / `conn` tokens inside generated
+/// method bodies.  The `post_open` approach avoids this limitation entirely.
 #[macro_export]
 macro_rules! define_store {
-    // ── Form 1: Simple (no post-open) ──────────────────────────────────
     (
         $(#[$attr:meta])*
         pub static $name:ident: $ty:ident,
         db_name = $db_name:literal,
         schema = $schema:ident,
-        expect = $expect:expr,
-    ) => {
-        $(#[$attr])*
-        #[derive(Clone, Debug)]
-        pub struct $ty {
-            pub(crate) conn: $crate::turso::Connection,
-        }
-
-        impl $ty {
-            /// Open (or create) the database at `root/db/{name}.db`.
-            pub async fn open(
-                root: &std::path::Path,
-            ) -> ::anyhow::Result<Self> {
-                let conn = $crate::turso::open_store(root, $db_name, $schema).await?;
-                Ok(Self { conn })
-            }
-        }
-
-        $crate::global_store! {
-            $(#[$attr])*
-            pub static $name: $ty,
-            constructor = $ty::open,
-            expect = $expect,
-        }
-    };
-
-    // ── Form 2: Post-open via init method ───────────────────────────────
-    (
-        $(#[$attr:meta])*
-        pub static $name:ident: $ty:ident,
-        db_name = $db_name:literal,
-        schema = $schema:ident,
-        post_open = $method:ident,
+        $(post_open = $method:ident,)?
         expect = $expect:expr,
     ) => {
         $(#[$attr])*
@@ -204,7 +164,7 @@ macro_rules! define_store {
             ) -> ::anyhow::Result<Self> {
                 let conn = $crate::turso::open_store(root, $db_name, $schema).await?;
                 let this = Self { conn };
-                this.$method().await?;
+                $(this.$method().await?;)?
                 Ok(this)
             }
         }
