@@ -716,43 +716,16 @@ impl SettingsState {
                 let (status_color, status_bg) = theme::workspace_status_color(&ws_item.status);
                 let maintainer_on = ws_item.maintenance_enabled;
 
-                let delete_btn = if ws.delete_target == Some(ws_item.name.clone()) {
-                    row![
-                        text("Delete?").size(12).color(theme::STATUS_ERROR),
-                        Space::new().width(4),
-                        button(text("Yes").size(11).color(theme::STATUS_ERROR))
-                            .style(theme::button_danger)
-                            .on_press(SettingsMessage::WorkspaceMsg(
-                                workspaces::WorkspacesMessage::ConfirmDelete(ws_item.name.clone(),),
-                            )),
-                        Space::new().width(4),
-                        button(text("No").size(11))
-                            .style(theme::button_secondary)
-                            .on_press(SettingsMessage::WorkspaceMsg(
-                                workspaces::WorkspacesMessage::CancelDelete,
-                            )),
-                    ]
-                } else {
-                    row![
-                        tooltip(
-                            button(
-                                lucide::x::<iced::Theme, iced::Renderer>()
-                                    .size(18)
-                                    .color(theme::STATUS_ERROR),
-                            )
-                            .style(theme::button_text)
-                            .on_press(SettingsMessage::WorkspaceMsg(
-                                workspaces::WorkspacesMessage::DeleteWorkspace(
-                                    ws_item.name.clone(),
-                                ),
-                            )),
-                            "Delete",
-                            tooltip::Position::Top,
-                        )
-                        .style(theme::tooltip_style)
-                        .delay(Duration::from_millis(400)),
-                    ]
-                };
+                let delete_btn = delete_confirm_button(
+                    Some(&ws_item.name) == ws.delete_target.as_ref(),
+                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::ConfirmDelete(
+                        ws_item.name.clone(),
+                    )),
+                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::CancelDelete),
+                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::DeleteWorkspace(
+                        ws_item.name.clone(),
+                    )),
+                );
 
                 let ws_row = container(
                     column![
@@ -1088,39 +1061,18 @@ impl SettingsState {
                 };
 
                 let delete_btn = if is_admin {
-                    row![]
-                } else if Some(&user.name) == us.delete_target.as_ref() {
-                    row![
-                        text("Delete?").size(12).color(theme::STATUS_ERROR),
-                        Space::new().width(4),
-                        button(text("Yes").size(11).color(theme::STATUS_ERROR))
-                            .style(theme::button_danger)
-                            .on_press(SettingsMessage::UserMsg(
-                                users::UsersMessage::ConfirmDelete(user.name.clone()),
-                            )),
-                        Space::new().width(4),
-                        button(text("No").size(11))
-                            .style(theme::button_secondary)
-                            .on_press(SettingsMessage::UserMsg(users::UsersMessage::CancelDelete,)),
-                    ]
+                    row![].into()
                 } else {
-                    row![
-                        tooltip(
-                            button(
-                                lucide::x::<iced::Theme, iced::Renderer>()
-                                    .size(18)
-                                    .color(theme::STATUS_ERROR),
-                            )
-                            .style(theme::button_text)
-                            .on_press(SettingsMessage::UserMsg(users::UsersMessage::DeleteUser(
-                                user.name.clone()
-                            ),)),
-                            "Delete",
-                            tooltip::Position::Top,
-                        )
-                        .style(theme::tooltip_style)
-                        .delay(Duration::from_millis(400)),
-                    ]
+                    delete_confirm_button(
+                        Some(&user.name) == us.delete_target.as_ref(),
+                        SettingsMessage::UserMsg(users::UsersMessage::ConfirmDelete(
+                            user.name.clone(),
+                        )),
+                        SettingsMessage::UserMsg(users::UsersMessage::CancelDelete),
+                        SettingsMessage::UserMsg(users::UsersMessage::DeleteUser(
+                            user.name.clone(),
+                        )),
+                    )
                 };
 
                 let user_row = container(
@@ -2023,6 +1975,47 @@ fn password_input<'a>(
     ]
     .align_y(Alignment::Center)
     .into()
+}
+
+/// Delete-confirm button — shows a trash icon (with tooltip) or a
+/// "Delete? Yes / No" confirmation prompt when the item is the delete target.
+fn delete_confirm_button<'a>(
+    is_delete_target: bool,
+    on_confirm: SettingsMessage,
+    on_cancel: SettingsMessage,
+    on_delete: SettingsMessage,
+) -> Element<'a, SettingsMessage> {
+    if is_delete_target {
+        row![
+            text("Delete?").size(12).color(theme::STATUS_ERROR),
+            Space::new().width(4),
+            button(text("Yes").size(11).color(theme::STATUS_ERROR))
+                .style(theme::button_danger)
+                .on_press(on_confirm),
+            Space::new().width(4),
+            button(text("No").size(11))
+                .style(theme::button_secondary)
+                .on_press(on_cancel),
+        ]
+        .into()
+    } else {
+        row![
+            tooltip(
+                button(
+                    lucide::x::<iced::Theme, iced::Renderer>()
+                        .size(18)
+                        .color(theme::STATUS_ERROR),
+                )
+                .style(theme::button_text)
+                .on_press(on_delete),
+                "Delete",
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .delay(Duration::from_millis(400)),
+        ]
+        .into()
+    }
 }
 
 /// Save button — disabled while saving.
