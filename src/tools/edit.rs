@@ -485,28 +485,32 @@ fn find_ws_insensitive(content: &str, old_string: &str) -> Result<Option<WsMatch
 mod tests {
     use super::*;
     use crate::workspace::test_ws;
+    use tempfile::TempDir;
 
     /// Helper: creates a temp workspace directory for an edit test, writes
     /// initial files, runs the test closure, and cleans up afterwards.
-    async fn with_temp_workspace<F, Fut>(test_name: &str, files: &[(&str, &str)], test: F)
+    /// The temp directory is backed by [`TempDir`] and is automatically
+    /// cleaned up on drop — even if the closure panics.
+    async fn with_temp_workspace<F, Fut>(files: &[(&str, &str)], test: F)
     where
         F: FnOnce(PathBuf) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let dir = std::env::temp_dir().join(test_name);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        if files.is_empty() {
-            tokio::fs::create_dir_all(&dir).await.unwrap();
-        }
+        let dir = TempDir::new().unwrap();
         for (filename, content) in files {
-            let path = dir.join(filename);
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await.unwrap();
-            }
-            tokio::fs::write(&path, content).await.unwrap();
+            let full_path = dir.path().join(filename);
+            tokio::fs::create_dir_all(
+                full_path
+                    .parent()
+                    .expect("TempDir-joined path always has a parent"),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(&full_path, content).await.unwrap();
         }
-        test(dir.clone()).await;
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let path = dir.path().to_path_buf();
+        test(path).await;
+        // TempDir::drop auto-cleans — panic-safe
     }
 
     // ── Extension check tests ────────────────────────────────────────
@@ -811,17 +815,15 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_multiple_replacements() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_edit_multiple");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "a b a c a d")
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), "a b a c a d")
             .await
             .unwrap();
 
         // single match without multiple flag still works
         let result = EditTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "b", "new_string": "x"}),
             )
             .await;
@@ -829,7 +831,7 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("replaced 1 occurrence"));
         assert_eq!(
-            tokio::fs::read_to_string(dir.join("test.txt"))
+            tokio::fs::read_to_string(dir.path().join("test.txt"))
                 .await
                 .unwrap(),
             "a x a c a d"
@@ -838,7 +840,7 @@ mod tests {
         // multiple=true replaces all occurrences
         let result = EditTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "a", "new_string": "y", "multiple": true}),
             )
             .await;
@@ -846,7 +848,7 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("replaced 3 occurrences"));
         assert_eq!(
-            tokio::fs::read_to_string(dir.join("test.txt"))
+            tokio::fs::read_to_string(dir.path().join("test.txt"))
                 .await
                 .unwrap(),
             "y x y c y d"
@@ -855,7 +857,7 @@ mod tests {
         // multiple=true with no matches still fails
         let result = EditTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "z", "new_string": "w", "multiple": true}),
             )
             .await;
@@ -867,11 +869,11 @@ mod tests {
         assert!(err.contains("not found"));
 
         // multiple=true with single match works too
-        tokio::fs::write(dir.join("test.txt"), "only one")
+        tokio::fs::write(dir.path().join("test.txt"), "only one")
             .await
             .unwrap();
         let result = EditTool
-            .execute(&Workspace::from_path(&dir), json!({"path": "test.txt", "old_string": "one", "new_string": "two", "multiple": true}))
+            .execute(&Workspace::from_path(dir.path()), json!({"path": "test.txt", "old_string": "one", "new_string": "two", "multiple": true}))
             .await;
         assert!(
             result.is_ok(),
@@ -880,28 +882,24 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("replaced 1 occurrence"));
         assert_eq!(
-            tokio::fs::read_to_string(dir.join("test.txt"))
+            tokio::fs::read_to_string(dir.path().join("test.txt"))
                 .await
                 .unwrap(),
             "only two"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_edit_match_operations() {
-        let dir = std::env::temp_dir().join("mahbot_test_file_edit_match");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello world")
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), "hello world")
             .await
             .unwrap();
 
         // replace single match
         let result = EditTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "hello", "new_string": "goodbye"}),
             )
             .await;
@@ -909,13 +907,13 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("replaced 1 occurrence"));
         assert_eq!(
-            tokio::fs::read_to_string(dir.join("test.txt"))
+            tokio::fs::read_to_string(dir.path().join("test.txt"))
                 .await
                 .unwrap(),
             "goodbye world"
         );
         // not found
-        let result = EditTool.execute(&Workspace::from_path(&dir), json!({"path": "test.txt", "old_string": "nonexistent", "new_string": "replacement"})).await;
+        let result = EditTool.execute(&Workspace::from_path(dir.path()), json!({"path": "test.txt", "old_string": "nonexistent", "new_string": "replacement"})).await;
         assert!(
             result.is_err(),
             "edit with nonexistent string should fail: {result:?}"
@@ -923,12 +921,12 @@ mod tests {
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("not found"));
         // multiple matches rejected
-        tokio::fs::write(dir.join("test.txt"), "aaa bbb aaa")
+        tokio::fs::write(dir.path().join("test.txt"), "aaa bbb aaa")
             .await
             .unwrap();
         let result = EditTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(dir.path()),
                 json!({"path": "test.txt", "old_string": "aaa", "new_string": "ccc"}),
             )
             .await;
@@ -936,49 +934,42 @@ mod tests {
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("matches 2 times"));
         assert_eq!(
-            tokio::fs::read_to_string(dir.join("test.txt"))
+            tokio::fs::read_to_string(dir.path().join("test.txt"))
                 .await
                 .unwrap(),
             "aaa bbb aaa"
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_edit_delete_via_empty_new_string() {
-        with_temp_workspace(
-            "mahbot_test_file_edit_delete",
-            &[("test.txt", "keep remove keep")],
-            |dir| async move {
-                let result = EditTool
-                    .execute(
-                        &test_ws(&dir),
-                        json!({"path": "test.txt", "old_string": " remove", "new_string": ""}),
-                    )
-                    .await;
-                assert!(
-                    result.is_ok(),
-                    "delete edit should succeed: {:?}",
-                    result.as_ref().unwrap_err()
-                );
-                let content = tokio::fs::read_to_string(dir.join("test.txt"))
-                    .await
-                    .unwrap();
-                assert_eq!(content, "keep keep");
-            },
-        )
+        with_temp_workspace(&[("test.txt", "keep remove keep")], |dir| async move {
+            let result = EditTool
+                .execute(
+                    &test_ws(&dir),
+                    json!({"path": "test.txt", "old_string": " remove", "new_string": ""}),
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "delete edit should succeed: {:?}",
+                result.as_ref().unwrap_err()
+            );
+            let content = tokio::fs::read_to_string(dir.join("test.txt"))
+                .await
+                .unwrap();
+            assert_eq!(content, "keep keep");
+        })
         .await;
     }
 
     #[tokio::test]
     async fn edit_write_mode_creates_file() {
-        let dir = std::env::temp_dir().join("mahbot_test_edit_write_mode");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dir = TempDir::new().unwrap();
 
         let result = EditTool
             .execute(
-                &Workspace::from_path(&dir),
+                &Workspace::from_path(dir.path()),
                 json!({"path": "out.txt", "new_string": "written!"}),
             )
             .await;
@@ -986,23 +977,19 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("8 bytes"));
 
-        let content = tokio::fs::read_to_string(dir.join("out.txt"))
+        let content = tokio::fs::read_to_string(dir.path().join("out.txt"))
             .await
             .unwrap();
         assert_eq!(content, "written!");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn edit_write_mode_with_empty_old_string() {
-        let dir = std::env::temp_dir().join("mahbot_test_edit_write_mode_empty");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dir = TempDir::new().unwrap();
 
         let result = EditTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(dir.path()),
                 json!({"path": "out.txt", "old_string": "", "new_string": "content"}),
             )
             .await;
@@ -1011,38 +998,32 @@ mod tests {
             "write mode with empty old_string: {result:?}"
         );
 
-        let content = tokio::fs::read_to_string(dir.join("out.txt"))
+        let content = tokio::fs::read_to_string(dir.path().join("out.txt"))
             .await
             .unwrap();
         assert_eq!(content, "content");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn edit_write_mode_creates_parent_dirs() {
-        let dir = std::env::temp_dir().join("mahbot_test_edit_write_mode_nested");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dir = TempDir::new().unwrap();
 
         let result = EditTool
             .execute(
-                &test_ws(&dir),
+                &test_ws(dir.path()),
                 json!({"path": "a/b/c/deep.txt", "new_string": "deep"}),
             )
             .await;
         assert!(result.is_ok(), "write with parent dirs: {result:?}");
-        let content = tokio::fs::read_to_string(dir.join("a/b/c/deep.txt"))
+        let content = tokio::fs::read_to_string(dir.path().join("a/b/c/deep.txt"))
             .await
             .unwrap();
         assert_eq!(content, "deep");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_edit_blocks_dangerous_paths() {
-        with_temp_workspace("mahbot_test_file_edit_traversal", &[], |dir| async move {
+        with_temp_workspace(&[], |dir| async move {
             let result = EditTool
                 .execute(
                     &test_ws(&dir),
@@ -1071,7 +1052,6 @@ mod tests {
     #[tokio::test]
     async fn file_edit_normalizes_relative_path() {
         with_temp_workspace(
-            "mahbot_test_file_edit_relative",
             &[("workspace/nested/target.txt", "hello world")],
             |root| async move {
                 let workspace = root.join("workspace");
@@ -1094,11 +1074,10 @@ mod tests {
     async fn file_edit_blocks_symlink_target_file() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("mahbot_test_file_edit_symlink_target");
-        let workspace = root.join("workspace");
-        let outside = root.join("outside");
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
 
-        let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&outside).await.unwrap();
 
@@ -1132,13 +1111,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "original", "original file must not be modified");
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
     async fn file_edit_nonexistent_file() {
-        with_temp_workspace("mahbot_test_file_edit_nofile", &[], |dir| async move {
+        with_temp_workspace(&[], |dir| async move {
             let result = EditTool
                 .execute(
                     &test_ws(&dir),
@@ -1155,7 +1132,6 @@ mod tests {
     #[tokio::test]
     async fn file_edit_absolute_path_in_workspace() {
         with_temp_workspace(
-            "mahbot_test_file_edit_abs_path",
             &[("target.txt", "old content")],
             |dir| async move {
                 // Canonicalize so the workspace dir matches resolved paths on macOS (/private/var/…)
@@ -1181,7 +1157,6 @@ mod tests {
         // Two assignments that normalize to the same string — the WS fallback
         // must detect ambiguity and refuse to pick one arbitrarily.
         with_temp_workspace(
-            "mahbot_test_ws_ambiguous",
             &[("lib.rs", "let  x  =  1;\nlet  x  =  1;\nlet  y  =  2;\n")],
             |dir| async move {
                 let result = EditTool
@@ -1216,7 +1191,6 @@ mod tests {
     async fn ws_unambiguous_single_match_still_works() {
         // Regression: a .rs file with a single WS-only match should still succeed.
         with_temp_workspace(
-            "mahbot_test_ws_unambiguous",
             &[("lib.rs", "let  x  =  1;\nlet  y  =  2;\n")],
             |dir| async move {
                 let result = EditTool
@@ -1242,31 +1216,27 @@ mod tests {
         // Non-code files use exact matching only, so the WS ambiguity check
         // is never reached. Ensure a .txt file with multiple normalized matches
         // gets the standard exact-match error, not the WS-ambiguity error.
-        with_temp_workspace(
-            "mahbot_test_ws_nocode",
-            &[("readme.txt", "a  b  a  b")],
-            |dir| async move {
-                let result = EditTool
-                    .execute(
-                        &test_ws(&dir),
-                        json!({
-                            "path": "readme.txt",
-                            "old_string": "a b",
-                            "new_string": "x"
-                        }),
-                    )
-                    .await;
-                assert!(
-                    result.is_err(),
-                    "Exact match for .txt should fail (no matches): {result:?}"
-                );
-                let err = format!("{}", result.unwrap_err());
-                assert!(
-                    err.contains("not found"),
-                    ".txt should use exact matching only, got: {err}"
-                );
-            },
-        )
+        with_temp_workspace(&[("readme.txt", "a  b  a  b")], |dir| async move {
+            let result = EditTool
+                .execute(
+                    &test_ws(&dir),
+                    json!({
+                        "path": "readme.txt",
+                        "old_string": "a b",
+                        "new_string": "x"
+                    }),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "Exact match for .txt should fail (no matches): {result:?}"
+            );
+            let err = format!("{}", result.unwrap_err());
+            assert!(
+                err.contains("not found"),
+                ".txt should use exact matching only, got: {err}"
+            );
+        })
         .await;
     }
 }
