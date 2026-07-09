@@ -17,10 +17,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 /// Safety guard against infinite tool-calling loops from weaker models or
-/// broken prompts. Generously set at 1000 (well above typical 3–8 turns) to
-/// avoid false-positive cutoffs during complex multi-step runs. Tool-result
-/// turnarounds are cheap; even a worst-case loop of 1000 full inferences
-/// costs at most a fraction of a dollar.
+/// broken prompts. Generously set at 1000 because modern LLMs almost never
+/// get stuck in tool-calling loops — even in extreme edge cases, this is a
+/// very reasonable ceiling. At worst (e.g. DeepSeek V4 Flash, the default),
+/// a full 1000-iteration loop costs well under $1.
 const MAX_LLM_ITERATIONS: usize = 1000;
 
 /// Maximum length of serialized arguments stored in per-call stats.
