@@ -110,6 +110,33 @@ crate::columns! {
     }
 }
 
+/// Columns explicitly inserted during ticket creation.
+///
+/// This is a subset of the DDL columns. The following columns have DDL defaults
+/// and are set later via dedicated UPDATE statements, so they are intentionally
+/// excluded from the initial INSERT:
+///
+/// | Column                  | DDL default | Set by                          |
+/// |-------------------------|-------------|---------------------------------|
+/// | `assigned_to`           | `NULL`      | [`set_assigned_to`] after claim |
+/// | `superseded_by`         | `NULL`      | [`supersede_and_create`]        |
+/// | `commit_hash`           | `NULL`      | [`set_commit_info`]             |
+/// | `lines_added`           | `NULL`      | [`set_commit_info`]             |
+/// | `lines_removed`         | `NULL`      | [`set_commit_info`]             |
+/// | `is_archived`           | `0`         | [`set_archived`] / archive fns  |
+/// | `pipeline_reservation`  | `0`         | [`transition`] with reservation |
+///
+/// **Asymmetry note:** `embedding` is included here but absent from
+/// [`TICKET_COLUMNS`] because it is a write-only column — the blob is stored at
+/// creation time and later cleared after archival indexing, but it is never
+/// SELECTed from the `tickets` table. This means `TICKET_INSERT_COLUMNS` is not
+/// a strict subset of `TICKET_COLUMNS`.
+///
+/// If you add a column to the DDL that requires an explicit value at INSERT time,
+/// add it here AND add a `?N` binding in [`insert_ticket_tx`].
+pub(crate) const TICKET_INSERT_COLUMNS: &str = "id, title, description, status, workspace_name, \
+    created_at, updated_at, prerequisites, supersedes, reporter, embedding";
+
 // Column definitions for comment SELECT queries.
 // Note: `id` and `ticket_id` are intentionally excluded from the column list
 // because they are not consumed by the comment rendering path:
@@ -598,9 +625,10 @@ impl BoardStore {
         let now = turso::now();
         let prereqs_json = serde_json::to_string(&params.prerequisites)?;
         tx.execute(
-            "INSERT INTO tickets (id, title, description, status, workspace_name, \
-             created_at, updated_at, prerequisites, supersedes, reporter, embedding) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            &format!(
+                "INSERT INTO tickets ({TICKET_INSERT_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ),
             turso::params![
                 ticket_id,
                 params.title.as_str(),
