@@ -198,15 +198,13 @@ async fn dispatch_notification(
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
-    log_label: &str,
+    _log_label: &str,
     failure_comment: Option<&str>,
 ) {
     match notify {
         NotifyPolicy::Notify => notify_ticket(ticket, target, failure_comment).await,
         NotifyPolicy::Buffer => {
-            if let Some(ws) = resolve_ticket_workspace(ticket, log_label).await {
-                ticket_buffer::push(&ws.name, &ticket.id, source, target);
-            }
+            ticket_buffer::push(&ticket.workspace_name, &ticket.id, source, target);
         }
     }
 }
