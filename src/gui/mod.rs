@@ -914,6 +914,7 @@ impl Dashboard {
         }
 
         match message {
+            // ── Pre-ready handlers (execute regardless of ready state) ──
             Message::Boot(result) => self.finish_boot(result),
             Message::BootWorkspaces(paths, paused_map, maintenance_enabled_map, restored_name) => {
                 self.apply_boot_workspaces(
@@ -923,10 +924,34 @@ impl Dashboard {
                     restored_name.as_deref().unwrap_or(""),
                 )
             }
+            Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
+            Message::CheckpointAndExit => iced::exit(),
+            Message::WindowEvent(_id, event) => {
+                match event {
+                    window::Event::Resized(new_size) => self.last_size = new_size,
+                    window::Event::Moved(new_pos) => self.last_position = new_pos,
+                    _ => {}
+                }
+                Task::none()
+            }
+            Message::DismissToast(id) => {
+                self.toasts.retain(|t| t.id != id);
+                Task::none()
+            }
+            Message::CloseDiffModal => {
+                self.show_diff_modal = false;
+                Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
+            }
+            // Navigation has explicit before/after-ready handling
             Message::Navigation(_) if !self.ready => Task::none(),
             Message::Navigation(page) => self.navigate_to(page),
+
+            // ── Everything else before boot → silent no-op ──
+            _ if !self.ready => Task::none(),
+
+            // ── Post-ready handlers (no per-arm guards needed) ──
             Message::Tick => self.process_tick(),
-            Message::Home(msg) if self.ready => {
+            Message::Home(msg) => {
                 // Intercept RequestWorkspaceChange: the Home page detected
                 // that the selected user's DB workspace differs from the
                 // sidebar selection.  Perform a Dashboard-level workspace
@@ -949,12 +974,12 @@ impl Dashboard {
                 }
                 self.home_state.update(msg).map(Message::Home)
             }
-            Message::Shell(msg) if self.ready => self.shell_state.update(msg).map(Message::Shell),
-            Message::Logs(msg) if self.ready => self
+            Message::Shell(msg) => self.shell_state.update(msg).map(Message::Shell),
+            Message::Logs(msg) => self
                 .logs_state
                 .update(msg, self.log_store.as_ref().expect("ready"))
                 .map(Message::Logs),
-            Message::Board(msg) if self.ready => {
+            Message::Board(msg) => {
                 // Intercept ViewCommitDiff for cross-page navigation
                 // before it reaches board_state.update.
                 if let board::BoardMessage::ViewCommitDiff {
@@ -965,46 +990,22 @@ impl Dashboard {
                 }
                 self.board_state.update(msg).map(Message::Board)
             }
-            Message::Sessions(msg) if self.ready => {
-                self.sessions_state.update(msg).map(Message::Sessions)
-            }
+            Message::Sessions(msg) => self.sessions_state.update(msg).map(Message::Sessions),
             // Intercept CloseModal from successful manual commit — auto-close
             // the diff modal while keeping the diff state in working-tree view.
             // ClearCommitState is intentionally not emitted; the commit handler
             // already cleared commit state and kicked off a diff refresh.
-            Message::DiffModal(diff::DiffMessage::CloseModal) if self.ready => {
+            Message::DiffModal(diff::DiffMessage::CloseModal) => {
                 self.show_diff_modal = false;
                 Task::none()
             }
-            Message::DiffModal(msg) if self.ready => {
-                self.diff_state.update(msg).map(Message::DiffModal)
-            }
-            Message::Editor(msg) if self.ready => {
-                self.editor_state.update(msg).map(Message::Editor)
-            }
-            Message::Settings(msg) if self.ready => self.process_settings_message(msg),
-            Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
-            Message::CheckpointAndExit => iced::exit(),
-            Message::WindowEvent(_id, event) => {
-                match event {
-                    window::Event::Resized(new_size) => self.last_size = new_size,
-                    window::Event::Moved(new_pos) => self.last_position = new_pos,
-                    _ => {}
-                }
-                Task::none()
-            }
-            Message::DismissToast(id) => {
-                self.toasts.retain(|t| t.id != id);
-                Task::none()
-            }
+            Message::DiffModal(msg) => self.diff_state.update(msg).map(Message::DiffModal),
+            Message::Editor(msg) => self.editor_state.update(msg).map(Message::Editor),
+            Message::Settings(msg) => self.process_settings_message(msg),
             // ── Diff modal ────────────────────────────────────────
-            Message::OpenDiffModal(commit_hash) if self.ready => self.open_diff_modal(commit_hash),
-            Message::CloseDiffModal => {
-                self.show_diff_modal = false;
-                Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
-            }
+            Message::OpenDiffModal(commit_hash) => self.open_diff_modal(commit_hash),
             // ── Git state (routed to self.git_state) ─────────────────
-            Message::Git(msg) if self.ready => {
+            Message::Git(msg) => {
                 // Cross-modal close: if opening the branch modal,
                 // close the diff modal from Dashboard side.
                 if matches!(msg, git::GitMessage::OpenModal) {
@@ -1023,7 +1024,7 @@ impl Dashboard {
                 _ => Task::none(),
             },
             Message::EscapePressed => self.process_escape(),
-            Message::UpdateBot if self.ready => {
+            Message::UpdateBot => {
                 if self.update_status != UpdateStatus::Available {
                     return Task::none();
                 }
@@ -1040,7 +1041,7 @@ impl Dashboard {
                     Message::UpdateResult,
                 )
             }
-            Message::UpdateResult(result) if self.ready => {
+            Message::UpdateResult(result) => {
                 // execute_update() calls exit(0) on success, so we never
                 // actually reach this branch for the Ok case. The window
                 // closes as the only success signal to the user.
@@ -1051,33 +1052,16 @@ impl Dashboard {
                 }
                 Task::none()
             }
-            Message::Toggle(kind) if self.ready => self.toggle_workspace_state(kind),
-            Message::ToggleResult(kind, result, ws_name, intended_state) if self.ready => {
+            Message::Toggle(kind) => self.toggle_workspace_state(kind),
+            Message::ToggleResult(kind, result, ws_name, intended_state) => {
                 self.finish_toggle(kind, result, &ws_name, intended_state)
             }
-            Message::WorkspaceStatesRefreshed(paused_map, maintenance_enabled_map)
-                if self.ready =>
-            {
+            Message::WorkspaceStatesRefreshed(paused_map, maintenance_enabled_map) => {
                 self.workspace_paused = paused_map;
                 self.workspace_maintenance_enabled = maintenance_enabled_map;
                 Task::none()
             }
-            Message::Home(_)
-            | Message::Shell(_)
-            | Message::Logs(_)
-            | Message::Board(_)
-            | Message::Sessions(_)
-            | Message::DiffModal(_)
-            | Message::Editor(_)
-            | Message::Settings(_)
-            | Message::UpdateBot
-            | Message::UpdateResult(_)
-            | Message::Toggle(_)
-            | Message::ToggleResult(..)
-            | Message::WorkspaceStatesRefreshed(..)
-            | Message::Nop
-            | Message::OpenDiffModal(_)
-            | Message::Git(_) => Task::none(),
+            Message::Nop => Task::none(),
         }
     }
 
