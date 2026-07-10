@@ -214,8 +214,6 @@ struct UndoStack {
     undo: Vec<UndoSnapshot>,
     /// Undone states, cleared on new edit.
     redo: Vec<UndoSnapshot>,
-    /// Prevents snapping during composite operations (auto-close pairs).
-    batch_depth: usize,
 }
 
 /// A single undo snapshot.
@@ -237,15 +235,11 @@ impl UndoStack {
         Self {
             undo: Vec::new(),
             redo: Vec::new(),
-            batch_depth: 0,
         }
     }
 
     /// Take a snapshot before an edit is performed.
     fn snap_before_edit(&mut self, content: &super::editor_widget::EditorBuffer) {
-        if self.batch_depth > 0 {
-            return;
-        }
         let text = content.text();
         let cursor = content.cursor();
         let max_depth = if text.len() > LARGE_FILE_UNDO_THRESHOLD {
@@ -280,17 +274,11 @@ impl UndoStack {
 
     #[must_use]
     fn undo(&mut self, content: &super::editor_widget::EditorBuffer) -> Option<UndoSnapshot> {
-        if self.batch_depth > 0 {
-            return None;
-        }
         Self::push_and_pop(&mut self.redo, &mut self.undo, content)
     }
 
     #[must_use]
     fn redo(&mut self, content: &super::editor_widget::EditorBuffer) -> Option<UndoSnapshot> {
-        if self.batch_depth > 0 {
-            return None;
-        }
         Self::push_and_pop(&mut self.undo, &mut self.redo, content)
     }
 }
