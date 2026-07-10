@@ -212,21 +212,18 @@ async fn dispatch_notification(
 /// phases directly so hardcoded phase-name strings can't drift.
 ///
 /// `log_label` is a human-readable name for the dispatch phase (e.g.
-/// `"Engineer"`, `"Sanitation"`, `"Analyst"`). `verb` is the past-tense action
-/// the phase performed — typically `"completed"`, but may be `"failed"` or
-/// `"passed"` depending on context.
+/// `"Engineer"`, `"Sanitation"`, `"Analyst"`).
 fn warn_transition_failed(
     ticket: &Ticket,
     source: TicketPhase,
     target: TicketPhase,
     log_label: &str,
-    verb: &str,
     error: &anyhow::Error,
 ) {
     warn!(
         ticket = %ticket.id,
         error = %error,
-        "{log_label} {verb} but transition to {target} failed — ticket stuck in {source}",
+        "{log_label}: transition to {target} failed — ticket stuck in {source}",
     );
 }
 
@@ -264,7 +261,6 @@ struct TransitionParams<'a> {
     target: TicketPhase,
     notify: NotifyPolicy,
     log_label: &'a str,
-    verb: &'a str,
 }
 
 /// Write one or more comments to a ticket, then transition it to a new phase.
@@ -310,7 +306,7 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
         &params.ticket.id,
-        &format!("{} {}", params.log_label, params.verb),
+        params.log_label,
         async |tx| {
             BoardStore::add_comment_tx(
                 tx,
@@ -341,7 +337,6 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
             params.source,
             params.target,
             params.log_label,
-            params.verb,
             &e,
         );
         return false;
@@ -974,11 +969,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         ("Agent failed", TicketPhase::Failed, NotifyPolicy::Notify)
     };
 
-    let verb = match target_phase {
-        TicketPhase::InDiagnostics => "completed",
-        _ => "failed",
-    };
-
     if !comment_and_transition(TransitionParams {
         ticket: &ticket,
         comment: CommentParam {
@@ -990,7 +980,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         target: target_phase,
         notify,
         log_label: "Engineer",
-        verb,
     })
     .await
     {
@@ -1069,7 +1058,6 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
         target: TicketPhase::Done,
         notify: notify_policy,
         log_label,
-        verb: "passed",
     })
     .await
     {
@@ -1095,7 +1083,6 @@ async fn transition_ticket_to_failed(
         target: TicketPhase::Failed,
         notify: NotifyPolicy::Notify,
         log_label,
-        verb: "failed",
     })
     .await
 }
@@ -1508,7 +1495,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             target: TicketPhase::SanitationPassed,
             notify: NotifyPolicy::Buffer,
             log_label: "Sanitation",
-            verb: "passed",
         })
         .await
         {
@@ -1550,7 +1536,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             target: TicketPhase::ReadyForDevelopment,
             notify: NotifyPolicy::Buffer,
             log_label: "Sanitation",
-            verb: "failed",
         })
         .await
         {
@@ -1634,7 +1619,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// This is a thin wrapper around [`comment_and_transition`] that fills in
 /// the shared parameters (`DIAGNOSTICS_ROLE`, `InDiagnostics` as source,
 /// `NotifyPolicy::Buffer`, and `"Diagnostics"` as log label), leaving the
-/// caller to specify the `target` phase, `comment` text, and `verb` string.
+/// caller to specify the `target` phase and `comment` text.
 ///
 /// `pipeline_reservation` is automatically derived as `Some(true)` when
 /// targeting `ReadyForDevelopment` (bounce-back transitions get priority
@@ -1647,7 +1632,6 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 async fn transition_ticket_from_diagnostics(
     ticket: &Ticket,
     comment: &str,
-    verb: &str,
     target: TicketPhase,
 ) -> bool {
     comment_and_transition(TransitionParams {
@@ -1661,7 +1645,6 @@ async fn transition_ticket_from_diagnostics(
         target,
         notify: NotifyPolicy::Buffer,
         log_label: "Diagnostics",
-        verb,
     })
     .await
 }
@@ -1727,7 +1710,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 let _ = transition_ticket_from_diagnostics(
                     &ticket,
                     &comment,
-                    "completed",
                     TicketPhase::DiagnosticsDone,
                 )
                 .await;
@@ -1747,7 +1729,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 if !transition_ticket_from_diagnostics(
                     &ticket,
                     &comment,
-                    "failed",
                     TicketPhase::ReadyForDevelopment,
                 )
                 .await
@@ -1766,7 +1747,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             let _ = transition_ticket_from_diagnostics(
                 &ticket,
                 "No diagnostics commands are configured for this workspace — diagnostics skipped.",
-                "skipped (no commands configured)",
                 TicketPhase::DiagnosticsDone,
             )
             .await;
@@ -1781,7 +1761,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             let _ = transition_ticket_from_diagnostics(
                 &ticket,
                 &format!("Could not load diagnostics commands due to a database error: {e}"),
-                "skipped (DB error)",
                 TicketPhase::DiagnosticsDone,
             )
             .await;
@@ -2125,7 +2104,6 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             TicketPhase::Analysis,
             TicketPhase::Planning,
             "Analyst",
-            "completed",
             &e,
         );
         return;
@@ -2380,16 +2358,12 @@ async fn process_verifier_verdicts(
     //   all-failed → Failed (notify, with failure comment)
     //   any-failed → ReadyForDevelopment (buffer, pipeline reservation)
     //   all-passed → verifier.success_phase (buffer)
-    let (target, notify, verb) = if all_failed {
-        (TicketPhase::Failed, NotifyPolicy::Notify, "failed")
+    let (target, notify) = if all_failed {
+        (TicketPhase::Failed, NotifyPolicy::Notify)
     } else if any_failed {
-        (
-            TicketPhase::ReadyForDevelopment,
-            NotifyPolicy::Buffer,
-            "failed",
-        )
+        (TicketPhase::ReadyForDevelopment, NotifyPolicy::Buffer)
     } else {
-        (verifier.success_phase, NotifyPolicy::Buffer, "completed")
+        (verifier.success_phase, NotifyPolicy::Buffer)
     };
 
     let pipeline_reservation = (target == TicketPhase::ReadyForDevelopment).then_some(true);
@@ -2452,7 +2426,6 @@ async fn process_verifier_verdicts(
             verifier.source_phase,
             target,
             verifier.log_label,
-            verb,
             &e,
         );
         return;
