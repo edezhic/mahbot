@@ -1552,7 +1552,7 @@ impl SettingsState {
                 field_row(
                     "API Key",
                     password_input(
-                        "sk-...",
+                        "sk-or-v1-...",
                         self.config.provider_key.as_deref().unwrap_or_default(),
                         self.password_visible.contains(&PasswordTarget::ProviderKey),
                         |v| SettingsMessage::ConfigField {

@@ -857,7 +857,7 @@ fn validate_config(config: &ConfigData) -> Result<()> {
     }
 
     if let Some(ref key) = config.provider_key
-        && key.starts_with("sk-..")
+        && key.contains("...")
     {
         anyhow::bail!("Provider key is still the placeholder value — please set a real key");
     }
@@ -1370,7 +1370,7 @@ mod tests {
     #[test]
     fn validate_config_rejects_placeholder_key() {
         let mut config = ConfigData {
-            provider_key: Some("sk-...".into()),
+            provider_key: Some("sk-or-v1-...".into()),
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
         config.finalize();
