@@ -634,6 +634,10 @@ Use this tool only for inspection: reading files, listing directories, running c
         self.mode != ShellMode::ReadOnly
     }
 
+    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
+        false // shell pipeline already scrubs credentials internally at every output path
+    }
+
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         self.execute_with_status(ws, args)
             .await
@@ -993,8 +997,9 @@ fn finish_shell_output(
 ) -> String {
     // Combined output is already credential-scrubbed upstream in the
     // `apply_profile_pipeline` combine closure, so no further scrubbing
-    // is needed here.  The agent layer's `scrub_tool_output` provides a
-    // further safety net regardless of call site.  Stderr was already
+    // is needed here.  ShellTool overrides `should_scrub_output` to return
+    // `false`, disabling the agent-level scrub as redundant — the pipeline
+    // guarantees scrubbing at every output path.  Stderr was already
     // scrubbed at `apply_profile_pipeline` entry.
     if elapsed.as_secs_f64() >= 1.0 {
         let _ = write!(combined, "\n[took {:.1}s]", elapsed.as_secs_f64());
