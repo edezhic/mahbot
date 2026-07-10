@@ -655,8 +655,7 @@ impl DiffState {
             }
 
             DiffMessage::TreeNavUp => {
-                if self.file_tree.tree_focused && self.file_tree.tree_focus_index > 0 {
-                    self.file_tree.tree_focus_index -= 1;
+                if self.file_tree.nav_up() {
                     return widgets::scroll_to_tree_focus(
                         &mut self.file_tree,
                         widgets::ScrollMode::ScrollIntoView,
@@ -666,10 +665,7 @@ impl DiffState {
             }
 
             DiffMessage::TreeNavDown => {
-                if self.file_tree.tree_focused
-                    && self.file_tree.tree_focus_index + 1 < self.file_tree.visible_tree_nodes.len()
-                {
-                    self.file_tree.tree_focus_index += 1;
+                if self.file_tree.nav_down() {
                     return widgets::scroll_to_tree_focus(
                         &mut self.file_tree,
                         widgets::ScrollMode::ScrollIntoView,
@@ -1734,72 +1730,6 @@ mod tests {
         let mut state = DiffState::new();
         let _ = state.update(DiffMessage::TreeFocusToggled);
         assert!(!state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_tree_nav_up_down() {
-        struct Case {
-            name: &'static str,
-            focused: bool,
-            start_idx: usize,
-            msg: DiffMessage,
-            expected_idx: usize,
-        }
-        // 3 visible nodes after expanding "src": ["src", "src/lib.rs", "src/main.rs"]
-        let last_idx = 2;
-
-        let cases: &[Case] = &[
-            Case {
-                name: "up_at_top_clamped",
-                focused: true,
-                start_idx: 0,
-                msg: DiffMessage::TreeNavUp,
-                expected_idx: 0,
-            },
-            Case {
-                name: "down_at_bottom_clamped",
-                focused: true,
-                start_idx: last_idx,
-                msg: DiffMessage::TreeNavDown,
-                expected_idx: last_idx,
-            },
-            Case {
-                name: "up_moves_focus",
-                focused: true,
-                start_idx: 1,
-                msg: DiffMessage::TreeNavUp,
-                expected_idx: 0,
-            },
-            Case {
-                name: "down_moves_focus",
-                focused: true,
-                start_idx: 0,
-                msg: DiffMessage::TreeNavDown,
-                expected_idx: 1,
-            },
-            Case {
-                name: "ignored_when_not_focused",
-                focused: false,
-                start_idx: 0,
-                msg: DiffMessage::TreeNavDown,
-                expected_idx: 0,
-            },
-        ];
-        for case in cases {
-            let mut state = make_diff_with_tree();
-            // Pre-expand "src" for all cases so the tree has >1 visible node.
-            state.file_tree.expanded_dirs.insert("src".to_string());
-            state.file_tree.nodes = build_tree(&state.diff_files);
-            state.file_tree.rebuild_visible();
-            state.file_tree.tree_focused = case.focused;
-            state.file_tree.tree_focus_index = case.start_idx;
-            let _ = state.update(case.msg.clone());
-            assert_eq!(
-                state.file_tree.tree_focus_index, case.expected_idx,
-                "case: {}",
-                case.name
-            );
-        }
     }
 
     #[test]

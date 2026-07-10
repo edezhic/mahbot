@@ -414,66 +414,6 @@ fn test_tree_focus_toggled_empty_tree_stays_off() {
 }
 
 #[test]
-fn test_tree_nav_up_down() {
-    struct Case {
-        name: &'static str,
-        focused: bool,
-        start_idx: usize,
-        msg: EditorMessage,
-        expected_idx: usize,
-    }
-    let last_idx = make_editor_with_tree().file_tree.visible_tree_nodes.len() - 1;
-    let cases: &[Case] = &[
-        Case {
-            name: "up_at_top_clamped",
-            focused: true,
-            start_idx: 0,
-            msg: EditorMessage::TreeNavUp,
-            expected_idx: 0,
-        },
-        Case {
-            name: "down_at_bottom_clamped",
-            focused: true,
-            start_idx: last_idx,
-            msg: EditorMessage::TreeNavDown,
-            expected_idx: last_idx,
-        },
-        Case {
-            name: "up_moves_focus",
-            focused: true,
-            start_idx: 1,
-            msg: EditorMessage::TreeNavUp,
-            expected_idx: 0,
-        },
-        Case {
-            name: "down_moves_focus",
-            focused: true,
-            start_idx: 0,
-            msg: EditorMessage::TreeNavDown,
-            expected_idx: 1,
-        },
-        Case {
-            name: "ignored_when_not_focused",
-            focused: false,
-            start_idx: 0,
-            msg: EditorMessage::TreeNavDown,
-            expected_idx: 0,
-        },
-    ];
-    for case in cases {
-        let mut state = make_editor_with_tree();
-        state.file_tree.tree_focused = case.focused;
-        state.file_tree.tree_focus_index = case.start_idx;
-        let _ = state.update(case.msg.clone());
-        assert_eq!(
-            state.file_tree.tree_focus_index, case.expected_idx,
-            "case: {}",
-            case.name
-        );
-    }
-}
-
-#[test]
 fn test_misc_focus_actions() {
     struct Case {
         name: &'static str,

@@ -4448,29 +4448,15 @@ impl EditorState {
             return Task::none();
         }
         // Navigate the file tree focus index.
-        if self.file_tree.tree_focused {
-            match *direction {
-                TreeNavDirection::Up if self.file_tree.tree_focus_index > 0 => {
-                    self.file_tree.tree_focus_index -= 1;
-                    return widgets::scroll_to_tree_focus(
-                        &mut self.file_tree,
-                        widgets::ScrollMode::ScrollIntoView,
-                    );
-                }
-                TreeNavDirection::Down
-                    if self.file_tree.tree_focus_index + 1
-                        < self.file_tree.visible_tree_nodes.len() =>
-                {
-                    self.file_tree.tree_focus_index += 1;
-                    return widgets::scroll_to_tree_focus(
-                        &mut self.file_tree,
-                        widgets::ScrollMode::ScrollIntoView,
-                    );
-                }
-                _ => {}
-            }
+        let moved = match *direction {
+            TreeNavDirection::Up => self.file_tree.nav_up(),
+            TreeNavDirection::Down => self.file_tree.nav_down(),
+        };
+        if moved {
+            widgets::scroll_to_tree_focus(&mut self.file_tree, widgets::ScrollMode::ScrollIntoView)
+        } else {
+            Task::none()
         }
-        Task::none()
     }
 
     #[allow(clippy::too_many_lines)]

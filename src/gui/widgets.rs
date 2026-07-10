@@ -291,6 +291,32 @@ impl FileTree {
         }
     }
 
+    /// Move focus up one visible node. Returns `true` if focus moved.
+    ///
+    /// No-op when the tree is not focused, or when already at the top.
+    #[must_use]
+    pub fn nav_up(&mut self) -> bool {
+        if self.tree_focused && self.tree_focus_index > 0 {
+            self.tree_focus_index -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move focus down one visible node. Returns `true` if focus moved.
+    ///
+    /// No-op when the tree is not focused, or when already at the bottom.
+    #[must_use]
+    pub fn nav_down(&mut self) -> bool {
+        if self.tree_focused && self.tree_focus_index + 1 < self.visible_tree_nodes.len() {
+            self.tree_focus_index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Recursively flatten tree nodes, respecting expanded state.
     fn flatten_tree_nodes(
         nodes: &[TreeNode],
@@ -851,6 +877,100 @@ mod tests {
         assert_eq!(idx, 0);
         assert_eq!(path, "src");
         assert!(is_dir);
+    }
+
+    // ── nav_up / nav_down tests ──────────────────────────────────────
+
+    #[test]
+    fn nav_up_at_top_clamped() {
+        let mut tree = make_tree(vec![("a", false), ("b", false)]);
+        tree.tree_focused = true;
+        tree.tree_focus_index = 0;
+        assert!(!tree.nav_up());
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn nav_down_at_bottom_clamped() {
+        let mut tree = make_tree(vec![("a", false), ("b", false)]);
+        tree.tree_focused = true;
+        tree.tree_focus_index = 1;
+        assert!(!tree.nav_down());
+        assert_eq!(tree.tree_focus_index, 1);
+    }
+
+    #[test]
+    fn nav_up_moves_focus() {
+        let mut tree = make_tree(vec![("a", false), ("b", false)]);
+        tree.tree_focused = true;
+        tree.tree_focus_index = 1;
+        assert!(tree.nav_up());
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    #[test]
+    fn nav_down_moves_focus() {
+        let mut tree = make_tree(vec![("a", false), ("b", false)]);
+        tree.tree_focused = true;
+        tree.tree_focus_index = 0;
+        assert!(tree.nav_down());
+        assert_eq!(tree.tree_focus_index, 1);
+    }
+
+    #[test]
+    fn nav_ignored_when_not_focused() {
+        let mut tree = make_tree(vec![("a", false), ("b", false)]);
+        tree.tree_focus_index = 0;
+        assert!(!tree.nav_down());
+        assert_eq!(tree.tree_focus_index, 0);
+        assert!(!tree.nav_up());
+        assert_eq!(tree.tree_focus_index, 0);
+    }
+
+    // ── rebuild_visible clamping tests ────────────────────────────────
+
+    #[test]
+    fn rebuild_visible_clamps_high_focus_index() {
+        let mut tree = FileTree::new(iced::widget::Id::new("test"));
+        tree.nodes = vec![
+            TreeNode {
+                name: "a".into(),
+                full_path: "a".into(),
+                is_dir: false,
+                children: vec![],
+                error: None,
+            },
+            TreeNode {
+                name: "b".into(),
+                full_path: "b".into(),
+                is_dir: false,
+                children: vec![],
+                error: None,
+            },
+            TreeNode {
+                name: "c".into(),
+                full_path: "c".into(),
+                is_dir: false,
+                children: vec![],
+                error: None,
+            },
+        ];
+        tree.rebuild_visible();
+        assert_eq!(tree.visible_tree_nodes.len(), 3);
+        tree.tree_focus_index = 999;
+        tree.rebuild_visible();
+        assert_eq!(tree.tree_focus_index, 2);
+    }
+
+    #[test]
+    fn rebuild_visible_empty_tree_resets_focus_index() {
+        let mut tree = make_tree(vec![("a", false)]);
+        tree.tree_focus_index = 0;
+        tree.nodes.clear();
+        tree.expanded_dirs.clear();
+        tree.rebuild_visible();
+        assert!(tree.visible_tree_nodes.is_empty());
+        assert_eq!(tree.tree_focus_index, 0);
     }
 
     // ── focused_is_expanded_dir tests ────────────────────────────────
