@@ -480,14 +480,12 @@ impl DiffState {
                 self.file_tree.tree_focused = true;
                 if self.file_tree.expanded_dirs.contains(&path) {
                     self.file_tree.expanded_dirs.remove(&path);
-                    self.file_tree.nodes = build_tree(&self.diff_files);
                     return self
                         .file_tree
                         .collapse_dir_and_keep_focus::<DiffMessage>(&path);
                 }
                 self.file_tree.expanded_dirs.insert(path.clone());
-                // Expand: rebuild, keep focus on the directory (don't advance).
-                self.file_tree.nodes = build_tree(&self.diff_files);
+                // Expand: rebuild visible tree, keep focus on the directory (don't advance).
                 self.file_tree.rebuild_visible();
                 self.file_tree.focus_path(&path);
                 Task::none()
@@ -665,9 +663,8 @@ impl DiffState {
                     return Task::none();
                 };
                 if self.file_tree.focused_is_expanded_dir() {
-                    // Collapse: rebuild and keep focus on the collapsed directory.
+                    // Collapse and keep focus on the collapsed directory.
                     self.file_tree.expanded_dirs.remove(&path);
-                    self.file_tree.nodes = build_tree(&self.diff_files);
                     return self
                         .file_tree
                         .collapse_dir_and_keep_focus::<DiffMessage>(&path);
@@ -675,7 +672,6 @@ impl DiffState {
                 if is_dir {
                     // Expand directory and move focus to the first child.
                     self.file_tree.expanded_dirs.insert(path.clone());
-                    self.file_tree.nodes = build_tree(&self.diff_files);
                     return self
                         .file_tree
                         .expand_dir_and_focus_first_child::<DiffMessage>(&path);
@@ -692,7 +688,6 @@ impl DiffState {
                 if self.file_tree.focused_is_expanded_dir() {
                     // Collapse expanded directory and keep focus on it.
                     self.file_tree.expanded_dirs.remove(&path);
-                    self.file_tree.nodes = build_tree(&self.diff_files);
                     return self
                         .file_tree
                         .collapse_dir_and_keep_focus::<DiffMessage>(&path);
@@ -724,7 +719,6 @@ impl DiffState {
                 if !self.file_tree.expanded_dirs.contains(&path) {
                     // Expand directory and move focus to the first child.
                     self.file_tree.expanded_dirs.insert(path.clone());
-                    self.file_tree.nodes = build_tree(&self.diff_files);
                     return self
                         .file_tree
                         .expand_dir_and_focus_first_child::<DiffMessage>(&path);
