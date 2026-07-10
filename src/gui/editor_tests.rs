@@ -891,6 +891,7 @@ fn test_is_find_bar_open_no_tabs() {
     assert!(!state.is_find_bar_open());
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn test_find_replace_auto_advance() {
     // Verifies cursor auto-advance after find_replace across five scenarios:
@@ -1020,7 +1021,7 @@ fn test_find_replace_auto_advance() {
             c.name,
         );
         for (i, &(s, e)) in c.expected_matches.iter().enumerate() {
-            assert_eq!(frs.matches[i], s..e, "{}: match {i} range", c.name,);
+            assert_eq!(frs.matches[i], s..e, "{}: match {i} range", c.name);
         }
         let cursor = tab.content.cursor();
         assert_eq!(
