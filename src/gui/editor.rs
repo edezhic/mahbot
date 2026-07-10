@@ -913,6 +913,19 @@ fn validate_file_content(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Helper to construct a `FileLoaded` message.
+fn file_loaded_msg(
+    path: String,
+    r#gen: u64,
+    result: Result<FileLoadData, String>,
+) -> EditorMessage {
+    EditorMessage::FileLoaded {
+        path,
+        r#gen,
+        result,
+    }
+}
+
 /// Load a file's contents from disk with detection of indent style, line
 /// ending, and trailing newline.
 async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
@@ -920,50 +933,42 @@ async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
     let metadata = match tokio::fs::metadata(&full_path).await {
         Ok(m) => m,
         Err(e) => {
-            return EditorMessage::FileLoaded {
-                path: full_path,
+            return file_loaded_msg(
+                full_path,
                 r#gen,
-                result: Err(format!("Cannot read file metadata: {e}")),
-            };
+                Err(format!("Cannot read file metadata: {e}")),
+            );
         }
     };
     if metadata.len() > MAX_FILE_SIZE {
-        return EditorMessage::FileLoaded {
-            path: full_path,
+        return file_loaded_msg(
+            full_path,
             r#gen,
-            result: Err(format!(
+            Err(format!(
                 "File too large ({} bytes, max {MAX_FILE_SIZE})",
                 metadata.len()
             )),
-        };
+        );
     }
 
     let bytes = match tokio::fs::read(&full_path).await {
         Ok(b) => b,
         Err(e) => {
-            return EditorMessage::FileLoaded {
-                path: full_path,
-                r#gen,
-                result: Err(format!("Cannot read file: {e}")),
-            };
+            return file_loaded_msg(full_path, r#gen, Err(format!("Cannot read file: {e}")));
         }
     };
 
     // Size and binary content validation.
     if let Err(e) = validate_file_content(&bytes) {
-        return EditorMessage::FileLoaded {
-            path: full_path,
-            r#gen,
-            result: Err(e),
-        };
+        return file_loaded_msg(full_path, r#gen, Err(e));
     }
     // UTF-8 validation for binary detection.
     let Ok(text) = String::from_utf8(bytes) else {
-        return EditorMessage::FileLoaded {
-            path: full_path,
+        return file_loaded_msg(
+            full_path,
             r#gen,
-            result: Err("Binary file detected (invalid UTF-8)".to_string()),
-        };
+            Err("Binary file detected (invalid UTF-8)".to_string()),
+        );
     };
 
     let data = FileLoadData {
@@ -972,11 +977,7 @@ async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
         line_ending: detect_line_ending(&text),
         text,
     };
-    EditorMessage::FileLoaded {
-        path: data.path.clone(),
-        r#gen,
-        result: Ok(data),
-    }
+    file_loaded_msg(data.path.clone(), r#gen, Ok(data))
 }
 
 /// Spawn a file load from disk and return a `Task` that produces
