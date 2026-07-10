@@ -57,6 +57,7 @@ fn build_chat_message(
     content: String,
     direction: ChatDirection,
     agent_role: Option<String>,
+    is_optimistic: bool,
 ) -> ChatMessage {
     use iced::widget::markdown;
     let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
@@ -68,7 +69,7 @@ fn build_chat_message(
         direction,
         agent_role,
         md_items,
-        is_optimistic: false,
+        is_optimistic,
     }
 }
 
@@ -470,6 +471,7 @@ impl HomeState {
                     content.to_string(),
                     direction,
                     agent_role.map(std::string::ToString::to_string),
+                    false,
                 );
                 // Track the canonical ID for dedup — the optimistic ID was
                 // never added to seen_ids.
@@ -564,7 +566,7 @@ impl HomeState {
         }
 
         self.messages.push(build_chat_message(
-            message_id, user_name, content, direction, agent_role,
+            message_id, user_name, content, direction, agent_role, false,
         ));
     }
 
@@ -1297,18 +1299,14 @@ impl HomeState {
         // Push optimistic message immediately so the user sees their own
         // message without waiting for the pipeline round-trip.
         if let Some(ref opt_id) = optimistic_id {
-            use iced::widget::markdown;
-            let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
-            self.messages.push(ChatMessage {
-                id: None,
-                message_id: opt_id.clone(),
-                user_name: sender.clone(),
-                content: content.clone(),
-                direction: ChatDirection::User,
-                agent_role: None,
-                md_items,
-                is_optimistic: true,
-            });
+            self.messages.push(build_chat_message(
+                opt_id.clone(),
+                sender.clone(),
+                content.clone(),
+                ChatDirection::User,
+                None,
+                true,
+            ));
         }
 
         let msg = crate::ChannelMessage {
