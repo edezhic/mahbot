@@ -279,9 +279,7 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
 /// → truncate to [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
 fn append_output_tail(msg: &mut String, label: &str, data: &[u8]) {
     if !data.is_empty() {
-        let decoded = String::from_utf8_lossy(data);
-        let stripped = strip_ansi_escapes(&decoded);
-        let scrubbed = scrub_credentials(&stripped);
+        let scrubbed = strip_and_scrub(data);
         let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
         let _ = write!(
             msg,
@@ -1606,6 +1604,25 @@ fn strip_ansi_escapes(input: &str) -> String {
     RE.replace_all(input, "").to_string()
 }
 
+/// Decode raw shell output bytes (lossy UTF-8), strip ANSI escape sequences,
+/// then scrub credentials.
+///
+/// This is the canonical conversion from raw command output (`&[u8]`) to
+/// a sanitized string. Use this whenever you need to process raw shell
+/// bytes into display-safe text.
+///
+/// # When to skip this helper
+///
+/// - **`clean_truncate`** intentionally only strips ANSI escapes (no scrubbing)
+///   because credential scrubbing happens later in the output pipeline
+///   ([`apply_profile_pipeline`]). It uses `strip_ansi_escapes` + `truncate_sandwich`
+///   directly — that is a distinct operation with a different post-processing contract.
+fn strip_and_scrub(data: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(data);
+    let stripped = strip_ansi_escapes(&decoded);
+    scrub_credentials(&stripped)
+}
+
 /// Strip ANSI escape sequences first, then truncate to [`MAX_OUTPUT_BYTES`].
 ///
 /// Applying [`truncate_sandwich`] after ANSI stripping guarantees that
@@ -1878,16 +1895,15 @@ fn save_full_output_if_large(
         .as_secs();
     let filename = format!("{epoch}_{slug}.full.log");
 
-    // Combine stdout + stderr with labels, strip ANSI escapes, scrub credentials
+    // Combine stdout + stderr with labels, strip ANSI escapes, scrub credentials.
     // Order: strip first, then scrub — prevents ANSI-obfuscated credentials
-    // from bypassing the regex-based scrubber, and matches append_output_tail.
+    // from bypassing the regex-based scrubber.
     let raw = format!(
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(stdout_bytes),
         String::from_utf8_lossy(stderr_bytes)
     );
-    let stripped = strip_ansi_escapes(&raw);
-    let scrubbed = scrub_credentials(&stripped);
+    let scrubbed = strip_and_scrub(raw.as_bytes());
     let line_count = scrubbed.lines().count();
     let byte_count = scrubbed.len();
     let path = write_to_spill(&scrubbed, &filename)?;
