@@ -743,11 +743,8 @@ impl HomeState {
                 // (e.g. treating 'z' as an Insert character).
                 // On macOS, only Cmd+Z (not Ctrl+Z) triggers undo; Ctrl+Z is
                 // the terminal SUSP character and should insert 'z'.
-                let is_intercept_z = if cfg!(target_os = "macos") {
-                    key_press.modifiers.command() && !key_press.modifiers.control()
-                } else {
-                    key_press.modifiers.command() || key_press.modifiers.control()
-                };
+                let km = super::detect_keyboard_mods(key_press.modifiers);
+                let is_intercept_z = km.is_shortcut_platform_mod();
                 if is_intercept_z {
                     if matches!(
                         &key_press.key,
