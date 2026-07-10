@@ -186,7 +186,7 @@ enum NotifyPolicy {
 
 /// Notification side-effect after a successful ticket transition. Parameters
 /// follow the `(source, target)` convention; `source` feeds the buffer entry
-/// when buffering, and `log_label` distinguishes callers in logs.
+/// when buffering.
 ///
 /// `failure_comment` is meaningful only when `target == TicketPhase::Failed` and
 /// `notify == NotifyPolicy::Notify` — it carries the failure detail text that
@@ -198,7 +198,6 @@ async fn dispatch_notification(
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
-    _log_label: &str,
     failure_comment: Option<&str>,
 ) {
     match notify {
@@ -355,7 +354,6 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
         params.source,
         params.target,
         params.notify,
-        params.log_label,
         failure_comment,
     )
     .await;
@@ -1255,15 +1253,7 @@ async fn finalize_commit_and_transition(
         info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
 
         let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-        dispatch_notification(
-            ticket,
-            source,
-            TicketPhase::Done,
-            notify_policy,
-            "finalize_commit_and_transition",
-            None,
-        )
-        .await;
+        dispatch_notification(ticket, source, TicketPhase::Done, notify_policy, None).await;
     } else {
         warn!(
             ticket = %ticket.id,
@@ -2148,7 +2138,6 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
         TicketPhase::Analysis,
         TicketPhase::Planning,
         NotifyPolicy::Notify,
-        "Analyst",
         None,
     )
     .await;
@@ -2476,7 +2465,6 @@ async fn process_verifier_verdicts(
         verifier.source_phase,
         target,
         notify,
-        verifier.log_label,
         failure_comment.as_deref(),
     )
     .await;
