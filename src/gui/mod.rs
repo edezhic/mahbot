@@ -33,7 +33,6 @@ pub mod widgets;
 pub mod workspaces;
 
 use crate::board::{Ticket, TicketPhase};
-use crate::gui::tool_failures::ToolFailuresMessage;
 use crate::logs::LogStore;
 
 use iced::keyboard;
@@ -300,10 +299,7 @@ impl Message {
     pub(crate) fn as_toast(&self) -> Option<&ToastMessage> {
         match self {
             Message::Home(home::HomeMessage::Toast(tm))
-            | Message::Logs(
-                logs::LogMessage::Toast(tm)
-                | logs::LogMessage::ToolFailures(ToolFailuresMessage::Toast(tm)),
-            )
+            | Message::Logs(logs::LogMessage::Toast(tm))
             | Message::Board(board::BoardMessage::Toast(tm))
             | Message::DiffModal(diff::DiffMessage::Toast(tm))
             | Message::Git(git::GitMessage::Toast(tm))

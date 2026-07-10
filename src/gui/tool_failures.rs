@@ -27,8 +27,6 @@ pub enum ToolFailuresMessage {
     NextPage,
     /// Dismiss modals/panels (Escape key).
     Escape,
-    /// Request toast notification.
-    Toast(super::ToastMessage),
 }
 
 pub struct ToolFailuresState {
@@ -103,7 +101,6 @@ impl ToolFailuresState {
             // PrevPage and NextPage are handled by LogsState which passes
             // filter parameters directly via prev_page()/next_page() methods.
             ToolFailuresMessage::Escape
-            | ToolFailuresMessage::Toast(_)
             | ToolFailuresMessage::PrevPage
             | ToolFailuresMessage::NextPage => Task::none(),
         }
