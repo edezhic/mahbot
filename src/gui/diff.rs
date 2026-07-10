@@ -16,8 +16,8 @@ use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 
 use crate::diff_parse::{DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff};
 use crate::git_commands::{
-    CommitInfo, git_has_commits, git_is_installed, is_git_repo, parse_untracked_from_porcelain,
-    run_git_command, run_git_commit, run_git_diff, run_git_show, run_git_status,
+    CommitInfo, DiscardTarget, git_discard, git_has_commits, git_is_installed, is_git_repo,
+    parse_untracked_from_porcelain, run_git_commit, run_git_diff, run_git_show, run_git_status,
 };
 
 use iced::widget::Id;
@@ -91,14 +91,6 @@ pub(super) fn compute_truncation_index(
 
 const FILE_HEADER_COLOR: Color = theme::STATUS_WARNING;
 const RENAME_COLOR: Color = theme::ACCENT_LIGHT;
-
-/// Whether to discard changes in a single file or an entire directory tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiscardTarget {
-    File,
-    /// Recursively discard all changes within a directory (and its subdirectories).
-    Directory,
-}
 
 #[derive(Debug, Clone)]
 pub enum DiffMessage {
@@ -613,57 +605,7 @@ impl DiffState {
                 Task::perform(
                     async move {
                         let ws_path_buf = resolve_workspace_path(&ws_name, ws_path).await?;
-
-                        // Three-step git command sequence to handle ALL file states:
-                        //
-                        // 1. git checkout HEAD -- <path>
-                        //    — restores tracked files from HEAD (handles Modified, Deleted,
-                        //      Renamed). For files staged in the index (Added) that don't
-                        //      exist in HEAD, checkout removes them from both index and
-                        //      working tree. Untracked files fail with "did not match" —
-                        //      absorbed below.
-                        //
-                        // 2. git reset HEAD -- <path>
-                        //    — unstages staged new (Added) files so that `git clean` can
-                        //      remove them. For files already restored by checkout this is
-                        //      a no-op. Errors (e.g. untracked files not in index) are
-                        //      absorbed.
-                        //
-                        // 3. git clean -f[d] -- <path>
-                        //    — removes untracked files. -f for files, -fd for directories
-                        //      (recurses into subdirectories). Errors (file already tracked,
-                        //      already removed by checkout) are absorbed.
-                        //
-                        // All errors from all three steps are absorbed. After the sequence,
-                        // we verify via `git status --porcelain -- <path>`: if empty, success;
-                        // otherwise report the remaining changes.
-                        //
-                        // Note: `git reset HEAD` also exists with non-zero status when the
-                        // path is outside the repository — we rely on the workspace-bound
-                        // path validation to prevent this.
-
-                        let _ =
-                            run_git_command(&ws_path_buf, &["checkout", "HEAD", "--", &path]).await;
-
-                        let _ =
-                            run_git_command(&ws_path_buf, &["reset", "HEAD", "--", &path]).await;
-
-                        let clean_args: &[&str] = match target {
-                            DiscardTarget::Directory => &["clean", "-fd", "--", &path],
-                            DiscardTarget::File => &["clean", "-f", "--", &path],
-                        };
-                        let _ = run_git_command(&ws_path_buf, clean_args).await;
-
-                        // Verify: check if any changes remain.
-                        match run_git_command(&ws_path_buf, &["status", "--porcelain", "--", &path])
-                            .await
-                        {
-                            Ok(status) if status.trim().is_empty() => Ok(()),
-                            Ok(status) => {
-                                Err(format!("Changes remain after discard:\n{}", status.trim()))
-                            }
-                            Err(e) => Err(format!("Discard ran but verification failed: {e}")),
-                        }
+                        git_discard(&ws_path_buf, &path, target).await
                     },
                     DiffMessage::DiscardResult,
                 )

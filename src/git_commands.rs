@@ -30,6 +30,14 @@ impl CommitInfo {
     }
 }
 
+/// Whether to discard changes in a single file or an entire directory tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardTarget {
+    File,
+    /// Recursively discard all changes within a directory (and its subdirectories).
+    Directory,
+}
+
 /// Check if a directory contains a `.git` entry (file for worktrees, directory otherwise).
 #[must_use]
 pub fn is_git_repo(path: &Path) -> bool {
@@ -447,6 +455,55 @@ pub async fn run_git_sync(repo_path: &Path) -> Result<String, String> {
         format!("{pull_out}\n{push_out}")
     };
     Ok(combined)
+}
+
+/// Discard all changes to a path — restores tracked files from HEAD, unstages
+/// staged new files, and removes untracked files. Uses a 3-step git command
+/// sequence to handle ALL file states:
+///
+/// 1. `git checkout HEAD -- <path>`
+///    — restores tracked files from HEAD (handles Modified, Deleted, Renamed).
+///    For files staged in the index (Added) that don't exist in HEAD, checkout
+///    removes them from both index and working tree. Untracked files fail with
+///    "did not match" — absorbed below.
+///
+/// 2. `git reset HEAD -- <path>`
+///    — unstages staged new (Added) files so that `git clean` can remove them.
+///    For files already restored by checkout this is a no-op. Errors
+///    (e.g. untracked files not in index) are absorbed.
+///
+/// 3. `git clean -f[d] -- <path>`
+///    — removes untracked files. `-f` for files, `-fd` for directories (recurses
+///    into subdirectories). Errors (file already tracked, already removed by
+///    checkout) are absorbed.
+///
+/// All errors from all three steps are absorbed. After the sequence, the working
+/// tree is verified via `git status --porcelain -- <path>`: if the output is
+/// empty the operation succeeded; otherwise the remaining changes are reported.
+///
+/// Note: `git reset HEAD` also exits with non-zero status when the path is
+/// outside the repository — callers should validate paths before calling this.
+pub async fn git_discard(
+    repo_path: &Path,
+    path: &str,
+    target: DiscardTarget,
+) -> Result<(), String> {
+    let _ = run_git_command(repo_path, &["checkout", "HEAD", "--", path]).await;
+
+    let _ = run_git_command(repo_path, &["reset", "HEAD", "--", path]).await;
+
+    let clean_args: &[&str] = match target {
+        DiscardTarget::Directory => &["clean", "-fd", "--", path],
+        DiscardTarget::File => &["clean", "-f", "--", path],
+    };
+    let _ = run_git_command(repo_path, clean_args).await;
+
+    // Verify: check if any changes remain.
+    match run_git_command(repo_path, &["status", "--porcelain", "--", path]).await {
+        Ok(status) if status.trim().is_empty() => Ok(()),
+        Ok(status) => Err(format!("Changes remain after discard:\n{}", status.trim())),
+        Err(e) => Err(format!("Discard ran but verification failed: {e}")),
+    }
 }
 
 /// Get the last commit's message via `git log -1 --format=%s`.
@@ -1045,5 +1102,102 @@ AM staged_then_modified.js
             ignored.is_empty(),
             "Empty path list should produce empty result"
         );
+    }
+
+    // ── git_discard — discard modifications ──
+
+    /// Discard changes to a modified tracked file — restores it to HEAD.
+    #[tokio::test]
+    async fn test_git_discard_modified_file() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Modify the tracked file.
+        std::fs::write(repo_path.join("test.txt"), b"modified content\n")
+            .expect("write modified file");
+
+        // Confirm file is dirty.
+        let status = run_git_command(&repo_path, &["status", "--porcelain", "test.txt"])
+            .await
+            .expect("status before discard");
+        assert!(
+            !status.trim().is_empty(),
+            "file should be dirty before discard"
+        );
+
+        // Discard the modification.
+        git_discard(&repo_path, "test.txt", DiscardTarget::File)
+            .await
+            .expect("git_discard should succeed");
+
+        // File should be clean now.
+        let status = run_git_command(&repo_path, &["status", "--porcelain", "test.txt"])
+            .await
+            .expect("status after discard");
+        assert!(
+            status.trim().is_empty(),
+            "file should be clean after discard"
+        );
+
+        // Content should match the committed version.
+        let content = std::fs::read_to_string(repo_path.join("test.txt")).expect("read file");
+        assert_eq!(
+            content, "line1\nline2\nline3\n",
+            "content should be restored to HEAD"
+        );
+    }
+
+    /// Discard a new untracked file — removes it from the working tree.
+    #[tokio::test]
+    async fn test_git_discard_new_file() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create a new untracked file.
+        let new_path = repo_path.join("new_file.rs");
+        std::fs::write(&new_path, b"fn new() {}").expect("write new file");
+        assert!(new_path.exists(), "new file should exist before discard");
+
+        // Discard the untracked file.
+        git_discard(&repo_path, "new_file.rs", DiscardTarget::File)
+            .await
+            .expect("git_discard should succeed");
+
+        // File should be removed.
+        assert!(
+            !new_path.exists(),
+            "new file should be removed after discard"
+        );
+    }
+
+    /// Discard a directory with untracked content — recursively removes it.
+    #[tokio::test]
+    async fn test_git_discard_directory() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create a directory with an untracked file inside.
+        let sub_dir = repo_path.join("subdir");
+        std::fs::create_dir(&sub_dir).expect("create subdir");
+        let sub_file = sub_dir.join("nested.rs");
+        std::fs::write(&sub_file, b"fn nested() {}").expect("write nested file");
+        assert!(sub_file.exists(), "nested file should exist before discard");
+
+        // Discard the directory.
+        git_discard(&repo_path, "subdir", DiscardTarget::Directory)
+            .await
+            .expect("git_discard should succeed");
+
+        // Directory and its contents should be gone.
+        assert!(
+            !sub_dir.exists(),
+            "directory should be removed after discard"
+        );
+    }
+
+    /// Discard a clean file — succeeds as a no-op.
+    #[tokio::test]
+    async fn test_git_discard_clean_file() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        let result = git_discard(&repo_path, "test.txt", DiscardTarget::File).await;
+        assert!(result.is_ok(), "discarding a clean file should succeed");
     }
 }
