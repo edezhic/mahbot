@@ -1970,7 +1970,7 @@ async fn record_verdict_comments_tx(
     for (i, r) in results.iter().enumerate() {
         let role_label = format!("{role_str}_{}", i + 1);
         if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-            BoardStore::add_comment_tx(tx, ticket_id, &role_label, &comment).await?;
+            BoardStore::insert_comment_tx(tx, ticket_id, &role_label, &comment).await?;
         }
     }
     Ok(())
