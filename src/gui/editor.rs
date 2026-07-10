@@ -389,18 +389,21 @@ fn compute_text_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Ra
 }
 
 /// Direction for navigating between find matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FindDirection {
     Next,
     Prev,
 }
 
 /// Direction for navigating the file tree, global search results, or quick-open list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeNavDirection {
     Up,
     Down,
 }
 
 /// Direction for switching tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabDirection {
     Next,
     Prev,
@@ -1890,7 +1893,7 @@ impl EditorState {
     /// Switch to the tab one step in the given direction, wrapping around.
     /// Returns `Task::none()` if a modal overlay is active or if there is
     /// only one tab.
-    fn switch_tab_relative(&mut self, direction: &TabDirection) -> Task<EditorMessage> {
+    fn switch_tab_relative(&mut self, direction: TabDirection) -> Task<EditorMessage> {
         if self.modal_overlay_blocks_editor_shortcuts() || self.tabs.len() <= 1 {
             return Task::none();
         }
@@ -2291,8 +2294,8 @@ impl EditorState {
             EditorMessage::QuickOpenSelect(idx) => self.quick_open_select(idx),
 
             // ── Tab switching ─────────────────────────────────────────
-            EditorMessage::TabSwitchNext => self.switch_tab_relative(&TabDirection::Next),
-            EditorMessage::TabSwitchPrev => self.switch_tab_relative(&TabDirection::Prev),
+            EditorMessage::TabSwitchNext => self.switch_tab_relative(TabDirection::Next),
+            EditorMessage::TabSwitchPrev => self.switch_tab_relative(TabDirection::Prev),
 
             EditorMessage::CloseActiveTab => self.close_active_tab(),
 
@@ -2303,9 +2306,9 @@ impl EditorState {
                 self.tree_scrolled(scroll_y, viewport_h)
             }
 
-            EditorMessage::TreeNavUp => self.navigate_tree_vertical(&TreeNavDirection::Up),
+            EditorMessage::TreeNavUp => self.navigate_tree_vertical(TreeNavDirection::Up),
 
-            EditorMessage::TreeNavDown => self.navigate_tree_vertical(&TreeNavDirection::Down),
+            EditorMessage::TreeNavDown => self.navigate_tree_vertical(TreeNavDirection::Down),
 
             EditorMessage::TreeNavEnter => self.tree_nav_enter(),
 
@@ -2323,9 +2326,9 @@ impl EditorState {
 
             EditorMessage::FindReplaceInput(replace) => self.find_replace_input(replace),
 
-            EditorMessage::FindNext => self.navigate_find_match(&FindDirection::Next),
+            EditorMessage::FindNext => self.navigate_find_match(FindDirection::Next),
 
-            EditorMessage::FindPrev => self.navigate_find_match(&FindDirection::Prev),
+            EditorMessage::FindPrev => self.navigate_find_match(FindDirection::Prev),
 
             EditorMessage::FindReplace => self.find_replace(),
 
@@ -4379,7 +4382,7 @@ impl EditorState {
 
     /// Navigate to the next or previous find match in the active tab.
     /// Returns silently if there is no active tab, no find state, or no matches.
-    fn navigate_find_match(&mut self, direction: &FindDirection) -> Task<EditorMessage> {
+    fn navigate_find_match(&mut self, direction: FindDirection) -> Task<EditorMessage> {
         let Some((_, path)) = self.active_tab() else {
             return Task::none();
         };
@@ -4415,9 +4418,9 @@ impl EditorState {
     fn navigate_search_results(
         selected_index: &mut usize,
         results_len: usize,
-        direction: &TreeNavDirection,
+        direction: TreeNavDirection,
     ) {
-        match *direction {
+        match direction {
             TreeNavDirection::Up if *selected_index > 0 => *selected_index -= 1,
             TreeNavDirection::Down if *selected_index + 1 < results_len => *selected_index += 1,
             _ => {}
@@ -4429,7 +4432,7 @@ impl EditorState {
     /// Handles global-search results, quick-open results, and file-tree focus
     /// in priority order. Only the file-tree path returns a scroll-to-focus
     /// task; the overlay paths return `Task::none()`.
-    fn navigate_tree_vertical(&mut self, direction: &TreeNavDirection) -> Task<EditorMessage> {
+    fn navigate_tree_vertical(&mut self, direction: TreeNavDirection) -> Task<EditorMessage> {
         // When global search is active, navigate the results list.
         if let Some(ModalKind::GlobalSearch(ref mut gs)) = self.active_modal {
             Self::navigate_search_results(&mut gs.selected_index, gs.results.len(), direction);
@@ -4448,7 +4451,7 @@ impl EditorState {
             return Task::none();
         }
         // Navigate the file tree focus index.
-        let moved = match *direction {
+        let moved = match direction {
             TreeNavDirection::Up => self.file_tree.nav_up(),
             TreeNavDirection::Down => self.file_tree.nav_down(),
         };

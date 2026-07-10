@@ -1069,13 +1069,13 @@ fn test_navigate_find_match_wraps_next() {
     );
 
     // Navigate next from index 0 → 1.
-    let _ = state.navigate_find_match(&FindDirection::Next);
+    let _ = state.navigate_find_match(FindDirection::Next);
     let frs = state.tab_contents.get("/test.rs").unwrap();
     let s = frs.find_replace_state.as_ref().unwrap();
     assert_eq!(s.current_match_idx, 1);
 
     // Navigate next from index 1 → wraps to 0.
-    let _ = state.navigate_find_match(&FindDirection::Next);
+    let _ = state.navigate_find_match(FindDirection::Next);
     let s = state.tab_contents.get("/test.rs").unwrap();
     let s = s.find_replace_state.as_ref().unwrap();
     assert_eq!(s.current_match_idx, 0);
@@ -1109,13 +1109,13 @@ fn test_navigate_find_match_wraps_prev() {
     );
 
     // Navigate prev from index 0 → wraps to 1 (last).
-    let _ = state.navigate_find_match(&FindDirection::Prev);
+    let _ = state.navigate_find_match(FindDirection::Prev);
     let s = state.tab_contents.get("/test.rs").unwrap();
     let s = s.find_replace_state.as_ref().unwrap();
     assert_eq!(s.current_match_idx, 1);
 
     // Navigate prev from index 1 → 0.
-    let _ = state.navigate_find_match(&FindDirection::Prev);
+    let _ = state.navigate_find_match(FindDirection::Prev);
     let s = state.tab_contents.get("/test.rs").unwrap();
     let s = s.find_replace_state.as_ref().unwrap();
     assert_eq!(s.current_match_idx, 0);
@@ -1149,8 +1149,8 @@ fn test_navigate_find_match_no_matches() {
     );
 
     // Navigating with no matches should not crash.
-    let _ = state.navigate_find_match(&FindDirection::Next);
-    let _ = state.navigate_find_match(&FindDirection::Prev);
+    let _ = state.navigate_find_match(FindDirection::Next);
+    let _ = state.navigate_find_match(FindDirection::Prev);
     let s = state.tab_contents.get("/test.rs").unwrap();
     let s = s.find_replace_state.as_ref().unwrap();
     assert_eq!(s.current_match_idx, 0);
@@ -1179,8 +1179,8 @@ fn test_navigate_find_match_only_affects_find_tab() {
     );
 
     // Should not panic.
-    let _ = state.navigate_find_match(&FindDirection::Next);
-    let _ = state.navigate_find_match(&FindDirection::Prev);
+    let _ = state.navigate_find_match(FindDirection::Next);
+    let _ = state.navigate_find_match(FindDirection::Prev);
 }
 
 // ── Tree arrow-key navigation tests ─────────────────────────────
