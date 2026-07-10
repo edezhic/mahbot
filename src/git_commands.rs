@@ -165,7 +165,7 @@ pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, 
 ///
 /// **Environment sanitization**: Same as [`run_git_output`] — the subprocess
 /// environment is cleared and re-populated with only a safe set of variables.
-pub(crate) async fn run_git_with_stdin(
+async fn run_git_with_stdin(
     repo_path: &Path,
     args: &[&str],
     stdin_lines: &[String],
