@@ -181,7 +181,7 @@ struct UndoSnapshot {
 }
 
 impl UndoStack {
-    const UNDO_MAX_DEPTH: usize = 100;
+    const MAX_UNDO_DEPTH: usize = 100;
 
     const fn new() -> Self {
         Self {
@@ -197,7 +197,7 @@ impl UndoStack {
             text: content.text(),
             cursor: content.cursor(),
         });
-        if self.undo.len() > Self::UNDO_MAX_DEPTH {
+        if self.undo.len() > Self::MAX_UNDO_DEPTH {
             self.undo.remove(0);
         }
     }
