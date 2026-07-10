@@ -1866,13 +1866,16 @@ fn save_raw_output_if_large(
         .as_secs();
     let filename = format!("{epoch}_{slug}.raw.log");
 
-    // Combine stdout + stderr with labels, scrub credentials
+    // Combine stdout + stderr with labels, strip ANSI escapes, scrub credentials
+    // Order: strip first, then scrub — prevents ANSI-obfuscated credentials
+    // from bypassing the regex-based scrubber, and matches append_output_tail.
     let raw = format!(
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(stdout_bytes),
         String::from_utf8_lossy(stderr_bytes)
     );
-    let scrubbed = scrub_credentials(&raw);
+    let stripped = strip_ansi_escapes(&raw);
+    let scrubbed = scrub_credentials(&stripped);
     let line_count = scrubbed.lines().count();
     let byte_count = scrubbed.len();
     let path = write_to_spill(&scrubbed, &filename)?;
@@ -3144,6 +3147,55 @@ mod tests {
         assert!(
             hint.contains("[view with: read"),
             "should provide read hint"
+        );
+    }
+
+    #[test]
+    fn save_raw_output_if_large_strips_ansi_escapes() {
+        // Build output with ANSI escape sequences above the spill threshold
+        let ansi_green = "\x1B[0;32m";
+        let ansi_reset = "\x1B[0m";
+        let inner =
+            format!("{ansi_green}output line{ansi_reset}\n{ansi_green}another line{ansi_reset}");
+        // Pad to exceed MAX_OUTPUT_BYTES while preserving ANSI content
+        let padding = " ".repeat(MAX_OUTPUT_BYTES.saturating_sub(inner.len()) + 1);
+        let ansi_content = format!("{inner}{padding}");
+        let stdout_bytes = ansi_content.as_bytes();
+
+        let result = save_raw_output_if_large(stdout_bytes, b"", "ansi-test");
+        assert!(
+            result.is_some(),
+            "should save for oversized output with ANSI"
+        );
+        let hint = result.unwrap();
+
+        // Extract the spill file path from the hint
+        let path_str = hint
+            .strip_prefix("[Output saved to ")
+            .and_then(|s| s.split_once(' '))
+            .map(|(path, _)| path)
+            .expect("should parse path from hint");
+        let path = std::path::Path::new(path_str);
+        assert!(path.exists(), "spill file should exist");
+
+        let spill_content = std::fs::read_to_string(path).expect("should read spill file");
+
+        // Verify ANSI escapes were stripped
+        assert!(
+            !spill_content.contains("\x1B["),
+            "spill file should not contain ANSI escapes: {spill_content:?}"
+        );
+        assert!(
+            !spill_content.contains(ansi_green),
+            "spill file should not contain ANSI green code"
+        );
+        assert!(
+            spill_content.contains("output line"),
+            "spill file should contain the actual output text"
+        );
+        assert!(
+            spill_content.contains("another line"),
+            "spill file should contain all output text"
         );
     }
 
