@@ -2414,7 +2414,11 @@ where
             })
         });
 
-        let text_clip = text_rect;
+        let text_geo = TextGeometry {
+            clip: text_rect,
+            x: text_x,
+            y: text_y,
+        };
 
         draw_background(renderer, bounds);
         draw_line_numbers(
@@ -2429,38 +2433,14 @@ where
         draw_find_match_highlights(
             renderer,
             &buffer_for_draw,
-            text_clip,
-            text_x,
-            text_y,
+            &text_geo,
             self.matches.as_ref(),
             self.match_current_idx,
         );
-        draw_bracket_match_highlights(
-            renderer,
-            &buffer_for_draw,
-            text_clip,
-            text_x,
-            text_y,
-            self.bracket_pair,
-        );
-        draw_selection(
-            renderer,
-            &buffer_for_draw,
-            text_clip,
-            text_x,
-            text_y,
-            self.buffer,
-        );
-        draw_text(renderer, &buffer_for_draw, text_x, text_y, text_clip);
-        draw_cursor(
-            renderer,
-            &buffer_for_draw,
-            text_clip,
-            text_x,
-            text_y,
-            state,
-            self.buffer,
-        );
+        draw_bracket_match_highlights(renderer, &buffer_for_draw, &text_geo, self.bracket_pair);
+        draw_selection(renderer, &buffer_for_draw, &text_geo, self.buffer);
+        draw_text(renderer, &buffer_for_draw, &text_geo);
+        draw_cursor(renderer, &buffer_for_draw, &text_geo, state, self.buffer);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3108,6 +3088,20 @@ where
 
 // ── Draw layer helpers ──────────────────────────────────────────────
 
+/// Geometry parameters for text-drawing functions, derived from the
+/// computed `text_rect` in [`Widget::draw`].
+///
+/// All five `draw_*` functions that render text content share these three
+/// values, which are always computed together from a single `text_rect`.
+struct TextGeometry {
+    /// The clipping rectangle for text content (same as `text_rect`).
+    clip: Rectangle,
+    /// Absolute x-coordinate of the text area origin.
+    x: f32,
+    /// Absolute y-coordinate of the text area origin.
+    y: f32,
+}
+
 /// Fill the widget background.
 fn draw_background<Renderer>(renderer: &mut Renderer, bounds: Rectangle)
 where
@@ -3175,9 +3169,7 @@ fn draw_line_numbers<Renderer>(
 fn draw_find_match_highlights<Renderer>(
     renderer: &mut Renderer,
     buffer: &cosmic_text::Buffer,
-    text_clip: Rectangle,
-    text_x: f32,
-    text_y: f32,
+    geo: &TextGeometry,
     matches: Option<&Vec<(usize, usize, usize)>>,
     match_current_idx: usize,
 ) where
@@ -3213,7 +3205,7 @@ fn draw_find_match_highlights<Renderer>(
                     },
                 ) {
                     draw_highlight_background(
-                        renderer, text_clip, text_x, text_y, &run, hl.0, hl.1, color,
+                        renderer, geo.clip, geo.x, geo.y, &run, hl.0, hl.1, color,
                     );
                 }
                 // Match may span multiple visual runs on soft-wrapped
@@ -3228,9 +3220,7 @@ fn draw_find_match_highlights<Renderer>(
 fn draw_bracket_match_highlights<Renderer>(
     renderer: &mut Renderer,
     buffer: &cosmic_text::Buffer,
-    text_clip: Rectangle,
-    text_x: f32,
-    text_y: f32,
+    geo: &TextGeometry,
     bracket_pair: Option<((usize, usize), (usize, usize))>,
 ) where
     Renderer: iced::advanced::Renderer,
@@ -3260,9 +3250,9 @@ fn draw_bracket_match_highlights<Renderer>(
                 ) {
                     draw_highlight_background(
                         renderer,
-                        text_clip,
-                        text_x,
-                        text_y,
+                        geo.clip,
+                        geo.x,
+                        geo.y,
                         &run,
                         hl.0,
                         hl.1,
@@ -3279,9 +3269,7 @@ fn draw_bracket_match_highlights<Renderer>(
 fn draw_selection<Renderer>(
     renderer: &mut Renderer,
     buffer: &cosmic_text::Buffer,
-    text_clip: Rectangle,
-    text_x: f32,
-    text_y: f32,
+    geo: &TextGeometry,
     editor_buffer: &EditorBuffer,
 ) where
     Renderer: iced::advanced::Renderer,
@@ -3320,9 +3308,9 @@ fn draw_selection<Renderer>(
             ) {
                 draw_highlight_background(
                     renderer,
-                    text_clip,
-                    text_x,
-                    text_y,
+                    geo.clip,
+                    geo.x,
+                    geo.y,
                     &run,
                     highlight.0,
                     highlight.1,
@@ -3337,17 +3325,15 @@ fn draw_selection<Renderer>(
 fn draw_text<Renderer>(
     renderer: &mut Renderer,
     buffer: &Arc<cosmic_text::Buffer>,
-    text_x: f32,
-    text_y: f32,
-    text_clip: Rectangle,
+    geo: &TextGeometry,
 ) where
     Renderer: iced::advanced::graphics::text::Renderer,
 {
     renderer.fill_raw(TextRaw {
         buffer: Arc::downgrade(buffer),
-        position: Point::new(text_x, text_y),
+        position: Point::new(geo.x, geo.y),
         color: iced::Color::WHITE, // neutral multiplier preserves per-glyph colors
-        clip_bounds: text_clip,
+        clip_bounds: geo.clip,
     });
 }
 
@@ -3355,9 +3341,7 @@ fn draw_text<Renderer>(
 fn draw_cursor<Renderer>(
     renderer: &mut Renderer,
     buffer: &cosmic_text::Buffer,
-    text_clip: Rectangle,
-    text_x: f32,
-    text_y: f32,
+    geo: &TextGeometry,
     state: &EditorWidgetState,
     editor_buffer: &EditorBuffer,
 ) where
@@ -3376,7 +3360,7 @@ fn draw_cursor<Renderer>(
         if let Some(run) =
             find_cursor_run(buffer.layout_runs(), cursor_state.line, cursor_state.column)
         {
-            cursor_y = text_y + run.line_top;
+            cursor_y = geo.y + run.line_top;
             cursor_height = run.line_height;
             let found_x = run
                 .glyphs
@@ -3385,11 +3369,11 @@ fn draw_cursor<Renderer>(
                     cursor_state.column < run.text[..g.end.min(run.text.len())].chars().count()
                 })
                 .map(|g| g.x);
-            cursor_x = text_x
+            cursor_x = geo.x
                 + found_x.unwrap_or_else(|| run.glyphs.last().map_or(0.0, |last| last.x + last.w));
         } else {
             cursor_x = 0.0;
-            cursor_y = text_y;
+            cursor_y = geo.y;
             cursor_height = font_metrics().line_height;
         }
 
@@ -3400,7 +3384,7 @@ fn draw_cursor<Renderer>(
             height: cursor_height,
         };
 
-        if let Some(clipped) = text_clip.intersection(&cursor_rect) {
+        if let Some(clipped) = geo.clip.intersection(&cursor_rect) {
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: clipped,
