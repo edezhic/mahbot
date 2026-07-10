@@ -542,6 +542,13 @@ impl PreparedUpdate {
 struct ResetTransition {
     from: TicketPhase,
     to: TicketPhase,
+    /// Whether to set `pipeline_reservation = 1` on the reset ticket.
+    ///
+    /// When `true`: the reset ticket gets priority re-dispatch — it will be
+    /// claimed before any fresh ticket in the same phase.
+    /// When `false`: normal queue order.
+    ///
+    /// See [`BoardStore::RESET_TRANSITIONS`] for the rationale behind each entry.
     pipeline_reservation: bool,
 }
 
@@ -1332,6 +1339,12 @@ impl BoardStore {
     /// Transitory handoff phases (DiagnosticsDone, SanitationPassed, Reviewed, QaPassed) are pipeline
     /// blocking but don't need a reset entry — the poller picks them up within seconds
     /// of restart, so no agent session is mid-execution in those states.
+    ///
+    /// `pipeline_reservation` choice per entry:
+    /// - `true`: expensive production-side phases (development, diagnostics, sanitation)
+    ///   — losing queue position wastes significant work, so reset tickets get priority.
+    /// - `false`: lighter inspection phases (analysis, review, QA) — re-queuing is cheap,
+    ///   so normal queue order is fine.
     const RESET_TRANSITIONS: &[ResetTransition] = &[
         ResetTransition {
             from: TicketPhase::InDevelopment,
@@ -1349,9 +1362,9 @@ impl BoardStore {
             pipeline_reservation: true,
             // Note: pipeline_reservation = true on InSanitation → QaPassed is inert —
             // QaPassed uses list-based dispatch (for_tickets_in_phase), not the claim
-            // loop where pipeline_reservation provides ordering. Set for consistency
-            // with the crash-recovery pattern; the flag is harmless for list-based
-            // dispatch.
+            // loop where pipeline_reservation provides ordering. Set `true` to match
+            // the production-side convention (sanitation is substantive work, like
+            // development and diagnostics); the flag is harmless for list-based dispatch.
         },
         ResetTransition {
             from: TicketPhase::InQa,
