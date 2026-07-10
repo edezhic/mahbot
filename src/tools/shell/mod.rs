@@ -1000,7 +1000,9 @@ fn finish_shell_output(
     // is needed here.  ShellTool overrides `should_scrub_output` to return
     // `false`, disabling the agent-level scrub as redundant — the pipeline
     // guarantees scrubbing at every output path.  Stderr was already
-    // scrubbed at `apply_profile_pipeline` entry.
+    // scrubbed at `apply_profile_pipeline` entry.  The pre-head/tail output
+    // (full_output_for_spill) is also scrubbed at the origin point in
+    // `apply_profile_pipeline`, immediately after line truncation.
     if elapsed.as_secs_f64() >= 1.0 {
         let _ = write!(combined, "\n[took {:.1}s]", elapsed.as_secs_f64());
     }
@@ -1008,13 +1010,13 @@ fn finish_shell_output(
     // When pre-head/tail output is available and large enough, spill the
     // fuller version so agents can `read` the complete output despite the
     // head/tail truncation reducing inline content to a snippet.
+    // `full_output_for_spill` is already credential-scrubbed.
     if let Some(pre) = full_output_for_spill
         && pre.len() > SPILL_THRESHOLD_BYTES
     {
-        let scrubbed = scrub_credentials(pre);
-        let byte_count = scrubbed.len();
-        let line_count = scrubbed.lines().count();
-        if let Some(path) = spill_output(&scrubbed) {
+        let byte_count = pre.len();
+        let line_count = pre.lines().count();
+        if let Some(path) = spill_output(pre) {
             let hint = format_spill_header(&path, byte_count, line_count);
             combined.push('\n');
             combined.push_str(&hint);
@@ -1488,6 +1490,8 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// Stderr is scrubbed at entry so all paths (early-return and main) are consistent.
 /// Stdout is scrubbed inside the `combine` closure so all output paths (JSON preview,
 /// short-circuit, on_empty, main) consistently receive scrubbed output.
+/// The pre-head/tail output (used for spill-to-file in `finish_shell_output`) is
+/// also scrubbed here, immediately after line truncation.
 ///
 /// Early-return stages (JSON preview, short-circuit, on_empty) call
 /// `combine_output` only.  The main path continues through `combine_output` →
@@ -1563,7 +1567,9 @@ fn apply_profile_pipeline(
     // Returns pre-truncation output for spilling by finish_shell_output,
     // so the complete content remains accessible even when truncation
     // reduces the inline view to a snippet.
+    // Scrub credentials here so finish_shell_output receives clean data.
     let (truncated, pre_head_tail) = apply_line_truncation(&processed, profile);
+    let pre_head_tail = pre_head_tail.map(|s| scrub_credentials(&s));
     processed = truncated;
 
     // Stage 7: on_empty — fallback when all output stripped
@@ -3519,9 +3525,9 @@ mod tests {
         for case in cases {
             // For pre-truncation spill path: repeat the string enough times to
             // exceed SPILL_THRESHOLD_BYTES, triggering the spill-to-file branch
-            // in finish_shell_output. The spill content scrubbing is done
-            // separately in finish_shell_output (via line 1012) — this test
-            // verifies that the spill hint is properly appended.
+            // in finish_shell_output. The spill content is pre-scrubbed by
+            // apply_profile_pipeline before being passed to finish_shell_output.
+            // This test verifies that the spill hint is properly appended.
             let pre_owned = case.pre.map(|s| s.repeat(SPILL_THRESHOLD_BYTES + 1));
             let result = finish_shell_output(
                 case.combined.to_string(),
