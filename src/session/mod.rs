@@ -236,7 +236,7 @@ impl SessionStore {
             params![session_key],
             |row| {
                 Ok::<_, anyhow::Error>(ChatMessage {
-                    role: row.get::<String>(COL_SM_ROLE)?.parse().map_err(|e: String| anyhow!(e))?,
+                    role: row.get::<String>(COL_SM_ROLE)?.parse::<ChatRole>().map_err(|e| anyhow!(e))?,
                     content: row.get(COL_SM_CONTENT)?,
                 })
             },

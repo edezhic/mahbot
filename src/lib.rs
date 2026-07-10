@@ -685,8 +685,11 @@ pub enum ToolOutputPhase {
 ///
 /// Replaces the previous `String`-based role to prevent typos and
 /// make the chat-role API self-documenting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "lowercase")]
 pub enum ChatRole {
     /// System prompt message.
     System,
@@ -696,31 +699,6 @@ pub enum ChatRole {
     Assistant,
     /// Tool result message.
     Tool,
-}
-
-impl std::fmt::Display for ChatRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::System => write!(f, "system"),
-            Self::User => write!(f, "user"),
-            Self::Assistant => write!(f, "assistant"),
-            Self::Tool => write!(f, "tool"),
-        }
-    }
-}
-
-impl std::str::FromStr for ChatRole {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "system" => Ok(Self::System),
-            "user" => Ok(Self::User),
-            "assistant" => Ok(Self::Assistant),
-            "tool" => Ok(Self::Tool),
-            other => Err(format!("Unknown chat role: {other}")),
-        }
-    }
 }
 
 // ── Provider trait + types ──────────────────────────────────────
