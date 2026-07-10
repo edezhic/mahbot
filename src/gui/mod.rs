@@ -716,6 +716,184 @@ impl Dashboard {
         }
     }
 
+    /// Process a periodic tick: expire old toasts, refresh workspace state,
+    /// poll the visible page, and update git state.
+    fn process_tick(&mut self) -> Task<Message> {
+        // Auto-dismiss expired toasts
+        let now = Instant::now();
+        self.toasts
+            .retain(|t| now.duration_since(t.created_at) < t.duration());
+        // Auto-poll visible page at 1-second intervals (with loading guard)
+        if !self.ready {
+            return Task::none();
+        }
+
+        // Auto-refresh workspace paused/maintenance state every tick.
+        // Only runs when a workspace is selected — the toggle result
+        // handler already re-reads authoritative state after writes.
+        let ws_refresh = if self.has_active_workspace() {
+            refresh_workspace_states_task()
+        } else {
+            Task::none()
+        };
+
+        let page_task = match self.page {
+            Page::Home if !self.board_state.load_state.loading() => {
+                self.board_state.load_state.start_loading();
+                self.board_state.refresh().map(Message::Board)
+            }
+            Page::Sessions if !self.sessions_state.load_state.loading() => {
+                self.sessions_state.load_state.start_loading();
+                self.sessions_state.refresh().map(Message::Sessions)
+            }
+            Page::Settings => {
+                // Refresh workspace and user lists when on Settings page
+                let ws_loading = self.settings_state.workspaces_state.load_state.loading();
+                let us_loading = self.settings_state.users_state.load_state.loading();
+                let ws = if !ws_loading {
+                    self.settings_state
+                        .workspaces_state
+                        .load_state
+                        .start_loading();
+                    self.settings_state
+                        .workspaces_state
+                        .refresh()
+                        .map(|msg| Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg)))
+                } else {
+                    Task::none()
+                };
+                let us = if !us_loading {
+                    self.settings_state.users_state.load_state.start_loading();
+                    self.settings_state
+                        .users_state
+                        .refresh()
+                        .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
+                } else {
+                    Task::none()
+                };
+                Task::batch([ws, us])
+            }
+            _ => Task::none(),
+        };
+
+        // ── Git state refresh (every second) ────────────────
+        // GitState handles eager-refresh gating internally.
+        let git_tasks = self.git_state.update_tick().map(Message::Git);
+
+        Task::batch([ws_refresh, page_task, git_tasks])
+    }
+
+    /// Handle Escape key: dismiss modals in priority order (diff modal →
+    /// git branch modal → page-level escape dispatch).
+    fn process_escape(&mut self) -> Task<Message> {
+        // Modal close priority: diff modal first, then branch modal,
+        // then page-level escapes.
+        if self.show_diff_modal {
+            self.show_diff_modal = false;
+            Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
+        } else if self.git_state.is_modal_open() {
+            self.git_state
+                .update(git::GitMessage::CloseModal)
+                .map(Message::Git)
+        } else {
+            match self.page {
+                Page::Home => {
+                    if self.board_state.is_modal_open() {
+                        self.board_state
+                            .update(board::BoardMessage::Escape)
+                            .map(Message::Board)
+                    } else {
+                        Task::none()
+                    }
+                }
+                Page::Shell => Task::none(),
+                Page::Logs => self
+                    .logs_state
+                    .update(
+                        logs::LogMessage::Escape,
+                        self.log_store.as_ref().expect("ready"),
+                    )
+                    .map(Message::Logs),
+                Page::Sessions => self
+                    .sessions_state
+                    .update(sessions::SessionsMessage::Escape)
+                    .map(Message::Sessions),
+                Page::Editor => self
+                    .editor_state
+                    .update(editor::EditorMessage::Escape)
+                    .map(Message::Editor),
+                Page::Settings => {
+                    if self.settings_state.is_modal_open() {
+                        self.settings_state
+                            .update(settings::SettingsMessage::Escape)
+                            .map(Message::Settings)
+                    } else {
+                        Task::none()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Process a Settings message, intercepting user-related messages for
+    /// cross-page side effects (user switching, workspace switching,
+    /// deletion recovery) and optionally reloading workspace options when
+    /// workspaces are added or deleted.
+    fn process_settings_message(&mut self, msg: settings::SettingsMessage) -> Task<Message> {
+        // Capture cross-page side effects for intercepted UserMsg
+        // variants. These batch alongside the delegation call below.
+        let mut intercept_task: Option<Task<Message>> = None;
+
+        if let settings::SettingsMessage::UserMsg(ref inner) = msg {
+            match inner {
+                users::UsersMessage::SwitchUser(user) => {
+                    // SwitchUser is a documented no-op in UsersState,
+                    // so unconditional delegation below is safe.
+                    intercept_task = Some(
+                        Task::done(home::HomeMessage::UserSelected(user.clone()))
+                            .map(Message::Home),
+                    );
+                }
+                users::UsersMessage::DeleteResult(Ok(()), deleted_user) => {
+                    if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
+                        self.selected_user_name = Some("admin".to_string());
+                        self.persist_window_state();
+                        intercept_task = Some(
+                            Task::done(home::HomeMessage::UserSelected("admin".to_string()))
+                                .map(Message::Home),
+                        );
+                    }
+                }
+                users::UsersMessage::UpdateWorkspace(sender, ws)
+                    if self.selected_user_name.as_deref() == Some(sender.as_str()) =>
+                {
+                    intercept_task = Some(self.select_workspace(ws));
+                }
+                _ => {}
+            }
+        }
+
+        let needs_global_reload = matches!(
+            msg,
+            settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::DeleteResult(
+                Ok(())
+            )) | settings::SettingsMessage::AddWorkspaceResult(Ok(_))
+        );
+
+        let settings_task = self.settings_state.update(msg).map(Message::Settings);
+
+        // Stack-allocated batch: only Some tasks are included via
+        // flatten. Avoids Vec heap allocation for the common
+        // no-intercept no-reload path.
+        let tasks = [
+            intercept_task,
+            Some(settings_task),
+            needs_global_reload.then(|| self.reload_workspace_options()),
+        ];
+
+        Task::batch(tasks.into_iter().flatten())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // ── Centralized Toast and LinkClicked interception ──────────
@@ -747,68 +925,7 @@ impl Dashboard {
             }
             Message::Navigation(_) if !self.ready => Task::none(),
             Message::Navigation(page) => self.navigate_to(page),
-            Message::Tick => {
-                // Auto-dismiss expired toasts
-                let now = Instant::now();
-                self.toasts
-                    .retain(|t| now.duration_since(t.created_at) < t.duration());
-                // Auto-poll visible page at 1-second intervals (with loading guard)
-                if !self.ready {
-                    return Task::none();
-                }
-
-                // Auto-refresh workspace paused/maintenance state every tick.
-                // Only runs when a workspace is selected — the toggle result
-                // handler already re-reads authoritative state after writes.
-                let ws_refresh = if self.has_active_workspace() {
-                    refresh_workspace_states_task()
-                } else {
-                    Task::none()
-                };
-
-                let page_task = match self.page {
-                    Page::Home if !self.board_state.load_state.loading() => {
-                        self.board_state.load_state.start_loading();
-                        self.board_state.refresh().map(Message::Board)
-                    }
-                    Page::Sessions if !self.sessions_state.load_state.loading() => {
-                        self.sessions_state.load_state.start_loading();
-                        self.sessions_state.refresh().map(Message::Sessions)
-                    }
-                    Page::Settings => {
-                        // Refresh workspace and user lists when on Settings page
-                        let ws_loading = self.settings_state.workspaces_state.load_state.loading();
-                        let us_loading = self.settings_state.users_state.load_state.loading();
-                        let ws = if !ws_loading {
-                            self.settings_state
-                                .workspaces_state
-                                .load_state
-                                .start_loading();
-                            self.settings_state.workspaces_state.refresh().map(|msg| {
-                                Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg))
-                            })
-                        } else {
-                            Task::none()
-                        };
-                        let us = if !us_loading {
-                            self.settings_state.users_state.load_state.start_loading();
-                            self.settings_state.users_state.refresh().map(|msg| {
-                                Message::Settings(settings::SettingsMessage::UserMsg(msg))
-                            })
-                        } else {
-                            Task::none()
-                        };
-                        Task::batch([ws, us])
-                    }
-                    _ => Task::none(),
-                };
-
-                // ── Git state refresh (every second) ────────────────
-                // GitState handles eager-refresh gating internally.
-                let git_tasks = self.git_state.update_tick().map(Message::Git);
-
-                Task::batch([ws_refresh, page_task, git_tasks])
-            }
+            Message::Tick => self.process_tick(),
             Message::Home(msg) if self.ready => {
                 // Intercept RequestWorkspaceChange: the Home page detected
                 // that the selected user's DB workspace differs from the
@@ -884,62 +1001,7 @@ impl Dashboard {
             Message::Editor(msg) if self.ready => {
                 self.editor_state.update(msg).map(Message::Editor)
             }
-            Message::Settings(msg) if self.ready => {
-                // Capture cross-page side effects for intercepted UserMsg
-                // variants. These batch alongside the delegation call below.
-                let mut intercept_task: Option<Task<Message>> = None;
-
-                if let settings::SettingsMessage::UserMsg(ref inner) = msg {
-                    match inner {
-                        users::UsersMessage::SwitchUser(user) => {
-                            // SwitchUser is a documented no-op in UsersState,
-                            // so unconditional delegation below is safe.
-                            intercept_task = Some(
-                                Task::done(home::HomeMessage::UserSelected(user.clone()))
-                                    .map(Message::Home),
-                            );
-                        }
-                        users::UsersMessage::DeleteResult(Ok(()), deleted_user) => {
-                            if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
-                                self.selected_user_name = Some("admin".to_string());
-                                self.persist_window_state();
-                                intercept_task = Some(
-                                    Task::done(home::HomeMessage::UserSelected(
-                                        "admin".to_string(),
-                                    ))
-                                    .map(Message::Home),
-                                );
-                            }
-                        }
-                        users::UsersMessage::UpdateWorkspace(sender, ws)
-                            if self.selected_user_name.as_deref() == Some(sender.as_str()) =>
-                        {
-                            intercept_task = Some(self.select_workspace(ws));
-                        }
-                        _ => {}
-                    }
-                }
-
-                let needs_global_reload = matches!(
-                    msg,
-                    settings::SettingsMessage::WorkspaceMsg(
-                        workspaces::WorkspacesMessage::DeleteResult(Ok(()))
-                    ) | settings::SettingsMessage::AddWorkspaceResult(Ok(_))
-                );
-
-                let settings_task = self.settings_state.update(msg).map(Message::Settings);
-
-                // Stack-allocated batch: only Some tasks are included via
-                // flatten. Avoids Vec heap allocation for the common
-                // no-intercept no-reload path.
-                let tasks = [
-                    intercept_task,
-                    Some(settings_task),
-                    needs_global_reload.then(|| self.reload_workspace_options()),
-                ];
-
-                Task::batch(tasks.into_iter().flatten())
-            }
+            Message::Settings(msg) if self.ready => self.process_settings_message(msg),
             Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
             Message::CheckpointAndExit => iced::exit(),
             Message::WindowEvent(_id, event) => {
@@ -1006,55 +1068,7 @@ impl Dashboard {
                     .map(Message::Logs),
                 _ => Task::none(),
             },
-            Message::EscapePressed => {
-                // Modal close priority: diff modal first, then branch modal,
-                // then page-level escapes.
-                if self.show_diff_modal {
-                    self.show_diff_modal = false;
-                    Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
-                } else if self.git_state.is_modal_open() {
-                    self.git_state
-                        .update(git::GitMessage::CloseModal)
-                        .map(Message::Git)
-                } else {
-                    match self.page {
-                        Page::Home => {
-                            if self.board_state.is_modal_open() {
-                                self.board_state
-                                    .update(board::BoardMessage::Escape)
-                                    .map(Message::Board)
-                            } else {
-                                Task::none()
-                            }
-                        }
-                        Page::Shell => Task::none(),
-                        Page::Logs => self
-                            .logs_state
-                            .update(
-                                logs::LogMessage::Escape,
-                                self.log_store.as_ref().expect("ready"),
-                            )
-                            .map(Message::Logs),
-                        Page::Sessions => self
-                            .sessions_state
-                            .update(sessions::SessionsMessage::Escape)
-                            .map(Message::Sessions),
-                        Page::Editor => self
-                            .editor_state
-                            .update(editor::EditorMessage::Escape)
-                            .map(Message::Editor),
-                        Page::Settings => {
-                            if self.settings_state.is_modal_open() {
-                                self.settings_state
-                                    .update(settings::SettingsMessage::Escape)
-                                    .map(Message::Settings)
-                            } else {
-                                Task::none()
-                            }
-                        }
-                    }
-                }
-            }
+            Message::EscapePressed => self.process_escape(),
             Message::UpdateBot if self.ready => {
                 if self.update_status != UpdateStatus::Available {
                     return Task::none();
