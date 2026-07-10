@@ -1017,14 +1017,10 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
     let log_label = match source {
         TicketPhase::QaPassed => "QA",
         TicketPhase::SanitationPassed => "Sanitation",
-        _ => {
-            warn!(
-                ticket = %ticket.id,
-                phase = %source.as_ref(),
-                "transition_ticket_to_done called from unexpected source phase",
-            );
-            "Unexpected"
-        }
+        _ => unreachable!(
+            "transition_ticket_to_done called with unexpected phase: {}",
+            source.as_ref(),
+        ),
     };
     if comment_and_transition(TransitionParams {
         ticket,
