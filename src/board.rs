@@ -1138,14 +1138,6 @@ impl BoardStore {
         Ok(())
     }
 
-    fn build_set_assigned_to_sql(ticket_id: &str, assigned_to: Option<&str>) -> PreparedUpdate {
-        Self::build_ticket_update_with_updated_at(
-            "assigned_to = ?",
-            vec![Value::from(assigned_to)],
-            ticket_id,
-        )
-    }
-
     /// Set or clear the assignee for a ticket (does not change status).
     ///
     /// When `assigned_to` is `Some(value)`, sets the `assigned_to` column to that
@@ -1157,7 +1149,11 @@ impl BoardStore {
     /// no-op. For clear operations, this ensures no stale agent remains bound to
     /// a now-unassigned ticket.
     pub async fn set_assigned_to(&self, ticket_id: &str, assigned_to: Option<&str>) -> Result<()> {
-        let prepared = Self::build_set_assigned_to_sql(ticket_id, assigned_to);
+        let prepared = Self::build_ticket_update_with_updated_at(
+            "assigned_to = ?",
+            vec![Value::from(assigned_to)],
+            ticket_id,
+        );
         prepared.execute_and_cancel(&self.conn).await
     }
 
@@ -1173,7 +1169,11 @@ impl BoardStore {
         ticket_id: &str,
         assigned_to: Option<&str>,
     ) -> Result<()> {
-        let prepared = Self::build_set_assigned_to_sql(ticket_id, assigned_to);
+        let prepared = Self::build_ticket_update_with_updated_at(
+            "assigned_to = ?",
+            vec![Value::from(assigned_to)],
+            ticket_id,
+        );
         prepared.execute_tx(tx).await
     }
 
