@@ -921,6 +921,7 @@ mod tests {
     // ── extract_media_from_outcomes tests ───────────────────────────────────
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn extract_media_outcomes_consolidated() {
         enum ToolDef {
             /// [`Media`] carries a marker prefix; [`NonMedia`] uses a unit variant because
