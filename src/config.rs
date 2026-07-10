@@ -298,6 +298,21 @@ macro_rules! string_config_fields {
         }
 
         // ── Generate typed accessors on ConfigReload ────────────
+        //
+        // Dual-normalisation design rationale (defence-in-depth):
+        //
+        // • Write-time: `normalize_string_fields()` (called from `finalize()`)
+        //   normalises every string field so that semantically-identical values
+        //   (e.g. `Some("")` vs `None`) compare equal — this supports the
+        //   snapshot-and-compare logic in `save_and_reload`.
+        //
+        // • Read-time: every accessor below also normalises (via `non_empty`,
+        //   `resolve_or`, or `parse_newline_list`) so that callers never see
+        //   leading/trailing whitespace or empty strings, even if an
+        //   un-finalised `ConfigData` is somehow swapped into `CONFIG`.
+        //
+        // Neither pass alone is sufficient — both are needed.
+        // See also: `config_reload_accessors_roundtrip`.
         impl ConfigReload {
             $(
                 string_config_fields!(@accessor $field $($annotation)*);
