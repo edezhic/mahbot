@@ -1765,7 +1765,6 @@ impl EditorState {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn subscription(&self) -> Subscription<EditorMessage> {
         let mut subs: Vec<Subscription<EditorMessage>> = Vec::new();
         if self.selected_workspace_name.is_some() {
@@ -1793,125 +1792,7 @@ impl EditorState {
             );
         }
         // Always listen for keyboard events — tree navigation may be active.
-        subs.push(keyboard::listen().filter_map(|event| {
-            use keyboard::{Event, Key};
-            let Event::KeyPressed {
-                key,
-                modifiers,
-                physical_key,
-                ..
-            } = event
-            else {
-                return None;
-            };
-            let km = super::detect_keyboard_mods(modifiers);
-
-            // Helper: match a Character key by its Latin equivalent.
-            let latin = |target: char| -> bool { key.to_latin(physical_key) == Some(target) };
-
-            // Ctrl+B / Cmd+B → toggle tree focus.
-            if km.is_shortcut_platform_mod() && latin('b') {
-                return Some(EditorMessage::TreeFocusToggled);
-            }
-            // Cmd+Shift+F / Ctrl+Shift+F → global search (find-in-files).
-            // Must appear BEFORE the Cmd+F / Ctrl+F check so Cmd+Shift+F
-            // doesn't also trigger FindToggle.
-            if km.is_platform_mod && !km.altgr_active && modifiers.shift() && latin('f') {
-                return Some(EditorMessage::GlobalSearchToggle);
-            }
-            // Cmd+F / Ctrl+F → toggle find/replace bar.
-            // Guard: Cmd+Shift+F handled above, so !modifiers.shift() prevents
-            // Cmd+Shift+F from also triggering FindToggle.
-            if km.is_shortcut_platform_mod() && !modifiers.shift() && latin('f') {
-                return Some(EditorMessage::FindToggle);
-            }
-            // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z / Ctrl+Shift+Z → redo.
-            if km.is_shortcut_platform_mod() && latin('z') {
-                if modifiers.shift() {
-                    return Some(EditorMessage::Redo);
-                }
-                return Some(EditorMessage::Undo);
-            }
-            // Cmd+S / Ctrl+S → save.
-            if km.is_shortcut_platform_mod() && latin('s') {
-                return Some(EditorMessage::SaveActiveTab);
-            }
-            // Ctrl+Tab / Ctrl+Shift+Tab → switch tabs.
-            // On macOS, modifiers.control() is used directly (not is_platform_mod)
-            // since Cmd+Tab is captured by the OS for app switching.
-            if modifiers.control() && matches!(key, Key::Named(keyboard::key::Named::Tab)) {
-                return if modifiers.shift() {
-                    Some(EditorMessage::TabSwitchPrev)
-                } else {
-                    Some(EditorMessage::TabSwitchNext)
-                };
-            }
-            // Ctrl+W → close tab (all platforms). Cmd+W on macOS is typically
-            // captured by the window manager to close the window, so we use
-            // Ctrl+W consistently.
-            if !km.altgr_active && modifiers.control() && latin('w') {
-                return Some(EditorMessage::CloseActiveTab);
-            }
-            // Go-to-line: Cmd+L on macOS, Ctrl+G on other platforms.
-            #[cfg(target_os = "macos")]
-            {
-                if modifiers.command() && !modifiers.control() && latin('l') {
-                    return Some(EditorMessage::GoToLineToggle);
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                if !km.altgr_active && modifiers.control() && latin('g') {
-                    return Some(EditorMessage::GoToLineToggle);
-                }
-            }
-            // Quick open: Cmd+P / Ctrl+P
-            if km.is_shortcut_platform_mod() && latin('p') {
-                return Some(EditorMessage::QuickOpenToggle);
-            }
-            // Refresh file tree: Cmd+R / Ctrl+R
-            if km.is_shortcut_platform_mod() && latin('r') {
-                return Some(EditorMessage::RefreshFileTree);
-            }
-            // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev
-            // macOS uses Cmd+G; non-macOS uses Ctrl+G for go-to-line (already mapped),
-            // so F3 and Shift+F3 serve as the cross-platform find shortcuts.
-            #[cfg(target_os = "macos")]
-            if modifiers.command() && !modifiers.control() && latin('g') {
-                return if modifiers.shift() {
-                    Some(EditorMessage::FindPrev)
-                } else {
-                    Some(EditorMessage::FindNext)
-                };
-            }
-            // F3 / Shift+F3 (all platforms)
-            if matches!(key, Key::Named(keyboard::key::Named::F3)) {
-                return if modifiers.shift() {
-                    Some(EditorMessage::FindPrev)
-                } else {
-                    Some(EditorMessage::FindNext)
-                };
-            }
-            // Shift+Enter → previous match (for use in the find/replace bar;
-            // no-op when find bar is closed — handler checks state).
-            if modifiers.shift() && matches!(key, Key::Named(keyboard::key::Named::Enter)) {
-                return Some(EditorMessage::FindPrev);
-            }
-            // Arrow key navigation: when quick-open is active, arrow keys
-            // navigate the results list (handled in the update method by
-            // checking quick_open state before tree focus).
-            match &key {
-                Key::Named(named) => match named {
-                    keyboard::key::Named::ArrowUp => Some(EditorMessage::TreeNavUp),
-                    keyboard::key::Named::ArrowDown => Some(EditorMessage::TreeNavDown),
-                    keyboard::key::Named::ArrowLeft => Some(EditorMessage::TreeNavLeft),
-                    keyboard::key::Named::ArrowRight => Some(EditorMessage::TreeNavRight),
-                    keyboard::key::Named::Enter => Some(EditorMessage::TreeNavEnter),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }));
+        subs.push(keyboard::listen().filter_map(map_editor_shortcut));
         Subscription::batch(subs)
     }
 
@@ -5830,6 +5711,135 @@ impl EditorState {
             },
             |()| EditorMessage::RevealDone,
         )
+    }
+}
+
+// ── Keyboard shortcut mapping ──────────────────────────────────────
+
+/// Map a keyboard event to an [`EditorMessage`] action, or `None` if unhandled.
+///
+/// This function is the `filter_map` predicate used by `subscription()` to
+/// translate keyboard events into editor actions.  It is extracted to a
+/// standalone function so that `subscription()` focuses on timer setup and
+/// the shortcut logic is independently readable (and potentially testable).
+#[allow(clippy::too_many_lines)]
+fn map_editor_shortcut(event: keyboard::Event) -> Option<EditorMessage> {
+    use keyboard::{Event, Key};
+    let Event::KeyPressed {
+        key,
+        modifiers,
+        physical_key,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let km = super::detect_keyboard_mods(modifiers);
+
+    // Helper: match a Character key by its Latin equivalent.
+    let latin = |target: char| -> bool { key.to_latin(physical_key) == Some(target) };
+
+    // Ctrl+B / Cmd+B → toggle tree focus.
+    if km.is_shortcut_platform_mod() && latin('b') {
+        return Some(EditorMessage::TreeFocusToggled);
+    }
+    // Cmd+Shift+F / Ctrl+Shift+F → global search (find-in-files).
+    // Must appear BEFORE the Cmd+F / Ctrl+F check so Cmd+Shift+F
+    // doesn't also trigger FindToggle.
+    if km.is_platform_mod && !km.altgr_active && modifiers.shift() && latin('f') {
+        return Some(EditorMessage::GlobalSearchToggle);
+    }
+    // Cmd+F / Ctrl+F → toggle find/replace bar.
+    // Guard: Cmd+Shift+F handled above, so !modifiers.shift() prevents
+    // Cmd+Shift+F from also triggering FindToggle.
+    if km.is_shortcut_platform_mod() && !modifiers.shift() && latin('f') {
+        return Some(EditorMessage::FindToggle);
+    }
+    // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z / Ctrl+Shift+Z → redo.
+    if km.is_shortcut_platform_mod() && latin('z') {
+        if modifiers.shift() {
+            return Some(EditorMessage::Redo);
+        }
+        return Some(EditorMessage::Undo);
+    }
+    // Cmd+S / Ctrl+S → save.
+    if km.is_shortcut_platform_mod() && latin('s') {
+        return Some(EditorMessage::SaveActiveTab);
+    }
+    // Ctrl+Tab / Ctrl+Shift+Tab → switch tabs.
+    // On macOS, modifiers.control() is used directly (not is_platform_mod)
+    // since Cmd+Tab is captured by the OS for app switching.
+    if modifiers.control() && matches!(key, Key::Named(keyboard::key::Named::Tab)) {
+        return if modifiers.shift() {
+            Some(EditorMessage::TabSwitchPrev)
+        } else {
+            Some(EditorMessage::TabSwitchNext)
+        };
+    }
+    // Ctrl+W → close tab (all platforms). Cmd+W on macOS is typically
+    // captured by the window manager to close the window, so we use
+    // Ctrl+W consistently.
+    if !km.altgr_active && modifiers.control() && latin('w') {
+        return Some(EditorMessage::CloseActiveTab);
+    }
+    // Go-to-line: Cmd+L on macOS, Ctrl+G on other platforms.
+    #[cfg(target_os = "macos")]
+    {
+        if modifiers.command() && !modifiers.control() && latin('l') {
+            return Some(EditorMessage::GoToLineToggle);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if !km.altgr_active && modifiers.control() && latin('g') {
+            return Some(EditorMessage::GoToLineToggle);
+        }
+    }
+    // Quick open: Cmd+P / Ctrl+P
+    if km.is_shortcut_platform_mod() && latin('p') {
+        return Some(EditorMessage::QuickOpenToggle);
+    }
+    // Refresh file tree: Cmd+R / Ctrl+R
+    if km.is_shortcut_platform_mod() && latin('r') {
+        return Some(EditorMessage::RefreshFileTree);
+    }
+    // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev
+    // macOS uses Cmd+G; non-macOS uses Ctrl+G for go-to-line (already mapped),
+    // so F3 and Shift+F3 serve as the cross-platform find shortcuts.
+    #[cfg(target_os = "macos")]
+    if modifiers.command() && !modifiers.control() && latin('g') {
+        return if modifiers.shift() {
+            Some(EditorMessage::FindPrev)
+        } else {
+            Some(EditorMessage::FindNext)
+        };
+    }
+    // F3 / Shift+F3 (all platforms)
+    if matches!(key, Key::Named(keyboard::key::Named::F3)) {
+        return if modifiers.shift() {
+            Some(EditorMessage::FindPrev)
+        } else {
+            Some(EditorMessage::FindNext)
+        };
+    }
+    // Shift+Enter → previous match (for use in the find/replace bar;
+    // no-op when find bar is closed — handler checks state).
+    if modifiers.shift() && matches!(key, Key::Named(keyboard::key::Named::Enter)) {
+        return Some(EditorMessage::FindPrev);
+    }
+    // Arrow key navigation: when quick-open is active, arrow keys
+    // navigate the results list (handled in the update method by
+    // checking quick_open state before tree focus).
+    match &key {
+        Key::Named(named) => match named {
+            keyboard::key::Named::ArrowUp => Some(EditorMessage::TreeNavUp),
+            keyboard::key::Named::ArrowDown => Some(EditorMessage::TreeNavDown),
+            keyboard::key::Named::ArrowLeft => Some(EditorMessage::TreeNavLeft),
+            keyboard::key::Named::ArrowRight => Some(EditorMessage::TreeNavRight),
+            keyboard::key::Named::Enter => Some(EditorMessage::TreeNavEnter),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
