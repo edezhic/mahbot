@@ -599,6 +599,123 @@ impl Dashboard {
         format!("MahBot — {page_name}")
     }
 
+    /// Apply workspace configuration loaded during boot.
+    fn apply_boot_workspaces(
+        &mut self,
+        paths: HashMap<String, String>,
+        paused_map: HashMap<String, bool>,
+        maintenance_enabled_map: HashMap<String, bool>,
+        restored_name: &str,
+    ) -> Task<Message> {
+        self.workspace_paths = paths;
+        self.workspace_paused = paused_map;
+        self.workspace_maintenance_enabled = maintenance_enabled_map;
+        // Pre-set Home's selected_user from persisted window state
+        // so UsersLoaded doesn't auto-select the first user when
+        // a previous user was saved.
+        if let Some(ref user_name) = self.selected_user_name {
+            self.home_state.selected_user = Some(user_name.clone());
+        }
+        let load_users = self.home_state.load_users().map(Message::Home);
+
+        // Empty string => "Personal" workspace (no shared workspace).
+        let ws_name = if restored_name.is_empty() {
+            self.selected_workspace_name = None;
+            String::new()
+        } else {
+            self.selected_workspace_name = Some(restored_name.to_owned());
+            restored_name.to_owned()
+        };
+        Task::batch([self.propagate_workspace_selection(&ws_name), load_users])
+    }
+
+    /// Navigate to a page, refreshing page-specific state as needed.
+    fn navigate_to(&mut self, page: Page) -> Task<Message> {
+        self.page = page;
+        // Notify sessions state when navigating to/from Sessions page
+        // so the auto-refresh timer starts/stops accordingly.
+        self.sessions_state.set_page_active(page == Page::Sessions);
+        match page {
+            // Logs and Shell maintain their own internal state; Editor
+            // receives workspace state via WorkspaceSelected from the
+            // Home page picker — none need a refresh on navigation.
+            Page::Logs | Page::Shell | Page::Editor => Task::none(),
+            Page::Home => {
+                let load_users = self.home_state.load_users().map(Message::Home);
+                let snap = iced::widget::operation::snap_to_end::<Message>(home::CHAT_SCROLL_ID);
+                let board_refresh = self.board_state.refresh().map(Message::Board);
+                Task::batch([load_users, snap, board_refresh])
+            }
+            Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
+            Page::Settings => {
+                self.settings_state.refresh();
+                let refresh_workspaces = self
+                    .settings_state
+                    .workspaces_state
+                    .refresh()
+                    .map(|msg| Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg)));
+                let refresh_users = self
+                    .settings_state
+                    .users_state
+                    .refresh()
+                    .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)));
+                Task::batch([refresh_workspaces, refresh_users])
+            }
+        }
+    }
+
+    /// Toggle the selected workspace's pause or maintainer state.
+    fn toggle_workspace_state(&mut self, kind: ToggleKind) -> Task<Message> {
+        let current_state = match kind {
+            ToggleKind::Pause => self.paused(),
+            ToggleKind::Maintenance => self.maintenance_enabled(),
+        };
+        let Some(ws_name) = self.active_workspace_name() else {
+            self.toasts.push(Toast::new(
+                "No workspace selected — select a workspace first".to_string(),
+                ToastKind::Warning,
+            ));
+            return Task::none();
+        };
+        let new_state = !current_state;
+        let ws_name_clone = ws_name.clone();
+        Task::perform(
+            kind.persist_to_store(ws_name_clone, new_state),
+            move |result| Message::ToggleResult(kind, result, ws_name, new_state),
+        )
+    }
+
+    /// Handle the result of a workspace toggle write.
+    fn finish_toggle(
+        &mut self,
+        kind: ToggleKind,
+        result: Result<(), String>,
+        ws_name: &str,
+        intended_state: bool,
+    ) -> Task<Message> {
+        match result {
+            Ok(()) => {
+                let label = if intended_state {
+                    kind.label_on()
+                } else {
+                    kind.label_off()
+                };
+                self.toasts.push(Toast::new(
+                    format!("{label} for {ws_name}"),
+                    ToastKind::Success,
+                ));
+                refresh_workspace_states_task()
+            }
+            Err(e) => {
+                self.toasts.push(Toast::new(
+                    format!("{}: {e}", kind.label_err()),
+                    ToastKind::Error,
+                ));
+                Task::none()
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // ── Centralized Toast and LinkClicked interception ──────────
@@ -621,65 +738,15 @@ impl Dashboard {
         match message {
             Message::Boot(result) => self.finish_boot(result),
             Message::BootWorkspaces(paths, paused_map, maintenance_enabled_map, restored_name) => {
-                self.workspace_paths = paths;
-                self.workspace_paused = paused_map;
-                self.workspace_maintenance_enabled = maintenance_enabled_map;
-                // Pre-set Home's selected_user from persisted window state
-                // so UsersLoaded doesn't auto-select the first user when
-                // a previous user was saved.
-                if let Some(ref user_name) = self.selected_user_name {
-                    self.home_state.selected_user = Some(user_name.clone());
-                }
-                let load_users = self.home_state.load_users().map(Message::Home);
-
-                // restored_name is always Some — load_workspace_options sets it.
-                // Empty string => "Personal" workspace (no shared workspace).
-                let ws_name = match restored_name {
-                    Some(ref name) if name.is_empty() => {
-                        self.selected_workspace_name = None;
-                        String::new()
-                    }
-                    Some(ref name) => {
-                        self.selected_workspace_name = Some(name.clone());
-                        name.clone()
-                    }
-                    None => unreachable!(),
-                };
-                Task::batch([self.propagate_workspace_selection(&ws_name), load_users])
+                self.apply_boot_workspaces(
+                    paths,
+                    paused_map,
+                    maintenance_enabled_map,
+                    restored_name.as_deref().unwrap_or(""),
+                )
             }
             Message::Navigation(_) if !self.ready => Task::none(),
-            Message::Navigation(page) => {
-                self.page = page;
-                // Notify sessions state when navigating to/from Sessions page
-                // so the auto-refresh timer starts/stops accordingly.
-                self.sessions_state.set_page_active(page == Page::Sessions);
-                match page {
-                    // Logs and Shell maintain their own internal state; Editor
-                    // receives workspace state via WorkspaceSelected from the
-                    // Home page picker — none need a refresh on navigation.
-                    Page::Logs | Page::Shell | Page::Editor => Task::none(),
-                    Page::Home => {
-                        let load_users = self.home_state.load_users().map(Message::Home);
-                        let snap =
-                            iced::widget::operation::snap_to_end::<Message>(home::CHAT_SCROLL_ID);
-                        let board_refresh = self.board_state.refresh().map(Message::Board);
-                        Task::batch([load_users, snap, board_refresh])
-                    }
-                    Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
-                    Page::Settings => {
-                        self.settings_state.refresh();
-                        let refresh_workspaces =
-                            self.settings_state.workspaces_state.refresh().map(|msg| {
-                                Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg))
-                            });
-                        let refresh_users =
-                            self.settings_state.users_state.refresh().map(|msg| {
-                                Message::Settings(settings::SettingsMessage::UserMsg(msg))
-                            });
-                        Task::batch([refresh_workspaces, refresh_users])
-                    }
-                }
-            }
+            Message::Navigation(page) => self.navigate_to(page),
             Message::Tick => {
                 // Auto-dismiss expired toasts
                 let now = Instant::now();
@@ -1016,47 +1083,9 @@ impl Dashboard {
                 }
                 Task::none()
             }
-            Message::Toggle(kind) if self.ready => {
-                let current_state = match kind {
-                    ToggleKind::Pause => self.paused(),
-                    ToggleKind::Maintenance => self.maintenance_enabled(),
-                };
-                let Some(ws_name) = self.active_workspace_name() else {
-                    self.toasts.push(Toast::new(
-                        "No workspace selected — select a workspace first".to_string(),
-                        ToastKind::Warning,
-                    ));
-                    return Task::none();
-                };
-                let new_state = !current_state;
-                let ws_name_clone = ws_name.clone();
-                Task::perform(
-                    kind.persist_to_store(ws_name_clone, new_state),
-                    move |result| Message::ToggleResult(kind, result, ws_name, new_state),
-                )
-            }
+            Message::Toggle(kind) if self.ready => self.toggle_workspace_state(kind),
             Message::ToggleResult(kind, result, ws_name, intended_state) if self.ready => {
-                match result {
-                    Ok(()) => {
-                        let label = if intended_state {
-                            kind.label_on()
-                        } else {
-                            kind.label_off()
-                        };
-                        self.toasts.push(Toast::new(
-                            format!("{label} for {ws_name}"),
-                            ToastKind::Success,
-                        ));
-                        refresh_workspace_states_task()
-                    }
-                    Err(e) => {
-                        self.toasts.push(Toast::new(
-                            format!("{}: {e}", kind.label_err()),
-                            ToastKind::Error,
-                        ));
-                        Task::none()
-                    }
-                }
+                self.finish_toggle(kind, result, &ws_name, intended_state)
             }
             Message::WorkspaceStatesRefreshed(paused_map, maintenance_enabled_map)
                 if self.ready =>
