@@ -388,6 +388,14 @@ impl SettingsState {
         self.add_user_adding = false;
     }
 
+    /// Look up the role config for a given role key.
+    fn role_config_for(&self, key: &str) -> Option<&RoleConfig> {
+        self.config
+            .per_role_configs
+            .iter()
+            .find(|rc| rc.role == key)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
@@ -1571,10 +1579,7 @@ impl SettingsState {
             let label = info.display_label;
             let default = info.default_model;
             let current = self
-                .config
-                .per_role_configs
-                .iter()
-                .find(|rc| rc.role == key)
+                .role_config_for(key)
                 .and_then(|rc| rc.model.clone())
                 .unwrap_or_default();
             field_row(
@@ -1600,10 +1605,7 @@ impl SettingsState {
             let label = info.display_label;
             let default = info.default_reasoning_effort;
             let current = self
-                .config
-                .per_role_configs
-                .iter()
-                .find(|rc| rc.role == key)
+                .role_config_for(key)
                 .and_then(|rc| rc.reasoning_effort.clone())
                 .unwrap_or_else(|| default.to_string());
             let effort_buttons = Row::from_iter(REASONING_EFFORT_OPTIONS.iter().map(move |&opt| {
@@ -1804,10 +1806,7 @@ impl SettingsState {
         for role in Role::iter() {
             let role_key: &str = role.into();
             let model = self
-                .config
-                .per_role_configs
-                .iter()
-                .find(|rc| rc.role == role_key)
+                .role_config_for(role_key)
                 .and_then(|rc| rc.model.clone().filter(|m| !m.is_empty()))
                 .unwrap_or_else(|| crate::role::role_info(&role).default_model.to_string());
             model_names.insert(model);
