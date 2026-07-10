@@ -118,7 +118,7 @@ pub async fn write_incoming_to_broadcast(msg: &ChannelMessage) {
         direction: ChatDirection::User,
         agent_role: None, // user messages have no agent role
         workspace: msg.workspace.clone(),
-        optimistic_id: msg.message_id.clone(), // GUI uses this for replacement
+        optimistic_id: msg.optimistic_id.clone(), // GUI uses this for replacement
     }
     .broadcast_and_persist()
     .await;
@@ -735,7 +735,7 @@ mod tests {
             content: content.to_string(),
             source_channel: "test".into(),
             workspace: "test".into(),
-            message_id: None,
+            optimistic_id: None,
             callback_query_id: None,
         }
     }
@@ -1111,7 +1111,7 @@ mod tests {
             content: content.to_string(),
             source_channel: "gui".to_string(),
             workspace: "test".to_string(),
-            message_id: None,
+            optimistic_id: None,
             callback_query_id: None,
         }
     }
@@ -1123,7 +1123,7 @@ mod tests {
             content: content.to_string(),
             source_channel: "telegram".to_string(),
             workspace: "test".to_string(),
-            message_id: None,
+            optimistic_id: None,
             callback_query_id: None,
         }
     }

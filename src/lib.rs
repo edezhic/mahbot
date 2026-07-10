@@ -273,7 +273,7 @@ pub struct ChannelMessage {
     pub workspace: String,
     /// Optimistic message ID set by the GUI sender for deduplication in the
     /// ChatEvent handler — `None` for non-GUI channels (Telegram, callbacks).
-    pub message_id: Option<String>,
+    pub optimistic_id: Option<String>,
     /// Callback query ID from Telegram inline keyboard interactions.
     /// Only set for callback queries (`__opt__` or `__act__` prefixes),
     /// used to acknowledge and dismiss the Telegram loading spinner.
@@ -359,7 +359,7 @@ pub enum ChatEvent {
         agent_role: Option<String>,
         /// The workspace this message belongs to.
         workspace: String,
-        /// Optional ID the GUI sender generated (via `ChannelMessage::message_id`) so
+        /// Optional ID the GUI sender generated (via `ChannelMessage::optimistic_id`) so
         /// the Home page can replace its optimistic message with the confirmed one.
         optimistic_id: Option<String>,
     },

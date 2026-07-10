@@ -1317,7 +1317,7 @@ impl HomeState {
             content,
             source_channel: "gui".to_string(),
             workspace: self.selected_workspace.clone().unwrap_or_default(),
-            message_id: optimistic_id,
+            optimistic_id,
             callback_query_id: None,
         };
 

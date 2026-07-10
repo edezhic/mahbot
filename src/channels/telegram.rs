@@ -227,7 +227,7 @@ impl MessageContext {
             content,
             source_channel: "telegram".to_string(),
             workspace: String::new(),
-            message_id: None,
+            optimistic_id: None,
             callback_query_id: None,
         }
     }
@@ -803,7 +803,7 @@ impl TelegramChannel {
             content: data.to_string(),
             source_channel: "telegram".to_string(),
             workspace: String::new(),
-            message_id: None,
+            optimistic_id: None,
             callback_query_id,
         })
     }
