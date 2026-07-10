@@ -156,9 +156,6 @@ pub enum HomeMessage {
     ModifiersChanged(keyboard::Modifiers),
 }
 
-/// Maximum undo/redo entries for the chat input.
-const UNDO_MAX_DEPTH: usize = 100;
-
 // ── Chat Input Undo/Redo ────────────────────────────────────────────
 
 /// Snapshot-based undo/redo stack for the chat input text editor.
@@ -183,6 +180,8 @@ struct UndoSnapshot {
 }
 
 impl UndoStack {
+    const UNDO_MAX_DEPTH: usize = 100;
+
     const fn new() -> Self {
         Self {
             undo: Vec::new(),
@@ -197,7 +196,7 @@ impl UndoStack {
             text: content.text(),
             cursor: content.cursor(),
         });
-        if self.undo.len() > UNDO_MAX_DEPTH {
+        if self.undo.len() > Self::UNDO_MAX_DEPTH {
             self.undo.remove(0);
         }
     }

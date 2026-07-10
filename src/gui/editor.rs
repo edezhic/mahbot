@@ -207,7 +207,7 @@ fn make_tab_and_data(
 // ── Undo/Redo ──────────────────────────────────────────────────────
 
 /// Snapshot-based undo/redo stack. Stores full-content snapshots
-/// with cursor positions. Bounded to [`MAX_UNDO_DEPTH`] entries.
+/// with cursor positions. Bounded to [`Self::MAX_UNDO_DEPTH`] entries.
 #[derive(Debug, Clone)]
 struct UndoStack {
     /// Previous states, newest last.
@@ -224,12 +224,10 @@ struct UndoSnapshot {
     cursor_col: usize,
 }
 
-/// Maximum undo/redo entries per tab. Reduced for large files.
-const MAX_UNDO_DEPTH: usize = 100;
-/// Threshold (bytes) above which max undo depth is halved.
-const LARGE_FILE_UNDO_THRESHOLD: usize = 100_000;
-
 impl UndoStack {
+    const MAX_UNDO_DEPTH: usize = 100;
+    const LARGE_FILE_UNDO_THRESHOLD: usize = 100_000;
+
     #[must_use]
     const fn new() -> Self {
         Self {
@@ -242,10 +240,10 @@ impl UndoStack {
     fn snap_before_edit(&mut self, content: &super::editor_widget::EditorBuffer) {
         let text = content.text();
         let cursor = content.cursor();
-        let max_depth = if text.len() > LARGE_FILE_UNDO_THRESHOLD {
-            MAX_UNDO_DEPTH / 2
+        let max_depth = if text.len() > Self::LARGE_FILE_UNDO_THRESHOLD {
+            Self::MAX_UNDO_DEPTH / 2
         } else {
-            MAX_UNDO_DEPTH
+            Self::MAX_UNDO_DEPTH
         };
         self.redo.clear();
         self.undo.push(UndoSnapshot {
