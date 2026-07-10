@@ -585,6 +585,23 @@ impl EditorBuffer {
         Some((sl, sc, el, ec))
     }
 
+    /// Returns `(start_line, end_line)` from the current selection, or
+    /// `(cursor_line, cursor_line)` if there is no selection.
+    /// Returns `None` when the buffer is empty or the selection is invalid.
+    fn selected_line_range(&self) -> Option<(usize, usize)> {
+        if self.line_count() == 0 {
+            return None;
+        }
+
+        if self.has_selection.get() {
+            let (sl, _sc, el, _ec) = self.clamped_selection_range()?;
+            Some((sl, el))
+        } else {
+            let line = self.cursor_line.get();
+            Some((line, line))
+        }
+    }
+
     /// Delete the currently selected text and return the byte range that
     /// was removed. If there is no selection, returns `None`.
     fn delete_selection_get_range(&self) -> Option<(usize, usize)> {
@@ -1181,17 +1198,8 @@ impl EditorBuffer {
             return; // No comment syntax for this language.
         };
 
-        // Determine which lines to operate on.  The no-selection path uses the
-        // cursor line (already clamped by set_cursor_pos), so only the
-        // selection path needs explicit clamping.
-        let (start_line, end_line) = if self.has_selection.get() {
-            let Some((sl, _sc, el, _ec)) = self.clamped_selection_range() else {
-                return;
-            };
-            (sl, el)
-        } else {
-            let line = self.cursor_line.get();
-            (line, line)
+        let Some((start_line, end_line)) = self.selected_line_range() else {
+            return;
         };
 
         let text = self.text();
@@ -1281,20 +1289,9 @@ impl EditorBuffer {
             return;
         }
 
-        let (start_line, end_line) = if self.has_selection.get() {
-            let (sl, _sc, el, _ec) = self.selection_range();
-            (sl, el)
-        } else {
-            let line = self.cursor_line.get();
-            (line, line)
-        };
-
-        let start_line = start_line.min(line_count.saturating_sub(1));
-        let end_line = end_line.min(line_count.saturating_sub(1));
-
-        if start_line > end_line {
+        let Some((start_line, end_line)) = self.selected_line_range() else {
             return;
-        }
+        };
 
         // We'll replace the range from start of start_line to start of
         // the line after end_line (or end of file). This effectively removes
@@ -1354,20 +1351,9 @@ impl EditorBuffer {
             return;
         }
 
-        let (start_line, end_line) = if self.has_selection.get() {
-            let (sl, _sc, el, _ec) = self.selection_range();
-            (sl, el)
-        } else {
-            let line = self.cursor_line.get();
-            (line, line)
-        };
-
-        let start_line = start_line.min(line_count.saturating_sub(1));
-        let end_line = end_line.min(line_count.saturating_sub(1));
-
-        if start_line > end_line {
+        let Some((start_line, end_line)) = self.selected_line_range() else {
             return;
-        }
+        };
 
         self.edit_text(|text| {
             let mut new_text = text.to_string();
@@ -1414,19 +1400,14 @@ impl EditorBuffer {
             return;
         }
 
-        let (start_line, end_line) = if self.has_selection.get() {
-            let (sl, _sc, el, _ec) = self.selection_range();
-            (sl, el)
-        } else {
-            let line = self.cursor_line.get();
-            (line, line)
+        let Some((start_line, end_line)) = self.selected_line_range() else {
+            return;
         };
 
         if start_line == 0 {
             return; // Already at top.
         }
 
-        let end_line = end_line.min(line_count.saturating_sub(1));
         let swap_line = start_line.saturating_sub(1);
 
         self.edit_text(|text| {
@@ -1455,19 +1436,14 @@ impl EditorBuffer {
             return;
         }
 
-        let (start_line, end_line) = if self.has_selection.get() {
-            let (sl, _sc, el, _ec) = self.selection_range();
-            (sl, el)
-        } else {
-            let line = self.cursor_line.get();
-            (line, line)
+        let Some((start_line, end_line)) = self.selected_line_range() else {
+            return;
         };
 
         if end_line + 1 >= line_count {
             return; // Already at bottom.
         }
 
-        let end_line = end_line.min(line_count.saturating_sub(1));
         let swap_line = end_line + 1;
 
         self.edit_text(|text| {
