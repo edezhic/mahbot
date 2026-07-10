@@ -390,6 +390,24 @@ impl Agent {
         call_name: &str,
         call_arguments: serde_json::Value,
     ) -> ToolExecutionOutcome {
+        // Pre-flight cancellation check: if the agent has been cancelled (e.g., by
+        // user pressing Stop), bail immediately without executing the tool.  This
+        // prevents side-effecting tools (shell commands, file edits, sub-agents)
+        // from running after cancellation.  The `llm_loop` checks cancellation at
+        // the top of each iteration, but tool calls dispatched before that check
+        // can still reach this method.
+        if self.cancel_token.is_cancelled() {
+            let reason = "Agent cancelled — tool execution skipped";
+            tracing::info!(
+                tool = %call_name,
+                "Agent cancelled — skipping tool execution"
+            );
+            return ToolExecutionOutcome {
+                output: format_tool_failure_feedback(call_name, &call_arguments, reason),
+                success: false,
+            };
+        }
+
         let start = Instant::now();
         let (tool_name, tool_arguments) = normalize_tool_call(call_name, call_arguments);
         if tool_name != call_name {
@@ -1086,6 +1104,25 @@ mod tests {
             result.is_ok(),
             "finalize_session should return Ok when cancelled, \
              skipping the 'no assistant message' warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_skips_when_cancelled() {
+        let tool: Box<dyn Tool> = Box::new(TestTool {
+            output: "should not run".into(),
+            scrub: false,
+        });
+        let name = tool.name();
+        let agent = make_agent(vec![tool]);
+        agent.cancel_token.cancel();
+        let out = agent.execute_tool(name, serde_json::json!({})).await;
+
+        assert!(!out.success, "cancelled agent should not execute tool");
+        assert!(
+            out.output.contains("Agent cancelled"),
+            "failure output should mention cancellation: {}",
+            out.output
         );
     }
 }
