@@ -1132,14 +1132,17 @@ impl EditorBuffer {
             return;
         }
 
-        let text = self.text();
-        let offset = line_col_to_byte_offset(&text, self.cursor_line.get(), self.cursor_col.get());
-        if offset == 0 {
+        // Early guard: cursor at document start → no text before cursor, no-op.
+        // Equivalent to `offset == 0` but avoids allocating `self.text()`.
+        if self.cursor_line.get() == 0 && self.cursor_col.get() == 0 {
             return;
         }
-        let word_start = find_word_start(&text, offset);
-        self.edit_text(|_| {
-            let mut new_text = text.clone();
+
+        let (cl, cc) = (self.cursor_line.get(), self.cursor_col.get());
+        self.edit_text(|text| {
+            let offset = line_col_to_byte_offset(text, cl, cc);
+            let word_start = find_word_start(text, offset);
+            let mut new_text = text.to_string();
             new_text.replace_range(word_start..offset, "");
             let (line, col) = byte_offset_to_line_col(&new_text, word_start);
             (new_text, Some((line, col)))
@@ -1152,14 +1155,14 @@ impl EditorBuffer {
             return;
         }
 
-        let text = self.text();
-        let offset = line_col_to_byte_offset(&text, self.cursor_line.get(), self.cursor_col.get());
-        if offset >= text.len() {
-            return;
-        }
-        let word_end = find_word_end(&text, offset);
-        self.edit_text(|_| {
-            let mut new_text = text.clone();
+        let (cl, cc) = (self.cursor_line.get(), self.cursor_col.get());
+        self.edit_text(|text| {
+            let offset = line_col_to_byte_offset(text, cl, cc);
+            if offset >= text.len() {
+                return (text.to_string(), None);
+            }
+            let word_end = find_word_end(text, offset);
+            let mut new_text = text.to_string();
             new_text.replace_range(offset..word_end, "");
             (new_text, None)
         });
