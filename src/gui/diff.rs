@@ -1284,7 +1284,6 @@ async fn resolve_workspace_path(
 /// Load the diff, compute per-file highlights, and return enhanced DiffFiles.
 /// `ws_path_override` is used for personal workspaces that don't exist in
 /// workspaces.db — when provided, it's used directly as the filesystem path.
-#[allow(clippy::too_many_lines)]
 async fn load_diff(
     ws_name: String,
     ws_path_override: Option<String>,
@@ -1313,51 +1312,7 @@ async fn load_diff(
     // Untracked files — only relevant for working-tree diffs.
     // Historical commits don't have untracked files.
     if commit_ref.is_none() {
-        let status_output = run_git_status(&ws_path)
-            .await
-            .map_err(|e| format!("Failed to run git status: {e}"))?;
-        let untracked = parse_untracked_from_porcelain(&status_output);
-
-        for path in &untracked {
-            let full = ws_path.join(path);
-            if !full.is_file() {
-                continue;
-            }
-            let Ok(meta) = tokio::fs::metadata(&full).await else {
-                continue;
-            };
-            if meta.len() > MAX_UNTRACKED_SIZE {
-                parsed.push(crate::diff_parse::DiffFile::placeholder(
-                    path.clone(),
-                    false,
-                    Some(meta.len()),
-                ));
-                continue;
-            }
-            let Ok(content) = tokio::fs::read(&full).await else {
-                continue;
-            };
-            if content.contains(&0) {
-                parsed.push(crate::diff_parse::DiffFile::placeholder(
-                    path.clone(),
-                    true,
-                    None,
-                ));
-                continue;
-            }
-            match String::from_utf8(content) {
-                Ok(text) => {
-                    parsed.push(make_untracked_diff_file(path, &text));
-                }
-                Err(_) => {
-                    parsed.push(crate::diff_parse::DiffFile::placeholder(
-                        path.clone(),
-                        true,
-                        None,
-                    ));
-                }
-            }
-        }
+        add_untracked_files(&mut parsed, &ws_path).await?;
     }
 
     // Compute highlights for each file off the UI thread.
@@ -1379,6 +1334,61 @@ async fn load_diff(
     }
 
     Ok(enhanced)
+}
+
+/// Add untracked/new files from `git status --porcelain` to the parsed diff list.
+/// Only called for working-tree diffs (commit_ref is None).
+async fn add_untracked_files(
+    parsed: &mut Vec<crate::diff_parse::DiffFile>,
+    ws_path: &Path,
+) -> Result<(), String> {
+    let status_output = run_git_status(ws_path)
+        .await
+        .map_err(|e| format!("Failed to run git status: {e}"))?;
+    let untracked = parse_untracked_from_porcelain(&status_output);
+
+    for path in &untracked {
+        let full = ws_path.join(path);
+        if !full.is_file() {
+            continue;
+        }
+        let Ok(meta) = tokio::fs::metadata(&full).await else {
+            continue;
+        };
+        if meta.len() > MAX_UNTRACKED_SIZE {
+            parsed.push(crate::diff_parse::DiffFile::placeholder(
+                path.clone(),
+                false,
+                Some(meta.len()),
+            ));
+            continue;
+        }
+        let Ok(content) = tokio::fs::read(&full).await else {
+            continue;
+        };
+        if content.contains(&0) {
+            parsed.push(crate::diff_parse::DiffFile::placeholder(
+                path.clone(),
+                true,
+                None,
+            ));
+            continue;
+        }
+        match String::from_utf8(content) {
+            Ok(text) => {
+                parsed.push(make_untracked_diff_file(path, &text));
+            }
+            Err(_) => {
+                parsed.push(crate::diff_parse::DiffFile::placeholder(
+                    path.clone(),
+                    true,
+                    None,
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Count added and removed lines in a diff file.
