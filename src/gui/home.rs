@@ -633,12 +633,7 @@ impl HomeState {
                         }
                     };
 
-                    // Inline keyboard buttons were previously rendered here but
-                    // the `reply_markup` field was removed from `ChatEvent::Message`
-                    // (always `None`), so this branch is always dead.
-                    let bubble_content: Element<'_, HomeMessage> = bubble_body;
-
-                    let bubble = container(bubble_content)
+                    let bubble = container(bubble_body)
                         .padding(10)
                         .style(theme::bubble_style(
                             if is_user {
