@@ -1,18 +1,18 @@
 use crate::{Tool, ToolOutputPhase, Workspace, util::UnwrapPoison};
 use async_trait::async_trait;
 use directories::UserDirs;
-use regex::{Regex, RegexSet};
+use regex::RegexSet;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::util::scrub_credentials;
+use crate::util::strip_ansi_escapes;
 
 mod profiles;
 mod readonly;
@@ -1593,17 +1593,6 @@ fn apply_profile_pipeline(
     finish_shell_output(combined, elapsed, pre_head_tail.as_deref())
 }
 
-/// Pass 1: Strip ANSI escape sequences.
-fn strip_ansi_escapes(input: &str) -> String {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"\x1B\[[0-9;]*[a-zA-Z]|\x1B\][0-9;]*[^\x1B]*\x1B\\|\x1B[\(\)\[\]KM]|\x1B\][0-9;]*\x07",
-        )
-        .unwrap()
-    });
-    RE.replace_all(input, "").to_string()
-}
-
 /// Decode raw shell output bytes (lossy UTF-8), strip ANSI escape sequences,
 /// then scrub credentials.
 ///
@@ -2637,17 +2626,6 @@ mod tests {
     }
 
     // ── Shell compression pipeline tests ────────────────────────────
-
-    #[test]
-    fn ansi_escape_cases() {
-        let cases: &[(&str, &str)] = &[
-            ("\x1B[31mred\x1B[0m \x1B[1mbold\x1B[22m", "red bold"),
-            ("hello world", "hello world"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(strip_ansi_escapes(input), *expected, "input: {input:?}");
-        }
-    }
 
     #[test]
     fn try_json_preview_cases() {

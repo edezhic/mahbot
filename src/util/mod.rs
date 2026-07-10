@@ -381,6 +381,23 @@ pub fn plaintext_for_display(reasoning: Option<&Reasoning>) -> Option<String> {
     })
 }
 
+/// Strip ANSI escape sequences from a string.
+///
+/// Removes common ANSI escape codes used for terminal text formatting (colors,
+/// bold, underline, cursor movement, etc.) while preserving the visible content.
+/// This is useful when processing shell command output or any text that may
+/// contain terminal control sequences.
+#[must_use]
+pub(crate) fn strip_ansi_escapes(input: &str) -> String {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\x1B\[[0-9;]*[a-zA-Z]|\x1B\][0-9;]*[^\x1B]*\x1B\\|\x1B[\(\)\[\]KM]|\x1B\][0-9;]*\x07",
+        )
+        .unwrap()
+    });
+    RE.replace_all(input, "").to_string()
+}
+
 /// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
 /// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -1052,6 +1069,25 @@ mod unescape_c_style_tests {
                 *expected,
                 "case {i}: unescape_c_style({input:?})"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod strip_ansi_escapes_tests {
+    use super::strip_ansi_escapes;
+
+    #[test]
+    fn test_ansi_escape_cases() {
+        let cases: &[(&str, &str)] = &[
+            ("\x1B[31mred\x1B[0m \x1B[1mbold\x1B[22m", "red bold"),
+            ("hello world", "hello world"),
+            ("\x1B[32mgreen\x1B[0m", "green"),
+            ("no escapes here", "no escapes here"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_ansi_escapes(input), *expected, "input: {input:?}");
         }
     }
 }
