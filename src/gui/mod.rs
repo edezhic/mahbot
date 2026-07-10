@@ -256,17 +256,14 @@ pub enum Message {
     /// WAL checkpoint complete — safe to exit now.
     CheckpointAndExit,
     /// Periodic refresh of workspace paused/maintenance state from DB.
-    WorkspaceStatesRefreshed(HashMap<String, bool>, HashMap<String, bool>),
+    /// Carries (name, paused, maintenance_enabled) tuples to merge into
+    /// the existing `workspaces` map without overwriting paths.
+    WorkspaceStatesRefreshed(Vec<(String, bool, bool)>),
     /// No-op — produced by refresh helpers on transient DB errors to avoid
     /// sending empty state maps that would wipe cached toggle state.
     Nop,
-    /// Workspace paths and state loaded during boot (paths, paused, maintenance, restored selection).
-    BootWorkspaces(
-        HashMap<String, String>,
-        HashMap<String, bool>,
-        HashMap<String, bool>,
-        Option<String>,
-    ),
+    /// Workspace info and restored selection loaded during boot.
+    BootWorkspaces(HashMap<String, WorkspaceInfo>, Option<String>),
     Home(home::HomeMessage),
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
@@ -442,6 +439,16 @@ pub(crate) fn detect_keyboard_mods(modifiers: keyboard::Modifiers) -> KeyboardMo
 /// Log store created during boot; read when handling [`Message::Boot`].
 pub static BOOT_LOG_STORE: OnceLock<LogStore> = OnceLock::new();
 
+/// Per-workspace metadata held in memory for fast sidebar lookup.
+/// Populated during boot from the DB and updated periodically via
+/// [`Message::WorkspaceStatesRefreshed`] (which only refreshes booleans).
+#[derive(Debug, Clone)]
+struct WorkspaceInfo {
+    path: String,
+    paused: bool,
+    maintenance_enabled: bool,
+}
+
 pub struct Dashboard {
     ready: bool,
     boot_error: Option<String>,
@@ -454,12 +461,8 @@ pub struct Dashboard {
     /// Toast notification stack.
     toasts: Vec<Toast>,
 
-    /// Maps workspace name → filesystem path.
-    workspace_paths: HashMap<String, String>,
-    /// Maps workspace name → paused state (for sidebar toggle).
-    workspace_paused: HashMap<String, bool>,
-    /// Maps workspace name → maintenance state (for sidebar toggle).
-    workspace_maintenance_enabled: HashMap<String, bool>,
+    /// Per-workspace info (path, paused, maintenance_enabled), keyed by name.
+    workspaces: HashMap<String, WorkspaceInfo>,
     /// Currently selected workspace name from the global picker.
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
@@ -495,9 +498,7 @@ impl Dashboard {
             last_size: iced::Size::new(1500.0, 800.0),
             last_position: iced::Point::new(-1.0, -1.0),
             toasts: Vec::new(),
-            workspace_paths: HashMap::new(),
-            workspace_paused: HashMap::new(),
-            workspace_maintenance_enabled: HashMap::new(),
+            workspaces: HashMap::new(),
             selected_workspace_name: None,
             selected_user_name: None,
             update_status: if update_available {
@@ -549,23 +550,23 @@ impl Dashboard {
         }
     }
 
-    /// Look up a boolean flag for the currently selected workspace.
-    fn workspace_flag(&self, map: &HashMap<String, bool>) -> bool {
+    /// Returns the [`WorkspaceInfo`] for the currently selected workspace, if any.
+    fn selected_workspace_info(&self) -> Option<&WorkspaceInfo> {
         self.selected_workspace_name
             .as_ref()
-            .and_then(|name| map.get(name))
-            .copied()
-            .unwrap_or(false)
+            .and_then(|name| self.workspaces.get(name))
     }
 
     /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
     fn paused(&self) -> bool {
-        self.workspace_flag(&self.workspace_paused)
+        self.selected_workspace_info()
+            .is_some_and(|w| w.paused)
     }
 
     /// Whether the selected workspace's maintainer is enabled.
     fn maintenance_enabled(&self) -> bool {
-        self.workspace_flag(&self.workspace_maintenance_enabled)
+        self.selected_workspace_info()
+            .is_some_and(|w| w.maintenance_enabled)
     }
 
     pub const fn theme(&self) -> iced::Theme {
@@ -599,14 +600,10 @@ impl Dashboard {
     /// Apply workspace configuration loaded during boot.
     fn apply_boot_workspaces(
         &mut self,
-        paths: HashMap<String, String>,
-        paused_map: HashMap<String, bool>,
-        maintenance_enabled_map: HashMap<String, bool>,
+        workspaces: HashMap<String, WorkspaceInfo>,
         restored_name: &str,
     ) -> Task<Message> {
-        self.workspace_paths = paths;
-        self.workspace_paused = paused_map;
-        self.workspace_maintenance_enabled = maintenance_enabled_map;
+        self.workspaces = workspaces;
         // Pre-set Home's selected_user from persisted window state
         // so UsersLoaded doesn't auto-select the first user when
         // a previous user was saved.
@@ -913,13 +910,8 @@ impl Dashboard {
         match message {
             // ── Pre-ready handlers (execute regardless of ready state) ──
             Message::Boot(result) => self.finish_boot(result),
-            Message::BootWorkspaces(paths, paused_map, maintenance_enabled_map, restored_name) => {
-                self.apply_boot_workspaces(
-                    paths,
-                    paused_map,
-                    maintenance_enabled_map,
-                    restored_name.as_deref().unwrap_or(""),
-                )
+            Message::BootWorkspaces(workspaces, restored_name) => {
+                self.apply_boot_workspaces(workspaces, restored_name.as_deref().unwrap_or(""))
             }
             Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
             Message::CheckpointAndExit => iced::exit(),
@@ -1053,9 +1045,24 @@ impl Dashboard {
             Message::ToggleResult(kind, result, ws_name, intended_state) => {
                 self.finish_toggle(kind, result, &ws_name, intended_state)
             }
-            Message::WorkspaceStatesRefreshed(paused_map, maintenance_enabled_map) => {
-                self.workspace_paused = paused_map;
-                self.workspace_maintenance_enabled = maintenance_enabled_map;
+            Message::WorkspaceStatesRefreshed(states) => {
+                for (name, paused, maintenance_enabled) in states {
+                    if let Some(info) = self.workspaces.get_mut(&name) {
+                        info.paused = paused;
+                        info.maintenance_enabled = maintenance_enabled;
+                    } else {
+                        // New workspace appeared since boot — create a placeholder
+                        // entry; the next BootWorkspaces will fill the path.
+                        self.workspaces.insert(
+                            name,
+                            WorkspaceInfo {
+                                path: String::new(),
+                                paused,
+                                maintenance_enabled,
+                            },
+                        );
+                    }
+                }
                 Task::none()
             }
             Message::Nop => Task::none(),
@@ -1107,7 +1114,7 @@ impl Dashboard {
     /// Sets workspace state on each page and triggers refreshes via their
     /// existing `WorkspaceSelected` handlers.
     fn propagate_workspace_selection(&mut self, name: &str) -> Task<Message> {
-        let ws_path = self.workspace_paths.get(name).cloned();
+        let ws_path = self.workspaces.get(name).map(|w| w.path.clone());
 
         // Set board's workspace filter directly, then refresh
         self.board_state.workspace_name = Some(name.to_string());
@@ -2187,15 +2194,7 @@ fn refresh_workspace_states_task() -> Task<Message> {
         async {
             let store = crate::workspace::store();
             match store.list_states().await {
-                Ok(states) => {
-                    let mut paused = HashMap::with_capacity(states.len());
-                    let mut maintenance_enabled = HashMap::with_capacity(states.len());
-                    for (name, is_paused, is_maint) in states {
-                        paused.insert(name.clone(), is_paused);
-                        maintenance_enabled.insert(name, is_maint);
-                    }
-                    Message::WorkspaceStatesRefreshed(paused, maintenance_enabled)
-                }
+                Ok(states) => Message::WorkspaceStatesRefreshed(states),
                 Err(e) => {
                     tracing::warn!("Failed to refresh workspace states: {e}");
                     // Keep existing cached state — don't loop back into the
@@ -2215,22 +2214,25 @@ fn refresh_workspace_states_task() -> Task<Message> {
 /// Returns a `BootWorkspaces` message ready for use with `Task::perform`.
 async fn load_workspace_options(prev_selection: Option<String>) -> Message {
     let store = crate::workspace::store();
-    let mut paths = HashMap::new();
-    let mut paused_map = HashMap::new();
-    let mut maintenance_enabled_map = HashMap::new();
+    let mut workspaces = HashMap::new();
     let mut restored_name = None;
 
     if let Ok(ws_list) = store.list().await {
         for ws in &ws_list {
-            paths.insert(ws.name.clone(), ws.path.clone());
-            paused_map.insert(ws.name.clone(), ws.paused);
-            maintenance_enabled_map.insert(ws.name.clone(), ws.maintenance_enabled);
+            workspaces.insert(
+                ws.name.clone(),
+                WorkspaceInfo {
+                    path: ws.path.clone(),
+                    paused: ws.paused,
+                    maintenance_enabled: ws.maintenance_enabled,
+                },
+            );
         }
     }
 
     if let Some(ref name) = prev_selection {
         // Empty string means "Personal" — always valid.
-        if name.is_empty() || paths.contains_key(name.as_str()) {
+        if name.is_empty() || workspaces.contains_key(name.as_str()) {
             restored_name = Some(name.clone());
         }
     }
@@ -2238,7 +2240,7 @@ async fn load_workspace_options(prev_selection: Option<String>) -> Message {
         restored_name = Some(String::new());
     }
 
-    Message::BootWorkspaces(paths, paused_map, maintenance_enabled_map, restored_name)
+    Message::BootWorkspaces(workspaces, restored_name)
 }
 
 /// Open a URL in the system browser (fire-and-forget).
