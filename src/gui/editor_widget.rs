@@ -2142,7 +2142,6 @@ impl Default for EditorWidgetState {
 /// with line numbers, syntax highlighting, selection, and cursor.
 pub struct EditorWidget<'a> {
     buffer: &'a EditorBuffer,
-    font_size: f32,
     padding: f32,
     /// When `true`, skip all keyboard event processing (e.g. when the
     /// file-tree panel or find/replace bar has focus).
@@ -2171,7 +2170,6 @@ impl<'a> EditorWidget<'a> {
     pub const fn new(buffer: &'a EditorBuffer) -> Self {
         Self {
             buffer,
-            font_size: 13.0,
             padding: 8.0,
             ignore_keyboard: false,
             matches: None,
@@ -2180,13 +2178,6 @@ impl<'a> EditorWidget<'a> {
             bracket_pair: None,
             buffer_key: None,
         }
-    }
-
-    /// Set the font size.
-    #[must_use]
-    pub const fn font_size(mut self, size: f32) -> Self {
-        self.font_size = size;
-        self
     }
 
     /// Set the padding.

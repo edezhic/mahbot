@@ -5304,7 +5304,6 @@ impl EditorState {
         bracket_pair: Option<super::editor_widget::BracketPair>,
     ) -> Element<'a, EditorMessage> {
         let editor = super::editor_widget::EditorWidget::new(content)
-            .font_size(EDITOR_FONT_SIZE)
             .padding(8.0)
             .ignore_keyboard(ignore_keyboard)
             .matches(matches, match_current_idx)
