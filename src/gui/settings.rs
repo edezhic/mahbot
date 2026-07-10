@@ -1565,7 +1565,7 @@ impl SettingsState {
     }
 
     fn models_section(&self) -> Element<'_, SettingsMessage> {
-        let rows = Role::all_roles().into_iter().map(|role| {
+        let rows = Role::iter().map(|role| {
             let key: &str = role.into();
             let info = crate::role::role_info(&role);
             let label = info.display_label;
@@ -1594,7 +1594,7 @@ impl SettingsState {
     }
 
     fn reasoning_section(&self) -> Element<'_, SettingsMessage> {
-        let rows = Role::all_roles().into_iter().map(|role| {
+        let rows = Role::iter().map(|role| {
             let key: &str = role.into();
             let info = crate::role::role_info(&role);
             let label = info.display_label;
@@ -1801,7 +1801,7 @@ impl SettingsState {
         // 1. Every role's effective model (override from per_role_configs → hardcoded default)
         // 2. Every model with a saved routing entry (preserves orphaned entries)
         let mut model_names: BTreeSet<String> = BTreeSet::new();
-        for role in Role::all_roles() {
+        for role in Role::iter() {
             let role_key: &str = role.into();
             let model = self
                 .config
@@ -1873,7 +1873,7 @@ impl SettingsState {
             );
         }
 
-        // No empty-state needed — defaults from Role::all_roles() always
+        // No empty-state needed — defaults from Role::iter() always
         // populate the list.
 
         section("Provider Routing (per-model)", Column::from_iter(rows))

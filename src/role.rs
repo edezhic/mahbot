@@ -198,15 +198,6 @@ impl Role {
         role_info(self).requires_multimodal
     }
 
-    /// Collects all roles into a [`Vec<Role>`].
-    ///
-    /// Uses [`Role::iter()`] internally and collects into a `Vec`.
-    /// Prefer using [`Role::iter()`] directly in most cases to avoid allocation.
-    #[must_use]
-    pub fn all_roles() -> Vec<Role> {
-        Role::iter().collect()
-    }
-
     /// Role description loaded from embedded prompt files.
     #[must_use]
     pub fn role_description(&self) -> String {
