@@ -1892,7 +1892,8 @@ fn save_full_output_if_large(
         String::from_utf8_lossy(stdout_bytes),
         String::from_utf8_lossy(stderr_bytes)
     );
-    let scrubbed = strip_and_scrub(raw.as_bytes());
+    let stripped = strip_ansi_escapes(&raw);
+    let scrubbed = scrub_credentials(&stripped);
     let line_count = scrubbed.lines().count();
     let byte_count = scrubbed.len();
     let path = write_to_spill(&scrubbed, &filename)?;

@@ -559,8 +559,7 @@ impl Dashboard {
 
     /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
     fn paused(&self) -> bool {
-        self.selected_workspace_info()
-            .is_some_and(|w| w.paused)
+        self.selected_workspace_info().is_some_and(|w| w.paused)
     }
 
     /// Whether the selected workspace's maintainer is enabled.
