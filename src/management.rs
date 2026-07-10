@@ -227,18 +227,6 @@ fn warn_transition_failed(
     );
 }
 
-/// A comment to add to a ticket, with the role that authored it.
-///
-/// Using a named struct instead of a `(role, content)` tuple eliminates the
-/// risk of accidentally swapping the two fields — the same bug class that
-/// [`TransitionParams`] already prevents for `source`/`target` via named
-/// fields.
-#[derive(Debug, Copy, Clone)]
-struct CommentParam<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
 /// Bundled parameters for [`comment_and_transition`].
 ///
 /// Encapsulates all arguments needed to add a comment (and optional extra
@@ -255,8 +243,8 @@ struct CommentParam<'a> {
 #[derive(Debug)]
 struct TransitionParams<'a> {
     ticket: &'a Ticket,
-    comment: CommentParam<'a>,
-    extra: Option<CommentParam<'a>>,
+    comment: (&'a str, &'a str),
+    extra: Option<(&'a str, &'a str)>,
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
@@ -300,7 +288,7 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
     // Extract failure_comment before the with_tx closure, which captures
     // params by move. Used exclusively for Failed-target transitions to avoid a
     // redundant DB round-trip in notify_ticket.
-    let failure_comment = (params.target == TicketPhase::Failed).then_some(params.comment.content);
+    let failure_comment = (params.target == TicketPhase::Failed).then_some(params.comment.1);
     let pipeline_reservation = (params.target == TicketPhase::ReadyForDevelopment).then_some(true);
 
     if let Err(e) = crate::turso::with_tx(
@@ -308,16 +296,10 @@ async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
         &params.ticket.id,
         params.log_label,
         async |tx| {
-            BoardStore::add_comment_tx(
-                tx,
-                &params.ticket.id,
-                params.comment.role,
-                params.comment.content,
-            )
-            .await?;
+            BoardStore::add_comment_tx(tx, &params.ticket.id, params.comment.0, params.comment.1)
+                .await?;
             if let Some(extra) = params.extra {
-                BoardStore::add_comment_tx(tx, &params.ticket.id, extra.role, extra.content)
-                    .await?;
+                BoardStore::add_comment_tx(tx, &params.ticket.id, extra.0, extra.1).await?;
             }
             BoardStore::transition_to_tx(
                 tx,
@@ -971,10 +953,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 
     if !comment_and_transition(TransitionParams {
         ticket: &ticket,
-        comment: CommentParam {
-            role: Role::Engineer.as_str(),
-            content: comment_text,
-        },
+        comment: (Role::Engineer.as_str(), comment_text),
         extra: None,
         source: TicketPhase::InDevelopment,
         target: target_phase,
@@ -1049,10 +1028,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
     };
     if comment_and_transition(TransitionParams {
         ticket,
-        comment: CommentParam {
-            role: SYSTEM_ROLE,
-            content: comment,
-        },
+        comment: (SYSTEM_ROLE, comment),
         extra: None,
         source,
         target: TicketPhase::Done,
@@ -1074,10 +1050,7 @@ async fn transition_ticket_to_failed(
 ) -> bool {
     comment_and_transition(TransitionParams {
         ticket,
-        comment: CommentParam {
-            role: SYSTEM_ROLE,
-            content: comment,
-        },
+        comment: (SYSTEM_ROLE, comment),
         extra: None,
         source,
         target: TicketPhase::Failed,
@@ -1486,10 +1459,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         );
         if !comment_and_transition(TransitionParams {
             ticket,
-            comment: CommentParam {
-                role: Role::Sanitation.as_str(),
-                content: &comment,
-            },
+            comment: (Role::Sanitation.as_str(), &comment),
             extra: None,
             source: TicketPhase::InSanitation,
             target: TicketPhase::SanitationPassed,
@@ -1524,14 +1494,8 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         // transaction. This matches the pattern used by all other verdict paths.
         if !comment_and_transition(TransitionParams {
             ticket,
-            comment: CommentParam {
-                role: Role::Sanitation.as_str(),
-                content: comment.as_str(),
-            },
-            extra: Some(CommentParam {
-                role: SYSTEM_ROLE,
-                content: sys_comment.as_str(),
-            }),
+            comment: (Role::Sanitation.as_str(), comment.as_str()),
+            extra: Some((SYSTEM_ROLE, sys_comment.as_str())),
             source: TicketPhase::InSanitation,
             target: TicketPhase::ReadyForDevelopment,
             notify: NotifyPolicy::Buffer,
@@ -1636,10 +1600,7 @@ async fn transition_ticket_from_diagnostics(
 ) -> bool {
     comment_and_transition(TransitionParams {
         ticket,
-        comment: CommentParam {
-            role: DIAGNOSTICS_ROLE,
-            content: comment,
-        },
+        comment: (DIAGNOSTICS_ROLE, comment),
         extra: None,
         source: TicketPhase::InDiagnostics,
         target,
