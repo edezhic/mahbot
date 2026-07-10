@@ -366,9 +366,9 @@ impl ShellTool {
                 status,
                 elapsed,
             } => {
-                // Save raw output BEFORE any truncation so agents can access
+                // Save full output BEFORE any truncation so agents can access
                 // the full output even when filtered/truncated to fit the context.
-                let raw_hint = save_raw_output_if_large(&stdout, &stderr, command_str);
+                let full_hint = save_full_output_if_large(&stdout, &stderr, command_str);
 
                 let stdout = clean_truncate(&stdout, "output");
                 let stderr = clean_truncate(&stderr, "stderr");
@@ -390,8 +390,8 @@ impl ShellTool {
                     elapsed,
                 );
                 let mut combined = processed;
-                // Include raw output hint if truncation or spill occurred.
-                if let Some(hint) = &raw_hint {
+                // Include full output hint if truncation or spill occurred.
+                if let Some(hint) = &full_hint {
                     combined.push('\n');
                     combined.push_str(hint);
                 }
@@ -1789,7 +1789,7 @@ fn format_spill_preview(output: &str, path: &Path) -> String {
     format!("{header}{}", format_sandwich(output, 5, 5))
 }
 
-/// Get the shared temp directory for spill files and raw output logs.
+/// Get the shared temp directory for spill/full output logs.
 /// On first call, purges any leftover files from previous sessions.
 fn agent_temp_dir() -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(".agent");
@@ -1847,11 +1847,12 @@ fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
     }
 }
 
-/// Save raw (pre-truncation) output to a temp file when 1MB truncation occurred,
+/// Save the full (pre-truncation) output to a temp file when 1MB truncation occurred,
 /// so agents can access the full output even when filtering/truncation reduces the
-/// inline view. Returns a spill header hint like "[Output saved to ...]" or None
-/// if the save failed or no truncation occurred.
-fn save_raw_output_if_large(
+/// inline view. Note: credentials are scrubbed and ANSI escapes are stripped before
+/// saving. Returns a spill header hint like "[Output saved to ...]" or None if the
+/// save failed or no truncation occurred.
+fn save_full_output_if_large(
     stdout_bytes: &[u8],
     stderr_bytes: &[u8],
     command: &str,
@@ -1875,7 +1876,7 @@ fn save_raw_output_if_large(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let filename = format!("{epoch}_{slug}.raw.log");
+    let filename = format!("{epoch}_{slug}.full.log");
 
     // Combine stdout + stderr with labels, strip ANSI escapes, scrub credentials
     // Order: strip first, then scrub — prevents ANSI-obfuscated credentials
@@ -3151,15 +3152,15 @@ mod tests {
     }
 
     #[test]
-    fn save_raw_output_if_large_skips_small_output() {
-        let result = save_raw_output_if_large(b"hello", b"", "echo hello");
+    fn save_full_output_if_large_skips_small_output() {
+        let result = save_full_output_if_large(b"hello", b"", "echo hello");
         assert!(result.is_none(), "should skip saving for small output");
     }
 
     #[test]
-    fn save_raw_output_if_large_saves_large_output() {
+    fn save_full_output_if_large_saves_large_output() {
         let large = vec![b'a'; MAX_OUTPUT_BYTES + 1];
-        let result = save_raw_output_if_large(&large, b"", "large-test");
+        let result = save_full_output_if_large(&large, b"", "large-test");
         assert!(result.is_some(), "should save for oversized output");
         let hint = result.unwrap();
         assert!(
@@ -3173,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn save_raw_output_if_large_strips_ansi_escapes() {
+    fn save_full_output_if_large_strips_ansi_escapes() {
         // Build output with ANSI escape sequences above the spill threshold
         let ansi_green = "\x1B[0;32m";
         let ansi_reset = "\x1B[0m";
@@ -3184,7 +3185,7 @@ mod tests {
         let ansi_content = format!("{inner}{padding}");
         let stdout_bytes = ansi_content.as_bytes();
 
-        let result = save_raw_output_if_large(stdout_bytes, b"", "ansi-test");
+        let result = save_full_output_if_large(stdout_bytes, b"", "ansi-test");
         assert!(
             result.is_some(),
             "should save for oversized output with ANSI"

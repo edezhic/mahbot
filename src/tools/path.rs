@@ -330,9 +330,9 @@ pub(crate) fn is_spill_filename(name: &str) -> bool {
         .is_some_and(|hex| hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// Whether `path` is a mahbot shell spill/raw log under an OS temp directory.
+/// Whether `path` is a mahbot shell spill/full log under an OS temp directory.
 fn is_mahbot_spill_filename(name: &str) -> bool {
-    if name.ends_with(".raw.log") {
+    if name.ends_with(".full.log") {
         return true;
     }
     is_spill_filename(name)
@@ -958,10 +958,10 @@ mod tests {
             path: spill.to_string_lossy().to_string(),
             allowed: true,
         });
-        let raw_log = std::env::temp_dir().join(".agent/12345_cargo_check.raw.log");
+        let full_log = std::env::temp_dir().join(".agent/12345_cargo_check.full.log");
         cases.push(Case {
-            name: "raw_log_spill",
-            path: raw_log.to_string_lossy().to_string(),
+            name: "full_log_spill",
+            path: full_log.to_string_lossy().to_string(),
             allowed: true,
         });
 
