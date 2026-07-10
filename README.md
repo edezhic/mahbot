@@ -43,13 +43,14 @@ Every ticket runs through a fixed lifecycle with **redundant checks**:
 
 | Phase | What happens |
 |-------|----------------|
-| **Backlog → Analysis** | 3 parallel Analysts research and score the ticket |
+| **Backlog → Analysis** | 3 parallel Analysts research and score the ticket (all must pass ≥ 7/10) |
 | **Planning** | Manager notified; moves the ticket to development when ready once the scope is confirmed |
 | **Ready → In development** | 1 Engineer implements using subagents when needed |
 | **In diagnostics** | Discovered project commands run (format, lint, build, test) |
 | **Diagnostics done → In review** | 3 parallel Reviewers (all must pass ≥ 9/10) |
 | **Reviewed → In QA** | 3 parallel QA agents (all must pass ≥ 9/10) |
-| **QA passed** | Auto `git commit` with the ticket's title if the tree is dirty → **Done** |
+| **QA passed** | Check for untracked/new files in the working tree. If found → dispatch **Sanitation** agent; otherwise auto `git commit` with the ticket's title if the tree is dirty |
+| **Sanitation passed** | Auto `git commit` with the ticket's title if the tree is dirty → **Done** |
 
 Failed review, QA, or diagnostics **bounce the ticket back to development** with pipeline priority. Circuit breakers pause a workspace if a ticket thrashes (too many comments or repeated diagnostics failures).
 
@@ -65,7 +66,7 @@ Other harnesses efficiency heavily relies on huge discrepancy between subscripti
 
 ### 4. Agentic engineering harness, built in
 
-- **Multi-role agents** — Manager, Engineer, Analyst, Coder, Reviewer, QA, Discovery, Maintainer, Artist
+- **Multi-role agents** — Manager, Engineer, Analyst, Coder, Reviewer, QA, Sanitation, Discovery, Maintainer, Artist
 - **Subagents** — `ask` spawns Analyst/Coder work in isolated context; Manager gets async results via a serialized queue
 - **Persistent state** — Turso-backed sessions, tickets, workspace context, chat history, tool stats
 - **Workspace discovery** — per-role codebase summaries + auto-detected diagnostics commands
@@ -79,15 +80,19 @@ Other harnesses efficiency heavily relies on huge discrepancy between subscripti
 flowchart TD
     User[User] --> Channels[GUI or Telegram]
     Channels --> MessagePipeline[Message Pipeline]
-    MessagePipeline --> ManagerQueue[Manager]
+    MessagePipeline --> ManagerQueue[Manager Queue]
     ManagerQueue --> Board[Ticket Board]
     Board --> Analysts[3 Analysts]
     Board --> Engineer[Engineer]
     Board --> Diagnostics[Diagnostics Runner]
     Board --> Reviewers[3 Reviewers]
     Board --> QA[3 QA Agents]
-    QA --> AutoCommit[Auto Commit; Done]
-    AutoCommit --> ManagerQueue
+    QA -->|all pass ≥ 9/10| QaCheck{Untracked files?}
+    QaCheck -->|yes| Sanitation[Sanitation Agent]
+    QaCheck -->|no| AutoCommit[Auto Commit]
+    Sanitation -->|pass| AutoCommit
+    AutoCommit --> Done[Done]
+    Done --> ManagerQueue
 ```
 
 - **Channels** — GUI and Telegram share one message pipeline and channel registry (`src/channels/`, `src/main.rs`).
