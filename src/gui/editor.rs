@@ -3985,66 +3985,92 @@ impl EditorState {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
         };
+
+        // ── Phase 1 (read-only): extract owned values upfront ────────────
+        // Cloning range/replace/query here avoids interleaving immutable
+        // borrows (to read state) with mutable borrows (to mutate content
+        // and update state) in the same scope.
+        let Some((range, replace_text, case_sensitive, query)) = self
+            .tab_contents
+            .get(&path)
+            .and_then(|tab_data| tab_data.find_replace_state.as_ref())
+            .and_then(|state| {
+                let range = state.matches.get(state.current_match_idx)?;
+                Some((
+                    range.clone(),
+                    state.replace.clone(),
+                    state.case_sensitive,
+                    state.query.clone(),
+                ))
+            })
+        else {
+            update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
+            return Task::none();
+        };
+
+        let replace_end = range.start + replace_text.len();
+
+        // Guard: no-op replacement (empty text on zero-width range).
+        if replace_text.is_empty() && range.start >= range.end {
+            update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
+            return Task::none();
+        }
+
+        // ── Phase 2 (mutation): perform the replacement ──────────────────
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-            if let Some(ref state) = tab_data.find_replace_state {
-                if let Some(range) = state.matches.get(state.current_match_idx) {
-                    let replace_text = state.replace.clone();
-                    let replace_end = range.start + replace_text.len();
-                    if !replace_text.is_empty() || range.start < range.end {
-                        // Take undo snapshot.
-                        tab_data
-                            .undo_stack
-                            .borrow_mut()
-                            .snap_before_edit(&tab_data.content);
-                        let text = tab_data.content.text();
-                        let new_text = format!(
-                            "{}{}{}",
-                            &text[..range.start],
-                            replace_text,
-                            &text[range.end..]
-                        );
-                        tab_data.content = EditorBuffer::from_file(&new_text, &path);
-                        // Recompute matches and auto-advance to next match.
-                        if let Some(ref mut state) = tab_data.find_replace_state {
-                            state.matches =
-                                compute_text_matches(&new_text, &state.query, state.case_sensitive);
-                            if !state.matches.is_empty() {
-                                // Advance to the next match starting at or
-                                // after the end of the replacement in the
-                                // new text (position = range.start + len(replace_text)).
-                                // Using a position in the old text (range.end)
-                                // would be wrong when replacement length differs
-                                // from the original match length.
-                                let next_idx = state
-                                    .matches
-                                    .iter()
-                                    .position(|m| m.start >= replace_end)
-                                    .unwrap_or(0)
-                                    .min(state.matches.len() - 1);
-                                state.current_match_idx = next_idx;
-                                // Position cursor at the new match.
-                                if let Some(r) = state.matches.get(next_idx) {
-                                    if let Some((line, col)) =
-                                        byte_offset_to_cursor_pos(&tab_data.content, r.start)
-                                    {
-                                        tab_data.content.move_to(line, col);
-                                    }
-                                }
-                            } else {
-                                state.current_match_idx = 0;
-                                // No remaining matches — place cursor at end
-                                // of the replacement, not at buffer start.
-                                if let Some((line, col)) =
-                                    byte_offset_to_cursor_pos(&tab_data.content, replace_end)
-                                {
-                                    tab_data.content.move_to(line, col);
-                                }
-                            }
+            tab_data
+                .undo_stack
+                .borrow_mut()
+                .snap_before_edit(&tab_data.content);
+
+            let text = tab_data.content.text();
+            let new_text = format!(
+                "{}{}{}",
+                &text[..range.start],
+                replace_text,
+                &text[range.end..]
+            );
+            tab_data.content = EditorBuffer::from_file(&new_text, &path);
+
+            // Recompute matches and auto-advance to next match.
+            if let Some(ref mut state) = tab_data.find_replace_state {
+                state.matches = compute_text_matches(&new_text, &query, case_sensitive);
+
+                if !state.matches.is_empty() {
+                    // Advance to the next match starting at or after the
+                    // end of the replacement in the new text
+                    // (position = range.start + len(replace_text)).
+                    // Using a position in the old text (range.end) would
+                    // be wrong when replacement length differs from the
+                    // original match length.
+                    let next_idx = state
+                        .matches
+                        .iter()
+                        .position(|m| m.start >= replace_end)
+                        .unwrap_or(0)
+                        .min(state.matches.len() - 1);
+                    state.current_match_idx = next_idx;
+                    // Position cursor at the new match.
+                    if let Some(r) = state.matches.get(next_idx) {
+                        if let Some((line, col)) =
+                            byte_offset_to_cursor_pos(&tab_data.content, r.start)
+                        {
+                            tab_data.content.move_to(line, col);
                         }
+                    }
+                } else {
+                    state.current_match_idx = 0;
+                    // No remaining matches — place cursor at end of
+                    // the replacement, not at buffer start.
+                    if let Some((line, col)) =
+                        byte_offset_to_cursor_pos(&tab_data.content, replace_end)
+                    {
+                        tab_data.content.move_to(line, col);
                     }
                 }
             }
         }
+
         update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
         Task::none()
     }
