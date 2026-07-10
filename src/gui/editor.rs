@@ -1501,11 +1501,11 @@ pub struct EditorState {
     git_ignore_cache: HashSet<String>,
     /// Guard against concurrent git ignore refresh operations.
     git_ignore_loading: bool,
-    /// Monotonically incrementing blink generation counter.
+    /// Monotonically incrementing blink tick counter.
     /// Incremented on each `BlinkTick` to force Iced to redraw the editor
     /// widget, keeping the cursor blink alive even if the `RedrawRequested`
     /// chain breaks.
-    blink_gen: u64,
+    blink_tick: u64,
     /// Shared atomic counter used by async save tasks for pre-write staleness
     /// checking.  Written to on every save initiation; read by in-flight tasks
     /// to determine if a newer save has superseded them.
@@ -1590,7 +1590,7 @@ impl EditorState {
             git_status_loading: false,
             git_ignore_cache: HashSet::new(),
             git_ignore_loading: false,
-            blink_gen: 0,
+            blink_tick: 0,
             tab_save_counter: Arc::new(AtomicU64::new(0)),
             file_mtimes: HashMap::new(),
             deleted_file_toasted: HashSet::new(),
@@ -1807,15 +1807,10 @@ impl EditorState {
             .is_some()
     }
 
-    /// Returns the active modal overlay, if any.
-    fn active_modal(&self) -> Option<&ModalKind> {
-        self.active_modal.as_ref()
-    }
-
     /// Returns `true` when a modal overlay owns keyboard focus
     /// and editor-wide shortcuts (undo, save, tab switch, etc.) must not run.
     fn modal_overlay_blocks_editor_shortcuts(&self) -> bool {
-        self.active_modal().is_some()
+        self.active_modal.is_some()
     }
 
     /// Save editor tabs to the database for the currently selected workspace.
@@ -4200,15 +4195,15 @@ impl EditorState {
         }
     }
 
-    /// Handle blink-tick — increments the blink generation counter.
+    /// Handle blink-tick — increments the blink tick counter.
     fn blink_tick(&mut self) -> Task<EditorMessage> {
-        // Increment the blink generation counter to force Iced
+        // Increment the blink tick counter to force Iced
         // to redraw the editor widget. Iced 0.14 may skip redrawing
         // unchanged widgets when only request_redraw_at is used;
         // this counter ensures the widget is re-evaluated on each
         // BlinkTick (every 100 ms), keeping the cursor blink alive
         // even if the RedrawRequested chain breaks.
-        self.blink_gen = self.blink_gen.wrapping_add(1);
+        self.blink_tick = self.blink_tick.wrapping_add(1);
         Task::none()
     }
 
@@ -4501,9 +4496,7 @@ impl EditorState {
             .height(Length::Fill);
 
         // ── Overlay (single match on active_modal) ────────────────────
-        let col_children: Vec<Element<'_, EditorMessage>> = vec![split.into()];
-
-        let body = column(col_children)
+        let body = column([split.into()])
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill);
@@ -5444,7 +5437,7 @@ impl EditorState {
         let tree_focused = self.file_tree.tree_focused;
         let find_bar_open = tab_data.find_replace_state.is_some();
         // Modal overlays own keyboard input entirely — block all editor keys.
-        let modal_overlay_open = self.active_modal().is_some();
+        let modal_overlay_open = self.active_modal.is_some();
         // Find/replace allows cursor navigation while its text inputs are focused.
         let ignore_keyboard = tree_focused || modal_overlay_open || find_bar_open;
 
@@ -5486,7 +5479,7 @@ impl EditorState {
             ignore_keyboard,
             match_tuples,
             match_current_idx,
-            self.blink_gen,
+            self.blink_tick,
             bracket_pair,
         )
     }
@@ -5499,7 +5492,7 @@ impl EditorState {
         ignore_keyboard: bool,
         matches: Vec<(usize, usize, usize)>,
         match_current_idx: usize,
-        blink_gen: u64,
+        blink_tick: u64,
         bracket_pair: Option<super::editor_widget::BracketPair>,
     ) -> Element<'a, EditorMessage> {
         let editor = super::editor_widget::EditorWidget::new(content)
@@ -5507,7 +5500,7 @@ impl EditorState {
             .padding(8.0)
             .ignore_keyboard(ignore_keyboard)
             .matches(matches, match_current_idx)
-            .blink_gen(blink_gen)
+            .blink_tick(blink_tick)
             .bracket_pair(bracket_pair)
             .buffer_key(buffer_key);
         let element = iced::Element::new(editor);

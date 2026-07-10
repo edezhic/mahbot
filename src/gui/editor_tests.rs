@@ -1441,16 +1441,16 @@ fn make_editor_with_single_tab(text: &str) -> EditorState {
     state
 }
 
-/// Each [`ModalKind`] variant must be returned by [`EditorState::active_modal()`]
-/// when the corresponding modal is open.  This catches the case where a new
-/// variant is added to the enum but `escape()`'s match is not updated (the
-/// compiler enforces exhaustiveness).
+/// Each [`ModalKind`] variant must be detected by matching on
+/// [`EditorState::active_modal`] when the corresponding modal is open.
+/// This catches the case where a new variant is added to the enum but
+/// `escape()`'s match is not updated (the compiler enforces exhaustiveness).
 #[test]
 fn test_active_modal_returns_correct_variant() {
     let mut state = EditorState::new();
 
     // None when no modal is open.
-    assert!(state.active_modal().is_none());
+    assert!(state.active_modal.as_ref().is_none());
 
     // Each variant — set it, verify it returns the expected variant,
     // then clear and test the next.
@@ -1462,13 +1462,16 @@ fn test_active_modal_returns_correct_variant() {
         search_gen: 0,
     }));
     assert!(matches!(
-        state.active_modal(),
+        state.active_modal.as_ref(),
         Some(ModalKind::GlobalSearch(_))
     ));
     state.active_modal = None;
 
     state.active_modal = Some(ModalKind::GotoLine(String::new()));
-    assert!(matches!(state.active_modal(), Some(ModalKind::GotoLine(_))));
+    assert!(matches!(
+        state.active_modal.as_ref(),
+        Some(ModalKind::GotoLine(_))
+    ));
     state.active_modal = None;
 
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
@@ -1477,7 +1480,7 @@ fn test_active_modal_returns_correct_variant() {
         results: Vec::new(),
     }));
     assert!(matches!(
-        state.active_modal(),
+        state.active_modal.as_ref(),
         Some(ModalKind::QuickOpen(_))
     ));
     state.active_modal = None;
@@ -1490,7 +1493,10 @@ fn test_active_modal_returns_correct_variant() {
         input_text: "foo".into(),
         error: None,
     }));
-    assert!(matches!(state.active_modal(), Some(ModalKind::Rename(_))));
+    assert!(matches!(
+        state.active_modal.as_ref(),
+        Some(ModalKind::Rename(_))
+    ));
     state.active_modal = None;
 
     state.active_modal = Some(ModalKind::NewItem(NewItemTarget {
@@ -1500,7 +1506,10 @@ fn test_active_modal_returns_correct_variant() {
         ws_root: String::new(),
         input_text: String::new(),
     }));
-    assert!(matches!(state.active_modal(), Some(ModalKind::NewItem(_))));
+    assert!(matches!(
+        state.active_modal.as_ref(),
+        Some(ModalKind::NewItem(_))
+    ));
     state.active_modal = None;
 
     state.active_modal = Some(ModalKind::DeleteConfirm(DeleteConfirmTarget {
@@ -1510,21 +1519,21 @@ fn test_active_modal_returns_correct_variant() {
         abs_path: String::new(),
     }));
     assert!(matches!(
-        state.active_modal(),
+        state.active_modal.as_ref(),
         Some(ModalKind::DeleteConfirm(_))
     ));
     state.active_modal = None;
 
     state.active_modal = Some(ModalKind::CloseDialog(0));
     assert!(matches!(
-        state.active_modal(),
+        state.active_modal.as_ref(),
         Some(ModalKind::CloseDialog(..))
     ));
     state.active_modal = None;
 
     state.active_modal = Some(ModalKind::CloseOthers(0));
     assert!(matches!(
-        state.active_modal(),
+        state.active_modal.as_ref(),
         Some(ModalKind::CloseOthers(_))
     ));
 }

@@ -2154,10 +2154,10 @@ pub struct EditorWidget<'a> {
     /// Index of the currently-focused match within `matches`.
     /// Used to render the current match with a stronger highlight color.
     match_current_idx: usize,
-    /// Blink generation counter from the editor state.
+    /// Blink tick counter from the editor state.
     /// Incremented on each `BlinkTick` subscription event to force Iced
     /// to redraw the widget even when no other state has changed.
-    blink_gen: u64,
+    blink_tick: u64,
     /// Matching bracket pair to highlight, if any.
     /// Each element is `(line, col)`.
     bracket_pair: Option<((usize, usize), (usize, usize))>,
@@ -2176,7 +2176,7 @@ impl<'a> EditorWidget<'a> {
             ignore_keyboard: false,
             matches: None,
             match_current_idx: 0,
-            blink_gen: 0,
+            blink_tick: 0,
             bracket_pair: None,
             buffer_key: None,
         }
@@ -2221,12 +2221,12 @@ impl<'a> EditorWidget<'a> {
         self
     }
 
-    /// Set the blink generation counter.
+    /// Set the blink tick counter.
     /// This is passed from the editor state's `BlinkTick` handler to force
     /// Iced to detect a widget change and schedule a redraw on each tick.
     #[must_use]
-    pub const fn blink_gen(mut self, blink_gen: u64) -> Self {
-        self.blink_gen = blink_gen;
+    pub const fn blink_tick(mut self, blink_tick: u64) -> Self {
+        self.blink_tick = blink_tick;
         self
     }
 
