@@ -1599,7 +1599,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
                     output
                 };
                 // Output is already credential-scrubbed by ShellTool's output
-                // pipeline (in the combine closure), so no further scrubbing needed.
+                // pipeline at pipeline entry, so no further scrubbing needed.
                 comment.push_str(&display);
 
                 if exit_code != Some(0) {

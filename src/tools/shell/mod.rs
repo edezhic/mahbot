@@ -635,7 +635,7 @@ Use this tool only for inspection: reading files, listing directories, running c
     }
 
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        false // shell pipeline already scrubs credentials internally at every output path
+        false // shell pipeline already scrubs stdout and stderr once at pipeline entry
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
@@ -995,14 +995,11 @@ fn finish_shell_output(
     elapsed: Duration,
     full_output_for_spill: Option<&str>,
 ) -> String {
-    // Combined output is already credential-scrubbed upstream in the
-    // `apply_profile_pipeline` combine closure, so no further scrubbing
-    // is needed here.  ShellTool overrides `should_scrub_output` to return
-    // `false`, disabling the agent-level scrub as redundant — the pipeline
-    // guarantees scrubbing at every output path.  Stderr was already
-    // scrubbed at `apply_profile_pipeline` entry.  The pre-head/tail output
-    // (full_output_for_spill) is also scrubbed at the origin point in
-    // `apply_profile_pipeline`, immediately after line truncation.
+    // Both stdout and stderr are credential-scrubbed once at
+    // `apply_profile_pipeline` entry, so no further scrubbing is needed
+    // here.  ShellTool overrides `should_scrub_output` to return `false`,
+    // disabling the agent-level scrub as redundant — the pipeline
+    // guarantees scrubbing before any data reaches this function.
     if elapsed.as_secs_f64() >= 1.0 {
         let _ = write!(combined, "\n[took {:.1}s]", elapsed.as_secs_f64());
     }
@@ -1487,11 +1484,11 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// Run the full profile-based processing pipeline on pre-processed output.
 ///
 /// Upstream processing (`execute()`) handles ANSI stripping and 1 MB truncation.
-/// Stderr is scrubbed at entry so all paths (early-return and main) are consistent.
-/// Stdout is scrubbed inside the `combine` closure so all output paths (JSON preview,
-/// short-circuit, on_empty, main) consistently receive scrubbed output.
-/// The pre-head/tail output (used for spill-to-file in `finish_shell_output`) is
-/// also scrubbed here, immediately after line truncation.
+/// Both stdout and stderr are scrubbed once at pipeline entry so all paths
+/// (early-return and main) consistently receive clean data.  No further
+/// scrubbing is needed anywhere downstream — all derived output (truncated,
+/// pre-head/tail for spill, JSON preview, short-circuit messages) originates
+/// from this single scrubbed source.
 ///
 /// Early-return stages (JSON preview, short-circuit, on_empty) call
 /// `combine_output` only.  The main path continues through `combine_output` →
@@ -1514,38 +1511,43 @@ fn apply_profile_pipeline(
     elapsed: Duration,
     is_chained: bool,
 ) -> String {
-    // Scrub stderr once at the top of the pipeline so all early-return
-    // paths (JSON preview, short-circuit, on_empty) consistently receive
-    // scrubbed stderr.  Scrubbing before keep_stderr filtering means
-    // credential lines that matched keep_stderr patterns will be dropped
-    // entirely because the redacted version no longer matches — this is
-    // acceptable since credentials should never appear in output.
-    // Stdout is scrubbed inside the `combine` closure below so all output
-    // paths uniformly receive scrubbed output at a single convergence point.
+    // Stage 1: try JSON preview — run on unscrubbed output because
+    // credential scrubbing replaces value matches with `*[REDACTED]` which
+    // can corrupt JSON syntax (e.g. inserting a second `"` before a key),
+    // making valid JSON unparseable.  The preview includes raw array element
+    // samples that may contain credentials, so scrub it after generation.
+    let json_preview = try_json_preview(output).map(|preview| scrub_credentials(&preview));
+
+    // Scrub both stdout and stderr once at pipeline entry so all
+    // downstream paths (short-circuit, on_empty, main) uniformly
+    // receive clean data.  Scrubbing before keep_stderr filtering
+    // means credential lines that matched keep_stderr patterns will
+    // be dropped entirely because the redacted version no longer
+    // matches — this is acceptable since credentials should never
+    // appear in output.  No further credential scrubbing is needed
+    // anywhere in the pipeline; all derived data (truncated output,
+    // spill output) originates from this single scrubbed source.
     let stderr = scrub_credentials(stderr);
+    let output = scrub_credentials(output);
+
+    // Short-circuit early return for JSON preview; output is already scrubbed.
+    if let Some(preview) = json_preview {
+        return combine_output(&preview, &stderr, exit_code, profile.keep_stderr.as_ref());
+    }
 
     // Local closure capturing the trailing combine_output arguments (stderr,
     // exit_code, keep_stderr) to reduce repetition across all call sites.
-    // Scrubbing stdout here ensures all output paths (JSON preview,
-    // short-circuit, on_empty, main) consistently receive scrubbed output.
-    let combine = |output: &str| {
-        let scrubbed = scrub_credentials(output);
-        combine_output(&scrubbed, &stderr, exit_code, profile.keep_stderr.as_ref())
-    };
-
-    // Stage 1: try JSON preview — early-return path; credentials are
-    // scrubbed by the `combine` closure automatically.
-    if let Some(json_preview) = try_json_preview(output) {
-        return combine(&json_preview);
-    }
+    // Output is already scrubbed at pipeline entry.
+    let combine =
+        |output: &str| combine_output(output, &stderr, exit_code, profile.keep_stderr.as_ref());
 
     // Stage 2: short-circuit on success patterns — skip for chained commands
     // to avoid suppressing output from later segments (e.g., `cargo build && echo done`).
-    if !is_chained && let Some(msg) = match_short_circuit(output, &profile.short_circuits) {
+    if !is_chained && let Some(msg) = match_short_circuit(&output, &profile.short_circuits) {
         return combine(msg);
     }
 
-    let mut processed = output.to_string();
+    let mut processed = output.clone();
 
     // Stage 3: strip lines
     processed = apply_strip_lines(&processed, profile);
@@ -1567,9 +1569,7 @@ fn apply_profile_pipeline(
     // Returns pre-truncation output for spilling by finish_shell_output,
     // so the complete content remains accessible even when truncation
     // reduces the inline view to a snippet.
-    // Scrub credentials here so finish_shell_output receives clean data.
     let (truncated, pre_head_tail) = apply_line_truncation(&processed, profile);
-    let pre_head_tail = pre_head_tail.map(|s| scrub_credentials(&s));
     processed = truncated;
 
     // Stage 7: on_empty — fallback when all output stripped
@@ -2724,6 +2724,17 @@ mod tests {
                 contains: &["api_key=abcd*[REDACTED]", "[tsc: ok]"],
                 ..Default::default()
             },
+            ShellOutputCase {
+                // Main pipeline path (all stages applied, no early-return):
+                // stdout credentials are scrubbed at pipeline entry before any
+                // downstream stage processes them.
+                name: "main pipeline scrubs credentials in stdout",
+                command: "echo test",
+                stdout: "API_KEY=abcdefghijklmnop12345678",
+                not_contains: &["abcdefghijklmnop12345678"],
+                contains: &["API_KEY=abcd*[REDACTED]"],
+                ..Default::default()
+            },
         ];
         check_shell_output(cases);
     }
@@ -3506,10 +3517,10 @@ mod tests {
     }
 
     // ── finish_shell_output unit tests ────────────────────────────────
-    // Credential scrubbing is now performed upstream in the `apply_profile_pipeline`
-    // combine closure, so `finish_shell_output` receives pre-scrubbed input.
-    // These tests verify that non-scrubbing behavior (timing, spill, idempotence)
-    // remains correct.
+    // Credential scrubbing is now performed upstream at pipeline entry in
+    // `apply_profile_pipeline`, so `finish_shell_output` receives pre-scrubbed
+    // input.  These tests verify that non-scrubbing behavior (timing, spill,
+    // idempotence) remains correct.
 
     struct FinishCase {
         name: &'static str,
