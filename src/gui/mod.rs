@@ -818,65 +818,60 @@ impl Dashboard {
                 self.editor_state.update(msg).map(Message::Editor)
             }
             Message::Settings(msg) if self.ready => {
-                // Intercept SwitchUser from user messages.
-                if let settings::SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
-                    ref user,
-                )) = msg
-                {
-                    let switch = Task::done(home::HomeMessage::UserSelected(user.clone()))
-                        .map(Message::Home);
-                    return switch;
-                }
-                // Intercept DeleteResult: if the deleted user was the active
-                // user, fall back to admin.
-                if let settings::SettingsMessage::UserMsg(
-                    ref msg_inner @ users::UsersMessage::DeleteResult(Ok(()), ref deleted_user),
-                ) = msg
-                {
-                    if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
-                        self.selected_user_name = Some("admin".to_string());
-                        self.persist_window_state();
-                        let switch =
-                            Task::done(home::HomeMessage::UserSelected("admin".to_string()))
-                                .map(Message::Home);
-                        let settings_task = self
-                            .settings_state
-                            .update(settings::SettingsMessage::UserMsg(msg_inner.clone()))
-                            .map(Message::Settings);
-                        return Task::batch([switch, settings_task]);
+                // Capture cross-page side effects for intercepted UserMsg
+                // variants. These batch alongside the delegation call below.
+                let mut intercept_task: Option<Task<Message>> = None;
+
+                if let settings::SettingsMessage::UserMsg(ref inner) = msg {
+                    match inner {
+                        users::UsersMessage::SwitchUser(user) => {
+                            // SwitchUser is a documented no-op in UsersState,
+                            // so unconditional delegation below is safe.
+                            intercept_task = Some(
+                                Task::done(home::HomeMessage::UserSelected(user.clone()))
+                                    .map(Message::Home),
+                            );
+                        }
+                        users::UsersMessage::DeleteResult(Ok(()), deleted_user) => {
+                            if self.selected_user_name.as_deref() == Some(deleted_user.as_str()) {
+                                self.selected_user_name = Some("admin".to_string());
+                                self.persist_window_state();
+                                intercept_task = Some(
+                                    Task::done(home::HomeMessage::UserSelected(
+                                        "admin".to_string(),
+                                    ))
+                                    .map(Message::Home),
+                                );
+                            }
+                        }
+                        users::UsersMessage::UpdateWorkspace(sender, ws)
+                            if self.selected_user_name.as_deref() == Some(sender.as_str()) =>
+                        {
+                            intercept_task = Some(self.select_workspace(ws));
+                        }
+                        _ => {}
                     }
                 }
-                // Intercept UpdateWorkspace: propagate to Dashboard if it's
-                // the active user.
-                if let settings::SettingsMessage::UserMsg(
-                    ref msg_inner @ users::UsersMessage::UpdateWorkspace(ref sender, ref ws),
-                ) = msg
-                {
-                    if self.selected_user_name.as_deref() == Some(sender.as_str()) {
-                        let select_task = self.select_workspace(ws);
-                        let settings_task = self
-                            .settings_state
-                            .update(settings::SettingsMessage::UserMsg(msg_inner.clone()))
-                            .map(Message::Settings);
-                        return Task::batch([select_task, settings_task]);
-                    }
-                }
-                // Check whether workspace list changed (add/delete) and
-                // needs_global_reload is computed right before consumption,
-                // after all early-return intercepts above.
+
                 let needs_global_reload = matches!(
                     msg,
                     settings::SettingsMessage::WorkspaceMsg(
                         workspaces::WorkspacesMessage::DeleteResult(Ok(()))
                     ) | settings::SettingsMessage::AddWorkspaceResult(Ok(_))
                 );
-                let task = self.settings_state.update(msg).map(Message::Settings);
-                if needs_global_reload {
-                    let reload_task = self.reload_workspace_options();
-                    Task::batch([task, reload_task])
-                } else {
-                    task
-                }
+
+                let settings_task = self.settings_state.update(msg).map(Message::Settings);
+
+                // Stack-allocated batch: only Some tasks are included via
+                // flatten. Avoids Vec heap allocation for the common
+                // no-intercept no-reload path.
+                let tasks = [
+                    intercept_task,
+                    Some(settings_task),
+                    needs_global_reload.then(|| self.reload_workspace_options()),
+                ];
+
+                Task::batch(tasks.into_iter().flatten())
             }
             Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
             Message::CheckpointAndExit => iced::exit(),
