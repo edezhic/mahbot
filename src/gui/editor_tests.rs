@@ -952,247 +952,152 @@ fn test_is_find_bar_open_no_tabs() {
 }
 
 #[test]
-fn test_find_replace_auto_advance_same_length() {
-    // Replace "ab" with "xy" in "ab cd ab" → "xy cd ab".
-    // After replacement, one "ab" remains at byte 7.
-    // Auto-advance should skip past the replacement (replace_end = 0 + 2 = 2)
-    // and find the remaining match at position 7.
-    let mut tab_data = TabData {
-        content: EditorBuffer::with_text("ab cd ab", None),
-        undo_stack: RefCell::new(UndoStack::new()),
-        find_replace_state: Some(FindReplaceState {
-            query: "ab".to_string(),
-            replace: "xy".to_string(),
-            matches: vec![0..2, 6..8],
-            current_match_idx: 0,
-            case_sensitive: true,
-        }),
-        saved_text_hash: 0,
-    };
+fn test_find_replace_auto_advance() {
+    // Verifies cursor auto-advance after find_replace across five scenarios:
+    // same-length replacement, shorter replacement, adjacent matches,
+    // longer replacement (wrap-around), and no remaining matches.
+    struct Case {
+        name: &'static str,
+        /// Initial buffer text.
+        text: &'static str,
+        /// Search query.
+        query: &'static str,
+        /// Replacement text.
+        replace: &'static str,
+        /// Pre-seeded match byte-range pairs.
+        initial_matches: &'static [(usize, usize)],
+        /// Expected text after replacement.
+        expected_text: &'static str,
+        /// Expected remaining match byte-range pairs.
+        expected_matches: &'static [(usize, usize)],
+        /// Expected cursor line after replacement.
+        expected_cursor_line: usize,
+        /// Expected cursor column after replacement.
+        expected_cursor_col: usize,
+        /// Expected current_match_idx after replacement.
+        expected_current_match_idx: usize,
+    }
 
-    // Simulate FindReplace on match 0.
-    let range = 0..2;
-    let replace_text = "xy".to_string();
-    let replace_end = range.start + replace_text.len(); // = 2
-    let text = tab_data.content.text();
-    let new_text = format!(
-        "{}{}{}",
-        &text[..range.start],
-        replace_text,
-        &text[range.end..]
-    );
-    assert_eq!(new_text, "xy cd ab");
-    tab_data.content = EditorBuffer::with_text(&new_text, None);
-    if let Some(ref mut state) = tab_data.find_replace_state {
-        state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
-        assert_eq!(state.matches.len(), 1, "one remaining match");
-        let next_idx = state
-            .matches
-            .iter()
-            .position(|m| m.start >= replace_end)
-            .unwrap_or(0)
-            .min(state.matches.len() - 1);
-        assert_eq!(next_idx, 0, "should advance to the remaining match");
-        if let Some(r) = state.matches.get(next_idx) {
-            assert_eq!(r.start, 6, "remaining match should start at byte 6");
-            assert_eq!(r.end, 8, "remaining match should end at byte 8");
+    let cases: &[Case] = &[
+        // Same-length replacement: "ab cd ab" → "xy cd ab".
+        // After replacing first "ab" (0..2) with "xy" (len=2), remaining "ab"
+        // at 6..8 is found by advancing past replace_end (= 0 + 2 = 2).
+        Case {
+            name: "same_length",
+            text: "ab cd ab",
+            query: "ab",
+            replace: "xy",
+            initial_matches: &[(0, 2), (6, 8)],
+            expected_text: "xy cd ab",
+            expected_matches: &[(6, 8)],
+            expected_cursor_line: 0,
+            expected_cursor_col: 6,
+            expected_current_match_idx: 0,
+        },
+        // replace_end = 0 + 1 = 1. Remaining "aaa" at byte 6 in new text.
+        Case {
+            name: "shorter_replacement",
+            text: "aaa bbb aaa",
+            query: "aaa",
+            replace: "a",
+            initial_matches: &[(0, 3), (8, 11)],
+            expected_text: "a bbb aaa",
+            expected_matches: &[(6, 9)],
+            expected_cursor_line: 0,
+            expected_cursor_col: 6,
+            expected_current_match_idx: 0,
+        },
+        // Adjacent matches: "aaaa" → "xaa".
+        // Using range.end (= 2) as the advance point would incorrectly skip
+        // the remaining match at 1..3 (1 >= 2 is false, so position() returns
+        // None → wraps to 0, not 1). Using replace_end (= 1) correctly finds
+        // the match at position 1.
+        Case {
+            name: "adjacent_matches",
+            text: "aaaa",
+            query: "aa",
+            replace: "x",
+            initial_matches: &[(0, 2), (2, 4)],
+            expected_text: "xaa",
+            expected_matches: &[(1, 3)],
+            expected_cursor_line: 0,
+            expected_cursor_col: 1,
+            expected_current_match_idx: 0,
+        },
+        // Longer replacement: "ab" → "abc".
+        // replace_end = 0 + 3 = 3. Remaining "ab" at 0..2 has start=0 < 3,
+        // so position() returns None → wraps to index 0.
+        Case {
+            name: "longer_replacement",
+            text: "ab",
+            query: "ab",
+            replace: "abc",
+            initial_matches: &[(0, 2)],
+            expected_text: "abc",
+            expected_matches: &[(0, 2)],
+            expected_cursor_line: 0,
+            expected_cursor_col: 0,
+            expected_current_match_idx: 0,
+        },
+        // No remaining matches: "ab" → "xy".
+        // Matches is empty, current_match_idx resets to 0, cursor moves to
+        // the end of the replacement (replace_end = 0 + 2 = 2).
+        Case {
+            name: "no_more_matches",
+            text: "ab",
+            query: "ab",
+            replace: "xy",
+            initial_matches: &[(0, 2)],
+            expected_text: "xy",
+            expected_matches: &[],
+            expected_cursor_line: 0,
+            expected_cursor_col: 2,
+            expected_current_match_idx: 0,
+        },
+    ];
+
+    let path = "/test.rs".to_string();
+    for c in cases {
+        let mut state = make_editor_with_single_tab(c.text);
+        if let Some(tab) = state.tab_contents.get_mut(&path) {
+            tab.find_replace_state = Some(FindReplaceState {
+                query: c.query.to_string(),
+                replace: c.replace.to_string(),
+                matches: c.initial_matches.iter().map(|&(s, e)| s..e).collect(),
+                current_match_idx: 0,
+                case_sensitive: true,
+            });
         }
-    }
-}
+        let _ = state.update(EditorMessage::FindReplace);
+        let tab = state.tab_contents.get(&path).unwrap();
+        let frs = tab.find_replace_state.as_ref().unwrap();
 
-#[test]
-fn test_find_replace_auto_advance_shorter_replacement() {
-    // Replace "aaa" with "a" in "aaa bbb aaa" → "a bbb aaa".
-    // After replacing first match (0..3) → "a" (at pos 0), the new text
-    // is "a bbb aaa". Position after replacement = 0 + 1 = 1.
-    // The remaining "aaa" starts at byte 6 in the new text.
-    // replace_end = 1 correctly finds it; old_end = 3 would also work here
-    // because 6 >= 3, but the real bug manifests with adjacent matches.
-    let mut tab_data = TabData {
-        content: EditorBuffer::with_text("aaa bbb aaa", None),
-        undo_stack: RefCell::new(UndoStack::new()),
-        find_replace_state: Some(FindReplaceState {
-            query: "aaa".to_string(),
-            replace: "a".to_string(),
-            matches: vec![0..3, 8..11],
-            current_match_idx: 0,
-            case_sensitive: true,
-        }),
-        saved_text_hash: 0,
-    };
-
-    let range = 0..3;
-    let replace_text = "a".to_string();
-    // CORRECT: position after replacement in NEW text
-    let replace_end = range.start + replace_text.len(); // = 1
-    let text = tab_data.content.text();
-    let new_text = format!(
-        "{}{}{}",
-        &text[..range.start],
-        replace_text,
-        &text[range.end..]
-    );
-    assert_eq!(new_text, "a bbb aaa");
-    tab_data.content = EditorBuffer::with_text(&new_text, None);
-    if let Some(ref mut state) = tab_data.find_replace_state {
-        state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
-        // Only the second "aaa" (now at 6..9) remains
-        assert_eq!(state.matches.len(), 1, "one remaining match");
-        assert_eq!(state.matches[0].start, 6);
-        assert_eq!(state.matches[0].end, 9);
-
-        // Using replace_end (= 1): finds next match at position 6
-        let correct_idx = state
-            .matches
-            .iter()
-            .position(|m| m.start >= replace_end)
-            .unwrap_or(0);
+        assert_eq!(tab.content.text(), c.expected_text, "{}: text", c.name);
         assert_eq!(
-            correct_idx, 0,
-            "replace_end should find the remaining match"
+            frs.matches.len(),
+            c.expected_matches.len(),
+            "{}: match count",
+            c.name,
         );
-    }
-}
-
-#[test]
-fn test_find_replace_auto_advance_adjacent_matches() {
-    // Replace "aa" with "x" in "aaaa" → "xx".
-    // Original matches: 0..2, 2..4 (adjacent overlapping prohibited).
-    // After replacing match 0 (0..2) with "x": new text = "xaa".
-    // Position after replacement = 0 + 1 = 1.
-    // The old_end bug: old_end = 2. In new text, the remaining "aa" is at
-    // byte 1..3. Using old_end (= 2) would skip it because 2 >= 2 is true!
-    // But replace_end (= 1) correctly finds it because 1 >= 1.
-    let mut tab_data = TabData {
-        content: EditorBuffer::with_text("aaaa", None),
-        undo_stack: RefCell::new(UndoStack::new()),
-        find_replace_state: Some(FindReplaceState {
-            query: "aa".to_string(),
-            replace: "x".to_string(),
-            matches: vec![0..2, 2..4],
-            current_match_idx: 0,
-            case_sensitive: true,
-        }),
-        saved_text_hash: 0,
-    };
-
-    let range = 0..2;
-    let replace_text = "x".to_string();
-    let replace_end = range.start + replace_text.len(); // = 1
-    let old_end = range.end; // = 2 (the bug value)
-    let text = tab_data.content.text();
-    let new_text = format!(
-        "{}{}{}",
-        &text[..range.start],
-        replace_text,
-        &text[range.end..]
-    );
-    assert_eq!(new_text, "xaa", "after replacing first aa with x");
-    tab_data.content = EditorBuffer::with_text(&new_text, None);
-    if let Some(ref mut state) = tab_data.find_replace_state {
-        state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
-        assert_eq!(state.matches.len(), 1, "one remaining match in xaa");
-
-        // replace_end (= 1): m.start >= 1 → finds match at 1..3
-        let correct_idx = state
-            .matches
-            .iter()
-            .position(|m| m.start >= replace_end)
-            .unwrap_or(0);
-        assert_eq!(
-            correct_idx, 0,
-            "replace_end should find the remaining match"
-        );
-
-        // old_end (= 2): m.start >= 2 → finds match at... 1..3 has start=1,
-        // so 1 >= 2 is false, and 0 is returned (no match found).
-        // This means the match would be SKIPPED!
-        let bug_idx = state.matches.iter().position(|m| m.start >= old_end);
-        assert_eq!(bug_idx, None, "old_end skips the remaining match!");
-    }
-}
-
-#[test]
-fn test_find_replace_auto_advance_longer_replacement() {
-    // Replace "ab" with "abc" in "ab" → "abc".
-    // After replacement, the new match for "ab" is at 0..2.
-    // replace_end = 0 + 3 = 3. The match at 0..2 has start=0 < 3,
-    // so position() returns None → unwrap_or(0) wraps to index 0.
-    let mut tab_data = TabData {
-        content: EditorBuffer::with_text("ab", None),
-        undo_stack: RefCell::new(UndoStack::new()),
-        find_replace_state: Some(FindReplaceState {
-            query: "ab".to_string(),
-            replace: "abc".to_string(),
-            matches: std::iter::once(0..2).collect(),
-            current_match_idx: 0,
-            case_sensitive: true,
-        }),
-        saved_text_hash: 0,
-    };
-
-    let range = 0..2;
-    let replace_text = "abc".to_string();
-    let replace_end = range.start + replace_text.len(); // = 3
-    let text = tab_data.content.text();
-    let new_text = format!(
-        "{}{}{}",
-        &text[..range.start],
-        replace_text,
-        &text[range.end..]
-    );
-    assert_eq!(new_text, "abc");
-    tab_data.content = EditorBuffer::with_text(&new_text, None);
-    if let Some(ref mut state) = tab_data.find_replace_state {
-        state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
-        // "abc" still contains "ab" at 0..2
-        assert_eq!(state.matches.len(), 1, "one match in abc");
-
-        // replace_end = 3: m.start >= 3 → match 0..2 has start=0, 0 >= 3 is false,
-        // so position() returns None, unwrap_or(0) gives 0.
-        let next_idx = state
-            .matches
-            .iter()
-            .position(|m| m.start >= replace_end)
-            .unwrap_or(0)
-            .min(state.matches.len() - 1);
-        assert_eq!(next_idx, 0, "wraps back to the same match");
-    }
-}
-
-#[test]
-fn test_find_replace_auto_advance_no_more_matches() {
-    // Replace "ab" with "xy" in "ab" → "xy". No more matches.
-    let mut tab_data = TabData {
-        content: EditorBuffer::with_text("ab", None),
-        undo_stack: RefCell::new(UndoStack::new()),
-        find_replace_state: Some(FindReplaceState {
-            query: "ab".to_string(),
-            replace: "xy".to_string(),
-            matches: std::iter::once(0..2).collect(),
-            current_match_idx: 0,
-            case_sensitive: true,
-        }),
-        saved_text_hash: 0,
-    };
-
-    let range = 0..2;
-    let replace_text = "xy".to_string();
-    let text = tab_data.content.text();
-    let new_text = format!(
-        "{}{}{}",
-        &text[..range.start],
-        replace_text,
-        &text[range.end..]
-    );
-    tab_data.content = EditorBuffer::with_text(&new_text, None);
-    if let Some(ref mut state) = tab_data.find_replace_state {
-        state.matches = compute_text_matches(&new_text, &state.query, state.case_sensitive);
-        assert!(state.matches.is_empty(), "no matches in xy");
-        if state.matches.is_empty() {
-            state.current_match_idx = 0;
+        for (i, &(s, e)) in c.expected_matches.iter().enumerate() {
+            assert_eq!(frs.matches[i], s..e, "{}: match {i} range", c.name,);
         }
-        assert_eq!(state.current_match_idx, 0, "reset to 0");
+        let cursor = tab.content.cursor();
+        assert_eq!(
+            cursor.line, c.expected_cursor_line,
+            "{}: cursor line",
+            c.name
+        );
+        assert_eq!(
+            cursor.column, c.expected_cursor_col,
+            "{}: cursor col",
+            c.name
+        );
+        assert_eq!(
+            frs.current_match_idx, c.expected_current_match_idx,
+            "{}: current_match_idx",
+            c.name,
+        );
     }
 }
 
@@ -1729,27 +1634,6 @@ fn test_tree_nav_suppressed_during_goto_line_overlay() {
         state.file_tree.tree_focused,
         "TreeFocusToggled should be suppressed during GotoLine overlay"
     );
-}
-
-#[test]
-#[allow(clippy::single_range_in_vec_init)]
-fn test_find_replace_cursor_after_last_match_removed() {
-    let mut state = make_editor_with_single_tab("ab");
-    let path = "/test.rs".to_string();
-    if let Some(tab_data) = state.tab_contents.get_mut(&path) {
-        tab_data.find_replace_state = Some(FindReplaceState {
-            query: "ab".to_string(),
-            replace: "xy".to_string(),
-            matches: vec![0..2],
-            current_match_idx: 0,
-            case_sensitive: true,
-        });
-    }
-    let _ = state.update(EditorMessage::FindReplace);
-    let cursor = state.tab_contents.get(&path).unwrap().content.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 2);
-    assert_eq!(state.tab_contents.get(&path).unwrap().content.text(), "xy");
 }
 
 #[test]
