@@ -251,6 +251,95 @@ struct TransitionParams<'a> {
     log_label: &'a str,
 }
 
+/// The transition context for [`with_comment_and_transition`].
+///
+/// Encapsulates the ticket, source/target phases, notify policy, and log
+/// label — the minimal context needed for any comment+transition operation.
+///
+/// See [`TransitionParams`] for argument-ordering notes.
+#[derive(Debug)]
+struct TransitionCtx<'a> {
+    ticket: &'a Ticket,
+    source: TicketPhase,
+    target: TicketPhase,
+    notify: NotifyPolicy,
+    log_label: &'a str,
+}
+
+/// Unified helper for combining comment writes + phase transition + notification.
+///
+/// Wraps [`crate::turso::with_tx`] for the comment-writing closure and phase
+/// transition, then dispatches a notification. The closure is responsible for
+/// writing all per-agent/system comments to the database.
+///
+/// `failure_comment` is an optimization hint for [`dispatch_notification`]: when
+/// this is `Some(...)`, the caller MUST ensure that text has already been
+/// written to the DB by the closure. The helper passes it directly to
+/// `notify_ticket` to avoid a redundant DB round-trip. For non-Failed
+/// transitions (where [`NotifyPolicy::Notify`] is unlikely but not prohibited),
+/// pass `None`.
+///
+/// `pipeline_reservation` is automatically derived from the target phase:
+/// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
+/// (bounce-back transitions get priority re-dispatch over fresh tickets),
+/// `None` for all other transitions.
+///
+/// Returns `true` on success, `false` on failure (with a warning logged).
+///
+/// # Correctness
+///
+/// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
+/// agents (unlike [`BoardStore::transition_to`]).
+/// This is correct because all call sites of `with_comment_and_transition` are
+/// post-agent paths (verdict handling, diagnostics completion, etc.) — no
+/// agents should be running on this ticket at any call site that reaches this
+/// function. Do **not** call this on a path where an agent may still be
+/// executing on the ticket.
+#[must_use]
+async fn with_comment_and_transition<F>(
+    args: TransitionCtx<'_>,
+    failure_comment: Option<&str>,
+    write_comments: F,
+) -> bool
+where
+    F: AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
+{
+    let pipeline_reservation = (args.target == TicketPhase::ReadyForDevelopment).then_some(true);
+
+    if let Err(e) = crate::turso::with_tx(
+        &board().conn,
+        &args.ticket.id,
+        args.log_label,
+        async move |tx| {
+            write_comments(tx).await?;
+            BoardStore::transition_to_tx(
+                tx,
+                &args.ticket.id,
+                Some(args.source),
+                args.target,
+                pipeline_reservation,
+            )
+            .await?;
+            Ok(())
+        },
+    )
+    .await
+    {
+        warn_transition_failed(args.ticket, args.source, args.target, args.log_label, &e);
+        return false;
+    }
+
+    dispatch_notification(
+        args.ticket,
+        args.source,
+        args.target,
+        args.notify,
+        failure_comment,
+    )
+    .await;
+    true
+}
+
 /// Write one or more comments to a ticket, then transition it to a new phase.
 ///
 /// All comments and the phase transition are wrapped in a single transaction
@@ -272,12 +361,8 @@ struct TransitionParams<'a> {
 /// least one comment is always written — a missing comment is a
 /// compile-time error, not a runtime panic.
 ///
-/// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
-/// agents (unlike [`BoardStore::transition_to`]).
-/// This is correct because `comment_and_transition` is only called from post-agent
-/// paths (verdict handling, diagnostics completion, sanitation verdict, etc.) —
-/// no agents should be running on this ticket at any call site that reaches
-/// this function.
+/// Delegates to [`with_comment_and_transition`]; see that function's
+/// `# Correctness` section for the agent-cancellation invariant.
 ///
 /// `pipeline_reservation` is automatically derived from the target phase:
 /// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
@@ -285,57 +370,27 @@ struct TransitionParams<'a> {
 /// `None` for all other transitions.
 #[must_use]
 async fn comment_and_transition(params: TransitionParams<'_>) -> bool {
-    // Extract failure_comment before the with_tx closure, which captures
-    // params by move. Used exclusively for Failed-target transitions to avoid a
-    // redundant DB round-trip in notify_ticket.
     let failure_comment = (params.target == TicketPhase::Failed).then_some(params.comment.1);
-    let pipeline_reservation = (params.target == TicketPhase::ReadyForDevelopment).then_some(true);
 
-    if let Err(e) = crate::turso::with_tx(
-        &board().conn,
-        &params.ticket.id,
-        params.log_label,
+    with_comment_and_transition(
+        TransitionCtx {
+            ticket: params.ticket,
+            source: params.source,
+            target: params.target,
+            notify: params.notify,
+            log_label: params.log_label,
+        },
+        failure_comment,
         async |tx| {
             BoardStore::add_comment_tx(tx, &params.ticket.id, params.comment.0, params.comment.1)
                 .await?;
             if let Some(extra) = params.extra {
                 BoardStore::add_comment_tx(tx, &params.ticket.id, extra.0, extra.1).await?;
             }
-            BoardStore::transition_to_tx(
-                tx,
-                &params.ticket.id,
-                Some(params.source),
-                params.target,
-                pipeline_reservation,
-            )
-            .await?;
             Ok(())
         },
     )
     .await
-    {
-        warn_transition_failed(
-            params.ticket,
-            params.source,
-            params.target,
-            params.log_label,
-            &e,
-        );
-        return false;
-    }
-
-    // Notification fires after the transaction commits so the user always
-    // sees the new phase in the database.
-    dispatch_notification(
-        params.ticket,
-        params.source,
-        params.target,
-        params.notify,
-        failure_comment,
-    )
-    .await;
-
-    true
 }
 
 /// Resolve a workspace from a ticket's stored `workspace_name`.
@@ -2020,18 +2075,15 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     // analysts must produce passing verdicts for the ticket to proceed.
     let all_passed = passing_count == PARALLEL_AGENT_COUNT;
 
-    // Write verdict comments, summary comment, and transition in a single
-    // transaction so a crash between verdict comments and the transition
-    // cannot leave orphan comments.
-    //
-    // We use [`BoardStore::transition_to_tx`] (no agent cancellation) rather
-    // than [`BoardStore::transition_to`] (which cancels agents). This is safe
-    // because analyst agents have already completed — no agents are running
-    // on this ticket at this point.
-    if let Err(e) = crate::turso::with_tx(
-        &board().conn,
-        &ticket.id,
-        "analyst verdict processing",
+    if !with_comment_and_transition(
+        TransitionCtx {
+            ticket,
+            source: TicketPhase::Analysis,
+            target: TicketPhase::Planning,
+            notify: NotifyPolicy::Notify,
+            log_label: "Analyst",
+        },
+        None,
         async |tx| {
             record_verdict_comments_tx(
                 tx,
@@ -2043,39 +2095,13 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             .await?;
 
             BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &summary).await?;
-            BoardStore::transition_to_tx(
-                tx,
-                &ticket.id,
-                Some(TicketPhase::Analysis),
-                TicketPhase::Planning,
-                None,
-            )
-            .await?;
             Ok(())
         },
     )
     .await
     {
-        warn_transition_failed(
-            ticket,
-            TicketPhase::Analysis,
-            TicketPhase::Planning,
-            "Analyst",
-            &e,
-        );
         return;
     }
-
-    // Notification fires after the transaction commits so the user
-    // always sees the new phase in the database.
-    dispatch_notification(
-        ticket,
-        TicketPhase::Analysis,
-        TicketPhase::Planning,
-        NotifyPolicy::Notify,
-        None,
-    )
-    .await;
 
     if all_passed {
         info!(
@@ -2323,8 +2349,6 @@ async fn process_verifier_verdicts(
         (verifier.success_phase, NotifyPolicy::Buffer)
     };
 
-    let pipeline_reservation = (target == TicketPhase::ReadyForDevelopment).then_some(true);
-
     // Build the failure comment string (only used in the all-failed branch).
     let failure_comment = if all_failed {
         Some(format!(
@@ -2336,19 +2360,15 @@ async fn process_verifier_verdicts(
         None
     };
 
-    // Write per-agent verdict comments AND the transition in a single
-    // transaction so a crash between the two cannot leave orphan comments.
-    //
-    // Note: we use [`BoardStore::transition_to_tx`] (which does NOT cancel
-    // registered agents) rather than [`BoardStore::transition_to`] (which
-    // does via `execute_and_cancel`). This is safe because the verifier
-    // agents have already completed and produced verdicts — no agents
-    // should be running on this ticket at this point. The same reasoning
-    // applies to [`comment_and_transition`] per its documentation.
-    if let Err(e) = crate::turso::with_tx(
-        &board().conn,
-        &ticket.id,
-        "verifier verdict processing",
+    if !with_comment_and_transition(
+        TransitionCtx {
+            ticket,
+            source: verifier.source_phase,
+            target,
+            notify,
+            log_label: verifier.log_label,
+        },
+        failure_comment.as_deref(),
         async |tx| {
             record_verdict_comments_tx(
                 tx,
@@ -2365,39 +2385,13 @@ async fn process_verifier_verdicts(
                 BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, fc).await?;
             }
 
-            BoardStore::transition_to_tx(
-                tx,
-                &ticket.id,
-                Some(verifier.source_phase),
-                target,
-                pipeline_reservation,
-            )
-            .await?;
             Ok(())
         },
     )
     .await
     {
-        warn_transition_failed(
-            ticket,
-            verifier.source_phase,
-            target,
-            verifier.log_label,
-            &e,
-        );
         return;
     }
-
-    // Notification fires after the transaction commits so the user
-    // always sees the new phase in the database.
-    dispatch_notification(
-        ticket,
-        verifier.source_phase,
-        target,
-        notify,
-        failure_comment.as_deref(),
-    )
-    .await;
 
     if !all_failed && !any_failed {
         info!(
