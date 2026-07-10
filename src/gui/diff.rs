@@ -326,6 +326,23 @@ impl DiffState {
         iced::Subscription::batch(subs)
     }
 
+    /// Start loading a diff. Returns a [`Task`] that will produce a [`DiffMessage::DiffLoaded`]
+    /// when complete. Guards against stale results via the generation counter.
+    ///
+    /// Sets `diff_loading = true` and increments the generation counter.
+    /// Callers are responsible for setting `diff_has_loaded` as appropriate before calling this
+    /// (it should be `false` on context switches, left unchanged on auto-refresh ticks).
+    fn spawn_diff_load(&mut self, commit_ref: Option<String>) -> Task<DiffMessage> {
+        self.diff_loading = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation_num = self.generation;
+        let workspace_name = self.selected_workspace_name.clone().unwrap_or_default();
+        let ws_path = self.personal_workspace_path.clone();
+        Task::perform(load_diff(workspace_name, ws_path, commit_ref), move |r| {
+            DiffMessage::DiffLoaded(generation_num, r)
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: DiffMessage) -> Task<DiffMessage> {
         match msg {
@@ -340,15 +357,8 @@ impl DiffState {
                 self.clear_diff_state();
                 self.selected_workspace_name = Some(name.clone());
                 self.personal_workspace_path.clone_from(&path_override);
-                self.generation = self.generation.wrapping_add(1);
-                let generation_num = self.generation;
-                let workspace_name = name.clone();
-                let ws_path = path_override.clone();
-                self.diff_loading = true;
                 self.diff_has_loaded = false;
-                Task::perform(load_diff(workspace_name, ws_path, None), move |r| {
-                    DiffMessage::DiffLoaded(generation_num, r)
-                })
+                self.spawn_diff_load(None)
             }
             DiffMessage::DiffLoaded(generation_num, result) => {
                 if generation_num != self.generation {
@@ -402,19 +412,9 @@ impl DiffState {
                     // Commit diffs are immutable — no auto-refresh needed.
                     return Task::none();
                 }
-                if let Some(ref ws_name) = self.selected_workspace_name.clone() {
-                    if !self.diff_loading && !self.committing {
-                        self.diff_loading = true;
-                        self.generation = self.generation.wrapping_add(1);
-                        let generation_num = self.generation;
-                        let workspace_name = ws_name.clone();
-                        let ws_path = self.personal_workspace_path.clone();
-                        Task::perform(load_diff(workspace_name, ws_path, None), move |r| {
-                            DiffMessage::DiffLoaded(generation_num, r)
-                        })
-                    } else {
-                        Task::none()
-                    }
+                if self.selected_workspace_name.is_some() && !self.diff_loading && !self.committing
+                {
+                    self.spawn_diff_load(None)
                 } else {
                     Task::none()
                 }
@@ -427,21 +427,12 @@ impl DiffState {
                 // error, etc.) including current_commit_ref. We re-establish
                 // current_commit_ref below; the rest stays cleared for the new
                 // commit's diff to load into.
-                // Set commit ref and loading BEFORE spawning task
+                // Set commit ref before spawning task
                 // (prevents Tick race: subscription checks .is_some() to skip).
                 self.current_commit_ref = Some(hash.clone());
-                self.diff_loading = true;
                 self.diff_has_loaded = false;
-                self.generation = self.generation.wrapping_add(1);
-                let generation_num = self.generation;
 
                 // Load the diff and fetch the commit message in parallel.
-                let hash_for_diff = hash.clone();
-                let diff_task = Task::perform(
-                    load_diff(ws_name.clone(), None, Some(hash_for_diff)),
-                    move |r| DiffMessage::DiffLoaded(generation_num, r),
-                );
-
                 let msg_ws = ws_name.clone();
                 let msg_hash = hash.clone();
                 let msg_hash_for_git = hash.clone();
@@ -461,25 +452,17 @@ impl DiffState {
                     move |msg| DiffMessage::CommitMessageFetched(msg_hash, msg),
                 );
 
-                Task::batch([diff_task, msg_task])
+                Task::batch([self.spawn_diff_load(Some(hash)), msg_task])
             }
             DiffMessage::BackToWorkingTree => {
-                let ws_name = match &self.selected_workspace_name {
-                    Some(n) => n.clone(),
-                    None => return Task::none(),
-                };
-                // clear_diff_state() sets current_commit_ref to None before
-                // diff_loading = true. Iced's update() is single-threaded, so
-                // Tick can't race between the two statements.
+                if self.selected_workspace_name.is_none() {
+                    return Task::none();
+                }
+                // clear_diff_state() sets current_commit_ref to None.
+                // Iced's update() is single-threaded, so Tick can't race.
                 self.clear_diff_state();
-                self.diff_loading = true;
                 self.diff_has_loaded = false;
-                self.generation = self.generation.wrapping_add(1);
-                let generation_num = self.generation;
-                let ws_path = self.personal_workspace_path.clone();
-                Task::perform(load_diff(ws_name, ws_path, None), move |result| {
-                    DiffMessage::DiffLoaded(generation_num, result)
-                })
+                self.spawn_diff_load(None)
             }
             DiffMessage::CommitMessageFetched(hash, msg) => {
                 // Only accept if we're still viewing the same commit.
@@ -560,20 +543,13 @@ impl DiffState {
                             (a, r) => format!("Committed {} (+{a}/-{r})", info.short_hash()),
                         };
                         // Immediately refresh the diff.
-                        if let Some(ref ws_name) = self.selected_workspace_name.clone() {
-                            self.diff_loading = true;
-                            self.generation = self.generation.wrapping_add(1);
-                            let generation_num = self.generation;
-                            let workspace_name = ws_name.clone();
-                            let ws_path = self.personal_workspace_path.clone();
+                        if self.selected_workspace_name.is_some() {
                             return Task::batch([
                                 Task::done(DiffMessage::CloseModal),
                                 Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
                                     toast_msg,
                                 ))),
-                                Task::perform(load_diff(workspace_name, ws_path, None), move |r| {
-                                    DiffMessage::DiffLoaded(generation_num, r)
-                                }),
+                                self.spawn_diff_load(None),
                             ]);
                         }
                         Task::batch([
@@ -615,19 +591,12 @@ impl DiffState {
                 match result {
                     Ok(()) => {
                         // Refresh the diff immediately.
-                        if let Some(ref ws_name) = self.selected_workspace_name.clone() {
-                            self.diff_loading = true;
-                            self.generation = self.generation.wrapping_add(1);
-                            let generation_num = self.generation;
-                            let workspace_name = ws_name.clone();
-                            let ws_path = self.personal_workspace_path.clone();
+                        if self.selected_workspace_name.is_some() {
                             return Task::batch([
                                 Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
                                     "Changes discarded.".to_string(),
                                 ))),
-                                Task::perform(load_diff(workspace_name, ws_path, None), move |r| {
-                                    DiffMessage::DiffLoaded(generation_num, r)
-                                }),
+                                self.spawn_diff_load(None),
                             ]);
                         }
                         self.diff_loading = false;
