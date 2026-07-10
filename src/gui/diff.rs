@@ -169,6 +169,26 @@ impl std::ops::DerefMut for DiffFile {
     }
 }
 
+impl DiffFile {
+    /// Construct a `DiffFile` from a parsed diff file, computing
+    /// `add_count` and `remove_count` automatically from hunks.
+    #[must_use]
+    pub fn from_parsed(
+        dfile: crate::diff_parse::DiffFile,
+        old_highlights: Option<FileHighlights>,
+        new_highlights: Option<FileHighlights>,
+    ) -> Self {
+        let (add_count, remove_count) = count_lines(&dfile);
+        Self {
+            dfile,
+            old_highlights,
+            new_highlights,
+            add_count,
+            remove_count,
+        }
+    }
+}
+
 /// Icon identifier for file headers (avoids widget construction at cache time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CachedIcon {
@@ -1312,19 +1332,12 @@ async fn load_diff(
     // Compute highlights for each file off the UI thread.
     let mut enhanced: Vec<DiffFile> = Vec::with_capacity(parsed.len());
     for dfile in parsed {
-        let (add_count, remove_count) = count_lines(&dfile);
         let (old_hl, new_hl) = if dfile.has_parseable_content() {
             compute_highlights(&dfile, &ws_path, commit_ref.as_deref()).await
         } else {
             (None, None)
         };
-        enhanced.push(DiffFile {
-            dfile,
-            old_highlights: old_hl,
-            new_highlights: new_hl,
-            add_count,
-            remove_count,
-        });
+        enhanced.push(DiffFile::from_parsed(dfile, old_hl, new_hl));
     }
 
     Ok(enhanced)
