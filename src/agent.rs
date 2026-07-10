@@ -921,178 +921,180 @@ mod tests {
     // ── extract_media_from_outcomes tests ───────────────────────────────────
 
     #[test]
-    fn extract_media_outcomes_parses_valid_marker() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MediaTestTool {
-            name: "image_gen",
-            marker: "[IMAGE:",
-        })];
-        let calls = vec![ToolCall {
-            id: "1".into(),
-            name: "image_gen".into(),
-            arguments: serde_json::json!({}),
-        }];
-        let outcomes = vec![ToolExecutionOutcome {
-            output: "[IMAGE:/tmp/img.png]".into(),
-            success: true,
-        }];
-
-        let paths = extract_media_from_outcomes(&tools, &calls, &outcomes);
-        assert_eq!(paths.len(), 1);
-        assert_eq!(
-            paths[0],
-            ("image_gen".to_string(), "/tmp/img.png".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_media_outcomes_skips_malformed_marker() {
-        // Marker prefix with nothing parseable after it (e.g. at end of output)
-        // produces an empty path which the filter rejects.
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MediaTestTool {
-            name: "image_gen",
-            marker: "[IMAGE:",
-        })];
-        let calls = vec![ToolCall {
-            id: "1".into(),
-            name: "image_gen".into(),
-            arguments: serde_json::json!({}),
-        }];
-        let outcomes = vec![ToolExecutionOutcome {
-            output: "description text [IMAGE:".into(),
-            success: true,
-        }];
-
-        let paths = extract_media_from_outcomes(&tools, &calls, &outcomes);
-        assert!(paths.is_empty(), "malformed marker should be skipped");
-    }
-
-    #[test]
-    fn extract_media_outcomes_skips_empty_marker() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MediaTestTool {
-            name: "image_gen",
-            marker: "[IMAGE:",
-        })];
-        let calls = vec![ToolCall {
-            id: "1".into(),
-            name: "image_gen".into(),
-            arguments: serde_json::json!({}),
-        }];
-        let outcomes = vec![ToolExecutionOutcome {
-            output: "[IMAGE:]".into(),
-            success: true,
-        }];
-
-        let paths = extract_media_from_outcomes(&tools, &calls, &outcomes);
-        assert!(
-            paths.is_empty(),
-            "empty marker '[IMAGE:]' should be skipped"
-        );
-    }
-
-    #[test]
-    fn extract_media_outcomes_skips_non_media_tool() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool {
-            output: "some output".into(),
-            scrub: false,
-        })];
-        let calls = vec![ToolCall {
-            id: "1".into(),
-            name: "never_scrub".into(),
-            arguments: serde_json::json!({}),
-        }];
-        let outcomes = vec![ToolExecutionOutcome {
-            output: "[IMAGE:path]".into(),
-            success: true,
-        }];
-
-        let paths = extract_media_from_outcomes(&tools, &calls, &outcomes);
-        assert!(
-            paths.is_empty(),
-            "non-media tool should not be inspected for media markers"
-        );
-    }
-
-    #[test]
-    fn extract_media_outcomes_skips_failed_outcome() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MediaTestTool {
-            name: "image_gen",
-            marker: "[IMAGE:",
-        })];
-        let calls = vec![ToolCall {
-            id: "1".into(),
-            name: "image_gen".into(),
-            arguments: serde_json::json!({}),
-        }];
-        let outcomes = vec![ToolExecutionOutcome {
-            output: "[IMAGE:/tmp/img.png]".into(),
-            success: false,
-        }];
-
-        let paths = extract_media_from_outcomes(&tools, &calls, &outcomes);
-        assert!(
-            paths.is_empty(),
-            "failed outcomes should not produce media paths"
-        );
-    }
-
-    #[test]
-    fn extract_media_outcomes_handles_mixed_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(MediaTestTool {
-                name: "image_gen",
-                marker: "[IMAGE:",
-            }),
-            Box::new(TestTool {
-                output: String::new(),
-                scrub: false,
-            }),
-            Box::new(MediaTestTool {
-                name: "video_gen",
-                marker: "[VIDEO:",
-            }),
-        ];
-        let calls = vec![
-            ToolCall {
-                id: "1".into(),
-                name: "image_gen".into(),
-                arguments: serde_json::json!({}),
+    fn extract_media_outcomes_consolidated() {
+        enum ToolDef {
+            /// [`Media`] carries a marker prefix; [`NonMedia`] uses a unit variant because
+            /// `extract_media_from_outcomes` only consults [`Tool::media_marker`], never
+            /// [`Tool::execute`] — the output value on [`TestTool`] has no behavioral effect.
+            Media {
+                name: &'static str,
+                marker: &'static str,
             },
-            ToolCall {
-                id: "2".into(),
-                name: "never_scrub".into(),
-                arguments: serde_json::json!({}),
+            NonMedia,
+        }
+
+        struct OutcomeDef {
+            output: &'static str,
+            success: bool,
+        }
+
+        struct TestCase {
+            name: &'static str,
+            msg: &'static str,
+            tools: Vec<ToolDef>,
+            outcomes: Vec<OutcomeDef>,
+            expected: Vec<(&'static str, &'static str)>,
+        }
+
+        let cases = vec![
+            TestCase {
+                name: "parses_valid_marker",
+                msg: "valid marker with success=true should extract the path",
+                tools: vec![ToolDef::Media {
+                    name: "image_gen",
+                    marker: "[IMAGE:",
+                }],
+                outcomes: vec![OutcomeDef {
+                    output: "[IMAGE:/tmp/img.png]",
+                    success: true,
+                }],
+                expected: vec![("image_gen", "/tmp/img.png")],
             },
-            ToolCall {
-                id: "3".into(),
-                name: "video_gen".into(),
-                arguments: serde_json::json!({}),
+            // Marker prefix with nothing parseable after it (e.g. at end of output)
+            // produces an empty path which the filter rejects.
+            TestCase {
+                name: "skips_malformed_marker",
+                msg: "malformed marker should be skipped",
+                tools: vec![ToolDef::Media {
+                    name: "image_gen",
+                    marker: "[IMAGE:",
+                }],
+                outcomes: vec![OutcomeDef {
+                    output: "description text [IMAGE:",
+                    success: true,
+                }],
+                expected: vec![],
             },
-        ];
-        let outcomes = vec![
-            ToolExecutionOutcome {
-                output: "[IMAGE:/tmp/img.png]".into(),
-                success: true,
+            TestCase {
+                name: "skips_empty_marker",
+                msg: "empty marker '[IMAGE:]' should be skipped",
+                tools: vec![ToolDef::Media {
+                    name: "image_gen",
+                    marker: "[IMAGE:",
+                }],
+                outcomes: vec![OutcomeDef {
+                    output: "[IMAGE:]",
+                    success: true,
+                }],
+                expected: vec![],
             },
-            ToolExecutionOutcome {
-                output: "non-media output".into(),
-                success: true,
+            TestCase {
+                name: "skips_non_media_tool",
+                msg: "non-media tool should not be inspected for media markers",
+                tools: vec![ToolDef::NonMedia],
+                outcomes: vec![OutcomeDef {
+                    output: "[IMAGE:path]",
+                    success: true,
+                }],
+                expected: vec![],
             },
-            ToolExecutionOutcome {
-                output: "[VIDEO:/tmp/vid.mp4]".into(),
-                success: true,
+            TestCase {
+                name: "skips_failed_outcome",
+                msg: "failed outcomes should not produce media paths",
+                tools: vec![ToolDef::Media {
+                    name: "image_gen",
+                    marker: "[IMAGE:",
+                }],
+                outcomes: vec![OutcomeDef {
+                    output: "[IMAGE:/tmp/img.png]",
+                    success: false,
+                }],
+                expected: vec![],
+            },
+            TestCase {
+                name: "handles_mixed_tools",
+                msg: "mixed tools with valid outcomes should extract only media paths",
+                tools: vec![
+                    ToolDef::Media {
+                        name: "image_gen",
+                        marker: "[IMAGE:",
+                    },
+                    ToolDef::NonMedia,
+                    ToolDef::Media {
+                        name: "video_gen",
+                        marker: "[VIDEO:",
+                    },
+                ],
+                outcomes: vec![
+                    OutcomeDef {
+                        output: "[IMAGE:/tmp/img.png]",
+                        success: true,
+                    },
+                    OutcomeDef {
+                        output: "non-media output",
+                        success: true,
+                    },
+                    OutcomeDef {
+                        output: "[VIDEO:/tmp/vid.mp4]",
+                        success: true,
+                    },
+                ],
+                expected: vec![("image_gen", "/tmp/img.png"), ("video_gen", "/tmp/vid.mp4")],
             },
         ];
 
-        let paths = extract_media_from_outcomes(&tools, &calls, &outcomes);
-        assert_eq!(paths.len(), 2);
-        assert_eq!(
-            paths[0],
-            ("image_gen".to_string(), "/tmp/img.png".to_string())
-        );
-        assert_eq!(
-            paths[1],
-            ("video_gen".to_string(), "/tmp/vid.mp4".to_string())
-        );
+        for case in cases {
+            let tools: Vec<Box<dyn Tool>> = case
+                .tools
+                .iter()
+                .map(|t| match t {
+                    ToolDef::Media { name, marker } => {
+                        Box::new(MediaTestTool { name, marker }) as Box<dyn Tool>
+                    }
+                    ToolDef::NonMedia => Box::new(TestTool {
+                        // Output value is irrelevant — extract_media_from_outcomes
+                        // only consults media_marker(), never execute().
+                        output: String::new(),
+                        scrub: false,
+                    }) as Box<dyn Tool>,
+                })
+                .collect();
+
+            let calls: Vec<ToolCall> = case
+                .tools
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let name = match t {
+                        ToolDef::Media { name, .. } => *name,
+                        ToolDef::NonMedia => "never_scrub",
+                    };
+                    ToolCall {
+                        id: (i + 1).to_string(),
+                        name: name.to_string(),
+                        arguments: serde_json::json!({}),
+                    }
+                })
+                .collect();
+
+            let outcomes: Vec<ToolExecutionOutcome> = case
+                .outcomes
+                .iter()
+                .map(|o| ToolExecutionOutcome {
+                    output: o.output.to_string(),
+                    success: o.success,
+                })
+                .collect();
+
+            let expected: Vec<(String, String)> = case
+                .expected
+                .iter()
+                .map(|(n, p)| (n.to_string(), p.to_string()))
+                .collect();
+
+            let result = extract_media_from_outcomes(&tools, &calls, &outcomes);
+            assert_eq!(result, expected, "case '{}': {}", case.name, case.msg);
+        }
     }
 
     #[tokio::test]
