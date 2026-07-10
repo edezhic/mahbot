@@ -150,8 +150,6 @@ pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_rol
         content,
         recipient: msg.reply_target.clone(),
         reply_markup: None,
-        agent_role,
-        workspace: msg.workspace.clone(),
     };
 
     if let Err(e) = channel.send(&reply).await {
@@ -677,8 +675,6 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
             content: quoted.clone(),
             recipient: reply_target.clone(),
             reply_markup: None,
-            agent_role: None,
-            workspace: String::new(),
         };
 
         if let Err(e) = channel.send(&reply).await {
@@ -1258,7 +1254,6 @@ mod tests {
             "<blockquote>\nHello, world!\n</blockquote>"
         );
         assert!(our_msgs[0].reply_markup.is_none());
-        assert!(our_msgs[0].agent_role.is_none());
     }
 
     #[tokio::test]

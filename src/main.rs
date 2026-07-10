@@ -550,8 +550,6 @@ async fn handle_start_command(msg: &ChannelMessage) {
         content: "Choose an action:".to_string(),
         recipient: msg.reply_target.clone(),
         reply_markup: Some(reply_markup),
-        agent_role: None,
-        workspace: msg.workspace.clone(),
     };
     // Send directly through the channel so the inline_keyboard structure
     // (rows of buttons) is preserved exactly — send_channel_reply does not

@@ -297,11 +297,6 @@ pub struct SendMessage {
     pub recipient: String,
     /// Optional inline keyboard markup to attach to the message.
     pub reply_markup: Option<serde_json::Value>,
-    /// The agent's role that produced this message, if sent by an agent.
-    /// Used by chat history and GUI live display to show which role responded.
-    pub agent_role: Option<String>,
-    /// The workspace this message belongs to.
-    pub workspace: String,
 }
 
 #[async_trait]

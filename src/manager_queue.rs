@@ -301,7 +301,7 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
             );
         }
 
-        // Extract common SendMessage fields once; only `recipient` differs
+        // Extract common broadcast/persist fields once; only `recipient` differs
         // between the broadcast+persist loop and the channel delivery loop.
         let content = &response;
         let agent_role = Some("manager".to_string());
@@ -351,8 +351,6 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
                             content: content.clone(),
                             recipient,
                             reply_markup: None,
-                            agent_role: agent_role.clone(),
-                            workspace: workspace.clone(),
                         })
                         .await
                     {

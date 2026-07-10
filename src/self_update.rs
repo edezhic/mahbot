@@ -554,8 +554,6 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
         content: message.to_string(),
         recipient: recipient.to_string(),
         reply_markup: None,
-        agent_role: None,
-        workspace: String::new(),
     };
 
     if let Err(e) = channel.send(&reply).await {
