@@ -31,7 +31,7 @@ pub(super) const CHAT_SCROLL_ID: Id = Id::new("home_chat_scroll");
 
 /// A displayed chat message in the scroll view.
 #[derive(Debug, Clone)]
-pub struct ChatMessage {
+pub struct DisplayMessage {
     /// Database row ID (Some for history-loaded, None for live arrivals).
     pub id: Option<i64>,
     pub message_id: String,
@@ -46,7 +46,7 @@ pub struct ChatMessage {
     pub is_optimistic: bool,
 }
 
-/// Construct a non-optimistic `ChatMessage` with parsed markdown.
+/// Construct a non-optimistic `DisplayMessage` with parsed markdown.
 ///
 /// Takes `message_id` by value so the caller can clone when they need to
 /// retain ownership (e.g. for dedup tracking on the optimistic-replacement
@@ -58,10 +58,10 @@ fn build_chat_message(
     direction: ChatDirection,
     agent_role: Option<String>,
     is_optimistic: bool,
-) -> ChatMessage {
+) -> DisplayMessage {
     use iced::widget::markdown;
     let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
-    ChatMessage {
+    DisplayMessage {
         id: None,
         message_id,
         user_name,
@@ -239,7 +239,7 @@ pub struct HomeState {
     /// to `personal:<user_name>` before querying chat_history or sessions.
     selected_workspace: Option<String>,
     /// Displayed chat messages.
-    messages: Vec<ChatMessage>,
+    messages: Vec<DisplayMessage>,
     /// Deduplication set of seen message IDs.
     seen_ids: HashSet<String>,
     /// Text editor content.
@@ -410,7 +410,7 @@ impl HomeState {
         use iced::widget::markdown;
 
         let md_items: Vec<markdown::Item> = markdown::parse(&entry.content).collect();
-        self.messages.push(ChatMessage {
+        self.messages.push(DisplayMessage {
             id: Some(entry.id),
             message_id: entry.message_id.clone(),
             user_name: entry.user_name,
@@ -446,7 +446,7 @@ impl HomeState {
     ///
     /// If `optimistic_id` matches a locally-inserted optimistic message
     /// (`is_optimistic && message_id == optimistic_id`), swaps in the real
-    /// [`ChatMessage`], marks the canonical ID as seen, clears `sending`,
+    /// [`DisplayMessage`], marks the canonical ID as seen, clears `sending`,
     /// and returns `Some(snap_task)` so the caller can early-return.
     /// Returns `None` when no replacement was performed.
     #[allow(clippy::too_many_arguments)]
@@ -1171,13 +1171,13 @@ impl HomeState {
                     return Task::none();
                 }
                 // Prepend entries to the beginning of messages.
-                let mut prepended: Vec<ChatMessage> = display_entries
+                let mut prepended: Vec<DisplayMessage> = display_entries
                     .into_iter()
                     .map(|entry| {
                         use iced::widget::markdown;
                         let md_items: Vec<markdown::Item> =
                             markdown::parse(&entry.content).collect();
-                        ChatMessage {
+                        DisplayMessage {
                             id: Some(entry.id),
                             message_id: entry.message_id,
                             user_name: entry.user_name,
@@ -1420,8 +1420,8 @@ mod tests {
         direction: ChatDirection,
         agent_role: Option<&str>,
         is_optimistic: bool,
-    ) -> ChatMessage {
-        ChatMessage {
+    ) -> DisplayMessage {
+        DisplayMessage {
             id: None,
             message_id: message_id.to_string(),
             user_name: user_name.to_string(),
