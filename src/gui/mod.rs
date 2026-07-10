@@ -958,29 +958,10 @@ impl Dashboard {
                 // Intercept ViewCommitDiff for cross-page navigation
                 // before it reaches board_state.update.
                 if let board::BoardMessage::ViewCommitDiff {
-                    ref commit_hash,
-                    ref workspace_name,
+                    ref commit_hash, ..
                 } = msg
                 {
-                    // Close any board modal
-                    let close_board = self
-                        .board_state
-                        .update(board::BoardMessage::CloseModal)
-                        .map(Message::Board);
-                    // Open diff modal — the diff_state will receive
-                    // NavigateToCommit which loads the commit data.
-                    self.show_diff_modal = true;
-                    // Close branch modal synchronously if open.
-                    // CloseModal always returns Task::none() so discarding is safe.
-                    let _ = self.git_state.update(git::GitMessage::CloseModal);
-                    let hash = commit_hash.clone();
-                    let ws = workspace_name.clone();
-                    return Task::batch([
-                        close_board,
-                        Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
-                            ws, hash,
-                        ))),
-                    ]);
+                    return self.open_diff_modal(Some(commit_hash.clone()));
                 }
                 self.board_state.update(msg).map(Message::Board)
             }
@@ -1017,34 +998,7 @@ impl Dashboard {
                 Task::none()
             }
             // ── Diff modal ────────────────────────────────────────
-            Message::OpenDiffModal(commit_hash) if self.ready => {
-                // Close any board modal and branch modal
-                let close_board = self
-                    .board_state
-                    .update(board::BoardMessage::CloseModal)
-                    .map(Message::Board);
-                self.show_diff_modal = true;
-                // Close branch modal synchronously if open.
-                // CloseModal always returns Task::none() so discarding is safe.
-                let _ = self.git_state.update(git::GitMessage::CloseModal);
-                if let Some(hash) = commit_hash {
-                    let ws = self.selected_workspace_name.clone().unwrap_or_default();
-                    let hash_clone = hash;
-                    Task::batch([
-                        close_board,
-                        Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
-                            ws, hash_clone,
-                        ))),
-                    ])
-                } else {
-                    // Working tree — send BackToWorkingTree to clear any
-                    // stale commit ref and load the working-tree diff.
-                    Task::batch([
-                        close_board,
-                        Task::done(Message::DiffModal(diff::DiffMessage::BackToWorkingTree)),
-                    ])
-                }
-            }
+            Message::OpenDiffModal(commit_hash) if self.ready => self.open_diff_modal(commit_hash),
             Message::CloseDiffModal => {
                 self.show_diff_modal = false;
                 Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
@@ -1125,6 +1079,30 @@ impl Dashboard {
             | Message::OpenDiffModal(_)
             | Message::Git(_) => Task::none(),
         }
+    }
+
+    /// Open the diff modal, closing any board or branch modal first.
+    ///
+    /// When `commit_hash` is `Some`, navigates to that commit; when `None`,
+    /// navigates to the working tree (clearing any stale commit state).
+    fn open_diff_modal(&mut self, commit_hash: Option<String>) -> Task<Message> {
+        // Close any board modal
+        let close_board = self
+            .board_state
+            .update(board::BoardMessage::CloseModal)
+            .map(Message::Board);
+        self.show_diff_modal = true;
+        // Close branch modal synchronously if open.
+        // CloseModal always returns Task::none() so discarding is safe.
+        let _ = self.git_state.update(git::GitMessage::CloseModal);
+        let ws = self.selected_workspace_name.clone().unwrap_or_default();
+        let diff_task = match commit_hash {
+            Some(hash) => Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
+                ws, hash,
+            ))),
+            None => Task::done(Message::DiffModal(diff::DiffMessage::BackToWorkingTree)),
+        };
+        Task::batch([close_board, diff_task])
     }
 
     /// Persist the workspace selection (sidebar state, window-state.json,
