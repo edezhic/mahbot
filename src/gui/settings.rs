@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use super::theme;
 use super::users;
+use super::widget_helpers;
 use super::widgets;
 use super::workspaces;
 
@@ -2058,31 +2059,12 @@ fn config_text_input<'a>(
 }
 
 /// Wrap a dialog element inside a semi-transparent backdrop, centered on screen.
-/// Uses `Stack` to overlay the dialog above the backdrop.
+/// Uses the shared backdrop helper for consistent overlay behavior.
 fn modal_with_backdrop(
     dialog: Element<'_, SettingsMessage>,
     on_backdrop_click: SettingsMessage,
 ) -> Element<'_, SettingsMessage> {
-    let backdrop = mouse_area(
-        container(text(""))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.0, 0.0, 0.0, 0.5,
-                ))),
-                ..container::Style::default()
-            }),
-    )
-    .on_press(on_backdrop_click);
-
-    let centered = container(dialog)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center);
-
-    iced::widget::stack([backdrop.into(), centered.into()]).into()
+    widget_helpers::modal_backdrop(dialog, on_backdrop_click, 0.5)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

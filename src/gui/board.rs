@@ -16,6 +16,7 @@ use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
 use super::theme;
+use super::widget_helpers;
 use super::widgets::{diff_stats_row, selectable_text};
 
 /// Per-file stat from `git show --numstat`.
@@ -723,29 +724,11 @@ impl BoardState {
     }
 
     /// Build a centered dialog with a semi-transparent backdrop that closes on click.
-    /// Mirrors the pattern from `settings.rs::modal_with_backdrop` and `mod.rs::modal_overlay`.
     fn centered_dialog<'a>(
         content: impl Into<Element<'a, BoardMessage>>,
         on_backdrop: BoardMessage,
     ) -> Element<'a, BoardMessage> {
-        let backdrop = iced::widget::mouse_area(
-            container(text(""))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BACKDROP_COLOR)),
-                    ..container::Style::default()
-                }),
-        )
-        .on_press(on_backdrop);
-
-        let centered = container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center);
-
-        iced::widget::stack([backdrop.into(), centered.into()]).into()
+        widget_helpers::modal_backdrop(content, on_backdrop, 0.5)
     }
 
     /// Render the modal overlay for ticket detail.

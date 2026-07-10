@@ -28,6 +28,7 @@ pub mod text_rendering;
 pub mod theme;
 pub mod tool_failures;
 pub mod users;
+pub mod widget_helpers;
 pub mod widgets;
 pub mod workspaces;
 
@@ -1360,24 +1361,12 @@ impl Dashboard {
 ///
 /// Creates a backdrop that dismisses the modal on click, wraps `inner` in the
 /// standard dialog container style with 16px padding, and centers it at 80%
-/// width using a `FillPortion(1/8/1)` row layout.
+/// width using a `FillPortion(1/8/1)` row layout, then delegates to the shared
+/// backdrop helper for the overlay layering.
 fn modal_overlay<'a>(
     inner: impl Into<Element<'a, Message>>,
     on_close: Message,
 ) -> Element<'a, Message> {
-    let backdrop = iced::widget::mouse_area(
-        container(text(""))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.0, 0.0, 0.0, 0.5,
-                ))),
-                ..container::Style::default()
-            }),
-    )
-    .on_press(on_close);
-
     let dialog = container(inner)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1392,7 +1381,7 @@ fn modal_overlay<'a>(
     .width(Length::Fill)
     .height(Length::Fill);
 
-    iced::widget::stack([backdrop.into(), centered.into()]).into()
+    widget_helpers::modal_backdrop(centered, on_close, 0.5)
 }
 
 /// Render the diff modal (80% width, 100% height, centered).

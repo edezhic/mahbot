@@ -21,31 +21,16 @@ use super::{
 
 /// Wrap any dialog element in a centered overlay with a semi-transparent
 /// backdrop that closes the dialog on click.
+///
+/// Delegates to the shared backdrop helper. The caller may specify a custom
+/// backdrop opacity; most dialogs use `0.5`, but lighter overlays (e.g.
+/// quick-open) use `0.3`.
 pub(super) fn overlay_dialog<'a>(
     dialog: impl Into<Element<'a, EditorMessage>>,
     on_backdrop: EditorMessage,
     opacity: f32,
 ) -> Element<'a, EditorMessage> {
-    let backdrop = iced::widget::mouse_area(
-        container(text(""))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.0, 0.0, 0.0, opacity,
-                ))),
-                ..Default::default()
-            }),
-    )
-    .on_press(on_backdrop);
-
-    let centered = container(dialog.into())
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill);
-
-    iced::widget::stack([backdrop.into(), centered.into()]).into()
+    super::super::widget_helpers::modal_backdrop(dialog, on_backdrop, opacity)
 }
 
 /// Wrap dialog content in the shared dialog container and overlay it.
