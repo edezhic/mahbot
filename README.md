@@ -58,7 +58,7 @@ This matches what SOTA agentic systems are converging on: **execution-grounded v
 
 ### 3. Common chat-completions economics
 
-MahBbot talks to models through **OpenRouter** (or any OpenAI-compatible chat-completions API). You pay for tokens on models you choose—defaults lean toward inexpensive options like DeepSeek v4 Flash/Pro—with per-role overrides and provider routing in config.
+MahBot talks to models through **OpenRouter** (or any OpenAI-compatible chat-completions API). You pay for tokens on models you choose—defaults lean toward inexpensive options like DeepSeek v4 Flash/Pro—with per-role overrides and provider routing in config.
 
 That is a different economic shape from tools bundled into **$20–$200/month subscriptions** with rolling 5-hour windows, weekly caps, or agent credit pools. MahBot does not require a specific vendor subscription to be efficient; heavy use scales with API spend and orchestration design, not with upgrading a product tier.
 
