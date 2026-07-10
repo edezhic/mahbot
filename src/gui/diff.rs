@@ -811,20 +811,14 @@ impl DiffState {
                 .padding([8, 12])
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_BASE)),
-                    ..Default::default()
-                })
+                .style(theme::base_container_style)
                 .into()
         } else if self.diff_loading && !self.diff_has_loaded {
             container(text("Loading diff…").size(12).color(theme::TEXT_MUTED))
                 .padding([8, 12])
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_BASE)),
-                    ..Default::default()
-                })
+                .style(theme::base_container_style)
                 .into()
         } else if self.selected_workspace_name.is_none() {
             container(
@@ -835,10 +829,7 @@ impl DiffState {
             .padding([8, 12])
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..Default::default()
-            })
+            .style(theme::base_container_style)
             .into()
         } else if self.diff_files.is_empty() {
             container(
@@ -858,10 +849,7 @@ impl DiffState {
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..Default::default()
-            })
+            .style(theme::base_container_style)
             .into()
         } else {
             self.build_split_view()
@@ -1123,10 +1111,7 @@ impl DiffState {
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..Default::default()
-            })
+            .style(theme::base_container_style)
             .into();
         }
 
@@ -1252,10 +1237,7 @@ impl DiffState {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_BASE)),
-            ..Default::default()
-        })
+        .style(theme::base_container_style)
         .into()
     }
 
