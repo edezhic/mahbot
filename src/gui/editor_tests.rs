@@ -840,24 +840,7 @@ fn test_is_find_bar_open_true_when_active() {
 
 #[test]
 fn test_is_find_bar_open_false_when_closed() {
-    let mut state = EditorState::new();
-    state.tabs.push(Tab {
-        path: "/test.rs".to_string(),
-        file_name: "test.rs".to_string(),
-        is_dirty: false,
-        has_trailing_newline: true,
-        line_ending: LineEnding::Lf,
-    });
-    state.active_tab_index = 0;
-    state.tab_contents.insert(
-        "/test.rs".to_string(),
-        TabData {
-            content: EditorBuffer::with_text("fn hello() {}", None),
-            undo_stack: RefCell::new(UndoStack::new()),
-            find_replace_state: None,
-            saved_text_hash: 0,
-        },
-    );
+    let state = make_editor_with_single_tab("fn hello() {}");
     assert!(!state.is_find_bar_open());
 }
 
