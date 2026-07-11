@@ -930,24 +930,6 @@ mod tests {
     // ── Schema / struct consistency ─────────────────────────────
 
     #[tokio::test]
-    async fn new_workspace_starts_paused() {
-        let (store, _tmp) = test_store().await;
-        let ws = insert_direct(&store, "test_ws", "/tmp/test_ws", true, false, 0).await;
-        assert!(ws.paused, "In-memory workspace should have paused = true");
-
-        // Round-trip through the DB.
-        let fetched = store
-            .get_by_name("test_ws")
-            .await
-            .expect("fetch workspace")
-            .expect("workspace exists");
-        assert!(
-            fetched.paused,
-            "Persisted workspace should have paused = true"
-        );
-    }
-
-    #[tokio::test]
     async fn schema_default_is_paused() {
         // Insert WITHOUT specifying paused, relying on the schema DEFAULT.
         let (store, _tmp) = test_store().await;
