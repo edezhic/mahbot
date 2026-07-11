@@ -1593,23 +1593,31 @@ fn apply_profile_pipeline(
     finish_shell_output(combined, elapsed, pre_head_tail.as_deref())
 }
 
+/// Decode raw shell output bytes (lossy UTF-8) and strip ANSI escape sequences.
+///
+/// This is the first step before further processing such as credential scrubbing
+/// ([`strip_and_scrub`]) or truncation ([`clean_truncate`]).
+fn decode_and_strip_ansi(data: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(data);
+    strip_ansi_escapes(&decoded)
+}
+
 /// Decode raw shell output bytes (lossy UTF-8), strip ANSI escape sequences,
 /// then scrub credentials.
 ///
-/// This is the canonical conversion from raw command output (`&[u8]`) to
-/// a sanitized string. Use this whenever you need to process raw shell
-/// bytes into display-safe text.
+/// Builds on [`decode_and_strip_ansi`] by additionally applying credential
+/// scrubbing. Use this whenever you need to process raw shell bytes into
+/// display-safe text.
 ///
 /// # When to skip this helper
 ///
 /// - **`clean_truncate`** intentionally only strips ANSI escapes (no scrubbing)
 ///   because credential scrubbing happens later in the output pipeline
-///   ([`apply_profile_pipeline`]). It uses `strip_ansi_escapes` + `truncate_sandwich`
-///   directly — that is a distinct operation with a different post-processing contract.
+///   ([`apply_profile_pipeline`]). It uses [`decode_and_strip_ansi`] +
+///   [`truncate_sandwich`](crate::util::truncate_sandwich) directly — that is a
+///   distinct operation with a different post-processing contract.
 fn strip_and_scrub(data: &[u8]) -> String {
-    let decoded = String::from_utf8_lossy(data);
-    let stripped = strip_ansi_escapes(&decoded);
-    scrub_credentials(&stripped)
+    scrub_credentials(&decode_and_strip_ansi(data))
 }
 
 /// Strip ANSI escape sequences first, then truncate to [`MAX_OUTPUT_BYTES`].
@@ -1618,9 +1626,7 @@ fn strip_and_scrub(data: &[u8]) -> String {
 /// truncation boundaries cannot split multi-character escape sequences
 /// into garbled fragments.
 fn clean_truncate(data: &[u8], label: &'static str) -> String {
-    let s = String::from_utf8_lossy(data);
-    let cleaned = strip_ansi_escapes(&s);
-    crate::util::truncate_sandwich(&cleaned, MAX_OUTPUT_BYTES, label)
+    crate::util::truncate_sandwich(&decode_and_strip_ansi(data), MAX_OUTPUT_BYTES, label)
 }
 
 /// Try to parse as JSON/structured data and return a schema preview.
