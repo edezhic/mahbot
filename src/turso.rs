@@ -402,7 +402,8 @@ impl Connection {
     }
 
     /// Lock the inner connection and rollback any dangling transaction.
-    /// Read-only callers should use `self.conn.lock().await` directly.
+    /// Both read and write callers should use this method — dangling
+    /// transactions can affect read visibility in WAL mode if left active.
     async fn lock_and_cleanup(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
         let conn = self.conn.lock().await;
         if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
@@ -445,7 +446,7 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let conn = self.conn.lock().await;
+        let conn = self.lock_and_cleanup().await;
         Self::query_impl(&conn, sql, params).await
     }
 
@@ -492,7 +493,7 @@ impl Connection {
     where
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let conn = self.conn.lock().await;
+        let conn = self.lock_and_cleanup().await;
         Self::query_row_impl(&conn, sql, params, map).await
     }
 
