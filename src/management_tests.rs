@@ -1005,21 +1005,12 @@ async fn dispatch_diagnostics_cases() {
 
     let fail_cmds = DiagnosticsCommands {
         format: Some("false".to_string()),
-        format_check: None,
-        lint_fix: None,
-        lint: None,
-        type_check: None,
-        build: None,
-        unit_test: None,
+        ..Default::default()
     };
     let pass_cmds = DiagnosticsCommands {
         format: Some("true".to_string()),
-        format_check: None,
-        lint_fix: None,
-        lint: None,
         type_check: Some("true".to_string()),
-        build: None,
-        unit_test: None,
+        ..Default::default()
     };
 
     let cases = [

@@ -63,7 +63,7 @@ use crate::util::UnwrapPoison;
 /// Discovered diagnostic commands for a workspace.
 ///
 /// All fields are optional — `None` means no such tooling was detected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiagnosticsCommands {
     /// Auto-formatter command (e.g., `cargo fmt`)
     pub format: Option<String>,
@@ -890,25 +890,12 @@ mod tests {
 
     #[test]
     fn diagnostics_is_empty() {
-        let empty = DiagnosticsCommands {
-            format: None,
-            format_check: None,
-            lint: None,
-            lint_fix: None,
-            type_check: None,
-            build: None,
-            unit_test: None,
-        };
+        let empty = DiagnosticsCommands::default();
         assert!(empty.is_empty());
 
         let partial = DiagnosticsCommands {
             format: Some("cargo fmt".into()),
-            format_check: None,
-            lint: None,
-            lint_fix: None,
-            type_check: None,
-            build: None,
-            unit_test: None,
+            ..Default::default()
         };
         assert!(!partial.is_empty());
     }
