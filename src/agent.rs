@@ -402,10 +402,7 @@ impl Agent {
                 tool = %call_name,
                 "Agent cancelled — skipping tool execution"
             );
-            return ToolExecutionOutcome {
-                output: format_tool_failure_feedback(call_name, &call_arguments, reason),
-                success: false,
-            };
+            return Self::failure_outcome(call_name, &call_arguments, reason).0;
         }
 
         let start = Instant::now();
