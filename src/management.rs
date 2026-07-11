@@ -347,8 +347,13 @@ async fn comment_and_transition(
 ) -> bool {
     let ticket = ctx.ticket;
 
-    // All callers that transition to Failed must provide a non-None `comment`.
-    let failure_comment = if ctx.target == TicketPhase::Failed { Some(comment.1) } else { None };
+    // When targeting Failed, the second tuple element of `comment` is used as
+    // the failure-reason text for notifications.
+    let failure_comment = if ctx.target == TicketPhase::Failed {
+        Some(comment.1)
+    } else {
+        None
+    };
 
     with_comment_and_transition(ctx, failure_comment, async |tx| {
         let (role, text) = comment;
