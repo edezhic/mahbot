@@ -1900,6 +1900,8 @@ async fn record_verdict_comments_tx(
 ///
 /// The circuit-breaker guard is handled centrally by [`spawn_dispatch`].
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
+    // Cancel any stale agents for this ticket before dispatching new ones
+    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
     let prompt_key = if ticket.reporter == Role::Maintainer.as_str() {
         "analyze/maintainer_ticket.md"
     } else {
@@ -2305,6 +2307,8 @@ async fn process_verifier_verdicts(
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs [`PARALLEL_AGENT_COUNT`] parallel verifiers of the given role, and processes the verdicts.
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
+    // Cancel any stale agents for this ticket before dispatching new ones
+    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
     let engineer_response = ticket
         .comments
         .iter()
