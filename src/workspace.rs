@@ -387,8 +387,8 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Normalize a workspace path: ensure it ends with a single `/`.
-fn normalize_path(path: &str) -> String {
+/// Ensure a directory path string ends with a single `/`.
+fn ensure_trailing_slash(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     format!("{trimmed}/")
 }
@@ -454,7 +454,7 @@ impl WorkspaceStore {
 
         // Canonicalize and validate the path so bad paths never enter the system.
         let canonical = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let path = normalize_path(&canonical);
+        let path = ensure_trailing_slash(&canonical);
         let now = turso::now();
         self.conn
             .execute(
