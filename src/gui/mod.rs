@@ -1398,7 +1398,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
 // ── Ticket sidebar (Home page, right side) ────────────────────────
 
 /// Ticket sidebar shown on the right side of the Home page.
-/// Displays all non-archived tickets grouped by status. A right-click
+/// Displays all non-archived tickets grouped by phase. A right-click
 /// context menu on this panel offers "Archive done & cancelled".
 fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     let (pending, pipeline, completed) = board::BoardState::partition_tickets(&board_state.tickets);

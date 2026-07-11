@@ -159,7 +159,7 @@ impl BoardState {
         iced::Subscription::none()
     }
 
-    /// Status transition actions (ported from Board.tsx `availableActions`)
+    /// Phase transition actions (ported from Board.tsx `availableActions`)
     fn available_actions(phase: TicketPhase) -> Vec<(&'static str, TicketPhase)> {
         match phase {
             TicketPhase::ReadyForDevelopment => vec![
@@ -263,7 +263,7 @@ impl BoardState {
     /// Compute how many of this ticket's prerequisites are still unfulfilled.
     /// A prerequisite is considered fulfilled if its ticket cannot be found in the
     /// loaded set (per manager clarification: missing = archived = fulfilled) or if
-    /// its status passes [`TicketPhase::is_unblocking()`].
+    /// its phase passes [`TicketPhase::is_unblocking()`].
     fn unfulfilled_prereq_count(&self, ticket: &Ticket) -> (usize, Vec<String>) {
         if ticket.prerequisites.is_empty() {
             return (0, Vec::new());

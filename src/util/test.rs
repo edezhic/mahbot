@@ -239,7 +239,7 @@ pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
         .expect("expected ticket phase to exist")
 }
 
-/// Assert that a ticket has been superseded: its status is `Cancelled`,
+/// Assert that a ticket has been superseded: its phase is `Cancelled`,
 /// it has no assignee, and it is archived immediately.
 ///
 /// This checks the minimum invariants set atomically by

@@ -167,7 +167,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
             false
         }
         Err(e) => {
-            warn!(ticket = %ticket_id, error = %e, "Failed to check ticket status");
+            warn!(ticket = %ticket_id, error = %e, "Failed to check ticket phase");
             false
         }
     }
@@ -2195,7 +2195,7 @@ async fn try_trip_circuit_breaker(
 }
 
 /// Process parallel verifier results: add failing comments, determine pass/fail,
-/// and update ticket status accordingly.
+/// and update ticket phase accordingly.
 ///
 /// Handles three outcomes in priority order:
 ///

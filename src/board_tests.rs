@@ -66,7 +66,7 @@ async fn test_get_ticket_phase() {
     let phase = crate::util::test::expect_ticket_phase(&store, &id).await;
     assert_eq!(phase, TicketPhase::Planning);
 
-    // After transition, reflects new status.
+    // After transition, reflects new phase.
     store
         .transition_to(&id, None, TicketPhase::ReadyForDevelopment, None)
         .await
@@ -151,7 +151,7 @@ async fn test_unconditional_transition_clears_assignment() {
         "assigned_to should be set after set_assigned_to"
     );
 
-    // Update status — this should clear assigned_to
+    // Update phase — this should clear assigned_to
     store
         .transition_to(&id, None, TicketPhase::DiagnosticsDone, None)
         .await
@@ -235,7 +235,7 @@ async fn test_list_tickets() {
         .expect("list");
     assert_eq!(tickets.len(), 3);
 
-    // Filter by status (none match since all are Backlog)
+    // Filter by phase (none match since all are Backlog)
     let tickets = store
         .list_all_tickets(Some("ws"), Some(TicketPhase::Done))
         .await
@@ -325,7 +325,7 @@ async fn test_reset_inflight_tickets() {
         let t = expect_ticket(&store, &id).await;
         assert_eq!(
             t.phase, case.expected,
-            "Case '{}': unexpected status after reset",
+            "Case '{}': unexpected phase after reset",
             case.name,
         );
         assert_eq!(
@@ -507,7 +507,7 @@ async fn test_has_active_tickets_excluding() {
     let (store, _tmp) = open_test_store().await;
     let ws = test_ws_named("/ws", "ws");
 
-    // Create one ticket per active status: all PIPELINE_BLOCKING_PHASES + ReadyForDevelopment
+    // Create one ticket per active phase: all PIPELINE_BLOCKING_PHASES + ReadyForDevelopment
     let rfd_id = make_ticket(&store, &ws, "RFD", TicketPhase::ReadyForDevelopment).await;
     let in_dev_id = make_ticket(&store, &ws, "InDev", TicketPhase::InDevelopment).await;
     let done_id = make_ticket(&store, &ws, "Done", TicketPhase::Done).await;
@@ -808,7 +808,7 @@ async fn test_claim_ticket_in_workspace_if_pipeline_free() {
             assert_eq!(
                 claimed.phase,
                 TicketPhase::InDevelopment,
-                "Case '{}': wrong status after claim",
+                "Case '{}': wrong phase after claim",
                 case.name
             );
         } else {

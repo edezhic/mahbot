@@ -457,7 +457,7 @@ impl TicketPhase {
     /// (which returns the machine-oriented `snake_case` form like
     /// `"in_development"`). Use `display_name()` for user-facing UI labels;
     /// keep `as_ref()` for tool output, SQL fragments, and agent-facing text
-    /// where agents expect the snake_case status string.
+    /// where agents expect the snake_case phase string.
     #[must_use]
     pub fn display_name(&self) -> String {
         self.as_ref().replace('_', " ")
@@ -1088,7 +1088,7 @@ impl BoardStore {
         }
     }
 
-    /// Update ticket status, optionally guarded by an expected phase for CAS-style
+    /// Update ticket phase, optionally guarded by an expected phase for CAS-style
     /// atomicity. Always clears `assigned_to` and cancels running agents.
     ///
     /// # Note on [`pipeline_reservation`](Ticket::pipeline_reservation)
@@ -1138,7 +1138,7 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Set or clear the assignee for a ticket (does not change status).
+    /// Set or clear the assignee for a ticket (does not change phase).
     ///
     /// When `assigned_to` is `Some(value)`, sets the `assigned_to` column to that
     /// value. When `None`, clears the assignee (sets `assigned_to = NULL`).
@@ -1422,7 +1422,7 @@ impl BoardStore {
     /// Shared implementation for checking if a workspace has active tickets.
     ///
     /// Returns `true` if any ticket in the workspace has a pipeline-blocking
-    /// status ([`PIPELINE_BLOCKING_PHASES`]), or a
+    /// phase ([`PIPELINE_BLOCKING_PHASES`]), or a
     /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket
     /// (regardless of `pipeline_reservation`), optionally excluding a
     /// specific ticket ID.
@@ -1460,7 +1460,7 @@ impl BoardStore {
     }
 
     /// Returns true if the given workspace has any ticket with a pipeline-blocking
-    /// status (dev/review/QA), OR any reserved ReadyForDevelopment ticket that
+    /// phase (dev/review/QA), OR any reserved ReadyForDevelopment ticket that
     /// was bounced back and is awaiting rework.
     ///
     /// **Test-only query** — retained to provide coverage of the pipeline-blocker SQL.
@@ -1658,7 +1658,7 @@ impl BoardStore {
         Ok(())
     }
 
-    /// List all tickets, optionally filtered by workspace and/or status.
+    /// List all tickets, optionally filtered by workspace and/or phase.
     /// Used by the dashboard to show tickets across all workspaces.
     pub async fn list_all_tickets(
         &self,

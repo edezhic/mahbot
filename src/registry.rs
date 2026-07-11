@@ -120,7 +120,7 @@ impl AgentRegistry {
     }
 
     /// Cancel all agents running for a specific `ticket_id`.
-    /// Used on ticket status transitions — stops any agent currently working on it.
+    /// Used on ticket phase transitions — stops any agent currently working on it.
     pub fn cancel_by_ticket_id(&self, ticket_id: &str) {
         self.cancel_matching(|entry| entry.handle.ticket_id.as_deref() == Some(ticket_id));
     }
