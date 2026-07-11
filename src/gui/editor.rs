@@ -1629,6 +1629,12 @@ impl EditorState {
         self.file_tree.rebuild_visible();
     }
 
+    fn bump_generation(&mut self) -> u64 {
+        let g = self.generation.wrapping_add(1);
+        self.generation = g;
+        g
+    }
+
     /// Start an async load of a directory's entries.
     ///
     /// Returns `Some(Task)` with the async load if a workspace is selected and
@@ -1652,8 +1658,7 @@ impl EditorState {
             tracing::error!("{label} without workspace selected");
             return None;
         };
-        let dir_gen = self.generation.wrapping_add(1);
-        self.generation = dir_gen;
+        let dir_gen = self.bump_generation();
         self.dir_generations.insert(dir_path.to_string(), dir_gen);
         self.loading_dirs.insert(dir_path.to_string());
         let d_path = dir_path.to_string();
@@ -1982,8 +1987,7 @@ impl EditorState {
         self.pending_enter_dir = None;
 
         let file_path = abs_path.clone();
-        let file_gen = self.generation.wrapping_add(1);
-        self.generation = file_gen;
+        let file_gen = self.bump_generation();
         self.file_generations.insert(file_path.clone(), file_gen);
         self.selected_file = Some(file_path.clone());
 
@@ -2383,8 +2387,7 @@ impl EditorState {
         self.selected_workspace_path = path.map(std::string::ToString::to_string);
 
         // Clear previous state and bump generation counters.
-        let r#gen = self.generation.wrapping_add(1);
-        self.generation = r#gen;
+        let r#gen = self.bump_generation();
         let saved_gen = self.saved_tabs_gen.wrapping_add(1);
         self.saved_tabs_gen = saved_gen;
         let git_gen = self.git_status_gen.wrapping_add(1);
@@ -3274,8 +3277,8 @@ impl EditorState {
 
         // File not open — load it, then jump after loading.
         // Set pending_goto so FileLoaded handler moves the cursor.
-        // Use self.generation.wrapping_add(1) to match the generation
-        // that open_file_in_editor will assign (line 2103).
+        // Use self.generation.wrapping_add(1) to predict the generation
+        // that open_file_in_editor will produce (it calls bump_generation).
         let file_gen = self.generation.wrapping_add(1);
         self.pending_goto = Some((abs_path.clone(), line_number, file_gen));
         self.open_file_in_editor(&abs_path)
@@ -3464,8 +3467,7 @@ impl EditorState {
         // perform_create_item, etc.): bump self.generation and register
         // it in dir_generations so that any in-flight DirExpanded for
         // this directory is invalidated (its generation won't match).
-        let dir_gen = self.generation.wrapping_add(1);
-        self.generation = dir_gen;
+        let dir_gen = self.bump_generation();
         self.dir_generations
             .insert(parent_dir_clone.clone(), dir_gen);
 
@@ -4126,8 +4128,7 @@ impl EditorState {
         let root_path = ws_path.clone();
 
         for dir_path in dirs_to_refresh {
-            let dir_gen = self.generation.wrapping_add(1);
-            self.generation = dir_gen;
+            let dir_gen = self.bump_generation();
             self.dir_generations.insert(dir_path.clone(), dir_gen);
             // NOTE: deliberately NOT adding to `loading_dirs` — this
             // avoids a "Loading…" flicker for every expanded directory
@@ -5421,8 +5422,7 @@ impl EditorState {
                 .unwrap_or_default()
         };
         let ws_path = self.selected_workspace_path.clone().unwrap_or_default();
-        let r#gen = self.generation.wrapping_add(1);
-        self.generation = r#gen;
+        let r#gen = self.bump_generation();
         // Register the generation so DirExpanded handler accepts the result.
         self.dir_generations.insert(parent_dir.clone(), r#gen);
 
@@ -5457,8 +5457,7 @@ impl EditorState {
             .join(name)
             .to_string_lossy()
             .to_string();
-        let r#gen = self.generation.wrapping_add(1);
-        self.generation = r#gen;
+        let r#gen = self.bump_generation();
         // Register the generation so DirExpanded handler accepts the result.
         self.dir_generations.insert(parent_dir.clone(), r#gen);
 
