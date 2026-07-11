@@ -292,7 +292,7 @@ macro_rules! string_config_fields {
             /// Unlike [`set_string_field`], which stores values as-is, this is the
             /// canonical normalization point — callers that set individual fields
             /// should ensure [`Self::finalize`] is called before using the config.
-            pub(crate) fn normalize_string_fields(&mut self) {
+            fn normalize_string_fields(&mut self) {
                 $(self.$field = non_empty(self.$field.take());)*
             }
         }
@@ -396,7 +396,7 @@ impl ConfigData {
     /// This is the Vec-entry counterpart of [`normalize_string_fields()`] —
     /// the macro-generated method only touches top-level `Option<String>` fields,
     /// not the inner fields of [`RoleConfig`] and [`ModelRouting`] entries.
-    pub(crate) fn normalize_entries(&mut self) {
+    fn normalize_entries(&mut self) {
         for rc in &mut self.per_role_configs {
             rc.model = non_empty(rc.model.take());
             rc.reasoning_effort = non_empty(rc.reasoning_effort.take());
