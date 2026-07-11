@@ -1,1 +1,1 @@
-Search the archive of completed/cancelled tickets by title. Uses hybrid search (keyword + semantic similarity). Returns up to 10 best matches as `{id, title, status}` lines. Use `get_ticket` with the returned IDs for full details including descriptions, comments, and code changes.
+Search the archive of completed/cancelled tickets by title. Uses hybrid search (keyword + semantic similarity). Returns up to 10 best matches, each formatted as `[phase] id: title`. Use `get_ticket` with the returned IDs for full details including descriptions, comments, and code changes.

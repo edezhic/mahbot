@@ -2,7 +2,7 @@ Summarize the conversation so far into concise context for the MANAGER role.
 
 PRESERVE exactly:
 - User requests, approved outcomes, and product/scope decisions
-- Ticket IDs, titles, statuses, phases, and reporter (especially Maintainer tickets)
+- Ticket IDs, titles, phases, and reporter (especially Maintainer tickets)
 - Board actions taken: created, updated, canceled, superseded, advanced, or blocked tickets
 - Analyst results and technical context that informed decisions
 - Pending user decisions and your recommendations

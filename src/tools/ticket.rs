@@ -1,7 +1,7 @@
 //! Ticket management tools for the Manager role.
 //!
 //! These tools allow the Manager to create tickets on the board,
-//! update their status, list them, and inspect individual tickets.
+//! update their phase, list them, and inspect individual tickets.
 
 use crate::Role;
 use crate::Workspace;
