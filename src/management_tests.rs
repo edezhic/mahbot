@@ -421,14 +421,10 @@ async fn sanitation_breaker_counts_failures() {
         "Should NOT trip with 2 failures (threshold: 3)"
     );
 
-    // Add a 3rd failure comment (should still not trip — reads fresh comments
-    // from DB, not the stale in-memory ticket.comments).
-    add_sanitation_failure(&ticket_id).await;
-
-    // ... actually 3 <= 3 means the breaker does NOT trip yet.
-    // The breaker trips when count > threshold, i.e., at 4 failures.
-    // Add a 4th failure.
-    add_sanitation_failure(&ticket_id).await;
+    // Add 2 more failures to bring total to 4 (threshold is 3).
+    // Breaker trips when count > threshold, so it needs 4 failures.
+    add_sanitation_failure(&ticket_id).await; // 3 total
+    add_sanitation_failure(&ticket_id).await; // 4 total — trips
 
     // Now with 4 failures, should trip (4 > 3).
     let tripped = try_trip_circuit_breaker(
