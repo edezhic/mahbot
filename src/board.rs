@@ -1005,6 +1005,35 @@ impl BoardStore {
             .next())
     }
 
+    /// Fetch multiple tickets by their IDs.
+    ///
+    /// Returns an empty vec if `ids` is empty (no SQL round-trip).
+    /// Tickets are returned in **arbitrary order** — callers that need to
+    /// preserve input ordering must re-sort after receiving the result.
+    pub(crate) async fn get_tickets_by_ids(
+        &self,
+        ids: &[String],
+        load_comments: LoadComments,
+    ) -> Result<Vec<Ticket>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (suffix, params) = Self::in_clause_for_ids(ids);
+        self.select_tickets(&suffix, params_from_iter(params), load_comments)
+            .await
+    }
+
+    /// Build a `WHERE id IN (?, ?, ...)` suffix and parameter vector from
+    /// ticket IDs.
+    ///
+    /// Callers must ensure `ids` is non-empty — the resulting SQL is invalid
+    /// (syntax error from SQLite) when the list is empty.
+    fn in_clause_for_ids(ids: &[String]) -> (String, Vec<Value>) {
+        let suffix = format!("WHERE id IN ({})", turso::sql_in_placeholders(ids.len()));
+        let params: Vec<Value> = ids.iter().map(|id| Value::Text(id.clone())).collect();
+        (suffix, params)
+    }
+
     /// Get a ticket's phase by id — lightweight, no comments loaded.
     pub async fn get_ticket_phase(&self, ticket_id: &str) -> Result<Option<TicketPhase>> {
         let sql = "SELECT status FROM tickets WHERE id = ?1";
@@ -1643,14 +1672,8 @@ impl BoardStore {
         // round trip. Uses tx.query() — the transaction's query method operates
         // on the upstream connection through the MutexGuard, avoiding mutex
         // deadlock with conn.query().
-        let sql = format!(
-            "SELECT id, workspace_name FROM tickets WHERE id IN ({})",
-            turso::sql_in_placeholders(prerequisite_ids.len()),
-        );
-        let params: Vec<Value> = prerequisite_ids
-            .iter()
-            .map(|id| Value::Text(id.clone()))
-            .collect();
+        let (suffix, params) = Self::in_clause_for_ids(prerequisite_ids);
+        let sql = format!("SELECT id, workspace_name FROM tickets {suffix}");
         let rows = tx.query(&sql, params_from_iter(params)).await?;
 
         // Build a lookup map for O(1) prerequisite resolution.

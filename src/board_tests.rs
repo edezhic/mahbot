@@ -75,6 +75,38 @@ async fn test_get_ticket_phase() {
     assert_eq!(phase, TicketPhase::ReadyForDevelopment);
 }
 
+#[tokio::test]
+async fn test_get_tickets_by_ids() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = crate::workspace::test_ws_named("/ws", "test_ws");
+
+    // sql_in_placeholders(0) produces invalid `WHERE id IN ()` —
+    // the guard must short-circuit empty input before reaching SQL.
+    let tickets = store
+        .get_tickets_by_ids(&[], crate::board::LoadComments::No)
+        .await
+        .expect("empty ids");
+    assert!(tickets.is_empty(), "empty ids should return empty vec");
+
+    let id_a = make_ticket(&store, &ws, "Ticket A", TicketPhase::Done).await;
+    let id_c = make_ticket(&store, &ws, "Ticket C", TicketPhase::Backlog).await;
+
+    let ids = vec![id_a.clone(), id_c.clone()];
+    let tickets = store
+        .get_tickets_by_ids(&ids, crate::board::LoadComments::No)
+        .await
+        .expect("get by ids");
+    assert_eq!(tickets.len(), 2, "should return exactly 2 tickets");
+
+    for t in &tickets {
+        match t.id.as_str() {
+            id if id == id_a => assert_eq!(t.title, "Ticket A"),
+            id if id == id_c => assert_eq!(t.title, "Ticket C"),
+            other => panic!("unexpected ticket id: {other}"),
+        }
+    }
+}
+
 #[test]
 fn test_ticket_phase_parse_and_roundtrip() {
     // Roundtrip: as_ref() -> parse() for every variant

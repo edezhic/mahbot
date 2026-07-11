@@ -114,8 +114,8 @@ impl SearchArchivedTicketsTool {
 
     /// Format the top-N results for display.
     ///
-    /// Fetches id/title/phase via [`crate::board::BoardStore::select_tickets`] and
-    /// formats them in rank order. At N ≤ 10 a linear scan suffices.
+    /// Fetches id/title/phase via [`crate::board::BoardStore::get_tickets_by_ids`]
+    /// and formats them in rank order. At N ≤ 10 a linear scan suffices.
     async fn format_results(
         board: &crate::board::BoardStore,
         top_ids: &[String],
@@ -124,20 +124,8 @@ impl SearchArchivedTicketsTool {
             return Ok("Search results (top 10, highest score first):\n".to_string());
         }
 
-        let sql = format!(
-            "WHERE id IN ({})",
-            crate::turso::sql_in_placeholders(top_ids.len()),
-        );
-        let params: Vec<crate::turso::Value> = top_ids
-            .iter()
-            .map(|id| crate::turso::Value::Text(id.clone()))
-            .collect();
         let tickets = board
-            .select_tickets(
-                &sql,
-                crate::turso::params_from_iter(params),
-                crate::board::LoadComments::No,
-            )
+            .get_tickets_by_ids(top_ids, crate::board::LoadComments::No)
             .await?;
 
         let mut output = String::from("Search results (top 10, highest score first):\n");
