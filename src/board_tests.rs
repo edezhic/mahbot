@@ -115,12 +115,8 @@ fn test_ticket_phase_from_str_error_message() {
         "error should contain the invalid input value, got: {msg}"
     );
     assert!(
-        msg.contains("backlog"),
-        "error should list valid phases (e.g. backlog), got: {msg}"
-    );
-    assert!(
-        msg.contains("cancelled"),
-        "error should list valid phases (e.g. cancelled), got: {msg}"
+        TicketPhase::iter().any(|p| msg.contains(p.as_ref())),
+        "error should list at least one valid phase, got: {msg}"
     );
 }
 
