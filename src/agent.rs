@@ -31,7 +31,7 @@ const MAX_STATS_ARG_LENGTH: usize = 500;
 ///
 /// Scans the zipped tool calls and outcomes for media-generation tools,
 /// parsing the output for their media marker prefixes (e.g. `[IMAGE:path]`,
-/// `[VIDEO:path]`) and returning `(tool_name, path)` pairs.
+/// `[VIDEO:path]`) and returning `(marker_prefix, path)` pairs.
 ///
 /// Only successfully-executed tools with a defined [`Tool::media_marker`] are
 /// inspected. Non-media tools and failed outcomes are silently skipped.
@@ -52,7 +52,7 @@ fn extract_media_from_outcomes(
     tools: &[Box<dyn Tool>],
     tool_calls: &[ToolCall],
     outcomes: &[ToolExecutionOutcome],
-) -> Vec<(String, String)> {
+) -> Vec<(&'static str, String)> {
     let mut paths = Vec::new();
     for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
         if outcome.success
@@ -69,7 +69,7 @@ fn extract_media_from_outcomes(
                 .and_then(|s| s.split(']').next())
                 .filter(|p| !p.is_empty())
             {
-                paths.push((call.name.clone(), path.to_string()));
+                paths.push((marker_prefix, path.to_string()));
             } else {
                 tracing::warn!(
                     media_tool = %call.name,
@@ -247,7 +247,7 @@ impl Agent {
         let span = tracing::info_span!("agent", agent_id = %self.id, role = %self.role, workspace = %self.workspace.path);
         async {
             let mut iteration = 0usize;
-            let mut accumulated_media_paths: Vec<(String, String)> = Vec::new();
+            let mut accumulated_media_paths: Vec<(&'static str, String)> = Vec::new();
             loop {
                 if self.cancel_token.is_cancelled() {
                     anyhow::bail!("Agent cancelled by user");
@@ -271,14 +271,10 @@ impl Agent {
                 if tool_calls.is_empty() {
                     self.session.push_assistant(history_content);
                     // Append any pending media markers the model may have omitted
-                    for (tool_name, path) in &accumulated_media_paths {
-                        if let Some(prefix) =
-                            find_tool(&self.tools, tool_name).and_then(Tool::media_marker)
-                        {
-                            let marker = format!("{prefix}{path}]");
-                            if !display_text.contains(&marker) {
-                                let _ = write!(display_text, "\n{marker}");
-                            }
+                    for (marker_prefix, path) in &accumulated_media_paths {
+                        let marker = format!("{marker_prefix}{path}]");
+                        if !display_text.contains(&marker) {
+                            let _ = write!(display_text, "\n{marker}");
                         }
                     }
                     return Ok(display_text);
@@ -956,7 +952,7 @@ mod tests {
                     output: "[IMAGE:/tmp/img.png]",
                     success: true,
                 }],
-                expected: vec![("image_gen", "/tmp/img.png")],
+                expected: vec![("[IMAGE:", "/tmp/img.png")],
             },
             // Marker prefix with nothing parseable after it (e.g. at end of output)
             // produces an empty path which the filter rejects.
@@ -1037,7 +1033,7 @@ mod tests {
                         success: true,
                     },
                 ],
-                expected: vec![("image_gen", "/tmp/img.png"), ("video_gen", "/tmp/vid.mp4")],
+                expected: vec![("[IMAGE:", "/tmp/img.png"), ("[VIDEO:", "/tmp/vid.mp4")],
             },
         ];
 
@@ -1084,10 +1080,10 @@ mod tests {
                 })
                 .collect();
 
-            let expected: Vec<(String, String)> = case
+            let expected: Vec<(&'static str, String)> = case
                 .expected
                 .iter()
-                .map(|(n, p)| (n.to_string(), p.to_string()))
+                .map(|(n, p)| (*n, p.to_string()))
                 .collect();
 
             let result = extract_media_from_outcomes(&tools, &calls, &outcomes);
