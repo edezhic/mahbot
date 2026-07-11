@@ -47,7 +47,7 @@ static QUERIES: [OnceLock<Option<Query>>; HighlightLanguage::COUNT] =
 
 /// Get (or compile) the highlight query for a language.
 /// Returns None if the query is invalid (should not happen with baked-in queries).
-pub(crate) fn cached_query(lang: HighlightLanguage) -> Option<&'static Query> {
+fn cached_query(lang: HighlightLanguage) -> Option<&'static Query> {
     let cell = &QUERIES[lang as usize];
     cell.get_or_init(|| {
         let (ts_lang, query_str) = lang.language_and_query();
@@ -203,7 +203,7 @@ fn parse_markdown_highlights(source: &str) -> FileHighlights {
 /// [`distribute_byte_spans`]. Used by the editor highlighter which reuses
 /// a persistent [`MarkdownParser`] across edits.
 #[must_use]
-pub(crate) fn build_markdown_highlights_from_tree(
+fn build_markdown_highlights_from_tree(
     markdown_tree: &MarkdownTree,
     source: &str,
 ) -> FileHighlights {
@@ -274,7 +274,7 @@ pub(crate) fn build_markdown_highlights_from_tree(
 /// parent emphasis/strong spans (`Function` / `Keyword`), so both opening
 /// and closing `*` / `**` delimiters keep delimiter color.
 #[must_use]
-pub(crate) fn distribute_byte_spans(
+fn distribute_byte_spans(
     source: &str,
     byte_spans: &[(usize, usize, HighlightClass)],
 ) -> FileHighlights {
@@ -386,7 +386,7 @@ const fn span_paint_priority(class: HighlightClass) -> u8 {
 /// Collects capture spans from the tree and delegates to
 /// [`distribute_byte_spans`] for line distribution.
 #[must_use]
-pub(crate) fn build_highlights_from_tree(
+fn build_highlights_from_tree(
     tree: &tree_sitter::Tree,
     source: &str,
     query_obj: &Query,
@@ -561,7 +561,7 @@ impl HighlightLanguage {
     /// For Markdown, returns the **block** grammar — inline Markdown uses
     /// a separate grammar (see [`MD_INLINE_LANG`] and
     /// [`MD_HIGHLIGHT_QUERY_INLINE`]).
-    pub(crate) fn language_and_query(self) -> (Language, &'static str) {
+    fn language_and_query(self) -> (Language, &'static str) {
         match self {
             HighlightLanguage::Rust => (tree_sitter_rust::LANGUAGE.into(), RUST_HIGHLIGHT_QUERY),
             HighlightLanguage::JavaScript => (

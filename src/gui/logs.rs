@@ -98,9 +98,6 @@ pub enum LogMessage {
     /// Dismiss modals/panels (Escape key).
     Escape,
 
-    /// Request toast notification.
-    Toast(super::ToastMessage),
-
     /// Cmd+F keyboard shortcut — highlight the search input.
     FocusSearch,
 
@@ -437,7 +434,6 @@ impl LogsState {
                 self.focus_search = false;
                 Task::none()
             }
-            LogMessage::Toast(_) => Task::none(),
             LogMessage::FocusSearch => {
                 self.focus_search = true;
                 Task::none()

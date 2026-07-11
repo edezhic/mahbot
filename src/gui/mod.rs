@@ -296,7 +296,6 @@ impl Message {
     pub(crate) fn as_toast(&self) -> Option<&ToastMessage> {
         match self {
             Message::Home(home::HomeMessage::Toast(tm))
-            | Message::Logs(logs::LogMessage::Toast(tm))
             | Message::Board(board::BoardMessage::Toast(tm))
             | Message::DiffModal(diff::DiffMessage::Toast(tm))
             | Message::Git(git::GitMessage::Toast(tm))
