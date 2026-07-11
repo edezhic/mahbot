@@ -62,9 +62,10 @@ pub(crate) fn ensure_chat_completions_url(base_url: &str) -> String {
 /// (it mimics a chat-format tool-use API), while video generation uses a dedicated
 /// `/videos` endpoint under the same API base.
 pub(crate) fn ensure_base_url(endpoint: &str) -> String {
-    endpoint
-        .trim_end_matches('/')
-        .trim_end_matches("/chat/completions")
+    let trimmed = endpoint.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/chat/completions")
+        .unwrap_or(trimmed)
         .to_string()
 }
 
@@ -380,6 +381,14 @@ mod tests {
                 input: "https://chat.completions.com/api",
                 expected_chat: "https://chat.completions.com/api/chat/completions",
                 expected_base: "https://chat.completions.com/api",
+            },
+            // Regression: ensure_base_url must strip exactly one suffix, not all.
+            // trim_end_matches would strip both; strip_suffix stops after one.
+            Case {
+                name: "repeated_suffix",
+                input: "https://api.example.com/v1/chat/completions/chat/completions",
+                expected_chat: "https://api.example.com/v1/chat/completions/chat/completions",
+                expected_base: "https://api.example.com/v1/chat/completions",
             },
         ];
 
