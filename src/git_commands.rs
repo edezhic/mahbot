@@ -603,33 +603,24 @@ mod tests {
     // ── Unit tests for CommitInfo::short_hash ────────────────────
 
     #[test]
-    fn short_hash_truncates_long_hash() {
-        let info = CommitInfo {
-            hash: "abc1234def5678".to_string(),
-            lines_added: 0,
-            lines_removed: 0,
-        };
-        assert_eq!(info.short_hash(), "abc1234");
-    }
-
-    #[test]
-    fn short_hash_returns_full_hash_when_short() {
-        let info = CommitInfo {
-            hash: "abc12".to_string(),
-            lines_added: 0,
-            lines_removed: 0,
-        };
-        assert_eq!(info.short_hash(), "abc12");
-    }
-
-    #[test]
-    fn short_hash_returns_full_hash_when_exactly_7() {
-        let info = CommitInfo {
-            hash: "abc1234".to_string(),
-            lines_added: 0,
-            lines_removed: 0,
-        };
-        assert_eq!(info.short_hash(), "abc1234");
+    fn short_hash_cases() {
+        let cases = [
+            (
+                "long hash truncated to 7 chars",
+                "abc1234def5678",
+                "abc1234",
+            ),
+            ("short hash returned as-is", "abc12", "abc12"),
+            ("exactly 7 chars returned as-is", "abc1234", "abc1234"),
+        ];
+        for (name, hash, expected) in &cases {
+            let info = CommitInfo {
+                hash: hash.to_string(),
+                lines_added: 0,
+                lines_removed: 0,
+            };
+            assert_eq!(info.short_hash(), *expected, "{name}");
+        }
     }
 
     // ── Integration tests for run_git_* functions ────────────────
