@@ -1965,34 +1965,6 @@ async fn record_verdict_comments_tx(
     Ok(())
 }
 
-/// Shared orchestration skeleton for dispatch functions that spawn parallel
-/// agents and then process results via extraction.
-///
-/// 1. Spawns agents via [`run_parallel_agents`]
-/// 2. Runs a post-dispatch phase check (guard against race conditions)
-///
-/// The pre-dispatch circuit-breaker guard is handled centrally by
-/// [`spawn_dispatch`] — this function only needs the post-check.
-///
-/// Returns `None` if the post-check failed (ticket moved externally).
-/// Returns `Some(results)` when it's safe to process the verdicts.
-///
-/// Used by [`dispatch_backlog_analysts`] and [`dispatch_verifiers`].
-async fn dispatch_parallel_agents(
-    ticket: &Arc<Ticket>,
-    ws: &Workspace,
-    expected_phase: TicketPhase,
-    role: Role,
-    prompt: &str,
-    extraction_prompt: &str,
-) -> Option<Vec<ParallelVerdict>> {
-    let results = run_parallel_agents(ticket, ws, role, prompt, extraction_prompt).await;
-    if !is_ticket_in_phase(&ticket.id, expected_phase).await {
-        return None;
-    }
-    Some(results)
-}
-
 // ── Backlog Analysis ──────────────────────────────────────────────────
 
 /// Spawn 3 parallel analyst agents to research a backlog ticket.
@@ -2009,18 +1981,11 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     };
     let message = load_prompt(prompt_key);
     let extraction_prompt = load_prompt("extraction/analyst.md");
-    let Some(results) = dispatch_parallel_agents(
-        &ticket,
-        &ws,
-        TicketPhase::Analysis,
-        Role::Analyst,
-        &message,
-        &extraction_prompt,
-    )
-    .await
-    else {
+    let results =
+        run_parallel_agents(&ticket, &ws, Role::Analyst, &message, &extraction_prompt).await;
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
         return;
-    };
+    }
 
     process_analyst_verdicts(&ticket, &results).await;
 }
@@ -2424,18 +2389,10 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     );
 
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
-    let Some(results) = dispatch_parallel_agents(
-        &ticket,
-        &ws,
-        vi.source_phase,
-        vi.role,
-        &prompt,
-        &extraction_prompt,
-    )
-    .await
-    else {
+    let results = run_parallel_agents(&ticket, &ws, vi.role, &prompt, &extraction_prompt).await;
+    if !is_ticket_in_phase(&ticket.id, vi.source_phase).await {
         return;
-    };
+    }
 
     process_verifier_verdicts(&ticket, &results, vi).await;
 }
