@@ -15,8 +15,10 @@ struct PromptAssets;
 ///
 /// Only matches keys consisting of word characters (`\w` = `[a-zA-Z0-9_]`).
 /// Future template keys must not contain hyphens, dots, or spaces.
+/// Uses `(?-u)` to enforce ASCII-only `\w` — without it, the regex crate
+/// defaults to Unicode-aware matching which would accept `{{résumé}}`.
 pub(crate) static TEMPLATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("TEMPLATE_RE must compile"));
+    LazyLock::new(|| Regex::new(r"(?-u)\{\{(\w+)\}\}").expect("TEMPLATE_RE must compile"));
 
 /// Load a prompt template from embedded assets.
 ///
@@ -381,6 +383,34 @@ mod tests {
                 "Tool description file '{key}' is empty or whitespace-only.\n\
                  Add a meaningful description for the tool '{name}'.",
             );
+        }
+    }
+
+    #[test]
+    fn all_template_variables_are_word_chars() {
+        // Every {{...}} placeholder in embedded prompt assets must use
+        // \w+ keys (ASCII alphanumeric + underscore) so that TEMPLATE_RE
+        // can match and substitute them.  Non-conforming keys like
+        // {{role-name}} or {{my var}} would silently remain in the
+        // prompt output because the regex never matches them.
+        let broad_re =
+            regex::Regex::new(r"\{\{([^}]+)\}\}").expect("broad placeholder regex must compile");
+        for asset_key in PromptAssets::iter() {
+            let asset = PromptAssets::get(&asset_key)
+                .unwrap_or_else(|| panic!("asset {asset_key} disappeared between iter and get"));
+            let content = String::from_utf8_lossy(asset.data.as_ref());
+            for cap in broad_re.captures_iter(&content) {
+                let var_name = cap.get(1).unwrap().as_str();
+                assert!(
+                    var_name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "Template variable '{{{{{var_name}}}}}' in '{asset_key}' contains non-\\w \
+                     characters (only ASCII alphanumeric and underscore are allowed).\n\
+                     Template keys must match \\w+ so that TEMPLATE_RE can substitute them. \
+                     Use underscores instead of hyphens, dots, or spaces.",
+                );
+            }
         }
     }
 
