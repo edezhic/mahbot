@@ -1,7 +1,7 @@
 //! Search archived tickets via hybrid FTS + semantic vector search.
 //!
 //! Available only to the Manager role. Searches the `is_archived = 1` subset
-//! of the tickets table. Returns up to 10 matches as `{id, title, status}`
+//! of the tickets table. Returns up to 10 matches as `[phase] id: title`
 //! lines, sorted by RRF score. The Manager then uses [`crate::tools::ticket::GetTicketTool`] on the
 //! returned IDs for full details.
 
@@ -114,7 +114,7 @@ impl SearchArchivedTicketsTool {
 
     /// Format the top-N results for display.
     ///
-    /// Fetches id/title/status via [`crate::board::BoardStore::select_tickets`] and
+    /// Fetches id/title/phase via [`crate::board::BoardStore::select_tickets`] and
     /// formats them in rank order. At N ≤ 10 a linear scan suffices.
     async fn format_results(
         board: &crate::board::BoardStore,
