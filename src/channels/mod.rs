@@ -28,48 +28,78 @@ struct BroadcastPersistEntry {
 impl BroadcastPersistEntry {
     /// Broadcast this entry to [`crate::CHAT_BROADCAST`] and persist it to
     /// `chat_history`.
+    ///
+    /// Ownership flow: `self` is destructured at the top so that each field's
+    /// value is cloned only for the broadcast (which consumes via `tx.send`),
+    /// then the original owned value is moved into the DB insert.  This
+    /// eliminates the redundant clones that would otherwise be needed when the
+    /// same field appears in both the [`ChatEvent::Message`] and
+    /// [`ChatHistoryInsert`] struct literals.
     async fn broadcast_and_persist(self) {
         use crate::ChatEvent;
 
+        // Destructure self to obtain owned fields.  The broadcast (tx.send)
+        // receives clones; the DB insert receives the originals.
+        let BroadcastPersistEntry {
+            user_name,
+            channel_name,
+            content,
+            direction,
+            agent_role,
+            workspace,
+            optimistic_id,
+        } = self;
+
         // Invariant: direction=Agent must carry a non-None agent_role
         debug_assert!(
-            self.direction != ChatDirection::Agent || self.agent_role.is_some(),
+            direction != ChatDirection::Agent || agent_role.is_some(),
             "BroadcastPersistEntry: direction=Agent but agent_role is None"
         );
 
         let message_id = crate::generate_id();
         let timestamp = turso::now();
 
-        let (db_role, db_direction) = match self.direction {
-            ChatDirection::Agent => (self.agent_role.as_deref().unwrap_or(""), "agent"),
-            ChatDirection::User => ("user", "user"),
+        // Compute db_role/db_direction as owned strings before agent_role is
+        // moved into the DB insert below.  (We borrow agent_role here via
+        // as_deref, so the owned strings must be computed first.)
+        let (db_role, db_direction) = match direction {
+            ChatDirection::Agent => (
+                agent_role.as_deref().unwrap_or("").to_string(),
+                "agent".to_string(),
+            ),
+            ChatDirection::User => ("user".to_string(), "user".to_string()),
         };
 
+        // ── Broadcast ──────────────────────────────────────────────
+        // Broadcast precedes the DB insert: values cloned here are later
+        // moved (originals) into ChatHistoryInsert below.
         if let Some(tx) = crate::CHAT_BROADCAST.get() {
             let _ = tx.send(ChatEvent::Message {
                 message_id: message_id.clone(),
-                user_name: self.user_name.clone(),
-                content: self.content.clone(),
-                direction: self.direction,
+                user_name: user_name.clone(),
+                content: content.clone(),
+                direction,
                 timestamp: timestamp.clone(),
-                agent_role: self.agent_role.clone(),
-                workspace: self.workspace.clone(),
-                optimistic_id: self.optimistic_id,
+                agent_role: agent_role.clone(),
+                workspace: workspace.clone(),
+                optimistic_id,
             });
         }
 
+        // ── Persist to chat_history ────────────────────────────────
+        // All fields receive the original owned values (moved, not cloned).
         let store = crate::chat_history::store();
         let _ = store
             .insert(&ChatHistoryInsert {
-                message_id: message_id.clone(),
-                user_name: self.user_name.clone(),
-                channel: self.channel_name.clone(),
-                role: db_role.to_string(),
-                direction: db_direction.to_string(),
-                content: self.content.clone(),
-                agent_role: self.agent_role.clone(),
-                workspace: self.workspace.clone(),
-                created_at: timestamp.clone(),
+                message_id,
+                user_name,
+                channel: channel_name,
+                role: db_role,
+                direction: db_direction,
+                content,
+                agent_role,
+                workspace,
+                created_at: timestamp,
             })
             .await;
     }
