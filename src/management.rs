@@ -210,33 +210,12 @@ async fn dispatch_notification(
 
 /// The transition context for [`comment_and_transition`] and [`with_comment_and_transition`].
 ///
-/// Encapsulates the ticket, optional comment(s), source/target phases, notify
-/// policy, and log label — everything needed for a comment+transition operation.
-///
-/// ## Field semantics per consumed function
-///
-/// - **`comment_and_transition`**: consumes `comment` and `extra` — writes them
-///   to the database atomically with the phase transition. The caller **MUST**
-///   provide a non-`None` `comment` to avoid a silent no-comment transition
-///   (the ticket advances with no explanation written). When targeting
-///   [`TicketPhase::Failed`], `comment` is also used to derive the notification
-///   failure reason (the second tuple element). Passing `comment: None` when
-///   targeting `Failed` will cause a panic in [`notify_ticket`] — the caller
-///   **MUST** ensure `comment` is `Some` for Failed transitions.
-/// - **`with_comment_and_transition`**: ignores `comment` and `extra` — the
-///   closure handles all comment writing. Pass `None` for both.
-///
-/// # Design note: why `Option`?
-///
-/// Both `comment` and `extra` are `Option` rather than required fields because
-/// this single struct is shared between [`comment_and_transition`] (which
-/// consumes the comment fields) and [`with_comment_and_transition`] (which
-/// delegates all comment writing to a closure and ignores them). Keeping two
-/// separate structs would avoid the `Option` wrapping but would reintroduce
-/// the exact duplication this merge eliminates — the other five fields
-/// (`ticket`, `source`, `target`, `notify`, `log_label`) are identical
-/// between the two usage patterns. The `Option` is the accepted cost of a
-/// single unified struct.
+/// Encapsulates the ticket, source/target phases, notify policy, and log label
+/// — everything needed for a comment+transition operation. Comment text is
+/// passed as separate parameters to each function since
+/// [`comment_and_transition`] always requires a comment (it is no longer
+/// optional), and [`with_comment_and_transition`] delegates all comment
+/// writing to a closure.
 ///
 /// # ⚠ Argument ordering
 ///
@@ -246,8 +225,6 @@ async fn dispatch_notification(
 #[derive(Debug)]
 struct TransitionCtx<'a> {
     ticket: &'a Ticket,
-    comment: Option<(&'a str, &'a str)>,
-    extra: Option<(&'a str, &'a str)>,
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
@@ -349,16 +326,11 @@ where
 ///
 /// # Correctness
 ///
-/// The caller **MUST** provide a non-`None` primary `comment`. Passing
-/// `comment: None, extra: None` compiles but silently transitions the ticket
-/// to the target phase without writing any explanatory comment — this is
-/// almost certainly a bug.
-///
-/// When targeting [`TicketPhase::Failed`], the primary `comment`'s second
-/// tuple element is used to derive the failure-reason text for notifications.
-/// Passing `comment: None` on a Failed transition **will cause a panic** in
-/// [`notify_ticket`] via a `.expect()` on the failure comment — do not pass
-/// `None` when the target is `Failed`.
+/// The primary `comment` is a required argument — the compiler guarantees
+/// it is always written (eliminating the previous class of bugs where
+/// `comment: None` silently produced a no-comment transition). The second
+/// tuple element is also used to derive the failure-reason text when
+/// targeting [`TicketPhase::Failed`].
 ///
 /// Delegates to [`with_comment_and_transition`]; see that function's
 /// `# Correctness` section for the agent-cancellation invariant.
@@ -368,34 +340,24 @@ where
 /// (bounce-back transitions get priority re-dispatch over fresh tickets),
 /// `None` for all other transitions.
 #[must_use]
-async fn comment_and_transition(ctx: TransitionCtx<'_>) -> bool {
+async fn comment_and_transition(
+    ctx: TransitionCtx<'_>,
+    comment: (&str, &str),
+    extra: Option<(&str, &str)>,
+) -> bool {
     let ticket = ctx.ticket;
-    let comment = ctx.comment;
-    let extra = ctx.extra;
 
     // All callers that transition to Failed must provide a non-None `comment`.
-    let failure_comment = match (ctx.target == TicketPhase::Failed, comment) {
-        (true, Some((_, text))) => Some(text),
-        _ => None,
-    };
+    let failure_comment = if ctx.target == TicketPhase::Failed { Some(comment.1) } else { None };
 
-    with_comment_and_transition(
-        TransitionCtx {
-            comment: None,
-            extra: None,
-            ..ctx
-        },
-        failure_comment,
-        async |tx| {
-            if let Some((role, text)) = comment {
-                BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
-            }
-            if let Some((role, text)) = extra {
-                BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
-            }
-            Ok(())
-        },
-    )
+    with_comment_and_transition(ctx, failure_comment, async |tx| {
+        let (role, text) = comment;
+        BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
+        if let Some((role, text)) = extra {
+            BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
+        }
+        Ok(())
+    })
     .await
 }
 
@@ -1010,15 +972,17 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         ("Agent failed", TicketPhase::Failed, NotifyPolicy::Notify)
     };
 
-    if !comment_and_transition(TransitionCtx {
-        ticket: &ticket,
-        comment: Some((Role::Engineer.as_str(), comment_text)),
-        extra: None,
-        source: TicketPhase::InDevelopment,
-        target: target_phase,
-        notify,
-        log_label: "Engineer",
-    })
+    if !comment_and_transition(
+        TransitionCtx {
+            ticket: &ticket,
+            source: TicketPhase::InDevelopment,
+            target: target_phase,
+            notify,
+            log_label: "Engineer",
+        },
+        (Role::Engineer.as_str(), comment_text),
+        None,
+    )
     .await
     {
         return;
@@ -1081,15 +1045,17 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
             source.as_ref(),
         ),
     };
-    if comment_and_transition(TransitionCtx {
-        ticket,
-        comment: Some((SYSTEM_ROLE, comment)),
-        extra: None,
-        source,
-        target: TicketPhase::Done,
-        notify: notify_policy,
-        log_label,
-    })
+    if comment_and_transition(
+        TransitionCtx {
+            ticket,
+            source,
+            target: TicketPhase::Done,
+            notify: notify_policy,
+            log_label,
+        },
+        (SYSTEM_ROLE, comment),
+        None,
+    )
     .await
     {
         info!(ticket = %ticket.id, "{comment}");
@@ -1103,15 +1069,17 @@ async fn transition_ticket_to_failed(
     comment: &str,
     log_label: &str,
 ) -> bool {
-    comment_and_transition(TransitionCtx {
-        ticket,
-        comment: Some((SYSTEM_ROLE, comment)),
-        extra: None,
-        source,
-        target: TicketPhase::Failed,
-        notify: NotifyPolicy::Notify,
-        log_label,
-    })
+    comment_and_transition(
+        TransitionCtx {
+            ticket,
+            source,
+            target: TicketPhase::Failed,
+            notify: NotifyPolicy::Notify,
+            log_label,
+        },
+        (SYSTEM_ROLE, comment),
+        None,
+    )
     .await
 }
 
@@ -1512,15 +1480,17 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             "🧹 Sanitation passed{passed_suffix}: {rationale}",
             rationale = verdict.rationale
         );
-        if !comment_and_transition(TransitionCtx {
-            ticket,
-            comment: Some((Role::Sanitation.as_str(), &comment)),
-            extra: None,
-            source: TicketPhase::InSanitation,
-            target: TicketPhase::SanitationPassed,
-            notify: NotifyPolicy::Buffer,
-            log_label: "Sanitation",
-        })
+        if !comment_and_transition(
+            TransitionCtx {
+                ticket,
+                source: TicketPhase::InSanitation,
+                target: TicketPhase::SanitationPassed,
+                notify: NotifyPolicy::Buffer,
+                log_label: "Sanitation",
+            },
+            (Role::Sanitation.as_str(), &comment),
+            None,
+        )
         .await
         {
             return;
@@ -1547,15 +1517,17 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         // Write both comments and transition atomically via
         // [`comment_and_transition`], which wraps all writes in a single
         // transaction. This matches the pattern used by all other verdict paths.
-        if !comment_and_transition(TransitionCtx {
-            ticket,
-            comment: Some((Role::Sanitation.as_str(), comment.as_str())),
-            extra: Some((SYSTEM_ROLE, sys_comment.as_str())),
-            source: TicketPhase::InSanitation,
-            target: TicketPhase::ReadyForDevelopment,
-            notify: NotifyPolicy::Buffer,
-            log_label: "Sanitation",
-        })
+        if !comment_and_transition(
+            TransitionCtx {
+                ticket,
+                source: TicketPhase::InSanitation,
+                target: TicketPhase::ReadyForDevelopment,
+                notify: NotifyPolicy::Buffer,
+                log_label: "Sanitation",
+            },
+            (Role::Sanitation.as_str(), comment.as_str()),
+            Some((SYSTEM_ROLE, sys_comment.as_str())),
+        )
         .await
         {
             return;
@@ -1653,15 +1625,17 @@ async fn transition_ticket_from_diagnostics(
     comment: &str,
     target: TicketPhase,
 ) -> bool {
-    comment_and_transition(TransitionCtx {
-        ticket,
-        comment: Some((DIAGNOSTICS_ROLE, comment)),
-        extra: None,
-        source: TicketPhase::InDiagnostics,
-        target,
-        notify: NotifyPolicy::Buffer,
-        log_label: "Diagnostics",
-    })
+    comment_and_transition(
+        TransitionCtx {
+            ticket,
+            source: TicketPhase::InDiagnostics,
+            target,
+            notify: NotifyPolicy::Buffer,
+            log_label: "Diagnostics",
+        },
+        (DIAGNOSTICS_ROLE, comment),
+        None,
+    )
     .await
 }
 
@@ -2027,8 +2001,6 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     if !with_comment_and_transition(
         TransitionCtx {
             ticket,
-            comment: None,
-            extra: None,
             source: TicketPhase::Analysis,
             target: TicketPhase::Planning,
             notify: NotifyPolicy::Notify,
@@ -2314,8 +2286,6 @@ async fn process_verifier_verdicts(
     if !with_comment_and_transition(
         TransitionCtx {
             ticket,
-            comment: None,
-            extra: None,
             source: verifier.source_phase,
             target,
             notify,
