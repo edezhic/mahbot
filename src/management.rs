@@ -311,7 +311,7 @@ where
     true
 }
 
-/// Write one or more comments to a ticket, then transition it to a new phase.
+/// Write a comment to a ticket, then transition it to a new phase.
 ///
 /// All comments and the phase transition are wrapped in a single transaction
 /// via [`crate::turso::with_tx`]. If any operation fails, the entire
@@ -326,7 +326,7 @@ where
 ///
 /// # Correctness
 ///
-/// The primary `comment` is a required argument — the compiler guarantees
+/// The `comment` is a required argument — the compiler guarantees
 /// it is always written (eliminating the previous class of bugs where
 /// `comment: None` silently produced a no-comment transition). The second
 /// tuple element is also used to derive the failure-reason text when
@@ -340,11 +340,7 @@ where
 /// (bounce-back transitions get priority re-dispatch over fresh tickets),
 /// `None` for all other transitions.
 #[must_use]
-async fn comment_and_transition(
-    ctx: TransitionCtx<'_>,
-    comment: (&str, &str),
-    extra: Option<(&str, &str)>,
-) -> bool {
+async fn comment_and_transition(ctx: TransitionCtx<'_>, comment: (&str, &str)) -> bool {
     let ticket = ctx.ticket;
 
     // When targeting Failed, the second tuple element of `comment` is used as
@@ -358,9 +354,6 @@ async fn comment_and_transition(
     with_comment_and_transition(ctx, failure_comment, async |tx| {
         let (role, text) = comment;
         BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
-        if let Some((role, text)) = extra {
-            BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
-        }
         Ok(())
     })
     .await
@@ -584,7 +577,6 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                     log_label: "dispatch panic",
                 },
                 (SYSTEM_ROLE, &format!("❌ Dispatch panicked: {msg}")),
-                None,
             )
             .await;
         }
@@ -991,7 +983,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             log_label: "Engineer",
         },
         (Role::Engineer.as_str(), comment_text),
-        None,
     )
     .await
     {
@@ -1064,7 +1055,6 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
             log_label,
         },
         (SYSTEM_ROLE, comment),
-        None,
     )
     .await
     {
@@ -1478,7 +1468,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 log_label: "Sanitation",
             },
             (Role::Sanitation.as_str(), &comment),
-            None,
         )
         .await
         {
@@ -1504,9 +1493,9 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         );
 
         // Write both comments and transition atomically via
-        // [`comment_and_transition`], which wraps all writes in a single
+        // [`with_comment_and_transition`], which wraps all writes in a single
         // transaction. This matches the pattern used by all other verdict paths.
-        if !comment_and_transition(
+        if !with_comment_and_transition(
             TransitionCtx {
                 ticket,
                 source: TicketPhase::InSanitation,
@@ -1514,8 +1503,19 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 notify: NotifyPolicy::Buffer,
                 log_label: "Sanitation",
             },
-            (Role::Sanitation.as_str(), comment.as_str()),
-            Some((SYSTEM_ROLE, sys_comment.as_str())),
+            None,
+            async |tx| {
+                BoardStore::add_comment_tx(
+                    tx,
+                    &ticket.id,
+                    Role::Sanitation.as_str(),
+                    comment.as_str(),
+                )
+                .await?;
+                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, sys_comment.as_str())
+                    .await?;
+                Ok(())
+            },
         )
         .await
         {
@@ -1690,7 +1690,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             log_label: "Diagnostics",
         },
         (DIAGNOSTICS_ROLE, &comment_body),
-        None,
     )
     .await
     {
@@ -2186,7 +2185,6 @@ async fn try_trip_circuit_breaker(
             log_label: &format!("{log_label} circuit breaker"),
         },
         (SYSTEM_ROLE, &kind.comment(count)),
-        None,
     )
     .await
     {
@@ -2275,7 +2273,7 @@ async fn process_verifier_verdicts(
             .await?;
 
             // For the all-failed case, also write the system failure comment
-            // via comment_and_transition (matching the inlined failure transition).
+            // via with_comment_and_transition (matching the sanitation failure path).
             if let Some(ref fc) = failure_comment {
                 BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, fc).await?;
             }
