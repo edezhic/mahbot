@@ -130,7 +130,7 @@ pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_rol
         &msg.user_name,
         &msg.source_channel,
         &content,
-        agent_role.clone(),
+        agent_role,
         &msg.workspace,
     )
     .await;
