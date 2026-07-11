@@ -126,7 +126,6 @@ pub(crate) enum UpdateStatus {
 /// A floating toast notification.
 #[derive(Debug, Clone)]
 pub struct Toast {
-    pub id: usize,
     pub message: String,
     pub kind: ToastKind,
     pub created_at: Instant,
@@ -144,14 +143,9 @@ pub enum ToastMessage {
     SuccessMsg(String),
 }
 
-/// Auto-incrementing toast ID counter.
-static TOAST_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 impl Toast {
     fn new(message: String, kind: ToastKind) -> Self {
-        let id = TOAST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
-            id,
             message,
             kind,
             created_at: Instant::now(),
@@ -238,8 +232,6 @@ pub enum Message {
     CloseRequested(window::Id),
     /// Window geometry event (move/resize) — tracks state for persist-on-close.
     WindowEvent(window::Id, window::Event),
-    /// Dismiss a toast by ID.
-    DismissToast(usize),
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
     FocusSearch,
     /// Keyboard shortcut: Escape — dismiss modal/panel/confirmation on the current page.
@@ -892,10 +884,6 @@ impl Dashboard {
                     window::Event::Moved(new_pos) => self.last_position = new_pos,
                     _ => {}
                 }
-                Task::none()
-            }
-            Message::DismissToast(id) => {
-                self.toasts.retain(|t| t.id != id);
                 Task::none()
             }
             Message::CloseDiffModal => {
