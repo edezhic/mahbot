@@ -16,8 +16,9 @@ use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 
 use crate::diff_parse::{DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff};
 use crate::git_commands::{
-    CommitInfo, DiscardTarget, git_discard, git_has_commits, git_is_installed, is_git_repo,
-    parse_untracked_from_porcelain, run_git_commit, run_git_diff, run_git_show, run_git_status,
+    CommitInfo, DiscardTarget, git_has_commits, git_is_installed, is_git_repo,
+    parse_untracked_from_porcelain, run_git_commit, run_git_diff, run_git_discard, run_git_show,
+    run_git_status,
 };
 
 use iced::widget::Id;
@@ -599,7 +600,7 @@ impl DiffState {
                 Task::perform(
                     async move {
                         let ws_path_buf = resolve_workspace_path(&ws_name, ws_path).await?;
-                        git_discard(&ws_path_buf, &path, target).await
+                        run_git_discard(&ws_path_buf, &path, target).await
                     },
                     DiffMessage::DiscardResult,
                 )

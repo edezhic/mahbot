@@ -483,7 +483,7 @@ pub async fn run_git_sync(repo_path: &Path) -> Result<String, String> {
 ///
 /// Note: `git reset HEAD` also exits with non-zero status when the path is
 /// outside the repository — callers should validate paths before calling this.
-pub async fn git_discard(
+pub async fn run_git_discard(
     repo_path: &Path,
     path: &str,
     target: DiscardTarget,
@@ -1095,11 +1095,11 @@ AM staged_then_modified.js
         );
     }
 
-    // ── git_discard — discard modifications ──
+    // ── run_git_discard — discard modifications ──
 
     /// Discard changes to a modified tracked file — restores it to HEAD.
     #[tokio::test]
-    async fn test_git_discard_modified_file() {
+    async fn test_run_git_discard_modified_file() {
         let (_dir, repo_path) = init_temp_repo();
 
         // Modify the tracked file.
@@ -1116,9 +1116,9 @@ AM staged_then_modified.js
         );
 
         // Discard the modification.
-        git_discard(&repo_path, "test.txt", DiscardTarget::File)
+        run_git_discard(&repo_path, "test.txt", DiscardTarget::File)
             .await
-            .expect("git_discard should succeed");
+            .expect("run_git_discard should succeed");
 
         // File should be clean now.
         let status = run_git_command(&repo_path, &["status", "--porcelain", "test.txt"])
@@ -1139,7 +1139,7 @@ AM staged_then_modified.js
 
     /// Discard a new untracked file — removes it from the working tree.
     #[tokio::test]
-    async fn test_git_discard_new_file() {
+    async fn test_run_git_discard_new_file() {
         let (_dir, repo_path) = init_temp_repo();
 
         // Create a new untracked file.
@@ -1148,9 +1148,9 @@ AM staged_then_modified.js
         assert!(new_path.exists(), "new file should exist before discard");
 
         // Discard the untracked file.
-        git_discard(&repo_path, "new_file.rs", DiscardTarget::File)
+        run_git_discard(&repo_path, "new_file.rs", DiscardTarget::File)
             .await
-            .expect("git_discard should succeed");
+            .expect("run_git_discard should succeed");
 
         // File should be removed.
         assert!(
@@ -1161,7 +1161,7 @@ AM staged_then_modified.js
 
     /// Discard a directory with untracked content — recursively removes it.
     #[tokio::test]
-    async fn test_git_discard_directory() {
+    async fn test_run_git_discard_directory() {
         let (_dir, repo_path) = init_temp_repo();
 
         // Create a directory with an untracked file inside.
@@ -1172,9 +1172,9 @@ AM staged_then_modified.js
         assert!(sub_file.exists(), "nested file should exist before discard");
 
         // Discard the directory.
-        git_discard(&repo_path, "subdir", DiscardTarget::Directory)
+        run_git_discard(&repo_path, "subdir", DiscardTarget::Directory)
             .await
-            .expect("git_discard should succeed");
+            .expect("run_git_discard should succeed");
 
         // Directory and its contents should be gone.
         assert!(
@@ -1185,10 +1185,10 @@ AM staged_then_modified.js
 
     /// Discard a clean file — succeeds as a no-op.
     #[tokio::test]
-    async fn test_git_discard_clean_file() {
+    async fn test_run_git_discard_clean_file() {
         let (_dir, repo_path) = init_temp_repo();
 
-        let result = git_discard(&repo_path, "test.txt", DiscardTarget::File).await;
+        let result = run_git_discard(&repo_path, "test.txt", DiscardTarget::File).await;
         assert!(result.is_ok(), "discarding a clean file should succeed");
     }
 }
