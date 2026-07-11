@@ -45,7 +45,6 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
 const MEDIA_MARKER_PATTERN: &str = r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]]+)\]";
 
 /// Matches `[IMAGE:path]`, `[AUDIO:path]`, or `[VIDEO:path]` markers in message content.
-/// Path must be non-empty (uses `+` quantifier).
 ///
 /// **Invariant — multimodal stripping:** When enriching messages in multimodal
 /// mode, IMAGE markers are preserved (they're needed for vision API integration
