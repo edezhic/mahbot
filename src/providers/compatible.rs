@@ -501,16 +501,12 @@ fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_json::Value {
 
 /// Shared helper to build a [`ProviderToolCall`] from parsed API tool-call data.
 ///
-/// Handles empty/whitespace-only arguments, JSON parsing with repair fallback,
-/// and generates a fallback ID when none is provided.
+/// Delegates argument parsing to [`parse_tool_call_arguments`], which handles
+/// JSON parsing with repair fallback, and generates a fallback ID when none is
+/// provided.
 #[must_use]
 fn make_provider_tool_call(id: Option<String>, name: String, arguments: &str) -> ProviderToolCall {
-    let arguments = if arguments.trim().is_empty() {
-        "{}".to_string()
-    } else {
-        arguments.to_string()
-    };
-    let arguments = parse_tool_call_arguments(&name, &arguments);
+    let arguments = parse_tool_call_arguments(&name, arguments);
     ProviderToolCall {
         id: id.unwrap_or_else(crate::generate_id),
         name,
