@@ -24,7 +24,7 @@ use std::path::PathBuf;
 pub struct GitState {
     // ── Cached git info ──────────────────────────────────────────
     /// Filesystem path for the currently selected workspace.
-    workspace_path: Option<String>,
+    workspace_path: Option<PathBuf>,
     /// Cached diff stats (+N / -M) from periodic refresh.
     diff_stats: Option<(i64, i64)>,
     /// Cached current branch name from periodic refresh.
@@ -194,12 +194,12 @@ impl GitState {
     /// when the async operations complete.
     pub fn set_workspace_path(&mut self, path: Option<String>) -> Task<GitMessage> {
         self.clear();
-        self.workspace_path = path;
+        self.workspace_path = path.map(PathBuf::from);
         // Signal the next tick to skip — the refresh tasks spawned below
         // already cover the initial load.
         self.refresh_eagerly = true;
         match &self.workspace_path {
-            Some(p) => Self::refresh_inner(PathBuf::from(p)),
+            Some(p) => Self::refresh_inner(p.clone()),
             None => Task::none(),
         }
     }
@@ -243,7 +243,6 @@ impl GitState {
                     async move {
                         match ws_path {
                             Some(path) => {
-                                let path = PathBuf::from(path);
                                 let out = crate::git_commands::run_git_command(
                                     &path,
                                     &["branch", "--format=%(refname:short)"],
@@ -278,10 +277,7 @@ impl GitState {
                 Task::perform(
                     async move {
                         match ws_path {
-                            Some(path) => {
-                                let path = PathBuf::from(path);
-                                crate::git_commands::run_git_sync(&path).await
-                            }
+                            Some(path) => crate::git_commands::run_git_sync(&path).await,
                             None => Err("No workspace path".to_string()),
                         }
                     },
@@ -317,7 +313,6 @@ impl GitState {
                     async move {
                         match ws_path {
                             Some(path) => {
-                                let path = PathBuf::from(path);
                                 crate::git_commands::run_git_command(
                                     &path,
                                     &["switch", branch_clone.as_str()],
@@ -364,7 +359,6 @@ impl GitState {
                     async move {
                         match ws_path {
                             Some(path) => {
-                                let path = PathBuf::from(path);
                                 crate::git_commands::run_git_command(
                                     &path,
                                     &["switch", "-c", branch_clone.as_str()],
@@ -422,7 +416,7 @@ impl GitState {
 
         // Use the stored workspace path.
         match &self.workspace_path {
-            Some(p) => Self::refresh_inner(PathBuf::from(p)),
+            Some(p) => Self::refresh_inner(p.clone()),
             None => Task::none(),
         }
     }
