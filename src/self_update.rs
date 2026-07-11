@@ -108,15 +108,16 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 ///
 /// # Caller responsibilities
 ///
-/// Shared helper used by [`acquire_lock`] and [`FlockGuard::reacquire`]. Each
-/// caller handles its own concerns:
+/// Shared helper used by [`acquire_lock`] (sync, at startup) and
+/// [`reacquire_instance_lock`] (async, after failed spawn). Each caller handles
+/// its own concerns:
 ///
 /// - **Directory creation**: [`acquire_lock`] ensures the parent directory exists
 ///   before calling this helper.
-/// - **Idempotency guard**: [`FlockGuard::reacquire`] checks whether the lock is
-///   already held before calling this helper. Calling this helper while already
-///   holding the lock via a different `File` would fail with `EAGAIN` (the two
-///   file descriptors are independent from the kernel's perspective).
+/// - **Idempotency guard**: both callers check whether the lock is already held
+///   before calling this helper. Calling this helper while already holding the
+///   lock via a different `File` would fail with `EAGAIN` (the two file
+///   descriptors are independent from the kernel's perspective).
 /// - **PID writing & error messages**: each caller formats its own success/failure
 ///   messages.
 fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
@@ -212,7 +213,7 @@ fn try_flock(file: &File) -> Result<bool> {
 /// A guard holding the instance lock file.
 ///
 /// The lock is released via [`release`](FlockGuard::release) (or on drop).
-/// Use [`reacquire`](FlockGuard::reacquire) to re-take the lock after release —
+/// Re-acquisition after release is handled by [`reacquire_instance_lock`] —
 /// needed when a self-update spawn fails and the current process stays alive.
 struct FlockGuard {
     file: Option<File>,
@@ -236,32 +237,6 @@ impl FlockGuard {
             info!(path = %self.lock_path.display(), "Released instance lock");
         }
     }
-
-    /// Re-acquire the lock after a previous [`release`](FlockGuard::release).
-    ///
-    /// Retries up to 3 times with 100ms delays to handle the scheduling window
-    /// between old process exit and kernel lock release.
-    ///
-    /// The idempotency guard (early return if `self.file.is_some()`) is critical:
-    /// calling [`try_acquire_lock`] while already holding the lock via a different
-    /// `File` would fail with `EAGAIN`, because the two file descriptors are
-    /// independent from the kernel's perspective.
-    fn reacquire(&mut self) -> Result<()> {
-        if self.file.is_some() {
-            return Ok(()); // Already held.
-        }
-
-        match try_acquire_lock(&self.lock_path)? {
-            Some(file) => {
-                info!(path = %self.lock_path.display(), "Re-acquired instance lock");
-                self.file = Some(file);
-                Ok(())
-            }
-            None => Err(anyhow!(
-                "Failed to re-acquire instance lock — another instance may have started"
-            )),
-        }
-    }
 }
 
 /// Global instance lock, held for the process lifetime.
@@ -283,12 +258,46 @@ async fn release_instance_lock() {
 ///
 /// Called when [`spawn_new_instance_from`] fails — the current process stays
 /// alive and must re-claim the lock.
+///
+/// Uses [`tokio::task::spawn_blocking`] to offload the blocking retry loop
+/// (which uses `std::thread::sleep`) to a dedicated blocking thread, avoiding
+/// blocking the Tokio worker thread.
+///
+/// This is a recoverable path: it runs during self-update after all agents
+/// have been cancelled, browser sessions closed, and shutdown signaled.
 async fn reacquire_instance_lock() -> Result<()> {
     let mutex = INSTANCE_LOCK
         .get()
         .context("Instance lock not initialized")?;
+
+    // Extract the lock path while the mutex is held, dropping the guard
+    // before spawn_blocking to avoid holding the tokio Mutex across the
+    // blocking thread boundary.
+    let lock_path = {
+        let guard = mutex.lock().await;
+        if guard.file.is_some() {
+            return Ok(()); // Already held.
+        }
+        guard.lock_path.clone()
+    };
+
+    // Offload blocking retry loop (std::thread::sleep) to a blocking thread.
+    let file = tokio::task::spawn_blocking(move || try_acquire_lock(&lock_path))
+        .await
+        .context("spawn_blocking for lock reacquire failed")??;
+
+    // Re-acquire mutex and update guard with the re-acquired file.
     let mut guard = mutex.lock().await;
-    guard.reacquire()
+    match file {
+        Some(file) => {
+            info!(path = %guard.lock_path.display(), "Re-acquired instance lock");
+            guard.file = Some(file);
+            Ok(())
+        }
+        None => Err(anyhow!(
+            "Failed to re-acquire instance lock — another instance may have started"
+        )),
+    }
 }
 
 // ── Update availability ───────────────────────────────────────────────────
