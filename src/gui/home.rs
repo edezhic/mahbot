@@ -73,6 +73,26 @@ fn build_chat_message(
     }
 }
 
+/// Convert a [`ChatHistoryEntry`] into a [`DisplayMessage`] for rendering.
+///
+/// Unlike [`build_chat_message`] which takes raw parts with `id: None`, this
+/// uses the entry's database ID (`id: Some(entry.id)`) and always creates a
+/// non-optimistic message.
+fn entry_to_display_message(entry: ChatHistoryEntry) -> DisplayMessage {
+    use iced::widget::markdown;
+    let md_items: Vec<markdown::Item> = markdown::parse(&entry.content).collect();
+    DisplayMessage {
+        id: Some(entry.id),
+        message_id: entry.message_id,
+        user_name: entry.user_name,
+        content: entry.content,
+        direction: entry.direction,
+        agent_role: entry.agent_role,
+        md_items,
+        is_optimistic: false,
+    }
+}
+
 /// Wrap a chat bubble in a 3:1 FillPortion row so it occupies 75% width,
 /// aligned to the right for user messages or to the left for agent/typing.
 ///
@@ -407,20 +427,9 @@ impl HomeState {
 
     /// Push a new chat message to the display. Returns the message's ID for dedup tracking.
     fn push_message(&mut self, entry: ChatHistoryEntry) -> String {
-        use iced::widget::markdown;
-
-        let md_items: Vec<markdown::Item> = markdown::parse(&entry.content).collect();
-        self.messages.push(DisplayMessage {
-            id: Some(entry.id),
-            message_id: entry.message_id.clone(),
-            user_name: entry.user_name,
-            content: entry.content,
-            direction: entry.direction,
-            agent_role: entry.agent_role,
-            md_items,
-            is_optimistic: false,
-        });
-        entry.message_id
+        let msg_id = entry.message_id.clone();
+        self.messages.push(entry_to_display_message(entry));
+        msg_id
     }
 
     /// Reset pagination and auto-scroll state. Called at all cleanup sites
@@ -1173,21 +1182,7 @@ impl HomeState {
                 // Prepend entries to the beginning of messages.
                 let mut prepended: Vec<DisplayMessage> = display_entries
                     .into_iter()
-                    .map(|entry| {
-                        use iced::widget::markdown;
-                        let md_items: Vec<markdown::Item> =
-                            markdown::parse(&entry.content).collect();
-                        DisplayMessage {
-                            id: Some(entry.id),
-                            message_id: entry.message_id,
-                            user_name: entry.user_name,
-                            content: entry.content,
-                            direction: entry.direction,
-                            agent_role: entry.agent_role,
-                            md_items,
-                            is_optimistic: false,
-                        }
-                    })
+                    .map(entry_to_display_message)
                     .collect();
                 // Track seen_ids for the prepended messages.
                 for msg in &prepended {
