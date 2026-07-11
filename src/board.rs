@@ -1423,31 +1423,53 @@ impl BoardStore {
     ///
     /// Returns `true` if any ticket in the workspace has a pipeline-blocking
     /// phase ([`PIPELINE_BLOCKING_PHASES`]), or a
-    /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket
-    /// (regardless of `pipeline_reservation`), optionally excluding a
-    /// specific ticket ID.
+    /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket,
+    /// optionally excluding a specific ticket ID.
     ///
-    /// [`has_active_tickets_excluding`] delegates to this helper.
+    /// [`has_active_tickets_excluding`] delegates to this helper. The test-only
+    /// [`has_pipeline_blocker_for_workspace`] delegates too, with
+    /// `require_rfd_reservation = true`.
     ///
     /// # Parameters
     ///
     /// * `workspace_name` — The workspace to check.
     /// * `exclude_ticket_id` — When `Some(id)`, that ticket is excluded from
-    ///   the check (e.g., when checking if other active tickets remain after one
-    ///   ticket completes). When `None`, no exclusion is applied.
+    ///   the check. When `None`, no exclusion is applied (the SQL clause
+    ///   `(?2 IS NULL OR id != ?2)` short-circuits to `TRUE`).
+    /// * `require_rfd_reservation` — When `true`, only ReadyForDevelopment
+    ///   tickets with `pipeline_reservation = 1` are counted as active (used
+    ///   by the pipeline-blocker check). When `false`, all ReadyForDevelopment
+    ///   tickets are active regardless of reservation (notification-suppression
+    ///   policy for [`has_active_tickets_excluding`]).
     ///
     /// Excludes archived tickets — the only phases that ever get archived are
     /// `Done` and `Cancelled`, neither of which appears in
     /// `PIPELINE_BLOCKING_PHASES`, so this is a defensive consistency measure.
+    ///
+    /// # Parameter binding note
+    ///
+    /// The SQL always binds three positional parameters:
+    /// - `?1`: `workspace_name`
+    /// - `?2`: `exclude_ticket_id` (may be `None`)
+    /// - `?3`: ReadyForDevelopment phase value
+    ///
+    /// When `require_rfd_reservation = true` the RFD branch adds
+    /// `AND pipeline_reservation = 1` to the same `?3` position.
     async fn has_active_tickets_internal(
         &self,
         workspace_name: &str,
         exclude_ticket_id: Option<&str>,
+        require_rfd_reservation: bool,
     ) -> Result<bool> {
         let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
+        let rfd_condition = if require_rfd_reservation {
+            "(status = ?3 AND pipeline_reservation = 1)".to_string()
+        } else {
+            "status = ?3".to_string()
+        };
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR status = ?3) \
+             (status IN ({blocker_sql}) OR {rfd_condition}) \
              AND workspace_name = ?1 AND is_archived = 0 \
              AND (?2 IS NULL OR id != ?2) LIMIT 1",
         );
@@ -1459,18 +1481,24 @@ impl BoardStore {
         Ok(!rows.is_empty())
     }
 
-    /// Returns true if the given workspace has any ticket with a pipeline-blocking
-    /// phase (dev/review/QA), OR any reserved ReadyForDevelopment ticket that
-    /// was bounced back and is awaiting rework.
+    /// Returns `true` if the given workspace has any ticket with a
+    /// pipeline-blocking phase (dev/review/QA), OR any reserved
+    /// ReadyForDevelopment ticket that was bounced back and is awaiting rework.
     ///
-    /// **Test-only query** — retained to provide coverage of the pipeline-blocker SQL.
-    /// Production code uses [`has_active_tickets_excluding`] or [`count_by_phase`].
+    /// **Test-only query** — retained to provide coverage of the pipeline-blocker
+    /// SQL variant. Production code uses [`has_active_tickets_excluding`] or
+    /// [`count_by_phase`].
+    ///
+    /// Delegates to [`has_active_tickets_internal`] with
+    /// `exclude_ticket_id = None` and `require_rfd_reservation = true`.
     ///
     /// Note this includes `AND pipeline_reservation = 1` for ReadyForDevelopment
-    /// tickets, unlike [`has_active_tickets_internal`] which treats all
-    /// ReadyForDevelopment tickets as active regardless of reservation.
+    /// tickets, unlike [`has_active_tickets_excluding`] (the production entry
+    /// point) which treats all ReadyForDevelopment tickets as active regardless
+    /// of reservation.
     ///
     /// # Maintenance warning
+    ///
     /// If a future feature needs this in production, remove the `#[cfg(test)]`
     /// gate and add a real caller. The doc comment and tests will validate the
     /// query is correct before any production use.
@@ -1483,18 +1511,8 @@ impl BoardStore {
         &self,
         workspace_name: &str,
     ) -> Result<bool> {
-        let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
-        let sql = format!(
-            "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR (status = ?2 AND pipeline_reservation = 1)) \
-             AND workspace_name = ?1 AND is_archived = 0 LIMIT 1",
-        );
-        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
-        let rows = self
-            .conn
-            .query(&sql, turso::params![workspace_name, rfd])
-            .await?;
-        Ok(!rows.is_empty())
+        self.has_active_tickets_internal(workspace_name, None, true)
+            .await
     }
 
     /// Check if the workspace has any active tickets other than the excluded one.
@@ -1526,7 +1544,7 @@ impl BoardStore {
         workspace_name: &str,
         exclude_ticket_id: &str,
     ) -> Result<bool> {
-        self.has_active_tickets_internal(workspace_name, Some(exclude_ticket_id))
+        self.has_active_tickets_internal(workspace_name, Some(exclude_ticket_id), false)
             .await
     }
 
