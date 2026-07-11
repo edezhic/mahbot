@@ -41,6 +41,20 @@ pub struct DiffFile {
 }
 
 impl DiffFile {
+    /// Create a new `DiffFile` with the given path, hunks, and status.
+    /// Defaults: `old_path: None`, `is_binary: false`, `too_large_size: None`.
+    #[must_use]
+    pub fn new(path: String, hunks: Vec<DiffHunk>, status: DiffFileStatus) -> Self {
+        Self {
+            path,
+            old_path: None,
+            hunks,
+            status,
+            is_binary: false,
+            too_large_size: None,
+        }
+    }
+
     /// Create a placeholder entry for binary or too-large untracked files.
     #[must_use]
     pub const fn placeholder(path: String, is_binary: bool, too_large_size: Option<u64>) -> Self {
@@ -133,14 +147,7 @@ impl DiffParser {
         self.new_counter = 0;
 
         if let Some(path) = parse_diff_git_line(line) {
-            self.current_file = Some(DiffFile {
-                path,
-                old_path: None,
-                hunks: Vec::new(),
-                status: DiffFileStatus::Modified,
-                is_binary: false,
-                too_large_size: None,
-            });
+            self.current_file = Some(DiffFile::new(path, Vec::new(), DiffFileStatus::Modified));
         }
     }
 
@@ -300,14 +307,7 @@ pub fn make_untracked_diff_file(path: &str, content: &str) -> DiffFile {
         lines,
     };
 
-    DiffFile {
-        path: path.to_string(),
-        old_path: None,
-        hunks: vec![hunk],
-        status: DiffFileStatus::Untracked,
-        is_binary: false,
-        too_large_size: None,
-    }
+    DiffFile::new(path.to_string(), vec![hunk], DiffFileStatus::Untracked)
 }
 
 /// Parse the `b/` path from a `diff --git a/… b/…` line.

@@ -1593,14 +1593,11 @@ mod tests {
 
     fn make_test_file(path: &str, add: usize, remove: usize) -> DiffFile {
         DiffFile {
-            dfile: crate::diff_parse::DiffFile {
-                path: path.to_string(),
-                old_path: None,
-                hunks: Vec::new(),
-                status: crate::diff_parse::DiffFileStatus::Modified,
-                is_binary: false,
-                too_large_size: None,
-            },
+            dfile: crate::diff_parse::DiffFile::new(
+                path.to_string(),
+                Vec::new(),
+                crate::diff_parse::DiffFileStatus::Modified,
+            ),
             old_highlights: None,
             new_highlights: None,
             add_count: add,
@@ -1666,28 +1663,22 @@ mod tests {
         let mut state = DiffState::new();
         state.diff_files = vec![
             DiffFile {
-                dfile: crate::diff_parse::DiffFile {
-                    path: "src/main.rs".to_owned(),
-                    old_path: None,
-                    hunks: Vec::new(),
-                    status: crate::diff_parse::DiffFileStatus::Modified,
-                    is_binary: false,
-                    too_large_size: None,
-                },
+                dfile: crate::diff_parse::DiffFile::new(
+                    "src/main.rs".to_owned(),
+                    Vec::new(),
+                    crate::diff_parse::DiffFileStatus::Modified,
+                ),
                 old_highlights: None,
                 new_highlights: None,
                 add_count: 0,
                 remove_count: 0,
             },
             DiffFile {
-                dfile: crate::diff_parse::DiffFile {
-                    path: "src/lib.rs".to_owned(),
-                    old_path: None,
-                    hunks: Vec::new(),
-                    status: crate::diff_parse::DiffFileStatus::Modified,
-                    is_binary: false,
-                    too_large_size: None,
-                },
+                dfile: crate::diff_parse::DiffFile::new(
+                    "src/lib.rs".to_owned(),
+                    Vec::new(),
+                    crate::diff_parse::DiffFileStatus::Modified,
+                ),
                 old_highlights: None,
                 new_highlights: None,
                 add_count: 0,
@@ -2196,14 +2187,11 @@ mod tests {
             .collect();
 
         DiffFile {
-            dfile: crate::diff_parse::DiffFile {
-                path: path.to_string(),
-                old_path: None,
+            dfile: crate::diff_parse::DiffFile::new(
+                path.to_string(),
                 hunks,
-                status: crate::diff_parse::DiffFileStatus::Modified,
-                is_binary: false,
-                too_large_size: None,
-            },
+                crate::diff_parse::DiffFileStatus::Modified,
+            ),
             old_highlights: None,
             new_highlights: None,
             add_count: num_hunks * lines_per_hunk,
@@ -2214,12 +2202,12 @@ mod tests {
     fn make_binary_file(path: &str) -> DiffFile {
         DiffFile {
             dfile: crate::diff_parse::DiffFile {
-                path: path.to_string(),
-                old_path: None,
-                hunks: Vec::new(),
-                status: crate::diff_parse::DiffFileStatus::Modified,
                 is_binary: true,
-                too_large_size: None,
+                ..crate::diff_parse::DiffFile::new(
+                    path.to_string(),
+                    Vec::new(),
+                    crate::diff_parse::DiffFileStatus::Modified,
+                )
             },
             old_highlights: None,
             new_highlights: None,
@@ -2231,12 +2219,12 @@ mod tests {
     fn make_too_large_file(path: &str) -> DiffFile {
         DiffFile {
             dfile: crate::diff_parse::DiffFile {
-                path: path.to_string(),
-                old_path: None,
-                hunks: Vec::new(),
-                status: crate::diff_parse::DiffFileStatus::Modified,
-                is_binary: false,
                 too_large_size: Some(5_000_000),
+                ..crate::diff_parse::DiffFile::new(
+                    path.to_string(),
+                    Vec::new(),
+                    crate::diff_parse::DiffFileStatus::Modified,
+                )
             },
             old_highlights: None,
             new_highlights: None,
