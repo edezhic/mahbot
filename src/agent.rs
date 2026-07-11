@@ -16,11 +16,31 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-/// Safety guard against infinite tool-calling loops from weaker models or
-/// broken prompts. Generously set at 1000 because modern LLMs almost never
-/// get stuck in tool-calling loops — even in extreme edge cases, this is a
-/// very reasonable ceiling. At worst (e.g. DeepSeek V4 Flash, the default),
-/// a full 1000-iteration loop costs well under $1.
+/// Maximum LLM iterations before the agent loop bails out.
+///
+/// **DO NOT REDUCE this value without benchmarking against real ticket iteration
+/// distributions in this codebase.**
+///
+/// # Why this is intentionally generous (1000)
+///
+/// * Agents routinely consume hundreds of iterations in normal, legitimate work:
+///   multi-file editing with compile-error feedback loops, research → implement →
+///   review cycles, and sequential tool dependencies all require many turns — this
+///   is deliberate problem-solving, not a runaway loop.
+///
+/// * Cost is not a concern. Even a full 1000-iteration run with the default model
+///   (DeepSeek V4 Flash) costs well under $1, so there is zero cost reason to
+///   lower the limit.
+///
+/// * Running to the iteration cap is EXTREMELY rare with modern models. The limit
+///   exists only as a safety net for pathological edge cases — it is not protecting
+///   against a common or recurring problem.
+///
+/// * Reducing the cap prematurely would cause legitimate long-running agents to
+///   fail mid-task, wasting more time and tokens on restarts than the iterations
+///   themselves would have consumed.
+///
+/// Value last intentionally reviewed: 2026-07-11
 const MAX_LLM_ITERATIONS: usize = 1000;
 
 /// Maximum length of serialized arguments stored in per-call stats.
