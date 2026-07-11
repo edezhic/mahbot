@@ -499,7 +499,7 @@ impl Tool for WebSearchTool {
         })
     }
 
-    /// Preserve full search results — don't truncate with default 5K limit.
+    /// Preserve full search results — don't truncate with default 5 KB limit.
     fn format_output(&self, output: &str) -> String {
         output.to_string()
     }

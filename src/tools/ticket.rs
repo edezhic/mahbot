@@ -274,7 +274,7 @@ impl Tool for GetTicketTool {
     }
 
     /// Override format_output to preserve full ticket content.
-    /// The default truncation at 5K chars would lose long comments/descriptions
+    /// The default truncation at 5 KB would lose long comments/descriptions
     /// that LLMs need to read in their entirety.
     fn format_output(&self, output: &str) -> String {
         output.to_string()

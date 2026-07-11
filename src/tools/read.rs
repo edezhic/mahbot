@@ -106,8 +106,8 @@ impl Tool for ReadTool {
     }
 
     fn format_output(&self, output: &str) -> String {
-        const MAX_CHARS: usize = 5_000;
-        if output.len() <= MAX_CHARS {
+        const MAX_BYTES: usize = 5_000;
+        if output.len() <= MAX_BYTES {
             return output.to_string();
         }
 
@@ -122,7 +122,7 @@ impl Tool for ReadTool {
 
                 // Worst-case marker length — `omitted ≤ expected` guarantees the actual marker never exceeds this
                 let marker_budget = format!("\n... ({expected} lines omitted)").len();
-                let body_budget = MAX_CHARS.saturating_sub(header.len() + marker_budget + 1);
+                let body_budget = MAX_BYTES.saturating_sub(header.len() + marker_budget + 1);
 
                 // Truncate at last complete line boundary within budget
                 let cut = body.floor_char_boundary(body_budget.min(body.len()));
