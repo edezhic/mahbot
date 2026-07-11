@@ -2203,3 +2203,88 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
         "new expanded_dir should exist"
     );
 }
+
+/// Creates an [`EditorState`] with `count` tabs, each with a unique path and
+/// file name. The active tab is set to `active`. The caller must ensure
+/// `active < count`.
+fn make_editor_with_tabs(count: usize, active: usize) -> EditorState {
+    assert!(
+        active < count,
+        "active tab index must be less than tab count"
+    );
+    let mut state = EditorState::new();
+    for i in 0..count {
+        state.tabs.push(Tab {
+            path: format!("/tmp/test_{i}.rs"),
+            file_name: format!("test_{i}.rs"),
+            is_dirty: false,
+            has_trailing_newline: true,
+            line_ending: LineEnding::Lf,
+        });
+        state.tab_contents.insert(
+            format!("/tmp/test_{i}.rs"),
+            TabData {
+                content: EditorBuffer::with_text("", None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: None,
+                saved_text_hash: 0,
+            },
+        );
+    }
+    state.active_tab_index = active;
+    state
+}
+
+#[test]
+fn test_switch_tab_relative_single_tab_returns_none() {
+    // With only one tab, switching tabs is a no-op (guard clause returns early).
+    let mut state = make_editor_with_tabs(1, 0);
+    let _ = state.switch_tab_relative(TabDirection::Next);
+    assert_eq!(state.active_tab_index, 0);
+
+    let mut state = make_editor_with_tabs(1, 0);
+    let _ = state.switch_tab_relative(TabDirection::Prev);
+    assert_eq!(state.active_tab_index, 0);
+}
+
+#[test]
+fn test_switch_tab_relative_next_wraps_to_first() {
+    // From the last tab, Next wraps to the first tab.
+    let mut state = make_editor_with_tabs(3, 2);
+    let _ = state.switch_tab_relative(TabDirection::Next);
+    assert_eq!(state.active_tab_index, 0);
+}
+
+#[test]
+fn test_switch_tab_relative_prev_wraps_to_last() {
+    // From the first tab, Prev wraps to the last tab.
+    let mut state = make_editor_with_tabs(3, 0);
+    let _ = state.switch_tab_relative(TabDirection::Prev);
+    assert_eq!(state.active_tab_index, 2);
+}
+
+#[test]
+fn test_switch_tab_relative_middle() {
+    // From the middle tab, Next goes forward and Prev goes backward.
+    let mut state = make_editor_with_tabs(3, 1);
+    let _ = state.switch_tab_relative(TabDirection::Next);
+    assert_eq!(state.active_tab_index, 2);
+
+    let mut state = make_editor_with_tabs(3, 1);
+    let _ = state.switch_tab_relative(TabDirection::Prev);
+    assert_eq!(state.active_tab_index, 0);
+}
+
+#[test]
+fn test_switch_tab_relative_two_tabs() {
+    // With exactly two tabs, Next and Prev toggle between them.
+    let mut state = make_editor_with_tabs(2, 0);
+    let _ = state.switch_tab_relative(TabDirection::Next);
+    assert_eq!(state.active_tab_index, 1);
+
+    let _ = state.switch_tab_relative(TabDirection::Next);
+    assert_eq!(state.active_tab_index, 0);
+
+    let _ = state.switch_tab_relative(TabDirection::Prev);
+    assert_eq!(state.active_tab_index, 1);
+}

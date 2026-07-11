@@ -1898,12 +1898,11 @@ impl EditorState {
         if self.modal_overlay_blocks_editor_shortcuts() || self.tabs.len() <= 1 {
             return Task::none();
         }
-        let delta: isize = match direction {
-            TabDirection::Next => 1,
-            TabDirection::Prev => -1,
+        let len = self.tabs.len();
+        let new_idx = match direction {
+            TabDirection::Next => (self.active_tab_index + 1) % len,
+            TabDirection::Prev => (self.active_tab_index + len - 1) % len,
         };
-        let new_idx = ((self.active_tab_index.cast_signed() + delta)
-            .rem_euclid(self.tabs.len().cast_signed())) as usize;
         self.scroll_to_tab(new_idx)
     }
 
