@@ -1073,14 +1073,7 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 /// Transition a ticket to Done with a descriptive reason from the given source phase.
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-    let log_label = match source {
-        TicketPhase::QaPassed => "QA",
-        TicketPhase::SanitationPassed => "Sanitation",
-        _ => unreachable!(
-            "transition_ticket_to_done called with unexpected phase: {}",
-            source.as_ref(),
-        ),
-    };
+    let log_label = source.as_ref();
     if comment_and_transition(
         TransitionCtx {
             ticket,
