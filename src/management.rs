@@ -707,8 +707,6 @@ impl PollPhase {
             },
             Self::SanitationCheck => PollPhaseInfo {
                 expected_phase: TicketPhase::InSanitation,
-                // Note: expected_phase is consumed by spawn_dispatch's
-                // panic-recovery transition (expected_phase → Failed).
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
                 // claim_sanitation in handle_qa_passed.
