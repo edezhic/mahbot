@@ -193,7 +193,7 @@ pub async fn stop_typing(handle: tokio::task::JoinHandle<()>) {
     }
 }
 
-/// as a blockquote, so conversation history is readable from both surfaces.
+/// Mirror a GUI user's message to their Telegram chats as a blockquote, so conversation history is readable from both surfaces.
 ///
 /// This should be called before enrichment to preserve the original
 /// user-typed text (pre-link-summary, pre-transcription).
