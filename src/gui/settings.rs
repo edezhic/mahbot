@@ -362,17 +362,6 @@ impl SettingsState {
         self.error = None;
     }
 
-    /// Whether a modal is currently open (for Escape key routing).
-    #[must_use]
-    pub const fn is_modal_open(&self) -> bool {
-        self.show_add_workspace_modal
-            || self.show_add_user_modal
-            || self.workspaces_state.context_view.is_some()
-            || self.workspaces_state.diagnostics_modal.is_some()
-            || self.users_state.delete_target.is_some()
-            || self.users_state.bind_target.is_some()
-    }
-
     /// Close the add-workspace modal and reset all form fields.
     fn close_add_workspace_modal(&mut self) {
         self.show_add_workspace_modal = false;

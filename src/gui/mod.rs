@@ -773,15 +773,10 @@ impl Dashboard {
                 .map(Message::Git)
         } else {
             match self.page {
-                Page::Home => {
-                    if self.board_state.is_modal_open() {
-                        self.board_state
-                            .update(board::BoardMessage::Escape)
-                            .map(Message::Board)
-                    } else {
-                        Task::none()
-                    }
-                }
+                Page::Home => self
+                    .board_state
+                    .update(board::BoardMessage::Escape)
+                    .map(Message::Board),
                 Page::Shell => Task::none(),
                 Page::Logs => self
                     .logs_state
@@ -798,15 +793,10 @@ impl Dashboard {
                     .editor_state
                     .update(editor::EditorMessage::Escape)
                     .map(Message::Editor),
-                Page::Settings => {
-                    if self.settings_state.is_modal_open() {
-                        self.settings_state
-                            .update(settings::SettingsMessage::Escape)
-                            .map(Message::Settings)
-                    } else {
-                        Task::none()
-                    }
-                }
+                Page::Settings => self
+                    .settings_state
+                    .update(settings::SettingsMessage::Escape)
+                    .map(Message::Settings),
             }
         }
     }
