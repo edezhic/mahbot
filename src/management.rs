@@ -1935,6 +1935,25 @@ async fn record_verdict_comments_tx(
 /// - Planning (notify) when any analyst fails, with a comment listing the counts
 ///
 /// The circuit-breaker guard is handled centrally by [`spawn_dispatch`].
+///
+/// ## Note: no `clear_assigned_to` on post-run phase check
+///
+/// Unlike [`dispatch_engineer`], [`dispatch_diagnostics`], and [`dispatch_sanitation`],
+/// this function does **not** call [`clear_assigned_to`] when the post-run phase check
+/// fails (the ticket moved externally during analysis). This is intentional:
+///
+/// * **`assigned_to` is already `NULL`** — [`claim_ticket_in_workspace`] sets
+///   `assigned_to = NULL` during the Backlog → InAnalysis claim
+///   (see [board.rs:906-912]). There is no assigned user to clear.
+/// * **Ephemeral session keys** — [`run_parallel_agents`] generates unique session
+///   keys (`{base}_{i}_{suffix}`) that are never written to the ticket's `assigned_to`
+///   field. The agent registry entries for these parallel agents have already finished
+///   or been cancelled by the explicit [`AGENT_REGISTRY.cancel_by_ticket_id`] call
+///   at the top of this function.
+/// * **Calling `clear_assigned_to` would be actively harmful** — it triggers
+///   [`AGENT_REGISTRY.cancel_by_ticket_id`] as a side-effect (see the docs on
+///   [`clear_assigned_to`]), which could cancel the agent that the new phase has
+///   already assigned to this ticket.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     // Cancel any stale agents for this ticket before dispatching new ones
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
@@ -2341,6 +2360,13 @@ async fn process_verifier_verdicts(
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs [`PARALLEL_AGENT_COUNT`] parallel verifiers of the given role, and processes the verdicts.
+///
+/// ## Note: no `clear_assigned_to` on post-run phase check
+///
+/// See [`dispatch_backlog_analysts`] for the full rationale — the same
+/// structural reasons apply here (parallel agents via [`run_parallel_agents`],
+/// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim,
+/// and [`clear_assigned_to`]'s cancellation side-effect would be harmful).
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
     // Cancel any stale agents for this ticket before dispatching new ones
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
