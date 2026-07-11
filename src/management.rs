@@ -73,6 +73,39 @@ fn board() -> &'static BoardStore {
     crate::board::store()
 }
 
+/// Best-effort clearing of `assigned_to` on early-return / error paths.
+///
+/// Prevents stuck tickets when a dispatch function must return without
+/// transitioning the ticket. Errors are logged but not propagated —
+/// callers are already on an error path and should not fail again here.
+///
+/// ## Agent cancellation side-effect
+///
+/// [`BoardStore::set_assigned_to`](crate::board::BoardStore::set_assigned_to)
+/// implicitly cancels any running agent registered for this ticket via
+/// `execute_and_cancel` → [`AGENT_REGISTRY.cancel_by_ticket_id`].
+/// At all current call sites the associated agent has already completed,
+/// so the cancel is always a no-op. This is safe because:
+///
+/// 1. **post-run phase checks** — the agent finished (we just got `response`)
+/// 2. **`comment_and_transition` failures** — the agent finished, the
+///    transition step failed (not the agent itself)
+///
+/// ## TOCTOU race
+///
+/// A concurrent claim may set a new assignee between a phase check and this
+/// clear. That's very low probability and the same race is accepted in
+/// [`record_sanitation_failure`].
+async fn clear_assigned_to(ticket_id: &str, context: &str) {
+    if let Err(e) = board().set_assigned_to(ticket_id, None).await {
+        warn!(
+            ticket = %ticket_id,
+            error = %e,
+            "Failed to clear assigned_to: {context}",
+        );
+    }
+}
+
 // ── Circuit breaker kind ──────────────────────────────────────────────────────
 
 /// Identifies which circuit breaker variant to use for phase-guard checks
@@ -959,6 +992,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Post-run check still needed for race conditions during agent execution.
     if !is_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
+        clear_assigned_to(&ticket.id, "ticket left InDevelopment").await;
         return;
     }
 
@@ -986,6 +1020,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     )
     .await
     {
+        clear_assigned_to(&ticket.id, "transition failed (Engineer)").await;
         return;
     }
 
@@ -1400,6 +1435,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Post-run phase check — bail if ticket was moved externally.
     if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
+        clear_assigned_to(&ticket.id, "ticket left InSanitation").await;
         return;
     }
 
@@ -1471,6 +1507,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         )
         .await
         {
+            clear_assigned_to(&ticket.id, "transition to SanitationPassed failed").await;
             return;
         }
 
@@ -1519,6 +1556,11 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         )
         .await
         {
+            clear_assigned_to(
+                &ticket.id,
+                "transition to ReadyForDevelopment failed (Sanitation)",
+            )
+            .await;
             return;
         }
 
@@ -1647,6 +1689,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 // diagnostics commands ran. Consistent with dispatch_engineer and
                 // dispatch_sanitation.
                 if !is_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
+                    clear_assigned_to(&ticket.id, "ticket left InDiagnostics").await;
                     return;
                 }
 
@@ -1693,6 +1736,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     )
     .await
     {
+        clear_assigned_to(&ticket.id, "transition failed (Diagnostics)").await;
         return;
     }
 
