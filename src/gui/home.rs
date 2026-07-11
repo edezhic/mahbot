@@ -347,15 +347,12 @@ impl HomeState {
     }
 
     /// Resolve the workspace name for chat history and session queries.
-    /// Empty string (Personal) → `personal:<user_name>`. `None` → `None`.
+    /// `None` or empty string (Personal) → `personal:<user_name>`.
+    /// Non-empty workspace → the workspace name as-is.
     fn resolve_workspace_name(&self) -> Option<String> {
         match &self.selected_workspace {
-            Some(w) if w.is_empty() => {
-                let user = self.selected_user.as_ref()?;
-                Some(format!("personal:{user}"))
-            }
-            Some(w) => Some(w.clone()),
-            None => {
+            Some(w) if !w.is_empty() => Some(w.clone()),
+            _ => {
                 let user = self.selected_user.as_ref()?;
                 Some(format!("personal:{user}"))
             }
