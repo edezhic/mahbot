@@ -1049,3 +1049,124 @@ async fn diagnostics_failure_bounces_to_ready_for_development() {
     // Keep dir alive until after the test completes.
     drop(dir);
 }
+
+/// Verify that when all diagnostics commands pass, `dispatch_diagnostics`
+/// transitions the ticket to `DiagnosticsDone` with a passed marker comment.
+/// This exercises Path C1 (all commands succeed), complementing the Path B
+/// and Path C2 tests above.
+#[tokio::test]
+async fn diagnostics_all_pass_transitions_to_diagnostics_done() {
+    init_management_test_stores().await;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let ws_path = dir.path().to_string_lossy().to_string();
+    let ws_name = "test_diag_pass";
+    let ws = create_test_workspace(&ws_path, ws_name).await;
+
+    // Set diagnostics commands that always pass.
+    let cmds = DiagnosticsCommands {
+        format: Some("true".to_string()),
+        format_check: None,
+        lint_fix: None,
+        lint: None,
+        type_check: Some("true".to_string()),
+        build: None,
+        unit_test: None,
+    };
+    crate::workspace::store()
+        .set_diagnostics(ws_name, &cmds, &crate::turso::now())
+        .await
+        .expect("set diagnostics");
+
+    let ticket_id = make_ticket(
+        board(),
+        &ws,
+        "Diagnostics All Pass Test",
+        TicketPhase::InDiagnostics,
+    )
+    .await;
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    dispatch_diagnostics(Arc::new(ticket), ws).await;
+
+    // Verify transition to DiagnosticsDone.
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_eq!(
+        phase,
+        TicketPhase::DiagnosticsDone,
+        "all diagnostics passed should transition to DiagnosticsDone",
+    );
+
+    // Verify a DIAGNOSTICS_ROLE comment with the passed marker.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get_comments");
+    let has_passed_marker = comments.iter().any(|c| {
+        c.role == DIAGNOSTICS_ROLE
+            && c.content.contains(DIAGNOSTICS_COMMENT_PREFIX)
+            && c.content.contains(DIAGNOSTICS_PASSED_MARKER)
+    });
+    assert!(
+        has_passed_marker,
+        "should have a DIAGNOSTICS_ROLE comment with the passed marker",
+    );
+
+    // Keep dir alive until after the test completes.
+    drop(dir);
+}
+
+/// Verify that when the diagnostics commands string is corrupt (invalid JSON),
+/// `dispatch_diagnostics` handles the DB error gracefully: transitions to
+/// `DiagnosticsDone` and writes a comment explaining the database error.
+/// This exercises Path A (DB error loading diagnostics).
+#[tokio::test]
+async fn diagnostics_db_error_transitions_to_diagnostics_done() {
+    init_management_test_stores().await;
+
+    let ws_name = "test_diag_db_error";
+    let ws = create_test_workspace("/tmp/test_diag_db_error", ws_name).await;
+
+    // Store invalid JSON in the diagnostics column to force a serde parse error
+    // when get_diagnostics tries to deserialize it.
+    crate::workspace::store()
+        .conn
+        .execute(
+            "UPDATE workspaces SET diagnostics = ?1 WHERE name = ?2",
+            turso::params!["not valid json", ws_name],
+        )
+        .await
+        .expect("set diagnostics to invalid JSON");
+
+    let ticket_id = make_ticket(
+        board(),
+        &ws,
+        "Diagnostics DB Error Test",
+        TicketPhase::InDiagnostics,
+    )
+    .await;
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    dispatch_diagnostics(Arc::new(ticket), ws).await;
+
+    // Verify transition to DiagnosticsDone.
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_eq!(
+        phase,
+        TicketPhase::DiagnosticsDone,
+        "DB error loading diagnostics should still transition to DiagnosticsDone",
+    );
+
+    // Verify a DIAGNOSTICS_ROLE comment explaining the database error.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get_comments");
+    let has_db_error_comment = comments
+        .iter()
+        .any(|c| c.role == DIAGNOSTICS_ROLE && c.content.contains("database error"));
+    assert!(
+        has_db_error_comment,
+        "should have a DIAGNOSTICS_ROLE comment explaining the database error",
+    );
+}

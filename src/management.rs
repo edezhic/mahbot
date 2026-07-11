@@ -1662,7 +1662,6 @@ async fn transition_ticket_from_diagnostics(
 /// After execution, transitions the ticket to either `DiagnosticsDone` (all
 /// passed) or `ReadyForDevelopment` (any failure), unless the circuit breaker
 /// trips (see [`CircuitBreakerKind::Diagnostics`]).
-#[allow(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     // Circuit breaker check happens in spawn_dispatch before entering this
     // function — consistent with all other dispatchers.
@@ -1689,80 +1688,61 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         Ok(true) => {}
     }
 
-    // 1. Load diagnostics commands for this workspace.
-    match crate::workspace::store().get_diagnostics(&ws.name).await {
-        Ok(Some(cmds)) if !cmds.is_empty() => {
-            // 2. Run commands sequentially in the prescribed order.
-            let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
+    // Separate the decision (target phase + comment body) from the action
+    // (single transition call), matching the dispatch_engineer precedent.
+    let (target_phase, comment_body): (TicketPhase, String) =
+        match crate::workspace::store().get_diagnostics(&ws.name).await {
+            Ok(Some(cmds)) if !cmds.is_empty() => {
+                // Run commands sequentially in the prescribed order.
+                let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
 
-            // Post-run check: verify ticket hasn't been moved externally while
-            // diagnostics commands ran. Consistent with dispatch_engineer and
-            // dispatch_sanitation.
-            if !is_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
-                return;
-            }
-
-            if all_passed {
-                // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                let _ = transition_ticket_from_diagnostics(
-                    &ticket,
-                    &comment,
-                    TicketPhase::DiagnosticsDone,
-                )
-                .await;
-            } else {
-                // Path C2: Diagnostics failed — write the failure comment and
-                // bounce back to development for rework.
-                //
-                // Uses `comment_and_transition` (which wraps both writes in a
-                // single transaction). `pipeline_reservation` is automatically
-                // derived as `Some(true)` when bouncing back to
-                // ReadyForDevelopment, ensuring the ticket gets priority
-                // re-dispatch over fresh tickets.
-                // If the process crashes before the transaction commits, neither
-                // the comment nor the transition is persisted — the ticket stays
-                // in InDiagnostics and reset_inflight_tickets on the next startup
-                // handles recovery without inflating the circuit breaker counter.
-                if !transition_ticket_from_diagnostics(
-                    &ticket,
-                    &comment,
-                    TicketPhase::ReadyForDevelopment,
-                )
-                .await
-                {
+                // Post-run check: verify ticket hasn't been moved externally while
+                // diagnostics commands ran. Consistent with dispatch_engineer and
+                // dispatch_sanitation.
+                if !is_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
                     return;
                 }
 
-                info!(
-                    ticket = %ticket.id,
-                    "Diagnostics failed — pipeline reservation set for rework priority",
-                );
+                if all_passed {
+                    // Path C1: All diagnostics passed — transition to DiagnosticsDone.
+                    (TicketPhase::DiagnosticsDone, comment)
+                } else {
+                    // Path C2: Diagnostics failed — bounce back to development.
+                    (TicketPhase::ReadyForDevelopment, comment)
+                }
             }
-        }
-        Ok(_) => {
-            // Path B: No diagnostics commands configured (or empty list) — skip.
-            let _ = transition_ticket_from_diagnostics(
-                &ticket,
-                "No diagnostics commands are configured for this workspace — diagnostics skipped.",
-                TicketPhase::DiagnosticsDone,
-            )
-            .await;
-        }
-        Err(e) => {
-            // Path A: DB error loading diagnostics — log and skip.
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
-            );
-            let _ = transition_ticket_from_diagnostics(
-                &ticket,
-                &format!("Could not load diagnostics commands due to a database error: {e}"),
-                TicketPhase::DiagnosticsDone,
-            )
-            .await;
-        }
+            Ok(_) => {
+                // Path B: No diagnostics commands configured (or empty list) — skip.
+                (
+                    TicketPhase::DiagnosticsDone,
+                    "No diagnostics commands are configured for this workspace \
+                     — diagnostics skipped."
+                        .to_string(),
+                )
+            }
+            Err(e) => {
+                // Path A: DB error loading diagnostics — log and skip.
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
+                );
+                (
+                    TicketPhase::DiagnosticsDone,
+                    format!("Could not load diagnostics commands due to a database error: {e}"),
+                )
+            }
+        };
+
+    if !transition_ticket_from_diagnostics(&ticket, &comment_body, target_phase).await {
+        return;
     }
+
+    info!(
+        ticket = %ticket.id,
+        target = %target_phase,
+        "Diagnostics finished — transitioned ticket",
+    );
 }
 
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
