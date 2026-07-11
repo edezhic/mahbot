@@ -1,5 +1,5 @@
-use crate::util::TELEGRAM_MEDIA_MARKER_RE;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
+use crate::util::{TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -413,15 +413,8 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 
     let cleaned = TELEGRAM_MEDIA_MARKER_RE
         .replace_all(message, |caps: &regex::Captures| {
-            let kind_str = caps
-                .name("kind")
-                .expect("TELEGRAM_MEDIA_MARKER_RE: expected 'kind' group")
-                .as_str();
-            let path = caps
-                .name("path")
-                .expect("TELEGRAM_MEDIA_MARKER_RE: expected 'path' group")
-                .as_str()
-                .trim();
+            let (kind_str, path) = parse_media_marker(caps);
+            let path = path.trim();
 
             // Preserve markers with whitespace-only paths (e.g. `[IMAGE: ]`)
             // as original text, mirroring the old hand-rolled parser's behavior

@@ -3,7 +3,7 @@ pub mod telegram;
 use crate::chat_history::ChatHistoryInsert;
 use crate::tools::browser::BrowserTool;
 use crate::turso;
-use crate::util::MEDIA_MARKER_RE;
+use crate::util::{MEDIA_MARKER_RE, parse_media_marker};
 use crate::{ChannelMessage, ChatDirection, SendMessage};
 use regex::Regex;
 use std::borrow::Cow;
@@ -371,14 +371,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
 
     for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {
         let whole = caps.get_match();
-        let kind = caps
-            .name("kind")
-            .expect("MEDIA_MARKER_RE: expected 'kind' group")
-            .as_str();
-        let path = caps
-            .name("path")
-            .expect("MEDIA_MARKER_RE: expected 'path' group")
-            .as_str();
+        let (kind, path) = parse_media_marker(&caps);
         let path_obj = std::path::Path::new(path);
 
         match kind {
@@ -464,13 +457,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     let keep_image = matches!(strategy, EnrichmentStrategy::Multimodal { .. });
     let cleaned = MEDIA_MARKER_RE
         .replace_all(&result, |caps: &regex::Captures| {
-            if keep_image
-                && caps
-                    .name("kind")
-                    .expect("MEDIA_MARKER_RE: expected 'kind' group")
-                    .as_str()
-                    == "IMAGE"
-            {
+            if keep_image && parse_media_marker(caps).0 == "IMAGE" {
                 caps.get_match().as_str().to_string()
             } else {
                 String::new()

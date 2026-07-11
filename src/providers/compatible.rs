@@ -303,15 +303,8 @@ fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 
     let cleaned = crate::util::MEDIA_MARKER_RE
         .replace_all(content, |caps: &regex::Captures| {
-            let kind = caps
-                .name("kind")
-                .expect("MEDIA_MARKER_RE: expected 'kind' group")
-                .as_str();
-            let path = caps
-                .name("path")
-                .expect("MEDIA_MARKER_RE: expected 'path' group")
-                .as_str()
-                .trim();
+            let (kind, path) = crate::util::parse_media_marker(caps);
+            let path = path.trim();
 
             if kind == "IMAGE" {
                 refs.push(path.to_string());

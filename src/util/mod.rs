@@ -68,6 +68,27 @@ pub(crate) static TELEGRAM_MEDIA_MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("TELEGRAM_MEDIA_MARKER_RE must compile")
 });
 
+/// Extract the `kind` and `path` named groups from a [`MEDIA_MARKER_RE`] / [`TELEGRAM_MEDIA_MARKER_RE`] capture.
+///
+/// Returns `(kind, path)` as string slices borrowed from the original haystack.
+///
+/// # Panics
+///
+/// Panics if either named group is missing — this should never happen with the
+/// well-formed regex since the pattern requires both groups to match.
+#[must_use]
+pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (&'h str, &'h str) {
+    let kind = caps
+        .name("kind")
+        .expect("parse_media_marker: expected 'kind' group")
+        .as_str();
+    let path = caps
+        .name("path")
+        .expect("parse_media_marker: expected 'path' group")
+        .as_str();
+    (kind, path)
+}
+
 /// Truncate a string to `max_chars` Unicode characters, appending "…" if truncated.
 #[must_use]
 pub fn truncate(input: &str, max_chars: usize) -> String {
