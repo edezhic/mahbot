@@ -1006,9 +1006,16 @@ fn finish_shell_output(
     // fuller version so agents can `read` the complete output despite the
     // head/tail truncation reducing inline content to a snippet.
     // `full_output_for_spill` is already credential-scrubbed.
-    if let Some(pre) = full_output_for_spill
-        && pre.len() > SPILL_THRESHOLD_BYTES
-    {
+    // The `pre` value is only provided when output exceeds
+    // `SPILL_THRESHOLD_BYTES` (guaranteed by `apply_line_truncation`),
+    // so no length re-check is needed here.
+    if let Some(pre) = full_output_for_spill {
+        debug_assert!(
+            pre.len() > SPILL_THRESHOLD_BYTES,
+            "invariant: pre-truncation output ({}) must exceed threshold ({})",
+            pre.len(),
+            SPILL_THRESHOLD_BYTES,
+        );
         let byte_count = pre.len();
         let line_count = pre.lines().count();
         if let Some(path) = spill_output(pre) {
