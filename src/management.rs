@@ -208,25 +208,6 @@ async fn dispatch_notification(
     }
 }
 
-/// Log a warning when a ticket transition fails, using `source` and `target`
-/// phases directly so hardcoded phase-name strings can't drift.
-///
-/// `log_label` is a human-readable name for the dispatch phase (e.g.
-/// `"Engineer"`, `"Sanitation"`, `"Analyst"`).
-fn warn_transition_failed(
-    ticket: &Ticket,
-    source: TicketPhase,
-    target: TicketPhase,
-    log_label: &str,
-    error: &anyhow::Error,
-) {
-    warn!(
-        ticket = %ticket.id,
-        error = %error,
-        "{log_label}: transition to {target} failed — ticket stuck in {source}",
-    );
-}
-
 /// Bundled parameters for [`comment_and_transition`].
 ///
 /// Encapsulates all arguments needed to add a comment (and optional extra
@@ -325,7 +306,13 @@ where
     )
     .await
     {
-        warn_transition_failed(args.ticket, args.source, args.target, args.log_label, &e);
+        // Use phase values directly (not strings) so phase names can't drift.
+        warn!(
+            ticket = %args.ticket.id,
+            error = %e,
+            "{}: transition to {} failed — ticket stuck in {}",
+            args.log_label, args.target, args.source,
+        );
         return false;
     }
 
