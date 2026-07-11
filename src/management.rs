@@ -575,11 +575,16 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             );
             // Best-effort transition: the ticket may have been moved
             // externally while the dispatch was running.
-            let _ = transition_ticket_to_failed(
-                &ticket_for_failure,
-                expected_phase,
-                &format!("❌ Dispatch panicked: {msg}"),
-                "dispatch panic",
+            let _ = comment_and_transition(
+                TransitionCtx {
+                    ticket: &ticket_for_failure,
+                    source: expected_phase,
+                    target: TicketPhase::Failed,
+                    notify: NotifyPolicy::Notify,
+                    log_label: "dispatch panic",
+                },
+                (SYSTEM_ROLE, &format!("❌ Dispatch panicked: {msg}")),
+                None,
             )
             .await;
         }
@@ -1065,27 +1070,6 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
     {
         info!(ticket = %ticket.id, "{comment}");
     }
-}
-
-#[must_use]
-async fn transition_ticket_to_failed(
-    ticket: &Ticket,
-    source: TicketPhase,
-    comment: &str,
-    log_label: &str,
-) -> bool {
-    comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source,
-            target: TicketPhase::Failed,
-            notify: NotifyPolicy::Notify,
-            log_label,
-        },
-        (SYSTEM_ROLE, comment),
-        None,
-    )
-    .await
 }
 
 /// Transition the ticket to Done if git is unavailable.
@@ -1609,41 +1593,6 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     (comment, all_passed)
 }
 
-/// Transition from `InDiagnostics` to the given target phase with a comment
-/// explaining the outcome.
-///
-/// This is a thin wrapper around [`comment_and_transition`] that fills in
-/// the shared parameters (`DIAGNOSTICS_ROLE`, `InDiagnostics` as source,
-/// `NotifyPolicy::Buffer`, and `"Diagnostics"` as log label), leaving the
-/// caller to specify the `target` phase and `comment` text.
-///
-/// `pipeline_reservation` is automatically derived as `Some(true)` when
-/// targeting `ReadyForDevelopment` (bounce-back transitions get priority
-/// re-dispatch over fresh tickets) and `None` for all other targets — this
-/// is handled by [`comment_and_transition`] itself, so no special treatment
-/// is needed at this wrapper level.
-///
-/// Returns `true` if the transition succeeded, `false` otherwise.
-#[must_use]
-async fn transition_ticket_from_diagnostics(
-    ticket: &Ticket,
-    comment: &str,
-    target: TicketPhase,
-) -> bool {
-    comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source: TicketPhase::InDiagnostics,
-            target,
-            notify: NotifyPolicy::Buffer,
-            log_label: "Diagnostics",
-        },
-        (DIAGNOSTICS_ROLE, comment),
-        None,
-    )
-    .await
-}
-
 /// Run diagnostics commands after the engineer completes development.
 ///
 /// Called by [`PollPhase::DiagnosticsCheck`] via [`spawn_dispatch`].
@@ -1732,7 +1681,19 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             }
         };
 
-    if !transition_ticket_from_diagnostics(&ticket, &comment_body, target_phase).await {
+    if !comment_and_transition(
+        TransitionCtx {
+            ticket: &ticket,
+            source: TicketPhase::InDiagnostics,
+            target: target_phase,
+            notify: NotifyPolicy::Buffer,
+            log_label: "Diagnostics",
+        },
+        (DIAGNOSTICS_ROLE, &comment_body),
+        None,
+    )
+    .await
+    {
         return;
     }
 
@@ -2140,8 +2101,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum. This
 /// eliminates ~80% structural duplication while preserving exact behavioral semantics.
 ///
-/// The Manager is notified via [`transition_ticket_to_failed`] when the ticket
-/// transitions to [`TicketPhase::Failed`].
+/// The Manager is notified when the ticket transitions to [`TicketPhase::Failed`].
 ///
 /// # Self-counting prevention
 ///
@@ -2176,7 +2136,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///
 /// * `ticket` — the ticket being evaluated for the circuit breaker.
 /// * `source_phase` — the phase the ticket must currently be in for the transition
-///   to succeed (passed to [`transition_ticket_to_failed`] as the `source` parameter).
+///   to succeed (passed as the `source` parameter to the inner `comment_and_transition` call).
 /// * `kind` — identifies which circuit breaker variant to use. Determines
 ///   threshold, failure-counting logic, and trip-comment format.
 /// * `log_label` — human-readable label used in log messages to identify the
@@ -2215,11 +2175,16 @@ async fn try_trip_circuit_breaker(
         "Circuit breaker tripped at {count}/{threshold} ({log_label}) — failing ticket"
     );
 
-    if transition_ticket_to_failed(
-        ticket,
-        source_phase,
-        &kind.comment(count),
-        &format!("{log_label} circuit breaker"),
+    if comment_and_transition(
+        TransitionCtx {
+            ticket,
+            source: source_phase,
+            target: TicketPhase::Failed,
+            notify: NotifyPolicy::Notify,
+            log_label: &format!("{log_label} circuit breaker"),
+        },
+        (SYSTEM_ROLE, &kind.comment(count)),
+        None,
     )
     .await
     {
@@ -2308,7 +2273,7 @@ async fn process_verifier_verdicts(
             .await?;
 
             // For the all-failed case, also write the system failure comment
-            // (matching what transition_ticket_to_failed did via comment_and_transition).
+            // via comment_and_transition (matching the inlined failure transition).
             if let Some(ref fc) = failure_comment {
                 BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, fc).await?;
             }
