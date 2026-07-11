@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, warn};
@@ -98,6 +98,9 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// | 1     | LOADING  | Initialization in progress (sync cache load or   |
 /// |       |          | background download with retries).               |
 /// | 2     | READY    | A usable [`Embedder`] instance is available.     |
+/// | 3     | FAILED   | Embedder initialization failed terminally;               |
+/// |       |          | [`ensure_embedder()`] returns `false` immediately and     |
+/// |       |          | logs a warning (once). A restart is required to retry.   |
 ///
 /// # Transitions
 ///
@@ -113,16 +116,25 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// | `LOADING`  | `UNINIT`   | No Tokio runtime available — no background download  |
 /// |            |            | task can be spawned. STATE is rolled back so a       |
 /// |            |            | future call running under a runtime can retry.       |
-/// | `LOADING`  | (stuck)    | **Terminal condition** leaving `LOADING` forever:    |
-/// |            |            | • Freshly downloaded, SHA256-verified files fail     |
-/// |            |            |   to load (code-level bug in [`Embedder::load()`]);  |
-/// |            |            |   [`download_retry_loop`] returns without any        |
-/// |            |            |   state transition.                                  |
+/// | `LOADING`  | `FAILED`   | **Terminal condition:** freshly downloaded,          |
+/// |            |            | SHA256-verified files fail to load (code-level bug   |
+/// |            |            | in [`Embedder::load()`]). [`download_retry_loop()`]  |
+/// |            |            | transitions state to [`STATE_FAILED`] and returns.   |
 ///
-/// Once STATE reaches `READY` it stays there for the lifetime of the process.
+/// Once STATE reaches `READY` or `FAILED` it stays there for the lifetime of the process.
 const STATE_UNINIT: u8 = 0;
 const STATE_LOADING: u8 = 1;
 const STATE_READY: u8 = 2;
+
+/// Embedder initialization failed terminally — see [`STATE_FAILED`] for permanent state.
+///
+/// Once STATE reaches `FAILED` it stays there for the lifetime of the process.
+/// A restart is required to re-attempt initialization.
+const STATE_FAILED: u8 = 3;
+
+/// One-shot guard to log the [`STATE_FAILED`] warning only once, preventing log
+/// spam on every [`embed_query()`] / [`embed_document()`] call.
+static STATE_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Global embedder singleton, wrapped in an Option for graceful degradation.
 static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
@@ -153,6 +165,16 @@ fn set_embedder_ready(emb: Embedder) {
 fn ensure_embedder() -> bool {
     match STATE.load(Ordering::Acquire) {
         STATE_READY => return true,
+        STATE_FAILED => {
+            // Log exactly once to avoid spamming on every embed_query/embed_document call.
+            if !STATE_FAILED_WARNED.swap(true, Ordering::AcqRel) {
+                warn!(
+                    "Embedding model permanently unavailable after failed initialization; \
+                     FTS-only fallback active (restart required to retry)"
+                );
+            }
+            return false;
+        }
         STATE_UNINIT => {} // proceed to initialize
         _ => return false, // STATE_LOADING or unexpected state
     }
@@ -340,6 +362,7 @@ async fn download_retry_loop() {
                  failed to load. This indicates a code-level issue with Embedder::load(). \
                  The model will remain unavailable for this session (FTS-only fallback)."
             );
+            STATE.store(STATE_FAILED, Ordering::Release);
             return;
         }
 
@@ -1073,6 +1096,7 @@ mod tests {
     fn reset_global_state() {
         *global_embedder().write().unwrap_poison() = None;
         STATE.store(STATE_UNINIT, Ordering::Release);
+        STATE_FAILED_WARNED.store(false, Ordering::Release);
     }
 
     #[test]
@@ -1137,6 +1161,52 @@ mod tests {
         );
         // Clean up state
         STATE.store(STATE_UNINIT, Ordering::Release);
+    }
+
+    #[test]
+    fn test_ensure_embedder_terminally_failed() {
+        // Regression test: when STATE is FAILED, ensure_embedder() should return
+        // false immediately (without attempting re-initialization) and log a
+        // warning exactly once.
+        let _root = init_test_config();
+        reset_global_state();
+
+        // Manually set STATE to FAILED (simulates the terminal condition from
+        // download_retry_loop after freshly-downloaded files fail to load).
+        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE_FAILED_WARNED.store(false, Ordering::Release);
+
+        // First call: should return false, log a warning (swap observes false→true)
+        let r1 = ensure_embedder();
+        assert!(!r1, "ensure_embedder should return false in STATE_FAILED");
+        assert_eq!(
+            STATE.load(Ordering::Acquire),
+            STATE_FAILED,
+            "STATE should remain FAILED after ensure_embedder()"
+        );
+        assert!(
+            STATE_FAILED_WARNED.load(Ordering::Acquire),
+            "STATE_FAILED_WARNED should be set after first call (warning emitted)"
+        );
+
+        // Second call: should return false silently (no second warning)
+        let r2 = ensure_embedder();
+        assert!(!r2, "ensure_embedder should still return false");
+        assert_eq!(
+            STATE.load(Ordering::Acquire),
+            STATE_FAILED,
+            "STATE should remain FAILED after second call"
+        );
+        // STATE_FAILED_WARNED is already true — swap would return true, warning not emitted.
+        // Verify by calling ensure_embedder again and checking state unchanged.
+        let r3 = ensure_embedder();
+        assert!(
+            !r3,
+            "ensure_embedder should still return false on third call"
+        );
+
+        // Clean up state for subsequent tests
+        reset_global_state();
     }
 
     #[test]
