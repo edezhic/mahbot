@@ -1,6 +1,5 @@
 use super::Provider;
 use crate::util::error::HttpError;
-use crate::util::http::extract_http_status;
 use crate::{ChatRequest, ChatResponse};
 use async_trait::async_trait;
 use std::time::Duration;
@@ -72,7 +71,7 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
 ///    regardless of status code (context window exceeded, tool schema errors,
 ///    auth failures, quota exhaustion).
 /// 2. **4xx status codes** (except 408 Request Timeout and 429 Too Many Requests)
-///    — structured [`HttpError`] downcast or string extraction.
+///    — structured [`HttpError`] downcast.
 /// 3. **Model-not-found composite pattern** — "model" combined with
 ///    "not found"/"unknown"/"unsupported"/"does not exist".
 /// 4. Default to [`Retryable`](ErrorClass::Retryable).
@@ -80,12 +79,8 @@ fn classify_err(err: &anyhow::Error) -> ErrorClass {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
 
-    // Typed path: extract status from HttpError; string-fallback path for
-    // errors that arrive without a structured wrapper (transport, etc.)
-    let status = err
-        .downcast_ref::<HttpError>()
-        .map(|e| e.status)
-        .or_else(|| extract_http_status(&msg));
+    // Extract status from structured HttpError when available
+    let status = err.downcast_ref::<HttpError>().map(|e| e.status);
 
     // Body-text hints indicate permanent errors regardless of status code
     if NON_RETRYABLE_HINTS.iter().any(|h| lower.contains(h)) {
@@ -651,7 +646,7 @@ mod tests {
                 "should detect: {msg}"
             );
         }
-        // Pure 400 without tool-schema keywords → also NonRetryable (via 4xx status check)
+        // Pure 400 without tool-schema keywords → also NonRetryable (via body-text hint matching)
         assert!(
             matches!(
                 classify_err(&anyhow::anyhow!(
