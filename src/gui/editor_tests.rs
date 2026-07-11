@@ -834,31 +834,7 @@ fn test_parse_git_status_porcelain() {
 
 #[test]
 fn test_is_find_bar_open_true_when_active() {
-    let mut state = EditorState::new();
-    // Must have an active tab with find_replace_state.
-    state.tabs.push(Tab {
-        path: "/test.rs".to_string(),
-        file_name: "test.rs".to_string(),
-        is_dirty: false,
-        has_trailing_newline: true,
-        line_ending: LineEnding::Lf,
-    });
-    state.active_tab_index = 0;
-    state.tab_contents.insert(
-        "/test.rs".to_string(),
-        TabData {
-            content: EditorBuffer::with_text("fn hello() {}", None),
-            undo_stack: RefCell::new(UndoStack::new()),
-            find_replace_state: Some(FindReplaceState {
-                query: "hello".to_string(),
-                replace: String::new(),
-                matches: std::iter::once(4..9).collect(),
-                current_match_idx: 0,
-                case_sensitive: false,
-            }),
-            saved_text_hash: 0,
-        },
-    );
+    let state = make_editor_with_find_state("fn hello() {}", "hello", vec![4..9], 0);
     assert!(state.is_find_bar_open());
 }
 
@@ -1042,8 +1018,14 @@ fn test_find_replace_auto_advance() {
     }
 }
 
-#[test]
-fn test_navigate_find_match_wraps_next() {
+/// Helper to create an [`EditorState`] with a single tab at `/test.rs`
+/// that has an active [`FindReplaceState`].
+fn make_editor_with_find_state(
+    text: &str,
+    query: &str,
+    matches: Vec<Range<usize>>,
+    current_match_idx: usize,
+) -> EditorState {
     let mut state = EditorState::new();
     state.tabs.push(Tab {
         path: "/test.rs".to_string(),
@@ -1056,18 +1038,24 @@ fn test_navigate_find_match_wraps_next() {
     state.tab_contents.insert(
         "/test.rs".to_string(),
         TabData {
-            content: EditorBuffer::with_text("a b c", None),
+            content: EditorBuffer::with_text(text, None),
             undo_stack: RefCell::new(UndoStack::new()),
             find_replace_state: Some(FindReplaceState {
-                query: " ".to_string(),
+                query: query.to_string(),
                 replace: String::new(),
-                matches: vec![1..2, 3..4],
-                current_match_idx: 0,
+                matches,
+                current_match_idx,
                 case_sensitive: true,
             }),
             saved_text_hash: 0,
         },
     );
+    state
+}
+
+#[test]
+fn test_navigate_find_match_wraps_next() {
+    let mut state = make_editor_with_find_state("a b c", " ", vec![1..2, 3..4], 0);
 
     // Navigate next from index 0 → 1.
     let _ = state.navigate_find_match(FindDirection::Next);
@@ -1084,30 +1072,7 @@ fn test_navigate_find_match_wraps_next() {
 
 #[test]
 fn test_navigate_find_match_wraps_prev() {
-    let mut state = EditorState::new();
-    state.tabs.push(Tab {
-        path: "/test.rs".to_string(),
-        file_name: "test.rs".to_string(),
-        is_dirty: false,
-        has_trailing_newline: true,
-        line_ending: LineEnding::Lf,
-    });
-    state.active_tab_index = 0;
-    state.tab_contents.insert(
-        "/test.rs".to_string(),
-        TabData {
-            content: EditorBuffer::with_text("a b c", None),
-            undo_stack: RefCell::new(UndoStack::new()),
-            find_replace_state: Some(FindReplaceState {
-                query: " ".to_string(),
-                replace: String::new(),
-                matches: vec![1..2, 3..4],
-                current_match_idx: 0,
-                case_sensitive: true,
-            }),
-            saved_text_hash: 0,
-        },
-    );
+    let mut state = make_editor_with_find_state("a b c", " ", vec![1..2, 3..4], 0);
 
     // Navigate prev from index 0 → wraps to 1 (last).
     let _ = state.navigate_find_match(FindDirection::Prev);
@@ -1124,30 +1089,7 @@ fn test_navigate_find_match_wraps_prev() {
 
 #[test]
 fn test_navigate_find_match_no_matches() {
-    let mut state = EditorState::new();
-    state.tabs.push(Tab {
-        path: "/test.rs".to_string(),
-        file_name: "test.rs".to_string(),
-        is_dirty: false,
-        has_trailing_newline: true,
-        line_ending: LineEnding::Lf,
-    });
-    state.active_tab_index = 0;
-    state.tab_contents.insert(
-        "/test.rs".to_string(),
-        TabData {
-            content: EditorBuffer::with_text("no matches", None),
-            undo_stack: RefCell::new(UndoStack::new()),
-            find_replace_state: Some(FindReplaceState {
-                query: "zzz".to_string(),
-                replace: String::new(),
-                matches: vec![],
-                current_match_idx: 0,
-                case_sensitive: true,
-            }),
-            saved_text_hash: 0,
-        },
-    );
+    let mut state = make_editor_with_find_state("no matches", "zzz", vec![], 0);
 
     // Navigating with no matches should not crash.
     let _ = state.navigate_find_match(FindDirection::Next);
@@ -1160,24 +1102,7 @@ fn test_navigate_find_match_no_matches() {
 #[test]
 fn test_navigate_find_match_only_affects_find_tab() {
     // Tab without find state should not be affected.
-    let mut state = EditorState::new();
-    state.tabs.push(Tab {
-        path: "/a.rs".to_string(),
-        file_name: "a.rs".to_string(),
-        is_dirty: false,
-        has_trailing_newline: true,
-        line_ending: LineEnding::Lf,
-    });
-    state.active_tab_index = 0;
-    state.tab_contents.insert(
-        "/a.rs".to_string(),
-        TabData {
-            content: EditorBuffer::with_text("hello", None),
-            undo_stack: RefCell::new(UndoStack::new()),
-            find_replace_state: None,
-            saved_text_hash: 0,
-        },
-    );
+    let mut state = make_editor_with_single_tab("hello");
 
     // Should not panic.
     let _ = state.navigate_find_match(FindDirection::Next);
