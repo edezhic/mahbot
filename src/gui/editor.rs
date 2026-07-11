@@ -1816,12 +1816,6 @@ impl EditorState {
             .is_some()
     }
 
-    /// Returns `true` when a modal overlay owns keyboard focus
-    /// and editor-wide shortcuts (undo, save, tab switch, etc.) must not run.
-    fn modal_overlay_blocks_editor_shortcuts(&self) -> bool {
-        self.active_modal.is_some()
-    }
-
     /// Save editor tabs to the database for the currently selected workspace.
     ///
     /// Returns a task that performs the async DB write, or [`None`] if:
@@ -1900,7 +1894,7 @@ impl EditorState {
     /// Returns `Task::none()` if a modal overlay is active or if there is
     /// only one tab.
     fn switch_tab_relative(&mut self, direction: TabDirection) -> Task<EditorMessage> {
-        if self.modal_overlay_blocks_editor_shortcuts() || self.tabs.len() <= 1 {
+        if self.active_modal.is_some() || self.tabs.len() <= 1 {
             return Task::none();
         }
         let len = self.tabs.len();
@@ -2092,7 +2086,7 @@ impl EditorState {
     /// undo the editor content. Bail out early so the text input handles the
     /// shortcut internally.
     fn handle_undo_or_redo(&mut self, is_redo: bool) -> Task<EditorMessage> {
-        if self.is_find_bar_open() || self.modal_overlay_blocks_editor_shortcuts() {
+        if self.is_find_bar_open() || self.active_modal.is_some() {
             Task::none()
         } else {
             self.apply_undo_or_redo(is_redo)
@@ -3060,7 +3054,7 @@ impl EditorState {
 
     /// Handle save-active-tab — builds a save task for the active tab.
     fn save_active_tab(&self) -> Task<EditorMessage> {
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         let Some(idx) = self.active_tab_idx() else {
@@ -3775,7 +3769,7 @@ impl EditorState {
 
     /// Handle close-active-tab — closes the currently active tab.
     fn close_active_tab(&mut self) -> Task<EditorMessage> {
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         let idx = self.active_tab_index;
@@ -3790,7 +3784,7 @@ impl EditorState {
         // Suppress during any modal overlay (QuickOpen, GlobalSearch,
         // GotoLine, Rename, etc.) — the overlay owns keyboard focus
         // and the single-field `active_modal` covers all variants.
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         self.file_tree.tree_focused = !self.file_tree.tree_focused;
@@ -3832,7 +3826,7 @@ impl EditorState {
         // overlay handles its own Enter key handling.  Must be placed
         // AFTER the search redirects above so Enter-to-select still works
         // in GlobalSearch and QuickOpen.
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         let Some((_idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
@@ -3854,7 +3848,7 @@ impl EditorState {
     fn tree_nav_left(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the overlay handles
         // its own keyboard navigation (covers Rename, GotoLine, etc.).
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         let Some((_idx, path, _)) = self.file_tree.focused_tree_node() else {
@@ -3883,7 +3877,7 @@ impl EditorState {
     fn tree_nav_right(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the overlay handles
         // its own keyboard navigation (covers Rename, GotoLine, etc.).
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         let Some((idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
@@ -3913,7 +3907,7 @@ impl EditorState {
 
     /// Handle find-toggle — opens/closes the find/replace bar.
     fn find_toggle(&mut self) -> Task<EditorMessage> {
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         let Some((_, path)) = self.active_tab() else {
@@ -4096,7 +4090,7 @@ impl EditorState {
         // not refresh behind an active overlay.  This covers both the
         // Cmd+R / Ctrl+R keyboard shortcut AND the periodic 30-second
         // timer subscription.
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         let Some(ref ws_path) = self.selected_workspace_path else {
@@ -4448,7 +4442,7 @@ impl EditorState {
         // CloseDialog, etc.) is active, suppress tree navigation.  The search
         // overlay redirects above have already returned, so only non-search
         // overlays reach this guard.
-        if self.modal_overlay_blocks_editor_shortcuts() {
+        if self.active_modal.is_some() {
             return Task::none();
         }
         // Navigate the file tree focus index.
