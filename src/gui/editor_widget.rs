@@ -20,7 +20,7 @@ use crate::util::UnwrapPoison;
 
 /// Number of lines to scroll when paging up or down. Both directions use
 /// the same value so that page-up and page-down undo each other.
-pub(crate) const PAGE_SCROLL_LINES: usize = 40;
+const PAGE_SCROLL_LINES: usize = 40;
 
 // ── CursorState ──────────────────────────────────────────────────────
 
