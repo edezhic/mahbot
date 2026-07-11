@@ -38,10 +38,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokenizers::Tokenizer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -99,8 +99,8 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// |       |          | background download with retries).               |
 /// | 2     | READY    | A usable [`Embedder`] instance is available.     |
 /// | 3     | FAILED   | Embedder initialization failed terminally;               |
-/// |       |          | [`ensure_embedder()`] returns `false` immediately and     |
-/// |       |          | logs a warning (once). A restart is required to retry.   |
+/// |       |          | [`ensure_embedder()`] returns `false` immediately.       |
+/// |       |          | A restart is required to retry.                         |
 ///
 /// # Transitions
 ///
@@ -110,9 +110,6 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// |            |            | caller becomes the initializer.                      |
 /// | `LOADING`  | `READY`    | [`set_embedder_ready()`] after a successful load     |
 /// |            |            | (sync cache hit, cached re-load, or fresh download). |
-/// | `LOADING`  | `UNINIT`   | CONFIG not yet initialised → `models_dir()` returns  |
-/// |            |            | `None`. STATE is rolled back so the next [`embed_query()`] |
-/// |            |            | or [`embed_document()`] call can retry.                  |
 /// | `LOADING`  | `UNINIT`   | No Tokio runtime available — no background download  |
 /// |            |            | task can be spawned. STATE is rolled back so a       |
 /// |            |            | future call running under a runtime can retry.       |
@@ -131,10 +128,6 @@ const STATE_READY: u8 = 2;
 /// Once STATE reaches `FAILED` it stays there for the lifetime of the process.
 /// A restart is required to re-attempt initialization.
 const STATE_FAILED: u8 = 3;
-
-/// One-shot guard to log the [`STATE_FAILED`] warning only once, preventing log
-/// spam on every [`embed_query()`] / [`embed_document()`] call.
-static STATE_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Global embedder singleton, wrapped in an Option for graceful degradation.
 static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
@@ -165,18 +158,8 @@ fn set_embedder_ready(emb: Embedder) {
 fn ensure_embedder() -> bool {
     match STATE.load(Ordering::Acquire) {
         STATE_READY => return true,
-        STATE_FAILED => {
-            // Log exactly once to avoid spamming on every embed_query/embed_document call.
-            if !STATE_FAILED_WARNED.swap(true, Ordering::AcqRel) {
-                warn!(
-                    "Embedding model permanently unavailable after failed initialization; \
-                     FTS-only fallback active (restart required to retry)"
-                );
-            }
-            return false;
-        }
         STATE_UNINIT => {} // proceed to initialize
-        _ => return false, // STATE_LOADING or unexpected state
+        _ => return false, // STATE_LOADING, STATE_FAILED, or unexpected state
     }
 
     // Try to become the initializer (atomic CAS to prevent races)
@@ -193,13 +176,8 @@ fn ensure_embedder() -> bool {
     }
 
     // Thread-local: try to load cached files synchronously
-    let Some(models_dir) = models_dir() else {
-        // CONFIG not initialized yet — can't locate model cache.
-        // This condition IS transient: CONFIG will be initialized during
-        // bootstrap. Roll back to UNINIT so the next embed_query/embed_document call can retry.
-        STATE.store(STATE_UNINIT, Ordering::Release);
-        return false;
-    };
+    let models_dir =
+        models_dir().expect("CONFIG must be initialized before embedder initialization");
     let model_path = models_dir.join(MODEL_FILENAME);
     let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
 
@@ -357,7 +335,7 @@ async fn download_retry_loop() {
                 set_embedder_ready(emb);
                 return;
             }
-            error!(
+            warn!(
                 "Giving up on embedding model: freshly downloaded, SHA256-verified files \
                  failed to load. This indicates a code-level issue with Embedder::load(). \
                  The model will remain unavailable for this session (FTS-only fallback)."
@@ -1096,7 +1074,6 @@ mod tests {
     fn reset_global_state() {
         *global_embedder().write().unwrap_poison() = None;
         STATE.store(STATE_UNINIT, Ordering::Release);
-        STATE_FAILED_WARNED.store(false, Ordering::Release);
     }
 
     #[test]
@@ -1166,17 +1143,15 @@ mod tests {
     #[test]
     fn test_ensure_embedder_terminally_failed() {
         // Regression test: when STATE is FAILED, ensure_embedder() should return
-        // false immediately (without attempting re-initialization) and log a
-        // warning exactly once.
+        // false immediately (without attempting re-initialization).
         let _root = init_test_config();
         reset_global_state();
 
         // Manually set STATE to FAILED (simulates the terminal condition from
         // download_retry_loop after freshly-downloaded files fail to load).
         STATE.store(STATE_FAILED, Ordering::Release);
-        STATE_FAILED_WARNED.store(false, Ordering::Release);
 
-        // First call: should return false, log a warning (swap observes false→true)
+        // First call: should return false immediately
         let r1 = ensure_embedder();
         assert!(!r1, "ensure_embedder should return false in STATE_FAILED");
         assert_eq!(
@@ -1184,12 +1159,8 @@ mod tests {
             STATE_FAILED,
             "STATE should remain FAILED after ensure_embedder()"
         );
-        assert!(
-            STATE_FAILED_WARNED.load(Ordering::Acquire),
-            "STATE_FAILED_WARNED should be set after first call (warning emitted)"
-        );
 
-        // Second call: should return false silently (no second warning)
+        // Second call: should again return false (no state change)
         let r2 = ensure_embedder();
         assert!(!r2, "ensure_embedder should still return false");
         assert_eq!(
@@ -1197,8 +1168,8 @@ mod tests {
             STATE_FAILED,
             "STATE should remain FAILED after second call"
         );
-        // STATE_FAILED_WARNED is already true — swap would return true, warning not emitted.
-        // Verify by calling ensure_embedder again and checking state unchanged.
+
+        // Third call: same behavior
         let r3 = ensure_embedder();
         assert!(
             !r3,
