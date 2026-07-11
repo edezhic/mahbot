@@ -921,73 +921,35 @@ async fn process_sanitation_verdict_cases() {
     );
 }
 
-/// Verify that when a workspace has no diagnostics commands configured,
-/// `dispatch_diagnostics` writes a no-commands comment and transitions
-/// the ticket to `DiagnosticsDone`.
+/// Verify [`dispatch_diagnostics`] behaviour across all scenarios:
+///
+/// | Scenario | Commands | Expected Phase | Pipeline Reservation | Comment Contains |
+/// |---|---|---|---|---|
+/// | No diagnostics commands | None (unset) | DiagnosticsDone | false | "No diagnostics commands are configured" |
+/// | Diagnostics failure | `false` | ReadyForDevelopment | true | DIAGNOSTICS_COMMENT_PREFIX + DIAGNOSTICS_FAILED_MARKER |
+/// | Diagnostics pass | `true`, ... | DiagnosticsDone | false | DIAGNOSTICS_COMMENT_PREFIX + DIAGNOSTICS_PASSED_MARKER |
+/// | DB error (corrupt JSON) | N/A (corrupt) | DiagnosticsDone | false | "database error" |
 #[tokio::test]
-async fn no_diagnostics_commands_skips_to_diagnostics_done() {
+async fn dispatch_diagnostics_cases() {
+    struct Case {
+        name: &'static str,
+        ws_suffix: &'static str,
+        title: &'static str,
+        /// Diagnostics commands to persist (None = leave unset).
+        commands: Option<DiagnosticsCommands>,
+        /// If true, overwrite the diagnostics column with invalid JSON.
+        corrupt_diagnostics: bool,
+        /// If true, create a real temp directory for command execution.
+        needs_tempdir: bool,
+        expected_phase: TicketPhase,
+        expected_pipeline_reservation: bool,
+        /// Substrings that must all be present in a DIAGNOSTICS_ROLE comment.
+        expected_comment_contains: &'static [&'static str],
+    }
+
     init_management_test_stores().await;
 
-    let ws = create_test_workspace("/tmp/test_no_diag", "test_no_diag").await;
-
-    let ticket_id = make_ticket(
-        board(),
-        &ws,
-        "No Diagnostics Commands",
-        TicketPhase::InDiagnostics,
-    )
-    .await;
-
-    // NOTE: Do NOT claim the ticket beforehand — dispatch_diagnostics
-    // calls claim_diagnostics internally as its first step.
-    let ticket = expect_ticket(board(), &ticket_id).await;
-
-    dispatch_diagnostics(Arc::new(ticket), ws).await;
-
-    // Verify transition to DiagnosticsDone.
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::DiagnosticsDone,
-        "ticket should be DiagnosticsDone when no diagnostics commands are configured",
-    );
-
-    // Verify a diagnostics-role comment was written explaining the skip.
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert!(
-        !comments.is_empty(),
-        "should have written at least one comment",
-    );
-    let comment = &comments[0];
-    assert_eq!(comment.role, DIAGNOSTICS_ROLE);
-    assert!(
-        comment
-            .content
-            .contains("No diagnostics commands are configured"),
-        "comment should explain that no diagnostics commands are configured: {}",
-        comment.content,
-    );
-}
-
-/// Verify that when diagnostics commands fail, `dispatch_diagnostics` writes a
-/// failure comment and bounces the ticket back to `ReadyForDevelopment` with
-/// `pipeline_reservation = true`. This exercises Path C2 through the complete
-/// transaction (comment + transition), complementing the Path B test above
-/// and verifying the with_tx crash-consistency fix.
-#[tokio::test]
-async fn diagnostics_failure_bounces_to_ready_for_development() {
-    init_management_test_stores().await;
-
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let ws_path = dir.path().to_string_lossy().to_string();
-    let ws_name = "test_diag_fail";
-    let ws = create_test_workspace(&ws_path, ws_name).await;
-
-    // Set a diagnostics command that will always fail (exit non-zero).
-    let cmds = DiagnosticsCommands {
+    let fail_cmds = DiagnosticsCommands {
         format: Some("false".to_string()),
         format_check: None,
         lint_fix: None,
@@ -996,75 +958,7 @@ async fn diagnostics_failure_bounces_to_ready_for_development() {
         build: None,
         unit_test: None,
     };
-    crate::workspace::store()
-        .set_diagnostics(ws_name, &cmds, &crate::turso::now())
-        .await
-        .expect("set diagnostics");
-
-    let ticket_id = make_ticket(
-        board(),
-        &ws,
-        "Diagnostics Failure Test",
-        TicketPhase::InDiagnostics,
-    )
-    .await;
-
-    // NOTE: Do NOT claim the ticket beforehand — dispatch_diagnostics
-    // calls claim_diagnostics internally as its first step.
-    let ticket = expect_ticket(board(), &ticket_id).await;
-
-    dispatch_diagnostics(Arc::new(ticket), ws).await;
-
-    // Verify transition to ReadyForDevelopment with pipeline_reservation.
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        ticket.phase,
-        TicketPhase::ReadyForDevelopment,
-        "diagnostics failure should bounce to ReadyForDevelopment",
-    );
-    assert!(
-        ticket.pipeline_reservation,
-        "bounced ticket should have pipeline_reservation = true",
-    );
-
-    // Verify a DIAGNOSTICS_ROLE comment was written with the failure marker.
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert!(
-        !comments.is_empty(),
-        "should have written at least one comment",
-    );
-    let has_diag_failure = comments.iter().any(|c| {
-        c.role == DIAGNOSTICS_ROLE
-            && c.content.contains(DIAGNOSTICS_COMMENT_PREFIX)
-            && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
-    });
-    assert!(
-        has_diag_failure,
-        "should have a DIAGNOSTICS_ROLE comment with the failure marker",
-    );
-
-    // Keep dir alive until after the test completes.
-    drop(dir);
-}
-
-/// Verify that when all diagnostics commands pass, `dispatch_diagnostics`
-/// transitions the ticket to `DiagnosticsDone` with a passed marker comment.
-/// This exercises Path C1 (all commands succeed), complementing the Path B
-/// and Path C2 tests above.
-#[tokio::test]
-async fn diagnostics_all_pass_transitions_to_diagnostics_done() {
-    init_management_test_stores().await;
-
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let ws_path = dir.path().to_string_lossy().to_string();
-    let ws_name = "test_diag_pass";
-    let ws = create_test_workspace(&ws_path, ws_name).await;
-
-    // Set diagnostics commands that always pass.
-    let cmds = DiagnosticsCommands {
+    let pass_cmds = DiagnosticsCommands {
         format: Some("true".to_string()),
         format_check: None,
         lint_fix: None,
@@ -1073,100 +967,123 @@ async fn diagnostics_all_pass_transitions_to_diagnostics_done() {
         build: None,
         unit_test: None,
     };
-    crate::workspace::store()
-        .set_diagnostics(ws_name, &cmds, &crate::turso::now())
-        .await
-        .expect("set diagnostics");
 
-    let ticket_id = make_ticket(
-        board(),
-        &ws,
-        "Diagnostics All Pass Test",
-        TicketPhase::InDiagnostics,
-    )
-    .await;
+    let cases = [
+        Case {
+            name: "no diagnostics commands",
+            ws_suffix: "dc_no_cmds",
+            title: "No Diagnostics Commands",
+            commands: None,
+            corrupt_diagnostics: false,
+            needs_tempdir: false,
+            expected_phase: TicketPhase::DiagnosticsDone,
+            expected_pipeline_reservation: false,
+            expected_comment_contains: &["No diagnostics commands are configured"],
+        },
+        Case {
+            name: "diagnostics failure",
+            ws_suffix: "dc_fail",
+            title: "Diagnostics Failure Test",
+            commands: Some(fail_cmds),
+            corrupt_diagnostics: false,
+            needs_tempdir: true,
+            expected_phase: TicketPhase::ReadyForDevelopment,
+            expected_pipeline_reservation: true,
+            expected_comment_contains: &[DIAGNOSTICS_COMMENT_PREFIX, DIAGNOSTICS_FAILED_MARKER],
+        },
+        Case {
+            name: "diagnostics all pass",
+            ws_suffix: "dc_pass",
+            title: "Diagnostics All Pass Test",
+            commands: Some(pass_cmds),
+            corrupt_diagnostics: false,
+            needs_tempdir: true,
+            expected_phase: TicketPhase::DiagnosticsDone,
+            expected_pipeline_reservation: false,
+            expected_comment_contains: &[DIAGNOSTICS_COMMENT_PREFIX, DIAGNOSTICS_PASSED_MARKER],
+        },
+        Case {
+            name: "diagnostics DB error",
+            ws_suffix: "dc_db_err",
+            title: "Diagnostics DB Error Test",
+            commands: None,
+            corrupt_diagnostics: true,
+            needs_tempdir: false,
+            expected_phase: TicketPhase::DiagnosticsDone,
+            expected_pipeline_reservation: false,
+            expected_comment_contains: &["database error"],
+        },
+    ];
 
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    dispatch_diagnostics(Arc::new(ticket), ws).await;
+    for case in &cases {
+        let (_dir, ws_path): (Option<tempfile::TempDir>, String) = if case.needs_tempdir {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().to_string_lossy().to_string();
+            (Some(dir), path)
+        } else {
+            (None, format!("/tmp/{}", case.ws_suffix))
+        };
 
-    // Verify transition to DiagnosticsDone.
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::DiagnosticsDone,
-        "all diagnostics passed should transition to DiagnosticsDone",
-    );
+        let ws = create_test_workspace(&ws_path, case.ws_suffix).await;
 
-    // Verify a DIAGNOSTICS_ROLE comment with the passed marker.
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    let has_passed_marker = comments.iter().any(|c| {
-        c.role == DIAGNOSTICS_ROLE
-            && c.content.contains(DIAGNOSTICS_COMMENT_PREFIX)
-            && c.content.contains(DIAGNOSTICS_PASSED_MARKER)
-    });
-    assert!(
-        has_passed_marker,
-        "should have a DIAGNOSTICS_ROLE comment with the passed marker",
-    );
+        if let Some(cmds) = &case.commands {
+            crate::workspace::store()
+                .set_diagnostics(case.ws_suffix, cmds, &crate::turso::now())
+                .await
+                .expect("set diagnostics");
+        }
+        if case.corrupt_diagnostics {
+            crate::workspace::store()
+                .conn
+                .execute(
+                    "UPDATE workspaces SET diagnostics = ?1 WHERE name = ?2",
+                    turso::params!["not valid json", case.ws_suffix],
+                )
+                .await
+                .expect("set diagnostics to invalid JSON");
+        }
 
-    // Keep dir alive until after the test completes.
-    drop(dir);
-}
+        let ticket_id = make_ticket(board(), &ws, case.title, TicketPhase::InDiagnostics).await;
 
-/// Verify that when the diagnostics commands string is corrupt (invalid JSON),
-/// `dispatch_diagnostics` handles the DB error gracefully: transitions to
-/// `DiagnosticsDone` and writes a comment explaining the database error.
-/// This exercises Path A (DB error loading diagnostics).
-#[tokio::test]
-async fn diagnostics_db_error_transitions_to_diagnostics_done() {
-    init_management_test_stores().await;
+        // NOTE: Do NOT claim the ticket beforehand — dispatch_diagnostics
+        // calls claim_diagnostics internally as its first step.
+        let ticket = expect_ticket(board(), &ticket_id).await;
+        dispatch_diagnostics(Arc::new(ticket), ws).await;
 
-    let ws_name = "test_diag_db_error";
-    let ws = create_test_workspace("/tmp/test_diag_db_error", ws_name).await;
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
+        assert_eq!(
+            phase, case.expected_phase,
+            "case {}: expected phase {:?}, got {:?}",
+            case.name, case.expected_phase, phase,
+        );
 
-    // Store invalid JSON in the diagnostics column to force a serde parse error
-    // when get_diagnostics tries to deserialize it.
-    crate::workspace::store()
-        .conn
-        .execute(
-            "UPDATE workspaces SET diagnostics = ?1 WHERE name = ?2",
-            turso::params!["not valid json", ws_name],
-        )
-        .await
-        .expect("set diagnostics to invalid JSON");
+        let ticket = expect_ticket(board(), &ticket_id).await;
+        assert_eq!(
+            ticket.pipeline_reservation, case.expected_pipeline_reservation,
+            "case {}: pipeline_reservation mismatch",
+            case.name,
+        );
 
-    let ticket_id = make_ticket(
-        board(),
-        &ws,
-        "Diagnostics DB Error Test",
-        TicketPhase::InDiagnostics,
-    )
-    .await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    dispatch_diagnostics(Arc::new(ticket), ws).await;
-
-    // Verify transition to DiagnosticsDone.
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::DiagnosticsDone,
-        "DB error loading diagnostics should still transition to DiagnosticsDone",
-    );
-
-    // Verify a DIAGNOSTICS_ROLE comment explaining the database error.
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    let has_db_error_comment = comments
-        .iter()
-        .any(|c| c.role == DIAGNOSTICS_ROLE && c.content.contains("database error"));
-    assert!(
-        has_db_error_comment,
-        "should have a DIAGNOSTICS_ROLE comment explaining the database error",
-    );
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        assert!(
+            !comments.is_empty(),
+            "case {}: should have written at least one comment",
+            case.name,
+        );
+        let has_expected = comments.iter().any(|c| {
+            c.role == DIAGNOSTICS_ROLE
+                && case
+                    .expected_comment_contains
+                    .iter()
+                    .all(|&marker| c.content.contains(marker))
+        });
+        assert!(
+            has_expected,
+            "case {}: should have a DIAGNOSTICS_ROLE comment containing: {:?}",
+            case.name, case.expected_comment_contains,
+        );
+    }
 }
