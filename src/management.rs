@@ -51,15 +51,15 @@ const PARALLEL_AGENT_COUNT: usize = 3;
 const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 /// Comment-formatting constant — appended to the diagnostics comment body when
 /// all checks pass. This is **not** a circuit-breaker marker; the circuit breaker
-/// only checks for [`DIAGNOSTICS_FAILED_MARKER`] prefix and [`DIAGNOSTICS_ROLE`].
+/// only checks for [`DIAGNOSTICS_FAILED_MARKER`] substring and [`DIAGNOSTICS_ROLE`].
 const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 /// Marker appended when diagnostics fail (includes the failed-at label after it).
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 
-/// Prefix for sanitation failure system comments — [`CircuitBreakerKind::Sanitation`]'s
+/// Marker for sanitation failure system comments — [`CircuitBreakerKind::Sanitation`]'s
 /// [`trip_count`](CircuitBreakerKind::trip_count) depends on substring matching
 /// this value, so it must not drift from comment text.
-const SANITATION_FAILED_PREFIX: &str = "Sanitation failed";
+const SANITATION_FAILED_MARKER: &str = "Sanitation failed";
 
 /// Minimum acceptable verification score (0-10) for analyst verdicts.
 const ANALYST_PASS_THRESHOLD: u8 = 7;
@@ -108,7 +108,7 @@ impl CircuitBreakerKind {
             Self::General => comments.len(),
             Self::Sanitation => comments
                 .iter()
-                .filter(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_PREFIX))
+                .filter(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_MARKER))
                 .count(),
             Self::Diagnostics => comments
                 .iter()
@@ -1334,7 +1334,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 /// Record a sanitation failure: add a system comment for the circuit breaker
 /// and clear assigned_to so the ticket can be re-dispatched.
 async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
-    let reason_str = format!("{SANITATION_FAILED_PREFIX} — {reason}");
+    let reason_str = format!("{SANITATION_FAILED_MARKER} — {reason}");
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
         ticket_id,
@@ -1499,7 +1499,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         );
         // Pre-build the system comment so we can pass it into the transaction.
         let sys_comment = format!(
-            "{SANITATION_FAILED_PREFIX} — garbage files: {count}",
+            "{SANITATION_FAILED_MARKER} — garbage files: {count}",
             count = verdict.garbage_files.len(),
         );
 
@@ -2113,7 +2113,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///   re-dispatch by transitioning to the terminal `Failed` phase before the
 ///   breaker could re-read the same trip comment.
 /// * **Sanitation breaker** — filters comments by role `"system"` and content
-///   containing [`SANITATION_FAILED_PREFIX`], but trip comments use different
+///   containing [`SANITATION_FAILED_MARKER`], but trip comments use different
 ///   text, so they are never counted.
 /// * **Diagnostics breaker** — filters comments by role `"diagnostics"` and content
 ///   containing [`DIAGNOSTICS_FAILED_MARKER`];

@@ -437,7 +437,7 @@ async fn add_sanitation_failure(ticket_id: &str) {
         .add_comment(
             ticket_id,
             SYSTEM_ROLE,
-            &format!("{SANITATION_FAILED_PREFIX} — garbage files: 1"),
+            &format!("{SANITATION_FAILED_MARKER} — garbage files: 1"),
         )
         .await;
 }
@@ -911,10 +911,10 @@ async fn process_sanitation_verdict_cases() {
         "pass=false should have a sanitation comment mentioning garbage files",
     );
 
-    // Verify a system comment with SANITATION_FAILED_PREFIX was added
+    // Verify a system comment with SANITATION_FAILED_MARKER was added
     let has_system_breaker = comments
         .iter()
-        .any(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_PREFIX));
+        .any(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_MARKER));
     assert!(
         has_system_breaker,
         "pass=false should have a system comment with the circuit breaker prefix",
