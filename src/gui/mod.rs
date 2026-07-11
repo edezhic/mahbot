@@ -703,10 +703,6 @@ impl Dashboard {
         let now = Instant::now();
         self.toasts
             .retain(|t| now.duration_since(t.created_at) < t.duration());
-        // Auto-poll visible page at 1-second intervals (with loading guard)
-        if !self.ready {
-            return Task::none();
-        }
 
         // Auto-refresh workspace paused/maintenance state every tick.
         // Only runs when a workspace is selected — the toggle result
