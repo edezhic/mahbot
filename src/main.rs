@@ -571,6 +571,11 @@ async fn handle_start_command(msg: &ChannelMessage) {
 async fn build_start_keyboard(msg: &ChannelMessage) -> serde_json::Value {
     let role = mahbot::users::resolve_active_role(&msg.user_name).await;
 
+    let clear_session_btn = serde_json::json!([{
+        "text": "Clear session",
+        "callback_data": "__act__clear_session|",
+    }]);
+
     let rows = if role == Role::Artist {
         let mut rows: Vec<serde_json::Value> = Vec::new();
 
@@ -590,19 +595,10 @@ async fn build_start_keyboard(msg: &ChannelMessage) -> serde_json::Value {
             "__act__set_video_model",
         );
 
-        // Clear session button
-        rows.push(serde_json::json!([{
-            "text": "Clear session",
-            "callback_data": "__act__clear_session|",
-        }]));
-
+        rows.push(clear_session_btn);
         rows
     } else {
-        // Non-Artist: just a clear session button
-        vec![serde_json::json!([{
-            "text": "Clear session",
-            "callback_data": "__act__clear_session|",
-        }])]
+        vec![clear_session_btn]
     };
 
     serde_json::json!({ "inline_keyboard": rows })
