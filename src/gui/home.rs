@@ -379,7 +379,7 @@ impl HomeState {
                 let ws_gui = if crate::users::is_personal_workspace(&ws_name) {
                     String::new()
                 } else {
-                    ws_name.clone()
+                    ws_name
                 };
                 if Some(&ws_gui) != current_ws.as_ref() {
                     HomeMessage::RequestWorkspaceChange(ws_gui)

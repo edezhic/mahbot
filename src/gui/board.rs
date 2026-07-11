@@ -459,7 +459,7 @@ impl BoardState {
                 let generation = self.commit_stats_generation;
                 let ws_name = ticket.workspace_name.clone();
                 let hash = commit_hash.clone();
-                let id = ticket_id.clone();
+                let id = ticket_id;
                 Task::perform(
                     async move {
                         // Resolve workspace name to a filesystem path for git.

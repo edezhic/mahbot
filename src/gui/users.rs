@@ -203,7 +203,7 @@ impl UsersState {
             UsersMessage::ConfirmDelete(sender) => {
                 self.delete_target = None;
                 self.deleting = true;
-                let s = sender.clone();
+                let s = sender;
                 let s_clone = s.clone();
                 Task::perform(
                     async move {
@@ -278,7 +278,7 @@ impl UsersState {
                             .await
                             .map_err(|e| e.to_string())
                     },
-                    move |res| UsersMessage::BindResult(res, user_name.clone()),
+                    move |res| UsersMessage::BindResult(res, user_name),
                 )
             }
             UsersMessage::UnbindChannel(user_name, identifier) => {
@@ -293,7 +293,7 @@ impl UsersState {
                             .await
                             .map_err(|e| e.to_string())
                     },
-                    move |res| UsersMessage::BindResult(res, user_name.clone()),
+                    move |res| UsersMessage::BindResult(res, user_name),
                 )
             }
             UsersMessage::BindResult(Ok(()), _user_name) => {

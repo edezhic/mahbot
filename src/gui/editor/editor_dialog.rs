@@ -86,7 +86,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, 
             } else {
                 iced::Color::TRANSPARENT
             };
-            let label = text(path_owned.clone()).size(12).color(if is_selected {
+            let label = text(path_owned).size(12).color(if is_selected {
                 theme::ACCENT
             } else {
                 theme::TEXT_SECONDARY
@@ -432,13 +432,10 @@ pub(super) fn build_global_search_overlay(
                 theme::TEXT_SECONDARY
             };
 
-            let path_label = text(path_text.clone())
-                .size(12)
-                .color(accent)
-                .font(iced::Font {
-                    weight: iced::font::Weight::Bold,
-                    ..theme::FONT_REGULAR
-                });
+            let path_label = text(path_text).size(12).color(accent).font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..theme::FONT_REGULAR
+            });
 
             // Build the snippet with match portion highlighted in bold.
             let trimmed = line_content.trim().to_string();

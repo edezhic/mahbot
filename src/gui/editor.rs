@@ -1979,7 +1979,7 @@ impl EditorState {
         self.file_tree.tree_focused = false;
         self.pending_enter_dir = None;
 
-        let file_path = abs_path.clone();
+        let file_path = abs_path;
         let file_gen = self.bump_generation();
         self.file_generations.insert(file_path.clone(), file_gen);
         self.selected_file = Some(file_path.clone());
@@ -2932,7 +2932,7 @@ impl EditorState {
                     let text = tab_data.content.text();
                     let replace = &state.replace;
                     // Replace all in reverse order to preserve positions.
-                    let mut new_text = text.clone();
+                    let mut new_text = text;
                     for range in state.matches.iter().rev() {
                         new_text.replace_range(range.start..range.end, replace);
                     }
@@ -3454,7 +3454,7 @@ impl EditorState {
         let old_rel = target.path.clone();
         let is_dir = target.is_dir;
         let parent_dir_clone = parent_dir;
-        let ws_root = target.ws_root.clone();
+        let ws_root = target.ws_root;
         // Follow the same generation-based invalidation protocol as
         // every other async directory operation (ToggleDir, TreeNavEnter,
         // perform_create_item, etc.): bump self.generation and register
@@ -4148,7 +4148,7 @@ impl EditorState {
         // get their git status colors without waiting for the next Tick.
         if !self.git_status_loading {
             self.git_status_loading = true;
-            let path = root_path.clone();
+            let path = root_path;
             let r#gen = self.git_status_gen;
             tasks.push(Task::perform(
                 async move { load_git_status(path).await },

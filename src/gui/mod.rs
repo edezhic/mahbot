@@ -1109,7 +1109,7 @@ impl Dashboard {
 
         // Propagate workspace path to git state, triggering eager refresh.
         // GitState owns the single source of truth for this path.
-        let resolved_path = ws_path.clone().or_else(|| personal_path.clone());
+        let resolved_path = ws_path.or_else(|| personal_path.clone());
         let git_task: Task<Message> = self
             .git_state
             .set_workspace_path(resolved_path)

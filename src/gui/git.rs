@@ -464,7 +464,7 @@ impl GitState {
                     .on_press_maybe(if self.syncing {
                         None
                     } else {
-                        Some(GitMessage::Switch(b.clone()))
+                        Some(GitMessage::Switch(b))
                     })
                     .into()
             })

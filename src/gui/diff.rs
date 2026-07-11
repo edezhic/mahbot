@@ -376,7 +376,7 @@ impl DiffState {
                     return Task::none();
                 }
                 self.clear_diff_state();
-                self.selected_workspace_name = Some(name.clone());
+                self.selected_workspace_name = Some(name);
                 self.personal_workspace_path.clone_from(&path_override);
                 self.diff_has_loaded = false;
                 self.spawn_diff_load(None)
@@ -454,7 +454,7 @@ impl DiffState {
                 self.diff_has_loaded = false;
 
                 // Load the diff and fetch the commit message in parallel.
-                let msg_ws = ws_name.clone();
+                let msg_ws = ws_name;
                 let msg_hash = hash.clone();
                 let msg_hash_for_git = hash.clone();
                 let msg_task = Task::perform(
