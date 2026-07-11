@@ -363,12 +363,9 @@ impl KeyboardMods {
     /// On other platforms: Cmd or Ctrl.
     #[must_use]
     pub(crate) fn is_nav_platform_mod(self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
+        if cfg!(target_os = "macos") {
             self.is_cmd
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
+        } else {
             self.is_platform_mod
         }
     }
@@ -382,12 +379,9 @@ impl KeyboardMods {
     /// text characters for international keyboard layouts.
     #[must_use]
     pub(crate) fn is_text_platform_mod(self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
+        if cfg!(target_os = "macos") {
             self.is_cmd && !self.ctrl_held
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
+        } else {
             self.is_platform_mod && !self.altgr_active
         }
     }
@@ -408,22 +402,15 @@ impl KeyboardMods {
 
 /// Compute [`KeyboardMods`] from an Iced [`keyboard::Modifiers`] value.
 ///
-/// Encapsulates the `#[cfg(target_os = "macos")]` / `#[cfg(not(...))]`
-/// blocks that every keyboard subscription handler previously inlined.
+/// Encapsulates the `cfg!()`-based platform branching that every keyboard
+/// subscription handler previously inlined.
 pub(crate) fn detect_keyboard_mods(modifiers: keyboard::Modifiers) -> KeyboardMods {
     let is_cmd = modifiers.command();
     let is_platform_mod = modifiers.command() || modifiers.control();
     let ctrl_held = modifiers.control();
 
-    #[cfg(target_os = "macos")]
-    let is_emacs_ctrl = modifiers.control() && !modifiers.command();
-    #[cfg(not(target_os = "macos"))]
-    let is_emacs_ctrl = false;
-
-    #[cfg(not(target_os = "macos"))]
-    let altgr_active = modifiers.alt() && modifiers.control();
-    #[cfg(target_os = "macos")]
-    let altgr_active = false;
+    let is_emacs_ctrl = cfg!(target_os = "macos") && modifiers.control() && !modifiers.command();
+    let altgr_active = !cfg!(target_os = "macos") && modifiers.alt() && modifiers.control();
 
     KeyboardMods {
         is_cmd,
