@@ -1552,10 +1552,8 @@ fn apply_profile_pipeline(
         return combine(msg);
     }
 
-    let mut processed = output.clone();
-
     // Stage 3: strip lines
-    processed = apply_strip_lines(&processed, profile);
+    let mut processed = apply_strip_lines(&output, profile);
 
     // Stage 4: collapse blank lines (runs >2 → 2), then collapse consecutive
     // duplicate content lines (≥5 identical → [repeated N] marker).
