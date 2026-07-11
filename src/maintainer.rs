@@ -231,48 +231,54 @@ mod tests {
         }
     }
 
+    /// Table-driven test for all `should_skip_maintainer_debounce` cases.
+    ///
+    /// Reasoning for the "just ran" cases: both `now_str` cases evaluate
+    /// against the same instant, so any near-zero elapsed time produces
+    /// `elapsed < debounce` → `true`. The 500 value is clamped to 240
+    /// internally, so the behaviour is identical to the 240 case.
     #[test]
-    fn should_skip_debounce_none_last_run() {
-        // No prior run — always let through.
-        let ws = ws_with(None, 5);
-        assert!(!should_skip_maintainer_debounce(&ws));
-    }
-
-    #[test]
-    fn should_skip_debounce_parse_error() {
-        // Unparseable timestamp — let through (stale data shouldn't block).
-        let ws = ws_with(Some("garbage-timestamp"), 5);
-        assert!(!should_skip_maintainer_debounce(&ws));
-    }
-
-    #[test]
-    fn should_skip_debounce_elapsed_less_than_debounce() {
-        // last_run_at = "now" → elapsed ~0s < 240 min → skip.
+    fn should_skip_maintainer_debounce_cases() {
         let now_str = Utc::now().to_rfc3339();
-        let ws = ws_with(Some(&now_str), 240);
-        assert!(should_skip_maintainer_debounce(&ws));
-    }
-
-    #[test]
-    fn should_skip_debounce_elapsed_gte_debounce() {
-        // Far-past timestamp → many years elapsed ≥ 5 min → let through.
-        let ws = ws_with(Some("2020-01-01T00:00:00Z"), 5);
-        assert!(!should_skip_maintainer_debounce(&ws));
-    }
-
-    #[test]
-    fn should_skip_debounce_zero_debounce() {
-        // debounce clamped to 0 → mins_elapsed < 0 never true → never skip.
-        let ws = ws_with(Some("2020-01-01T00:00:00Z"), -5);
-        assert!(!should_skip_maintainer_debounce(&ws));
-    }
-
-    #[test]
-    fn should_skip_debounce_high_debounce() {
-        // last_run_at = "now" → elapsed ~0s < 240 (clamped from 500) → skip.
-        let now_str = Utc::now().to_rfc3339();
-        let ws = ws_with(Some(&now_str), 500);
-        assert!(should_skip_maintainer_debounce(&ws));
+        let cases = [
+            (
+                ws_with(None, 5),
+                false,
+                "no prior run → last_run_at is None → no debounce",
+            ),
+            (
+                ws_with(Some("garbage-timestamp"), 5),
+                false,
+                "unparseable timestamp → parse error → let through",
+            ),
+            (
+                ws_with(Some(&now_str), 240),
+                true,
+                "just ran — elapsed ~0s < 240 → skip",
+            ),
+            (
+                ws_with(Some("2020-01-01T00:00:00Z"), 5),
+                false,
+                "long ago — many years elapsed >= 5 → let through",
+            ),
+            (
+                ws_with(Some("2020-01-01T00:00:00Z"), -5),
+                false,
+                "debounce clamped from -5 to 0 → mins_elapsed < 0 never true",
+            ),
+            (
+                ws_with(Some(&now_str), 500),
+                true,
+                "debounce clamped from 500 to 240 → elapsed ~0s < 240 → skip",
+            ),
+        ];
+        for (ws, expected, reason) in &cases {
+            assert_eq!(
+                should_skip_maintainer_debounce(ws),
+                *expected,
+                "case: {reason}"
+            );
+        }
     }
 
     #[test]
