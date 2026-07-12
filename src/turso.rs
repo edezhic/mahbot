@@ -286,9 +286,6 @@ static TANTIVY_SPECIAL: &[char] = &[
 ///   produce an empty string, allowing callers to short-circuit.
 #[must_use]
 pub fn sanitize_fts_query(query: &str) -> String {
-    // First pass: replace Tantivy syntax operators with spaces.
-    // Non-special punctuation is preserved (improves search precision
-    // without causing parse errors).
     let sanitized: String = query
         .chars()
         .map(|c| {
@@ -300,11 +297,6 @@ pub fn sanitize_fts_query(query: &str) -> String {
         })
         .collect();
 
-    // Second pass: split into words, strip leading `/` (Tantivy's lenient
-    // parser treats `/`-prefixed terms as regex queries), then rejoin with
-    // single spaces. split_whitespace also collapses runs of spaces and
-    // produces an empty string when the query consisted entirely of Tantivy
-    // special characters — allowing callers to short-circuit on empty input.
     sanitized
         .split_whitespace()
         .map(|word| word.trim_start_matches('/'))
