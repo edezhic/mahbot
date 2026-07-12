@@ -9,7 +9,9 @@ use crate::tools::{
     ToolExecutionOutcome, find_tool, format_tool_failure_feedback, normalize_tool_call,
     scrub_tool_output,
 };
-use crate::util::{UnwrapPoison, plaintext_for_display, scrub_credentials};
+use crate::util::{
+    MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, plaintext_for_display, scrub_credentials,
+};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall, ToolOutputPhase};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -58,16 +60,20 @@ const MAX_STATS_ARG_LENGTH: usize = 500;
 ///
 /// # Parse rules
 ///
-/// * Path is the text between the marker prefix and the first closing `]`.
-/// * Empty paths (e.g. `[IMAGE:]`) are rejected — the entry is skipped.
-/// * Malformed output (marker prefix found but no closing `]`) is skipped with
-///   a `warn!` log to surface potential tool-output bugs.
+/// * The output is scanned using [`MEDIA_MARKER_RE`] for markers matching the
+///   tool's media kind (e.g. `IMAGE` for a tool returning `[IMAGE:`).
+/// * Only markers whose `kind` matches the tool's [`Tool::media_marker`] prefix
+///   are extracted.
+/// * The regex inherently requires a closing `]` and a non-empty `path` group,
+///   so malformed markers (e.g. `[IMAGE:bogus`) or empty paths (`[IMAGE:]`) are
+///   correctly skipped.
 ///
 /// # Pre-existing limitation
 ///
-/// File paths containing `]` would be truncated by the split on `]`. All
-/// media-generation tools produce paths that never contain `]` in practice
-/// (temporary files with safe names), so this is not a concern.
+/// File paths containing `]` would be truncated because the regex path group
+/// is `[^\]]+` (one or more characters that are not `]`). All media-generation
+/// tools produce paths that never contain `]` in practice (temporary files with
+/// safe names), so this is not a concern.
 fn extract_media_from_outcomes(
     tools: &[Box<dyn Tool>],
     tool_calls: &[ToolCall],
@@ -78,19 +84,18 @@ fn extract_media_from_outcomes(
         if outcome.success
             && let Some(marker_prefix) = find_tool(tools, &call.name).and_then(Tool::media_marker)
         {
-            // Output may be "text\n\n[IMAGE:path]" or "[IMAGE:path]".
-            // Split on the marker prefix, take the part after it, then split on ']'
-            // to find the path.  Reject empty paths (e.g. `[IMAGE:]`) so they don't
-            // produce a garbage media marker later.
-            if let Some(path) = outcome
-                .output
-                .split(marker_prefix)
-                .nth(1)
-                .and_then(|s| s.split(']').next())
-                .filter(|p| !p.is_empty())
-            {
-                paths.push((marker_prefix, path.to_string()));
-            } else {
+            // Derive the regex kind from the marker prefix, e.g. "[IMAGE:" -> "IMAGE".
+            // This relies on the documented invariant that media_marker() returns "[KIND:".
+            let kind = &marker_prefix[1..marker_prefix.len() - 1];
+            let mut matched = false;
+            for caps in MEDIA_MARKER_RE.captures_iter(&outcome.output) {
+                let (captured_kind, path) = parse_media_marker(&caps);
+                if captured_kind == kind {
+                    matched = true;
+                    paths.push((marker_prefix, path.to_string()));
+                }
+            }
+            if !matched {
                 tracing::warn!(
                     media_tool = %call.name,
                     marker = %marker_prefix,
@@ -996,6 +1001,19 @@ mod tests {
                 }],
                 outcomes: vec![OutcomeDef {
                     output: "[IMAGE:]",
+                    success: true,
+                }],
+                expected: vec![],
+            },
+            TestCase {
+                name: "skips_no_closing_bracket_non_empty_path",
+                msg: "output with '[IMAGE:bogus' (no closing bracket, non-empty path) should be skipped",
+                tools: vec![ToolDef::Media {
+                    name: "image_gen",
+                    marker: "[IMAGE:",
+                }],
+                outcomes: vec![OutcomeDef {
+                    output: "oops [IMAGE:bogus",
                     success: true,
                 }],
                 expected: vec![],
