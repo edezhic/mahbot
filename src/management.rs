@@ -511,6 +511,10 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         phase_info.role_label,
     );
 
+    // Cancel any stale agents for this ticket before dispatching new ones.
+    // This is a uniform pre-flight step that applies to all dispatch paths.
+    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
+
     // Wrap in Arc so the panic-recovery clone is a cheap refcount bump
     // instead of a deep copy of the entire comments Vec.
     let ticket = Arc::new(ticket);
@@ -1883,14 +1887,12 @@ async fn record_verdict_comments_tx(
 /// * **Ephemeral session keys** — [`run_parallel_agents`] generates unique session
 ///   keys (`{base}_{i}_{suffix}`) that are never written to the ticket's `assigned_to`
 ///   field. The agent registry entries for these parallel agents have already finished
-///   or been cancelled by the explicit [`AGENT_REGISTRY.cancel_by_ticket_id`] call
-///   at the top of this function.
+///   or been cancelled by the pre-flight [`AGENT_REGISTRY.cancel_by_ticket_id`] call
+///   in [`spawn_dispatch`].
 /// * **TOCTOU race** — calling [`clear_assigned_to`] would unnecessarily risk
 ///   overwriting an assignee that a concurrent claim set between the phase check and
 ///   the clear. Since `assigned_to` is already `NULL`, there is nothing to gain.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
-    // Cancel any stale agents for this ticket before dispatching new ones
-    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
     let prompt_key = if ticket.reporter == Role::Maintainer.as_str() {
         "analyze/maintainer_ticket.md"
     } else {
@@ -2295,8 +2297,6 @@ async fn process_verifier_verdicts(
 /// structural reasons apply here (parallel agents via [`run_parallel_agents`],
 /// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim).
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
-    // Cancel any stale agents for this ticket before dispatching new ones
-    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
     let engineer_response = ticket
         .comments
         .iter()
