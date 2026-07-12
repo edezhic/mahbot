@@ -269,19 +269,26 @@ where
 /// problem is almost certainly a code-level bug, so the loop gives up and leaves
 /// the global embedder uninitialized (graceful degradation to FTS-only search).
 async fn download_retry_loop() {
-    let models_dir =
-        models_dir().expect("CONFIG storage_root must be set before download_retry_loop runs");
+    let Some(models_dir) = models_dir() else {
+        warn!("Embedder: CONFIG not initialized — background download cancelled");
+        STATE.store(STATE_FAILED, Ordering::Release);
+        return;
+    };
     std::fs::create_dir_all(&models_dir).ok();
 
     let model_dest = models_dir.join(MODEL_FILENAME);
     let tokenizer_dest = models_dir.join(TOKENIZER_FILENAME);
 
     // Shared HTTP client reused across retries (avoids new TLS handshake per iteration).
-    let client = reqwest::Client::builder()
+    let Ok(client) = reqwest::Client::builder()
         .timeout(MODEL_DOWNLOAD_TIMEOUT)
         .connect_timeout(Duration::from_secs(30))
         .build()
-        .expect("Failed to build reqwest::Client for model download");
+    else {
+        warn!("Embedder: failed to build HTTP client — background download cancelled");
+        STATE.store(STATE_FAILED, Ordering::Release);
+        return;
+    };
 
     let mut delay = Duration::from_mins(1);
     let max_delay = Duration::from_mins(30); // 30 minutes
