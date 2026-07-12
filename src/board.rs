@@ -1872,11 +1872,10 @@ impl BoardStore {
 
     // ── Archived ticket search methods ────────────────────────────────────
     //
-    // These encapsulate the FTS and embedding SQL that
-    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets)
-    // previously ran directly against `self.conn`. The board owns the schema
-    // (`ngram` tokenizer, FTS index name, blob format) and the tool layer
-    // owns the hybrid RRF merge logic.
+    // These BoardStore methods contain the FTS and embedding SQL used by
+    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets).
+    // The board owns the schema (`ngram` tokenizer, FTS index name, blob format)
+    // and the tool layer owns the hybrid RRF merge logic.
 
     /// Search archived tickets by FTS keyword match.
     ///
