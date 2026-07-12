@@ -876,7 +876,6 @@ pub(super) fn canonical_command(segment: &str) -> String {
         return String::new();
     };
 
-    // If no more words after the command, return just the command
     let remaining = &words[cmd_idx + 1..];
     if remaining.is_empty() {
         return cmd.to_string();
@@ -970,7 +969,6 @@ fn combine_output(
         }
         return stdout.to_string();
     }
-    // Non-zero exit: show all stderr
     if stdout.is_empty() {
         return format!("stderr:\n{stderr_trimmed}");
     }
@@ -1094,7 +1092,6 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
             continue;
         }
 
-        // Skip passing test lines
         if trimmed.starts_with("test ") && trimmed.contains("... ok") {
             continue;
         }

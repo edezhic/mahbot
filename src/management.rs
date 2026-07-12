@@ -1098,7 +1098,6 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
     let repo_path = ws.as_path();
     let phase_label = source.as_ref();
 
-    // Check git availability first.
     if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
         return;
     }
@@ -1250,7 +1249,6 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let untracked = parse_new_files_from_porcelain(&porcelain);
 
     if untracked.is_empty() {
-        // No untracked/new files — finalize to Done.
         finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
     } else {
         // Untracked files exist — claim this specific ticket to InSanitation
