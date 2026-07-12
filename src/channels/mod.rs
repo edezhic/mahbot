@@ -190,7 +190,6 @@ pub fn spawn_scoped_typing_task(
     source_channel: String,
     cancellation_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    let stop_signal = cancellation_token;
     let refresh_interval = std::time::Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
     tokio::spawn(async move {
         let Some(channel) = crate::channel_registry().get(&source_channel) else {
@@ -205,7 +204,7 @@ pub fn spawn_scoped_typing_task(
 
         loop {
             tokio::select! {
-                () = stop_signal.cancelled() => break,
+                () = cancellation_token.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(e) = channel.start_typing(&recipient).await {
                         tracing::debug!("Failed to start typing on {}: {e}", channel.name());
