@@ -28,7 +28,7 @@ pub fn reasoning_plaintext_for_roundtrip(
         return Some(s.to_string());
     }
     if let Some(d) = details {
-        let extracted = crate::util::plaintext_from_reasoning_details(d);
+        let extracted = crate::providers::reasoning::plaintext_from_reasoning_details(d);
         if !extracted.is_empty() {
             return Some(extracted);
         }
@@ -182,12 +182,15 @@ mod tests {
             {"type": "reasoning.summary", "summary": "Plan: step A", "format": "x", "index": 0},
             {"type": "reasoning.text", "text": "Details here.", "format": "x", "index": 1}
         ]);
-        let s = crate::util::plaintext_from_reasoning_details(&d);
+        let s = crate::providers::reasoning::plaintext_from_reasoning_details(&d);
         assert!(s.contains("Plan: step A"));
         assert!(s.contains("Details here."));
         // Encrypted blocks are skipped
         let d = json!([{"type": "reasoning.encrypted", "data": "abc", "format": "x", "index": 0}]);
-        assert_eq!(crate::util::plaintext_from_reasoning_details(&d), "");
+        assert_eq!(
+            crate::providers::reasoning::plaintext_from_reasoning_details(&d),
+            ""
+        );
     }
 
     #[test]

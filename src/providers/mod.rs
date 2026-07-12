@@ -5,9 +5,12 @@
 //! are supported, wrapped with automatic retry logic.
 
 pub mod compatible;
+pub mod reasoning;
 pub mod reasoning_roundtrip;
 pub mod reliable;
 pub mod transcribe;
+
+pub use reasoning::plaintext_for_display;
 
 use crate::config::{CONFIG, non_empty, resolve_or, trimmed_or_none};
 use crate::util::UnwrapPoison;

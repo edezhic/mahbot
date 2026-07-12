@@ -390,7 +390,7 @@ impl SessionsState {
                     } => {
                         if let Some(tool_calls) = tool_calls {
                             let reasoning_text =
-                                crate::util::plaintext_for_display(reasoning.as_ref());
+                                crate::providers::plaintext_for_display(reasoning.as_ref());
 
                             let calls: Vec<ToolCallInfo> = tool_calls
                                 .iter()
@@ -414,7 +414,7 @@ impl SessionsState {
                         } else {
                             let mut parts = Vec::new();
                             if let Some(reasoning_text) =
-                                crate::util::plaintext_for_display(reasoning.as_ref())
+                                crate::providers::plaintext_for_display(reasoning.as_ref())
                             {
                                 parts.push(format!("[thinking]\n{reasoning_text}\n[/thinking]"));
                             }

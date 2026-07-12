@@ -154,12 +154,12 @@ impl ResponseMessage {
     /// inline in `content` instead of using a separate field.
     fn effective_content_optional(&self) -> Option<String> {
         if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty())
-            && let Some(stripped) = crate::util::strip_think_tags(content)
+            && let Some(stripped) = crate::providers::reasoning::strip_think_tags(content)
         {
             return Some(stripped);
         }
 
-        crate::util::merged_reasoning_string(
+        crate::providers::reasoning::merged_reasoning_string(
             self.reasoning_content
                 .as_ref()
                 .map(|c| c.trim().to_string())

@@ -3,15 +3,14 @@ use std::time::Instant;
 use anyhow::Context;
 
 use crate::providers::chat;
+use crate::providers::plaintext_for_display;
 use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
     ToolExecutionOutcome, find_tool, format_tool_failure_feedback, normalize_tool_call,
     scrub_tool_output,
 };
-use crate::util::{
-    MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, plaintext_for_display, scrub_credentials,
-};
+use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, scrub_credentials};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall, ToolOutputPhase};
 use std::fmt::Write;
 use std::sync::Arc;
