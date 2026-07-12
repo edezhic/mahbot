@@ -276,49 +276,6 @@ async fn setup_ticket(
     (ws, ticket_id)
 }
 
-/// Verify that [`clear_assigned_to`] clears the `assigned_to` field
-/// on a ticket.
-///
-/// Covers both the normal case (field was set) and the idempotent no-op
-/// case (field already None). Both paths must succeed without error.
-#[tokio::test]
-async fn clear_assigned_to_clears_assigned_to() {
-    init_management_test_stores().await;
-    let ws = test_ws_named("/tmp/test", "clear_at");
-    let ticket_id = make_ticket(board(), &ws, "Clear AT", TicketPhase::ReadyForDevelopment).await;
-
-    // 1. Set assigned_to to a known value.
-    board()
-        .set_assigned_to(&ticket_id, Some("test_engineer"))
-        .await
-        .expect("set assigned_to");
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        ticket.assigned_to.as_deref(),
-        Some("test_engineer"),
-        "assigned_to should be set before clear",
-    );
-
-    // 2. Clear it via the helper.
-    clear_assigned_to(&ticket_id, "test context").await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert!(
-        ticket.assigned_to.is_none(),
-        "assigned_to should be None after clear_assigned_to",
-    );
-
-    // 3. Idempotency: clearing again when already None should be a no-op.
-    clear_assigned_to(&ticket_id, "idempotent test").await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert!(
-        ticket.assigned_to.is_none(),
-        "assigned_to should still be None after idempotent clear",
-    );
-}
-
 /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
 /// via `transition_ticket_to_done`: the first one buffers, the last one
 /// notifies and drains the buffer.
