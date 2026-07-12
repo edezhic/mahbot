@@ -21,7 +21,7 @@ use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::is_start_command;
 use mahbot::manager_queue;
-use mahbot::session::{Session, direct_session_key, manager_session_key};
+use mahbot::session::{Session, direct_session_key, session_key};
 use mahbot::util::UnwrapPoison;
 use mahbot::{Agent, Channel, ChannelMessage, Role, Workspace};
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
@@ -108,17 +108,6 @@ async fn handle_option_callback(mut msg: ChannelMessage) {
     // Route directly to Manager session, bypassing resolve_active_role.
     // Enrichment is skipped — synthetic callback text has no media markers or URLs.
     manager_queue::manager_queue().enqueue_user_message(msg.content, ws.name);
-}
-
-/// Build a session key for a given workspace, role, and source channel.
-/// Non-Manager sessions include the channel scope: `{channel}_{user_name}_{role}_{ws}`.
-/// Manager sessions stay channel-agnostic: `manager_{ws_name}`.
-fn build_session_key(ws_name: &str, user_name: &str, role: Role, source_channel: &str) -> String {
-    if role == Role::Manager {
-        manager_session_key(ws_name)
-    } else {
-        direct_session_key(source_channel, user_name, role.as_str(), ws_name)
-    }
 }
 
 /// Run [`bootstrap_mahbot`] and convert panics into `Err` so the dashboard shows
@@ -656,9 +645,8 @@ async fn handle_action_callback(msg: ChannelMessage) {
                 resolve_workspace_for_user(&msg),
                 mahbot::users::resolve_active_role(&msg.user_name),
             );
-            let session_key =
-                build_session_key(&ws.name, &msg.user_name, role, &msg.source_channel);
-            let reply = Session::delete(&session_key).await;
+            let sk = session_key(&msg.source_channel, &msg.user_name, role.as_str(), &ws.name);
+            let reply = Session::delete(&sk).await;
             send_channel_reply(reply, &msg, None).await;
         }
         _ => {

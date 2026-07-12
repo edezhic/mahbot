@@ -414,6 +414,30 @@ pub fn manager_session_key(ws_name: &str) -> String {
     format!("manager_{ws_name}")
 }
 
+/// Construct a session key for a user message, dispatching to the appropriate
+/// key format based on role.
+///
+/// - **Manager** sessions use workspace-scoped keys (`manager_{ws_name}`).
+/// - **Non-Manager** sessions use channel-scoped keys
+///   (`{channel}_{user_name}_{role}_{ws_name}`).
+///
+/// This is a convenience wrapper around [`manager_session_key`] and
+/// [`direct_session_key`] that selects the right format based on
+/// whether `role` is `"manager"`.
+///
+/// # Parameter order
+///
+/// Matches [`direct_session_key`]: `source_channel` first, then `user_name`,
+/// `role`, and `ws_name` last.
+#[must_use]
+pub fn session_key(source_channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
+    if role == "manager" {
+        manager_session_key(ws_name)
+    } else {
+        direct_session_key(source_channel, user_name, role, ws_name)
+    }
+}
+
 /// Construct a session key for Maintainer agents (workspace-scoped, unique per run).
 ///
 /// Format: `maintainer_{ws_name}_{suffix}`
@@ -600,6 +624,29 @@ mod transient_prefix_tests {
             "discovery_",
             "discovery_session_key('ws', 'analyst')",
         );
+    }
+
+    #[test]
+    fn session_key_manager_dispatch() {
+        // Manager role produces a manager-scoped key.
+        let key = session_key("telegram", "alice", "manager", "my-workspace");
+        assert_eq!(key, "manager_my-workspace");
+    }
+
+    #[test]
+    fn session_key_non_manager_dispatch() {
+        // Non-Manager role produces a direct channel-scoped key.
+        let key = session_key("discord", "bob", "engineer", "my-workspace");
+        assert_eq!(key, "discord_bob_engineer_my-workspace");
+    }
+
+    #[test]
+    fn session_key_lowercase_manager() {
+        // The dispatching uses string comparison `"manager"` — verify it works
+        // (matches Role::Manager.as_str() which is lowercase).
+        let key = session_key("gui", "carol", "Manager", "ws");
+        assert_ne!(key, "manager_ws", "capital-M 'Manager' should NOT match");
+        assert_eq!(key, "gui_carol_Manager_ws");
     }
 }
 
