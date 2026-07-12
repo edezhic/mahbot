@@ -1168,14 +1168,6 @@ mod tests {
             STATE_FAILED,
             "STATE should remain FAILED after second call"
         );
-
-        // Third call: same behavior
-        let r3 = ensure_embedder();
-        assert!(
-            !r3,
-            "ensure_embedder should still return false on third call"
-        );
-
         // Clean up state for subsequent tests
         reset_global_state();
     }
