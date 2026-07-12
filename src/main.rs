@@ -493,7 +493,7 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
     let shutdown_token = mahbot::shutdown::shutdown_token();
 
     loop {
-        let mut msg = tokio::select! {
+        let msg = tokio::select! {
             () = shutdown_token.cancelled() => break,
             msg = rx.recv() => match msg {
                 Some(msg) => msg,
@@ -515,7 +515,7 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
             continue;
         }
 
-        if handle_telegram_start_command(&mut msg).await {
+        if handle_telegram_start_command(&msg).await {
             continue;
         }
 
@@ -529,7 +529,7 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
 /// Only Telegram gets the `/start` inline keyboard; GUI and other channels route
 /// `/start` as a normal message (returns false to fall through to
 /// `process_channel_message`).
-async fn handle_telegram_start_command(msg: &mut ChannelMessage) -> bool {
+async fn handle_telegram_start_command(msg: &ChannelMessage) -> bool {
     if !is_start_command(&msg.content) || msg.source_channel != "telegram" {
         return false;
     }
