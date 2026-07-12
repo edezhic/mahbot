@@ -433,7 +433,7 @@ impl OpenAiCompatibleProvider {
                     };
                 };
                 let has_tool_calls = parts.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
-                let (r_plain, r_content, r_details) =
+                let (r_reasoning, r_content, r_details) =
                     reasoning_roundtrip::native_reasoning_triple_for_replay(
                         parts.reasoning.as_ref(),
                         has_tool_calls,
@@ -456,7 +456,8 @@ impl OpenAiCompatibleProvider {
                         })
                         .collect()
                 });
-                let has_reasoning = r_content.is_some() || r_plain.is_some() || r_details.is_some();
+                let has_reasoning =
+                    r_content.is_some() || r_reasoning.is_some() || r_details.is_some();
                 let content = match (&parts.content, has_reasoning, has_tool_calls) {
                     (Some(s), _, _) => Some(MessageContent::Text(s.clone())),
                     (None, true, true) => Some(MessageContent::Null),
@@ -468,7 +469,7 @@ impl OpenAiCompatibleProvider {
                     content,
                     tool_call_id: parts.tool_call_id,
                     tool_calls,
-                    reasoning: r_plain,
+                    reasoning: r_reasoning,
                     reasoning_content: r_content,
                     reasoning_details: r_details,
                 }
