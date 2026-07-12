@@ -32,7 +32,6 @@ use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use directories::UserDirs;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{LazyLock, OnceLock};
@@ -41,10 +40,8 @@ use tracing::{error, info, warn};
 
 // ── File-lock based single-instance guard ─────────────────────────────────
 
-/// Acquire an exclusive lock on the global lock file, failing immediately
-/// if another instance holds it. Retries up to 3 times with 100ms delays
-/// to handle the scheduling window between old process exit and kernel lock
-/// release.
+/// Acquire an exclusive lock on the global lock file, returning an error
+/// if another instance holds it.
 ///
 /// `storage_root` is the directory where `mahbot.lock` is created — typically
 /// [`crate::config::default_config_dir`].
@@ -67,10 +64,7 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
     }
 
     match try_acquire_lock(&lock_path)? {
-        Some(mut file) => {
-            // Write our PID to the lock file for diagnostics only (not used
-            // for alive-checking — the lock itself is authoritative).
-            let _ = write!(file, "{}", std::process::id());
+        Some(file) => {
             info!(path = %lock_path.display(), "Acquired instance lock");
 
             let guard = FlockGuard {
@@ -93,16 +87,14 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 /// Attempt to acquire an exclusive lock on the given file path.
 ///
 /// Opens the file (creating it if necessary) and tries `flock(LOCK_EX|LOCK_NB)`.
-/// Retries up to 3 times with 100ms delays between attempts, to handle the
-/// scheduling window between an old process exiting and the kernel releasing
-/// its lock.
+/// Returns immediately if another process holds the lock.
 ///
 /// # Returns
 ///
 /// - `Ok(Some(file))` — lock acquired successfully. **The caller must keep the
 ///   returned `File` alive for the lifetime of the lock** — dropping it releases
 ///   the kernel-level lock.
-/// - `Ok(None)` — all retries exhausted (another process holds the lock).
+/// - `Ok(None)` — another process holds the lock.
 /// - `Err(...)` — a non-retryable OS error occurred (propagated from [`try_flock`]
 ///   or file open).
 ///
@@ -118,23 +110,16 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 ///   before calling this helper. Calling this helper while already holding the
 ///   lock via a different `File` would fail with `EAGAIN` (the two file
 ///   descriptors are independent from the kernel's perspective).
-/// - **PID writing & error messages**: each caller formats its own success/failure
-///   messages.
+/// - **Error messages**: each caller formats its own success/failure messages.
 fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
-    for attempt in 0..3 {
-        let file = open_lock_file(path)
-            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+    let file = open_lock_file(path)
+        .with_context(|| format!("failed to open lock file {}", path.display()))?;
 
-        if try_flock(&file)? {
-            return Ok(Some(file));
-        }
-
-        if attempt < 2 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+    if try_flock(&file)? {
+        Ok(Some(file))
+    } else {
+        Ok(None)
     }
-
-    Ok(None)
 }
 
 /// Open (or create) the lock file with the standard set of options.
@@ -259,10 +244,6 @@ async fn release_instance_lock() {
 /// Called when [`spawn_new_instance_from`] fails — the current process stays
 /// alive and must re-claim the lock.
 ///
-/// Uses [`tokio::task::spawn_blocking`] to offload the blocking retry loop
-/// (which uses `std::thread::sleep`) to a dedicated blocking thread, avoiding
-/// blocking the Tokio worker thread.
-///
 /// This is a recoverable path: it runs during self-update after all agents
 /// have been cancelled, browser sessions closed, and shutdown signaled.
 async fn reacquire_instance_lock() -> Result<()> {
@@ -270,9 +251,6 @@ async fn reacquire_instance_lock() -> Result<()> {
         .get()
         .context("Instance lock not initialized")?;
 
-    // Extract the lock path while the mutex is held, dropping the guard
-    // before spawn_blocking to avoid holding the tokio Mutex across the
-    // blocking thread boundary.
     let lock_path = {
         let guard = mutex.lock().await;
         if guard.file.is_some() {
@@ -281,10 +259,7 @@ async fn reacquire_instance_lock() -> Result<()> {
         guard.lock_path.clone()
     };
 
-    // Offload blocking retry loop (std::thread::sleep) to a blocking thread.
-    let file = tokio::task::spawn_blocking(move || try_acquire_lock(&lock_path))
-        .await
-        .context("spawn_blocking for lock reacquire failed")??;
+    let file = try_acquire_lock(&lock_path)?;
 
     // Re-acquire mutex and update guard with the re-acquired file.
     let mut guard = mutex.lock().await;
@@ -935,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_acquire_lock_exhaustion() {
+    fn test_try_acquire_lock_held_free() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("mahbot.lock");
 
@@ -943,9 +918,9 @@ mod tests {
         let holder = open_lock_file(&lock_path).unwrap();
         assert!(try_flock(&holder).unwrap(), "First flock should succeed");
 
-        // While the lock is held, try_acquire_lock should exhaust retries.
+        // While the lock is held, try_acquire_lock should return None.
         let result = try_acquire_lock(&lock_path).unwrap();
-        assert!(result.is_none(), "Should exhaust retries when lock is held");
+        assert!(result.is_none(), "Should return None when lock is held");
 
         // Release the lock.
         drop(holder);
