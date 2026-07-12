@@ -212,21 +212,14 @@ enum NotifyPolicy {
 /// Notification side-effect after a successful ticket transition. Parameters
 /// follow the `(source, target)` convention; `source` feeds the buffer entry
 /// when buffering.
-///
-/// `failure_comment` is meaningful only when `target == TicketPhase::Failed` and
-/// `notify == NotifyPolicy::Notify` — it carries the failure detail text that
-/// was already written to the DB atomically with the transition, avoiding a
-/// redundant DB round-trip in [`notify_ticket`]. Callers transitioning to
-/// non-Failed phases should pass `None`.
 async fn dispatch_notification(
     ticket: &Ticket,
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
-    failure_comment: Option<&str>,
 ) {
     match notify {
-        NotifyPolicy::Notify => notify_ticket(ticket, target, failure_comment).await,
+        NotifyPolicy::Notify => notify_ticket(ticket, target).await,
         NotifyPolicy::Buffer => {
             ticket_buffer::push(&ticket.workspace_name, &ticket.id, source, target);
         }
@@ -262,13 +255,6 @@ struct TransitionCtx<'a> {
 /// transition, then dispatches a notification. The closure is responsible for
 /// writing all per-agent/system comments to the database.
 ///
-/// `failure_comment` is an optimization hint for [`dispatch_notification`]: when
-/// this is `Some(...)`, the caller MUST ensure that text has already been
-/// written to the DB by the closure. The helper passes it directly to
-/// `notify_ticket` to avoid a redundant DB round-trip. For non-Failed
-/// transitions (where [`NotifyPolicy::Notify`] is unlikely but not prohibited),
-/// pass `None`.
-///
 /// `pipeline_reservation` is automatically derived from the target phase:
 /// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
 /// (bounce-back transitions get priority re-dispatch over fresh tickets),
@@ -286,11 +272,7 @@ struct TransitionCtx<'a> {
 /// function. Do **not** call this on a path where an agent may still be
 /// executing on the ticket.
 #[must_use]
-async fn with_comment_and_transition<F>(
-    args: TransitionCtx<'_>,
-    failure_comment: Option<&str>,
-    write_comments: F,
-) -> bool
+async fn with_comment_and_transition<F>(args: TransitionCtx<'_>, write_comments: F) -> bool
 where
     F: AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
 {
@@ -325,14 +307,7 @@ where
         return false;
     }
 
-    dispatch_notification(
-        args.ticket,
-        args.source,
-        args.target,
-        args.notify,
-        failure_comment,
-    )
-    .await;
+    dispatch_notification(args.ticket, args.source, args.target, args.notify).await;
     true
 }
 
@@ -353,9 +328,7 @@ where
 ///
 /// The `comment` is a required argument — the compiler guarantees
 /// it is always written (eliminating the previous class of bugs where
-/// `comment: None` silently produced a no-comment transition). The second
-/// tuple element is also used to derive the failure-reason text when
-/// targeting [`TicketPhase::Failed`].
+/// `comment: None` silently produced a no-comment transition).
 ///
 /// Delegates to [`with_comment_and_transition`]; see that function's
 /// `# Correctness` section for the agent-cancellation invariant.
@@ -368,15 +341,7 @@ where
 async fn comment_and_transition(ctx: TransitionCtx<'_>, comment: (&str, &str)) -> bool {
     let ticket = ctx.ticket;
 
-    // When targeting Failed, the second tuple element of `comment` is used as
-    // the failure-reason text for notifications.
-    let failure_comment = if ctx.target == TicketPhase::Failed {
-        Some(comment.1)
-    } else {
-        None
-    };
-
-    with_comment_and_transition(ctx, failure_comment, async |tx| {
+    with_comment_and_transition(ctx, async |tx| {
         let (role, text) = comment;
         BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
         Ok(())
@@ -421,21 +386,17 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
 ///
 /// # Invariant: failure comment before Failed transition
 ///
-/// When `target_phase == TicketPhase::Failed`, the failure details are passed
-/// directly via `failure_comment` instead of re-reading from the database.
-/// The caller MUST ensure `failure_comment` is `Some` when `target == Failed`.
+/// When `target_phase == TicketPhase::Failed`, the failure details are read from
+/// the database (last comment, any role) instead of being passed as a parameter.
+/// The caller MUST ensure the failure comment has already been written to the DB
+/// before calling this function (the transition closure runs first in
+/// [`with_comment_and_transition`], so this invariant holds for all call paths).
 /// The session key (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
 /// must see both notification context and user conversation history in a unified
 /// session. Do NOT change this key or add `manager_` to `TRANSIENT_SESSION_PREFIXES`
 /// — it would either break context continuity or nuke user conversation history.
-///
-/// # Panics
-///
-/// Panics if `target == TicketPhase::Failed` and `failure_comment` is `None`,
-/// indicating a programming error in a caller that failed to provide the
-/// required failure detail text.
-async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase, failure_comment: Option<&str>) {
+async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
             ticket = %ticket.id,
@@ -474,17 +435,18 @@ async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase, failure_comme
     );
 
     if target_phase == TicketPhase::Failed {
-        // failure_comment must be Some when target is Failed — all call paths
-        // that transition to Failed write the comment atomically with the
-        // transition and pass it through the call chain (via
-        // comment_and_transition → dispatch_notification → notify_ticket).
-        // A None here indicates a programming error in a new or modified caller.
-        let failure_details =
-            failure_comment.expect("failure_comment must be Some when target is Failed");
+        // Fetch the last comment (any role) from the database — the failure
+        // comment was already written by the closure before this notification
+        // call. Falls back to a generic message if no comment exists.
+        let failure_details: String = match board().get_comments(&ticket.id).await {
+            Ok(comments) => comments
+                .last().map_or_else(|| "(unknown failure reason)".to_string(), |c| c.content.clone()),
+            Err(_) => "(unknown failure reason)".to_string(),
+        };
 
         let warning = substitute(
             &load_prompt("warning.md"),
-            &[("{{failure_details}}", failure_details)],
+            &[("{{failure_details}}", &failure_details)],
         );
         message.push_str("\n\n");
         message.push_str(&warning);
@@ -1224,7 +1186,7 @@ async fn finalize_commit_and_transition(
         info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
 
         let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-        dispatch_notification(ticket, source, TicketPhase::Done, notify_policy, None).await;
+        dispatch_notification(ticket, source, TicketPhase::Done, notify_policy).await;
     } else {
         warn!(
             ticket = %ticket.id,
@@ -1504,7 +1466,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 notify: NotifyPolicy::Buffer,
                 log_label: "Sanitation",
             },
-            None,
             async |tx| {
                 BoardStore::add_comment_tx(
                     tx,
@@ -1999,7 +1960,6 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             notify: NotifyPolicy::Notify,
             log_label: "Analyst",
         },
-        None,
         async |tx| {
             record_verdict_comments_tx(
                 tx,
@@ -2287,7 +2247,6 @@ async fn process_verifier_verdicts(
             notify,
             log_label: verifier.log_label,
         },
-        failure_comment.as_deref(),
         async |tx| {
             record_verdict_comments_tx(
                 tx,
