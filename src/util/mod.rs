@@ -418,7 +418,7 @@ pub(crate) fn strip_ansi_escapes(input: &str) -> String {
     RE.replace_all(input, "").to_string()
 }
 
-/// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
+/// Redact sensitive values for safe logging. Shows first 4 characters + "*[REDACTED]" suffix.
 /// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).expect("hardcoded regex is valid")
