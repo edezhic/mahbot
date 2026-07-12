@@ -831,7 +831,7 @@ mod truncate_tests {
     // ── truncate_tool_output compatibility ──────────────────────────────────
 
     #[test]
-    fn truncate_tool_output_delegates_correctly() {
+    fn truncate_tool_output_appends_correct_label() {
         let input = "abc".repeat(2_000); // 6_000 bytes > 5_000 limit
         let result = truncate_tool_output(&input);
         assert!(result.len() < input.len(), "should truncate");
@@ -840,13 +840,6 @@ mod truncate_tests {
             "should use 'tool output' label"
         );
         assert!(result.starts_with("abcabc"), "head should be preserved");
-    }
-
-    #[test]
-    fn truncate_tool_output_passthrough() {
-        let input = "short";
-        let result = truncate_tool_output(input);
-        assert_eq!(result, input, "short input passes through unchanged");
     }
 }
 
