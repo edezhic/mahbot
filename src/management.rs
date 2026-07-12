@@ -508,7 +508,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         title = %ticket.title,
         workspace = %ws.name,
         "Dispatching {} ticket",
-        phase_info.role_label,
+        phase_info.log_label,
     );
 
     // Cancel any stale agents for this ticket before dispatching new ones.
@@ -641,7 +641,6 @@ struct PollPhaseInfo {
     /// blocks claims when another pipeline ticket is active in the workspace;
     /// [`Skip`](PipelineCheck::Skip) allows concurrent claims.
     pipeline_check: PipelineCheck,
-    role_label: &'static str,
     /// Which circuit breaker variant to use for phase-guard checks.
     circuit_breaker_kind: CircuitBreakerKind,
     /// Human-readable label used in logs and circuit-breaker messages.
@@ -671,14 +670,12 @@ impl PollPhase {
             Self::BacklogAnalysis => PollPhaseInfo {
                 expected_phase: TicketPhase::Analysis,
                 pipeline_check: PipelineCheck::Skip,
-                role_label: Role::Analyst.as_str(),
                 circuit_breaker_kind: CircuitBreakerKind::General,
                 log_label: "Analyst",
             },
             Self::EngineerDevelopment => PollPhaseInfo {
                 expected_phase: TicketPhase::InDevelopment,
                 pipeline_check: PipelineCheck::Enforce,
-                role_label: Role::Engineer.as_str(),
                 circuit_breaker_kind: CircuitBreakerKind::General,
                 log_label: "Engineer",
             },
@@ -688,21 +685,18 @@ impl PollPhase {
                 // actual QaPassed→InSanitation transition happens via
                 // claim_sanitation in handle_qa_passed.
                 pipeline_check: PipelineCheck::Skip,
-                role_label: Role::Sanitation.as_str(),
                 circuit_breaker_kind: CircuitBreakerKind::Sanitation,
                 log_label: "Sanitation",
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
                 expected_phase: TicketPhase::InDiagnostics,
                 pipeline_check: PipelineCheck::Skip,
-                role_label: DIAGNOSTICS_ROLE,
                 circuit_breaker_kind: CircuitBreakerKind::Diagnostics,
                 log_label: "Diagnostics",
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
                 expected_phase: vi.source_phase,
                 pipeline_check: PipelineCheck::Skip,
-                role_label: vi.role.as_str(),
                 circuit_breaker_kind: CircuitBreakerKind::General,
                 log_label: vi.log_label,
             },
@@ -870,7 +864,7 @@ async fn poll_round() -> anyhow::Result<()> {
                 Err(e) => {
                     error!(
                         workspace = %ws.name,
-                        phase = %info.role_label,
+                        phase = %info.log_label,
                         error = %e,
                         "Claim failed, skipping remaining phases for workspace",
                     );
