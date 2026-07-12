@@ -120,10 +120,6 @@ impl SearchArchivedTicketsTool {
         board: &crate::board::BoardStore,
         top_ids: &[String],
     ) -> Result<String> {
-        if top_ids.is_empty() {
-            return Ok("Search results (top 10, highest score first):\n".to_string());
-        }
-
         let tickets = board
             .get_tickets_by_ids(top_ids, crate::board::LoadComments::No)
             .await?;
