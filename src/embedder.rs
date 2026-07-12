@@ -123,7 +123,7 @@ const STATE_UNINIT: u8 = 0;
 const STATE_LOADING: u8 = 1;
 const STATE_READY: u8 = 2;
 
-/// Embedder initialization failed terminally — see [`STATE_FAILED`] for permanent state.
+/// Embedder initialization failed terminally.
 ///
 /// Once STATE reaches `FAILED` it stays there for the lifetime of the process.
 /// A restart is required to re-attempt initialization.
