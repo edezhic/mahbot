@@ -57,7 +57,7 @@ const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 
 /// Marker for sanitation failure system comments — [`CircuitBreakerKind::Sanitation`]'s
-/// [`trip_count`](CircuitBreakerKind::trip_count) depends on substring matching
+/// [`trip_info`](CircuitBreakerKind::trip_info) depends on substring matching
 /// this value, so it must not drift from comment text.
 const SANITATION_FAILED_MARKER: &str = "Sanitation failed";
 
@@ -126,10 +126,16 @@ impl CircuitBreakerKind {
         }
     }
 
-    /// Extract the relevant trip count from the ticket's comments for
-    /// this breaker variant.
-    fn trip_count(self, comments: &[TicketComment]) -> usize {
-        match self {
+    /// Compute trip information for this breaker variant.
+    ///
+    /// Counts failures matching this variant's criteria from the ticket comments.
+    /// If the count exceeds the variant's threshold, returns
+    /// `Some((count, threshold, message))` where `message` is the formatted
+    /// trip comment string to post on the ticket. Returns `None` if the breaker
+    /// should not trip (count ≤ threshold).
+    fn trip_info(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
+        let threshold = self.threshold();
+        let count = match self {
             Self::General => comments.len(),
             Self::Sanitation => comments
                 .iter()
@@ -141,32 +147,29 @@ impl CircuitBreakerKind {
                     c.role == DIAGNOSTICS_ROLE && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
                 })
                 .count(),
-        }
-    }
+        };
 
-    /// Format the circuit-breaker trip comment body for this breaker variant.
-    fn comment(self, count: usize) -> String {
-        match self {
-            Self::General => {
-                let threshold = self.threshold();
-                format!(
-                    "Failed after {count} comments — ticket has accumulated too many comments \
-                     (circuit breaker, threshold: {threshold}). \
-                     Ticket failed — Manager will triage."
-                )
-            }
-            Self::Sanitation => {
-                let threshold = self.threshold();
-                format!(
-                    "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
-                     (threshold: {threshold})",
-                )
-            }
+        if count <= threshold {
+            return None;
+        }
+
+        let msg = match self {
+            Self::General => format!(
+                "Failed after {count} comments — ticket has accumulated too many comments \
+                 (circuit breaker, threshold: {threshold}). \
+                 Ticket failed — Manager will triage."
+            ),
+            Self::Sanitation => format!(
+                "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
+                 (threshold: {threshold})",
+            ),
             Self::Diagnostics => format!(
                 "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
                  failures. Failing ticket."
             ),
-        }
+        };
+
+        Some((count, threshold, msg))
     }
 }
 
@@ -2081,10 +2084,9 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
     }
 }
 
-/// Shared circuit breaker skeleton: fetch comments, count via
-/// [`CircuitBreakerKind::trip_count`], compare to [`CircuitBreakerKind::threshold`],
-/// add a system comment via [`CircuitBreakerKind::comment`], then transition to
-/// [`TicketPhase::Failed`].
+/// Shared circuit breaker skeleton: fetch comments, evaluate via
+/// [`CircuitBreakerKind::trip_info`], add a system comment via the returned
+/// message string, then transition to [`TicketPhase::Failed`].
 ///
 /// All three concrete breakers (General, Sanitation, Diagnostics) delegate to this
 /// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum. This
@@ -2149,12 +2151,9 @@ async fn try_trip_circuit_breaker(
         }
     };
 
-    let count = kind.trip_count(&comments);
-    let threshold = kind.threshold();
-
-    if count <= threshold {
+    let Some((count, threshold, msg)) = kind.trip_info(&comments) else {
         return false;
-    }
+    };
 
     info!(
         ticket = %ticket.id,
@@ -2172,7 +2171,7 @@ async fn try_trip_circuit_breaker(
             notify: NotifyPolicy::Notify,
             log_label: &format!("{log_label} circuit breaker"),
         },
-        (SYSTEM_ROLE, &kind.comment(count)),
+        (SYSTEM_ROLE, &msg),
     )
     .await
     {

@@ -631,7 +631,7 @@ async fn process_verifier_verdicts_cases() {
 /// - `= CircuitBreakerKind::General.threshold()` comments → does NOT trip
 ///
 /// When the breaker trips, also verifies the trip comment contains the
-/// "circuit breaker" marker as produced by [`CircuitBreakerKind::comment`].
+/// "circuit breaker" marker as produced by [`CircuitBreakerKind::trip_info`].
 #[tokio::test]
 async fn circuit_breaker_comment_boundary() {
     struct Case {
@@ -703,7 +703,7 @@ async fn circuit_breaker_comment_boundary() {
         );
 
         // When the breaker trips, verify the trip comment contains the
-        // circuit breaker marker as produced by `CircuitBreakerKind::comment`.
+        // circuit breaker marker as produced by `CircuitBreakerKind::trip_info`.
         if tripped {
             let comments = board()
                 .get_comments(&ticket_id)
