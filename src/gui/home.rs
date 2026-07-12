@@ -533,14 +533,13 @@ impl HomeState {
         if Some(workspace) != self.resolve_workspace_name().as_deref() {
             return;
         }
-
-        if direction == ChatDirection::Agent && Some(user_name) == self.selected_user.as_deref() {
-            self.typing = false;
-            self.sending = false;
+        if Some(user_name) != self.selected_user.as_deref() {
+            return;
         }
 
-        if direction == ChatDirection::User && Some(user_name) == self.selected_user.as_deref() {
-            self.sending = false;
+        self.sending = false;
+        if direction == ChatDirection::Agent {
+            self.typing = false;
         }
     }
 
