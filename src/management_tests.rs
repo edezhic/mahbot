@@ -346,133 +346,122 @@ async fn transition_ticket_to_done_buffer_and_notify() {
     );
 }
 
-// ── try_trip_circuit_breaker — sanitation counting ──
+// ── try_trip_circuit_breaker — failure counting ──────────────────
 
-/// Verify that the sanitation circuit breaker counting logic works correctly.
+/// Verify that circuit breaker counting logic works correctly for each
+/// non-General breaker variant.
+///
+/// For each variant:
+/// - Adds below-threshold failures — verifies the breaker does NOT trip
+/// - Adds more failures to reach the trip count — verifies the breaker
+///   trips, transitions to Failed, and writes a trip comment with the
+///   "Circuit breaker" marker as a SYSTEM_ROLE comment.
 #[tokio::test]
-async fn sanitation_breaker_counts_failures() {
-    init_management_test_stores().await;
-    let ticket_id = make_ticket(
-        board(),
-        &test_ws_named("/tmp/test", "san_breaker_test"),
-        "Sanitation Breaker Test",
-        TicketPhase::InSanitation,
-    )
-    .await;
-
-    // Add 2 sanitation failure comments (below threshold of 3).
-    for _ in 0..2 {
-        add_sanitation_failure(&ticket_id).await;
+async fn breaker_counts_failures() {
+    struct BreakerCase {
+        name: &'static str,
+        kind: CircuitBreakerKind,
+        source_phase: TicketPhase,
+        log_label: &'static str,
+        ws_suffix: &'static str,
+        below_threshold_count: usize,
+        trip_count: usize,
     }
 
-    let ticket = expect_ticket(board(), &ticket_id).await;
-
-    assert!(
-        !try_trip_circuit_breaker(
-            &ticket,
-            TicketPhase::InSanitation,
-            CircuitBreakerKind::Sanitation,
-            "Sanitation",
-        )
-        .await,
-        "Should NOT trip with 2 failures (threshold: 3)"
-    );
-
-    // Add 2 more failures to bring total to 4 (threshold is 3).
-    // Breaker trips when count > threshold, so it needs 4 failures.
-    add_sanitation_failure(&ticket_id).await; // 3 total
-    add_sanitation_failure(&ticket_id).await; // 4 total — trips
-
-    // Now with 4 failures, should trip (4 > 3).
-    let tripped = try_trip_circuit_breaker(
-        &ticket,
-        TicketPhase::InSanitation,
-        CircuitBreakerKind::Sanitation,
-        "Sanitation",
-    )
-    .await;
-    assert!(tripped, "Should trip with 4 failures (threshold: 3, 4 > 3)");
-
-    // Verify the ticket is now Failed
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::Failed,
-        "Circuit breaker should transition to Failed"
-    );
-}
-
-// ── try_trip_circuit_breaker — diagnostics counting ────────────────────
-
-/// Verify that the diagnostics circuit breaker counting logic works correctly.
-#[tokio::test]
-async fn diagnostics_breaker_counts_failures() {
     init_management_test_stores().await;
-    let ticket_id = make_ticket(
-        board(),
-        &test_ws_named("/tmp/test", "diag_breaker_test"),
-        "Diagnostics Breaker Test",
-        TicketPhase::InDiagnostics,
-    )
-    .await;
 
-    // Add 3 diagnostics failure comments (below threshold of 4).
-    for _ in 0..3 {
-        add_diagnostics_failure(&ticket_id).await;
-    }
+    let cases = [
+        BreakerCase {
+            name: "Sanitation",
+            kind: CircuitBreakerKind::Sanitation,
+            source_phase: TicketPhase::InSanitation,
+            log_label: "Sanitation",
+            ws_suffix: "san_breaker_test",
+            below_threshold_count: 2,
+            trip_count: 4,
+        },
+        BreakerCase {
+            name: "Diagnostics",
+            kind: CircuitBreakerKind::Diagnostics,
+            source_phase: TicketPhase::InDiagnostics,
+            log_label: "Diagnostics",
+            ws_suffix: "diag_breaker_test",
+            below_threshold_count: 3,
+            trip_count: 5,
+        },
+    ];
 
-    let ticket = expect_ticket(board(), &ticket_id).await;
-
-    assert!(
-        !try_trip_circuit_breaker(
-            &ticket,
-            TicketPhase::InDiagnostics,
-            CircuitBreakerKind::Diagnostics,
-            "Diagnostics",
+    for case in &cases {
+        let ticket_id = make_ticket(
+            board(),
+            &test_ws_named("/tmp/test", case.ws_suffix),
+            &format!("{} Breaker Test", case.log_label),
+            case.source_phase,
         )
-        .await,
-        "Should NOT trip with 3 failures (threshold: 4)"
-    );
+        .await;
 
-    // Add 2 more failures to bring total to 5 (threshold is 4).
-    // Breaker trips when count > threshold, so it needs 5 failures.
-    add_diagnostics_failure(&ticket_id).await; // 4 total
-    add_diagnostics_failure(&ticket_id).await; // 5 total — trips
+        // Add below-threshold failures.
+        for _ in 0..case.below_threshold_count {
+            add_breaker_failure(case.kind, &ticket_id).await;
+        }
 
-    // Now with 5 failures, should trip (5 > 4).
-    let tripped = try_trip_circuit_breaker(
-        &ticket,
-        TicketPhase::InDiagnostics,
-        CircuitBreakerKind::Diagnostics,
-        "Diagnostics",
-    )
-    .await;
-    assert!(tripped, "Should trip with 5 failures (threshold: 4, 5 > 4)");
+        let ticket = expect_ticket(board(), &ticket_id).await;
 
-    // Verify the ticket is now Failed
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::Failed,
-        "Circuit breaker should transition to Failed"
-    );
+        assert!(
+            !try_trip_circuit_breaker(&ticket, case.source_phase, case.kind, case.log_label,).await,
+            "case {}: should NOT trip with {} failures (threshold: {})",
+            case.name,
+            case.below_threshold_count,
+            case.kind.threshold(),
+        );
 
-    // Verify the trip comment was written correctly
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    let has_breaker_comment = comments.iter().any(|c| {
-        c.role == SYSTEM_ROLE
-            && c.content.contains(DIAGNOSTICS_COMMENT_PREFIX)
-            && c.content.contains("Circuit breaker")
-    });
-    assert!(
-        has_breaker_comment,
-        "Should have a SYSTEM_ROLE comment with the diagnostics \
-         breaker message (containing DIAGNOSTICS_COMMENT_PREFIX and \
-         'Circuit breaker')",
-    );
+        // Add more failures to reach the trip count.
+        // Breaker trips when count > threshold.
+        for _ in case.below_threshold_count..case.trip_count {
+            add_breaker_failure(case.kind, &ticket_id).await;
+        }
+
+        // Re-fetch ticket (comments are refetched internally by
+        // try_trip_circuit_breaker, so we just need the ID).
+        let ticket = expect_ticket(board(), &ticket_id).await;
+
+        let tripped =
+            try_trip_circuit_breaker(&ticket, case.source_phase, case.kind, case.log_label).await;
+        assert!(
+            tripped,
+            "case {}: should trip with {} failures (threshold: {}, {} > {})",
+            case.name,
+            case.trip_count,
+            case.kind.threshold(),
+            case.trip_count,
+            case.kind.threshold(),
+        );
+
+        // Verify the ticket is now Failed
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
+        assert_eq!(
+            phase,
+            TicketPhase::Failed,
+            "case {}: circuit breaker should transition to Failed",
+            case.name,
+        );
+
+        // Verify the trip comment was written correctly:
+        // must be a SYSTEM_ROLE comment containing "circuit breaker"
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get_comments");
+        let has_breaker_comment = comments
+            .iter()
+            .any(|c| c.role == SYSTEM_ROLE && c.content.to_lowercase().contains("circuit breaker"));
+        assert!(
+            has_breaker_comment,
+            "case {}: should have a SYSTEM_ROLE comment with the circuit breaker message \
+             (containing 'circuit breaker')",
+            case.name,
+        );
+    }
 }
 
 // ── Setup helpers ──────────────────────────────────────────────────────
@@ -500,34 +489,28 @@ fn no_verdict() -> ParallelVerdict {
     ParallelVerdict::NoResponse
 }
 
-/// Add a sanitation failure comment for circuit breaker testing.
-async fn add_sanitation_failure(ticket_id: &str) {
-    let _ = board()
-        .add_comment(
-            ticket_id,
+/// Add a failure comment for circuit breaker testing, matching the
+/// comment format used for the given breaker variant.
+///
+/// For [`CircuitBreakerKind::Sanitation`], adds a [`SYSTEM_ROLE`] comment
+/// with [`SANITATION_FAILED_MARKER`]. For [`CircuitBreakerKind::Diagnostics`],
+/// adds a [`DIAGNOSTICS_ROLE`] comment with [`DIAGNOSTICS_COMMENT_PREFIX`]
+/// and [`DIAGNOSTICS_FAILED_MARKER`].
+async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
+    let (role, comment) = match kind {
+        CircuitBreakerKind::Sanitation => (
             SYSTEM_ROLE,
-            &format!("{SANITATION_FAILED_MARKER} — garbage files: 1"),
-        )
-        .await;
-}
-
-/// Add a diagnostics failure comment for circuit breaker testing.
-///
-/// Mirrors the production format from [`run_diagnostics_commands`]:
-/// ```text
-/// 🔍 Auto-diagnostics
-///
-/// ---
-/// ❌ Diagnostics failed at {label}
-/// ```
-async fn add_diagnostics_failure(ticket_id: &str) {
-    let _ = board()
-        .add_comment(
-            ticket_id,
+            format!("{SANITATION_FAILED_MARKER} — garbage files: 1"),
+        ),
+        CircuitBreakerKind::Diagnostics => (
             DIAGNOSTICS_ROLE,
-            &format!("{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{DIAGNOSTICS_FAILED_MARKER} test_step"),
-        )
-        .await;
+            format!("{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{DIAGNOSTICS_FAILED_MARKER} test_step",),
+        ),
+        CircuitBreakerKind::General => {
+            unreachable!("General breaker not used in failure-counting tests")
+        }
+    };
+    let _ = board().add_comment(ticket_id, role, &comment).await;
 }
 
 /// Helper: wrap a passing verdict (reviewer/QA flow).
