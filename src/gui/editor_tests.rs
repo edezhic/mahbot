@@ -2144,43 +2144,63 @@ fn make_editor_with_tabs(count: usize, active: usize) -> EditorState {
 }
 
 #[test]
-fn test_switch_tab_relative_single_tab_returns_none() {
-    // With only one tab, switching tabs is a no-op (guard clause returns early).
-    let mut state = make_editor_with_tabs(1, 0);
-    let _ = state.switch_tab_relative(TabDirection::Next);
-    assert_eq!(state.active_tab_index, 0);
-
-    let mut state = make_editor_with_tabs(1, 0);
-    let _ = state.switch_tab_relative(TabDirection::Prev);
-    assert_eq!(state.active_tab_index, 0);
-}
-
-#[test]
-fn test_switch_tab_relative_next_wraps_to_first() {
-    // From the last tab, Next wraps to the first tab.
-    let mut state = make_editor_with_tabs(3, 2);
-    let _ = state.switch_tab_relative(TabDirection::Next);
-    assert_eq!(state.active_tab_index, 0);
-}
-
-#[test]
-fn test_switch_tab_relative_prev_wraps_to_last() {
-    // From the first tab, Prev wraps to the last tab.
-    let mut state = make_editor_with_tabs(3, 0);
-    let _ = state.switch_tab_relative(TabDirection::Prev);
-    assert_eq!(state.active_tab_index, 2);
-}
-
-#[test]
-fn test_switch_tab_relative_middle() {
-    // From the middle tab, Next goes forward and Prev goes backward.
-    let mut state = make_editor_with_tabs(3, 1);
-    let _ = state.switch_tab_relative(TabDirection::Next);
-    assert_eq!(state.active_tab_index, 2);
-
-    let mut state = make_editor_with_tabs(3, 1);
-    let _ = state.switch_tab_relative(TabDirection::Prev);
-    assert_eq!(state.active_tab_index, 0);
+fn test_switch_tab_relative() {
+    struct Case {
+        name: &'static str,
+        tabs: usize,
+        start: usize,
+        direction: TabDirection,
+        expected: usize,
+    }
+    let cases: &[Case] = &[
+        Case {
+            name: "single tab next",
+            tabs: 1,
+            start: 0,
+            direction: TabDirection::Next,
+            expected: 0,
+        },
+        Case {
+            name: "single tab prev",
+            tabs: 1,
+            start: 0,
+            direction: TabDirection::Prev,
+            expected: 0,
+        },
+        Case {
+            name: "next wraps to first",
+            tabs: 3,
+            start: 2,
+            direction: TabDirection::Next,
+            expected: 0,
+        },
+        Case {
+            name: "prev wraps to last",
+            tabs: 3,
+            start: 0,
+            direction: TabDirection::Prev,
+            expected: 2,
+        },
+        Case {
+            name: "middle next",
+            tabs: 3,
+            start: 1,
+            direction: TabDirection::Next,
+            expected: 2,
+        },
+        Case {
+            name: "middle prev",
+            tabs: 3,
+            start: 1,
+            direction: TabDirection::Prev,
+            expected: 0,
+        },
+    ];
+    for case in cases {
+        let mut state = make_editor_with_tabs(case.tabs, case.start);
+        let _ = state.switch_tab_relative(case.direction);
+        assert_eq!(state.active_tab_index, case.expected, "{}", case.name);
+    }
 }
 
 #[test]
