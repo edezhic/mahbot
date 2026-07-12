@@ -541,6 +541,8 @@ pub async fn run_management() {
 fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let phase_info = phase.info();
     let expected_phase = phase_info.expected_phase;
+    let kind = phase_info.circuit_breaker_kind;
+    let log_label = phase_info.log_label;
 
     info!(
         ticket = %ticket.id,
@@ -558,13 +560,12 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     tokio::spawn(async move {
         // ── Pre-flight guard checks ──
         //
-        // Adding a new PollPhase variant requires deciding its
-        // circuit_breaker_kind() (enforced by the match in
-        // circuit_breaker_kind()).
+        // Adding a new PollPhase variant requires adding a row in
+        // PollPhase::info() which now also carries the circuit_breaker_kind
+        // and log_label fields (enforced by the single match in info()).
         //
         // The post-agent is_ticket_in_phase check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
-        let (kind, log_label) = phase.circuit_breaker_kind();
         if !is_ticket_in_phase(&ticket.id, expected_phase).await {
             return;
         }
@@ -667,8 +668,9 @@ const QA_VI: VerifierInfo = VerifierInfo {
 
 /// Static metadata for a single poll phase.
 ///
-/// All phase-specific data lives here, sourced from the single [`PollPhase::info()`]
-/// match — adding any phase requires one row in that match.
+/// All phase-specific data lives here — including the circuit-breaker kind and
+/// log label — sourced from the single [`PollPhase::info()`] match. Adding any
+/// phase requires one row in that match.
 #[derive(Copy, Clone)]
 struct PollPhaseInfo {
     expected_phase: TicketPhase,
@@ -677,6 +679,11 @@ struct PollPhaseInfo {
     /// [`Skip`](PipelineCheck::Skip) allows concurrent claims.
     pipeline_check: PipelineCheck,
     role_label: &'static str,
+    /// Which circuit breaker variant to use for phase-guard checks.
+    circuit_breaker_kind: CircuitBreakerKind,
+    /// Human-readable label used in logs and circuit-breaker messages.
+    /// PascalCase for roles ("Engineer", "Analyst"), "QA" for the QA verifier.
+    log_label: &'static str,
 }
 
 /// A single poll phase: maps a `from → to` ticket transition to the agent
@@ -702,11 +709,15 @@ impl PollPhase {
                 expected_phase: TicketPhase::Analysis,
                 pipeline_check: PipelineCheck::Skip,
                 role_label: Role::Analyst.as_str(),
+                circuit_breaker_kind: CircuitBreakerKind::General,
+                log_label: "Analyst",
             },
             Self::EngineerDevelopment => PollPhaseInfo {
                 expected_phase: TicketPhase::InDevelopment,
                 pipeline_check: PipelineCheck::Enforce,
                 role_label: Role::Engineer.as_str(),
+                circuit_breaker_kind: CircuitBreakerKind::General,
+                log_label: "Engineer",
             },
             Self::SanitationCheck => PollPhaseInfo {
                 expected_phase: TicketPhase::InSanitation,
@@ -715,31 +726,23 @@ impl PollPhase {
                 // claim_sanitation in handle_qa_passed.
                 pipeline_check: PipelineCheck::Skip,
                 role_label: Role::Sanitation.as_str(),
+                circuit_breaker_kind: CircuitBreakerKind::Sanitation,
+                log_label: "Sanitation",
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
                 expected_phase: TicketPhase::InDiagnostics,
                 pipeline_check: PipelineCheck::Skip,
                 role_label: DIAGNOSTICS_ROLE,
+                circuit_breaker_kind: CircuitBreakerKind::Diagnostics,
+                log_label: "Diagnostics",
             },
             Self::VerifierCheck(vi) => PollPhaseInfo {
                 expected_phase: vi.source_phase,
                 pipeline_check: PipelineCheck::Skip,
                 role_label: vi.role.as_str(),
+                circuit_breaker_kind: CircuitBreakerKind::General,
+                log_label: vi.log_label,
             },
-        }
-    }
-
-    /// Returns the circuit breaker kind and log label for this phase.
-    ///
-    /// The log label matches the current convention (PascalCase for roles, "QA"
-    /// for the QA verifier) to preserve log output consistency.
-    fn circuit_breaker_kind(self) -> (CircuitBreakerKind, &'static str) {
-        match self {
-            Self::BacklogAnalysis => (CircuitBreakerKind::General, "Analyst"),
-            Self::EngineerDevelopment => (CircuitBreakerKind::General, "Engineer"),
-            Self::SanitationCheck => (CircuitBreakerKind::Sanitation, "Sanitation"),
-            Self::DiagnosticsCheck => (CircuitBreakerKind::Diagnostics, "Diagnostics"),
-            Self::VerifierCheck(vi) => (CircuitBreakerKind::General, vi.log_label),
         }
     }
 }
