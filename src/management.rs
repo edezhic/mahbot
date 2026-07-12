@@ -439,8 +439,10 @@ async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
         // comment was already written by the closure before this notification
         // call. Falls back to a generic message if no comment exists.
         let failure_details: String = match board().get_comments(&ticket.id).await {
-            Ok(comments) => comments
-                .last().map_or_else(|| "(unknown failure reason)".to_string(), |c| c.content.clone()),
+            Ok(comments) => comments.last().map_or_else(
+                || "(unknown failure reason)".to_string(),
+                |c| c.content.clone(),
+            ),
             Err(_) => "(unknown failure reason)".to_string(),
         };
 

@@ -1,6 +1,5 @@
-//! Dashboard theme — ports color constants from web/src/index.css (Flexoki dark theme),
-//! web/src/roleConfig.ts (10 role badge colors), Board.tsx STATUS_STYLE (16 ticket status
-//! colors), Logs.tsx level colors, and Workspaces.tsx status colors.
+//! Dashboard theme — defines the Flexoki dark color palette, ticket phase colors, role badge
+//! colors, log level colors, and workspace status colors for the native Iced GUI.
 
 use iced::Background;
 use iced::Color;
@@ -56,7 +55,7 @@ pub const STATUS_SUCCESS: Color = Color::from_rgb(0.0, 0.902, 0.541); // #00e68a
 pub const STATUS_WARNING: Color = Color::from_rgb(1.0, 0.667, 0.0); // #ffaa00
 pub const STATUS_ERROR: Color = Color::from_rgb(1.0, 0.267, 0.4); // #ff4466
 
-// ── Log level colors (from Logs.tsx) ─────────────────────────────
+// ── Log level colors ──────────────────────────────────────────────
 
 #[must_use]
 pub fn log_level_color(level: &str) -> (Color, Color) {
@@ -176,8 +175,8 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
     iced::widget::markdown::Settings::with_text_size(13, style)
 }
 
-// ── Ticket status badge colors (from Board.tsx STATUS_STYLE) ─────
-// 15 TicketPhase variants, exhaustively matched — no catch-all.
+// ── Ticket phase colors ───────────────────────────────────────────
+// 16 TicketPhase variants, exhaustively matched — no catch-all.
 
 #[must_use]
 pub const fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
@@ -283,7 +282,7 @@ pub fn format_timestamp(ts: &str) -> String {
     }
 }
 
-// ── Workspace status colors (from Workspaces.tsx) ────────────────
+// ── Workspace status colors ───────────────────────────────────────
 
 #[must_use]
 pub fn workspace_status_color(status: &str) -> (Color, Color) {
