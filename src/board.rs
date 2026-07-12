@@ -494,7 +494,8 @@ impl std::str::FromStr for TicketPhase {
 
 /// Bundles a SQL mutation statement with its parameters and ticket id.
 /// Returned by [`BoardStore::build_transition_sql`]; executed via
-/// [`PreparedUpdate::execute_tx`] or [`PreparedUpdate::execute_and_cancel`].
+/// [`PreparedUpdate::execute`], [`PreparedUpdate::execute_tx`] or
+/// [`PreparedUpdate::execute_and_cancel`].
 struct PreparedUpdate {
     sql: String,
     params: Vec<turso::Value>,
@@ -512,6 +513,17 @@ impl PreparedUpdate {
         Ok(())
     }
 
+    /// Execute the update without cancelling any agent.
+    ///
+    /// Use this for post-agent operations where the caller knows no agent
+    /// is running and the implicit cancellation of
+    /// [`execute_and_cancel`](Self::execute_and_cancel) is unnecessary.
+    async fn execute(self, conn: &turso::Connection) -> Result<()> {
+        let rows = conn.execute(&self.sql, self.params).await?;
+        BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
+        Ok(())
+    }
+
     /// Execute the update, verify it affected a row, then cancel any agent
     /// registered on this ticket.
     ///
@@ -520,7 +532,10 @@ impl PreparedUpdate {
     ///
     /// # When NOT to use
     ///
-    /// Do **not** use this helper for operations with different semantics:
+    /// Do **not** use this helper for operations where cancellation is
+    /// unnecessary or has different semantics. Prefer [`execute`](Self::execute)
+    /// for simple post-agent updates that do not need stale-agent cancellation.
+    /// Additionally, avoid this helper for:
     /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
     /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
     ///   before commit via a different pattern.
@@ -1175,8 +1190,14 @@ impl BoardStore {
     /// Cancels any running agents registered on this ticket as a safety-in-depth
     /// measure against stale assignments. For set operations, callers typically
     /// set the assignee before spawning an agent, so the cancel is normally a
-    /// no-op. For clear operations, this ensures no stale agent remains bound to
-    /// a now-unassigned ticket.
+    /// no-op.
+    ///
+    /// ## When to use [`clear_assigned_to_no_cancel`](Self::clear_assigned_to_no_cancel)
+    ///
+    /// If you are clearing the assignee (`assigned_to = None`) and know that no
+    /// agent is running (e.g., post-agent cleanup), prefer
+    /// [`clear_assigned_to_no_cancel`](Self::clear_assigned_to_no_cancel) to avoid
+    /// the misleading cancellation side-effect.
     pub async fn set_assigned_to(&self, ticket_id: &str, assigned_to: Option<&str>) -> Result<()> {
         let prepared = Self::build_ticket_update_with_updated_at(
             "assigned_to = ?",
@@ -1184,6 +1205,24 @@ impl BoardStore {
             ticket_id,
         );
         prepared.execute_and_cancel(&self.conn).await
+    }
+
+    /// Clear the assignee for a ticket **without** cancelling any running agent.
+    ///
+    /// This is the safe choice for post-agent operations (e.g., after an agent
+    /// has already finished) where no agent is running and the cancellation
+    /// side-effect of [`set_assigned_to`](Self::set_assigned_to) would be
+    /// misleading.
+    ///
+    /// To set a new assignee (with stale-agent cancellation), use
+    /// [`set_assigned_to`](Self::set_assigned_to).
+    pub async fn clear_assigned_to_no_cancel(&self, ticket_id: &str) -> Result<()> {
+        let prepared = Self::build_ticket_update_with_updated_at(
+            "assigned_to = ?",
+            vec![Value::from(None::<&str>)],
+            ticket_id,
+        );
+        prepared.execute(&self.conn).await
     }
 
     /// Transactional variant of [`set_assigned_to`](Self::set_assigned_to) —

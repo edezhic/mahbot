@@ -79,17 +79,9 @@ fn board() -> &'static BoardStore {
 /// transitioning the ticket. Errors are logged but not propagated —
 /// callers are already on an error path and should not fail again here.
 ///
-/// ## Agent cancellation side-effect
-///
-/// [`BoardStore::set_assigned_to`](crate::board::BoardStore::set_assigned_to)
-/// implicitly cancels any running agent registered for this ticket via
-/// `execute_and_cancel` → [`AGENT_REGISTRY.cancel_by_ticket_id`].
-/// At all current call sites the associated agent has already completed,
-/// so the cancel is always a no-op. This is safe because:
-///
-/// 1. **post-run phase checks** — the agent finished (we just got `response`)
-/// 2. **`comment_and_transition` failures** — the agent finished, the
-///    transition step failed (not the agent itself)
+/// Uses [`BoardStore::clear_assigned_to_no_cancel`] — unlike
+/// [`BoardStore::set_assigned_to`], this does NOT cancel any running agent.
+/// All call sites are post-agent so there is no agent to cancel.
 ///
 /// ## TOCTOU race
 ///
@@ -97,7 +89,7 @@ fn board() -> &'static BoardStore {
 /// clear. That's very low probability and the same race is accepted in
 /// [`record_sanitation_failure`].
 async fn clear_assigned_to(ticket_id: &str, context: &str) {
-    if let Err(e) = board().set_assigned_to(ticket_id, None).await {
+    if let Err(e) = board().clear_assigned_to_no_cancel(ticket_id).await {
         warn!(
             ticket = %ticket_id,
             error = %e,
@@ -1929,10 +1921,9 @@ async fn record_verdict_comments_tx(
 ///   field. The agent registry entries for these parallel agents have already finished
 ///   or been cancelled by the explicit [`AGENT_REGISTRY.cancel_by_ticket_id`] call
 ///   at the top of this function.
-/// * **Calling `clear_assigned_to` would be actively harmful** — it triggers
-///   [`AGENT_REGISTRY.cancel_by_ticket_id`] as a side-effect (see the docs on
-///   [`clear_assigned_to`]), which could cancel the agent that the new phase has
-///   already assigned to this ticket.
+/// * **TOCTOU race** — calling [`clear_assigned_to`] would unnecessarily risk
+///   overwriting an assignee that a concurrent claim set between the phase check and
+///   the clear. Since `assigned_to` is already `NULL`, there is nothing to gain.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     // Cancel any stale agents for this ticket before dispatching new ones
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
@@ -2344,8 +2335,7 @@ async fn process_verifier_verdicts(
 ///
 /// See [`dispatch_backlog_analysts`] for the full rationale — the same
 /// structural reasons apply here (parallel agents via [`run_parallel_agents`],
-/// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim,
-/// and [`clear_assigned_to`]'s cancellation side-effect would be harmful).
+/// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim).
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
     // Cancel any stale agents for this ticket before dispatching new ones
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
