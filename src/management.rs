@@ -117,7 +117,8 @@ enum CircuitBreakerKind {
 
 impl CircuitBreakerKind {
     /// Returns the trip-count threshold for this breaker variant.
-    /// The breaker trips when `trip_count > threshold()`.
+    /// The breaker trips when [`trip_info`](CircuitBreakerKind::trip_info) returns
+    /// `Some` (the count exceeds this threshold).
     const fn threshold(self) -> usize {
         match self {
             Self::General => 30,
@@ -2103,7 +2104,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
 ///   are never counted.
 ///
-/// See each variant's [`CircuitBreakerKind::trip_count`] implementation for
+/// See each variant's [`CircuitBreakerKind::trip_info`] implementation for
 /// the exact filtering logic.
 ///
 /// # Return value
