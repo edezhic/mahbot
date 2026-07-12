@@ -1663,28 +1663,8 @@ mod tests {
     fn make_diff_with_tree() -> DiffState {
         let mut state = DiffState::new();
         state.diff_files = vec![
-            DiffFile {
-                dfile: crate::diff_parse::DiffFile::new(
-                    "src/main.rs".to_owned(),
-                    Vec::new(),
-                    crate::diff_parse::DiffFileStatus::Modified,
-                ),
-                old_highlights: None,
-                new_highlights: None,
-                add_count: 0,
-                remove_count: 0,
-            },
-            DiffFile {
-                dfile: crate::diff_parse::DiffFile::new(
-                    "src/lib.rs".to_owned(),
-                    Vec::new(),
-                    crate::diff_parse::DiffFileStatus::Modified,
-                ),
-                old_highlights: None,
-                new_highlights: None,
-                add_count: 0,
-                remove_count: 0,
-            },
+            make_test_file("src/main.rs", 0, 0),
+            make_test_file("src/lib.rs", 0, 0),
         ];
         state.file_tree.nodes = build_tree(&state.diff_files);
         state.file_tree.rebuild_visible();
@@ -2201,37 +2181,15 @@ mod tests {
     }
 
     fn make_binary_file(path: &str) -> DiffFile {
-        DiffFile {
-            dfile: crate::diff_parse::DiffFile {
-                is_binary: true,
-                ..crate::diff_parse::DiffFile::new(
-                    path.to_string(),
-                    Vec::new(),
-                    crate::diff_parse::DiffFileStatus::Modified,
-                )
-            },
-            old_highlights: None,
-            new_highlights: None,
-            add_count: 0,
-            remove_count: 0,
-        }
+        let mut file = make_test_file(path, 0, 0);
+        file.is_binary = true;
+        file
     }
 
     fn make_too_large_file(path: &str) -> DiffFile {
-        DiffFile {
-            dfile: crate::diff_parse::DiffFile {
-                too_large_size: Some(5_000_000),
-                ..crate::diff_parse::DiffFile::new(
-                    path.to_string(),
-                    Vec::new(),
-                    crate::diff_parse::DiffFileStatus::Modified,
-                )
-            },
-            old_highlights: None,
-            new_highlights: None,
-            add_count: 0,
-            remove_count: 0,
-        }
+        let mut file = make_test_file(path, 0, 0);
+        file.too_large_size = Some(5_000_000);
+        file
     }
 
     #[allow(clippy::too_many_lines)]
