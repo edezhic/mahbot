@@ -57,22 +57,8 @@ const MAX_STATS_ARG_LENGTH: usize = 500;
 /// Only successfully-executed tools with a defined [`Tool::media_marker`] are
 /// inspected. Non-media tools and failed outcomes are silently skipped.
 ///
-/// # Parse rules
-///
-/// * The output is scanned using [`MEDIA_MARKER_RE`] for markers matching the
-///   tool's media kind (e.g. `IMAGE` for a tool returning `[IMAGE:`).
-/// * Only markers whose `kind` matches the tool's [`Tool::media_marker`] prefix
-///   are extracted.
-/// * The regex inherently requires a closing `]` and a non-empty `path` group,
-///   so malformed markers (e.g. `[IMAGE:bogus`) or empty paths (`[IMAGE:]`) are
-///   correctly skipped.
-///
-/// # Pre-existing limitation
-///
-/// File paths containing `]` would be truncated because the regex path group
-/// is `[^\]]+` (one or more characters that are not `]`). All media-generation
-/// tools produce paths that never contain `]` in practice (temporary files with
-/// safe names), so this is not a concern.
+/// Limitation: file paths containing `]` are truncated by the regex — not a
+/// concern in practice, as media-generation tools produce temporary files with safe names.
 fn extract_media_from_outcomes(
     tools: &[Box<dyn Tool>],
     tool_calls: &[ToolCall],
