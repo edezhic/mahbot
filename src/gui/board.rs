@@ -39,7 +39,7 @@ pub enum BoardMessage {
     RefreshError(String),
     TicketDetails(Box<Ticket>),
     DetailError(String),
-    PerformAction(String, String), // ticket_id, new_status
+    PerformAction(String, String), // ticket_id, new_phase
     ActionResult(Result<(), String>),
 
     /// Open the ticket detail modal.
@@ -240,13 +240,13 @@ impl BoardState {
 
     /// Build a status badge pill for a ticket phase.
     /// Used on ticket cards and in the modal detail header.
-    /// Derives badge colours from [`theme::ticket_status_color`].
+    /// Derives badge colours from [`theme::ticket_phase_color`].
     fn status_badge<'a>(
         phase: TicketPhase,
         text_size: u32,
         padding: [u16; 2],
     ) -> Element<'a, BoardMessage> {
-        let (badge_bg, badge_text) = theme::ticket_status_color(phase);
+        let (badge_bg, badge_text) = theme::ticket_phase_color(phase);
         container(text(phase.display_name()).size(text_size).color(badge_text))
             .padding(padding)
             .style(move |_theme: &iced::Theme| container::Style {
@@ -365,14 +365,14 @@ impl BoardState {
                 self.selected_loading = false;
                 Task::none()
             }
-            BoardMessage::PerformAction(ticket_id, new_status) => {
+            BoardMessage::PerformAction(ticket_id, new_phase) => {
                 self.action_loading = Some(ticket_id.clone());
                 Task::perform(
                     async move {
                         let board = crate::board::store();
-                        let phase: TicketPhase = new_status
+                        let phase: TicketPhase = new_phase
                             .parse()
-                            .map_err(|_| format!("Invalid status: {new_status}"))?;
+                            .map_err(|_| format!("Invalid phase: {new_phase}"))?;
                         board
                             .transition_to(&ticket_id, None, phase, None)
                             .await

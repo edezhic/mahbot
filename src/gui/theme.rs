@@ -179,7 +179,7 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
 // 16 TicketPhase variants, exhaustively matched — no catch-all.
 
 #[must_use]
-pub const fn ticket_status_color(phase: TicketPhase) -> (Color, Color) {
+pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
         Analysis, Backlog, Cancelled, DiagnosticsDone, Done, Failed, InDevelopment, InDiagnostics,
         InQa, InReview, InSanitation, Planning, QaPassed, ReadyForDevelopment, Reviewed,

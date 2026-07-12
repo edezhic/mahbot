@@ -145,20 +145,20 @@ impl Tool for UpdateTicketTool {
                     "type": "string",
                     "description": "The ticket id"
                 },
-                "status": {
+                "phase": {
                     "type": "string",
-                    "description": "New status for the ticket. Valid manual transitions: backlog (return to queue), ready_for_development (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete), qa_passed (advance failed ticket past failed — only valid from 'failed' phase for Manager triage of minor issues). Do NOT manually set other pipeline-managed phases (analysis, planning, in_development, in_diagnostics, diagnostics_done, in_review, reviewed, in_qa) — the board poller handles these automatically and manual transitions will interfere with running agents."
+                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), ready_for_development (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete), qa_passed (advance failed ticket past failed — only valid from 'failed' phase for Manager triage of minor issues). Do NOT manually set other pipeline-managed phases (analysis, planning, in_development, in_diagnostics, diagnostics_done, in_review, reviewed, in_qa) — the board poller handles these automatically and manual transitions will interfere with running agents."
                 }
             }),
-            &["ticket_id", "status"],
+            &["ticket_id", "phase"],
         )
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let ticket_id = super::get_str(&args, "ticket_id")?;
-        let new_status = super::get_str(&args, "status")?;
+        let new_phase = super::get_str(&args, "phase")?;
 
-        let parsed_phase = new_status.parse::<TicketPhase>()?;
+        let parsed_phase = new_phase.parse::<TicketPhase>()?;
 
         let store = crate::board::store();
 
@@ -169,9 +169,7 @@ impl Tool for UpdateTicketTool {
             .transition_to(ticket_id, None, parsed_phase, None)
             .await?;
 
-        Ok(format!(
-            "Ticket {ticket_id} status updated to '{new_status}'"
-        ))
+        Ok(format!("Ticket {ticket_id} phase updated to '{new_phase}'"))
     }
 }
 
@@ -188,9 +186,9 @@ impl Tool for ListTicketsTool {
     fn parameters_schema(&self) -> serde_json::Value {
         super::tool_params_schema(
             &json!({
-                "status": {
+                "phase": {
                     "type": "string",
-                    "description": "Optional status filter (e.g. 'ready_for_development', 'in_development', 'done', 'cancelled'). When omitted, 'done' and 'cancelled' tickets are excluded — use an explicit status filter to include them. Use 'search_archived_tickets' to find archived tickets."
+                    "description": "Optional phase filter (e.g. 'ready_for_development', 'in_development', 'done', 'cancelled'). When omitted, 'done' and 'cancelled' tickets are excluded — use an explicit phase filter to include them. Use 'search_archived_tickets' to find archived tickets."
                 }
             }),
             &[],
@@ -202,10 +200,10 @@ impl Tool for ListTicketsTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let raw_status = super::get_opt_str(&args, "status");
+        let raw_phase = super::get_opt_str(&args, "phase");
 
-        // "archived" is no longer a status — redirect to search_archived_tickets
-        if let Some(s) = raw_status
+        // "archived" is no longer a phase — redirect to search_archived_tickets
+        if let Some(s) = raw_phase
             && s.eq_ignore_ascii_case("archived")
         {
             anyhow::bail!(
@@ -214,7 +212,7 @@ impl Tool for ListTicketsTool {
             );
         }
 
-        let status_filter = match raw_status {
+        let phase_filter = match raw_phase {
             Some(s) => {
                 let parsed = s.parse::<TicketPhase>()?;
                 Some(parsed)
@@ -224,13 +222,11 @@ impl Tool for ListTicketsTool {
 
         let store = crate::board::store();
 
-        let mut tickets = store
-            .list_all_tickets(Some(&ws.name), status_filter)
-            .await?;
+        let mut tickets = store.list_all_tickets(Some(&ws.name), phase_filter).await?;
 
-        // Default: exclude unblocking phases. When an explicit status filter
+        // Default: exclude unblocking phases. When an explicit phase filter
         // is provided, respect it as-is.
-        if status_filter.is_none() {
+        if phase_filter.is_none() {
             tickets.retain(|t| !t.phase.is_unblocking());
         }
 
@@ -396,7 +392,7 @@ mod tests {
         let ws = test_ws("/tmp");
         let args = json!({
             "ticket_id": id,
-            "status": "in_qa"
+            "phase": "in_qa"
         });
         tool.execute(&ws, args).await.expect("execute");
         let ticket = store
@@ -451,7 +447,7 @@ mod tests {
         );
 
         // Explicit filter for 'done': includes done tickets
-        let args = json!({"status": "done"});
+        let args = json!({"phase": "done"});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
             result.contains('C'),
@@ -463,7 +459,7 @@ mod tests {
         );
 
         // Explicit filter for 'cancelled': includes cancelled tickets
-        let args = json!({"status": "cancelled"});
+        let args = json!({"phase": "cancelled"});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
             result.contains('B'),
@@ -471,7 +467,7 @@ mod tests {
         );
 
         // Filter for an active phase that ticket A is actually in
-        let args = json!({"status": "backlog"});
+        let args = json!({"phase": "backlog"});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
             result.contains('A'),
@@ -480,14 +476,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_tickets_invalid_status() {
+    async fn test_list_tickets_invalid_phase() {
         crate::util::test::init_test_stores().await;
 
         let ws = crate::workspace::test_ws("/tmp");
         let tool = ListTicketsTool;
-        let args = json!({"status": "bogus_status"});
+        let args = json!({"phase": "bogus_phase"});
         let result = tool.execute(&ws, args).await;
-        assert!(result.is_err(), "Invalid status should fail");
+        assert!(result.is_err(), "Invalid phase should fail");
     }
 
     #[tokio::test]
@@ -545,7 +541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_status() {
+    async fn test_invalid_phase() {
         crate::util::test::init_test_stores().await;
 
         let store = crate::board::store();
@@ -561,10 +557,10 @@ mod tests {
         let ws = test_ws("/tmp");
         let args = json!({
             "ticket_id": id,
-            "status": "invalid_status"
+            "phase": "invalid_phase"
         });
         let result = tool.execute(&ws, args).await;
-        assert!(result.is_err(), "Invalid status should fail");
+        assert!(result.is_err(), "Invalid phase should fail");
     }
 
     // ── Pipeline-blocking guard tests ────────────────────────────
@@ -631,7 +627,7 @@ mod tests {
         let result = UpdateTicketTool
             .execute(
                 &test_ws("/tmp"),
-                json!({"ticket_id": id, "status": "backlog"}),
+                json!({"ticket_id": id, "phase": "backlog"}),
             )
             .await;
         assert!(

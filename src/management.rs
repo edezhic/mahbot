@@ -428,7 +428,7 @@ async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
         &[
             ("{{ticket_id}}", &ticket.id),
             ("{{ticket_title}}", &ticket.title),
-            ("{{ticket_status}}", target_phase.as_ref()),
+            ("{{ticket_phase}}", target_phase.as_ref()),
             ("{{transition_log}}", &transition_log),
             ("{{ticket_updates}}", &drained),
         ],
