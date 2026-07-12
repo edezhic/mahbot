@@ -519,9 +519,7 @@ impl Agent {
             self.role.requires_multimodal(),
         );
 
-        let response = chat(request).await?;
-
-        Ok(response)
+        chat(request).await
     }
 
     /// Log tool-call notifications
