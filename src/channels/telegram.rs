@@ -86,12 +86,12 @@ struct IncomingAttachment {
     mime_type: Option<String>,
 }
 
-/// The kind of incoming attachment (document vs photo).
+/// The kind of incoming attachment (document, photo, or audio).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
-    Voice,
+    Audio,
 }
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -347,7 +347,7 @@ fn format_attachment_content(
         IncomingAttachmentKind::Photo | IncomingAttachmentKind::Document if is_image => {
             format!("[IMAGE:{}]", local_path.display())
         }
-        IncomingAttachmentKind::Voice => {
+        IncomingAttachmentKind::Audio => {
             format!("[AUDIO:{}]", local_path.display())
         }
         _ => {
@@ -975,8 +975,8 @@ impl TelegramChannel {
     /// Extract attachment metadata from an incoming Telegram message.
     ///
     /// Handles `document`, `photo` (array — takes last element for highest
-    /// resolution), `audio`, and `voice`.  Audio maps to [`IncomingAttachmentKind::Voice`]
-    /// because there is no separate audio variant.  Returns `None` for text‑only
+    /// resolution), `audio`, and `voice`.  Both map to [`IncomingAttachmentKind::Audio`]
+    /// since there's no separate variant for each.  Returns `None` for text‑only
     /// and other unsupported message types.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
         // Document
@@ -990,14 +990,14 @@ impl TelegramChannel {
             return Self::build_attachment(best, message, IncomingAttachmentKind::Photo);
         }
 
-        // Audio — maps to Voice kind (no separate Audio variant)
+        // Audio — maps to Audio kind (same variant handles both audio and voice)
         if let Some(audio) = message.get("audio") {
-            return Self::build_attachment(audio, message, IncomingAttachmentKind::Voice);
+            return Self::build_attachment(audio, message, IncomingAttachmentKind::Audio);
         }
 
         // Voice message
         if let Some(voice) = message.get("voice") {
-            return Self::build_attachment(voice, message, IncomingAttachmentKind::Voice);
+            return Self::build_attachment(voice, message, IncomingAttachmentKind::Audio);
         }
 
         None
@@ -2536,7 +2536,7 @@ mod tests {
             &serde_json::json!({"voice": {"file_id": "v", "duration": 5}}),
         )
         .unwrap();
-        assert_eq!(att.kind, IncomingAttachmentKind::Voice);
+        assert_eq!(att.kind, IncomingAttachmentKind::Audio);
         assert_eq!(att.file_id, "v");
         assert!(att.file_name.is_none());
         // Audio message
@@ -2544,7 +2544,7 @@ mod tests {
             &serde_json::json!({"audio": {"file_id": "a", "file_name": "song.mp3", "file_size": 999}}),
         )
         .unwrap();
-        assert_eq!(att.kind, IncomingAttachmentKind::Voice);
+        assert_eq!(att.kind, IncomingAttachmentKind::Audio);
         assert_eq!(att.file_id, "a");
         assert_eq!(att.file_name.as_deref(), Some("song.mp3"));
         assert_eq!(att.file_size, Some(999));
@@ -2640,6 +2640,21 @@ mod tests {
             Some("image/jpeg"),
         );
         assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]");
+        // Audio kind produces [AUDIO:] marker regardless of extension
+        let c = format_attachment_content(
+            IncomingAttachmentKind::Audio,
+            "voice.ogg",
+            std::path::Path::new("/tmp/workspace/voice.ogg"),
+            None,
+        );
+        assert_eq!(c, "[AUDIO:/tmp/workspace/voice.ogg]");
+        let c = format_attachment_content(
+            IncomingAttachmentKind::Audio,
+            "song.mp3",
+            std::path::Path::new("/tmp/workspace/song.mp3"),
+            Some("audio/mpeg"),
+        );
+        assert_eq!(c, "[AUDIO:/tmp/workspace/song.mp3]");
     }
 
     #[test]
