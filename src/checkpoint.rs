@@ -35,7 +35,7 @@
 //! crash data loss is bounded to the auto-checkpoint interval (5 minutes).
 
 use futures_util::future::join_all;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Checkpoint all Turso database stores before hard process termination.
 ///
@@ -63,6 +63,31 @@ pub async fn checkpoint_all_databases() {
     join_all(futs).await;
 }
 
+/// Run PRAGMA quick_check on all initialized database stores.
+///
+/// Iterates all stores via [`crate::turso::iter_checkpoint_stores`], runs
+/// `quick_check` on each in parallel, and logs the results. Corruption
+/// errors are logged at `error!` level for operator visibility in the
+/// dashboard Logs page. Successes are logged at `info!` level.
+///
+/// Skips stores that haven't been initialized yet. This is a fire-and-forget
+/// function: all per-store errors are logged and swallowed to avoid blocking
+/// the caller (matching the pattern of [`checkpoint_all_databases`]).
+pub async fn verify_all_databases() {
+    let futs: Vec<_> = crate::turso::iter_checkpoint_stores()
+        .filter_map(|(name, conn_opt)| {
+            let conn = conn_opt?;
+            Some(async move {
+                match conn.quick_check().await {
+                    Ok(()) => info!(db = %name, "Database integrity check passed"),
+                    Err(e) => error!(error = %e, db = %name, "Database integrity check failed"),
+                }
+            })
+        })
+        .collect();
+    join_all(futs).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +99,14 @@ mod tests {
         // No stores initialized — all get() calls return None.
         // This should not panic or error.
         checkpoint_all_databases().await;
+    }
+
+    /// Verify that `verify_all_databases` is a no-op (no panic) when
+    /// no stores are initialized (all `OnceCell`s are empty).
+    #[tokio::test]
+    async fn verify_noop_when_no_stores() {
+        // No stores initialized — all get() calls return None.
+        // This should not panic or error.
+        verify_all_databases().await;
     }
 }

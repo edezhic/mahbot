@@ -11,10 +11,18 @@
 //!
 //! Queries are validated before execution: the SQL is split into whole words
 //! (on whitespace and SQL punctuation) and checked case-insensitively against
-//! a blocklist of mutation keywords (PRAGMA, INSERT, UPDATE, DELETE, DROP,
-//! ALTER, CREATE, REPLACE, BEGIN, COMMIT, ROLLBACK, VACUUM, REINDEX, GRANT,
-//! REVOKE, ATTACH, DETACH, ANALYZE). Whole-word matching avoids false
-//! positives on column names like `created_at`.
+//! a blocklist of mutation keywords (INSERT, UPDATE, DELETE, DROP, ALTER,
+//! CREATE, REPLACE, BEGIN, COMMIT, ROLLBACK, VACUUM, REINDEX, GRANT, REVOKE,
+//! ATTACH, DETACH, ANALYZE). Whole-word matching avoids false positives on
+//! column names like `created_at`.
+//!
+//! `PRAGMA` is intentionally **not** in the blocklist because:
+//! - The connection is opened with `ReadOnly | NoLock`, which prevents actual
+//!   database mutations even if a mutating PRAGMA (e.g. `PRAGMA wal_checkpoint`)
+//!   is issued — the engine returns an error, not a silent write.
+//! - Read-only PRAGMAs like `PRAGMA quick_check` and `PRAGMA integrity_check`
+//!   are valuable on-demand diagnostics. The ReadOnly flag is the primary
+//!   safeguard; the blocklist is defense-in-depth for accidental queries.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +38,11 @@ const ROW_LIMIT: usize = 10_000;
 
 /// Mutation keywords blocked by the read-only validator.
 /// Case-insensitive whole-word match (not substring).
+///
+/// `PRAGMA` is intentionally absent — see module-level docs for rationale.
 const BLOCKLIST: &[&str] = &[
-    "PRAGMA", "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "BEGIN",
-    "COMMIT", "ROLLBACK", "VACUUM", "REINDEX", "GRANT", "REVOKE", "ATTACH", "DETACH", "ANALYZE",
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "BEGIN", "COMMIT",
+    "ROLLBACK", "VACUUM", "REINDEX", "GRANT", "REVOKE", "ATTACH", "DETACH", "ANALYZE",
 ];
 
 /// SQL punctuation characters used for word-boundary tokenization.

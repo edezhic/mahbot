@@ -557,6 +557,30 @@ impl Connection {
             .context("Failed to checkpoint WAL")?;
         Ok(())
     }
+
+    /// Run PRAGMA quick_check to verify database integrity.
+    ///
+    /// Checks b-tree page structure, NOT NULL and CHECK constraints, and
+    /// index cardinality. Returns `Ok(())` on success, or an error with the
+    /// first corruption message if any corruption is detected.
+    ///
+    /// Lightweight (~10ms on a healthy store) and read-only — safe to call
+    /// periodically while the system is running.
+    pub async fn quick_check(&self) -> anyhow::Result<()> {
+        let rows = self
+            .query("PRAGMA quick_check;", ())
+            .await
+            .context("Failed to execute PRAGMA quick_check")?;
+
+        if let Some(row) = rows.first() {
+            match row.get_value(0)? {
+                Value::Text(s) if s == "ok" => {}
+                Value::Text(s) => anyhow::bail!("Database integrity check failed: {s}"),
+                _ => anyhow::bail!("Unexpected result from PRAGMA quick_check"),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A locked connection handle scoped to a single transaction.
@@ -953,5 +977,19 @@ mod tests {
                 "expected error for: {invalid:?}",
             );
         }
+    }
+
+    // ── quick_check tests ────────────────────────────────────────────
+
+    /// Verify that quick_check returns Ok on a healthy (empty) database.
+    #[tokio::test]
+    async fn test_quick_check_passes_on_healthy_db() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let conn = Connection::open(tmp.path().join("test.db").as_path())
+            .await
+            .expect("open test database");
+        conn.quick_check()
+            .await
+            .expect("quick_check should pass on a healthy empty database");
     }
 }

@@ -307,6 +307,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
                 break;
             }
             mahbot::checkpoint::checkpoint_all_databases().await;
+            mahbot::checkpoint::verify_all_databases().await;
         }
     });
 
