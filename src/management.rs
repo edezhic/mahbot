@@ -333,6 +333,10 @@ where
             "{}: transition to {} failed — ticket stuck in {}",
             args.log_label, args.target, args.source,
         );
+        // Clear assigned_to so the ticket can be re-dispatched on the next poll
+        // cycle. All call sites set assigned_to before reaching this function, so
+        // the field is always populated when this runs.
+        clear_assigned_to(&args.ticket.id, args.log_label).await;
         return false;
     }
 
@@ -1001,7 +1005,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     )
     .await
     {
-        clear_assigned_to(&ticket.id, "transition failed (Engineer)").await;
         return;
     }
 
@@ -1475,7 +1478,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         )
         .await
         {
-            clear_assigned_to(&ticket.id, "transition to SanitationPassed failed").await;
             return;
         }
 
@@ -1523,11 +1525,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         )
         .await
         {
-            clear_assigned_to(
-                &ticket.id,
-                "transition to ReadyForDevelopment failed (Sanitation)",
-            )
-            .await;
             return;
         }
 
@@ -1701,7 +1698,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     )
     .await
     {
-        clear_assigned_to(&ticket.id, "transition failed (Diagnostics)").await;
         return;
     }
 
