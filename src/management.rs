@@ -1123,9 +1123,25 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
         }
     };
 
+    commit_or_done(&ticket, repo_path, has_changes, source).await;
+}
+
+/// Commit the ticket's changes (if any) and transition to Done, or transition
+/// directly to Done if the working tree is clean.
+///
+/// Unlike [`finalize_ticket_from_phase`], this function assumes git is available
+/// and a git repo exists — callers must check that upfront (e.g. via
+/// [`transition_ticket_to_done_if_git_unavailable`]). It takes a pre-computed
+/// `has_changes` flag (from `git status --porcelain`) to avoid redundant
+/// subprocess calls when the caller already has this information.
+///
+/// - **Clean tree** (`has_changes == false`): skips commit, transitions directly
+///   to Done with notification.
+/// - **Dirty tree** (`has_changes == true`): runs `git commit -m "<ticket title>"`.
+async fn commit_or_done(ticket: &Ticket, repo_path: &Path, has_changes: bool, source: TicketPhase) {
     if !has_changes {
         transition_ticket_to_done(
-            &ticket,
+            ticket,
             source,
             "Clean working tree — moving to Done without commit",
         )
@@ -1135,13 +1151,14 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
 
     match crate::git_commands::run_git_commit(repo_path, &ticket.title).await {
         Ok(commit_info) => {
-            finalize_commit_and_transition(&ticket, commit_info, source).await;
+            finalize_commit_and_transition(ticket, commit_info, source).await;
         }
         Err(e) => {
             error!(
                 ticket = %ticket.id,
                 error = %e,
-                "Commit failed — staying in {phase_label} for retry"
+                "Commit failed — staying in {} for retry",
+                source.as_ref(),
             );
         }
     }
@@ -1258,7 +1275,11 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let untracked = parse_new_files_from_porcelain(&porcelain);
 
     if untracked.is_empty() {
-        finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
+        // Git is available (checked above), and we already have cached porcelain
+        // from the status check. Compute has_changes from the same output to avoid
+        // a redundant subprocess call.
+        let has_changes = !porcelain.trim().is_empty();
+        commit_or_done(&ticket, ws.as_path(), has_changes, TicketPhase::QaPassed).await;
     } else {
         // Untracked files exist — claim this specific ticket to InSanitation
         // via the dedicated claim_sanitation method (see BoardStore docs).

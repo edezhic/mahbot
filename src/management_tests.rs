@@ -897,6 +897,54 @@ async fn handle_qa_passed_untracked_files_to_insanitation() {
     );
 }
 
+/// handle_qa_passed with a clean working tree (no untracked files, no
+/// modifications) should transition to Done directly without creating a
+/// commit — exercising [`commit_or_done`] with `has_changes=false`.
+///
+/// Creates a real git repo with a clean working tree to exercise the
+/// QaPassed→Done transition through the clean-tree path.
+#[tokio::test]
+async fn handle_qa_passed_clean_tree_to_done() {
+    // Skip if git is not installed — the test cannot create a repo.
+    if !crate::git_commands::git_is_installed().await {
+        eprintln!("git not installed — skipping git-dependent test");
+        return;
+    }
+
+    let (_dir, repo_path) = crate::util::test::init_temp_repo();
+
+    let (ws, ticket_id) = setup_ticket(
+        repo_path.to_str().unwrap(),
+        "qa_clean",
+        "QA Clean Tree",
+        TicketPhase::QaPassed,
+    )
+    .await;
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+
+    handle_qa_passed(ticket, ws).await;
+
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_eq!(
+        phase,
+        TicketPhase::Done,
+        "QA passed with clean tree should transition to Done"
+    );
+
+    // Verify a SYSTEM_ROLE comment was written explaining the clean-tree skip.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get_comments");
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.role == SYSTEM_ROLE && c.content.contains("Clean working tree")),
+        "Expected a SYSTEM_ROLE comment explaining the clean-tree skip"
+    );
+}
+
 // ── process_sanitation_verdict — verdict processing ──────────────────
 
 /// Verify both branches of `process_sanitation_verdict`:
