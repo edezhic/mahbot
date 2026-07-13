@@ -1,4 +1,4 @@
-use crate::{Tool, ToolOutputPhase, Workspace, util::UnwrapPoison};
+use crate::{Tool, ToolOutputPhase, Workspace};
 use async_trait::async_trait;
 use directories::UserDirs;
 use regex::RegexSet;
@@ -8,7 +8,6 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::util::scrub_credentials;
@@ -157,46 +156,60 @@ enum ShellRunResult {
     SpawnFailed(std::io::Error),
 }
 
-/// Read from an async stream up to `cap` bytes, mirroring progress into `shared`.
+/// Read from an async stream up to `cap` bytes, then continue reading and
+/// discarding any remaining data to drain the pipe (preventing back-pressure
+/// on the child process from a full pipe buffer).
+///
+/// Stops early when `cancel` is signalled, returning whatever has been read
+/// so far. This allows the timeout path to collect partial output even when
+/// grandchild processes inherited the pipe write end and prevent EOF.
 async fn read_stream_limited(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
     cap: usize,
-    shared: &Arc<Mutex<Vec<u8>>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
 
+    let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        let to_read = {
-            let guard = shared.lock().unwrap_poison();
-            if guard.len() >= cap {
-                chunk.len()
-            } else {
-                (cap - guard.len()).min(chunk.len())
-            }
+        let to_read = if buf.len() >= cap {
+            chunk.len() // drain mode — read and discard to prevent back-pressure
+        } else {
+            (cap - buf.len()).min(chunk.len())
         };
-        match reader.read(&mut chunk[..to_read]).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let mut guard = shared.lock().unwrap_poison();
-                if guard.len() < cap {
-                    let take = n.min(cap - guard.len());
-                    guard.extend_from_slice(&chunk[..take]);
+
+        tokio::select! {
+            biased;
+            result = reader.read(&mut chunk[..to_read]) => {
+                match result {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if buf.len() < cap {
+                            let take = n.min(cap - buf.len());
+                            buf.extend_from_slice(&chunk[..take]);
+                        }
+                        // In drain mode (buf.len() >= cap): chunk data is discarded
+                        // to prevent the child from blocking on a full pipe buffer.
+                    }
                 }
             }
+            () = cancel.cancelled() => break,
         }
     }
-    shared.lock().unwrap_poison().clone()
+    buf
 }
 
-/// Spawn a background task that reads from an optional pipe into a shared buffer.
+/// Spawn a background task that reads from an optional pipe.
+/// The task stops early when `cancel` is signalled and returns
+/// whatever data has been buffered so far.
 fn spawn_pipe_reader(
     pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
-    shared: Arc<Mutex<Vec<u8>>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<Vec<u8>> {
     tokio::spawn(async move {
         if let Some(mut reader) = pipe {
-            read_stream_limited(&mut reader, SHELL_PIPE_READ_CAP, &shared).await
+            read_stream_limited(&mut reader, SHELL_PIPE_READ_CAP, cancel).await
         } else {
             Vec::new()
         }
@@ -222,14 +235,13 @@ async fn run_command_with_timeout(
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
-    let stdout_shared = Arc::new(Mutex::new(Vec::new()));
-    let stderr_shared = Arc::new(Mutex::new(Vec::new()));
-
-    let stdout_handle = spawn_pipe_reader(stdout_pipe, Arc::clone(&stdout_shared));
-    let stderr_handle = spawn_pipe_reader(stderr_pipe, Arc::clone(&stderr_shared));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stdout_handle = spawn_pipe_reader(stdout_pipe, cancel.clone());
+    let stderr_handle = spawn_pipe_reader(stderr_pipe, cancel.clone());
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
+            // Child exited naturally — readers get EOF and complete on their own.
             let stdout = stdout_handle.await.unwrap_or_else(|e| {
                 tracing::warn!(%e, "stdout reader task panicked");
                 Vec::new()
@@ -247,14 +259,30 @@ async fn run_command_with_timeout(
         }
         Ok(Err(e)) => ShellRunResult::SpawnFailed(e),
         Err(_) => {
+            // Kill the child process and signal readers to return what they have.
             let _ = child.kill().await;
-            let (_, _, _) = tokio::join!(
-                tokio::time::timeout(Duration::from_secs(2), child.wait()),
-                tokio::time::timeout(Duration::from_secs(2), stdout_handle),
-                tokio::time::timeout(Duration::from_secs(2), stderr_handle),
-            );
-            let stdout = stdout_shared.lock().unwrap_poison().clone();
-            let stderr = stderr_shared.lock().unwrap_poison().clone();
+            cancel.cancel();
+
+            // Give readers a grace window to notice cancellation and return
+            // their buffers. If a reader takes longer than 2 s (e.g. because
+            // a grandchild keeps the pipe open), we still get partial data
+            // from the buffer it returns after noticing cancellation.
+            let stdout = tokio::time::timeout(Duration::from_secs(2), stdout_handle)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .unwrap_or_else(|| {
+                    tracing::warn!("stdout reader did not respond to cancellation within 2 s");
+                    Vec::new()
+                });
+            let stderr = tokio::time::timeout(Duration::from_secs(2), stderr_handle)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .unwrap_or_else(|| {
+                    tracing::warn!("stderr reader did not respond to cancellation within 2 s");
+                    Vec::new()
+                });
             ShellRunResult::TimedOut {
                 stdout,
                 stderr,
@@ -1867,6 +1895,7 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
+    use crate::util::UnwrapPoison;
     use crate::util::test::{env_lock, set_env_var};
 
     // ── Table-driven test helpers ─────────────────────────────────────
