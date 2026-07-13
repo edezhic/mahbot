@@ -142,21 +142,11 @@ pub async fn verify_all_databases() {
 mod tests {
     use super::*;
 
-    /// Verify that `checkpoint_all_databases` is a no-op (no panic) when
-    /// no stores are initialized (all `OnceCell`s are empty).
+    /// Verify that both `checkpoint_all_databases` and `verify_all_databases` are
+    /// no-ops (no panic) when no stores are initialized (all `OnceCell`s are empty).
     #[tokio::test]
     async fn noop_when_no_stores() {
-        // No stores initialized — all get() calls return None.
-        // This should not panic or error.
         checkpoint_all_databases().await;
-    }
-
-    /// Verify that `verify_all_databases` is a no-op (no panic) when
-    /// no stores are initialized (all `OnceCell`s are empty).
-    #[tokio::test]
-    async fn verify_noop_when_no_stores() {
-        // No stores initialized — all get() calls return None.
-        // This should not panic or error.
         verify_all_databases().await;
     }
 }
