@@ -698,13 +698,9 @@ mod tests {
     use super::*;
     use crate::providers::test_request;
 
-    fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
-        OpenAiCompatibleProvider::new(name, url, key)
-    }
-
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
-        let p = make_provider("Local", "http://127.0.0.1:1", None);
+        let p = OpenAiCompatibleProvider::new("Local", "http://127.0.0.1:1", None);
         let result = p
             .chat(test_request(vec![ChatMessage::user("hello")], None))
             .await;
@@ -948,7 +944,7 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_attempts_connection() {
-        let provider = make_provider("test", "http://127.0.0.1:1", None);
+        let provider = OpenAiCompatibleProvider::new("test", "http://127.0.0.1:1", None);
         let result = provider.warmup().await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
