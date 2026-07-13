@@ -79,7 +79,7 @@ async fn enrich_message_for_role(msg: &mut ChannelMessage, role: Role, ws: &Work
     let enriched = mahbot::channels::enrich_links(&msg.content).await;
     if let Cow::Owned(s) = enriched {
         tracing::info!(
-            channel = %msg.source_channel,
+            channel = %msg.channel,
             user_name = %msg.user_name,
             "Link enricher: prepended URL summaries to message"
         );
@@ -316,7 +316,7 @@ fn init_message_pipeline(
 ) -> tokio::sync::mpsc::Receiver<ChannelMessage> {
     // Create the shared message channel before any channel listeners are
     // spawned. All channels push into the same tx; rx is consumed by the
-    // single `run_message_dispatch_loop` consumer. `ChannelMessage.source_channel`
+    // single `run_message_dispatch_loop` consumer. `ChannelMessage.channel`
     // disambiguates origins.
     let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(100);
 
@@ -530,7 +530,7 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
 /// `/start` as a normal message (returns false to fall through to
 /// `process_channel_message`).
 async fn handle_telegram_start_command(msg: &ChannelMessage) -> bool {
-    if !is_start_command(&msg.content) || msg.source_channel != "telegram" {
+    if !is_start_command(&msg.content) || msg.channel != "telegram" {
         return false;
     }
 
@@ -551,7 +551,7 @@ async fn handle_start_command(msg: &ChannelMessage) {
     // (rows of buttons) is preserved exactly — send_channel_reply does not
     // support inline keyboards, so this path bypasses it for multi-row
     // replies like the /start menu.
-    if let Some(channel) = mahbot::channel_registry().get(&msg.source_channel) {
+    if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
         let _ = channel.send(&reply).await;
     }
 }
@@ -645,7 +645,7 @@ async fn handle_action_callback(msg: ChannelMessage) {
                 resolve_workspace_for_user(&msg),
                 mahbot::users::resolve_active_role(&msg.user_name),
             );
-            let sk = session_key(&msg.source_channel, &msg.user_name, role.as_str(), &ws.name);
+            let sk = session_key(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
             let reply = Session::delete(&sk).await;
             send_channel_reply(reply, &msg, None).await;
         }
@@ -710,7 +710,7 @@ async fn answer_telegram_callback(msg: &ChannelMessage, toast: Option<String>) {
 async fn process_channel_message(mut msg: ChannelMessage) {
     tracing::info!(
         "💬 [{}] from {}: {}",
-        msg.source_channel,
+        msg.channel,
         msg.user_name,
         mahbot::util::truncate(&msg.content, 80)
     );
@@ -762,7 +762,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // inline in the calling task.
 
     let session_key = direct_session_key(
-        &msg.source_channel,
+        &msg.channel,
         &msg.user_name,
         effective_role.as_str(),
         &ws.name,
@@ -771,7 +771,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     let cancel = agent.cancel_token();
     let typing_handle = spawn_scoped_typing_task(
         msg.reply_target.clone(),
-        msg.source_channel.clone(),
+        msg.channel.clone(),
         cancel.clone(),
     );
 

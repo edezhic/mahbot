@@ -225,7 +225,7 @@ impl MessageContext {
             user_name: self.user_name,
             reply_target: self.reply_target,
             content,
-            source_channel: "telegram".to_string(),
+            channel: "telegram".to_string(),
             workspace: String::new(),
             optimistic_id: None,
             callback_query_id: None,
@@ -794,7 +794,7 @@ impl TelegramChannel {
             user_name,
             reply_target,
             content: data.to_string(),
-            source_channel: "telegram".to_string(),
+            channel: "telegram".to_string(),
             workspace: String::new(),
             optimistic_id: None,
             callback_query_id,
@@ -1835,7 +1835,7 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
 ///
 /// # Guards
 ///
-/// * Only mirrors messages where `source_channel == "gui"` (prevents echo loops).
+/// * Only mirrors messages where `channel == "gui"` (prevents echo loops).
 /// * Skips empty or whitespace-only messages.
 /// * Silently returns when no Telegram channel is registered or the user has no
 ///   Telegram binding with a `reply_target` (no error, no crash).
@@ -1851,7 +1851,7 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
 /// messages are skipped entirely.
 pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
     // Guard: only mirror GUI-originated user messages (prevents echo loops).
-    if msg.source_channel != "gui" {
+    if msg.channel != "gui" {
         return;
     }
 

@@ -427,14 +427,14 @@ pub fn manager_session_key(ws_name: &str) -> String {
 ///
 /// # Parameter order
 ///
-/// Matches [`direct_session_key`]: `source_channel` first, then `user_name`,
+/// Matches [`direct_session_key`]: `channel` first, then `user_name`,
 /// `role`, and `ws_name` last.
 #[must_use]
-pub fn session_key(source_channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
+pub fn session_key(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
     if role == "manager" {
         manager_session_key(ws_name)
     } else {
-        direct_session_key(source_channel, user_name, role, ws_name)
+        direct_session_key(channel, user_name, role, ws_name)
     }
 }
 

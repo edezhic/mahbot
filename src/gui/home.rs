@@ -1300,7 +1300,7 @@ impl HomeState {
             user_name: sender.clone(),
             reply_target: sender,
             content,
-            source_channel: "gui".to_string(),
+            channel: "gui".to_string(),
             workspace: self.selected_workspace.clone().unwrap_or_default(),
             optimistic_id,
             callback_query_id: None,

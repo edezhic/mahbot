@@ -444,7 +444,7 @@ mod tests {
             user_name: "test".into(),
             reply_target: "test".into(),
             content: content.to_string(),
-            source_channel: "test".into(),
+            channel: "test".into(),
             workspace: "test".into(),
             optimistic_id: None,
             callback_query_id: None,

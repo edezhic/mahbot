@@ -268,7 +268,7 @@ pub struct ChannelMessage {
     pub content: String,
     /// The channel this message originated from (e.g. `"telegram"`, `"gui"`).
     /// Set by each channel's `listen()` loop when constructing the message.
-    pub source_channel: String,
+    pub channel: String,
     /// The workspace this message targets.
     pub workspace: String,
     /// Optimistic message ID set by the GUI sender for deduplication in the

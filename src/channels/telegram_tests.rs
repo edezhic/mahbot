@@ -370,7 +370,7 @@ async fn parse_callback_query_returns_message_with_extracted_fields() {
     assert_eq!(msg.user_name, "alice");
     assert_eq!(msg.reply_target, "-100200300");
     assert_eq!(msg.content, "set_model|gpt-4");
-    assert_eq!(msg.source_channel, "telegram");
+    assert_eq!(msg.channel, "telegram");
     assert_eq!(msg.callback_query_id.as_deref(), Some("12345"));
 }
 
@@ -1425,7 +1425,7 @@ fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
         user_name: user_name.to_string(),
         reply_target: String::new(),
         content: content.to_string(),
-        source_channel: "gui".to_string(),
+        channel: "gui".to_string(),
         workspace: "test".to_string(),
         optimistic_id: None,
         callback_query_id: None,
@@ -1437,7 +1437,7 @@ fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
         user_name: user_name.to_string(),
         reply_target: "chat:thread".to_string(),
         content: content.to_string(),
-        source_channel: "telegram".to_string(),
+        channel: "telegram".to_string(),
         workspace: "test".to_string(),
         optimistic_id: None,
         callback_query_id: None,

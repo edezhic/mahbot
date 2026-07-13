@@ -17,7 +17,7 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 #[derive(Debug, Clone)]
 struct BroadcastPersistEntry {
     user_name: String,
-    channel_name: String,
+    channel: String,
     content: String,
     direction: ChatDirection,
     agent_role: Option<String>,
@@ -65,7 +65,7 @@ impl BroadcastPersistEntry {
             .insert(&ChatHistoryInsert {
                 message_id,
                 user_name: self.user_name,
-                channel: self.channel_name,
+                channel: self.channel,
                 role: db_role,
                 direction: db_direction,
                 content: self.content,
@@ -95,7 +95,7 @@ pub async fn broadcast_and_persist_agent_response(
 ) {
     BroadcastPersistEntry {
         user_name: user_name.to_string(),
-        channel_name: channel.to_string(),
+        channel: channel.to_string(),
         content: content.to_string(),
         direction: ChatDirection::Agent,
         agent_role,
@@ -107,12 +107,12 @@ pub async fn broadcast_and_persist_agent_response(
 }
 
 /// Write an incoming user message to CHAT_BROADCAST for immediate GUI display
-/// and persist it to chat_history. Uses `msg.source_channel` for the channel
+/// and persist it to chat_history. Uses `msg.channel` for the channel
 /// field so it works for both Telegram and GUI-originated messages.
 pub async fn write_incoming_to_broadcast(msg: &ChannelMessage) {
     BroadcastPersistEntry {
         user_name: msg.user_name.clone(),
-        channel_name: msg.source_channel.clone(),
+        channel: msg.channel.clone(),
         content: msg.content.clone(),
         direction: ChatDirection::User,
         agent_role: None, // user messages have no agent role
@@ -130,16 +130,16 @@ pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_rol
     // does not depend on the channel object, only on fields from `msg`.
     broadcast_and_persist_agent_response(
         &msg.user_name,
-        &msg.source_channel,
+        &msg.channel,
         &content,
         agent_role,
         &msg.workspace,
     )
     .await;
 
-    let Some(channel) = crate::channel_registry().get(&msg.source_channel) else {
+    let Some(channel) = crate::channel_registry().get(&msg.channel) else {
         tracing::warn!(
-            source_channel = %msg.source_channel,
+            channel = %msg.channel,
             "Channel not found in registry -- reply not delivered via transport (already broadcast & persisted)"
         );
         return;
@@ -159,14 +159,14 @@ pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_rol
 #[must_use]
 pub fn spawn_scoped_typing_task(
     recipient: String,
-    source_channel: String,
+    channel: String,
     cancellation_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let refresh_interval = std::time::Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
     tokio::spawn(async move {
-        let Some(channel) = crate::channel_registry().get(&source_channel) else {
+        let Some(ch) = crate::channel_registry().get(&channel) else {
             tracing::warn!(
-                source_channel = %source_channel,
+                channel = %channel,
                 "Channel not found in registry — skipping typing indicator"
             );
             return;
@@ -178,8 +178,8 @@ pub fn spawn_scoped_typing_task(
             tokio::select! {
                 () = cancellation_token.cancelled() => break,
                 _ = interval.tick() => {
-                    if let Err(e) = channel.start_typing(&recipient).await {
-                        tracing::debug!("Failed to start typing on {}: {e}", channel.name());
+                    if let Err(e) = ch.start_typing(&recipient).await {
+                        tracing::debug!("Failed to start typing on {}: {e}", ch.name());
                     }
                 }
             }
