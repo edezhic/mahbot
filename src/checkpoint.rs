@@ -35,7 +35,32 @@
 //! crash data loss is bounded to the auto-checkpoint interval (5 minutes).
 
 use futures_util::future::join_all;
+use std::future::Future;
 use tracing::{error, info, warn};
+
+/// Iterate all stores via [`crate::turso::iter_checkpoint_stores`] and run an
+/// async operation on each initialized store in parallel.
+///
+/// This is the shared iteration pattern used by both
+/// [`checkpoint_all_databases`] and [`verify_all_databases`]. Stores that
+/// haven't been initialized yet (connection is `None`) are silently skipped.
+///
+/// The operation closure receives `(&'static str, &'static Connection)` — the
+/// store name and the canonical connection — and should return a `Future` that
+/// completes the operation and logs the result.
+async fn for_each_store<F, Fut>(op: F)
+where
+    F: Fn(&'static str, &'static crate::turso::Connection) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let futs: Vec<_> = crate::turso::iter_checkpoint_stores()
+        .filter_map(|(name, conn_opt)| {
+            let conn = conn_opt?;
+            Some(op(name, conn))
+        })
+        .collect();
+    join_all(futs).await;
+}
 
 /// Checkpoint all Turso database stores before hard process termination.
 ///
@@ -49,18 +74,13 @@ use tracing::{error, info, warn};
 /// The store entries come from [`crate::turso::iter_checkpoint_stores`] — the
 /// single source of truth for which stores get checkpointed.
 pub async fn checkpoint_all_databases() {
-    let futs: Vec<_> = crate::turso::iter_checkpoint_stores()
-        .filter_map(|(name, conn_opt)| {
-            let conn = conn_opt?;
-            Some(async move {
-                match conn.checkpoint().await {
-                    Ok(()) => info!(db = %name, "Database WAL checkpointed"),
-                    Err(e) => warn!(error = %e, db = %name, "Failed to checkpoint database WAL"),
-                }
-            })
-        })
-        .collect();
-    join_all(futs).await;
+    for_each_store(|name, conn| async move {
+        match conn.checkpoint().await {
+            Ok(()) => info!(db = %name, "Database WAL checkpointed"),
+            Err(e) => warn!(error = %e, db = %name, "Failed to checkpoint database WAL"),
+        }
+    })
+    .await;
 }
 
 /// Run PRAGMA quick_check on all initialized database stores.
@@ -74,18 +94,13 @@ pub async fn checkpoint_all_databases() {
 /// function: all per-store errors are logged and swallowed to avoid blocking
 /// the caller (matching the pattern of [`checkpoint_all_databases`]).
 pub async fn verify_all_databases() {
-    let futs: Vec<_> = crate::turso::iter_checkpoint_stores()
-        .filter_map(|(name, conn_opt)| {
-            let conn = conn_opt?;
-            Some(async move {
-                match conn.quick_check().await {
-                    Ok(()) => info!(db = %name, "Database integrity check passed"),
-                    Err(e) => error!(error = %e, db = %name, "Database integrity check failed"),
-                }
-            })
-        })
-        .collect();
-    join_all(futs).await;
+    for_each_store(|name, conn| async move {
+        match conn.quick_check().await {
+            Ok(()) => info!(db = %name, "Database integrity check passed"),
+            Err(e) => error!(error = %e, db = %name, "Database integrity check failed"),
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]
