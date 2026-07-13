@@ -1635,7 +1635,7 @@ fn try_json_preview(input: &str) -> Option<String> {
                     .join("\n");
                 format!(
                     "[JSON array: {count} items, schema: {types}]\n{entries}\n(total: {} chars)",
-                    input.len()
+                    input.chars().count()
                 )
             };
             Some(preview)
@@ -1652,7 +1652,7 @@ fn try_json_preview(input: &str) -> Option<String> {
                 "[JSON object: {} fields]\n{}\n(total: {} chars)",
                 fields.len(),
                 fields.join("\n"),
-                input.len()
+                input.chars().count()
             );
             Some(preview)
         }
@@ -1720,7 +1720,7 @@ fn truncate_line_width(input: &str, max_line_len: usize) -> String {
             let _ = write!(
                 result,
                 "\n... ({} more chars on this line)",
-                line.len() - cut
+                line[cut..].chars().count()
             );
         } else {
             push_line(&mut result, line);

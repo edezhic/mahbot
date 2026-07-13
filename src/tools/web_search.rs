@@ -218,11 +218,11 @@ impl WebSearchCache {
                     .map(str::trim)
                     .ok_or_else(|| anyhow::anyhow!("Invalid `query` value"))?;
 
-                if query.len() <= 2 {
+                if query.chars().count() <= 2 {
                     anyhow::bail!(
                         "Search query must be at least 3 characters long. \
                          Got: \"{query}\" ({} chars)",
-                        query.len()
+                        query.chars().count()
                     );
                 }
 
