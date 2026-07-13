@@ -1391,48 +1391,33 @@ fn apply_strip_lines(output: &str, profile: &Profile) -> String {
         .join("\n")
 }
 
-/// Split output into head lines, an omitted count, and tail lines.
+/// Build a head/tail sandwich with an omitted-lines marker in the middle.
 ///
-/// When total lines ≤ head_count + tail_count, all lines are returned in `head`
-/// with `omitted = 0` and an empty `tail`. Otherwise the output is split into
-/// the first `head_count` lines and the last `tail_count` lines, with the
-/// omitted line count recorded.
-fn split_head_tail(
-    output: &str,
-    head_count: usize,
-    tail_count: usize,
-) -> (Vec<String>, usize, Vec<String>) {
+/// Edge cases:
+/// - `head=0` (tail-only, e.g., `ping`, `gh`, `helm` profiles): no leading
+///   newline before the omission marker.
+/// - `tail=0` (head-only, e.g., `git log` profile): no trailing newline after
+///   the omission marker.
+fn format_sandwich(output: &str, head: usize, tail: usize) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let total = lines.len();
-    if total <= head_count + tail_count {
-        (
-            lines.iter().map(ToString::to_string).collect(),
-            0,
-            Vec::new(),
-        )
-    } else {
-        let head = lines[..head_count.min(total)]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        let tail = lines[total.saturating_sub(tail_count)..]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        (head, total - head_count - tail_count, tail)
-    }
-}
-
-/// Build a head/tail sandwich with an omitted-lines marker in the middle.
-fn format_sandwich(output: &str, head: usize, tail: usize) -> String {
-    let (head_lines, omitted, tail_lines) = split_head_tail(output, head, tail);
-    if omitted == 0 {
+    if total <= head + tail {
         return output.to_string();
     }
-    let mut v = head_lines;
-    v.push(format!("... ({omitted} lines omitted)"));
-    v.extend(tail_lines);
-    v.join("\n")
+    let omitted = total - head - tail;
+
+    // Build the result directly from &str slices, avoiding intermediate Vec<String> copies.
+    let mut result = lines[..head].join("\n");
+    if result.is_empty() {
+        // head=0: no leading newline before the omission marker
+        let _ = write!(result, "... ({omitted} lines omitted)");
+    } else {
+        let _ = write!(result, "\n... ({omitted} lines omitted)");
+    }
+    if tail > 0 {
+        let _ = write!(result, "\n{}", lines[total - tail..].join("\n"));
+    }
+    result
 }
 
 /// Apply line truncation: head/tail sandwich (byte-gated), `max_lines`-only absolute cap, or passthrough.
@@ -3312,6 +3297,20 @@ mod tests {
             ),
             ("a\nb\nc\nd\ne\nf\ng", 7, 0, "a\nb\nc\nd\ne\nf\ng"),
             ("a\nb\nc\nd\ne\nf\ng", 0, 7, "a\nb\nc\nd\ne\nf\ng"),
+            // Head-only truncation (e.g., git log profile: head=20, no tail)
+            (
+                "a\nb\nc\nd\ne\nf\ng",
+                3,
+                0,
+                "a\nb\nc\n... (4 lines omitted)",
+            ),
+            // Tail-only truncation (e.g., ping/gh/helm profiles: tail=4..10, no head)
+            (
+                "a\nb\nc\nd\ne\nf\ng",
+                0,
+                3,
+                "... (4 lines omitted)\ne\nf\ng",
+            ),
         ];
         for (input, head, tail, expected) in cases {
             let result = format_sandwich(input, *head, *tail);
