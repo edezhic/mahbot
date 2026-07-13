@@ -1552,13 +1552,8 @@ fn apply_profile_pipeline(
     // Stage 3: strip lines
     let mut processed = apply_strip_lines(&output, profile);
 
-    // Stage 4: collapse blank lines (runs >2 → 2), then collapse consecutive
-    // duplicate content lines (≥5 identical → [repeated N] marker).
-    // collapse_consecutive_lines skips blank lines — otherwise [repeated]
-    // markers on blank runs would prevent blank-line compression.
-    // The blank-line skip makes the two passes order-independent.
+    // Stage 4: collapse blank lines (runs >2 → 2).
     processed = collapse_blank_lines(&processed);
-    processed = collapse_consecutive_lines(&processed);
 
     // Stage 5: truncate long lines
     if let Some(max) = profile.max_line_len {
@@ -1727,41 +1722,6 @@ fn json_value_type(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
     }
-}
-
-/// Collapse consecutive identical non-blank lines (≥5 repetitions).
-/// Blank/whitespace-only lines are passed through individually so
-/// collapse_blank_lines can compress them without interference.
-fn collapse_consecutive_lines(input: &str) -> String {
-    const THRESHOLD: usize = 5;
-    let mut result = String::with_capacity(input.len());
-    let lines: Vec<&str> = input.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let current = lines[i];
-        // Blank lines are handled by collapse_blank_lines — treat each
-        // blank line individually to avoid [repeated N times] markers
-        // that would prevent blank-line compression.
-        if current.trim().is_empty() {
-            push_line(&mut result, current);
-            i += 1;
-            continue;
-        }
-        let mut count = 1;
-        while i + count < lines.len() && lines[i + count] == current {
-            count += 1;
-        }
-        if count >= THRESHOLD {
-            push_line(&mut result, current);
-            let _ = write!(result, "\n[repeated {count} times]");
-        } else {
-            for _ in 0..count {
-                push_line(&mut result, current);
-            }
-        }
-        i += count;
-    }
-    result
 }
 
 /// Truncate any single line exceeding `max_line_len` with a note.
@@ -2249,10 +2209,10 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "generic pipeline: strips ANSI, collapses repeats, preserves content",
+                name: "generic pipeline: strips ANSI, preserves content",
                 command: "unknown",
                 stdout: "Compiling foo v1.0.0 (/tmp)\nCompiling bar v2.0.0 (/tmp)\nresult: ok\nline1\nline2\nline3\nline3\nline3\nline3\nline3\nline3\nline3\n",
-                contains: &["Compiling", "[repeated", "result: ok"],
+                contains: &["Compiling", "result: ok"],
                 not_contains: &["\x1B["],
                 ..Default::default()
             },
@@ -2744,20 +2704,6 @@ mod tests {
     }
 
     #[test]
-    fn collapse_consecutive_lines_cases() {
-        let cases: &[(&str, &str)] = &[
-            // 6 identical "b" lines → collapsed with [repeated N times] marker
-            ("a\nb\nb\nb\nb\nb\nb\nc", "a\nb\n[repeated 6 times]\nc"),
-            // 3 identical "b" lines → below threshold (5), pass through unchanged
-            ("a\nb\nb\nb\nc", "a\nb\nb\nb\nc"),
-        ];
-        for (input, expected) in cases {
-            let result = collapse_consecutive_lines(input);
-            assert_eq!(result, *expected, "input: {input:?}");
-        }
-    }
-
-    #[test]
     fn truncate_line_width_short_and_long() {
         // Long lines truncated with continuation marker
         let long = "a".repeat(500);
@@ -2929,34 +2875,6 @@ mod tests {
             let result = collapse_blank_lines(input);
             assert_eq!(result, *expected, "input: {input:?}");
         }
-    }
-
-    /// 5+ consecutive blank lines should collapse to 2 without `[repeated]` markers,
-    /// regardless of whether collapse_blank_lines or collapse_consecutive_lines runs first.
-    #[test]
-    fn collapse_blank_lines_then_consecutive_no_marker() {
-        let input = "a\n\n\n\n\n\nb"; // 6 blank lines between a and b
-
-        // Forward order: blank first, then consecutive
-        let forward = collapse_blank_lines(input);
-        let forward = collapse_consecutive_lines(&forward);
-        assert_eq!(
-            forward, "a\n\n\nb",
-            "6 blank lines → 2 blanks, no [repeated] marker"
-        );
-        assert!(
-            !forward.contains("[repeated"),
-            "should not contain repeated marker for blank lines"
-        );
-
-        // Reverse order: consecutive first, then blank — should produce same result
-        let reverse = collapse_consecutive_lines(input);
-        let reverse = collapse_blank_lines(&reverse);
-        assert_eq!(forward, reverse, "both orders produce same result");
-        assert!(
-            !reverse.contains("[repeated"),
-            "no [repeated] marker in reverse order"
-        );
     }
 
     // ── Chained command and canonical command tests ─────────────────
