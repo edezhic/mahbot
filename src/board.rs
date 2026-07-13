@@ -1098,7 +1098,7 @@ impl BoardStore {
         }
     }
 
-    /// Build the SQL, params, and action description for a ticket status
+    /// Build the SQL, params, and action description for a ticket phase
     /// transition. Shared by [`transition_to`](Self::transition_to) and
     /// [`transition_to_tx`](Self::transition_to_tx).
     ///
