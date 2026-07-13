@@ -867,7 +867,7 @@ async fn poll_round() -> anyhow::Result<()> {
                         workspace = %ws.name,
                         phase = %info.log_label,
                         error = %e,
-                        "Claim failed, skipping remaining phases for workspace",
+                        "Claim failed, skipping remaining claim phases for workspace",
                     );
                     break;
                 }
