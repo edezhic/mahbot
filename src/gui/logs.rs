@@ -195,6 +195,29 @@ impl LogsState {
         }
     }
 
+    /// Reset pagination for whichever tab is currently active.
+    fn reset_pagination_for_active_tab(&mut self) {
+        match self.active_tab {
+            LogsTab::AllLogs | LogsTab::Issues => self.pagination.reset(),
+            LogsTab::ToolFailures => self.tool_failures_state.reset_pagination(),
+        }
+    }
+
+    /// Refresh the active tab's data.
+    fn refresh_active_tab(&mut self, log_store: &LogStore) -> Task<LogMessage> {
+        match self.active_tab {
+            LogsTab::AllLogs | LogsTab::Issues => self.refresh(log_store),
+            LogsTab::ToolFailures => self
+                .tool_failures_state
+                .refresh(
+                    &self.role_filter,
+                    &self.workspace_filter,
+                    &self.search_filter,
+                )
+                .map(LogMessage::ToolFailures),
+        }
+    }
+
     pub fn refresh(&mut self, log_store: &LogStore) -> Task<LogMessage> {
         self.load_state.start_loading();
         let query = self.build_query();
@@ -327,69 +350,26 @@ impl LogsState {
                 self.refresh(log_store)
             }
             // ── Filter routing based on active tab ─────────────
-            LogMessage::RoleFilterInput(v) => match self.active_tab {
-                LogsTab::AllLogs | LogsTab::Issues => {
-                    self.role_filter = v;
-                    self.pagination.reset();
-                    self.refresh(log_store)
-                }
-                LogsTab::ToolFailures => {
-                    self.role_filter = v;
-                    self.tool_failures_state.reset_pagination();
-                    self.tool_failures_state
-                        .refresh(
-                            &self.role_filter,
-                            &self.workspace_filter,
-                            &self.search_filter,
-                        )
-                        .map(LogMessage::ToolFailures)
-                }
-            },
-            LogMessage::WorkspaceInput(v) => match self.active_tab {
-                LogsTab::AllLogs | LogsTab::Issues => {
-                    self.workspace_filter = v;
-                    self.pagination.reset();
-                    self.refresh(log_store)
-                }
-                LogsTab::ToolFailures => {
-                    self.workspace_filter = v;
-                    self.tool_failures_state.reset_pagination();
-                    self.tool_failures_state
-                        .refresh(
-                            &self.role_filter,
-                            &self.workspace_filter,
-                            &self.search_filter,
-                        )
-                        .map(LogMessage::ToolFailures)
-                }
-            },
-            LogMessage::SearchInput(v) => match self.active_tab {
-                LogsTab::AllLogs | LogsTab::Issues => {
-                    self.search_filter = v;
-                    self.pagination.reset();
-                    self.debounce.trigger(300).map(LogMessage::DebouncedRefresh)
-                }
-                LogsTab::ToolFailures => {
-                    self.search_filter = v;
-                    self.tool_failures_state.reset_pagination();
-                    self.debounce.trigger(300).map(LogMessage::DebouncedRefresh)
-                }
-            },
+            LogMessage::RoleFilterInput(v) => {
+                self.role_filter = v;
+                self.reset_pagination_for_active_tab();
+                self.refresh_active_tab(log_store)
+            }
+            LogMessage::WorkspaceInput(v) => {
+                self.workspace_filter = v;
+                self.reset_pagination_for_active_tab();
+                self.refresh_active_tab(log_store)
+            }
+            LogMessage::SearchInput(v) => {
+                self.search_filter = v;
+                self.reset_pagination_for_active_tab();
+                self.debounce.trigger(300).map(LogMessage::DebouncedRefresh)
+            }
             LogMessage::DebouncedRefresh(generation) => {
                 if !self.debounce.should_process(generation) {
                     return Task::none();
                 }
-                match self.active_tab {
-                    LogsTab::AllLogs | LogsTab::Issues => self.refresh(log_store),
-                    LogsTab::ToolFailures => self
-                        .tool_failures_state
-                        .refresh(
-                            &self.role_filter,
-                            &self.workspace_filter,
-                            &self.search_filter,
-                        )
-                        .map(LogMessage::ToolFailures),
-                }
+                self.refresh_active_tab(log_store)
             }
             LogMessage::PrevPage => match self.active_tab {
                 LogsTab::AllLogs | LogsTab::Issues => {
@@ -440,17 +420,7 @@ impl LogsState {
             }
             LogMessage::TabSelected(tab) => {
                 self.active_tab = tab;
-                if tab == LogsTab::ToolFailures {
-                    self.tool_failures_state
-                        .refresh(
-                            &self.role_filter,
-                            &self.workspace_filter,
-                            &self.search_filter,
-                        )
-                        .map(LogMessage::ToolFailures)
-                } else {
-                    self.refresh(log_store)
-                }
+                self.refresh_active_tab(log_store)
             }
             LogMessage::ToolFailures(msg) => match msg {
                 super::tool_failures::ToolFailuresMessage::PrevPage => self
