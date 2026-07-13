@@ -367,8 +367,22 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
     }
 }
 
-/// This is a pure notification function — it does NOT pause the workspace.
-/// The Manager handles failed tickets autonomously via the triage prompt.
+/// Enqueue a notification for the Manager about a ticket transition.
+///
+/// Renders a template with the ticket ID, title, target phase, transition log,
+/// and the workspace's buffered non-critical transitions (see "Side effects"
+/// below), then enqueues the result into the serialized Manager queue.
+///
+/// This function does NOT pause the workspace — the Manager handles failed
+/// tickets autonomously via the triage prompt.
+///
+/// # Side effects
+///
+/// Drains the [`ticket_buffer`] for this workspace before rendering the
+/// notification template. The drained entries are injected via the
+/// `{{ticket_updates}}` placeholder. See the inline comment at the drain call
+/// site for the data-loss guard (drain happens only after workspace lookup
+/// succeeds so that buffered entries survive a temporary lookup failure).
 ///
 /// # Invariant: failure comment before Failed transition
 ///
