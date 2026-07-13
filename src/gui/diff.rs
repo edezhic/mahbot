@@ -2167,17 +2167,15 @@ mod tests {
             })
             .collect();
 
-        DiffFile {
-            dfile: crate::diff_parse::DiffFile::new(
+        DiffFile::from_parsed(
+            crate::diff_parse::DiffFile::new(
                 path.to_string(),
                 hunks,
                 crate::diff_parse::DiffFileStatus::Modified,
             ),
-            old_highlights: None,
-            new_highlights: None,
-            add_count: num_hunks * lines_per_hunk,
-            remove_count: 0,
-        }
+            None,
+            None,
+        )
     }
 
     fn make_binary_file(path: &str) -> DiffFile {
