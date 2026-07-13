@@ -346,7 +346,6 @@ async fn download_retry_loop() {
             warn!("Deleting cached model files after load failure, forcing re-download");
             let _ = std::fs::remove_file(&model_dest);
             let _ = std::fs::remove_file(&tokenizer_dest);
-            continue;
         }
 
         // ── Phase 2: Download missing files ──
