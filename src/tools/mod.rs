@@ -234,7 +234,13 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
             remap_arg_key(obj, "id", "ticket_id");
             remap_arg_key(obj, "ticket", "ticket_id");
         }
+        "read" => {
+            remap_arg_key(obj, "file", "path");
+            remap_arg_key(obj, "filename", "path");
+        }
         "edit" => {
+            remap_arg_key(obj, "file", "path");
+            remap_arg_key(obj, "filename", "path");
             remap_arg_key(obj, "old_str", "old_string");
             remap_arg_key(obj, "new_str", "new_string");
         }
@@ -389,6 +395,36 @@ mod tests {
         let (name, args) = normalize_tool_call("get_ticket", serde_json::json!({"id": "mahbot-1"}));
         assert_eq!(name, "get_ticket");
         assert_eq!(args["ticket_id"], "mahbot-1");
+
+        // "read" tool: file/filename → path
+        let (name, args) = normalize_tool_call("read", serde_json::json!({"file": "src/main.rs"}));
+        assert_eq!(name, "read");
+        assert_eq!(args["path"], "src/main.rs");
+
+        let (name, args) =
+            normalize_tool_call("read_file", serde_json::json!({"filename": "lib.rs"}));
+        assert_eq!(name, "read");
+        assert_eq!(args["path"], "lib.rs");
+
+        // "edit" tool: file/filename → path, old_str/new_str → old_string/new_string
+        let (name, args) = normalize_tool_call(
+            "edit",
+            serde_json::json!({"file": "main.rs", "old_str": "foo", "new_str": "bar"}),
+        );
+        assert_eq!(name, "edit");
+        assert_eq!(args["path"], "main.rs");
+        assert_eq!(args["old_string"], "foo");
+        assert_eq!(args["new_string"], "bar");
+
+        // Canonical "path" key is preserved when both "path" and alias are present.
+        // remap_arg_key only moves when canonical key is absent, so "file" remains.
+        let (name, args) = normalize_tool_call(
+            "read",
+            serde_json::json!({"path": "canonical.rs", "file": "alias.rs"}),
+        );
+        assert_eq!(name, "read");
+        assert_eq!(args["path"], "canonical.rs");
+        assert!(args.as_object().unwrap().contains_key("file"));
     }
 
     #[test]
