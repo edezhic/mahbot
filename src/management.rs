@@ -317,30 +317,12 @@ where
 
 /// Write a comment to a ticket, then transition it to a new phase.
 ///
-/// All comments and the phase transition are wrapped in a single transaction
-/// via [`crate::turso::with_tx`]. If any operation fails, the entire
-/// transaction is rolled back — neither the comments nor the transition takes
-/// effect. Returns `true` on success, `false` on failure.
+/// Delegates to [`with_comment_and_transition`]; see that function for
+/// transaction semantics, notification dispatch, and return-value conventions.
 ///
-/// On success, dispatches a notification after the transaction commits (via
-/// [`dispatch_notification`]).
-///
-/// This is atomic — there is no crash window between comments and transition
-/// where orphaned comments could persist.
-///
-/// # Correctness
-///
-/// The `comment` is a required argument — the compiler guarantees
-/// it is always written (eliminating the previous class of bugs where
-/// `comment: None` silently produced a no-comment transition).
-///
-/// Delegates to [`with_comment_and_transition`]; see that function's
-/// `# Correctness` section for the agent-cancellation invariant.
-///
-/// `pipeline_reservation` is automatically derived from the target phase:
-/// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
-/// (bounce-back transitions get priority re-dispatch over fresh tickets),
-/// `None` for all other transitions.
+/// The `comment` argument is required — the compiler guarantees it is always
+/// written (eliminating the previous class of bugs where `comment: None`
+/// silently produced a no-comment transition).
 #[must_use]
 async fn comment_and_transition(ctx: TransitionCtx<'_>, comment: (&str, &str)) -> bool {
     let ticket = ctx.ticket;
