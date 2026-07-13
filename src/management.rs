@@ -2249,16 +2249,22 @@ async fn process_verifier_verdicts(
         return;
     }
 
-    if !all_failed && !any_failed {
+    if all_failed {
         info!(
             ticket = %ticket.id,
-            "{log_label}: all passed (≥ {REVIEW_QA_THRESHOLD}/10)",
+            "{log_label}: all verifier agents failed to produce verdicts — ticket moved to Failed",
             log_label = verifier.log_label,
         );
     } else if any_failed {
         info!(
             ticket = %ticket.id,
             "{log_label} failed — pipeline reservation set for rework priority",
+            log_label = verifier.log_label,
+        );
+    } else {
+        info!(
+            ticket = %ticket.id,
+            "{log_label}: all passed (≥ {REVIEW_QA_THRESHOLD}/10)",
             log_label = verifier.log_label,
         );
     }
