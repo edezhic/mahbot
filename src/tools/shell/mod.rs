@@ -825,27 +825,20 @@ pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
         .position(|w| !SHELL_PREFIXES.contains(w) && !w.starts_with('-') && !is_env_assignment(w))
 }
 
-/// Shared helper that returns both the index and the basename of the first
-/// command word from a bare list of words. Used by [`command_word_from_segment`]
-/// to avoid duplicating index unwrap + basename extraction.
-fn command_word_and_index<'a>(words: &[&'a str]) -> Option<(usize, &'a str)> {
-    let cmd_idx = find_first_command_word_index(words)?;
-    let basename = words[cmd_idx]
-        .rsplit('/')
-        .next()
-        .expect("rsplit always yields at least one element");
-    Some((cmd_idx, basename))
-}
-
 /// Extract the first command word index, basename, and the whitespace-split words
 /// from a shell segment.
 ///
-/// Trims the segment, splits on whitespace, and delegates to [`command_word_and_index`].
+/// Trims the segment, splits on whitespace, finds the first non-prefix/non-flag/non-env
+/// word index via [`find_first_command_word_index`], and extracts the basename from it.
 /// Returns `None` when no command word is found (e.g., only prefixes/flags/env assignments).
 fn command_word_from_segment(segment: &str) -> Option<(usize, &str, Vec<&str>)> {
     let trimmed = segment.trim();
     let words: Vec<&str> = trimmed.split_whitespace().collect();
-    let (idx, cmd) = command_word_and_index(&words)?;
+    let idx = find_first_command_word_index(&words)?;
+    let cmd = words[idx]
+        .rsplit('/')
+        .next()
+        .expect("rsplit always yields at least one element");
     Some((idx, cmd, words))
 }
 
