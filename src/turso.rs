@@ -573,6 +573,41 @@ impl Connection {
         }
         Ok(())
     }
+
+    /// Run PRAGMA integrity_check to produce a complete diagnostic report.
+    ///
+    /// Performs a thorough database integrity scan (b-tree tree structure,
+    /// index consistency, constraint checks, etc.) and returns every problem
+    /// description as a separate `String` in the result vector.  Returns an
+    /// empty `Vec` when the database is healthy — the only row from
+    /// `PRAGMA integrity_check` is `"ok"`.
+    ///
+    /// This is more comprehensive and slower than [`quick_check`]; it should
+    /// only be run when [`quick_check`] has already indicated corruption, so
+    /// that operators get the full diagnostic picture without the overhead on
+    /// every 5-minute periodic scan.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the SQL statement itself fails (e.g., severe corruption that
+    /// prevents even diagnostic queries from executing), or if any row value
+    /// has an unexpected type.
+    pub async fn integrity_check(&self) -> anyhow::Result<Vec<String>> {
+        let rows = self
+            .query("PRAGMA integrity_check;", ())
+            .await
+            .context("Failed to execute PRAGMA integrity_check")?;
+
+        let mut problems: Vec<String> = Vec::new();
+        for row in &rows {
+            match row.get_value(0)? {
+                Value::Text(s) if s == "ok" => { /* healthy, skip */ }
+                Value::Text(s) => problems.push(s),
+                _ => anyhow::bail!("Unexpected result from PRAGMA integrity_check"),
+            }
+        }
+        Ok(problems)
+    }
 }
 
 /// A locked connection handle scoped to a single transaction.
@@ -983,5 +1018,36 @@ mod tests {
         conn.quick_check()
             .await
             .expect("quick_check should pass on a healthy empty database");
+    }
+
+    /// Verify that integrity_check returns an empty Vec on a healthy database.
+    #[tokio::test]
+    async fn test_integrity_check_passes_on_healthy_db() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let conn = Connection::open(tmp.path().join("test.db").as_path())
+            .await
+            .expect("open test database");
+
+        // Create a simple table and insert data so the database has real
+        // schema — integrity_check on a truly empty DB works, but testing
+        // against a minimally populated one is more representative.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _test (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .expect("create test table");
+        conn.execute("INSERT INTO _test (id, val) VALUES (1, 'hello')", ())
+            .await
+            .expect("insert test row");
+
+        let problems = conn
+            .integrity_check()
+            .await
+            .expect("integrity_check should pass on a healthy database");
+        assert!(
+            problems.is_empty(),
+            "expected no integrity problems, got: {problems:?}",
+        );
     }
 }

@@ -88,7 +88,10 @@ pub async fn checkpoint_all_databases() {
 /// Iterates all stores via [`crate::turso::iter_checkpoint_stores`], runs
 /// `quick_check` on each in parallel, and logs the results. Corruption
 /// errors are logged at `error!` level for operator visibility in the
-/// dashboard Logs page. Successes are logged at `info!` level.
+/// dashboard Logs page, and a full `PRAGMA integrity_check` is
+/// automatically triggered on the affected store so the complete
+/// diagnostic report is available without manual intervention.
+/// Successes are logged at `info!` level.
 ///
 /// Skips stores that haven't been initialized yet. This is a fire-and-forget
 /// function: all per-store errors are logged and swallowed to avoid blocking
@@ -97,7 +100,39 @@ pub async fn verify_all_databases() {
     for_each_store(|name, conn| async move {
         match conn.quick_check().await {
             Ok(()) => info!(db = %name, "Database integrity check passed"),
-            Err(e) => error!(error = %e, db = %name, "Database integrity check failed"),
+            Err(e) => {
+                error!(error = %e, db = %name, "Database integrity check failed, running full diagnostic");
+
+                // Run the full integrity_check to get the complete diagnostic
+                // report so operators can triage without running debug CLI.
+                match conn.integrity_check().await {
+                    Ok(problems) if problems.is_empty() => {
+                        // quick_check reported corruption but integrity_check
+                        // found nothing — unexpected but handle gracefully.
+                        warn!(
+                            db = %name,
+                            "Full integrity check returned no problems after quick_check failure"
+                        );
+                    }
+                    Ok(problems) => {
+                        for problem in &problems {
+                            error!(db = %name, problem = %problem, "Integrity issue");
+                        }
+                        let count = problems.len();
+                        error!(
+                            db = %name, count,
+                            "Full integrity check found {} issue(s) in {}",
+                            count, name,
+                        );
+                    }
+                    Err(diag_err) => {
+                        error!(
+                            error = %diag_err, db = %name,
+                            "Full integrity check also failed — database corruption may be severe"
+                        );
+                    }
+                }
+            }
         }
     })
     .await;
