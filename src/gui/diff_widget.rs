@@ -778,13 +778,11 @@ mod tests {
         hunks: Vec<crate::diff_parse::DiffHunk>,
         status: DiffFileStatus,
     ) -> super::super::diff::DiffFile {
-        super::super::diff::DiffFile {
-            dfile: crate::diff_parse::DiffFile::new(path.to_string(), hunks, status),
-            old_highlights: None,
-            new_highlights: None,
-            add_count: 0,
-            remove_count: 0,
-        }
+        super::super::diff::DiffFile::from_parsed(
+            crate::diff_parse::DiffFile::new(path.to_string(), hunks, status),
+            None,
+            None,
+        )
     }
 
     fn make_line(
