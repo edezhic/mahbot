@@ -538,12 +538,10 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
         }
 
         // ── Heredoc detection ───────────────────────────────────────
-        if w.starts_with("<<") {
-            in_heredoc_body = true;
-            continue;
-        }
-        // Heredoc with fd prefix (e.g. 3<<EOF, 1<<-EOF)
-        if w.len() > 2 && w.as_bytes()[0].is_ascii_digit() && w.contains("<<") {
+        // Bare heredoc (<<EOF, <<-EOF, <<<) or fd-prefixed heredoc (3<<EOF, 1<<-EOF)
+        if w.starts_with("<<")
+            || (w.len() > 2 && w.as_bytes()[0].is_ascii_digit() && w.contains("<<"))
+        {
             in_heredoc_body = true;
             continue;
         }
