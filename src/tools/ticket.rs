@@ -5,6 +5,7 @@
 
 use crate::Role;
 use crate::Workspace;
+use crate::board::store as board_store;
 use crate::board::{TicketParams, TicketPhase};
 use crate::tools::Tool;
 use anyhow::Result;
@@ -103,7 +104,7 @@ impl Tool for CreateTicketTool {
             None => None,
         };
 
-        let store = crate::board::store();
+        let store = board_store();
         let embedding_bytes: Option<Vec<u8>> =
             crate::embedder::embed_document(title).map(|v| crate::vector::vec_to_bytes(&v));
 
@@ -160,7 +161,7 @@ impl Tool for UpdateTicketTool {
 
         let parsed_phase = new_phase.parse::<TicketPhase>()?;
 
-        let store = crate::board::store();
+        let store = board_store();
 
         // Guard: refuse to update a ticket that is in a pipeline-blocking phase.
         guard_not_pipeline_blocking(store, ticket_id).await?;
@@ -220,7 +221,7 @@ impl Tool for ListTicketsTool {
             None => None,
         };
 
-        let store = crate::board::store();
+        let store = board_store();
 
         let mut tickets = store.list_all_tickets(Some(&ws.name), phase_filter).await?;
 
@@ -279,7 +280,7 @@ impl Tool for GetTicketTool {
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let ticket_id = super::get_str(&args, "ticket_id")?;
 
-        let store = crate::board::store();
+        let store = board_store();
 
         match store.get_ticket(ticket_id).await? {
             Some(ticket) => Ok(ticket.detailed_display()),
@@ -318,7 +319,7 @@ impl Tool for AddCommentTool {
         let ticket_id = super::get_str(&args, "ticket_id")?;
         let content = super::get_str(&args, "content")?;
 
-        let store = crate::board::store();
+        let store = board_store();
 
         // Guard: refuse to comment on a ticket that is in a pipeline-blocking phase.
         guard_not_pipeline_blocking(store, ticket_id).await?;
@@ -379,7 +380,7 @@ mod tests {
     async fn test_update_ticket_tool() {
         crate::util::test::init_test_stores().await;
 
-        let store = crate::board::store();
+        let store = board_store();
         let id = make_ticket(
             store,
             &test_ws("/ws"),
@@ -407,7 +408,7 @@ mod tests {
     async fn test_list_tickets_tool() {
         crate::util::test::init_test_stores().await;
 
-        let store = crate::board::store();
+        let store = board_store();
         let ws = test_ws("/tmp_ws");
 
         let _id_a = make_ticket(store, &ws, "A", crate::board::TicketPhase::Backlog).await;
@@ -490,7 +491,7 @@ mod tests {
     async fn test_get_ticket_tool() {
         crate::util::test::init_test_stores().await;
 
-        let store = crate::board::store();
+        let store = board_store();
         let id = TicketBuilder::new(store, &test_ws("/ws"))
             .title("GetTest")
             .desc("get me")
@@ -516,7 +517,7 @@ mod tests {
     async fn test_add_comment_tool() {
         crate::util::test::init_test_stores().await;
 
-        let store = crate::board::store();
+        let store = board_store();
         let id = TicketBuilder::new(store, &test_ws("/ws"))
             .title("CommentTest")
             .desc("add a comment")
@@ -544,7 +545,7 @@ mod tests {
     async fn test_invalid_phase() {
         crate::util::test::init_test_stores().await;
 
-        let store = crate::board::store();
+        let store = board_store();
         let id = make_ticket(
             store,
             &test_ws("/ws"),
@@ -569,7 +570,7 @@ mod tests {
     async fn test_guard_not_pipeline_blocking_cases() {
         crate::util::test::init_test_stores().await;
 
-        let store = crate::board::store();
+        let store = board_store();
         let ws = test_ws("/ws");
 
         let blocking_id = TicketBuilder::new(store, &ws)
@@ -611,7 +612,7 @@ mod tests {
     /// Used by wiring tests below to verify tools call `guard_not_pipeline_blocking`.
     async fn create_blocking_ticket() -> String {
         crate::util::test::init_test_stores().await;
-        let store = crate::board::store();
+        let store = board_store();
         TicketBuilder::new(store, &test_ws("/ws"))
             .title("BlockMe")
             .desc("in flight")
