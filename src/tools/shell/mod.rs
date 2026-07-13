@@ -67,11 +67,17 @@ const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
 /// Default maximum shell command execution time before kill.
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
 /// Cap bytes collected from each pipe during command execution (including timeouts).
+///
+/// # Truncation safety
+///
+/// This cap (256 KB) is well below 1 MB, so the [`decode_and_strip_ansi`]
+/// output never reaches a size where truncation would be necessary. If this
+/// cap is ever raised above 1 MB, re-add truncation safeguards (e.g.,
+/// [`truncate_sandwich`](crate::util::truncate_sandwich) after ANSI stripping)
+/// to prevent unbounded output.
 const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
 /// Max chars of partial output included in timeout error messages.
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
-/// Maximum output size in bytes (1MB).
-const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
@@ -392,12 +398,8 @@ impl ShellTool {
                 status,
                 elapsed,
             } => {
-                // Save full output BEFORE any truncation so agents can access
-                // the full output even when filtered/truncated to fit the context.
-                let full_hint = save_full_output_if_large(&stdout, &stderr, command_str);
-
-                let stdout = clean_truncate(&stdout, "output");
-                let stderr = clean_truncate(&stderr, "stderr");
+                let stdout = decode_and_strip_ansi(&stdout);
+                let stderr = decode_and_strip_ansi(&stderr);
 
                 let exit_code = status.code(); // Option<i32> — None means signal
                 let exit_note = match exit_code {
@@ -416,11 +418,6 @@ impl ShellTool {
                     elapsed,
                 );
                 let mut combined = processed;
-                // Include full output hint if truncation or spill occurred.
-                if let Some(hint) = &full_hint {
-                    combined.push('\n');
-                    combined.push_str(hint);
-                }
                 if exit_code != Some(0) {
                     combined.push_str("\n\n");
                     combined.push_str(&exit_note);
@@ -1614,7 +1611,7 @@ fn apply_profile_pipeline(
 /// Decode raw shell output bytes (lossy UTF-8) and strip ANSI escape sequences.
 ///
 /// This is the first step before further processing such as credential scrubbing
-/// ([`strip_and_scrub`]) or truncation ([`clean_truncate`]).
+/// ([`strip_and_scrub`]).
 fn decode_and_strip_ansi(data: &[u8]) -> String {
     let decoded = String::from_utf8_lossy(data);
     strip_ansi_escapes(&decoded)
@@ -1626,25 +1623,8 @@ fn decode_and_strip_ansi(data: &[u8]) -> String {
 /// Builds on [`decode_and_strip_ansi`] by additionally applying credential
 /// scrubbing. Use this whenever you need to process raw shell bytes into
 /// display-safe text.
-///
-/// # When to skip this helper
-///
-/// - **`clean_truncate`** intentionally only strips ANSI escapes (no scrubbing)
-///   because credential scrubbing happens later in the output pipeline
-///   ([`apply_profile_pipeline`]). It uses [`decode_and_strip_ansi`] +
-///   [`truncate_sandwich`](crate::util::truncate_sandwich) directly — that is a
-///   distinct operation with a different post-processing contract.
 fn strip_and_scrub(data: &[u8]) -> String {
     scrub_credentials(&decode_and_strip_ansi(data))
-}
-
-/// Strip ANSI escape sequences first, then truncate to [`MAX_OUTPUT_BYTES`].
-///
-/// Applying [`truncate_sandwich`] after ANSI stripping guarantees that
-/// truncation boundaries cannot split multi-character escape sequences
-/// into garbled fragments.
-fn clean_truncate(data: &[u8], label: &'static str) -> String {
-    crate::util::truncate_sandwich(&decode_and_strip_ansi(data), MAX_OUTPUT_BYTES, label)
 }
 
 /// Try to parse as JSON/structured data and return a schema preview.
@@ -1840,53 +1820,6 @@ fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
         Some(path) => format_spill_preview(&output, &path),
         None => crate::util::truncate_tool_output(&output),
     }
-}
-
-/// Save the full (pre-truncation) output to a temp file when 1MB truncation occurred,
-/// so agents can access the full output even when filtering/truncation reduces the
-/// inline view. Note: credentials are scrubbed and ANSI escapes are stripped before
-/// saving. Returns a spill header hint like "[Output saved to ...]" or None if the
-/// save failed or no truncation occurred.
-fn save_full_output_if_large(
-    stdout_bytes: &[u8],
-    stderr_bytes: &[u8],
-    command: &str,
-) -> Option<String> {
-    // Only save when actual truncation is needed — skip trivial commands
-    if stdout_bytes.len() <= MAX_OUTPUT_BYTES && stderr_bytes.len() <= MAX_OUTPUT_BYTES {
-        return None;
-    }
-    let slug: String = command
-        .chars()
-        .take(40)
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    let filename = format!("{epoch}_{slug}.full.log");
-
-    // Combine stdout + stderr with labels, strip ANSI escapes, scrub credentials.
-    // Order: strip first, then scrub — prevents ANSI-obfuscated credentials
-    // from bypassing the regex-based scrubber.
-    let raw = format!(
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(stdout_bytes),
-        String::from_utf8_lossy(stderr_bytes)
-    );
-    let stripped = strip_ansi_escapes(&raw);
-    let scrubbed = scrub_credentials(&stripped);
-    let line_count = scrubbed.lines().count();
-    let byte_count = scrubbed.len();
-    let path = write_to_spill(&scrubbed, &filename)?;
-    Some(format_spill_header(&path, byte_count, line_count))
 }
 
 #[cfg(test)]
@@ -3092,77 +3025,6 @@ mod tests {
         // 20 lines + 1 truncated note line = 21 max
         assert!(lines <= 21, "df should cap at ~21 lines, got {lines}");
         assert!(lines >= 19, "df should have around 20 lines, got {lines}");
-    }
-
-    #[test]
-    fn save_full_output_if_large_skips_small_output() {
-        let result = save_full_output_if_large(b"hello", b"", "echo hello");
-        assert!(result.is_none(), "should skip saving for small output");
-    }
-
-    #[test]
-    fn save_full_output_if_large_saves_large_output() {
-        let large = vec![b'a'; MAX_OUTPUT_BYTES + 1];
-        let result = save_full_output_if_large(&large, b"", "large-test");
-        assert!(result.is_some(), "should save for oversized output");
-        let hint = result.unwrap();
-        assert!(
-            hint.contains("[Output saved to"),
-            "should mention saved file"
-        );
-        assert!(
-            hint.contains("[view with: read"),
-            "should provide read hint"
-        );
-    }
-
-    #[test]
-    fn save_full_output_if_large_strips_ansi_escapes() {
-        // Build output with ANSI escape sequences above the spill threshold
-        let ansi_green = "\x1B[0;32m";
-        let ansi_reset = "\x1B[0m";
-        let inner =
-            format!("{ansi_green}output line{ansi_reset}\n{ansi_green}another line{ansi_reset}");
-        // Pad to exceed MAX_OUTPUT_BYTES while preserving ANSI content
-        let padding = " ".repeat(MAX_OUTPUT_BYTES.saturating_sub(inner.len()) + 1);
-        let ansi_content = format!("{inner}{padding}");
-        let stdout_bytes = ansi_content.as_bytes();
-
-        let result = save_full_output_if_large(stdout_bytes, b"", "ansi-test");
-        assert!(
-            result.is_some(),
-            "should save for oversized output with ANSI"
-        );
-        let hint = result.unwrap();
-
-        // Extract the spill file path from the hint
-        let path_str = hint
-            .strip_prefix("[Output saved to ")
-            .and_then(|s| s.split_once(' '))
-            .map(|(path, _)| path)
-            .expect("should parse path from hint");
-        let path = std::path::Path::new(path_str);
-        assert!(path.exists(), "spill file should exist");
-
-        let spill_content = std::fs::read_to_string(path).expect("should read spill file");
-
-        // Verify ANSI escapes were stripped
-        assert!(
-            !spill_content.contains("\x1B["),
-            "spill file should not contain ANSI escapes: {spill_content:?}"
-        );
-        assert!(
-            !spill_content.contains(ansi_green),
-            "spill file should not contain ANSI green code"
-        );
-        assert!(
-            spill_content.contains("output line"),
-            "spill file should contain the actual output text"
-        );
-        assert!(
-            spill_content.contains("another line"),
-            "spill file should contain all output text"
-        );
     }
 
     // ── check_outside_quotes ──────────────────────────────────────────
