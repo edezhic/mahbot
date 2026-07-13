@@ -28,35 +28,18 @@ impl ErrorClass {
     }
 }
 
-/// Body-text hints that indicate permanent (non-retryable) errors
-/// regardless of HTTP status code — checked before status-based
-/// classification.
+/// Body-text hints that indicate permanent (non-retryable) errors when the
+/// HTTP status-code check is ambiguous — specifically, HTTP 429 Too Many
+/// Requests is excluded from the status-based classification (rate limits
+/// are transient), so these billing/quota hints override 429 to prevent
+/// endless retries on exhausted accounts.
+///
+/// All other non-retryable errors (context window exceeded, tool schema
+/// validation, auth failures) are reliably caught by the HTTP 4xx status-code
+/// check (step 2 in [`classify_err`]) and do NOT need entries here.  That
+/// also fixes a latent bug: 5xx responses whose body happens to contain a
+/// hint-like substring are now correctly classified as retryable.
 const NON_RETRYABLE_HINTS: &[&str] = &[
-    "exceeds the context window",
-    "exceeds the available context size",
-    "context window of this model",
-    "maximum context length",
-    "context length exceeded",
-    "too many tokens",
-    "token limit exceeded",
-    "prompt is too long",
-    "input is too long",
-    "prompt exceeds max length",
-    "tool call validation failed",
-    "which was not in request",
-    "not found in tool list",
-    "invalid_tool_call",
-    "invalid api key",
-    "incorrect api key",
-    "missing api key",
-    "api key not set",
-    "authentication failed",
-    "auth failed",
-    "unauthorized",
-    "forbidden",
-    "permission denied",
-    "access denied",
-    "invalid token",
     "insufficient balance",
     "insufficient_quota",
     "quota exhausted",
@@ -67,9 +50,9 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
 /// Classify an error into one of the [`ErrorClass`] variants.
 ///
 /// The classification cascade is:
-/// 1. **Body-text hints** — `NON_RETRYABLE_HINTS` patterns permanently classify
-///    regardless of status code (context window exceeded, tool schema errors,
-///    auth failures, quota exhaustion).
+/// 1. **Billing/quota body-text hints** — The [`NON_RETRYABLE_HINTS`] entries
+///    override the default Retryable classification for HTTP 429 responses
+///    (quota exhaustion is permanent, not transient).
 /// 2. **4xx status codes** (except 408 Request Timeout and 429 Too Many Requests)
 ///    — structured [`HttpError`] downcast.
 /// 3. **Model-not-found composite pattern** — "model" combined with
@@ -335,6 +318,25 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
 
             if self.check_fail(call + 1) {
+                // Context-overflow and tool-schema errors reach classify_err
+                // via HttpError with status 400, so they are correctly classified
+                // as NonRetryable by the status-code check (step 2).
+                if self.context_overflow {
+                    return Err(anyhow::Error::from(HttpError::new(
+                        400,
+                        "test",
+                        self.make_error(),
+                        None,
+                    )));
+                }
+                if self.tool_schema_error {
+                    return Err(anyhow::Error::from(HttpError::new(
+                        400,
+                        "test",
+                        self.make_error(),
+                        None,
+                    )));
+                }
                 anyhow::bail!("{}", self.make_error());
             }
 
@@ -359,17 +361,34 @@ mod tests {
     fn retryable_error_classification() {
         let is_non_retryable =
             |e: &anyhow::Error| matches!(classify_err(e), ErrorClass::NonRetryable);
-        // Non-retryable
-        assert!(is_non_retryable(&anyhow::anyhow!("401 Unauthorized")));
-        assert!(is_non_retryable(&anyhow::anyhow!("403 Forbidden")));
-        assert!(is_non_retryable(&anyhow::anyhow!("invalid api key")));
+        // Non-retryable via status code (HttpError 4xx, excluding 408/429)
+        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+            401,
+            "test",
+            "Unauthorized",
+            None
+        ))));
+        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+            403,
+            "test",
+            "Forbidden",
+            None
+        ))));
+        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+            400,
+            "test",
+            "invalid api key",
+            None
+        ))));
+        // Non-retryable via model-not-found composite check
         assert!(is_non_retryable(&anyhow::anyhow!("model not found")));
         assert!(is_non_retryable(&anyhow::anyhow!("model 'xyz' is unknown")));
+        // Non-retryable via billing/quota hints (override 429)
         assert!(is_non_retryable(&anyhow::anyhow!("insufficient balance")));
         assert!(is_non_retryable(&anyhow::anyhow!("insufficient_quota")));
         assert!(is_non_retryable(&anyhow::anyhow!("quota exhausted")));
         assert!(is_non_retryable(&anyhow::anyhow!("error code 1113")));
-        // Retryable
+        // Retryable — no HttpError, no hint match, no model-not-found
         assert!(!is_non_retryable(&anyhow::anyhow!("500 Server Error")));
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
         assert!(!is_non_retryable(&anyhow::anyhow!(
@@ -459,7 +478,7 @@ mod tests {
         ));
 
         // 429 with billing/quota body signals → non-retryable
-        // (caught by NON_RETRYABLE_HINTS, not by status code)
+        // (caught by NON_RETRYABLE_HINTS, overriding 429's default retryable)
         assert_eq!(
             classify_err(&make_structured(429, "insufficient balance")),
             ErrorClass::NonRetryable
@@ -491,7 +510,7 @@ mod tests {
             ErrorClass::Retryable
         ));
 
-        // Context window → NonRetryable (body text analysis)
+        // Context window → NonRetryable (via status 400)
         assert!(matches!(
             classify_err(&make_structured(
                 400,
@@ -500,13 +519,13 @@ mod tests {
             ErrorClass::NonRetryable
         ));
 
-        // Tool schema error → NonRetryable (body text analysis)
+        // Tool schema error → NonRetryable (via status 400)
         assert!(matches!(
             classify_err(&make_structured(400, "tool call validation failed")),
             ErrorClass::NonRetryable
         ));
 
-        // Auth patterns in body → NonRetryable (body-text hint override)
+        // Auth patterns in body → NonRetryable (via status 403)
         assert!(matches!(
             classify_err(&make_structured(403, "unauthorized")),
             ErrorClass::NonRetryable
@@ -588,18 +607,32 @@ mod tests {
     fn context_window_error_classification() {
         let is_non_retryable =
             |e: &anyhow::Error| matches!(classify_err(e), ErrorClass::NonRetryable);
-        // Context window exceeded SHOULD be non-retryable now
-        assert!(is_non_retryable(&anyhow::anyhow!(
-            "request (8968 tokens) exceeds the available context size (8448 tokens)"
-        )));
-        assert!(is_non_retryable(&anyhow::anyhow!(
-            "This model's maximum context length is 8192 tokens"
-        )));
-        assert!(is_non_retryable(&anyhow::anyhow!(
-            "maximum context length of this model is 128K tokens"
-        )));
-        // Non-retryable errors should still be non-retryable
-        assert!(is_non_retryable(&anyhow::anyhow!("401 Unauthorized")));
+        // Context window exceeded — NonRetryable via status 400
+        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+            400,
+            "test",
+            "request (8968 tokens) exceeds the available context size (8448 tokens)",
+            None,
+        ))));
+        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+            400,
+            "test",
+            "This model's maximum context length is 8192 tokens",
+            None,
+        ))));
+        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+            400,
+            "test",
+            "maximum context length of this model is 128K tokens",
+            None,
+        ))));
+        // 4xx errors are still non-retryable via status code
+        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+            401,
+            "test",
+            "Unauthorized",
+            None
+        ))));
     }
 
     #[tokio::test]
@@ -634,7 +667,7 @@ mod tests {
     #[test]
     fn tool_schema_error_detection() {
         use ErrorClass::NonRetryable;
-        // Detects various tool schema error patterns as NonRetryable
+        // Detects various tool schema error patterns as NonRetryable via status 400
         for msg in [
             r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'recall' which was not in request"}}"#,
             "tool 'search' which was not in request",
@@ -642,16 +675,24 @@ mod tests {
             "invalid_tool_call: no matching function",
         ] {
             assert!(
-                matches!(classify_err(&anyhow::anyhow!("{msg}")), NonRetryable),
+                matches!(
+                    classify_err(&anyhow::Error::from(
+                        HttpError::new(400, "test", msg, None,)
+                    )),
+                    NonRetryable
+                ),
                 "should detect: {msg}"
             );
         }
-        // Pure 400 without tool-schema keywords → also NonRetryable (via body-text hint matching)
+        // Pure 400 without tool-schema keywords → also NonRetryable (via status code)
         assert!(
             matches!(
-                classify_err(&anyhow::anyhow!(
-                    "400 Bad Request: invalid api key provided"
-                )),
+                classify_err(&anyhow::Error::from(HttpError::new(
+                    400,
+                    "test",
+                    "invalid api key provided",
+                    None,
+                ))),
                 NonRetryable
             ),
             "pure 400 should be NonRetryable"
