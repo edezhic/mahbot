@@ -1,5 +1,5 @@
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
-use crate::util::{TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
+use crate::util::{MEDIA_MARKER_RE, TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -1827,6 +1827,103 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
 
     Ok(())
 }
+
+/// Mirror a GUI user's message to their Telegram chats as a blockquote, so conversation history is readable from both surfaces.
+///
+/// This should be called before enrichment to preserve the original
+/// user-typed text (pre-link-summary, pre-transcription).
+///
+/// # Guards
+///
+/// * Only mirrors messages where `source_channel == "gui"` (prevents echo loops).
+/// * Skips empty or whitespace-only messages.
+/// * Silently returns when no Telegram channel is registered or the user has no
+///   Telegram binding with a `reply_target` (no error, no crash).
+/// * Sends to **all** Telegram bindings if the user has multiple.
+///
+/// # Quote format
+///
+/// Uses `<blockquote>` HTML tags, which `markdown_to_telegram_html` in the
+/// Telegram channel's `send()` pipeline passes through unchanged. The user's
+/// text retains markdown formatting through the standard inline parser.
+/// Media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`) are stripped
+/// so raw marker syntax does not appear in the quote; purely media-only
+/// messages are skipped entirely.
+pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
+    // Guard: only mirror GUI-originated user messages (prevents echo loops).
+    if msg.source_channel != "gui" {
+        return;
+    }
+
+    // Guard: skip empty or whitespace-only messages.
+    let trimmed = msg.content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // Guard: Telegram channel must be available.
+    let Some(channel) = crate::channel_registry().get("telegram") else {
+        return;
+    };
+
+    // Look up the user's channel bindings.
+    let bindings = match crate::users::store()
+        .get_user_channels(&msg.user_name)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                user = %msg.user_name,
+                error = %e,
+                "Failed to look up user channels for GUI message mirror"
+            );
+            return;
+        }
+    };
+
+    // Filter to Telegram bindings (reply_target checked per binding below).
+    let telegram_bindings: Vec<_> = bindings
+        .into_iter()
+        .filter(|b| b.channel == "telegram")
+        .collect();
+
+    if telegram_bindings.is_empty() {
+        return; // No Telegram binding — silently skip.
+    }
+
+    // Strip media markers so users don't see raw `[IMAGE:...]` syntax in the quote.
+    let content = MEDIA_MARKER_RE.replace_all(trimmed, "").to_string();
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return; // Media-only message — nothing to quote.
+    }
+
+    // Wrap in <blockquote> — these tags pass through markdown_to_telegram_html
+    // unchanged, while the user's text retains markdown formatting.
+    let quoted = format!("<blockquote>\n{content}\n</blockquote>");
+
+    for binding in &telegram_bindings {
+        let Some(reply_target) = &binding.reply_target else {
+            continue; // skip bindings without a reply target
+        };
+        let reply = SendMessage {
+            content: quoted.clone(),
+            recipient: reply_target.clone(),
+            reply_markup: None,
+        };
+
+        if let Err(e) = channel.send(&reply).await {
+            tracing::error!(
+                user = %msg.user_name,
+                recipient = %reply_target,
+                error = %e,
+                "Failed to mirror GUI message to Telegram"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "telegram_tests.rs"]
 mod tests;

@@ -1322,3 +1322,333 @@ fn test_decode_action() {
         assert_eq!(result, expected, "case: {}", case.name);
     }
 }
+
+// ── GUI message → Telegram mirror tests ─────────────────────────────
+//
+// These tests verify that `mirror_gui_message_to_telegram` returns
+// early (without sending) for each guard condition, and that
+// blockquote-format messages are correctly sent to the user's Telegram
+// bindings. They are serialized via [`MIRROR_TEST_LOCK`] because the
+// channel registry and store singletons are global.
+
+use crate::util::UnwrapPoison;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+/// Serialization lock for all mirror tests — these tests share the global
+/// [`CHANNEL_REGISTRY`] and store singletons, so they must run one at a time.
+/// Uses `tokio::sync::Mutex` to avoid blocking worker threads while held
+/// across await points.
+static MIRROR_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn acquire_mirror_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    MIRROR_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// A spy channel that records sent messages in a shared Vec.
+struct SpyChannel {
+    sent: Arc<Mutex<Vec<SendMessage>>>,
+}
+
+#[async_trait]
+impl crate::Channel for SpyChannel {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.sent.lock().unwrap_poison().push(message.clone());
+        Ok(())
+    }
+
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Set up the channel registry with a spy Telegram channel and return a
+/// shared sent-messages buffer. Idempotent — safe to call from every test.
+fn setup_spy_channel() -> &'static Arc<Mutex<Vec<SendMessage>>> {
+    static SPY_SENT: OnceLock<Arc<Mutex<Vec<SendMessage>>>> = OnceLock::new();
+    SPY_SENT.get_or_init(|| {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let registry = crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        registry.register(Arc::new(SpyChannel {
+            sent: Arc::clone(&sent),
+        }) as Arc<dyn crate::Channel>);
+        sent
+    })
+}
+
+/// Ensure the user store has a test user with a Telegram binding and
+/// reply_target. Idempotent.
+async fn setup_user_with_telegram_binding(user_name: &str, reply_target: &str) {
+    use crate::users::store;
+    let store = store();
+    store
+        .add_user(user_name, Some("full"))
+        .await
+        .expect("add_user");
+    store
+        .bind_channel(user_name, "telegram", user_name)
+        .await
+        .expect("bind_channel");
+    store
+        .update_channel_contact("telegram", user_name, reply_target)
+        .await
+        .expect("update_channel_contact");
+}
+
+/// Three-line preamble shared by all mirror tests: acquire the serialization
+/// lock, initialise test stores, and set up the spy channel. Returns the spy
+/// sent-messages buffer and the lock guard (kept alive for the test duration).
+async fn setup_mirror_test_env() -> (
+    &'static Arc<Mutex<Vec<SendMessage>>>,
+    tokio::sync::MutexGuard<'static, ()>,
+) {
+    let lock = acquire_mirror_lock().await;
+    crate::util::test::init_test_stores().await;
+    let sent = setup_spy_channel();
+    (sent, lock)
+}
+
+fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
+    ChannelMessage {
+        user_name: user_name.to_string(),
+        reply_target: String::new(),
+        content: content.to_string(),
+        source_channel: "gui".to_string(),
+        workspace: "test".to_string(),
+        optimistic_id: None,
+        callback_query_id: None,
+    }
+}
+
+fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
+    ChannelMessage {
+        user_name: user_name.to_string(),
+        reply_target: "chat:thread".to_string(),
+        content: content.to_string(),
+        source_channel: "telegram".to_string(),
+        workspace: "test".to_string(),
+        optimistic_id: None,
+        callback_query_id: None,
+    }
+}
+
+// ── Guard tests: early-return conditions ─────────────────────────────
+
+#[tokio::test]
+async fn skip_non_gui_source() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("skip_telegram", "target_non_gui").await;
+
+    let msg = telegram_msg("skip_telegram", "hello from telegram");
+    super::mirror_gui_message_to_telegram(&msg).await;
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "target_non_gui")
+        .collect();
+    assert!(our_msgs.is_empty(), "non-GUI source should not send");
+}
+
+#[tokio::test]
+async fn skip_empty_or_whitespace_content() {
+    // Both inputs exercise the same guard — `msg.content.trim().is_empty()`.
+    // Each iteration acquires the serialization lock independently; this
+    // is safe because the global stores (OnceCell) and the spy channel
+    // (OnceLock) are identical across calls to `setup_mirror_test_env()`.
+    for content in ["", "   \t\n  "] {
+        let (sent, _lock) = setup_mirror_test_env().await;
+        setup_user_with_telegram_binding("skip_ew", "target_empty_ws").await;
+        let msg = gui_msg("skip_ew", content);
+        super::mirror_gui_message_to_telegram(&msg).await;
+        let guard = sent.lock().unwrap_poison();
+        let our_msgs: Vec<_> = guard
+            .iter()
+            .filter(|m| m.recipient == "target_empty_ws")
+            .collect();
+        assert!(
+            our_msgs.is_empty(),
+            "content {content:?} should not send, got {} message(s)",
+            our_msgs.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn skip_user_with_no_bindings() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    // Create user but DO NOT bind a Telegram channel.
+    let store = crate::users::store();
+    store.add_user("no_binding", None).await.expect("add_user");
+
+    // Use the user's name as the recipient filter — no bindings means
+    // no messages should be sent for this user at all.
+    let user_name = "no_binding";
+    let msg = gui_msg(user_name, "hello");
+    super::mirror_gui_message_to_telegram(&msg).await;
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard.iter().filter(|m| m.recipient == user_name).collect();
+    assert!(our_msgs.is_empty(), "user with no bindings should not send");
+}
+
+#[tokio::test]
+async fn skip_binding_without_reply_target() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    // Bind a Telegram channel but don't set reply_target.
+    let store = crate::users::store();
+    store.add_user("no_target", None).await.expect("add_user");
+    store
+        .bind_channel("no_target", "telegram", "no_target")
+        .await
+        .expect("bind_channel");
+    // Note: skip update_channel_contact → reply_target stays NULL.
+
+    let msg = gui_msg("no_target", "hello");
+    super::mirror_gui_message_to_telegram(&msg).await;
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "no_target")
+        .collect();
+    assert!(
+        our_msgs.is_empty(),
+        "binding without reply_target should not send"
+    );
+}
+
+#[tokio::test]
+async fn skip_media_only_content() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("media_only", "target_media").await;
+
+    let msg = gui_msg("media_only", "[IMAGE:/path/to/img.png]");
+    super::mirror_gui_message_to_telegram(&msg).await;
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "target_media")
+        .collect();
+    assert!(our_msgs.is_empty(), "media-only content should not send");
+}
+
+// ── Happy path tests ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sends_blockquote_to_single_binding() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("single_user", "unique_single").await;
+
+    let msg = gui_msg("single_user", "Hello, world!");
+    super::mirror_gui_message_to_telegram(&msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    // Filter to our test's messages by recipient.
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "unique_single")
+        .collect();
+    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    assert_eq!(
+        our_msgs[0].content,
+        "<blockquote>\nHello, world!\n</blockquote>"
+    );
+    assert!(our_msgs[0].reply_markup.is_none());
+}
+
+#[tokio::test]
+async fn sends_to_multiple_telegram_bindings() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    let store = crate::users::store();
+    store.add_user("multi_user", None).await.expect("add_user");
+    // Bind two Telegram accounts with unique recipients.
+    store
+        .bind_channel("multi_user", "telegram", "multi_user_1")
+        .await
+        .expect("bind_channel_1");
+    store
+        .bind_channel("multi_user", "telegram", "multi_user_2")
+        .await
+        .expect("bind_channel_2");
+    store
+        .update_channel_contact("telegram", "multi_user_1", "unique_multi_a")
+        .await
+        .expect("update_channel_contact_1");
+    store
+        .update_channel_contact("telegram", "multi_user_2", "unique_multi_b")
+        .await
+        .expect("update_channel_contact_2");
+
+    let msg = gui_msg("multi_user", "Hi both!");
+    super::mirror_gui_message_to_telegram(&msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "unique_multi_a" || m.recipient == "unique_multi_b")
+        .collect();
+    assert_eq!(our_msgs.len(), 2, "expected two messages (one per binding)");
+    // Both should have the same content.
+    for m in &our_msgs {
+        assert_eq!(m.content, "<blockquote>\nHi both!\n</blockquote>");
+    }
+    let recipients: Vec<&str> = our_msgs.iter().map(|m| m.recipient.as_str()).collect();
+    assert!(recipients.contains(&"unique_multi_a"));
+    assert!(recipients.contains(&"unique_multi_b"));
+}
+
+#[tokio::test]
+async fn strips_media_markers_from_content() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("strip_markers", "unique_markers").await;
+
+    let msg = gui_msg(
+        "strip_markers",
+        "Check this [IMAGE:/tmp/screenshot.png] and my [AUDIO:/tmp/recording.mp3]",
+    );
+    super::mirror_gui_message_to_telegram(&msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "unique_markers")
+        .collect();
+    assert_eq!(our_msgs.len(), 1);
+    // Markers should be stripped entirely (trailing whitespace is trimmed).
+    assert_eq!(
+        our_msgs[0].content,
+        "<blockquote>\nCheck this  and my\n</blockquote>"
+    );
+}
+
+#[tokio::test]
+async fn preserves_markdown_formatting_in_blockquote() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("md_user", "unique_md").await;
+
+    let msg = gui_msg("md_user", "**bold** and `code` and *italic*");
+    super::mirror_gui_message_to_telegram(&msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "unique_md")
+        .collect();
+    assert_eq!(our_msgs.len(), 1);
+    // Markdown syntax inside the blockquote passes through — the Telegram
+    // channel's markdown_to_telegram_html will handle formatting later.
+    assert_eq!(
+        our_msgs[0].content,
+        "<blockquote>\n**bold** and `code` and *italic*\n</blockquote>"
+    );
+}
