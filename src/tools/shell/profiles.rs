@@ -197,6 +197,16 @@ fn cargo_tool(matcher: &str, max_lines: usize, ok_msg: &'static str) -> Profile 
         .on_empty(ok_msg)
 }
 
+/// Build a "lint tool" profile: strips blank lines, keeps stderr
+/// warning/error lines, caps at `max_lines`, signals clean success via `ok_msg`.
+fn lint_tool(matcher: &str, max_lines: usize, ok_msg: &'static str) -> Profile {
+    Profile::new(matcher)
+        .strip(&[BLANK_LINE])
+        .keep_stderr(CARGO_COMPILE_KEEP_STDERR)
+        .max(max_lines)
+        .on_empty(ok_msg)
+}
+
 // ── Profile definitions ─────────────────────────────────────────────
 
 /// Generic fallback applied to all commands that don't match a specific profile.
@@ -327,20 +337,12 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
                 r"Downloading:",
             ])
             .max(30),
-        Profile::new(r"^tsc\b")
-            .strip(&[BLANK_LINE])
-            .keep_stderr(CARGO_COMPILE_KEEP_STDERR)
-            .max(50)
-            .on_empty("[tsc: ok]"),
+        lint_tool(r"^tsc\b", 50, "[tsc: ok]"),
         Profile::new(r"^vitest\b")
             .strip(&[r"^\s*(stdout|PASS|SKIP)\s"])
             .tail(20)
             .max(60),
-        Profile::new(r"^eslint\b")
-            .strip(&[BLANK_LINE])
-            .keep_stderr(CARGO_COMPILE_KEEP_STDERR)
-            .max(50)
-            .on_empty("[eslint: ok]"),
+        lint_tool(r"^eslint\b", 50, "[eslint: ok]"),
         Profile::new(r"^prettier\b")
             .strip(&[BLANK_LINE])
             .short_circuit(r"unchanged", "prettier: ok")
