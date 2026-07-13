@@ -242,6 +242,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Wrapper around [`HttpError::new`] that sets context="test" and
+    /// retry_after=None, reducing boilerplate in error-classification tests.
+    fn test_err(status: u16, body: &str) -> anyhow::Error {
+        anyhow::Error::from(HttpError::new(status, "test", body, None))
+    }
+
     /// Unified test mock. Covers all failure modes: simple retry gating,
     /// model-specific failures, context overflow, and native tool calls.
     struct TestProvider {
@@ -322,20 +328,10 @@ mod tests {
                 // via HttpError with status 400, so they are correctly classified
                 // as NonRetryable by the status-code check (step 2).
                 if self.context_overflow {
-                    return Err(anyhow::Error::from(HttpError::new(
-                        400,
-                        "test",
-                        self.make_error(),
-                        None,
-                    )));
+                    return Err(test_err(400, &self.make_error()));
                 }
                 if self.tool_schema_error {
-                    return Err(anyhow::Error::from(HttpError::new(
-                        400,
-                        "test",
-                        self.make_error(),
-                        None,
-                    )));
+                    return Err(test_err(400, &self.make_error()));
                 }
                 anyhow::bail!("{}", self.make_error());
             }
@@ -362,24 +358,9 @@ mod tests {
         let is_non_retryable =
             |e: &anyhow::Error| matches!(classify_err(e), ErrorClass::NonRetryable);
         // Non-retryable via status code (HttpError 4xx, excluding 408/429)
-        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
-            401,
-            "test",
-            "Unauthorized",
-            None
-        ))));
-        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
-            403,
-            "test",
-            "Forbidden",
-            None
-        ))));
-        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
-            400,
-            "test",
-            "invalid api key",
-            None
-        ))));
+        assert!(is_non_retryable(&test_err(401, "Unauthorized")));
+        assert!(is_non_retryable(&test_err(403, "Forbidden")));
+        assert!(is_non_retryable(&test_err(400, "invalid api key")));
         // Non-retryable via model-not-found composite check
         assert!(is_non_retryable(&anyhow::anyhow!("model not found")));
         assert!(is_non_retryable(&anyhow::anyhow!("model 'xyz' is unknown")));
@@ -434,8 +415,8 @@ mod tests {
             Some(5000)
         );
 
-        let no_retry = HttpError::new(429, "test", "rate limit", None);
-        assert_eq!(parse_retry_after_ms(&anyhow::Error::from(no_retry)), None);
+        let no_retry = test_err(429, "rate limit");
+        assert_eq!(parse_retry_after_ms(&no_retry), None);
 
         // ── compute_backoff: respects retry-after ──
         let structured =
@@ -451,7 +432,7 @@ mod tests {
         );
 
         // ── compute_backoff: jittered fallback when no retry-after ──
-        let no_header = anyhow::Error::from(HttpError::new(500, "test", "error", None));
+        let no_header = test_err(500, "error");
         let backoff = ReliableProvider::compute_backoff(500, &no_header);
         assert!(
             (375..625).contains(&backoff),
@@ -462,92 +443,86 @@ mod tests {
     #[test]
     fn classify_err_typed_path() {
         // ── HttpError typed path for classify_err ──
-        let make_structured = |status: u16, body: &str| -> anyhow::Error {
-            anyhow::Error::from(HttpError::new(status, "test", body, None))
-        };
 
         // 429 transient rate limit → retryable (falls through to
         // model-not-found check, which returns Retryable for non-billing bodies)
         assert!(matches!(
-            classify_err(&make_structured(429, "Too Many Requests")),
+            classify_err(&test_err(429, "Too Many Requests")),
             ErrorClass::Retryable
         ));
         assert!(matches!(
-            classify_err(&make_structured(429, "rate limit exceeded")),
+            classify_err(&test_err(429, "rate limit exceeded")),
             ErrorClass::Retryable
         ));
 
         // 429 with billing/quota body signals → non-retryable
         // (caught by NON_RETRYABLE_HINTS, overriding 429's default retryable)
         assert_eq!(
-            classify_err(&make_structured(429, "insufficient balance")),
+            classify_err(&test_err(429, "insufficient balance")),
             ErrorClass::NonRetryable
         );
         assert_eq!(
-            classify_err(&make_structured(429, "quota exhausted")),
+            classify_err(&test_err(429, "quota exhausted")),
             ErrorClass::NonRetryable
         );
 
         // Non-429 4xx → non-retryable
         assert!(matches!(
-            classify_err(&make_structured(400, "Bad Request")),
+            classify_err(&test_err(400, "Bad Request")),
             ErrorClass::NonRetryable
         ));
         assert!(matches!(
-            classify_err(&make_structured(403, "Forbidden")),
+            classify_err(&test_err(403, "Forbidden")),
             ErrorClass::NonRetryable
         ));
 
         // 408 → fallback (not NonRetryable)
         assert!(matches!(
-            classify_err(&make_structured(408, "Request Timeout")),
+            classify_err(&test_err(408, "Request Timeout")),
             ErrorClass::Retryable
         ));
 
         // 5xx → retryable (fallback)
         assert!(matches!(
-            classify_err(&make_structured(500, "Internal Server Error")),
+            classify_err(&test_err(500, "Internal Server Error")),
             ErrorClass::Retryable
         ));
 
         // Context window → NonRetryable (via status 400)
         assert!(matches!(
-            classify_err(&make_structured(
-                400,
-                "exceeds the context window of this model"
-            )),
+            classify_err(&test_err(400, "exceeds the context window of this model")),
             ErrorClass::NonRetryable
         ));
 
         // Tool schema error → NonRetryable (via status 400)
         assert!(matches!(
-            classify_err(&make_structured(400, "tool call validation failed")),
+            classify_err(&test_err(400, "tool call validation failed")),
             ErrorClass::NonRetryable
         ));
 
         // Auth patterns in body → NonRetryable (via status 403)
         assert!(matches!(
-            classify_err(&make_structured(403, "unauthorized")),
+            classify_err(&test_err(403, "unauthorized")),
             ErrorClass::NonRetryable
         ));
 
         // Model not found → NonRetryable (via 4xx status check for 404)
         assert!(matches!(
-            classify_err(&make_structured(404, "model not found")),
+            classify_err(&test_err(404, "model not found")),
             ErrorClass::NonRetryable
         ));
 
         // ZhipuAI billing error code 1113 → NonRetryable
         // (caught by NON_RETRYABLE_HINTS)
         assert_eq!(
-            classify_err(&make_structured(429, "error code 1113")),
+            classify_err(&test_err(429, "error code 1113")),
             ErrorClass::NonRetryable
         );
 
         // OpenRouter 502 "invalid response" → NOT NonRetryable
         // (the word "invalid" alone does not imply a bad model id)
         assert_eq!(
-            classify_err(&make_structured(
+            classify_err(&test_err(
                 502,
                 "Your chosen model is down or we received an invalid response from it"
             )),
@@ -608,31 +583,20 @@ mod tests {
         let is_non_retryable =
             |e: &anyhow::Error| matches!(classify_err(e), ErrorClass::NonRetryable);
         // Context window exceeded — NonRetryable via status 400
-        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+        assert!(is_non_retryable(&test_err(
             400,
-            "test",
             "request (8968 tokens) exceeds the available context size (8448 tokens)",
-            None,
-        ))));
-        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+        )));
+        assert!(is_non_retryable(&test_err(
             400,
-            "test",
             "This model's maximum context length is 8192 tokens",
-            None,
-        ))));
-        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
+        )));
+        assert!(is_non_retryable(&test_err(
             400,
-            "test",
             "maximum context length of this model is 128K tokens",
-            None,
-        ))));
+        )));
         // 4xx errors are still non-retryable via status code
-        assert!(is_non_retryable(&anyhow::Error::from(HttpError::new(
-            401,
-            "test",
-            "Unauthorized",
-            None
-        ))));
+        assert!(is_non_retryable(&test_err(401, "Unauthorized")));
     }
 
     #[tokio::test]
@@ -675,24 +639,14 @@ mod tests {
             "invalid_tool_call: no matching function",
         ] {
             assert!(
-                matches!(
-                    classify_err(&anyhow::Error::from(
-                        HttpError::new(400, "test", msg, None,)
-                    )),
-                    NonRetryable
-                ),
+                matches!(classify_err(&test_err(400, msg)), NonRetryable),
                 "should detect: {msg}"
             );
         }
         // Pure 400 without tool-schema keywords → also NonRetryable (via status code)
         assert!(
             matches!(
-                classify_err(&anyhow::Error::from(HttpError::new(
-                    400,
-                    "test",
-                    "invalid api key provided",
-                    None,
-                ))),
+                classify_err(&test_err(400, "invalid api key provided")),
                 NonRetryable
             ),
             "pure 400 should be NonRetryable"
