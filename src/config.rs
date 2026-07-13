@@ -1132,7 +1132,7 @@ mod tests {
         {
             let mut items = vec![role_config("engineer", Some("old"), Some("high"))];
             RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.model = Some("new".into())
+                item.model = Some("new".into());
             });
             assert_eq!(items.len(), 1);
             assert_eq!(
@@ -1150,7 +1150,7 @@ mod tests {
         {
             let mut items = vec![role_config("engineer", Some("gpt-4"), Some("low"))];
             RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.reasoning_effort = Some("high".into())
+                item.reasoning_effort = Some("high".into());
             });
             assert_eq!(items.len(), 1);
             assert_eq!(
@@ -1169,7 +1169,7 @@ mod tests {
         {
             let mut items = vec![];
             RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.model = Some("gpt-4".into())
+                item.model = Some("gpt-4".into());
             });
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].role, "engineer");
@@ -1184,7 +1184,7 @@ mod tests {
         {
             let mut items = vec![];
             RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.reasoning_effort = Some("high".into())
+                item.reasoning_effort = Some("high".into());
             });
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].role, "engineer");
@@ -1229,7 +1229,7 @@ mod tests {
         {
             let mut items = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
             ModelRouting::upsert(&mut items, "gpt-4", |item| {
-                item.provider_order = Some("Anthropic".into())
+                item.provider_order = Some("Anthropic".into());
             });
             assert_eq!(items.len(), 1);
             assert_eq!(
@@ -1247,7 +1247,7 @@ mod tests {
         {
             let mut items = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
             ModelRouting::upsert(&mut items, "gpt-4", |item| {
-                item.allow_fallbacks = Some(false)
+                item.allow_fallbacks = Some(false);
             });
             assert_eq!(items.len(), 1);
             assert_eq!(
@@ -1266,7 +1266,7 @@ mod tests {
         {
             let mut items = vec![];
             ModelRouting::upsert(&mut items, "gpt-4", |item| {
-                item.provider_order = Some("OpenAi".into())
+                item.provider_order = Some("OpenAi".into());
             });
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].model, "gpt-4");
@@ -1281,7 +1281,7 @@ mod tests {
         {
             let mut items = vec![];
             ModelRouting::upsert(&mut items, "gpt-4", |item| {
-                item.allow_fallbacks = Some(false)
+                item.allow_fallbacks = Some(false);
             });
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].model, "gpt-4");

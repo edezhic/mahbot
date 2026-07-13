@@ -500,7 +500,7 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
         ),
         CircuitBreakerKind::Diagnostics => (
             DIAGNOSTICS_ROLE,
-            format!("{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{DIAGNOSTICS_FAILED_MARKER} test_step",),
+            format!("{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{DIAGNOSTICS_FAILED_MARKER} test_step"),
         ),
         CircuitBreakerKind::General => {
             unreachable!("General breaker not used in failure-counting tests")
