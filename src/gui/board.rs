@@ -238,10 +238,10 @@ impl BoardState {
         icon_row
     }
 
-    /// Build a status badge pill for a ticket phase.
+    /// Build a phase badge pill for a ticket phase.
     /// Used on ticket cards and in the modal detail header.
     /// Derives badge colours from [`theme::ticket_phase_color`].
-    fn status_badge<'a>(
+    fn phase_badge<'a>(
         phase: TicketPhase,
         text_size: u32,
         padding: [u16; 2],
@@ -268,15 +268,15 @@ impl BoardState {
         if ticket.prerequisites.is_empty() {
             return (0, Vec::new());
         }
-        let status_map: std::collections::HashMap<&str, TicketPhase> = self
+        let phase_map: std::collections::HashMap<&str, TicketPhase> = self
             .tickets
             .iter()
             .map(|t| (t.id.as_str(), t.phase))
             .collect();
         let mut unfulfilled_ids = Vec::new();
         for prereq_id in &ticket.prerequisites {
-            let is_unfulfilled = match status_map.get(prereq_id.as_str()) {
-                Some(status) => !status.is_unblocking(),
+            let is_unfulfilled = match phase_map.get(prereq_id.as_str()) {
+                Some(phase) => !phase.is_unblocking(),
                 None => false, // missing = archived = fulfilled
             };
             if is_unfulfilled {
@@ -605,7 +605,7 @@ impl BoardState {
         (pending, pipeline, completed)
     }
 
-    /// Render a single ticket card: clickable title, ID, status badge, and action icons.
+    /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
     #[allow(clippy::too_many_lines)]
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
@@ -615,7 +615,7 @@ impl BoardState {
 
         let (unfulfilled_count, unfulfilled_ids) = self.unfulfilled_prereq_count(ticket);
 
-        let mut badge_row = row![Self::status_badge(ticket.phase, 10, [1, 6]),].spacing(6);
+        let mut badge_row = row![Self::phase_badge(ticket.phase, 10, [1, 6]),].spacing(6);
 
         if unfulfilled_count > 0 {
             let tooltip_text = format!("Blocked by: {}", unfulfilled_ids.join(", "));
@@ -848,7 +848,7 @@ impl BoardState {
             .into()
     }
 
-    /// Render the modal header: title, ticket ID, status badge, action icons, and metadata lines.
+    /// Render the modal header: title, ticket ID, phase badge, action icons, and metadata lines.
     fn render_header_metadata(
         ticket: &Ticket,
         is_action_disabled: bool,
@@ -937,7 +937,7 @@ impl BoardState {
             text(&ticket.id).size(12).color(theme::TEXT_MUTED),
             Space::new().height(6),
             row![
-                Self::status_badge(ticket.phase, 12, [2, 8]),
+                Self::phase_badge(ticket.phase, 12, [2, 8]),
                 Space::new().width(Length::Fill),
                 icon_row,
             ]
