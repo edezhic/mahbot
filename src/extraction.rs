@@ -6,7 +6,7 @@
 use serde::de::DeserializeOwned;
 
 use crate::providers::chat;
-use crate::util::parse_fenced_json;
+use crate::util::json::parse_fenced_json;
 use crate::{ChatMessage, ChatRequest};
 
 // ── Retry extraction ──────────────────────────────────────────────────

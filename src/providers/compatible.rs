@@ -5,7 +5,7 @@
 use crate::providers::reasoning_roundtrip;
 use crate::providers::{ensure_chat_completions_url, provider_routing_json};
 use crate::util::error::HttpError;
-use crate::util::try_repair_json;
+use crate::util::json::try_repair_json;
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ChatRole, Provider, ProviderUsage, Reasoning, ToolCall as ProviderToolCall, ToolSpec,
