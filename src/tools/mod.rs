@@ -235,12 +235,14 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
             remap_arg_key(obj, "ticket", "ticket_id");
         }
         "read" => {
-            remap_arg_key(obj, "file", "path");
-            remap_arg_key(obj, "filename", "path");
+            for &alias in PATH_ALIAS_KEYS {
+                remap_arg_key(obj, alias, "path");
+            }
         }
         "edit" => {
-            remap_arg_key(obj, "file", "path");
-            remap_arg_key(obj, "filename", "path");
+            for &alias in PATH_ALIAS_KEYS {
+                remap_arg_key(obj, alias, "path");
+            }
             remap_arg_key(obj, "old_str", "old_string");
             remap_arg_key(obj, "new_str", "new_string");
         }
@@ -505,6 +507,51 @@ mod tests {
         let err = require_path_arg(&serde_json::json!({"path": ["invalid"], "file": "real.rs"}))
             .unwrap_err();
         assert!(err.to_string().contains("path"));
+    }
+
+    /// Verify that [`normalize_tool_call`] remaps every alias in
+    /// [`PATH_ALIAS_KEYS`] to `"path"` for both the `"read"` and `"edit"` tools.
+    ///
+    /// This test explicitly iterates the constant so the loop-based approach in
+    /// [`normalize_tool_arguments`] is verified against all current aliases.
+    /// If an alias is added to [`PATH_ALIAS_KEYS`], this test immediately
+    /// exercises it — preventing any gap between the lookup path and the
+    /// normalization path.
+    #[test]
+    fn normalize_tool_call_remaps_all_path_aliases() {
+        for &alias in PATH_ALIAS_KEYS {
+            for (tool_name, extra) in &[
+                ("read", serde_json::json!({})),
+                ("edit", serde_json::json!({"old_str": "a", "new_str": "b"})),
+            ] {
+                let mut input = serde_json::json!({});
+                input[alias] = serde_json::json!("src/main.rs");
+                if let Some(obj) = extra.as_object() {
+                    for (k, v) in obj {
+                        input[k] = v.clone();
+                    }
+                }
+                let (name, args) = normalize_tool_call(tool_name, input);
+                assert_eq!(
+                    name, *tool_name,
+                    "tool name should not change for {tool_name} with alias {alias}"
+                );
+                assert_eq!(
+                    args["path"], "src/main.rs",
+                    "alias {alias} should be remapped to 'path' for tool {tool_name}"
+                );
+                // The alias key itself should have been removed since "path" was absent.
+                assert!(
+                    !args.as_object().unwrap().contains_key(alias),
+                    "alias key {alias} should be removed after normalization for {tool_name}"
+                );
+                // Edit-specific remaps must be unaffected.
+                if *tool_name == "edit" {
+                    assert_eq!(args["old_string"], "a");
+                    assert_eq!(args["new_string"], "b");
+                }
+            }
+        }
     }
 
     // ── save_generated_file tests ──────────────────────────────────────────
