@@ -297,13 +297,16 @@ impl Drop for EmbedderGuard {
 /// SHA256 verification. If the freshly downloaded files also fail to load, the
 /// problem is almost certainly a code-level bug, so the loop gives up and leaves
 /// the global embedder uninitialized (graceful degradation to FTS-only search).
+///
+/// # Invariant
+///
+/// CONFIG must be initialized before calling this function. The only caller,
+/// [`ensure_embedder`], already validates this with `.expect()` before spawning,
+/// and `storage_root` is a `OnceLock` that cannot revert to `None` once set.
 async fn download_retry_loop() {
     let _guard = EmbedderGuard;
-    let Some(models_dir) = models_dir() else {
-        warn!("Embedder: CONFIG not initialized — background download cancelled");
-        STATE.store(STATE_FAILED, Ordering::Release);
-        return;
-    };
+    let models_dir =
+        models_dir().expect("CONFIG must be initialized before embedder initialization");
     std::fs::create_dir_all(&models_dir).ok();
 
     let model_dest = models_dir.join(MODEL_FILENAME);
