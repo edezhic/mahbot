@@ -866,7 +866,7 @@ async fn poll_round() -> anyhow::Result<()> {
             {
                 Ok(Some(t)) => {
                     // Buffer the claim transition. The returned ticket already
-                    // has status = info.expected_phase (from SQL RETURNING), so record
+                    // has phase = info.expected_phase (from SQL RETURNING), so record
                     // the transition from source.
                     ticket_buffer::push(&ws.name, &t.id, source, t.phase);
                     t
