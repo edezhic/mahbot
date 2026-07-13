@@ -294,11 +294,11 @@ async fn run_command_with_timeout(
 }
 
 fn tail_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         return s.to_string();
     }
-    let skip = s.chars().count().saturating_sub(max_chars);
-    s.chars().skip(skip).collect()
+    s.chars().skip(char_count - max_chars).collect()
 }
 
 /// Appends the tail of an output buffer to `msg` with a label (e.g. "stdout" or "stderr").
