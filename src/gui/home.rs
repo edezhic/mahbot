@@ -1562,63 +1562,42 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_update_sending_state_agent_match() {
-        let mut state = make_home_state("alice", "ws1");
-        state.sending = true;
-        state.typing = true;
-
-        state.update_sending_state(ChatDirection::Agent, "alice", "ws1");
-
-        assert!(!state.sending, "agent response should clear sending");
-        assert!(!state.typing, "agent response should clear typing");
-    }
-
-    #[test]
-    fn test_update_sending_state_user_match() {
-        let mut state = make_home_state("alice", "ws1");
-        state.sending = true;
-        state.typing = true;
-
-        state.update_sending_state(ChatDirection::User, "alice", "ws1");
-
-        assert!(!state.sending, "user echo should clear sending");
-        assert!(state.typing, "user echo should NOT clear typing");
-    }
-
-    #[test]
-    fn test_update_sending_state_no_match() {
-        let mut state = make_home_state("alice", "ws1");
-        state.sending = true;
-        state.typing = true;
-
-        state.update_sending_state(ChatDirection::Agent, "bob", "ws1");
-
-        assert!(
-            state.sending,
-            "other user's agent msg should not clear sending"
-        );
-        assert!(
-            state.typing,
-            "other user's agent msg should not clear typing"
-        );
-    }
-
-    #[test]
-    fn test_update_sending_state_no_match_workspace() {
-        let mut state = make_home_state("alice", "ws1");
-        state.sending = true;
-        state.typing = true;
-
-        state.update_sending_state(ChatDirection::Agent, "alice", "ws2");
-
-        assert!(
-            state.sending,
-            "matching user but wrong workspace should not clear sending"
-        );
-        assert!(
-            state.typing,
-            "matching user but wrong workspace should not clear typing"
-        );
+    fn test_update_sending_state() {
+        let cases = [
+            (
+                "agent match",
+                ChatDirection::Agent,
+                "alice",
+                "ws1",
+                false,
+                false,
+            ),
+            (
+                "user match",
+                ChatDirection::User,
+                "alice",
+                "ws1",
+                false,
+                true,
+            ),
+            ("wrong user", ChatDirection::Agent, "bob", "ws1", true, true),
+            (
+                "wrong workspace",
+                ChatDirection::Agent,
+                "alice",
+                "ws2",
+                true,
+                true,
+            ),
+        ];
+        for (name, direction, user, workspace, exp_sending, exp_typing) in cases {
+            let mut state = make_home_state("alice", "ws1");
+            state.sending = true;
+            state.typing = true;
+            state.update_sending_state(direction, user, workspace);
+            assert_eq!(state.sending, exp_sending, "{name}: sending");
+            assert_eq!(state.typing, exp_typing, "{name}: typing");
+        }
     }
 
     // ------------------------------------------------------------------
