@@ -33,10 +33,7 @@ static URL_RE: LazyLock<Regex> =
 /// Transcribe an audio file referenced by a `[AUDIO:...]` marker and return
 /// the annotation text to embed in the message.
 async fn transcribe_audio_marker(path: &str) -> String {
-    let file_name = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path);
+    let file_name = extract_file_name(path);
 
     if let Some(ref transcriber) = crate::providers::audio_transcriber() {
         match transcriber.transcribe(std::path::Path::new(path)).await {
