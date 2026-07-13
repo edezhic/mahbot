@@ -817,15 +817,14 @@ async fn process_analyst_verdicts_cases() {
 /// This test validates the graceful non-git fallback path.
 #[tokio::test]
 async fn handle_qa_passed_no_git_to_done() {
-    // Use a path that cannot be a git repo regardless of the test
-    // environment's current working directory.
-    let (ws, ticket_id) = setup_ticket(
-        "/nonexistent/mahbot-test-qa-no-git",
-        "qa_no_git",
-        "QA No Git",
-        TicketPhase::QaPassed,
-    )
-    .await;
+    // Use a temporary directory without git init — guarantees no git repo
+    // exists regardless of the test runner's filesystem state. The `dir`
+    // binding must stay alive (function scope) for the workspace path to
+    // remain valid.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let ws_path = dir.path().to_str().expect("temp path is valid UTF-8");
+    let (ws, ticket_id) =
+        setup_ticket(ws_path, "qa_no_git", "QA No Git", TicketPhase::QaPassed).await;
 
     let ticket = expect_ticket(board(), &ticket_id).await;
 
