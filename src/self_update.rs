@@ -34,7 +34,7 @@ use directories::UserDirs;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -295,7 +295,7 @@ pub fn is_update_available() -> bool {
 /// Global mutex ensuring only one update runs at a time.
 /// A second trigger while an update is in progress gets an immediate error
 /// via [`try_lock`](Mutex::try_lock).
-static UPDATE_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
 
 // ── Execute update ────────────────────────────────────────────────────────
 
