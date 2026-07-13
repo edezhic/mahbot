@@ -752,15 +752,12 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         );
     }
 
-    let mut matched_safe = "";
-    for safe in GIT_SAFE_SUBCOMMANDS {
-        if subcommand == *safe || subcommand.starts_with(&format!("{safe} ")) {
-            matched_safe = safe;
-            break;
-        }
-    }
+    let matched_safe = GIT_SAFE_SUBCOMMANDS
+        .iter()
+        .copied()
+        .find(|safe| subcommand == *safe || subcommand.starts_with(&format!("{safe} ")));
 
-    if matched_safe.is_empty() {
+    if matched_safe.is_none() {
         return Err(format!(
             "⚠️ Read-only mode: the `git {subcommand}` subcommand is not allowed — it may mutate the repository.\n\
              Command: `{trimmed}`\n\
@@ -771,9 +768,13 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
 
     // Additional mutation-flag checks for branch/tag/remote
     match matched_safe {
-        "branch" => check_git_subcommand_mutation(&subcommand, "branch", GIT_BRANCH_MUTATIONS)?,
-        "tag" => check_git_subcommand_mutation(&subcommand, "tag", GIT_TAG_MUTATIONS)?,
-        "remote" => check_git_subcommand_mutation(&subcommand, "remote", GIT_REMOTE_MUTATIONS)?,
+        Some("branch") => {
+            check_git_subcommand_mutation(&subcommand, "branch", GIT_BRANCH_MUTATIONS)?;
+        }
+        Some("tag") => check_git_subcommand_mutation(&subcommand, "tag", GIT_TAG_MUTATIONS)?,
+        Some("remote") => {
+            check_git_subcommand_mutation(&subcommand, "remote", GIT_REMOTE_MUTATIONS)?;
+        }
         _ => {}
     }
 
