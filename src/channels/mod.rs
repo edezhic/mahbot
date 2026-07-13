@@ -28,15 +28,9 @@ struct BroadcastPersistEntry {
 impl BroadcastPersistEntry {
     /// Broadcast this entry to [`crate::CHAT_BROADCAST`] and persist it to
     /// `chat_history`.
-    ///
-    /// Fields shared between the broadcast and DB insert are cloned for the
-    /// broadcast (which consumes via `tx.send`), then the originals are moved
-    /// into the DB insert.  Fields only used in the broadcast
-    /// (`optimistic_id`) are moved directly without an unnecessary clone.
     async fn broadcast_and_persist(self) {
         use crate::ChatEvent;
 
-        // Invariant: direction=Agent must carry a non-None agent_role
         debug_assert!(
             self.direction != ChatDirection::Agent || self.agent_role.is_some(),
             "BroadcastPersistEntry: direction=Agent but agent_role is None"
@@ -45,9 +39,6 @@ impl BroadcastPersistEntry {
         let message_id = crate::generate_id();
         let timestamp = turso::now();
 
-        // Compute db_role/db_direction while self.agent_role is still
-        // available (borrowed temporarily via as_deref before being moved
-        // into the DB insert below).
         let (db_role, db_direction) = match self.direction {
             ChatDirection::Agent => (
                 self.agent_role.as_deref().unwrap_or("").to_string(),
@@ -56,9 +47,6 @@ impl BroadcastPersistEntry {
             ChatDirection::User => ("user".to_string(), "user".to_string()),
         };
 
-        // ── Broadcast ──────────────────────────────────────────────
-        // Clone fields shared with the DB insert; move optimistic_id
-        // (only used in the event, not persisted).
         if let Some(tx) = crate::CHAT_BROADCAST.get() {
             let _ = tx.send(ChatEvent::Message {
                 message_id: message_id.clone(),
@@ -72,7 +60,6 @@ impl BroadcastPersistEntry {
             });
         }
 
-        // ── Persist to chat_history ────────────────────────────────
         let store = crate::chat_history::store();
         let _ = store
             .insert(&ChatHistoryInsert {
