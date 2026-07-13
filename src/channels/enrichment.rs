@@ -164,11 +164,6 @@ fn extract_file_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// Delete a temporary file, ignoring errors (best-effort cleanup).
-async fn remove_temp_file(path: &std::path::Path) {
-    let _ = tokio::fs::remove_file(path).await;
-}
-
 /// Process all media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`)
 /// in a single pass. Each marker kind is handled according to the strategy:
 ///
@@ -254,7 +249,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
         // regardless of kind or strategy. The helper functions (e.g.
         // handle_multimodal_image, handle_non_multimodal_image) no longer
         // perform cleanup themselves.
-        remove_temp_file(path_obj).await;
+        let _ = tokio::fs::remove_file(path_obj).await;
     }
 
     // ── Multimodal-specific post-processing ──
