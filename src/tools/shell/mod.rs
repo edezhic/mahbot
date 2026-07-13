@@ -1476,10 +1476,10 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// Both stdout and stderr are scrubbed once at pipeline entry so all paths
 /// (early-return and main) consistently receive clean data.  No further
 /// scrubbing is needed anywhere downstream — all derived output (truncated,
-/// pre-head/tail for spill, JSON preview, on_empty messages) originates
+/// pre-head/tail for spill, on_empty messages) originates
 /// from this single scrubbed source.
 ///
-/// Early-return stages (JSON preview, on_empty) call `combine_output` only.  The main path continues through `combine_output` →
+/// Early-return stages (on_empty) call `combine_output` only.  The main path continues through `combine_output` →
 /// `finish_shell_output` (timing, spill-to-file).  `SPILL_THRESHOLD_BYTES`
 /// (5 KB) gates the head/tail truncation and spill preview — it is a trigger,
 /// not a truncation cutoff.  `finish_shell_output` → `try_spill_to_file`'s
@@ -1487,7 +1487,7 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// safety net for output that still exceeds the threshold after all pipeline
 /// stages.
 ///
-/// Stages: JSON preview, line filters, collapse, truncate, line_truncation,
+/// Stages: line filters, collapse, truncate, line_truncation,
 ///         on_empty, output_transform.
 fn apply_profile_pipeline(
     profile: &Profile,
@@ -1496,13 +1496,6 @@ fn apply_profile_pipeline(
     exit_code: i32,
     elapsed: Duration,
 ) -> String {
-    // Stage 1: try JSON preview — run on unscrubbed output because
-    // credential scrubbing replaces value matches with `*[REDACTED]` which
-    // can corrupt JSON syntax (e.g. inserting a second `"` before a key),
-    // making valid JSON unparseable.  The preview includes raw array element
-    // samples that may contain credentials, so scrub it after generation.
-    let json_preview = try_json_preview(output).map(|preview| scrub_credentials(&preview));
-
     // Scrub both stdout and stderr once at pipeline entry so all
     // downstream paths (on_empty, main) uniformly receive clean
     // data.  Scrubbing before keep_stderr filtering means credential
@@ -1515,36 +1508,31 @@ fn apply_profile_pipeline(
     let stderr = scrub_credentials(stderr);
     let output = scrub_credentials(output);
 
-    // Early return for JSON preview; output is already scrubbed.
-    if let Some(preview) = json_preview {
-        return combine_output(&preview, &stderr, exit_code, profile.keep_stderr.as_ref());
-    }
-
     // Local closure capturing the trailing combine_output arguments (stderr,
     // exit_code, keep_stderr) to reduce repetition across all call sites.
     // Output is already scrubbed at pipeline entry.
     let combine =
         |output: &str| combine_output(output, &stderr, exit_code, profile.keep_stderr.as_ref());
 
-    // Stage 3: strip lines
+    // Stage 1: strip lines
     let mut processed = apply_strip_lines(&output, profile);
 
-    // Stage 4: collapse blank lines (runs >2 → 2).
+    // Stage 2: collapse blank lines (runs >2 → 2).
     processed = collapse_blank_lines(&processed);
 
-    // Stage 5: truncate long lines
+    // Stage 3: truncate long lines
     if let Some(max) = profile.max_line_len {
         processed = truncate_line_width(&processed, max);
     }
 
-    // Stage 6: line truncation (head/tail + max_lines).
+    // Stage 4: line truncation (head/tail + max_lines).
     // Returns pre-truncation output for spilling by finish_shell_output,
     // so the complete content remains accessible even when truncation
     // reduces the inline view to a snippet.
     let (truncated, pre_head_tail) = apply_line_truncation(&processed, profile);
     processed = truncated;
 
-    // Stage 7: on_empty — fallback when all output stripped
+    // Stage 5: on_empty — fallback when all output stripped
     if processed.trim().is_empty()
         && let Some(msg) = profile.on_empty
     {
@@ -1553,7 +1541,7 @@ fn apply_profile_pipeline(
         return combine(&format!("{msg}{exit_note} ({secs:.1}s)"));
     }
 
-    // Stage 8: output transform — replaces processed output before combine/finish.
+    // Stage 6: output transform — replaces processed output before combine/finish.
     // This allows profiles to apply custom transformations (e.g., cargo test state
     // machine, ls compaction) that operate on the full output after standard
     // line-level processing has been applied.
@@ -1584,104 +1572,6 @@ fn decode_and_strip_ansi(data: &[u8]) -> String {
 /// display-safe text.
 fn strip_and_scrub(data: &[u8]) -> String {
     scrub_credentials(&decode_and_strip_ansi(data))
-}
-
-/// Try to parse as JSON/structured data and return a schema preview.
-/// Returns `Some(preview)` if JSON was parsed, `None` otherwise.
-fn try_json_preview(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(serde_json::Value::Array(arr)) => {
-            let count = arr.len();
-            let preview = if arr.is_empty() {
-                String::from("[] (empty array)")
-            } else {
-                let sample = arr.iter().take(3).collect::<Vec<_>>();
-                let types = infer_json_types(&sample);
-                let entries = sample
-                    .iter()
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "[JSON array: {count} items, schema: {types}]\n{entries}\n(total: {} chars)",
-                    input.chars().count()
-                )
-            };
-            Some(preview)
-        }
-        Ok(serde_json::Value::Object(obj)) => {
-            let fields: Vec<String> = obj
-                .iter()
-                .map(|(k, v)| {
-                    let t = json_value_type(v);
-                    format!("  {k}: {t}")
-                })
-                .collect();
-            let preview = format!(
-                "[JSON object: {} fields]\n{}\n(total: {} chars)",
-                fields.len(),
-                fields.join("\n"),
-                input.chars().count()
-            );
-            Some(preview)
-        }
-        _ => None,
-    }
-}
-
-/// Infer a schema from a list of JSON values (typically array elements).
-fn infer_json_types(values: &[&serde_json::Value]) -> String {
-    use std::collections::BTreeMap;
-    let mut fields: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for v in values {
-        if let Some(obj) = v.as_object() {
-            for (k, val) in obj {
-                fields
-                    .entry(k)
-                    .or_default()
-                    .push(json_value_type(val).to_string());
-            }
-        }
-    }
-    if fields.is_empty() {
-        return json_value_type(values.first().copied().unwrap_or(&serde_json::Value::Null))
-            .to_string();
-    }
-    fields
-        .iter()
-        .map(|(k, types)| {
-            let unique: Vec<&str> = {
-                let mut v: Vec<&str> = types.iter().map(String::as_str).collect();
-                v.sort_unstable();
-                v.dedup();
-                v
-            };
-            format!("{k}: {}", unique.join(" | "))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn json_value_type(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(n) => {
-            if n.is_f64() {
-                "float"
-            } else {
-                "int"
-            }
-        }
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
 }
 
 /// Truncate any single line exceeding `max_line_len` with a note.
@@ -2510,79 +2400,14 @@ mod tests {
     // ── Shell compression pipeline tests ────────────────────────────
 
     #[test]
-    fn try_json_preview_cases() {
-        let cases: &[(&str, &[&str])] = &[
-            // JSON array → detected with item count and schema inference
-            (
-                r#"[{"name": "alice", "age": 30}, {"name": "bob", "age": 25}]"#,
-                &["2 items", "name: string", "age: int"],
-            ),
-            // JSON object → detected with field count and field names
-            (
-                r#"{"status": "ok", "count": 42}"#,
-                &["2 fields", "status", "count"],
-            ),
-            // Non-JSON → None
-            ("hello world\nthis is not json", &[]),
-        ];
-        for (input, expected_contains) in cases {
-            let result = try_json_preview(input);
-            if expected_contains.is_empty() {
-                assert!(result.is_none(), "expected no JSON preview for: {input:?}");
-            } else {
-                assert!(result.is_some(), "expected JSON preview for: {input:?}");
-                let output = result.unwrap();
-                for s in *expected_contains {
-                    assert!(output.contains(s), "expected {s:?} in: {output}");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn pipeline_credential_scrubbing_cases() {
-        // Pipeline stages 1/2/7 all scrub credentials in stderr.
+        // Pipeline entry scrubs both stdout and stderr; on_empty (Stage 5)
+        // also verifies scrubbing in stderr.
         // Each case follows the same pattern: raw credentials not present,
         // redacted form present, pipeline-specific content preserved.
         let cases: &[ShellOutputCase] = &[
             ShellOutputCase {
-                // Stage 1 (JSON preview): credentials in stdout are scrubbed
-                name: "json preview scrubs credentials in array",
-                command: "echo test",
-                stdout: r#"[{"token": "sk-abcdefghijklmnop12345678", "name": "test"}]"#,
-                not_contains: &["sk-abcdefghijklmnop12345678"],
-                contains: &["sk-a*[REDACTED]", "test"],
-                ..Default::default()
-            },
-            ShellOutputCase {
-                // Stage 1 (JSON preview): object field values are scrubbed, names preserved
-                name: "json preview scrubs credentials in object",
-                command: "curl api",
-                stdout: r#"{"api_key": "abcdefghijklmnop12345678", "status": "ok"}"#,
-                not_contains: &["abcdefghijklmnop12345678"],
-                contains: &["api_key", "status", "[JSON object:"],
-                ..Default::default()
-            },
-            ShellOutputCase {
-                name: "json preview preserves clean json",
-                command: "echo test",
-                stdout: r#"[{"name": "alice", "age": 30}]"#,
-                contains: &["alice", "age", "30", "[JSON array:"],
-                ..Default::default()
-            },
-            ShellOutputCase {
-                // Stage 1 (JSON preview): credentials from stderr are scrubbed
-                name: "json preview scrubs credentials in stderr",
-                command: "echo test",
-                stdout: r#"[{"name": "alice"}]"#,
-                stderr: "api_key=abcdefghijklmnop12345678",
-                exit_code: 1,
-                not_contains: &["api_key=abcdefghijklmnop12345678"],
-                contains: &["api_key=abcd*[REDACTED]", "alice"],
-                ..Default::default()
-            },
-            ShellOutputCase {
-                // Stage 7 (on-empty): credentials from stderr are scrubbed
+                // Stage 5 (on-empty): credentials from stderr are scrubbed
                 // (via git diff profile's on_empty message)
                 name: "git diff on_empty scrubs credentials in stderr",
                 command: "git diff",
@@ -2593,7 +2418,7 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                // Stage 7 (on-empty): credentials from stderr are scrubbed
+                // Stage 5 (on-empty): credentials from stderr are scrubbed
                 name: "on-empty scrubs credentials in stderr",
                 command: "tsc --noEmit",
                 stderr: "api_key=abcdefghijklmnop12345678",
