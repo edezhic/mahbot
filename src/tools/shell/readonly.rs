@@ -149,7 +149,9 @@ const GIT_SAFE_SUBCOMMANDS: &[&str] = &[
     "stash list",
 ];
 
-/// Safe cargo subcommands.
+/// Safe cargo subcommands that only affect build artifacts in `target/` or are purely
+/// read-only queries. Commands that modify source files or `Cargo.lock` must NOT be added
+/// here — they should get targeted rejection messages with tailored suggestions instead.
 const CARGO_SAFE_SUBCOMMANDS: &[&str] = &[
     "build",
     "check",
@@ -166,8 +168,6 @@ const CARGO_SAFE_SUBCOMMANDS: &[&str] = &[
     "clean",
     "doc",
     "fmt",
-    "generate-lockfile",
-    "update",
     "version",
     "verify-project",
     "read-manifest",
@@ -867,6 +867,28 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
 
     let base = subcommand.split_whitespace().next().unwrap_or("");
 
+    // ── Specific rejection messages for subcommands that modify source files ──
+    // These are checked before the allowlist so they get tailored suggestions
+    // instead of the generic "use cargo check, cargo test, ..." message.
+    match base {
+        "update" => {
+            return reject(
+                trimmed,
+                "`cargo update` is not allowed — it modifies Cargo.lock.",
+                "switch to full shell mode to use `cargo update` \
+                 (or `cargo update --dry-run` to preview changes without modifying Cargo.lock).",
+            );
+        }
+        "generate-lockfile" => {
+            return reject(
+                trimmed,
+                "`cargo generate-lockfile` is not allowed — it creates or overwrites Cargo.lock.",
+                "switch to full shell mode to use `cargo generate-lockfile`.",
+            );
+        }
+        _ => {}
+    }
+
     let is_safe = CARGO_SAFE_SUBCOMMANDS.contains(&base);
 
     if !is_safe {
@@ -1155,6 +1177,10 @@ mod tests {
             ("cargo fmt --check", true),
             ("cargo fmt -- --check", true),
             ("cargo fix", false),
+            // cargo update and generate-lockfile are rejected with tailored messages
+            ("cargo update", false),
+            ("cargo update --dry-run", false),
+            ("cargo generate-lockfile", false),
         ];
 
         run_cases(&cases);
