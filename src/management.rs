@@ -216,6 +216,17 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
+/// Returns `true` if the ticket is still in `expected` phase.
+/// If not, clears `assigned_to` and returns `false`.
+#[must_use]
+async fn guard_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
+    if !is_ticket_in_phase(ticket_id, expected).await {
+        clear_assigned_to(ticket_id, &format!("ticket left {expected:?}")).await;
+        return false;
+    }
+    true
+}
+
 /// Controls whether a ticket transition triggers an immediate notification
 /// to the Manager (via [`notify_ticket`]) or is buffered for batched delivery.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -538,7 +549,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // PollPhase::info() which now also carries the circuit_breaker_kind
         // and log_label fields (enforced by the single match in info()).
         //
-        // The post-agent is_ticket_in_phase check in each dispatch function is
+        // The post-agent guard_ticket_in_phase check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         if !is_ticket_in_phase(&ticket.id, expected_phase).await {
             return;
@@ -962,8 +973,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         run_agent(session_key, Role::Engineer, &ws, Some(&ticket), &message).await;
 
     // Post-run check still needed for race conditions during agent execution.
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
-        clear_assigned_to(&ticket.id, "ticket left InDevelopment").await;
+    if !guard_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
         return;
     }
 
@@ -1393,8 +1403,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         run_agent(session_key, Role::Sanitation, &ws, Some(&ticket), &prompt).await;
 
     // Post-run phase check — bail if ticket was moved externally.
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
-        clear_assigned_to(&ticket.id, "ticket left InSanitation").await;
+    if !guard_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
         return;
     }
 
@@ -1644,10 +1653,8 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
 
                 // Post-run check: verify ticket hasn't been moved externally while
-                // diagnostics commands ran. Consistent with dispatch_engineer and
-                // dispatch_sanitation.
-                if !is_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
-                    clear_assigned_to(&ticket.id, "ticket left InDiagnostics").await;
+                // diagnostics commands ran.
+                if !guard_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
                     return;
                 }
 
