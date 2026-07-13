@@ -321,11 +321,7 @@ async fn transition_ticket_to_done_buffer_and_notify() {
 
     // Verify both tickets are Done and have SYSTEM_ROLE comments
     for (id, label) in [(&first_id, "A"), (&second_id, "B")] {
-        let t = board()
-            .get_ticket(id)
-            .await
-            .expect("get_ticket")
-            .unwrap_or_else(|| panic!("ticket {label} exists"));
+        let t = expect_ticket(board(), id).await;
         assert_eq!(t.phase, TicketPhase::Done, "Ticket {label} should be Done");
 
         // Each Done transition should have written a SYSTEM_ROLE comment
