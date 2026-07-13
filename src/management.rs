@@ -136,41 +136,55 @@ impl CircuitBreakerKind {
     /// should not trip (count ≤ threshold).
     fn trip_info(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
         let threshold = self.threshold();
-        let count = match self {
-            Self::General => comments.len(),
-            Self::Sanitation => comments
-                .iter()
-                .filter(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_MARKER))
-                .count(),
-            Self::Diagnostics => comments
-                .iter()
-                .filter(|c| {
-                    c.role == DIAGNOSTICS_ROLE && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
-                })
-                .count(),
+        let (count, msg) = match self {
+            Self::General => {
+                let count = comments.len();
+                (
+                    count,
+                    format!(
+                        "Failed after {count} comments — ticket has accumulated too many comments \
+                         (circuit breaker, threshold: {threshold}). \
+                         Ticket failed — Manager will triage."
+                    ),
+                )
+            }
+            Self::Sanitation => {
+                let count = comments
+                    .iter()
+                    .filter(|c| {
+                        c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_MARKER)
+                    })
+                    .count();
+                (
+                    count,
+                    format!(
+                        "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
+                         (threshold: {threshold})",
+                    ),
+                )
+            }
+            Self::Diagnostics => {
+                let count = comments
+                    .iter()
+                    .filter(|c| {
+                        c.role == DIAGNOSTICS_ROLE && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
+                    })
+                    .count();
+                (
+                    count,
+                    format!(
+                        "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
+                         failures. Failing ticket."
+                    ),
+                )
+            }
         };
 
         if count <= threshold {
-            return None;
+            None
+        } else {
+            Some((count, threshold, msg))
         }
-
-        let msg = match self {
-            Self::General => format!(
-                "Failed after {count} comments — ticket has accumulated too many comments \
-                 (circuit breaker, threshold: {threshold}). \
-                 Ticket failed — Manager will triage."
-            ),
-            Self::Sanitation => format!(
-                "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
-                 (threshold: {threshold})",
-            ),
-            Self::Diagnostics => format!(
-                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
-                 failures. Failing ticket."
-            ),
-        };
-
-        Some((count, threshold, msg))
     }
 }
 
