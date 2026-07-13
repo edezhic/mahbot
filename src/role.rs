@@ -31,7 +31,11 @@ pub(crate) const SYSTEM_ROLE: &str = "system";
 /// for role metadata lookups. Icon widgets live in `theme::role_icon()`.
 ///
 /// Adding a new role requires updating the [`Role`] enum in `lib.rs`,
-/// this match, the [`Role::tools()`] method, and the `theme::role_icon()` match.
+/// creating prompt files at `src/prompt/role/{name}.md` and
+/// `src/prompt/summarize/{name}.md` (and optionally
+/// `src/prompt/discovery/{name}.md` if `has_discovery` is true),
+/// adding an arm in this match, the [`Role::tools()`] method,
+/// and the `theme::role_icon()` match.
 /// The compiler will catch missing arms in exhaustive matches, but it
 /// cannot catch an arm that returns an empty tool set or silently uses
 /// struct update defaults — the tests in this module guard against those:
@@ -40,6 +44,9 @@ pub(crate) const SYSTEM_ROLE: &str = "system";
 /// * `display_label` empty string sentinel (struct update syntax)
 /// * `default_model` and `default_reasoning_effort` non-empty (struct update)
 /// * [`Role::tools()`] non-empty for every variant
+/// * `role_description()` contains real content (no placeholder)
+/// * `summary_prompt()` contains real content (no placeholder)
+/// * `discovery_prompt()` contains real content (no placeholder, for roles where `has_discovery` is true)
 pub struct RoleInfo {
     /// Whether this role has a discovery prompt for workspace exploration.
     pub has_discovery: bool,
@@ -314,8 +321,6 @@ impl Role {
             }
         };
 
-        // Manager does not need the web search tool as he is expected to
-        // use ask with analysts for that.
         if !matches!(self, Role::Manager) {
             Self::add_web_search_tool(&mut tools);
         }
@@ -470,7 +475,60 @@ mod tests {
     }
 
     #[test]
+    fn all_roles_have_role_description() {
+        // Guards against a missing src/prompt/role/{name}.md — the compiler
+        // cannot catch this because load_prompt returns a fallback string.
+        for role in Role::iter() {
+            let desc = role.role_description();
+            assert!(
+                !desc.trim().is_empty(),
+                "{}: role_description() must not be empty",
+                role.as_str()
+            );
+            assert!(
+                !desc.contains("PROMPT MISSING"),
+                "{}: role_description() returned a placeholder — create src/prompt/role/{}.md",
+                role.as_str(),
+                role.as_str()
+            );
+            assert!(
+                !crate::prompt::TEMPLATE_RE.is_match(&desc),
+                "{}: role description must not contain unsubstituted template keys",
+                role.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn all_roles_have_summary_prompt() {
+        // Guards against a missing src/prompt/summarize/{name}.md.
+        for role in Role::iter() {
+            let prompt = role.summary_prompt();
+            assert!(
+                !prompt.trim().is_empty(),
+                "{}: summary_prompt() must not be empty",
+                role.as_str()
+            );
+            assert!(
+                !prompt.contains("PROMPT MISSING"),
+                "{}: summary_prompt() returned a placeholder — create src/prompt/summarize/{}.md",
+                role.as_str(),
+                role.as_str()
+            );
+            assert!(
+                !crate::prompt::TEMPLATE_RE.is_match(&prompt),
+                "{}: summary prompt must not contain unsubstituted template keys",
+                role.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn all_roles_have_discovery_prompt() {
+        // Guards against a missing src/prompt/discovery/{name}.md for roles
+        // where has_discovery is true. The placeholder string from load_prompt
+        // would pass a non-empty and no-template-keys check, so we also check
+        // for the "PROMPT MISSING" marker.
         for role in Role::iter() {
             if !super::role_info(&role).has_discovery {
                 continue;
@@ -479,6 +537,12 @@ mod tests {
             assert!(
                 !prompt.trim().is_empty(),
                 "{}: discovery_prompt() must not be empty",
+                role.as_str()
+            );
+            assert!(
+                !prompt.contains("PROMPT MISSING"),
+                "{}: discovery_prompt() returned a placeholder — create src/prompt/discovery/{}.md",
+                role.as_str(),
                 role.as_str()
             );
             assert!(
