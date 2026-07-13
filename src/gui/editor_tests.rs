@@ -834,7 +834,7 @@ fn test_parse_git_status_porcelain() {
 
 #[test]
 fn test_is_find_bar_open_true_when_active() {
-    let state = make_editor_with_find_state("fn hello() {}", "hello", vec![4..9], 0);
+    let state = make_editor_with_find_state("fn hello() {}", "hello", [4..9].to_vec(), 0);
     assert!(state.is_find_bar_open());
 }
 

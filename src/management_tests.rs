@@ -1054,6 +1054,7 @@ async fn process_sanitation_verdict_cases() {
 /// | Diagnostics failure | `false` | ReadyForDevelopment | true | DIAGNOSTICS_COMMENT_PREFIX + DIAGNOSTICS_FAILED_MARKER |
 /// | Diagnostics pass | `true`, ... | DiagnosticsDone | false | DIAGNOSTICS_COMMENT_PREFIX + DIAGNOSTICS_PASSED_MARKER |
 /// | DB error (corrupt JSON) | N/A (corrupt) | DiagnosticsDone | false | "database error" |
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn dispatch_diagnostics_cases() {
     struct Case {
