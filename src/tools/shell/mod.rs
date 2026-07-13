@@ -16,7 +16,7 @@ use crate::util::strip_ansi_escapes;
 mod profiles;
 mod readonly;
 
-use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile, ShortCircuit};
+use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile};
 pub use self::readonly::ShellMode;
 use self::readonly::check_command;
 
@@ -931,7 +931,7 @@ fn is_env_assignment(word: &str) -> bool {
 
 /// Select the first matching profile for a command string.
 /// Returns on the first match in the first matching command segment
-/// (short-circuits on both segment and profile iteration); chained
+/// (breaks out of both segment and profile iteration early); chained
 /// commands are handled by iterating over pre-parsed segments.
 ///
 /// Profiles with `standalone_only` are skipped when `is_chained` is true,
@@ -1356,23 +1356,7 @@ fn process_shell_output(
     let segments = extract_command_segments(command);
     let is_chained = segments.len() > 1;
     let profile = select_profile(&segments, is_chained);
-    apply_profile_pipeline(profile, stdout, stderr, exit_code, elapsed, is_chained)
-}
-
-/// Match short-circuit patterns against trimmed output.
-fn match_short_circuit<'a>(output: &str, short_circuits: &'a [ShortCircuit]) -> Option<&'a str> {
-    let blob = output.trim();
-    for sc in short_circuits {
-        if sc.pattern.is_match(blob)
-            && !sc
-                .unless
-                .as_ref()
-                .is_some_and(|unless_re| unless_re.is_match(blob))
-        {
-            return Some(sc.message);
-        }
-    }
-    None
+    apply_profile_pipeline(profile, stdout, stderr, exit_code, elapsed)
 }
 
 /// Apply strip_lines filter.
@@ -1492,11 +1476,10 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// Both stdout and stderr are scrubbed once at pipeline entry so all paths
 /// (early-return and main) consistently receive clean data.  No further
 /// scrubbing is needed anywhere downstream — all derived output (truncated,
-/// pre-head/tail for spill, JSON preview, short-circuit messages) originates
+/// pre-head/tail for spill, JSON preview, on_empty messages) originates
 /// from this single scrubbed source.
 ///
-/// Early-return stages (JSON preview, short-circuit, on_empty) call
-/// `combine_output` only.  The main path continues through `combine_output` →
+/// Early-return stages (JSON preview, on_empty) call `combine_output` only.  The main path continues through `combine_output` →
 /// `finish_shell_output` (timing, spill-to-file).  `SPILL_THRESHOLD_BYTES`
 /// (5 KB) gates the head/tail truncation and spill preview — it is a trigger,
 /// not a truncation cutoff.  `finish_shell_output` → `try_spill_to_file`'s
@@ -1504,17 +1487,14 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// safety net for output that still exceeds the threshold after all pipeline
 /// stages.
 ///
-/// Stages: JSON preview, short-circuit, line filters, collapse, truncate,
-///         line_truncation, on_empty, output_transform.
-/// When `is_chained` is true (command has `&&`, `||`, `;`, or `|` segments),
-/// short-circuit is skipped to avoid suppressing output from later segments.
+/// Stages: JSON preview, line filters, collapse, truncate, line_truncation,
+///         on_empty, output_transform.
 fn apply_profile_pipeline(
     profile: &Profile,
     output: &str,
     stderr: &str,
     exit_code: i32,
     elapsed: Duration,
-    is_chained: bool,
 ) -> String {
     // Stage 1: try JSON preview — run on unscrubbed output because
     // credential scrubbing replaces value matches with `*[REDACTED]` which
@@ -1524,18 +1504,18 @@ fn apply_profile_pipeline(
     let json_preview = try_json_preview(output).map(|preview| scrub_credentials(&preview));
 
     // Scrub both stdout and stderr once at pipeline entry so all
-    // downstream paths (short-circuit, on_empty, main) uniformly
-    // receive clean data.  Scrubbing before keep_stderr filtering
-    // means credential lines that matched keep_stderr patterns will
-    // be dropped entirely because the redacted version no longer
-    // matches — this is acceptable since credentials should never
-    // appear in output.  No further credential scrubbing is needed
-    // anywhere in the pipeline; all derived data (truncated output,
-    // spill output) originates from this single scrubbed source.
+    // downstream paths (on_empty, main) uniformly receive clean
+    // data.  Scrubbing before keep_stderr filtering means credential
+    // lines that matched keep_stderr patterns will be dropped entirely
+    // because the redacted version no longer matches — this is acceptable
+    // since credentials should never appear in output.  No further
+    // credential scrubbing is needed anywhere in the pipeline; all
+    // derived data (truncated output, spill output) originates from
+    // this single scrubbed source.
     let stderr = scrub_credentials(stderr);
     let output = scrub_credentials(output);
 
-    // Short-circuit early return for JSON preview; output is already scrubbed.
+    // Early return for JSON preview; output is already scrubbed.
     if let Some(preview) = json_preview {
         return combine_output(&preview, &stderr, exit_code, profile.keep_stderr.as_ref());
     }
@@ -1545,12 +1525,6 @@ fn apply_profile_pipeline(
     // Output is already scrubbed at pipeline entry.
     let combine =
         |output: &str| combine_output(output, &stderr, exit_code, profile.keep_stderr.as_ref());
-
-    // Stage 2: short-circuit on success patterns — skip for chained commands
-    // to avoid suppressing output from later segments (e.g., `cargo build && echo done`).
-    if !is_chained && let Some(msg) = match_short_circuit(&output, &profile.short_circuits) {
-        return combine(msg);
-    }
 
     // Stage 3: strip lines
     let mut processed = apply_strip_lines(&output, profile);
@@ -1863,8 +1837,7 @@ mod tests {
         /// Strings that must all be absent from the output.
         not_contains: &'static [&'static str],
         /// If set, asserts `result.trim() == eq` (leading/trailing whitespace
-        /// is stripped before comparison, consistent with how profiles
-        /// trim output in short-circuit messages).
+        /// is stripped before comparison).
         eq: Option<&'static str>,
     }
 
@@ -1884,7 +1857,7 @@ mod tests {
     /// `contains` and `not_contains` are checked against the raw result.
     /// `eq` (if set) compares against `result.trim()` — leading/trailing
     /// whitespace is stripped, consistent with how profiles produce
-    /// short-circuit messages (e.g. `"[cargo test: ok]"`).
+    /// on_empty messages (e.g. `"[cargo test: ok]"`).
     fn check_shell_output(cases: &[ShellOutputCase]) {
         for case in cases {
             let result = process_shell_output(
@@ -2016,9 +1989,9 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "git -C /repo diff triggers git diff short-circuit",
+                name: "git -C /repo diff triggers git diff on_empty",
                 command: "git -C /repo diff",
-                eq: Some("[git diff: no changes]"),
+                contains: &["no changes"],
                 ..Default::default()
             },
             ShellOutputCase {
@@ -2086,7 +2059,7 @@ mod tests {
                 name: "npx prettier selects prettier profile",
                 command: "npx prettier --check file.js",
                 stdout: "unchanged",
-                contains: &["prettier: ok"],
+                contains: &["unchanged"],
                 ..Default::default()
             },
             ShellOutputCase {
@@ -2124,18 +2097,18 @@ mod tests {
     #[test]
     fn tool_profile_cases() {
         // Specific tool profile tests — consolidated table.
-        // Covers short-circuit, strip, and transform behaviors of named
+        // Covers strip, on_empty, and transform behaviors of named
         // tool profiles (git, docker, df, du, make, rsync, tsc, gh,
         // terraform, pytest, and the generic fallback pipeline).
         let cases: &[ShellOutputCase] = &[
             ShellOutputCase {
-                name: "git diff no changes short-circuits",
+                name: "git diff no changes via on_empty",
                 command: "git diff",
                 contains: &["no changes"],
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "docker build short-circuits on success",
+                name: "docker build success via on_empty",
                 command: "docker build -t myimage .",
                 stdout: "Step 1/3 : FROM alpine\n ---> abc123\nStep 2/3 : RUN echo hi\n ---> Using cache\nStep 3/3 : CMD [\"sh\"]\n ---> def456\nSuccessfully built abc123\nSuccessfully tagged myimage:latest\n",
                 contains: &["[docker"],
@@ -2171,10 +2144,10 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "rsync short-circuits on success",
+                name: "rsync success shows transfer summary",
                 command: "rsync -avz source/ dest/",
                 stdout: "building file list ... done\nsent 100 bytes  received 50 bytes\n\ntotal size is 98765  speedup is 658.43\n",
-                eq: Some("ok (synced)"),
+                contains: &["building file list", "total size is", "98765"],
                 ..Default::default()
             },
             ShellOutputCase {
@@ -2191,26 +2164,26 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "docker strips build steps and short-circuits",
+                name: "docker strips build steps and shows on_empty",
                 command: "docker build -t myapp .",
                 stdout: "Step 1/10 : FROM node:18\nStep 2/10 : WORKDIR /app\n ---> Using cache\nSuccessfully built abc123\nSuccessfully tagged myapp:latest\n",
-                contains: &["[docker build: ok]"],
+                contains: &["[docker: ok]"],
                 not_contains: &["Step "],
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "gh strips warning noise",
+                name: "gh strips warning noise, preserves output",
                 command: "gh pr create --fill",
                 stdout: "  \n - some detail\nwarning: consider updating gh\n✓ Created pull request\n",
-                contains: &["[gh: ok]"],
+                contains: &["Created pull request"],
                 not_contains: &["warning:"],
                 ..Default::default()
             },
             ShellOutputCase {
-                name: "terraform short-circuits on no changes",
+                name: "terraform shows no changes message",
                 command: "terraform plan",
                 stdout: "data.aws_region.current: Refreshing state...\nNo changes. Your infrastructure matches the configuration.\n",
-                contains: &["[terraform: no changes]"],
+                contains: &["No changes", "infrastructure matches"],
                 ..Default::default()
             },
             ShellOutputCase {
@@ -2609,8 +2582,9 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                // Stage 2 (short-circuit): credentials from stderr are scrubbed
-                name: "short-circuit scrubs credentials in stderr",
+                // Stage 7 (on-empty): credentials from stderr are scrubbed
+                // (via git diff profile's on_empty message)
+                name: "git diff on_empty scrubs credentials in stderr",
                 command: "git diff",
                 stderr: "api_key=abcdefghijklmnop12345678",
                 exit_code: 1,

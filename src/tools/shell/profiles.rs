@@ -9,20 +9,11 @@ use std::sync::LazyLock;
 
 // ── Profile data structures ───────────────────────────────────────────
 
-/// A short-circuit rule: if output matches `pattern` (and `unless` is absent or not matched),
-/// return `message` without further processing.
-pub(crate) struct ShortCircuit {
-    pub(crate) pattern: Regex,
-    pub(crate) message: &'static str,
-    pub(crate) unless: Option<Regex>,
-}
-
 /// A compiled output filter profile. Built once at init via [`Profile::new`] + builder methods.
 pub(super) struct Profile {
     pub(super) match_command: Regex,
     pub(super) strip_lines: Option<RegexSet>,
     pub(super) keep_stderr: Option<RegexSet>,
-    pub(super) short_circuits: Vec<ShortCircuit>,
     pub(super) max_line_len: Option<usize>,
     pub(super) head_lines: Option<usize>,
     pub(super) tail_lines: Option<usize>,
@@ -47,7 +38,6 @@ impl Profile {
             match_command: Regex::new(match_command).expect("bad match_command regex"),
             strip_lines: None,
             keep_stderr: None,
-            short_circuits: Vec::new(),
             max_line_len: None,
             head_lines: None,
             tail_lines: None,
@@ -72,24 +62,6 @@ impl Profile {
 
     fn keep_stderr(mut self, patterns: &[&str]) -> Self {
         self.keep_stderr = Some(RegexSet::new(patterns).expect("bad keep_stderr regex"));
-        self
-    }
-
-    fn short_circuit(mut self, pattern: &str, message: &'static str) -> Self {
-        self.short_circuits.push(ShortCircuit {
-            pattern: Regex::new(pattern).expect("bad short_circuit pattern"),
-            message,
-            unless: None,
-        });
-        self
-    }
-
-    fn short_circuit_unless(mut self, pattern: &str, message: &'static str, unless: &str) -> Self {
-        self.short_circuits.push(ShortCircuit {
-            pattern: Regex::new(pattern).expect("bad short_circuit pattern"),
-            message,
-            unless: Some(Regex::new(unless).expect("bad unless pattern")),
-        });
         self
     }
 
@@ -234,11 +206,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .tail(4),
         Profile::new(r"^rsync\b")
             .strip(&[BLANK_LINE, r"sending incremental", r"sent \d+"])
-            .short_circuit_unless(
-                r"total size is",
-                "ok (synced)",
-                r"error|failed|No such file",
-            )
             .max(20),
         Profile::new(r"^ssh\b")
             .strip(&[
@@ -262,20 +229,10 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
                 r"^Successfully built",
                 r"^Successfully tagged",
             ])
-            .short_circuit_unless(
-                r"Successfully built",
-                "[docker build: ok]",
-                r"error|Error|failed|FAILED",
-            )
             .max(40)
             .on_empty("[docker: ok]"),
         Profile::new(r"^gh\b")
             .strip(&[BLANK_LINE, r"^\s*-\s", r"warning:.*(?:gh|GitHub)"])
-            .short_circuit_unless(
-                r"(\u{2713}|Done|Successfully)",
-                "[gh: ok]",
-                r"error|Error|failed|FAILED",
-            )
             .tail(10)
             .max(30)
             .on_empty("[gh: ok]"),
@@ -290,12 +247,11 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .max_line_len(200)
             .head(20)
             .max(50),
-        Profile::new(r"^git\s+diff\b").short_circuit(r"^\s*$", "[git diff: no changes]"),
+        Profile::new(r"^git\s+diff\b").on_empty("[git diff: no changes]"),
         // ── Rust toolchain ────────────────────────────────────────────────
         cargo_tool(r"^cargo\s+(build|check)\b", 50, "[cargo: ok]"),
         cargo_tool(r"^cargo\s+clippy\b", 50, "[cargo clippy: ok]"),
         Profile::new(r"^cargo\s+fmt\b")
-            .short_circuit(r"^Formatted\s", "[cargo fmt: ok]")
             .max(50)
             .on_empty("[cargo fmt: ok]"),
         Profile::new(r"^cargo\s+install\b")
@@ -312,7 +268,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
                 r"^\s*changed\s",
                 r"^\s*audited\s",
             ])
-            .short_circuit_unless(r"up to date", "npm: up to date", r"ERR|error|failed")
             .max(30),
         Profile::new(r"^npm\s+audit\b|^pnpm\s+audit\b")
             .strip(&[BLANK_LINE])
@@ -321,11 +276,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .on_empty("[npm audit: clean]"),
         Profile::new(r"^npm\s+run\b|^pnpm\s+run\b|^yarn\s+(run\b)")
             .strip(&[BLANK_LINE, r"^> .+@", r"^npm ERR!", r"^ERR!"])
-            .short_circuit_unless(
-                r"success|Done in",
-                "[npm run: ok]",
-                r"error|Error|failed|FAILED|ERR",
-            )
             .tail(15)
             .max(40),
         small_util(r"^(?:biome|oxlint|ruff)\b", 30),
@@ -343,10 +293,7 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .tail(20)
             .max(60),
         lint_tool(r"^eslint\b", 50, "[eslint: ok]"),
-        Profile::new(r"^prettier\b")
-            .strip(&[BLANK_LINE])
-            .short_circuit(r"unchanged", "prettier: ok")
-            .max(20),
+        Profile::new(r"^prettier\b").strip(&[BLANK_LINE]).max(20),
         Profile::new(r"^next\s+build\b")
             .strip(&[BLANK_LINE, r"^\s*✓", r"^info\s+-"])
             .tail(10)
@@ -383,7 +330,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
                 r"^\s*collected\s+\d+",
                 r"^\s*={3,}\s",
             ])
-            .short_circuit_unless(r"passed", "[pytest: passed]", r"failed|error|FAILED|ERROR")
             .tail(20)
             .max(60)
             .on_empty("[pytest: passed]"),
@@ -395,7 +341,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
                 r"^\s*Installing\s",
                 r"^Successfully installed\s",
             ])
-            .short_circuit(r"already satisfied", "[pip: already satisfied]")
             .max(30),
         // ── Query & search ──────────────────────────────────────────────
         Profile::new(r"^fd\b")
@@ -416,7 +361,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
         // ── Terraform ────────────────────────────────────────────────────
         Profile::new(r"^terraform\b")
             .strip(&[BLANK_LINE, r"^Initializing", r"^Terraform has been"])
-            .short_circuit_unless(r"No changes", "[terraform: no changes]", r"error|Error")
             .head(5)
             .tail(15)
             .max(40)
