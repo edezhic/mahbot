@@ -113,10 +113,16 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// | `LOADING`  | `UNINIT`   | No Tokio runtime available — no background download  |
 /// |            |            | task can be spawned. STATE is rolled back so a       |
 /// |            |            | future call running under a runtime can retry.       |
-/// | `LOADING`  | `FAILED`   | **Terminal condition:** freshly downloaded,          |
-/// |            |            | SHA256-verified files fail to load (code-level bug   |
-/// |            |            | in [`Embedder::load()`]). [`download_retry_loop()`]  |
-/// |            |            | transitions state to [`STATE_FAILED`] and returns.   |
+/// | `LOADING`  | `FAILED`   | **Code-level error:** freshly downloaded,          |
+/// |            |            | SHA256-verified files fail to load (bug            |
+/// |            |            | in [`Embedder::load()`]).                           |
+/// |            |            | [`download_retry_loop()`] transitions state to      |
+/// |            |            | [`STATE_FAILED`] and returns.                       |
+/// | `LOADING`  | `FAILED`   | **Background task panic:** [`EmbedderGuard`]'s      |
+/// |            |            | [`Drop`] guard transitions state to [`STATE_FAILED`]|
+/// |            |            | when [`download_retry_loop()`] is dropped without   |
+/// |            |            | reaching a terminal state (e.g. a panic in Candle   |
+/// |            |            | or tokenizers).                                      |
 ///
 /// Once STATE reaches `READY` or `FAILED` it stays there for the lifetime of the process.
 const STATE_UNINIT: u8 = 0;
@@ -245,6 +251,37 @@ where
 
 // ── Background download with retry ────────────────────────────────────
 
+/// Guard that transitions [`STATE`] from [`STATE_LOADING`] to [`STATE_FAILED`] on drop.
+///
+/// If the background download task panics (e.g., a future dependency bug in Candle or
+/// tokenizers), Tokio catches the panic and swallows it. Without this guard, [`STATE`]
+/// would remain permanently stuck in [`STATE_LOADING`], causing every subsequent call
+/// to [`ensure_embedder()`] to return `false` immediately, silently disabling semantic
+/// search until the process is restarted.
+///
+/// # Invariants
+///
+/// * **Normal success:** [`set_embedder_ready()`] sets [`STATE`] to [`STATE_READY`]; the
+///   guard's CAS is a no-op (wrong expected value).
+/// * **Explicit terminal failure:** The function stores [`STATE_FAILED`] before returning;
+///   the guard's CAS is a no-op (wrong expected value).
+/// * **Panic / early drop:** [`STATE`] is still [`STATE_LOADING`]; the CAS succeeds and
+///   transitions to [`STATE_FAILED`].
+struct EmbedderGuard;
+
+impl Drop for EmbedderGuard {
+    fn drop(&mut self) {
+        STATE
+            .compare_exchange(
+                STATE_LOADING,
+                STATE_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+    }
+}
+
 /// Background retry loop that downloads model and tokenizer files.
 ///
 /// Uses exponential backoff (1 min → 2 min → 4 min → … → 30 min max) for
@@ -269,6 +306,7 @@ where
 /// problem is almost certainly a code-level bug, so the loop gives up and leaves
 /// the global embedder uninitialized (graceful degradation to FTS-only search).
 async fn download_retry_loop() {
+    let _guard = EmbedderGuard;
     let Some(models_dir) = models_dir() else {
         warn!("Embedder: CONFIG not initialized — background download cancelled");
         STATE.store(STATE_FAILED, Ordering::Release);
