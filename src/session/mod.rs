@@ -680,47 +680,6 @@ pub(crate) enum DecodedNativeHistoryMessage {
     },
 }
 
-/// Shared fields extracted from a [`DecodedNativeHistoryMessage`] that providers
-/// use to build their local native message types.
-/// Tool calls are returned as `Vec<ToolCall>` so each provider can convert them
-/// to its own tool-call type.
-#[derive(Debug)]
-pub(crate) struct NativeMessageParts {
-    pub role: String,
-    pub content: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub tool_calls: Option<Vec<ToolCall>>,
-    pub reasoning: Option<Reasoning>,
-}
-
-impl DecodedNativeHistoryMessage {
-    pub(crate) fn into_parts(self) -> NativeMessageParts {
-        match self {
-            DecodedNativeHistoryMessage::Assistant {
-                content,
-                tool_calls,
-                reasoning,
-            } => NativeMessageParts {
-                role: ChatRole::Assistant.to_string(),
-                content,
-                tool_call_id: None,
-                tool_calls,
-                reasoning,
-            },
-            DecodedNativeHistoryMessage::ToolResult {
-                tool_call_id,
-                content,
-            } => NativeMessageParts {
-                role: ChatRole::Tool.to_string(),
-                content: Some(content),
-                tool_call_id,
-                tool_calls: None,
-                reasoning: None,
-            },
-        }
-    }
-}
-
 /// Decode a `ChatMessage` whose `content` is a JSON-wrapped native message.
 /// Returns `None` if the message doesn't look like a native/session-persisted message.
 pub(crate) fn decode_native_history_message(

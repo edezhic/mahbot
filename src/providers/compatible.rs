@@ -414,9 +414,35 @@ impl OpenAiCompatibleProvider {
         messages
             .iter()
             .map(|message| {
+                // Shared fields extracted from a `DecodedNativeHistoryMessage` used
+                // to build provider-native message types.
+                // Tool calls are returned as `Vec<ToolCall>` so each provider can convert them
+                // to its own tool-call type.
                 let decoded = crate::session::decode_native_history_message(message);
-                let Some(parts) =
-                    decoded.map(crate::session::DecodedNativeHistoryMessage::into_parts)
+                let Some((role, content, tool_call_id, tool_calls, reasoning)) =
+                    decoded.map(|msg| match msg {
+                        crate::session::DecodedNativeHistoryMessage::Assistant {
+                            content,
+                            tool_calls,
+                            reasoning,
+                        } => (
+                            ChatRole::Assistant.to_string(),
+                            content,
+                            None, // tool_call_id
+                            tool_calls,
+                            reasoning,
+                        ),
+                        crate::session::DecodedNativeHistoryMessage::ToolResult {
+                            tool_call_id,
+                            content,
+                        } => (
+                            ChatRole::Tool.to_string(),
+                            Some(content),
+                            tool_call_id,
+                            None, // tool_calls
+                            None, // reasoning
+                        ),
+                    })
                 else {
                     return NativeMessage {
                         role: message.role.to_string(),
@@ -432,13 +458,13 @@ impl OpenAiCompatibleProvider {
                         reasoning_details: None,
                     };
                 };
-                let has_tool_calls = parts.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+                let has_tool_calls = tool_calls.as_ref().is_some_and(|c| !c.is_empty());
                 let (r_reasoning, r_content, r_details) =
                     reasoning_roundtrip::native_reasoning_triple_for_replay(
-                        parts.reasoning.as_ref(),
+                        reasoning.as_ref(),
                         has_tool_calls,
                     );
-                let tool_calls = parts.tool_calls.map(|tc| {
+                let tool_calls = tool_calls.map(|tc| {
                     tc.into_iter()
                         .map(|tc| ApiToolCall {
                             id: Some(tc.id),
@@ -458,16 +484,16 @@ impl OpenAiCompatibleProvider {
                 });
                 let has_reasoning =
                     r_content.is_some() || r_reasoning.is_some() || r_details.is_some();
-                let content = match (&parts.content, has_reasoning, has_tool_calls) {
+                let content = match (&content, has_reasoning, has_tool_calls) {
                     (Some(s), _, _) => Some(MessageContent::Text(s.clone())),
                     (None, true, true) => Some(MessageContent::Null),
                     (None, true, false) => Some(MessageContent::Text(String::new())),
                     (None, false, _) => None,
                 };
                 NativeMessage {
-                    role: parts.role,
+                    role,
                     content,
-                    tool_call_id: parts.tool_call_id,
+                    tool_call_id,
                     tool_calls,
                     reasoning: r_reasoning,
                     reasoning_content: r_content,
