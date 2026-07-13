@@ -137,7 +137,7 @@ static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 
 /// Returns a reference to the global singleton [`Embedder`] RwLock. Never panics.
 #[must_use]
-pub fn global_embedder() -> &'static RwLock<Option<Embedder>> {
+fn global_embedder() -> &'static RwLock<Option<Embedder>> {
     &GLOBAL_EMBEDDER
 }
 
