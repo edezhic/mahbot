@@ -2108,21 +2108,6 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// Returns `true` if the breaker tripped — the caller MUST abort dispatch.
 /// Returns `true` even on transition failure (the caller should still abort
 /// rather than dispatching an agent to a stale or unreachable ticket).
-/// Returns `false` only when the count does not exceed the variant's threshold.
-///
-/// This transitions the ticket to `Failed` (and drains ReadyForDevelopment
-/// siblings) when the breaker trips. The `try_trip` verb clearly communicates
-/// this side effect.
-///
-/// # Parameters
-///
-/// * `ticket` — the ticket being evaluated for the circuit breaker.
-/// * `source_phase` — the phase the ticket must currently be in for the transition
-///   to succeed (passed as the `source` parameter to the inner `comment_and_transition` call).
-/// * `kind` — identifies which circuit breaker variant to use. Determines
-///   threshold, failure-counting logic, and trip-comment format.
-/// * `log_label` — human-readable label used in log messages to identify the
-///   circuit breaker caller (e.g., `"Engineer"`, `"Sanitation"`, `"Diagnostics"`).
 #[must_use]
 async fn try_trip_circuit_breaker(
     ticket: &Ticket,
