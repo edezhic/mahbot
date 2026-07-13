@@ -153,7 +153,7 @@ impl HighlightClass {
 /// For Markdown, delegates to `parse_markdown_highlights` which uses
 /// the dual-grammar (block + inline) parsing approach.
 #[must_use]
-pub fn parse_file_highlights(
+pub(crate) fn parse_file_highlights(
     parser: &mut Parser,
     source: &str,
     lang: HighlightLanguage,
