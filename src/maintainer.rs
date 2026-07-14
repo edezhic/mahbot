@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::Role;
 use crate::Workspace;
+use crate::WorkspacePhase;
 use crate::agent::run_agent;
 use crate::board::TicketPhase;
 use crate::turso;
@@ -59,7 +60,7 @@ pub async fn run_maintainer_loop() {
             }
 
             // Only maintain workspaces whose discovery has completed.
-            if ws.status != "ready" {
+            if ws.status != WorkspacePhase::Ready {
                 info!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
                 continue;
             }
@@ -219,7 +220,7 @@ mod tests {
         Workspace {
             name: "test-ws".into(),
             path: "/tmp/test".into(),
-            status: "ready".into(),
+            status: WorkspacePhase::Ready,
             created_at: String::new(),
             updated_at: String::new(),
             maintenance_enabled: true,

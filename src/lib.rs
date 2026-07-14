@@ -107,12 +107,49 @@ impl DiagnosticsCommands {
 // Core type: Workspace
 // ---------------------------------------------------------------------------
 
+/// Lifecycle phase of a workspace.
+///
+/// Mirrors the `status` TEXT column in the workspaces database table.
+/// Conversion to/from strings happens at the DB boundary only.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Default, strum::Display, strum::AsRefStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum WorkspacePhase {
+    /// Workspace registered but discovery has not started.
+    #[default]
+    Pending,
+    /// Discovery agent is running.
+    Analyzing,
+    /// Discovery completed successfully — workspace is operational.
+    Ready,
+    /// Discovery failed — workspace cannot be used.
+    Failed,
+}
+
+impl std::str::FromStr for WorkspacePhase {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "analyzing" => Ok(Self::Analyzing),
+            "ready" => Ok(Self::Ready),
+            "failed" => Ok(Self::Failed),
+            other => Err(anyhow::anyhow!(
+                "Invalid workspace phase '{other}'. Valid phases: pending, analyzing, ready, failed"
+            )),
+        }
+    }
+}
+
 /// A persisted workspace entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct Workspace {
     pub name: String,
     pub path: String,
-    pub status: String,
+    pub status: WorkspacePhase,
     pub created_at: String,
     pub updated_at: String,
     /// Whether the maintainer agent is enabled for this workspace.
@@ -153,7 +190,7 @@ impl Default for Workspace {
         Self {
             name: String::default(),
             path: String::default(),
-            status: String::default(),
+            status: WorkspacePhase::Pending,
             created_at: String::default(),
             updated_at: String::default(),
             maintenance_enabled: bool::default(),

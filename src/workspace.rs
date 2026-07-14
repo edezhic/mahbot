@@ -5,6 +5,7 @@
 
 use crate::Role;
 use crate::Workspace;
+use crate::WorkspacePhase;
 use crate::agent::run_agent;
 use crate::session::discovery_session_key;
 use crate::turso::{self};
@@ -275,7 +276,7 @@ async fn finalize_discovery(
         );
     } else {
         let msg = errors.join("; ");
-        let _ = storage.set_status(ws_name, "failed").await;
+        let _ = storage.set_status(ws_name, &WorkspacePhase::Failed).await;
         tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
     }
 }
@@ -414,11 +415,13 @@ fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
-fn workspace_from_row(row: &turso::Row) -> Result<Workspace, ::turso::Error> {
+fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
     Ok(Workspace {
         name: row.get(COL_WS_NAME)?,
         path: row.get(COL_WS_PATH)?,
-        status: row.get(COL_WS_STATUS)?,
+        status: row
+            .get::<String>(COL_WS_STATUS)?
+            .parse::<WorkspacePhase>()?,
         created_at: row.get(COL_WS_CREATED_AT)?,
         updated_at: row.get(COL_WS_UPDATED_AT)?,
         maintenance_enabled: row.get::<bool>(COL_WS_MAINTENANCE_ENABLED)?,
@@ -462,7 +465,7 @@ impl WorkspaceStore {
         let ws = Workspace {
             name: name.to_string(),
             path: path.clone(),
-            status: "pending".to_string(),
+            status: WorkspacePhase::Pending,
             created_at: now.clone(),
             updated_at: now.clone(),
             maintenance_enabled: false,
@@ -472,7 +475,7 @@ impl WorkspaceStore {
             diagnostics: None,
             diagnostics_updated_at: None,
         };
-        let _ = self.set_status(name, "analyzing").await;
+        let _ = self.set_status(name, &WorkspacePhase::Analyzing).await;
         // New workspace: discovery_generation defaults to 0 in the schema.
         // Generation 0 means "the first discovery" — if rediscover() bumps
         // the generation before this task finishes, the task's context/
@@ -542,12 +545,12 @@ impl WorkspaceStore {
     }
 
     /// Update the status of a workspace.
-    pub async fn set_status(&self, name: &str, status: &str) -> Result<()> {
+    pub async fn set_status(&self, name: &str, status: &WorkspacePhase) -> Result<()> {
         let now = turso::now();
         self.conn
             .execute(
                 "UPDATE workspaces SET status = ?1, updated_at = ?2 WHERE name = ?3",
-                turso::params![status, now.clone(), name],
+                turso::params![status.to_string(), now.clone(), name],
             )
             .await?;
         Ok(())
@@ -912,7 +915,7 @@ mod tests {
         Workspace {
             name: name.to_string(),
             path: path.to_string(),
-            status: "pending".to_string(),
+            status: WorkspacePhase::Pending,
             created_at: now.clone(),
             updated_at: now.clone(),
             maintenance_enabled,
@@ -1074,7 +1077,7 @@ mod tests {
                 !ws.paused,
                 "Should auto-unpause after discovery OK (gen {generation})"
             );
-            assert_eq!(ws.status, "ready", "Status should be 'ready'");
+            assert_eq!(ws.status, WorkspacePhase::Ready, "Status should be 'ready'");
         }
     }
 
@@ -1093,7 +1096,11 @@ mod tests {
             .expect("fetch")
             .expect("exists");
         assert!(ws.paused, "Should remain paused after discovery failure");
-        assert_eq!(ws.status, "failed", "Status should be 'failed'");
+        assert_eq!(
+            ws.status,
+            WorkspacePhase::Failed,
+            "Status should be 'failed'"
+        );
     }
 
     #[tokio::test]
@@ -1129,7 +1136,8 @@ mod tests {
             "Should stay paused — writes skipped by generation guard"
         );
         assert_eq!(
-            ws.status, "pending",
+            ws.status,
+            WorkspacePhase::Pending,
             "Status should remain unchanged — writes skipped"
         );
     }
@@ -1148,7 +1156,10 @@ mod tests {
             0,
         )
         .await;
-        store.set_status("rediscover_test", "ready").await.unwrap();
+        store
+            .set_status("rediscover_test", &WorkspacePhase::Ready)
+            .await
+            .unwrap();
 
         let ws = store
             .get_by_name("rediscover_test")
@@ -1156,7 +1167,11 @@ mod tests {
             .expect("fetch")
             .expect("exists");
         assert!(!ws.paused, "Precondition: workspace should start unpaused");
-        assert_eq!(ws.status, "ready", "Precondition: status should be 'ready'");
+        assert_eq!(
+            ws.status,
+            WorkspacePhase::Ready,
+            "Precondition: status should be 'ready'"
+        );
 
         // Act: rediscover.
         store

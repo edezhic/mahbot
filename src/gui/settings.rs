@@ -711,7 +711,7 @@ impl SettingsState {
             );
         } else {
             for (row_index, ws_item) in ws.workspaces.iter().enumerate() {
-                let (status_color, status_bg) = theme::workspace_status_color(&ws_item.status);
+                let (status_color, status_bg) = theme::workspace_status_color(ws_item.status);
                 let maintainer_on = ws_item.maintenance_enabled;
 
                 let delete_btn = delete_confirm_button(
@@ -735,16 +735,20 @@ impl SettingsState {
                                 .align_y(Alignment::Center),
                             // Status column (FillPortion: 10)
                             container(
-                                container(text(&ws_item.status).size(11).color(status_color))
-                                    .padding([2, 8])
-                                    .style(move |_theme: &iced::Theme| container::Style {
+                                container(
+                                    text(ws_item.status.as_ref()).size(11).color(status_color)
+                                )
+                                .padding([2, 8])
+                                .style(
+                                    move |_theme: &iced::Theme| container::Style {
                                         background: Some(iced::Background::Color(status_bg)),
                                         border: iced::Border {
                                             radius: 4.0.into(),
                                             ..iced::Border::default()
                                         },
                                         ..container::Style::default()
-                                    }),
+                                    }
+                                ),
                             )
                             .width(Length::FillPortion(10))
                             .align_x(Alignment::Start)

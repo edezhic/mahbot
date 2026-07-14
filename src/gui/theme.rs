@@ -6,6 +6,7 @@ use iced::Color;
 use iced::border;
 use iced::widget::{container, scrollable};
 
+use crate::WorkspacePhase;
 use crate::board::TicketPhase;
 
 use iced_fonts::lucide;
@@ -285,21 +286,21 @@ pub fn format_timestamp(ts: &str) -> String {
 // ── Workspace status colors ───────────────────────────────────────
 
 #[must_use]
-pub fn workspace_status_color(status: &str) -> (Color, Color) {
+pub fn workspace_status_color(status: WorkspacePhase) -> (Color, Color) {
     match status {
-        "ready" => (
+        WorkspacePhase::Ready => (
             Color::from_rgb(0.133, 0.773, 0.369),
             Color::from_rgba(0.133, 0.773, 0.369, 0.1),
         ),
-        "analyzing" => (
+        WorkspacePhase::Analyzing => (
             Color::from_rgb(0.851, 0.557, 0.0),
             Color::from_rgba(0.851, 0.557, 0.0, 0.1),
         ),
-        "failed" => (
+        WorkspacePhase::Failed => (
             Color::from_rgb(0.957, 0.247, 0.369),
             Color::from_rgba(0.957, 0.247, 0.369, 0.1),
         ),
-        _ => (
+        WorkspacePhase::Pending => (
             Color::from_rgb(0.631, 0.631, 0.631),
             Color::from_rgba(0.631, 0.631, 0.631, 0.1),
         ),
