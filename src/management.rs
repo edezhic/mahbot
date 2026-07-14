@@ -216,21 +216,23 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// Checks whether the ticket is still in the expected phase AND clears
-/// `assigned_to` if it moved externally.
+/// Checks whether the ticket is still in the expected phase and, if it has
+/// moved externally, clears `assigned_to` to allow re-dispatch on the next
+/// poll cycle.
 ///
-/// This is a **guarded check with a side effect**: unlike [`is_ticket_in_phase`]
-/// (which is read-only), this function also clears the `assigned_to` field
-/// when the ticket has left the expected phase. The clearance enables
-/// re-dispatch on the next poll cycle — without it, the stale `assigned_to`
-/// would prevent any agent from picking up the ticket.
+/// Returns `true` when the ticket is still in the expected phase (no action
+/// taken). Returns `false` when the phase changed — in that case `assigned_to`
+/// is cleared and the caller should abort its current work on this ticket.
 ///
-/// The side effect is intentional: all call sites that use this function
-/// (see [`dispatch_engineer`], [`dispatch_sanitation`], [`dispatch_diagnostics`])
-/// have previously set `assigned_to` via [`claim_ticket_in_workspace`]
-/// or [`claim_diagnostics`], so it must be cleared to allow re-dispatch.
+/// All call sites ([`dispatch_engineer`], [`dispatch_sanitation`],
+/// [`dispatch_diagnostics`]) have previously set `assigned_to` via
+/// [`claim_ticket_in_workspace`] or [`claim_diagnostics`], so clearing it
+/// here is essential to prevent a stale assignment from blocking re-dispatch.
 #[must_use]
-async fn abort_if_phase_changed(ticket_id: &str, expected: TicketPhase) -> bool {
+async fn abort_if_phase_changed_and_clear_assignment(
+    ticket_id: &str,
+    expected: TicketPhase,
+) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
         let label = format!("ticket left {expected:?}");
         clear_assigned_to(ticket_id, &label).await;
@@ -563,7 +565,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // PollPhase::info() which now also carries the circuit_breaker_kind
         // and log_label fields (enforced by the single match in info()).
         //
-        // The post-agent abort_if_phase_changed check in each dispatch function is
+        // The post-agent abort_if_phase_changed_and_clear_assignment check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         if !is_ticket_in_phase(&ticket.id, expected_phase).await {
             return;
@@ -991,7 +993,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         run_agent(session_key, Role::Engineer, &ws, Some(&ticket), &message).await;
 
     // Post-run check still needed for race conditions during agent execution.
-    if !abort_if_phase_changed(&ticket.id, TicketPhase::InDevelopment).await {
+    if !abort_if_phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
         return;
     }
 
@@ -1434,7 +1436,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         run_agent(session_key, Role::Sanitation, &ws, Some(&ticket), &prompt).await;
 
     // Post-run phase check — bail if ticket was moved externally.
-    if !abort_if_phase_changed(&ticket.id, TicketPhase::InSanitation).await {
+    if !abort_if_phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
         return;
     }
 
@@ -1672,48 +1674,52 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Separate the decision (target phase + comment body) from the action
     // (single transition call), matching the dispatch_engineer precedent.
-    let (target_phase, comment_body): (TicketPhase, String) =
-        match crate::workspace::store().get_diagnostics(&ws.name).await {
-            Ok(Some(cmds)) if !cmds.is_empty() => {
-                // Run commands sequentially in the prescribed order.
-                let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
+    let (target_phase, comment_body): (TicketPhase, String) = match crate::workspace::store()
+        .get_diagnostics(&ws.name)
+        .await
+    {
+        Ok(Some(cmds)) if !cmds.is_empty() => {
+            // Run commands sequentially in the prescribed order.
+            let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
 
-                // Post-run check: verify ticket hasn't been moved externally while
-                // diagnostics commands ran.
-                if !abort_if_phase_changed(&ticket.id, TicketPhase::InDiagnostics).await {
-                    return;
-                }
-
-                if all_passed {
-                    // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                    (TicketPhase::DiagnosticsDone, comment)
-                } else {
-                    // Path C2: Diagnostics failed — bounce back to development.
-                    (TicketPhase::ReadyForDevelopment, comment)
-                }
+            // Post-run check: verify ticket hasn't been moved externally while
+            // diagnostics commands ran.
+            if !abort_if_phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDiagnostics)
+                .await
+            {
+                return;
             }
-            Ok(_) => {
-                // Path B: No diagnostics commands configured (or empty list) — skip.
-                (
-                    TicketPhase::DiagnosticsDone,
-                    "No diagnostics commands are configured for this workspace \
+
+            if all_passed {
+                // Path C1: All diagnostics passed — transition to DiagnosticsDone.
+                (TicketPhase::DiagnosticsDone, comment)
+            } else {
+                // Path C2: Diagnostics failed — bounce back to development.
+                (TicketPhase::ReadyForDevelopment, comment)
+            }
+        }
+        Ok(_) => {
+            // Path B: No diagnostics commands configured (or empty list) — skip.
+            (
+                TicketPhase::DiagnosticsDone,
+                "No diagnostics commands are configured for this workspace \
                      — diagnostics skipped."
-                        .to_string(),
-                )
-            }
-            Err(e) => {
-                // Path A: DB error loading diagnostics — log and skip.
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
-                );
-                (
-                    TicketPhase::DiagnosticsDone,
-                    format!("Could not load diagnostics commands due to a database error: {e}"),
-                )
-            }
-        };
+                    .to_string(),
+            )
+        }
+        Err(e) => {
+            // Path A: DB error loading diagnostics — log and skip.
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
+            );
+            (
+                TicketPhase::DiagnosticsDone,
+                format!("Could not load diagnostics commands due to a database error: {e}"),
+            )
+        }
+    };
 
     if !comment_and_transition(
         TransitionCtx {
