@@ -522,6 +522,11 @@ pub async fn run_management() {
 /// This is a plain `fn` (not `async`) because both `info!()` and
 /// `tokio::spawn()` are synchronous operations — no `.await` needed.
 ///
+/// When the circuit breaker trips for a ticket, all sibling
+/// [`TicketPhase::ReadyForDevelopment`] tickets in the same workspace are
+/// drained to [`TicketPhase::Planning`] so the Manager can triage the failure
+/// without new tickets auto-starting.
+///
 /// # Panic safety
 ///
 /// The dispatch runs inside a single [`tokio::spawn`] and uses
