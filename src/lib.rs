@@ -596,9 +596,36 @@ pub trait Tool: Send + Sync {
 
     /// Whether this tool's output should be scrubbed for credentials.
     ///
-    /// The default implementation returns `true` (scrub everything). Override for
-    /// tools that produce output where credential patterns are harmless or expected
-    /// (e.g. source code reads), so the model sees accurate content.
+    /// The call chain is (see `scrub_tool_output` in `tools/mod.rs`):
+    ///
+    /// ```text
+    /// agent::execute_tool
+    ///   └─ scrub_tool_output(tool, args, output)
+    ///        └─ tool.should_scrub_output(args)
+    ///             └─ (if true) scrub_credentials(output)
+    ///             └─ (if false) output as-is
+    /// ```
+    ///
+    /// There are three distinct policy patterns across the codebase:
+    ///
+    /// 1. **Scrub-all** (trait default: `true`) — web_search, browser, edit,
+    ///    ask, ticket, media-gen tools, and most others. The raw output may
+    ///    contain credentials, so it is always scrubbed before the LLM sees it.
+    ///
+    /// 2. **Skip scrubbing entirely** (`false`) — shell and search tools.
+    ///    - The shell tool's internal `apply_profile_pipeline` already scrubs
+    ///      stdout and stderr once at pipeline entry; returning `false` avoids
+    ///      double-scrubbing. Implementers of tools that scrub internally **must**
+    ///      return `false` from this method to prevent redundant scrubbing.
+    ///    - The search tool returns source code content where credential patterns
+    ///      are harmless and should be shown accurately to the model.
+    ///
+    /// 3. **Context-sensitive** — read tool. Scrubs only when the file path
+    ///    matches `is_sensitive_file_path` (config, credential, or key files).
+    ///    Non-sensitive files (regular source code) are returned as-is.
+    ///
+    /// **If your tool performs internal credential scrubbing**, override this
+    /// method to return `false` so the agent-level pass does not double-scrub.
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
         true
     }

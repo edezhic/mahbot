@@ -145,6 +145,23 @@ fn tool_params_schema(properties: &serde_json::Value, required: &[&str]) -> serd
 use crate::util::scrub_credentials;
 
 /// Scrub credentials from tool output; delegates the scrubbing policy to the tool.
+///
+/// Call flow:
+///
+/// ```text
+/// agent::execute_tool                           (agent.rs:455)
+///   └─ scrub_tool_output(tool, args, output)     (tools/mod.rs)
+///        ├─ tool.should_scrub_output(args)        (lib.rs, per-tool override)
+///        │    ├─ returns true  → scrub_credentials(output)  (util/mod.rs)
+///        │    └─ returns false → output as-is
+/// ```
+///
+/// Integration with shell tool's internal scrubbing:
+/// The shell tool's `apply_profile_pipeline` (shell/mod.rs) scrubs stdout and stderr
+/// at pipeline entry, so `ShellTool::should_scrub_output` returns `false` to prevent
+/// this function from double-scrubbing. See the `ShellTool::should_scrub_output` doc
+/// comment for the rationale. Any tool that performs its own credential scrubbing
+/// internally must follow the same pattern — return `false` from `should_scrub_output`.
 #[must_use]
 pub(crate) fn scrub_tool_output(
     tool: &dyn Tool,
