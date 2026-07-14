@@ -55,9 +55,7 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
 ///    (quota exhaustion is permanent, not transient).
 /// 2. **4xx status codes** (except 408 Request Timeout and 429 Too Many Requests)
 ///    — structured [`HttpError`] downcast.
-/// 3. **Model-not-found composite pattern** — "model" combined with
-///    "not found"/"unknown"/"unsupported"/"does not exist".
-/// 4. Default to [`Retryable`](ErrorClass::Retryable).
+/// 3. Default to [`Retryable`](ErrorClass::Retryable).
 fn classify_err(err: &anyhow::Error) -> ErrorClass {
     // ── Typed path: use structured fields from HttpError directly ──
     if let Some(http_err) = err.downcast_ref::<HttpError>() {
@@ -76,17 +74,6 @@ fn classify_err(err: &anyhow::Error) -> ErrorClass {
             return ErrorClass::NonRetryable;
         }
         return ErrorClass::Retryable;
-    }
-
-    // String fallback (for non-HttpError errors)
-    let lower = err.to_string().to_lowercase();
-    if lower.contains("model")
-        && (lower.contains("not found")
-            || lower.contains("unknown")
-            || lower.contains("unsupported")
-            || lower.contains("does not exist"))
-    {
-        return ErrorClass::NonRetryable;
     }
     ErrorClass::Retryable
 }
@@ -367,15 +354,12 @@ mod tests {
         assert!(is_non_retryable(&test_err(401, "Unauthorized")));
         assert!(is_non_retryable(&test_err(403, "Forbidden")));
         assert!(is_non_retryable(&test_err(400, "invalid api key")));
-        // Non-retryable via model-not-found composite check
-        assert!(is_non_retryable(&anyhow::anyhow!("model not found")));
-        assert!(is_non_retryable(&anyhow::anyhow!("model 'xyz' is unknown")));
         // Non-retryable via billing/quota hints (override 429)
         assert!(is_non_retryable(&test_err(429, "insufficient balance")));
         assert!(is_non_retryable(&test_err(429, "insufficient_quota")));
         assert!(is_non_retryable(&test_err(429, "quota exhausted")));
         assert!(is_non_retryable(&test_err(429, "error code 1113")));
-        // Retryable — no HttpError, no hint match, no model-not-found
+        // Retryable — no HttpError, no hint match
         assert!(!is_non_retryable(&anyhow::anyhow!("500 Server Error")));
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
         assert!(!is_non_retryable(&anyhow::anyhow!(
@@ -450,8 +434,8 @@ mod tests {
     fn classify_err_typed_path() {
         // ── HttpError typed path for classify_err ──
 
-        // 429 transient rate limit → retryable (falls through to
-        // model-not-found check, which returns Retryable for non-billing bodies)
+        // 429 transient rate limit → retryable (no billing/quota hint match,
+        // so falls through to return ErrorClass::Retryable)
         assert!(matches!(
             classify_err(&test_err(429, "Too Many Requests")),
             ErrorClass::Retryable
@@ -478,8 +462,8 @@ mod tests {
         );
 
         // Regression: 5xx HttpError with "model not found" in body → Retryable
-        // (the typed path exits early for non-4xx, non-429 responses, preventing
-        // the string fallback's model-not-found composite check from firing)
+        // (the typed path returns Retryable for non-4xx, non-429 responses
+        // regardless of body content)
         assert_eq!(
             classify_err(&test_err(502, "upstream model not found")),
             ErrorClass::Retryable

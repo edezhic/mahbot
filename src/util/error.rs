@@ -18,7 +18,7 @@ use std::time::Duration;
 /// via `err.downcast_ref::<HttpError>()`.
 ///
 /// Errors from third-party code or non-HTTP sources arrive without this
-/// wrapper and fall back to the existing string-parsing path unchanged.
+/// wrapper and are classified as retryable by default.
 #[derive(Debug)]
 pub struct HttpError {
     /// The HTTP status code (e.g., 429, 400, 500).
