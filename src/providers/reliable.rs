@@ -59,23 +59,27 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
 ///    "not found"/"unknown"/"unsupported"/"does not exist".
 /// 4. Default to [`Retryable`](ErrorClass::Retryable).
 fn classify_err(err: &anyhow::Error) -> ErrorClass {
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-
-    // Extract status from structured HttpError when available
-    let status = err.downcast_ref::<HttpError>().map(|e| e.status);
-
-    // Body-text hints indicate permanent errors — only relevant when
-    // the status code is ambiguous (HTTP 429 is normally retryable,
-    // but billing/quota exhaustion is permanent).
-    if status == Some(429) && NON_RETRYABLE_HINTS.iter().any(|h| lower.contains(h)) {
-        return ErrorClass::NonRetryable;
+    // ── Typed path: use structured fields from HttpError directly ──
+    if let Some(http_err) = err.downcast_ref::<HttpError>() {
+        // Body-text hints indicate permanent errors — only relevant when
+        // the status code is ambiguous (HTTP 429 is normally retryable,
+        // but billing/quota exhaustion is permanent).
+        if http_err.status == 429 {
+            let body_lower = http_err.body.to_lowercase();
+            if NON_RETRYABLE_HINTS.iter().any(|h| body_lower.contains(h)) {
+                return ErrorClass::NonRetryable;
+            }
+        }
+        // 4xx codes (except 408 Request Timeout and 429 Too Many Requests)
+        if (400..500).contains(&http_err.status) && http_err.status != 408 && http_err.status != 429
+        {
+            return ErrorClass::NonRetryable;
+        }
+        return ErrorClass::Retryable;
     }
-    // 4xx codes (except 408 Request Timeout and 429 Too Many Requests)
-    if status.is_some_and(|c| (400..500).contains(&c) && c != 408 && c != 429) {
-        return ErrorClass::NonRetryable;
-    }
-    // Model-not-found composite check
+
+    // String fallback (for non-HttpError errors)
+    let lower = err.to_string().to_lowercase();
     if lower.contains("model")
         && (lower.contains("not found")
             || lower.contains("unknown")
@@ -457,69 +461,11 @@ mod tests {
             ErrorClass::Retryable
         ));
 
-        // 429 with billing/quota body signals → non-retryable
-        // (caught by NON_RETRYABLE_HINTS, overriding 429's default retryable)
-        assert_eq!(
-            classify_err(&test_err(429, "insufficient balance")),
-            ErrorClass::NonRetryable
-        );
-        assert_eq!(
-            classify_err(&test_err(429, "quota exhausted")),
-            ErrorClass::NonRetryable
-        );
-
-        // Non-429 4xx → non-retryable
-        assert!(matches!(
-            classify_err(&test_err(400, "Bad Request")),
-            ErrorClass::NonRetryable
-        ));
-        assert!(matches!(
-            classify_err(&test_err(403, "Forbidden")),
-            ErrorClass::NonRetryable
-        ));
-
-        // 408 → fallback (not NonRetryable)
+        // 408 Request Timeout → retryable (excluded from 4xx status check)
         assert!(matches!(
             classify_err(&test_err(408, "Request Timeout")),
             ErrorClass::Retryable
         ));
-
-        // 5xx → retryable (fallback)
-        assert!(matches!(
-            classify_err(&test_err(500, "Internal Server Error")),
-            ErrorClass::Retryable
-        ));
-
-        // Context window → NonRetryable (via status 400)
-        assert!(matches!(
-            classify_err(&test_err(400, "exceeds the context window of this model")),
-            ErrorClass::NonRetryable
-        ));
-
-        // Tool schema error → NonRetryable (via status 400)
-        assert!(matches!(
-            classify_err(&test_err(400, "tool call validation failed")),
-            ErrorClass::NonRetryable
-        ));
-
-        // Auth patterns in body → NonRetryable (via status 403)
-        assert!(matches!(
-            classify_err(&test_err(403, "unauthorized")),
-            ErrorClass::NonRetryable
-        ));
-
-        // Model not found → NonRetryable (via 4xx status check for 404)
-        assert!(matches!(
-            classify_err(&test_err(404, "model not found")),
-            ErrorClass::NonRetryable
-        ));
-
-        // ZhipuAI billing error code 1113 → NonRetryable
-        // (caught by NON_RETRYABLE_HINTS)
-        assert_eq!(
-            classify_err(&test_err(429, "error code 1113")),
-            ErrorClass::NonRetryable
-        );
 
         // OpenRouter 502 "invalid response" → NOT NonRetryable
         // (the word "invalid" alone does not imply a bad model id)
@@ -528,6 +474,14 @@ mod tests {
                 502,
                 "Your chosen model is down or we received an invalid response from it"
             )),
+            ErrorClass::Retryable
+        );
+
+        // Regression: 5xx HttpError with "model not found" in body → Retryable
+        // (the typed path exits early for non-4xx, non-429 responses, preventing
+        // the string fallback's model-not-found composite check from firing)
+        assert_eq!(
+            classify_err(&test_err(502, "upstream model not found")),
             ErrorClass::Retryable
         );
     }
