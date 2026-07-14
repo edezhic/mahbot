@@ -65,8 +65,10 @@ fn classify_err(err: &anyhow::Error) -> ErrorClass {
     // Extract status from structured HttpError when available
     let status = err.downcast_ref::<HttpError>().map(|e| e.status);
 
-    // Body-text hints indicate permanent errors regardless of status code
-    if NON_RETRYABLE_HINTS.iter().any(|h| lower.contains(h)) {
+    // Body-text hints indicate permanent errors — only relevant when
+    // the status code is ambiguous (HTTP 429 is normally retryable,
+    // but billing/quota exhaustion is permanent).
+    if status == Some(429) && NON_RETRYABLE_HINTS.iter().any(|h| lower.contains(h)) {
         return ErrorClass::NonRetryable;
     }
     // 4xx codes (except 408 Request Timeout and 429 Too Many Requests)
@@ -365,10 +367,10 @@ mod tests {
         assert!(is_non_retryable(&anyhow::anyhow!("model not found")));
         assert!(is_non_retryable(&anyhow::anyhow!("model 'xyz' is unknown")));
         // Non-retryable via billing/quota hints (override 429)
-        assert!(is_non_retryable(&anyhow::anyhow!("insufficient balance")));
-        assert!(is_non_retryable(&anyhow::anyhow!("insufficient_quota")));
-        assert!(is_non_retryable(&anyhow::anyhow!("quota exhausted")));
-        assert!(is_non_retryable(&anyhow::anyhow!("error code 1113")));
+        assert!(is_non_retryable(&test_err(429, "insufficient balance")));
+        assert!(is_non_retryable(&test_err(429, "insufficient_quota")));
+        assert!(is_non_retryable(&test_err(429, "quota exhausted")));
+        assert!(is_non_retryable(&test_err(429, "error code 1113")));
         // Retryable — no HttpError, no hint match, no model-not-found
         assert!(!is_non_retryable(&anyhow::anyhow!("500 Server Error")));
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
@@ -656,10 +658,25 @@ mod tests {
     #[test]
     fn non_retryable_hints_are_classified_non_retryable() {
         for hint in NON_RETRYABLE_HINTS {
-            let err = anyhow::anyhow!("some error: {hint}");
+            let err = test_err(429, hint);
             assert!(
                 matches!(classify_err(&err), ErrorClass::NonRetryable),
                 "hint '{hint}' should be classified as NonRetryable"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_5xx_with_hint_text_is_retryable() {
+        // Regression: 5xx responses from proxy providers (e.g. OpenRouter
+        // forwarding an upstream error) may contain billing/quota language
+        // in the body. These must remain Retryable — the issue is a
+        // transient upstream failure, not account exhaustion.
+        for hint in NON_RETRYABLE_HINTS {
+            let err = test_err(502, &format!("upstream error: {hint}"));
+            assert!(
+                matches!(classify_err(&err), ErrorClass::Retryable),
+                "502 with hint '{hint}' should remain Retryable"
             );
         }
     }
