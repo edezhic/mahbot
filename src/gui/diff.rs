@@ -145,7 +145,7 @@ pub enum DiffMessage {
 /// A single changed file, enhanced with highlight data and line counts.
 #[derive(Debug, Clone)]
 pub struct DiffFile {
-    pub dfile: crate::diff_parse::DiffFile,
+    dfile: crate::diff_parse::DiffFile,
     /// Per-line highlight spans for removed lines (from old version).
     pub old_highlights: Option<FileHighlights>,
     /// Per-line highlight spans for added/context lines (from new version).
@@ -161,12 +161,6 @@ impl std::ops::Deref for DiffFile {
 
     fn deref(&self) -> &Self::Target {
         &self.dfile
-    }
-}
-
-impl std::ops::DerefMut for DiffFile {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.dfile
     }
 }
 
@@ -2179,15 +2173,33 @@ mod tests {
     }
 
     fn make_binary_file(path: &str) -> DiffFile {
-        let mut file = make_test_file(path, 0, 0);
-        file.is_binary = true;
-        file
+        DiffFile::from_parsed(
+            crate::diff_parse::DiffFile {
+                path: path.to_string(),
+                old_path: None,
+                hunks: Vec::new(),
+                status: crate::diff_parse::DiffFileStatus::Modified,
+                is_binary: true,
+                too_large_size: None,
+            },
+            None,
+            None,
+        )
     }
 
     fn make_too_large_file(path: &str) -> DiffFile {
-        let mut file = make_test_file(path, 0, 0);
-        file.too_large_size = Some(5_000_000);
-        file
+        DiffFile::from_parsed(
+            crate::diff_parse::DiffFile {
+                path: path.to_string(),
+                old_path: None,
+                hunks: Vec::new(),
+                status: crate::diff_parse::DiffFileStatus::Modified,
+                is_binary: false,
+                too_large_size: Some(5_000_000),
+            },
+            None,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_lines)]

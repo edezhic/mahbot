@@ -815,16 +815,36 @@ mod tests {
 
     #[test]
     fn test_binary_file_skipped() {
-        let mut file = make_test_diff_file("binary.bin", vec![], DiffFileStatus::Modified);
-        file.is_binary = true;
+        let file = super::super::diff::DiffFile::from_parsed(
+            crate::diff_parse::DiffFile {
+                path: "binary.bin".to_string(),
+                old_path: None,
+                hunks: Vec::new(),
+                status: DiffFileStatus::Modified,
+                is_binary: true,
+                too_large_size: None,
+            },
+            None,
+            None,
+        );
         let buffers = build_file_buffers(&[file], None, None);
         assert!(buffers.is_empty());
     }
 
     #[test]
     fn test_too_large_file_skipped() {
-        let mut file = make_test_diff_file("large.bin", vec![], DiffFileStatus::Modified);
-        file.too_large_size = Some(5_000_000);
+        let file = super::super::diff::DiffFile::from_parsed(
+            crate::diff_parse::DiffFile {
+                path: "large.bin".to_string(),
+                old_path: None,
+                hunks: Vec::new(),
+                status: DiffFileStatus::Modified,
+                is_binary: false,
+                too_large_size: Some(5_000_000),
+            },
+            None,
+            None,
+        );
         let buffers = build_file_buffers(&[file], None, None);
         assert!(buffers.is_empty());
     }
