@@ -237,17 +237,14 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
             remap_arg_key(obj, "id", "ticket_id");
             remap_arg_key(obj, "ticket", "ticket_id");
         }
-        "read" => {
+        "read" | "edit" => {
             for &alias in PATH_ALIAS_KEYS {
                 remap_arg_key(obj, alias, "path");
             }
-        }
-        "edit" => {
-            for &alias in PATH_ALIAS_KEYS {
-                remap_arg_key(obj, alias, "path");
+            if name == "edit" {
+                remap_arg_key(obj, "old_str", "old_string");
+                remap_arg_key(obj, "new_str", "new_string");
             }
-            remap_arg_key(obj, "old_str", "old_string");
-            remap_arg_key(obj, "new_str", "new_string");
         }
         _ => {}
     }
