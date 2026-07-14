@@ -1,3 +1,89 @@
+//! Configuration system with three independent resolution chains.
+//!
+//! # Architecture overview
+//!
+//! The config system has a two-tier design: hardcoded defaults in this module
+//! provide the base values, and the [`ConfigReload`] singleton is then overlayed
+//! with persisted values from the `config.db` Turso database (via
+//! [`crate::config_db`]).
+//!
+//! At startup, [`load_or_init`] seeds `ConfigData::STRUCT_FIELDS_DEFAULT` into the
+//! global [`CONFIG`]. Then [`reload_from_db`] overlays persisted values from the
+//! three database tables on top of those defaults.
+//!
+//! # Resolution chains
+//!
+//! The configuration system has three independent resolution chains. They are
+//! **independent** — a KV entry in Chain 1 cannot override a per-role model in
+//! Chain 2, and a per-role entry in Chain 2 cannot override a per-model routing
+//! in Chain 3. Each chain applies to different fields.
+//!
+//! ## Chain 1: KV-overridable string fields
+//!
+//! `config_kv` table → hardcoded default (`const` in this module)
+//!
+//! The 14 fields listed in the `string_config_fields!` invocation
+//! belong to this chain. Their accessor methods (generated on [`ConfigReload`])
+//! each follow a per-field annotation:
+//!
+//! * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
+//! * `or(DEFAULT)` — returns `String`, falls back to a compile-time constant
+//!   (e.g. `DEFAULT_PROVIDER_ENDPOINT`).
+//! * `list_or(fallback = …, default = …)` — returns `Vec<String>`, parses a
+//!   newline-separated list, falling back to a singular field then to a hardcoded
+//!   default.
+//!
+//! At reload time [`reload_from_db`] loads key–value pairs from the `config_kv`
+//! table (via [`crate::config_db::ConfigStore::get_all_kv`]) and applies them
+//! through [`ConfigData::set_string_field`]. Any key absent from the table
+//! remains `None`, and the accessor resolves the hardcoded fallback.
+//!
+//! Fields **not** in this chain (e.g. `per_role_configs`, `model_routings`) have
+//! their own dedicated tables and reload paths.
+//!
+//! ## Chain 2: Per-role model and reasoning effort
+//!
+//! `config_role` table → [`crate::role::RoleInfo::default_model`] / [`crate::role::RoleInfo::default_reasoning_effort`]
+//!
+//! Stored in [`ConfigData::per_role_configs`] as a [`Vec<RoleConfig>`][RoleConfig],
+//! loaded at reload time from the `config_role` table. Checked at request time by
+//! [`ConfigReload::role_model`] and [`ConfigReload::role_reasoning_effort`] with
+//! the priority:
+//!
+//! > Per-role override → [`role_info`]`(role).default_*`
+//!
+//! When no matching [`RoleConfig`] entry exists, the role's built-in default from
+//! [`role_info`] (defined in [`crate::role`]) is returned.
+//!
+//! ## Chain 3: Per-model provider routing
+//!
+//! `config_model_routing` table → `None` defaults
+//!
+//! Stored in [`ConfigData::model_routings`] as a [`Vec<ModelRouting>`][ModelRouting],
+//! loaded at reload time from the `config_model_routing` table. Checked via
+//! [`ConfigReload::model_routing`]. When no entry exists, all fields on the
+//! returned [`ModelRouting`] — `provider_order` and `allow_fallbacks` — are `None`.
+//! The provider layer (in [`crate::providers`]) resolves these `None` values at
+//! request time (see `build_http_request` in
+//! [`crate::providers::compatible`]).
+//!
+//! # Persistence layer
+//!
+//! The three tables live in `config.db` and are managed by [`crate::config_db`]:
+//!
+//! | Table | Read | Write |
+//! |---|---|---|
+//! | `config_kv` | [`crate::config_db::ConfigStore::get_all_kv`] | [`crate::config_db::ConfigStore::set_kv`] |
+//! | `config_role` | [`crate::config_db::ConfigStore::get_all_role_configs`] | [`crate::config_db::ConfigStore::save_role_and_routing_configs`] |
+//! | `config_model_routing` | [`crate::config_db::ConfigStore::get_all_model_routings`] | [`crate::config_db::ConfigStore::save_role_and_routing_configs`] |
+//!
+//! # See also
+//!
+//! * [`crate::config_db`] — database persistence for all three chains.
+//! * [`crate::role`] — [`crate::role::RoleInfo`] definitions with per-role defaults.
+//! * `build_http_request` in [`crate::providers::compatible`] — where `None` routing
+//!   fields are resolved at the provider layer.
+
 use crate::Role;
 use crate::config_db::ConfigStore;
 use crate::role::role_info;
