@@ -1107,38 +1107,24 @@ async fn transition_ticket_to_done_if_git_unavailable(
     false
 }
 
-/// Auto-commit changes and move the ticket to Done.
+/// Finalize a ticket given an already-obtained `git status --porcelain` output.
 ///
-/// Parameterized by source phase so both the QaPassed→Done and
-/// SanitationPassed→Done flows share the same implementation.
+/// Callers **must** have already verified git availability via
+/// [`transition_ticket_to_done_if_git_unavailable`] and obtained a porcelain
+/// string via [`run_git_status`] before calling this function.
 ///
-/// Always checks git availability via [`transition_ticket_to_done_if_git_unavailable`],
-/// then runs `git status --porcelain` to determine whether the working tree is dirty.
-/// - **Clean tree:** skips commit, transitions directly to Done with notification.
-/// - **Dirty tree:** runs `git commit -m "<ticket title>"` via [`crate::git_commands::run_git_commit`].
-/// - **Commit failure:** ticket stays in `source`, poller retries next cycle.
-/// - **Git unavailable:** delegated to [`transition_ticket_to_done_if_git_unavailable`].
-async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
+/// - **Clean tree** (empty porcelain): transitions directly to Done.
+/// - **Dirty tree**: commits the changes via [`crate::git_commands::run_git_commit`].
+/// - **Commit failure**: ticket stays in `source` phase; the poller retries.
+async fn finalize_ticket_with_status(
+    ticket: Ticket,
+    ws: Workspace,
+    source: TicketPhase,
+    porcelain: &str,
+) {
     let repo_path = ws.as_path();
-    let phase_label = source.as_ref();
 
-    if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
-        return;
-    }
-
-    let has_changes = match crate::git_commands::run_git_status(repo_path).await {
-        Ok(output) => !output.trim().is_empty(),
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to check git status — staying in {phase_label} for retry"
-            );
-            return;
-        }
-    };
-
-    if !has_changes {
+    if porcelain.trim().is_empty() {
         transition_ticket_to_done(
             &ticket,
             source,
@@ -1161,6 +1147,37 @@ async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: Ticke
             );
         }
     }
+}
+
+/// Auto-commit changes and move the ticket to Done.
+///
+/// Parameterized by source phase so both the QaPassed→Done and
+/// SanitationPassed→Done flows share the same implementation.
+///
+/// Always checks git availability via [`transition_ticket_to_done_if_git_unavailable`],
+/// then runs `git status --porcelain` and delegates to
+/// [`finalize_ticket_with_status`] for the commit-or-done decision.
+async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
+    let repo_path = ws.as_path();
+    let phase_label = source.as_ref();
+
+    if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
+        return;
+    }
+
+    let porcelain = match run_git_status(repo_path).await {
+        Ok(output) => output,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to check git status — staying in {phase_label} for retry"
+            );
+            return;
+        }
+    };
+
+    finalize_ticket_with_status(ticket, ws, source, &porcelain).await;
 }
 
 /// After a successful `git commit`, persist the metadata and transition the
@@ -1274,10 +1291,9 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let untracked = parse_new_files_from_porcelain(&porcelain);
 
     if untracked.is_empty() {
-        // Delegate to finalize_ticket_from_phase, which handles the git check,
-        // commit, and transition to Done. This re-runs git status (~5ms), which
-        // is negligible compared to the LLM agent calls that precede this path.
-        finalize_ticket_from_phase(ticket, ws, TicketPhase::QaPassed).await;
+        // Git status and availability already checked above — delegate directly
+        // to the helper that commits dirty changes or transitions to Done.
+        finalize_ticket_with_status(ticket, ws, TicketPhase::QaPassed, &porcelain).await;
     } else {
         // Untracked files exist — claim this specific ticket to InSanitation
         // via the dedicated claim_sanitation method (see BoardStore docs).

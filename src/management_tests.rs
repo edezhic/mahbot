@@ -899,7 +899,7 @@ async fn handle_qa_passed_untracked_files_to_insanitation() {
 
 /// handle_qa_passed with a clean working tree (no untracked files, no
 /// modifications) should transition to Done directly without creating a
-/// commit — exercising the clean-tree path through [`finalize_ticket_from_phase`].
+/// commit — exercising the clean-tree path through [`finalize_ticket_with_status`].
 ///
 /// Creates a real git repo with a clean working tree to exercise the
 /// QaPassed→Done transition through the clean-tree path.
