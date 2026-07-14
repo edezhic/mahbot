@@ -868,6 +868,7 @@ async fn poll_round() -> anyhow::Result<()> {
     };
 
     for ws in &workspaces {
+        // 1. Pipeline claims — atomic source→target transitions
         run_claim_pipeline(ws).await;
 
         // 2. DiagnosticsCheck — diagnostics keeps the ticket in InDiagnostics
