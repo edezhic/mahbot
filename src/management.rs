@@ -361,15 +361,13 @@ where
 /// Delegates to [`with_comment_and_transition`]; see that function for
 /// transaction semantics, notification dispatch, and return-value conventions.
 ///
-/// The `comment` argument is required — the compiler guarantees it is always
-/// written (eliminating the previous class of bugs where `comment: None`
-/// silently produced a no-comment transition).
+/// Both `role` and `text` are required — the compiler guarantees a comment
+/// is always written.
 #[must_use]
-async fn comment_and_transition(ctx: TransitionCtx<'_>, comment: (&str, &str)) -> bool {
+async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) -> bool {
     let ticket = ctx.ticket;
 
     with_comment_and_transition(ctx, async |tx| {
-        let (role, text) = comment;
         BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
         Ok(())
     })
@@ -612,7 +610,8 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                     notify: NotifyPolicy::Notify,
                     log_label: "dispatch panic",
                 },
-                (SYSTEM_ROLE, &panic_comment),
+                SYSTEM_ROLE,
+                &panic_comment,
             )
             .await;
         }
@@ -1013,7 +1012,8 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             notify,
             log_label: "Engineer",
         },
-        (Role::Engineer.as_str(), comment_text),
+        Role::Engineer.as_str(),
+        comment_text,
     )
     .await
     {
@@ -1078,7 +1078,8 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
             notify: notify_policy,
             log_label,
         },
-        (SYSTEM_ROLE, comment),
+        SYSTEM_ROLE,
+        comment,
     )
     .await
     {
@@ -1498,7 +1499,8 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 notify: NotifyPolicy::Buffer,
                 log_label: "Sanitation",
             },
-            (Role::Sanitation.as_str(), &comment),
+            Role::Sanitation.as_str(),
+            &comment,
         )
         .await
         {
@@ -1718,7 +1720,8 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             notify: NotifyPolicy::Buffer,
             log_label: "Diagnostics",
         },
-        (DIAGNOSTICS_ROLE, &comment_body),
+        DIAGNOSTICS_ROLE,
+        &comment_body,
     )
     .await
     {
@@ -2210,7 +2213,8 @@ async fn try_trip_circuit_breaker(
             notify: NotifyPolicy::Notify,
             log_label: &breaker_label,
         },
-        (SYSTEM_ROLE, &msg),
+        SYSTEM_ROLE,
+        &msg,
     )
     .await
     {
