@@ -216,8 +216,21 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
+/// Checks whether the ticket is still in the expected phase AND clears
+/// `assigned_to` if it moved externally.
+///
+/// This is a **guarded check with a side effect**: unlike [`is_ticket_in_phase`]
+/// (which is read-only), this function also clears the `assigned_to` field
+/// when the ticket has left the expected phase. The clearance enables
+/// re-dispatch on the next poll cycle — without it, the stale `assigned_to`
+/// would prevent any agent from picking up the ticket.
+///
+/// The side effect is intentional: all call sites that use this function
+/// (see [`dispatch_engineer`], [`dispatch_sanitation`], [`dispatch_diagnostics`])
+/// have previously set `assigned_to` via [`claim_ticket_in_workspace`]
+/// or [`claim_diagnostics`], so it must be cleared to allow re-dispatch.
 #[must_use]
-async fn guard_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
+async fn abort_if_phase_changed(ticket_id: &str, expected: TicketPhase) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
         clear_assigned_to(ticket_id, &format!("ticket left {expected:?}")).await;
         return false;
@@ -551,7 +564,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // PollPhase::info() which now also carries the circuit_breaker_kind
         // and log_label fields (enforced by the single match in info()).
         //
-        // The post-agent guard_ticket_in_phase check in each dispatch function is
+        // The post-agent abort_if_phase_changed check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         if !is_ticket_in_phase(&ticket.id, expected_phase).await {
             return;
@@ -974,7 +987,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         run_agent(session_key, Role::Engineer, &ws, Some(&ticket), &message).await;
 
     // Post-run check still needed for race conditions during agent execution.
-    if !guard_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
+    if !abort_if_phase_changed(&ticket.id, TicketPhase::InDevelopment).await {
         return;
     }
 
@@ -1418,7 +1431,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         run_agent(session_key, Role::Sanitation, &ws, Some(&ticket), &prompt).await;
 
     // Post-run phase check — bail if ticket was moved externally.
-    if !guard_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
+    if !abort_if_phase_changed(&ticket.id, TicketPhase::InSanitation).await {
         return;
     }
 
@@ -1663,7 +1676,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
                 // Post-run check: verify ticket hasn't been moved externally while
                 // diagnostics commands ran.
-                if !guard_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
+                if !abort_if_phase_changed(&ticket.id, TicketPhase::InDiagnostics).await {
                     return;
                 }
 
