@@ -858,7 +858,9 @@ async fn poll_round() -> anyhow::Result<()> {
         //
         // When the workspace is paused, only block EngineerDevelopment
         // (ready_for_development → in_development). All other phases
-        // (analysis, review, QA, …) proceed normally.
+        // (analysis, review, QA, …) proceed normally so that tickets
+        // already in review or QA finish without getting stuck — pausing
+        // gates *new* development, not in-progress work.
         //
         // On claim error we `break` out of the phase loop — this skips all
         // remaining CLAIM_PHASES for this workspace and falls through to
