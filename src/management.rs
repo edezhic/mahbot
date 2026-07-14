@@ -1180,7 +1180,7 @@ async fn ensure_git_and_get_status(
 /// - **Clean tree** (empty porcelain): transitions directly to Done.
 /// - **Dirty tree**: commits the changes via [`crate::git_commands::run_git_commit`].
 /// - **Commit failure**: ticket stays in `source` phase; the poller retries.
-async fn finalize_ticket_with_status(
+async fn finalize_ticket_with_git_status(
     ticket: Ticket,
     ws: Workspace,
     source: TicketPhase,
@@ -1220,13 +1220,13 @@ async fn finalize_ticket_with_status(
 ///
 /// Checks git availability, queries `git status --porcelain` via
 /// [`ensure_git_and_get_status`], then delegates to
-/// [`finalize_ticket_with_status`] for the commit-or-done decision.
+/// [`finalize_ticket_with_git_status`] for the commit-or-done decision.
 async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
     let Some(porcelain) = ensure_git_and_get_status(&ticket, &ws, source, "finalize").await else {
         return;
     };
 
-    finalize_ticket_with_status(ticket, ws, source, &porcelain).await;
+    finalize_ticket_with_git_status(ticket, ws, source, &porcelain).await;
 }
 
 /// After a successful `git commit`, persist the metadata and transition the
@@ -1326,7 +1326,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     if untracked.is_empty() {
         // Git status and availability already checked above — delegate directly
         // to the helper that commits dirty changes or transitions to Done.
-        finalize_ticket_with_status(ticket, ws, TicketPhase::QaPassed, &porcelain).await;
+        finalize_ticket_with_git_status(ticket, ws, TicketPhase::QaPassed, &porcelain).await;
     } else {
         // Untracked files exist — claim this specific ticket to InSanitation
         // via the dedicated claim_sanitation method (see BoardStore docs).
