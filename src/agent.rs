@@ -523,9 +523,12 @@ impl Agent {
         for (i, call) in calls.iter().enumerate() {
             let outcome = outcomes.and_then(|o| o.get(i));
             let msg = if let Some(tool) = find_tool(tools, &call.name) {
+                // Normalize before debug_output so tool implementations always
+                // receive canonical argument names (e.g. `file` → `path`).
+                let (_, normalized_args) = normalize_tool_call(&call.name, call.arguments.clone());
                 tool.debug_output(
                     phase,
-                    &call.arguments,
+                    &normalized_args,
                     outcome.map(|o| (o.output.as_str(), o.success)),
                 )
             } else {
