@@ -219,14 +219,14 @@ pub(crate) struct TicketParams {
     pub embedding: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TicketComment {
     pub role: String,
     pub content: String,
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ticket {
     pub id: String,
     pub title: String,

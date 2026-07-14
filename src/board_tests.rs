@@ -2004,7 +2004,7 @@ async fn test_ticket_roundtrip_all_fields() {
 
     let ws = crate::workspace::test_ws_named("/test_ws", "test_workspace");
 
-    // Create ticket with known values for every TICKET_COLUMNS position.
+    // Create ticket with known values.
     let id = TicketBuilder::new(&store, &ws)
         .title("Roundtrip Title")
         .desc("Roundtrip description")
@@ -2014,43 +2014,13 @@ async fn test_ticket_roundtrip_all_fields() {
         .await
         .expect("create_ticket");
 
-    // Read back BEFORE setting any mutable fields — verify fresh-ticket defaults
-    // (None for assigned_to, commit_hash, lines_added, lines_removed; empty comments).
+    // ── Fresh ticket (defaults: no assigned_to, no comments, no commit info) ─
     let fresh = store
         .get_ticket(&id)
         .await
         .expect("get_ticket")
         .expect("ticket exists");
-    assert_eq!(fresh.title, "Roundtrip Title", "fresh title");
-    assert_eq!(
-        fresh.description, "Roundtrip description",
-        "fresh description"
-    );
-    assert_eq!(fresh.phase, TicketPhase::Backlog, "fresh phase");
-    assert!(
-        fresh.assigned_to.is_none(),
-        "fresh ticket should have no assigned_to"
-    );
-    assert!(
-        fresh.comments.is_empty(),
-        "fresh ticket should have no comments"
-    );
-    assert!(
-        fresh.commit_hash.is_none(),
-        "fresh ticket should have no commit_hash"
-    );
-    assert!(
-        fresh.lines_added.is_none(),
-        "fresh ticket should have no lines_added"
-    );
-    assert!(
-        fresh.lines_removed.is_none(),
-        "fresh ticket should have no lines_removed"
-    );
-    assert_eq!(
-        fresh.workspace_name, "test_workspace",
-        "fresh workspace_name"
-    );
+
     assert!(
         fresh.created_at.contains('T'),
         "fresh created_at should be RFC 3339: {}",
@@ -2061,60 +2031,49 @@ async fn test_ticket_roundtrip_all_fields() {
         "fresh updated_at should be RFC 3339: {}",
         fresh.updated_at,
     );
-    assert_eq!(fresh.reporter, "test_reporter", "fresh reporter");
-    assert!(
-        fresh.prerequisites.is_empty(),
-        "fresh prerequisites should be empty"
-    );
-    assert!(
-        fresh.supersedes.is_none(),
-        "fresh supersedes should be None"
-    );
-    assert!(
-        fresh.superseded_by.is_none(),
-        "fresh superseded_by should be None"
-    );
-    assert!(!fresh.is_archived, "fresh is_archived should be false");
-    assert!(
-        !fresh.pipeline_reservation,
-        "fresh pipeline_reservation should be false"
+
+    assert_eq!(
+        fresh,
+        Ticket {
+            id: id.clone(),
+            title: "Roundtrip Title".into(),
+            description: "Roundtrip description".into(),
+            phase: TicketPhase::Backlog,
+            assigned_to: None,
+            workspace_name: "test_workspace".into(),
+            created_at: fresh.created_at.clone(),
+            updated_at: fresh.updated_at.clone(),
+            comments: vec![],
+            prerequisites: vec![],
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test_reporter".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+        },
     );
 
-    // Set assigned_to (exercises COL_TICKET_ASSIGNED_TO with non-None value).
+    // ── Mutated ticket (assigned_to + commit info) ──────────────────────
     store
         .set_assigned_to(&id, Some("test_assignee"))
         .await
         .expect("set_assigned_to");
 
-    // Set commit_hash, lines_added, lines_removed with non-default values.
     let tx = store.conn.begin_tx().await.unwrap();
     BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 42, 7)
         .await
         .expect("set_commit_info_tx");
     tx.commit().await.unwrap();
 
-    // Read back BEFORE archiving (which clears assigned_to).
     let ticket = store
         .get_ticket(&id)
         .await
         .expect("get_ticket")
         .expect("ticket exists");
 
-    // ── Assert every Ticket field round-trips ──────────────────────
-    assert_eq!(ticket.id, id, "id mismatch");
-    assert_eq!(ticket.title, "Roundtrip Title", "title mismatch");
-    assert_eq!(
-        ticket.description, "Roundtrip description",
-        "description mismatch",
-    );
-    assert_eq!(ticket.phase, TicketPhase::Backlog, "phase mismatch");
-    assert_eq!(
-        ticket.assigned_to.as_deref(),
-        Some("test_assignee"),
-        "assigned_to should round-trip",
-    );
-    assert_eq!(ticket.workspace_name, "test_workspace");
-    // Timestamps are auto-generated RFC 3339 — validate format, not value.
     assert!(
         ticket.created_at.contains('T'),
         "created_at should be RFC 3339: {}",
@@ -2125,40 +2084,32 @@ async fn test_ticket_roundtrip_all_fields() {
         "updated_at should be RFC 3339: {}",
         ticket.updated_at,
     );
-    assert!(ticket.comments.is_empty(), "no comments expected");
-    assert!(
-        ticket.prerequisites.is_empty(),
-        "prerequisites should round-trip as empty",
-    );
+
     assert_eq!(
-        ticket.commit_hash.as_deref(),
-        Some("abcdef0123456789abcdef0123456789abcd0123"),
-        "commit_hash mismatch",
-    );
-    assert_eq!(ticket.lines_added, Some(42), "lines_added mismatch");
-    assert_eq!(ticket.lines_removed, Some(7), "lines_removed mismatch");
-    assert_eq!(ticket.reporter, "test_reporter", "reporter mismatch");
-    // Fields not set remain at their defaults.
-    assert!(
-        ticket.supersedes.is_none(),
-        "supersedes should be None for simple ticket",
-    );
-    assert!(
-        ticket.superseded_by.is_none(),
-        "superseded_by should be None for simple ticket",
-    );
-    assert!(
-        !ticket.is_archived,
-        "is_archived should be false before archiving",
-    );
-    assert!(
-        !ticket.pipeline_reservation,
-        "pipeline_reservation should be false for fresh ticket",
+        ticket,
+        Ticket {
+            id: id.clone(),
+            title: "Roundtrip Title".into(),
+            description: "Roundtrip description".into(),
+            phase: TicketPhase::Backlog,
+            assigned_to: Some("test_assignee".into()),
+            workspace_name: "test_workspace".into(),
+            created_at: ticket.created_at.clone(),
+            updated_at: ticket.updated_at.clone(),
+            comments: vec![],
+            prerequisites: vec![],
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: Some("abcdef0123456789abcdef0123456789abcd0123".into()),
+            lines_added: Some(42),
+            lines_removed: Some(7),
+            reporter: "test_reporter".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+        },
     );
 
-    // ── Exercise is_archived bool deserialization ──────────────────
-    // set_archived flips is_archived to 1 in SQL, which exercises the
-    // conversion: row.get::<bool>()?.
+    // ── Archived ticket (exercises is_archived bool deserialization) ────
     store.set_archived(&id).await.expect("set_archived");
 
     let archived = store
@@ -2166,13 +2117,40 @@ async fn test_ticket_roundtrip_all_fields() {
         .await
         .expect("get_ticket")
         .expect("ticket exists after archive");
+
     assert!(
-        archived.is_archived,
-        "is_archived should be true after set_archived"
+        archived.created_at.contains('T'),
+        "archived created_at should be RFC 3339: {}",
+        archived.created_at,
     );
     assert!(
-        archived.assigned_to.is_none(),
-        "assigned_to should be cleared after archive",
+        archived.updated_at.contains('T'),
+        "archived updated_at should be RFC 3339: {}",
+        archived.updated_at,
+    );
+
+    assert_eq!(
+        archived,
+        Ticket {
+            id,
+            title: "Roundtrip Title".into(),
+            description: "Roundtrip description".into(),
+            phase: TicketPhase::Backlog,
+            assigned_to: None,
+            workspace_name: "test_workspace".into(),
+            created_at: archived.created_at.clone(),
+            updated_at: archived.updated_at.clone(),
+            comments: vec![],
+            prerequisites: vec![],
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: Some("abcdef0123456789abcdef0123456789abcd0123".into()),
+            lines_added: Some(42),
+            lines_removed: Some(7),
+            reporter: "test_reporter".into(),
+            is_archived: true,
+            pipeline_reservation: false,
+        },
     );
 }
 
