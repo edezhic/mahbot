@@ -1,6 +1,7 @@
 //! Tool implementations for agent-callable capabilities.
 
 use anyhow::Context;
+use tracing::debug;
 
 pub mod ask;
 pub mod browser;
@@ -268,11 +269,18 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
 }
 
 /// Move `from` → `to` only when the canonical key is absent.
+///
+/// When both the alias (`from`) and canonical (`to`) keys are present the
+/// canonical value is used and a diagnostic is logged so the behaviour is
+/// observable during agent debugging.
 fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &str, to: &str) {
     if !obj.contains_key(to)
         && let Some(v) = obj.remove(from)
     {
         obj.insert(to.to_string(), v);
+    } else if from != to && obj.contains_key(to) && obj.contains_key(from) {
+        // Both keys present — log a diagnostic so behavior is observable.
+        debug!("remap_arg_key: both '{from}' (alias) and '{to}' (canonical) present, using '{to}'");
     }
 }
 
