@@ -98,7 +98,8 @@ impl StatsStore {
     /// Returns `(where_clause, params)` where `where_clause` does NOT include
     /// the leading `WHERE` keyword — it is a set of `AND`-joined expressions
     /// suitable for embedding directly into SQL.  All placeholders use unnamed
-    /// `?` — use [`turso::params_from_iter`] to bind params positionally.
+    /// `?` — pass a `Vec<turso::Value>` to bind params positionally (it
+    /// implements [`IntoParams`](crate::turso::IntoParams)).
     ///
     /// This is an associated function (no `&self`) so it can be used without
     /// a store instance if needed.
@@ -131,9 +132,7 @@ impl StatsStore {
         let (where_clause, params) = Self::build_tool_error_filter(query);
         let sql = format!("SELECT COUNT(*) FROM tool_calls WHERE {where_clause}");
         self.conn
-            .query_optional(&sql, turso::params_from_iter(params), |row| {
-                row.get::<i64>(0)
-            })
+            .query_optional(&sql, params, |row| row.get::<i64>(0))
             .await
             .map(|opt| opt.unwrap_or(0))
             .map(|n: i64| {
@@ -175,10 +174,7 @@ impl StatsStore {
         all_params.push(turso::Value::Integer(limit_val));
         all_params.push(turso::Value::Integer(offset_val));
 
-        let rows = self
-            .conn
-            .query(&sql, turso::params_from_iter(all_params))
-            .await?;
+        let rows = self.conn.query(&sql, all_params).await?;
 
         let mut entries = Vec::new();
         for row in rows {

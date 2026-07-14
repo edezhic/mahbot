@@ -1,7 +1,7 @@
 //! Ticket/board system — Turso-backed task management.
 
 use crate::role::SYSTEM_ROLE;
-use crate::turso::{self, IntoParams, TxGuard, Value, params_from_iter};
+use crate::turso::{self, IntoParams, TxGuard, Value};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use serde::Serialize;
@@ -1034,8 +1034,7 @@ impl BoardStore {
             return Ok(Vec::new());
         }
         let (suffix, params) = Self::in_clause_for_ids(ids);
-        self.select_tickets(&suffix, params_from_iter(params), load_comments)
-            .await
+        self.select_tickets(&suffix, params, load_comments).await
     }
 
     /// Build a `WHERE id IN (?, ?, ...)` suffix and parameter vector from
@@ -1713,7 +1712,7 @@ impl BoardStore {
         // deadlock with conn.query().
         let (suffix, params) = Self::in_clause_for_ids(prerequisite_ids);
         let sql = format!("SELECT id, workspace_name FROM tickets {suffix}");
-        let rows = tx.query(&sql, params_from_iter(params)).await?;
+        let rows = tx.query(&sql, params).await?;
 
         // Build a lookup map for O(1) prerequisite resolution.
         let mut found: HashMap<String, String> = HashMap::new();
