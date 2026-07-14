@@ -1102,6 +1102,50 @@ async fn transition_ticket_to_done_if_git_unavailable(
     false
 }
 
+/// Check git availability and run `git status --porcelain`.
+///
+/// # Side effects
+///
+/// **May transition the ticket to Done.** If git is unavailable (`git` not
+/// installed or the workspace is not a git repo), this helper immediately
+/// transitions the ticket to Done (via
+/// [`transition_ticket_to_done_if_git_unavailable`]) and returns `None`. This
+/// is intentional — the ticket has already reached a terminal pipeline phase
+/// and should not block on infrastructure issues.
+///
+/// # Returns
+///
+/// - `Some(porcelain)` — git is available and `git status --porcelain`
+///   succeeded. The caller should use the output to decide how to finalize.
+/// - `None` — git is unavailable (ticket was already moved to Done) or the
+///   status query failed (caller should return; the poller will retry).
+async fn check_git_and_get_status(
+    ticket: &Ticket,
+    ws: &Workspace,
+    phase: TicketPhase,
+    error_context: &'static str,
+) -> Option<String> {
+    let repo_path = ws.as_path();
+
+    if transition_ticket_to_done_if_git_unavailable(ticket, repo_path, phase).await {
+        return None;
+    }
+
+    match run_git_status(repo_path).await {
+        Ok(porcelain) => Some(porcelain),
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to check git status — staying in {} for retry: {}",
+                phase.as_ref(),
+                error_context,
+            );
+            None
+        }
+    }
+}
+
 /// Finalize a ticket given an already-obtained `git status --porcelain` output.
 ///
 /// Callers **must** have already verified git availability via
@@ -1149,27 +1193,12 @@ async fn finalize_ticket_with_status(
 /// Parameterized by source phase so both the QaPassed→Done and
 /// SanitationPassed→Done flows share the same implementation.
 ///
-/// Always checks git availability via [`transition_ticket_to_done_if_git_unavailable`],
-/// then runs `git status --porcelain` and delegates to
+/// Checks git availability, queries `git status --porcelain` via
+/// [`check_git_and_get_status`], then delegates to
 /// [`finalize_ticket_with_status`] for the commit-or-done decision.
 async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
-    let repo_path = ws.as_path();
-    let phase_label = source.as_ref();
-
-    if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, source).await {
+    let Some(porcelain) = check_git_and_get_status(&ticket, &ws, source, "finalize").await else {
         return;
-    }
-
-    let porcelain = match run_git_status(repo_path).await {
-        Ok(output) => output,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to check git status — staying in {phase_label} for retry"
-            );
-            return;
-        }
     };
 
     finalize_ticket_with_status(ticket, ws, source, &porcelain).await;
@@ -1263,24 +1292,11 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 /// between transition and assignment), and dispatches the sanitation agent.
 /// Otherwise, commits and transitions to Done (existing behavior).
 async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
-    let repo_path = ws.as_path();
-
-    // Git not available or not a git repo — transition to Done directly.
-    if transition_ticket_to_done_if_git_unavailable(&ticket, repo_path, TicketPhase::QaPassed).await
-    {
+    let Some(porcelain) =
+        check_git_and_get_status(&ticket, &ws, TicketPhase::QaPassed, "untracked files check")
+            .await
+    else {
         return;
-    }
-
-    let porcelain = match run_git_status(repo_path).await {
-        Ok(out) => out,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to check git status for untracked files — staying in QaPassed for retry"
-            );
-            return;
-        }
     };
 
     let untracked = parse_new_files_from_porcelain(&porcelain);
