@@ -251,8 +251,8 @@ enum NotifyPolicy {
 }
 
 /// Notification side-effect after a successful ticket transition. Parameters
-/// follow the `(source, target)` convention; `source` feeds the buffer entry
-/// when buffering.
+/// follow the `(source, target)` convention; `source` feeds the transition log
+/// and the buffer entry.
 async fn dispatch_notification(
     ticket: &Ticket,
     source: TicketPhase,
@@ -260,7 +260,7 @@ async fn dispatch_notification(
     notify: NotifyPolicy,
 ) {
     match notify {
-        NotifyPolicy::Notify => notify_ticket(ticket, target).await,
+        NotifyPolicy::Notify => notify_ticket(ticket, source, target).await,
         NotifyPolicy::Buffer => {
             ticket_buffer::push(&ticket.workspace_name, &ticket.id, source, target);
         }
@@ -435,7 +435,7 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
 /// must see both notification context and user conversation history in a unified
 /// session. Do NOT change this key or add `manager_` to `TRANSIENT_SESSION_PREFIXES`
 /// — it would either break context continuity or nuke user conversation history.
-async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
+async fn notify_ticket(ticket: &Ticket, source: TicketPhase, target_phase: TicketPhase) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
             ticket = %ticket.id,
@@ -449,7 +449,7 @@ async fn notify_ticket(ticket: &Ticket, target_phase: TicketPhase) {
         "[{}] {}: {} → {}",
         ticket.reporter,
         ticket.id,
-        ticket.phase,
+        source.as_ref(),
         target_phase.as_ref()
     );
 
