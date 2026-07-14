@@ -27,7 +27,7 @@
 //! user approval.** It is a deliberate product decision, not accidental bloat
 //! or dead code.
 
-use crate::util::UnwrapPoison;
+use crate::util::{UnwrapPoison, panic_message};
 use anyhow::{Context, Result, anyhow};
 use candle_core::quantized::{QMatMul, gguf_file};
 use candle_core::{DType, Device, Tensor};
@@ -120,6 +120,11 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// |            |            | when [`download_retry_loop()`] is dropped without   |
 /// |            |            | reaching a terminal state (e.g. a panic in Candle   |
 /// |            |            | or tokenizers).                                      |
+/// | `LOADING`  | `FAILED`   | **Sync path panic:** [`ensure_embedder()`] wraps    |
+/// |            |            | the sync cache-load + `tokio::spawn` in             |
+/// |            |            | [`catch_unwind`] and transitions to [`STATE_FAILED`]|
+/// |            |            | on panic (e.g. OOM, Candle bug, or `tokio::spawn`   |
+/// |            |            | outside a tokio runtime).                            |
 ///
 /// Once STATE reaches `READY` or `FAILED` it stays there for the lifetime of the process.
 const STATE_UNINIT: u8 = 0;
@@ -158,6 +163,14 @@ fn set_embedder_ready(emb: Embedder) {
 ///
 /// Called on every [`embed_query()`] / [`embed_document()`] invocation. Returns `true` if the embedder is
 /// ready, `false` if it's still loading or permanently unavailable.
+///
+/// # Panic safety
+///
+/// The sync cache-load path and `tokio::spawn` call are wrapped in
+/// [`std::panic::catch_unwind`]. If either panics (e.g. OOM during GGUF parsing,
+/// a Candle-internal panic, or `tokio::spawn` called outside a tokio runtime),
+/// [`STATE`] transitions from [`STATE_LOADING`] to [`STATE_FAILED`] so subsequent
+/// calls return `false` immediately rather than wedging permanently.
 fn ensure_embedder() -> bool {
     match STATE.load(Ordering::Acquire) {
         STATE_READY => return true,
@@ -178,33 +191,58 @@ fn ensure_embedder() -> bool {
         return false;
     }
 
-    // Thread-local: try to load cached files synchronously
-    let models_dir =
-        models_dir().expect("CONFIG must be initialized before embedder initialization");
-    let model_path = models_dir.join(MODEL_FILENAME);
-    let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
+    // ── Sync initialisation (protected from panics) ──────────────────────
+    //
+    // The sync load and tokio::spawn are wrapped in catch_unwind so that a
+    // panic (OOM, Candle bug, tokio::spawn outside runtime, etc.) transitions
+    // STATE to FAILED instead of leaving it wedged in LOADING forever.
+    //
+    // Safety of AssertUnwindSafe: The closure only touches owned local
+    // variables (PathBufs, which are consumed/dropped on unwind) and
+    // globally-synchronized state (STATE via AtomicU8, GLOBAL_EMBEDDER via
+    // RwLock). No aliased &mut references cross the unwind boundary, so it
+    // is safe to resume the caller after a panic inside the closure.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let models_dir =
+            models_dir().expect("CONFIG must be initialized before embedder initialization");
+        let model_path = models_dir.join(MODEL_FILENAME);
+        let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
 
-    std::fs::create_dir_all(&models_dir).ok();
+        std::fs::create_dir_all(&models_dir).ok();
 
-    if model_path.exists()
-        && tokenizer_path.exists()
-        && let Some(emb) = try_load_embedder(&model_path, &tokenizer_path, "from cached files")
-    {
-        set_embedder_ready(emb);
-        return true;
+        if model_path.exists()
+            && tokenizer_path.exists()
+            && let Some(emb) = try_load_embedder(&model_path, &tokenizer_path, "from cached files")
+        {
+            set_embedder_ready(emb);
+            return true;
+        }
+        // Don't delete files on the sync-load path — the background retry
+        // loop (spawned below) will handle load failures by deleting and
+        // re-downloading. The sync path is intentionally conservative
+        // because a transient filesystem glitch on every embed_query/embed_document call
+        // should not force a 167 MB re-download.
+
+        // Spawn background download task.
+        // If no tokio runtime is active the spawn will panic; because we
+        // are inside catch_unwind that panic is caught and transitions
+        // STATE to FAILED (graceful degradation rather than a crash).
+        tokio::spawn(download_retry_loop());
+
+        false
+    }));
+
+    match result {
+        Ok(val) => val,
+        Err(panic_payload) => {
+            warn!(
+                panic = %panic_message(&panic_payload),
+                "Embedder: sync initialisation panicked — transitioning to FAILED",
+            );
+            STATE.store(STATE_FAILED, Ordering::Release);
+            false
+        }
     }
-    // Don't delete files on the sync-load path — the background retry
-    // loop (spawned below) will handle load failures by deleting and
-    // re-downloading. The sync path is intentionally conservative            // because a transient filesystem glitch on every embed_query/embed_document call
-    // should not force a 167 MB re-download.
-
-    // Spawn background download task.
-    // Safe: all production callers are within a tokio runtime (see `ensure_embedder`
-    // module docs for caller analysis). If called outside a tokio runtime,
-    // `tokio::spawn` panics with a clear error — this is a programming error.
-    tokio::spawn(download_retry_loop());
-
-    false
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -1162,6 +1200,47 @@ mod tests {
             "STATE should remain FAILED after second call"
         );
         // Clean up state for subsequent tests
+        reset_global_state();
+    }
+
+    /// Test that a panic inside the sync initialisation path (specifically from
+    /// `tokio::spawn` when there is no tokio runtime) is caught by
+    /// [`catch_unwind`] and transitions [`STATE`] to [`STATE_FAILED`].
+    ///
+    /// This is a regular `#[test]`, not `#[tokio::test]`, so there is no tokio
+    /// runtime active. When `ensure_embedder()` reaches `tokio::spawn(...)` the
+    /// spawn panics with "there is no reactor running".  The `catch_unwind`
+    /// wrapper in [`ensure_embedder()`] catches the panic and sets
+    /// [`STATE_FAILED`], preventing the permanent wedge.
+    #[test]
+    fn test_ensure_embedder_sync_panic_transitions_to_failed() {
+        let _root = init_test_config();
+        reset_global_state();
+
+        // ensure_embedder() will CAS → LOADING, try the sync load (fails
+        // because there are no model files in the temp dir), then call
+        // tokio::spawn — which panics without a tokio runtime.
+        let result = ensure_embedder();
+
+        assert!(
+            !result,
+            "ensure_embedder should return false after catching the spawn panic"
+        );
+        assert_eq!(
+            STATE.load(Ordering::Acquire),
+            STATE_FAILED,
+            "STATE should be FAILED after the spawn panic was caught"
+        );
+
+        // Subsequent calls immediately return false (no re-attempt).
+        let r2 = ensure_embedder();
+        assert!(!r2, "ensure_embedder should still return false");
+        assert_eq!(
+            STATE.load(Ordering::Acquire),
+            STATE_FAILED,
+            "STATE should remain FAILED"
+        );
+
         reset_global_state();
     }
 
