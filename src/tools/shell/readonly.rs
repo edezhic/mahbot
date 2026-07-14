@@ -1124,6 +1124,13 @@ mod tests {
         }
     }
 
+    /// Assert each token-classification case in a table-driven test.
+    fn run_token_cases(cases: &[(&str, TokenKind)]) {
+        for &(input, expected) in cases {
+            assert_eq!(classify_shell_token(input), expected, "{input:?}");
+        }
+    }
+
     /// Assert all items in `items` are rejected when formatted with `template`.
     fn assert_all_rejected(items: &[&str], template: impl Fn(&str) -> String) {
         for &item in items {
@@ -1373,183 +1380,74 @@ mod tests {
 
     // ── classify_shell_token unit tests ──────────────────────────────
 
-    /// Direct tests for [`classify_shell_token`] in isolation, verifying
-    /// correct [`TokenKind`] classification for every redirect operator
-    /// variant and edge case.
+    /// Verify [`classify_shell_token`] returns the correct [`TokenKind`] for all
+    /// operator variants, plain tokens, and ordering-sensitive edge cases.
+    ///
+    /// See the function's own doc comment for the ordering-invariant rationale.
+    ///
+    /// **Note:** All cases share a single `#[test]` entry point, so a panic
+    /// in any case aborts the remaining cases in that run. This is an accepted
+    /// trade-off for keeping fast, pure-function test data in one place.
     #[test]
-    fn classify_shell_token_standalone_redirects() {
-        // ── Standalone output redirect (expects target) ────────
-        for op in &[">", ">&", ">>", ">|"] {
-            let result = classify_shell_token(op);
-            assert!(
-                matches!(result, TokenKind::Redirect { needs_target: true }),
-                "expected {op} to be Redirect(needs_target=true), got {result:?}"
-            );
-        }
+    fn classify_shell_token_table() {
+        const NO_TARGET: TokenKind = TokenKind::Redirect {
+            needs_target: false,
+        };
 
-        // ── Standalone input redirect (expects target) ─────────
-        for op in &["<", "<&", "<>"] {
-            let result = classify_shell_token(op);
-            assert!(
-                matches!(result, TokenKind::Redirect { needs_target: true }),
-                "expected {op} to be Redirect(needs_target=true), got {result:?}"
-            );
-        }
-
-        // ── Digit-prefixed standalone (expects target) ─────────
-        for op in &["2>", "10>", "3<"] {
-            let result = classify_shell_token(op);
-            assert!(
-                matches!(result, TokenKind::Redirect { needs_target: true }),
-                "expected {op} to be Redirect(needs_target=true), got {result:?}"
-            );
-        }
-
-        // ── Self-contained fd-merge (no target) ────────────────
-        for op in &["2>&1", "1>&2"] {
-            let result = classify_shell_token(op);
-            assert!(
-                matches!(
-                    result,
-                    TokenKind::Redirect {
-                        needs_target: false
-                    }
-                ),
-                "expected {op} to be Redirect(needs_target=false), got {result:?}"
-            );
-        }
-
-        // ── Bash standalone (expects target) ───────────────────
-        for op in &["&>", "&>>"] {
-            let result = classify_shell_token(op);
-            assert!(
-                matches!(result, TokenKind::Redirect { needs_target: true }),
-                "expected {op} to be Redirect(needs_target=true), got {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_shell_token_heredoc() {
-        // ── Heredoc variants ───────────────────────────────────
-        let heredoc_tokens = &["<<EOF", "<<-EOF", "<<<", "3<<EOF", "1<<-EOF"];
-        for &token in heredoc_tokens {
-            let result = classify_shell_token(token);
-            assert!(
-                matches!(result, TokenKind::Heredoc),
-                "expected heredoc token {token} to be Heredoc, got {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_shell_token_combined() {
-        // ── Combined redirect tokens (operator merged with target, no skip) ──
-        let combined = &[
-            ">/dev/null",
-            ">>file",
-            "</dev/null",
-            "<&2",
-            "<>file",
-            "2>/dev/null",
-            "1>/tmp/out",
-            "3</dev/null",
-            "&>/dev/null",
-            "&>>file",
-            ">&2",
-        ];
-        for &token in combined {
-            let result = classify_shell_token(token);
-            assert!(
-                matches!(
-                    result,
-                    TokenKind::Redirect {
-                        needs_target: false
-                    }
-                ),
-                "expected combined token {token} to be Redirect(needs_target=false), got {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_shell_token_non_redirect() {
-        // ── Non-redirect tokens ────────────────────────────────
-        let normal = &["hello", "file.txt", "path/to/file", "test"];
-        for &token in normal {
-            let result = classify_shell_token(token);
-            assert!(
-                result == TokenKind::Regular,
-                "expected {token} to be Regular, got {result:?}"
-            );
-        }
-
-        // ── Flag tokens (not redirects) ────────────────────────
-        let flags = &["-o", "--output", "-f", "--force", "-d"];
-        for &token in flags {
-            let result = classify_shell_token(token);
-            assert!(
-                result == TokenKind::Regular,
-                "expected flag {token} to be Regular, got {result:?}"
-            );
-        }
-
-        // ── Bare digits (not redirects) ────────────────────────
-        let bare_digits = &["2", "10", "3"];
-        for &token in bare_digits {
-            let result = classify_shell_token(token);
-            assert!(
-                result == TokenKind::Regular,
-                "expected bare digit {token} to be Regular, got {result:?}"
-            );
-        }
-    }
-
-    /// Verify ordering invariants: `>&` must yield `needs_target=true` (not
-    /// be caught by the catch-all `starts_with('>')` which gives
-    /// `needs_target=false`), and `&>` / `&>>` must yield `needs_target=true`
-    /// (not be caught by `contains("&>")` which gives `needs_target=false`).
-    #[test]
-    fn classify_shell_token_ordering_invariants() {
-        // `>&` standalone — must expect target (exact-match branch)
-        assert!(
-            matches!(
-                classify_shell_token(">&"),
-                TokenKind::Redirect { needs_target: true }
-            ),
-            ">& standalone should expect a target"
-        );
-
-        // `>&2` combined — must NOT expect target (starts_with('>') branch)
-        assert!(
-            matches!(
-                classify_shell_token(">&2"),
-                TokenKind::Redirect {
-                    needs_target: false
-                }
-            ),
-            ">&2 combined should NOT expect a separate target"
-        );
-
-        // `&>` standalone — must expect target (exact-match branch)
-        assert!(
-            matches!(
-                classify_shell_token("&>"),
-                TokenKind::Redirect { needs_target: true }
-            ),
-            "&> standalone should expect a target"
-        );
-
-        // `&>/dev/null` combined — must NOT expect target (contains("&>") branch)
-        assert!(
-            matches!(
-                classify_shell_token("&>/dev/null"),
-                TokenKind::Redirect {
-                    needs_target: false
-                }
-            ),
-            "&>/dev/null combined should NOT expect a separate target"
-        );
+        run_token_cases(&[
+            // ── Standalone output redirect (expects target) ────────
+            (">", TokenKind::Redirect { needs_target: true }),
+            (">&", TokenKind::Redirect { needs_target: true }),
+            (">>", TokenKind::Redirect { needs_target: true }),
+            (">|", TokenKind::Redirect { needs_target: true }),
+            // ── Standalone input redirect (expects target) ─────────
+            ("<", TokenKind::Redirect { needs_target: true }),
+            ("<&", TokenKind::Redirect { needs_target: true }),
+            ("<>", TokenKind::Redirect { needs_target: true }),
+            // ── Digit-prefixed standalone (expects target) ─────────
+            ("2>", TokenKind::Redirect { needs_target: true }),
+            ("10>", TokenKind::Redirect { needs_target: true }),
+            ("3<", TokenKind::Redirect { needs_target: true }),
+            // ── Self-contained fd-merge (no target) ────────────────
+            ("2>&1", NO_TARGET),
+            ("1>&2", NO_TARGET),
+            // ── Bash standalone (expects target) ───────────────────
+            ("&>", TokenKind::Redirect { needs_target: true }),
+            ("&>>", TokenKind::Redirect { needs_target: true }),
+            // ── Heredoc variants ───────────────────────────────────
+            ("<<EOF", TokenKind::Heredoc),
+            ("<<-EOF", TokenKind::Heredoc),
+            ("<<<", TokenKind::Heredoc),
+            ("3<<EOF", TokenKind::Heredoc),
+            ("1<<-EOF", TokenKind::Heredoc),
+            // ── Combined redirect (operator + target, no skip) ─────
+            (">/dev/null", NO_TARGET),
+            (">>file", NO_TARGET),
+            ("</dev/null", NO_TARGET),
+            ("<&2", NO_TARGET),
+            ("<>file", NO_TARGET),
+            ("2>/dev/null", NO_TARGET),
+            ("1>/tmp/out", NO_TARGET),
+            ("3</dev/null", NO_TARGET),
+            ("&>/dev/null", NO_TARGET),
+            ("&>>file", NO_TARGET),
+            (">&2", NO_TARGET),
+            // ── Non-redirect tokens (plain) ────────────────────────
+            ("hello", TokenKind::Regular),
+            ("file.txt", TokenKind::Regular),
+            ("path/to/file", TokenKind::Regular),
+            ("test", TokenKind::Regular),
+            // ── Flags (not redirects) ──────────────────────────────
+            ("-o", TokenKind::Regular),
+            ("--output", TokenKind::Regular),
+            ("-f", TokenKind::Regular),
+            ("--force", TokenKind::Regular),
+            ("-d", TokenKind::Regular),
+            // ── Bare digits (not redirects) ────────────────────────
+            ("2", TokenKind::Regular),
+            ("10", TokenKind::Regular),
+            ("3", TokenKind::Regular),
+        ]);
     }
 
     // ── Redirect tests ─────────────────────────────────────────────
