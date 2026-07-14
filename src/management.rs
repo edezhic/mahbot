@@ -852,8 +852,6 @@ async fn dispatch_unassigned_in_phase(
 /// because claims are atomic per-workspace and `PipelineCheck` gates
 /// are checked within each workspace independently.
 async fn poll_round() -> anyhow::Result<()> {
-    let board = board();
-
     let workspaces = match crate::workspace::store().list().await {
         Ok(ws_list) => ws_list,
         Err(e) => {
@@ -863,53 +861,7 @@ async fn poll_round() -> anyhow::Result<()> {
     };
 
     for ws in &workspaces {
-        // 1. Claim for each pipeline phase.
-        //
-        // When the workspace is paused, only block EngineerDevelopment
-        // (ready_for_development → in_development). All other phases
-        // (analysis, review, QA, …) proceed normally so that tickets
-        // already in review or QA finish without getting stuck — pausing
-        // gates *new* development, not in-progress work.
-        //
-        // On claim error we `break` out of the phase loop — this skips all
-        // remaining CLAIM_PHASES for this workspace and falls through to
-        // Diagnostics/QaPassed (which handle their own errors independently).
-        // A DB-down workspace won't block other workspaces; a transient claim
-        // failure won't generate log noise for every remaining phase.
-        for &(source, phase) in CLAIM_PHASES {
-            if ws.paused && matches!(phase, PollPhase::EngineerDevelopment) {
-                continue;
-            }
-            let info = phase.info();
-            let ticket = match board
-                .claim_ticket_in_workspace(
-                    source,
-                    info.expected_phase,
-                    &ws.name,
-                    info.pipeline_check,
-                )
-                .await
-            {
-                Ok(Some(t)) => {
-                    // Buffer the claim transition. The returned ticket already
-                    // has phase = info.expected_phase (from SQL RETURNING), so record
-                    // the transition from source.
-                    ticket_buffer::push(&ws.name, &t.id, source, t.phase);
-                    t
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    error!(
-                        workspace = %ws.name,
-                        phase = %info.log_label,
-                        error = %e,
-                        "Claim failed, skipping remaining claim phases for workspace",
-                    );
-                    break;
-                }
-            };
-            spawn_dispatch(phase, ticket, ws.clone());
-        }
+        run_claim_pipeline(ws).await;
 
         // 2. DiagnosticsCheck — diagnostics keeps the ticket in InDiagnostics
         // while running, so the claim loop isn't applicable.
@@ -944,6 +896,52 @@ async fn poll_round() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Claim for each pipeline phase in a workspace.
+///
+/// When the workspace is paused, only block EngineerDevelopment
+/// (ready_for_development → in_development). All other phases
+/// (analysis, review, QA, …) proceed normally so that tickets
+/// already in review or QA finish without getting stuck — pausing
+/// gates *new* development, not in-progress work.
+///
+/// On claim error we `break` out of the phase loop — this skips all
+/// remaining CLAIM_PHASES for this workspace and falls through to
+/// Diagnostics/QaPassed (which handle their own errors independently).
+/// A DB-down workspace won't block other workspaces; a transient claim
+/// failure won't generate log noise for every remaining phase.
+async fn run_claim_pipeline(ws: &Workspace) {
+    let board = board();
+    for &(source, phase) in CLAIM_PHASES {
+        if ws.paused && matches!(phase, PollPhase::EngineerDevelopment) {
+            continue;
+        }
+        let info = phase.info();
+        let ticket = match board
+            .claim_ticket_in_workspace(source, info.expected_phase, &ws.name, info.pipeline_check)
+            .await
+        {
+            Ok(Some(t)) => {
+                // Buffer the claim transition. The returned ticket already
+                // has phase = info.expected_phase (from SQL RETURNING), so record
+                // the transition from source.
+                ticket_buffer::push(&ws.name, &t.id, source, t.phase);
+                t
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                error!(
+                    workspace = %ws.name,
+                    phase = %info.log_label,
+                    error = %e,
+                    "Claim failed, skipping remaining claim phases for workspace",
+                );
+                break;
+            }
+        };
+        spawn_dispatch(phase, ticket, ws.clone());
+    }
 }
 
 /// Run an Engineer agent to implement the ticket.
