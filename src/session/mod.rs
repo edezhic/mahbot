@@ -4,7 +4,7 @@ pub mod manager;
 pub use manager::Session;
 
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
-use crate::{ChatMessage, ChatRole, Reasoning, ToolCall};
+use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 
@@ -717,17 +717,11 @@ pub(crate) fn decode_native_history_message(
     }
 
     if message.role == ChatRole::Tool
-        && let Some(value) = parsed.as_ref()
+        && let Ok(payload) = serde_json::from_str::<ToolResultPayload>(&message.content)
     {
         return Some(DecodedNativeHistoryMessage::ToolResult {
-            tool_call_id: value
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string),
-            content: value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .map_or_else(|| message.content.clone(), ToString::to_string),
+            tool_call_id: Some(payload.tool_call_id),
+            content: payload.content,
         });
     }
 

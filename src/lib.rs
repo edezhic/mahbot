@@ -802,13 +802,14 @@ impl ChatMessage {
 
     #[must_use]
     pub fn tool_result(tool_call_id: &str, content: &str) -> Self {
-        let payload = serde_json::json!({
-            "tool_call_id": tool_call_id,
-            "content": content,
-        });
+        let payload = ToolResultPayload {
+            tool_call_id: tool_call_id.to_string(),
+            content: content.to_string(),
+        };
         Self {
             role: ChatRole::Tool,
-            content: payload.to_string(),
+            content: serde_json::to_string(&payload)
+                .expect("ToolResultPayload is always serializable"),
         }
     }
 }
@@ -818,6 +819,16 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+}
+
+/// Shared payload struct for tool-result messages.
+/// Ensures the writer (`ChatMessage::tool_result`) and reader
+/// (`decode_native_history_message`) stay in sync on field names,
+/// preventing silent field-name drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ToolResultPayload {
+    pub tool_call_id: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
