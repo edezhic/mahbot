@@ -7,15 +7,15 @@ use crate::util::test::{
 use crate::workspace::test_ws_named;
 use strum::IntoEnumIterator;
 
-/// All non-General circuit breaker variants must have a threshold strictly
-/// less than [`CircuitBreakerKind::General`]'s threshold.
+/// All non-General circuit breaker variants must have a `max_count` strictly
+/// less than [`CircuitBreakerKind::General`]'s `max_count`.
 ///
 /// ## Rationale
 ///
-/// - **Sanitation breaker** (`threshold = 3`): must trip before the general
-///   breaker (`threshold = 30`), otherwise a ticket could accumulate 30+
+/// - **Sanitation breaker** (`max_count = 3`): must trip before the general
+///   breaker (`max_count = 30`), otherwise a ticket could accumulate 30+
 ///   comments during repeated sanitation loops without tripping.
-/// - **Diagnostics breaker** (`threshold = 4`): must also trip before the
+/// - **Diagnostics breaker** (`max_count = 4`): must also trip before the
 ///   general breaker. This is a conservative approximation — the general
 ///   breaker counts *all* comments (not just diagnostics), but guaranteeing
 ///   that diagnostics-only chatter cannot bypass the general breaker prevents
@@ -23,15 +23,15 @@ use strum::IntoEnumIterator;
 
 #[test]
 fn all_non_general_circuit_breakers_trip_before_general() {
-    let general = CircuitBreakerKind::General.threshold();
+    let general = CircuitBreakerKind::General.max_count();
     for kind in CircuitBreakerKind::iter() {
         if kind == CircuitBreakerKind::General {
             continue;
         }
         assert!(
-            kind.threshold() < general,
-            "{kind:?}.threshold() ({}) must be less than General.threshold() ({general})",
-            kind.threshold(),
+            kind.max_count() < general,
+            "{kind:?}.max_count() ({}) must be less than General.max_count() ({general})",
+            kind.max_count(),
         );
     }
 }
@@ -74,8 +74,8 @@ async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning()
     .await;
 
     // Add comments to ticket A so the circuit breaker has something to count
-    // (CircuitBreakerKind::General.threshold() + 1 = 31 comments, enough to trip).
-    for i in 0..=CircuitBreakerKind::General.threshold() {
+    // (CircuitBreakerKind::General.max_count() + 1 = 31 comments, enough to trip).
+    for i in 0..=CircuitBreakerKind::General.max_count() {
         board()
             .add_comment(&trip_id, SYSTEM_ROLE, &format!("Comment {i}"))
             .await
@@ -348,7 +348,7 @@ async fn transition_ticket_to_done_buffer_and_notify() {
 /// non-General breaker variant.
 ///
 /// For each variant:
-/// - Adds below-threshold failures — verifies the breaker does NOT trip
+/// - Adds below-max-count failures — verifies the breaker does NOT trip
 /// - Adds more failures to reach the trip count — verifies the breaker
 ///   trips, transitions to Failed, and writes a trip comment with the
 ///   "Circuit breaker" marker as a SYSTEM_ROLE comment.
@@ -360,7 +360,7 @@ async fn breaker_counts_failures() {
         source_phase: TicketPhase,
         log_label: &'static str,
         ws_suffix: &'static str,
-        below_threshold_count: usize,
+        below_max_count: usize,
         trip_count: usize,
     }
 
@@ -373,7 +373,7 @@ async fn breaker_counts_failures() {
             source_phase: TicketPhase::InSanitation,
             log_label: "Sanitation",
             ws_suffix: "san_breaker_test",
-            below_threshold_count: 2,
+            below_max_count: 2,
             trip_count: 4,
         },
         BreakerCase {
@@ -382,7 +382,7 @@ async fn breaker_counts_failures() {
             source_phase: TicketPhase::InDiagnostics,
             log_label: "Diagnostics",
             ws_suffix: "diag_breaker_test",
-            below_threshold_count: 3,
+            below_max_count: 3,
             trip_count: 5,
         },
     ];
@@ -396,8 +396,8 @@ async fn breaker_counts_failures() {
         )
         .await;
 
-        // Add below-threshold failures.
-        for _ in 0..case.below_threshold_count {
+        // Add below-max-count failures.
+        for _ in 0..case.below_max_count {
             add_breaker_failure(case.kind, &ticket_id).await;
         }
 
@@ -405,15 +405,15 @@ async fn breaker_counts_failures() {
 
         assert!(
             !try_trip_circuit_breaker(&ticket, case.source_phase, case.kind, case.log_label,).await,
-            "case {}: should NOT trip with {} failures (threshold: {})",
+            "case {}: should NOT trip with {} failures (max: {})",
             case.name,
-            case.below_threshold_count,
-            case.kind.threshold(),
+            case.below_max_count,
+            case.kind.max_count(),
         );
 
         // Add more failures to reach the trip count.
-        // Breaker trips when count > threshold.
-        for _ in case.below_threshold_count..case.trip_count {
+        // Breaker trips when count > max_count.
+        for _ in case.below_max_count..case.trip_count {
             add_breaker_failure(case.kind, &ticket_id).await;
         }
 
@@ -425,12 +425,12 @@ async fn breaker_counts_failures() {
             try_trip_circuit_breaker(&ticket, case.source_phase, case.kind, case.log_label).await;
         assert!(
             tripped,
-            "case {}: should trip with {} failures (threshold: {}, {} > {})",
+            "case {}: should trip with {} failures (max: {}, {} > {})",
             case.name,
             case.trip_count,
-            case.kind.threshold(),
+            case.kind.max_count(),
             case.trip_count,
-            case.kind.threshold(),
+            case.kind.max_count(),
         );
 
         // Verify the ticket is now Failed
@@ -622,9 +622,9 @@ async fn process_verifier_verdicts_cases() {
 
 // ── try_trip_circuit_breaker — general circuit breaker ────────
 
-/// Verify the circuit breaker trips at the threshold boundary:
-/// - `> CircuitBreakerKind::General.threshold()` comments → trips (ticket → Failed)
-/// - `= CircuitBreakerKind::General.threshold()` comments → does NOT trip
+/// Verify the circuit breaker trips at the max_count boundary:
+/// - `> CircuitBreakerKind::General.max_count()` comments → trips (ticket → Failed)
+/// - `= CircuitBreakerKind::General.max_count()` comments → does NOT trip
 ///
 /// When the breaker trips, also verifies the trip comment contains the
 /// "circuit breaker" marker as produced by [`CircuitBreakerKind::should_trip`].
@@ -643,18 +643,18 @@ async fn circuit_breaker_comment_boundary() {
 
     let cases = [
         Case {
-            name: "> threshold trips",
-            ws_suffix: "cb_thresh",
-            title: "CB Threshold",
-            comment_count: CircuitBreakerKind::General.threshold() + 1,
+            name: "> max_count trips",
+            ws_suffix: "cb_max_count",
+            title: "CB Max Count",
+            comment_count: CircuitBreakerKind::General.max_count() + 1,
             expected_trip: true,
             expected_phase: TicketPhase::Failed,
         },
         Case {
-            name: "= threshold does not trip",
+            name: "= max_count does not trip",
             ws_suffix: "cb_no_trip",
             title: "CB No Trip",
-            comment_count: CircuitBreakerKind::General.threshold(),
+            comment_count: CircuitBreakerKind::General.max_count(),
             expected_trip: false,
             expected_phase: TicketPhase::InReview,
         },

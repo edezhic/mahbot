@@ -116,10 +116,10 @@ enum CircuitBreakerKind {
 }
 
 impl CircuitBreakerKind {
-    /// Returns the trip-count threshold for this breaker variant.
+    /// Returns the maximum tolerated failure count for this breaker variant.
     /// The breaker trips when [`should_trip`](CircuitBreakerKind::should_trip) returns
-    /// `Some` (the count exceeds this threshold).
-    const fn threshold(self) -> usize {
+    /// `Some` (the count exceeds this maximum).
+    const fn max_count(self) -> usize {
         match self {
             Self::General => 30,
             Self::Sanitation => 3,
@@ -130,12 +130,12 @@ impl CircuitBreakerKind {
     /// Determine whether this breaker variant should trip.
     ///
     /// Counts failures matching this variant's criteria from the ticket comments.
-    /// If the count exceeds the variant's threshold, returns
-    /// `Some((count, threshold, message))` where `message` is the formatted
+    /// If the count exceeds the variant's `max_count`, returns
+    /// `Some((count, max_count, message))` where `message` is the formatted
     /// trip comment string to post on the ticket. Returns `None` if the breaker
-    /// should not trip (count ≤ threshold).
+    /// should not trip (count ≤ max_count).
     fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
-        let threshold = self.threshold();
+        let max_count = self.max_count();
         let (count, msg) = match self {
             Self::General => {
                 let count = comments.len();
@@ -143,7 +143,7 @@ impl CircuitBreakerKind {
                     count,
                     format!(
                         "Failed after {count} comments — ticket has accumulated too many comments \
-                         (circuit breaker, threshold: {threshold}). \
+                         (circuit breaker, max: {max_count}). \
                          Ticket failed — Manager will triage."
                     ),
                 )
@@ -155,7 +155,7 @@ impl CircuitBreakerKind {
                     count,
                     format!(
                         "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
-                         (threshold: {threshold})",
+                         (max: {max_count})",
                     ),
                 )
             }
@@ -172,10 +172,10 @@ impl CircuitBreakerKind {
             }
         };
 
-        if count <= threshold {
+        if count <= max_count {
             None
         } else {
-            Some((count, threshold, msg))
+            Some((count, max_count, msg))
         }
     }
 }
@@ -2190,16 +2190,16 @@ async fn try_trip_circuit_breaker(
         }
     };
 
-    let Some((count, threshold, msg)) = kind.should_trip(&comments) else {
+    let Some((count, max_count, msg)) = kind.should_trip(&comments) else {
         return false;
     };
 
     info!(
         ticket = %ticket.id,
         count,
-        threshold,
+        max_count,
         log_label,
-        "Circuit breaker tripped at {count}/{threshold} ({log_label}) — failing ticket"
+        "Circuit breaker tripped at {count}/{max_count} ({log_label}) — failing ticket"
     );
 
     if comment_and_transition(
