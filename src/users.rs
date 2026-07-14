@@ -18,7 +18,7 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::WorkspacePhase;
+use crate::WorkspaceStatus;
 use crate::git_commands::run_git_output;
 use crate::turso::{self, TxGuard};
 use anyhow::Result;
@@ -462,7 +462,7 @@ pub async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
 pub fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
     let mut ws = Workspace::from_path(path);
     ws.name = format!("personal:{user_name}");
-    ws.status = WorkspacePhase::Ready;
+    ws.status = WorkspaceStatus::Ready;
     ws.maintainer_debounce_mins = 240;
     let now = turso::now();
     ws.created_at.clone_from(&now);

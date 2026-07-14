@@ -107,7 +107,7 @@ impl DiagnosticsCommands {
 // Core type: Workspace
 // ---------------------------------------------------------------------------
 
-/// Lifecycle phase of a workspace.
+/// Lifecycle status of a workspace.
 ///
 /// Mirrors the `status` TEXT column in the workspaces database table.
 /// Conversion to/from strings happens at the DB boundary only.
@@ -116,7 +116,7 @@ impl DiagnosticsCommands {
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-pub enum WorkspacePhase {
+pub enum WorkspaceStatus {
     /// Workspace registered but discovery has not started.
     #[default]
     Pending,
@@ -128,7 +128,7 @@ pub enum WorkspacePhase {
     Failed,
 }
 
-impl std::str::FromStr for WorkspacePhase {
+impl std::str::FromStr for WorkspaceStatus {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -138,7 +138,7 @@ impl std::str::FromStr for WorkspacePhase {
             "ready" => Ok(Self::Ready),
             "failed" => Ok(Self::Failed),
             other => Err(anyhow::anyhow!(
-                "Invalid workspace phase '{other}'. Valid phases: pending, analyzing, ready, failed"
+                "Invalid workspace status '{other}'. Valid statuses: pending, analyzing, ready, failed"
             )),
         }
     }
@@ -149,7 +149,7 @@ impl std::str::FromStr for WorkspacePhase {
 pub struct Workspace {
     pub name: String,
     pub path: String,
-    pub status: WorkspacePhase,
+    pub status: WorkspaceStatus,
     pub created_at: String,
     pub updated_at: String,
     /// Whether the maintainer agent is enabled for this workspace.
@@ -190,7 +190,7 @@ impl Default for Workspace {
         Self {
             name: String::default(),
             path: String::default(),
-            status: WorkspacePhase::Pending,
+            status: WorkspaceStatus::Pending,
             created_at: String::default(),
             updated_at: String::default(),
             maintenance_enabled: bool::default(),

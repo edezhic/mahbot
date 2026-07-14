@@ -5,7 +5,7 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::WorkspacePhase;
+use crate::WorkspaceStatus;
 use crate::agent::run_agent;
 use crate::session::discovery_session_key;
 use crate::turso::{self};
@@ -276,7 +276,7 @@ async fn finalize_discovery(
         );
     } else {
         let msg = errors.join("; ");
-        let _ = storage.set_status(ws_name, &WorkspacePhase::Failed).await;
+        let _ = storage.set_status(ws_name, &WorkspaceStatus::Failed).await;
         tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
     }
 }
@@ -421,7 +421,7 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
         path: row.get(COL_WS_PATH)?,
         status: row
             .get::<String>(COL_WS_STATUS)?
-            .parse::<WorkspacePhase>()?,
+            .parse::<WorkspaceStatus>()?,
         created_at: row.get(COL_WS_CREATED_AT)?,
         updated_at: row.get(COL_WS_UPDATED_AT)?,
         maintenance_enabled: row.get::<bool>(COL_WS_MAINTENANCE_ENABLED)?,
@@ -465,7 +465,7 @@ impl WorkspaceStore {
         let ws = Workspace {
             name: name.to_string(),
             path: path.clone(),
-            status: WorkspacePhase::Pending,
+            status: WorkspaceStatus::Pending,
             created_at: now.clone(),
             updated_at: now.clone(),
             maintenance_enabled: false,
@@ -475,7 +475,7 @@ impl WorkspaceStore {
             diagnostics: None,
             diagnostics_updated_at: None,
         };
-        let _ = self.set_status(name, &WorkspacePhase::Analyzing).await;
+        let _ = self.set_status(name, &WorkspaceStatus::Analyzing).await;
         // New workspace: discovery_generation defaults to 0 in the schema.
         // Generation 0 means "the first discovery" — if rediscover() bumps
         // the generation before this task finishes, the task's context/
@@ -545,7 +545,7 @@ impl WorkspaceStore {
     }
 
     /// Update the status of a workspace.
-    pub async fn set_status(&self, name: &str, status: &WorkspacePhase) -> Result<()> {
+    pub async fn set_status(&self, name: &str, status: &WorkspaceStatus) -> Result<()> {
         let now = turso::now();
         self.conn
             .execute(
@@ -915,7 +915,7 @@ mod tests {
         Workspace {
             name: name.to_string(),
             path: path.to_string(),
-            status: WorkspacePhase::Pending,
+            status: WorkspaceStatus::Pending,
             created_at: now.clone(),
             updated_at: now.clone(),
             maintenance_enabled,
@@ -1077,7 +1077,11 @@ mod tests {
                 !ws.paused,
                 "Should auto-unpause after discovery OK (gen {generation})"
             );
-            assert_eq!(ws.status, WorkspacePhase::Ready, "Status should be 'ready'");
+            assert_eq!(
+                ws.status,
+                WorkspaceStatus::Ready,
+                "Status should be 'ready'"
+            );
         }
     }
 
@@ -1098,7 +1102,7 @@ mod tests {
         assert!(ws.paused, "Should remain paused after discovery failure");
         assert_eq!(
             ws.status,
-            WorkspacePhase::Failed,
+            WorkspaceStatus::Failed,
             "Status should be 'failed'"
         );
     }
@@ -1137,7 +1141,7 @@ mod tests {
         );
         assert_eq!(
             ws.status,
-            WorkspacePhase::Pending,
+            WorkspaceStatus::Pending,
             "Status should remain unchanged — writes skipped"
         );
     }
@@ -1157,7 +1161,7 @@ mod tests {
         )
         .await;
         store
-            .set_status("rediscover_test", &WorkspacePhase::Ready)
+            .set_status("rediscover_test", &WorkspaceStatus::Ready)
             .await
             .unwrap();
 
@@ -1169,7 +1173,7 @@ mod tests {
         assert!(!ws.paused, "Precondition: workspace should start unpaused");
         assert_eq!(
             ws.status,
-            WorkspacePhase::Ready,
+            WorkspaceStatus::Ready,
             "Precondition: status should be 'ready'"
         );
 
