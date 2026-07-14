@@ -97,24 +97,17 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
     })
 }
 
-/// Parse rows into [`ChatHistoryEntry`], then reverse for chronological order.
-/// Shared helper for `load_for_user` and `load_older_for_user`.
-fn rows_to_history_entries(rows: Vec<Row>) -> Result<Vec<ChatHistoryEntry>> {
-    let mut entries = Vec::with_capacity(rows.len());
-    for row in rows {
-        entries.push(chat_history_entry_from_row(&row)?);
-    }
-    entries.reverse();
-    Ok(entries)
-}
-
 /// Process rows from a query that over-fetched by one row (limit = history
 /// limit + 1) into a page of entries with a `has_more` flag. Entries are
 /// returned in chronological order. The extra over-fetched row (if any) is
 /// dropped from the front (oldest entries) so the returned vector contains
 /// at most [`HISTORY_LIMIT`] entries.
 fn rows_to_page(rows: Vec<Row>) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-    let mut entries = rows_to_history_entries(rows)?;
+    let mut entries: Vec<ChatHistoryEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        entries.push(chat_history_entry_from_row(&row)?);
+    }
+    entries.reverse();
     let has_more = entries.len() > HISTORY_LIMIT;
     if has_more {
         // Entries are in chronological order (oldest first).
