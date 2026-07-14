@@ -149,12 +149,8 @@ impl CircuitBreakerKind {
                 )
             }
             Self::Sanitation => {
-                let count = comments
-                    .iter()
-                    .filter(|c| {
-                        c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_MARKER)
-                    })
-                    .count();
+                let count =
+                    count_matching_comments(comments, SYSTEM_ROLE, SANITATION_FAILED_MARKER);
                 (
                     count,
                     format!(
@@ -164,12 +160,8 @@ impl CircuitBreakerKind {
                 )
             }
             Self::Diagnostics => {
-                let count = comments
-                    .iter()
-                    .filter(|c| {
-                        c.role == DIAGNOSTICS_ROLE && c.content.contains(DIAGNOSTICS_FAILED_MARKER)
-                    })
-                    .count();
+                let count =
+                    count_matching_comments(comments, DIAGNOSTICS_ROLE, DIAGNOSTICS_FAILED_MARKER);
                 (
                     count,
                     format!(
@@ -186,6 +178,14 @@ impl CircuitBreakerKind {
             Some((count, threshold, msg))
         }
     }
+}
+
+/// Count ticket comments matching a specific role and marker substring.
+fn count_matching_comments(comments: &[TicketComment], role: &str, marker: &str) -> usize {
+    comments
+        .iter()
+        .filter(|c| c.role == role && c.content.contains(marker))
+        .count()
 }
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
