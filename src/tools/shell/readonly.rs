@@ -177,6 +177,16 @@ const CARGO_SAFE_SUBCOMMANDS: &[&str] = &[
 
 // ── Redirect detection ───────────────────────────────────────────────────
 
+///   Advance `i` past the current line (to the start of the next line or end of string).
+fn skip_to_next_line(i: &mut usize, chars: &[(usize, char)]) {
+    while *i < chars.len() && chars[*i].1 != '\n' {
+        *i += 1;
+    }
+    if *i < chars.len() {
+        *i += 1;
+    }
+}
+
 /// Remove heredoc bodies so redirect operators inside them are not scanned.
 ///
 /// # Security invariant
@@ -239,12 +249,7 @@ fn strip_heredoc_bodies(command: &str) -> String {
                 .unwrap_or(chars.len());
 
             // Skip rest of delimiter line
-            while i < chars.len() && chars[i].1 != '\n' {
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1;
-            }
+            skip_to_next_line(&mut i, &chars);
 
             // Skip body until a line equals the delimiter
             while i < chars.len() {
@@ -260,20 +265,10 @@ fn strip_heredoc_bodies(command: &str) -> String {
                         .iter()
                         .position(|(byte, _)| *byte > line_start + delimiter.len())
                         .unwrap_or(chars.len());
-                    while i < chars.len() && chars[i].1 != '\n' {
-                        i += 1;
-                    }
-                    if i < chars.len() {
-                        i += 1;
-                    }
+                    skip_to_next_line(&mut i, &chars);
                     break;
                 }
-                while i < chars.len() && chars[i].1 != '\n' {
-                    i += 1;
-                }
-                if i < chars.len() {
-                    i += 1;
-                }
+                skip_to_next_line(&mut i, &chars);
             }
             continue;
         }
