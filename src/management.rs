@@ -571,6 +571,9 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             return;
         }
         if try_trip_circuit_breaker(&ticket, expected_phase, kind, log_label).await {
+            // Circuit breaker tripped — drain the development pipeline so the
+            // Manager can triage the failure without new tickets auto-starting.
+            drain_ready_for_development_siblings(&ticket).await;
             return;
         }
 
@@ -2118,8 +2121,12 @@ fn format_analyst_summary(
 /// per-sibling notifications are noise.
 ///
 /// # Precondition
-/// `ticket` must already be in the `Failed` phase before calling this function.
-/// Callers must transition the ticket to `Failed` first.
+/// The circuit breaker must have tripped for `ticket` (i.e.,
+/// [`try_trip_circuit_breaker`] returned `true` and the transition to
+/// `Failed` has been attempted). The drain operates on the workspace
+/// identified by `ticket.workspace_name` and is safe to call even if the
+/// transition failed — the important invariant is that a breaker tripped,
+/// so the pipeline should pause.
 async fn drain_ready_for_development_siblings(ticket: &Ticket) {
     match board()
         .drain_ready_for_development_to_planning(&ticket.workspace_name)
@@ -2215,7 +2222,7 @@ async fn try_trip_circuit_breaker(
     );
 
     let breaker_label = format!("{log_label} circuit breaker");
-    if comment_and_transition(
+    let _ = comment_and_transition(
         TransitionCtx {
             ticket,
             source: source_phase,
@@ -2226,10 +2233,7 @@ async fn try_trip_circuit_breaker(
         SYSTEM_ROLE,
         &msg,
     )
-    .await
-    {
-        drain_ready_for_development_siblings(ticket).await;
-    }
+    .await;
 
     true
 }

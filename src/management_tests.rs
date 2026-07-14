@@ -95,6 +95,10 @@ async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning()
 
     assert!(tripped, "circuit breaker should have tripped");
 
+    // After the breaker trips, drain siblings so the Manager can triage
+    // without new tickets auto-starting.
+    drain_ready_for_development_siblings(&ticket_a).await;
+
     // ── Verify ticket A is Failed ──
     {
         let ticket_a = expect_ticket(board(), &trip_id).await;
