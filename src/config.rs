@@ -221,7 +221,7 @@ impl ModelRouting {
 /// [`ConfigData::string_fields`], which is macro-generated.  A field missing from
 /// the macro would appear editable in the GUI but silently discard its value on
 /// every save.  The compiler guard on `ConfigData::STRUCT_FIELDS_DEFAULT` prevents this.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ConfigData {
     /// API key for the LLM provider.
     pub provider_key: Option<String>,
@@ -295,8 +295,7 @@ pub struct ConfigData {
 //   parses a newline-separated list, falls back to the named field then
 //   the default constant.
 //
-// The generated accessors live on `impl ConfigReload` and follow the exact
-// same signatures as the hand-written ones they replaced.
+// Generated accessors live on `impl ConfigReload`, created by `string_config_fields!`.
 
 /// Generate the runtime sync methods `string_fields()` and `set_string_field()`,
 /// the const `STRUCT_FIELDS_DEFAULT`, **and** the typed accessors on [`ConfigReload`]
@@ -783,7 +782,6 @@ pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
     let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
 
-    // Load key-value pairs
     let kvs = store.get_all_kv().await?;
     for (key, value) in &kvs {
         if !config.set_string_field(key, value) {
@@ -791,11 +789,9 @@ pub async fn reload_from_db() -> Result<()> {
         }
     }
 
-    // Load per-role configs
     let roles = store.get_all_role_configs().await?;
     config.per_role_configs = roles;
 
-    // Load per-model provider routings
     let routings = store.get_all_model_routings().await?;
     config.model_routings = routings;
 
@@ -803,7 +799,6 @@ pub async fn reload_from_db() -> Result<()> {
     // save_and_reload's persistence path.
     config.finalize();
 
-    // Atomically swap
     CONFIG.swap(config);
     tracing::info!("Config reloaded from DB");
     Ok(())
@@ -887,8 +882,7 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     crate::providers::recreate_all(&config).await?;
     tracing::info!("Provider and transcriber singletons recreated from new config");
 
-    // Now swap the normalized config into the global singleton so readers
-    // see the latest values.
+    // Publish so readers see the latest values.
     let new_token = config.telegram_bot_token.clone();
     CONFIG.swap(config);
     tracing::info!("Config saved and swapped into runtime");
