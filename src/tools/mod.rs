@@ -33,8 +33,10 @@ const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 /// argument. This constant is the single source of truth for those aliases,
 /// used by [`normalize_tool_arguments`] to remap to the canonical `"path"` key.
 ///
-/// If a new alias needs to be added, update this list — the remapping is
-/// applied unconditionally to all tools, so no per-tool match arm is needed.
+/// Adding a new alias to this list automatically activates it for all
+/// path-accepting tools — no match-arm changes needed.  However, if a new
+/// tool is added that accepts a `"path"` parameter, it must also be registered
+/// in the `read | edit | search` match arm of [`normalize_tool_arguments`].
 const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
 /// Check that a file's size is within the allowed limit.
@@ -209,12 +211,19 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
         return;
     };
 
-    // Path aliases are applied to ALL tools unconditionally.
-    for &alias in PATH_ALIAS_KEYS {
-        remap_arg_key(obj, alias, "path");
-    }
-
     match name {
+        "read" | "edit" | "search" => {
+            // Apply path-aliases (file/filename) for tools that accept a "path"
+            // parameter. New path-accepting tools must be added here.
+            for &alias in PATH_ALIAS_KEYS {
+                remap_arg_key(obj, alias, "path");
+            }
+            // Per-tool argument remaps specific to "edit".
+            if name == "edit" {
+                remap_arg_key(obj, "old_str", "old_string");
+                remap_arg_key(obj, "new_str", "new_string");
+            }
+        }
         "shell" => {
             remap_arg_key(obj, "cmd", "command");
             remap_arg_key(obj, "script", "command");
@@ -222,10 +231,6 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
         "get_ticket" | "update_ticket" | "add_comment" => {
             remap_arg_key(obj, "id", "ticket_id");
             remap_arg_key(obj, "ticket", "ticket_id");
-        }
-        "edit" => {
-            remap_arg_key(obj, "old_str", "old_string");
-            remap_arg_key(obj, "new_str", "new_string");
         }
         _ => {}
     }
@@ -458,14 +463,14 @@ mod tests {
     // ── normalize_tool_call tests ─────────────────────────────────────
 
     /// Verify that [`normalize_tool_call`] remaps every alias in
-    /// [`PATH_ALIAS_KEYS`] to `"path"` unconditionally — the remapping is
-    /// applied to all tools, not just those that accept file paths.
+    /// [`PATH_ALIAS_KEYS`] to `"path"` for tools that accept a file path
+    /// parameter (`read`, `edit`, `search`).
     ///
     /// This test explicitly iterates the constant so the loop-based approach in
     /// [`normalize_tool_arguments`] is verified against all current aliases.
     /// If an alias is added to [`PATH_ALIAS_KEYS`], this test immediately
     /// exercises it — preventing any gap between the lookup path and the
-    /// normalization path.
+    /// normalization path. New path-accepting tools must be added here too.
     #[test]
     fn normalize_tool_call_remaps_all_path_aliases() {
         for &alias in PATH_ALIAS_KEYS {
@@ -473,7 +478,6 @@ mod tests {
                 ("read", serde_json::json!({})),
                 ("edit", serde_json::json!({"old_str": "a", "new_str": "b"})),
                 ("search", serde_json::json!({})),
-                ("shell", serde_json::json!({"cmd": "echo hi"})),
             ] {
                 let mut input = serde_json::json!({});
                 input[alias] = serde_json::json!("src/main.rs");
