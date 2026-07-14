@@ -537,47 +537,16 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
             continue;
         }
 
-        // ── Heredoc detection ───────────────────────────────────────
-        // Bare heredoc (<<EOF, <<-EOF, <<<) or fd-prefixed heredoc (3<<EOF, 1<<-EOF)
-        if w.starts_with("<<")
-            || (w.len() > 2 && w.as_bytes()[0].is_ascii_digit() && w.contains("<<"))
-        {
-            in_heredoc_body = true;
-            continue;
-        }
-
-        // ── Redirect detection ──────────────────────────────────────
-        // Standalone output redirect operators: symbolic or digit-prefixed
-        if matches!(*w, ">" | ">&" | ">>" | ">|") || is_digit_suffix_redirect(w, b'>') {
-            skip_redirect_target = true;
-            continue;
-        }
-        // Standalone input redirect operators: symbolic or digit-prefixed
-        if matches!(*w, "<" | "<&" | "<>") || is_digit_suffix_redirect(w, b'<') {
-            skip_redirect_target = true;
-            continue;
-        }
-        // Self-contained fd-merge redirects — no separate target
-        if matches!(*w, "2>&1" | "1>&2") {
-            continue;
-        }
-        // Combined redirect tokens: operator merged with target
-        // (e.g. >/dev/null, >>file, </dev/null, <&2, <>file)
-        if w.starts_with('>') || w.starts_with('<') {
-            continue;
-        }
-        // Combined fd+redirect like 2>/dev/null, 1>/tmp/out, 3</dev/null
-        if w.len() > 1 && w.as_bytes()[0].is_ascii_digit() && (w.contains('>') || w.contains('<')) {
-            continue;
-        }
-        // Bash &> standalone redirect (space-separated target expected)
-        if matches!(*w, "&>" | "&>>") {
-            skip_redirect_target = true;
-            continue;
-        }
-        // Bash &> combined stdout+stderr redirect (e.g. &>/dev/null, &>>file)
-        if w.contains("&>") {
-            continue;
+        match classify_shell_token(w) {
+            TokenKind::Redirect { needs_target } => {
+                skip_redirect_target = needs_target;
+                continue;
+            }
+            TokenKind::Heredoc => {
+                in_heredoc_body = true;
+                continue;
+            }
+            TokenKind::Regular => {}
         }
 
         args.push(w.to_string());
@@ -598,6 +567,105 @@ fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
     }
     // All bytes except the last must be decimal digits
     bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+}
+
+/// Result of classifying a whitespace-split shell token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    /// Not a redirect or heredoc — pass through.
+    Regular,
+    /// A redirect operator.  When `needs_target`, the caller should skip
+    /// the next whitespace-separated word (the redirect target).
+    Redirect { needs_target: bool },
+    /// A heredoc start token (e.g. `<<EOF`, `<<-`, `<<<`).  The caller
+    /// should skip subsequent lines until the heredoc body ends.
+    Heredoc,
+}
+
+/// Classify a whitespace-split token as a shell redirect operator or heredoc.
+///
+/// Returns [`TokenKind::Redirect`] with `needs_target` indicating whether
+/// the operator expects a following word (e.g. `>` → needs target, `2>&1` →
+/// self-contained), [`TokenKind::Heredoc`] for heredoc start tokens that
+/// trigger body-skipping, or [`TokenKind::Regular`] for anything else.
+///
+/// # Ordering invariants
+///
+/// Exact-match checks for `>&` and `&>`/`&>>` MUST precede the pattern-based
+/// checks because those patterns would also match `starts_with('>')` and
+/// `contains("&>")` respectively, but with the wrong `needs_target` value.
+///
+/// 1. `>&` exact-match check precedes `starts_with('>')` — `>&` also starts
+///    with `>` but has `needs_target: true` (standalone operator), while
+///    combined forms like `>&2` fall through to `starts_with('>')` which
+///    yields `needs_target: false`.
+/// 2. `&>` / `&>>` exact-match checks precede `contains("&>")` — both
+///    contain `&>` but have `needs_target: true` as standalone operators,
+///    while combined forms like `&>/dev/null` fall through to
+///    `contains("&>")` which yields `needs_target: false`.
+///
+/// # Design note
+///
+/// This is a **token-level** classifier used by [`non_flag_path_args`].  It is
+/// NOT used by [`has_disallowed_redirect`], which operates at a different
+/// abstraction level (character-based with quote-state awareness).  Those two
+/// functions have distinct semantics and are deliberately kept separate.
+fn classify_shell_token(w: &str) -> TokenKind {
+    // ── Exact-match redirect operators ────────────────────────────
+    // NOTE: `>&` and `&>`/`&>>` are checked via exact `match` BEFORE the
+    // pattern-based checks below (see ordering invariants in doc comment).
+    match w {
+        // Operators that consume the next word as their target:
+        ">" | ">&" | ">>" | ">|" | "<" | "<&" | "<>" | "&>" | "&>>" => {
+            return TokenKind::Redirect { needs_target: true };
+        }
+        // Self-contained fd-merge — no target to skip:
+        "2>&1" | "1>&2" => {
+            return TokenKind::Redirect {
+                needs_target: false,
+            };
+        }
+        _ => {}
+    }
+
+    // ── Heredoc detection ─────────────────────────────────────────
+    // Bare heredoc (<<EOF, <<-EOF, <<<) or fd-prefixed heredoc (3<<EOF, 1<<-EOF)
+    if w.starts_with("<<") || (w.len() > 2 && w.as_bytes()[0].is_ascii_digit() && w.contains("<<"))
+    {
+        return TokenKind::Heredoc;
+    }
+
+    // ── Standalone digit-prefixed redirect ────────────────────────
+    // e.g. 2>, 10>, 3< — expects a target word
+    if is_digit_suffix_redirect(w, b'>') || is_digit_suffix_redirect(w, b'<') {
+        return TokenKind::Redirect { needs_target: true };
+    }
+
+    // ── Combined redirect tokens (operator merged with target) ────
+    // e.g. >/dev/null, >>file, </dev/null, <&2, <>file
+    if w.starts_with('>') || w.starts_with('<') {
+        return TokenKind::Redirect {
+            needs_target: false,
+        };
+    }
+
+    // ── Combined fd-prefixed redirect (digits + redirect) ─────────
+    // e.g. 2>/dev/null, 3</dev/null, 1>/tmp/out
+    if w.len() > 1 && w.as_bytes()[0].is_ascii_digit() && (w.contains('>') || w.contains('<')) {
+        return TokenKind::Redirect {
+            needs_target: false,
+        };
+    }
+
+    // ── Combined bash &> redirect ─────────────────────────────────
+    // e.g. &>/dev/null, &>>file
+    if w.contains("&>") {
+        return TokenKind::Redirect {
+            needs_target: false,
+        };
+    }
+
+    TokenKind::Regular
 }
 
 /// True when every explicit path argument is an absolute path under allowed temp.
@@ -1306,6 +1374,187 @@ mod tests {
         ];
 
         run_cases(&cases);
+    }
+
+    // ── classify_shell_token unit tests ──────────────────────────────
+
+    /// Direct tests for [`classify_shell_token`] in isolation, verifying
+    /// correct [`TokenKind`] classification for every redirect operator
+    /// variant and edge case.
+    #[test]
+    fn classify_shell_token_standalone_redirects() {
+        // ── Standalone output redirect (expects target) ────────
+        for op in &[">", ">&", ">>", ">|"] {
+            let result = classify_shell_token(op);
+            assert!(
+                matches!(result, TokenKind::Redirect { needs_target: true }),
+                "expected {op} to be Redirect(needs_target=true), got {result:?}"
+            );
+        }
+
+        // ── Standalone input redirect (expects target) ─────────
+        for op in &["<", "<&", "<>"] {
+            let result = classify_shell_token(op);
+            assert!(
+                matches!(result, TokenKind::Redirect { needs_target: true }),
+                "expected {op} to be Redirect(needs_target=true), got {result:?}"
+            );
+        }
+
+        // ── Digit-prefixed standalone (expects target) ─────────
+        for op in &["2>", "10>", "3<"] {
+            let result = classify_shell_token(op);
+            assert!(
+                matches!(result, TokenKind::Redirect { needs_target: true }),
+                "expected {op} to be Redirect(needs_target=true), got {result:?}"
+            );
+        }
+
+        // ── Self-contained fd-merge (no target) ────────────────
+        for op in &["2>&1", "1>&2"] {
+            let result = classify_shell_token(op);
+            assert!(
+                matches!(
+                    result,
+                    TokenKind::Redirect {
+                        needs_target: false
+                    }
+                ),
+                "expected {op} to be Redirect(needs_target=false), got {result:?}"
+            );
+        }
+
+        // ── Bash standalone (expects target) ───────────────────
+        for op in &["&>", "&>>"] {
+            let result = classify_shell_token(op);
+            assert!(
+                matches!(result, TokenKind::Redirect { needs_target: true }),
+                "expected {op} to be Redirect(needs_target=true), got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_shell_token_heredoc() {
+        // ── Heredoc variants ───────────────────────────────────
+        let heredoc_tokens = &["<<EOF", "<<-EOF", "<<<", "3<<EOF", "1<<-EOF"];
+        for &token in heredoc_tokens {
+            let result = classify_shell_token(token);
+            assert!(
+                matches!(result, TokenKind::Heredoc),
+                "expected heredoc token {token} to be Heredoc, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_shell_token_combined() {
+        // ── Combined redirect tokens (operator merged with target, no skip) ──
+        let combined = &[
+            ">/dev/null",
+            ">>file",
+            "</dev/null",
+            "<&2",
+            "<>file",
+            "2>/dev/null",
+            "1>/tmp/out",
+            "3</dev/null",
+            "&>/dev/null",
+            "&>>file",
+            ">&2",
+        ];
+        for &token in combined {
+            let result = classify_shell_token(token);
+            assert!(
+                matches!(
+                    result,
+                    TokenKind::Redirect {
+                        needs_target: false
+                    }
+                ),
+                "expected combined token {token} to be Redirect(needs_target=false), got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_shell_token_non_redirect() {
+        // ── Non-redirect tokens ────────────────────────────────
+        let normal = &["hello", "file.txt", "path/to/file", "test"];
+        for &token in normal {
+            let result = classify_shell_token(token);
+            assert!(
+                result == TokenKind::Regular,
+                "expected {token} to be Regular, got {result:?}"
+            );
+        }
+
+        // ── Flag tokens (not redirects) ────────────────────────
+        let flags = &["-o", "--output", "-f", "--force", "-d"];
+        for &token in flags {
+            let result = classify_shell_token(token);
+            assert!(
+                result == TokenKind::Regular,
+                "expected flag {token} to be Regular, got {result:?}"
+            );
+        }
+
+        // ── Bare digits (not redirects) ────────────────────────
+        let bare_digits = &["2", "10", "3"];
+        for &token in bare_digits {
+            let result = classify_shell_token(token);
+            assert!(
+                result == TokenKind::Regular,
+                "expected bare digit {token} to be Regular, got {result:?}"
+            );
+        }
+    }
+
+    /// Verify ordering invariants: `>&` must yield `needs_target=true` (not
+    /// be caught by the catch-all `starts_with('>')` which gives
+    /// `needs_target=false`), and `&>` / `&>>` must yield `needs_target=true`
+    /// (not be caught by `contains("&>")` which gives `needs_target=false`).
+    #[test]
+    fn classify_shell_token_ordering_invariants() {
+        // `>&` standalone — must expect target (exact-match branch)
+        assert!(
+            matches!(
+                classify_shell_token(">&"),
+                TokenKind::Redirect { needs_target: true }
+            ),
+            ">& standalone should expect a target"
+        );
+
+        // `>&2` combined — must NOT expect target (starts_with('>') branch)
+        assert!(
+            matches!(
+                classify_shell_token(">&2"),
+                TokenKind::Redirect {
+                    needs_target: false
+                }
+            ),
+            ">&2 combined should NOT expect a separate target"
+        );
+
+        // `&>` standalone — must expect target (exact-match branch)
+        assert!(
+            matches!(
+                classify_shell_token("&>"),
+                TokenKind::Redirect { needs_target: true }
+            ),
+            "&> standalone should expect a target"
+        );
+
+        // `&>/dev/null` combined — must NOT expect target (contains("&>") branch)
+        assert!(
+            matches!(
+                classify_shell_token("&>/dev/null"),
+                TokenKind::Redirect {
+                    needs_target: false
+                }
+            ),
+            "&>/dev/null combined should NOT expect a separate target"
+        );
     }
 
     // ── Redirect tests ─────────────────────────────────────────────
