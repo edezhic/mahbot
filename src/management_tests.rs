@@ -364,8 +364,6 @@ async fn breaker_counts_failures() {
         source_phase: TicketPhase,
         log_label: &'static str,
         ws_suffix: &'static str,
-        below_max_count: usize,
-        trip_count: usize,
     }
 
     init_management_test_stores().await;
@@ -377,8 +375,6 @@ async fn breaker_counts_failures() {
             source_phase: TicketPhase::InSanitation,
             log_label: "Sanitation",
             ws_suffix: "san_breaker_test",
-            below_max_count: 2,
-            trip_count: 4,
         },
         BreakerCase {
             name: "Diagnostics",
@@ -386,12 +382,14 @@ async fn breaker_counts_failures() {
             source_phase: TicketPhase::InDiagnostics,
             log_label: "Diagnostics",
             ws_suffix: "diag_breaker_test",
-            below_max_count: 3,
-            trip_count: 5,
         },
     ];
 
     for case in &cases {
+        let max_count = case.kind.max_count();
+        let below_max = max_count - 1; // Won't trip
+        let trip_at = max_count + 1; // Will trip (count > max_count)
+
         let ticket_id = make_ticket(
             board(),
             &test_ws_named("/tmp/test", case.ws_suffix),
@@ -401,7 +399,7 @@ async fn breaker_counts_failures() {
         .await;
 
         // Add below-max-count failures.
-        for _ in 0..case.below_max_count {
+        for _ in 0..below_max {
             add_breaker_failure(case.kind, &ticket_id).await;
         }
 
@@ -411,13 +409,13 @@ async fn breaker_counts_failures() {
             !try_trip_circuit_breaker(&ticket, case.source_phase, case.kind, case.log_label,).await,
             "case {}: should NOT trip with {} failures (max: {})",
             case.name,
-            case.below_max_count,
+            below_max,
             case.kind.max_count(),
         );
 
         // Add more failures to reach the trip count.
         // Breaker trips when count > max_count.
-        for _ in case.below_max_count..case.trip_count {
+        for _ in below_max..trip_at {
             add_breaker_failure(case.kind, &ticket_id).await;
         }
 
@@ -431,9 +429,9 @@ async fn breaker_counts_failures() {
             tripped,
             "case {}: should trip with {} failures (max: {}, {} > {})",
             case.name,
-            case.trip_count,
+            trip_at,
             case.kind.max_count(),
-            case.trip_count,
+            trip_at,
             case.kind.max_count(),
         );
 
