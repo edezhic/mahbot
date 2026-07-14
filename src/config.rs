@@ -935,6 +935,36 @@ fn validate_config(config: &ConfigData) -> Result<()> {
     Ok(())
 }
 
+// ── Test helpers ──────────────────────────────────────────────
+
+/// Construct a [`RoleConfig`] for tests.
+#[cfg(test)]
+pub(crate) fn role_config(
+    role: &str,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> RoleConfig {
+    RoleConfig {
+        role: role.into(),
+        model: model.map(String::from),
+        reasoning_effort: reasoning_effort.map(String::from),
+    }
+}
+
+/// Construct a [`ModelRouting`] for tests.
+#[cfg(test)]
+pub(crate) fn model_routing(
+    model: &str,
+    provider_order: Option<&str>,
+    allow_fallbacks: Option<bool>,
+) -> ModelRouting {
+    ModelRouting {
+        model: model.into(),
+        provider_order: provider_order.map(String::from),
+        allow_fallbacks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,28 +1160,6 @@ mod tests {
 
         // Routing: whitespace-only provider_order → None
         assert_eq!(config.model_routings[0].provider_order, None);
-    }
-
-    // ── Test helpers ──────────────────────────────────────────────
-
-    fn role_config(role: &str, model: Option<&str>, reasoning_effort: Option<&str>) -> RoleConfig {
-        RoleConfig {
-            role: role.into(),
-            model: model.map(String::from),
-            reasoning_effort: reasoning_effort.map(String::from),
-        }
-    }
-
-    fn model_routing(
-        model: &str,
-        provider_order: Option<&str>,
-        allow_fallbacks: Option<bool>,
-    ) -> ModelRouting {
-        ModelRouting {
-            model: model.into(),
-            provider_order: provider_order.map(String::from),
-            allow_fallbacks,
-        }
     }
 
     // ── Upsert three-scenario tests ─────────────────────────

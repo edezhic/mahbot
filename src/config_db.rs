@@ -271,6 +271,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{model_routing, role_config};
     use tempfile::TempDir;
 
     async fn setup() -> (ConfigStore, TempDir) {
@@ -334,87 +335,39 @@ mod tests {
         get_all_role_configs,
         [
             (
-                vec![RoleConfig {
-                    role: "engineer".into(),
-                    model: Some("gpt-4".into()),
-                    reasoning_effort: Some("high".into()),
-                }],
+                vec![role_config("engineer", Some("gpt-4"), Some("high"))],
                 vec![],
-                vec![RoleConfig {
-                    role: "engineer".into(),
-                    model: Some("gpt-4".into()),
-                    reasoning_effort: Some("high".into()),
-                }],
+                vec![role_config("engineer", Some("gpt-4"), Some("high"))],
                 "save should persist item"
             ),
             (
-                vec![RoleConfig {
-                    role: "engineer".into(),
-                    model: Some("gpt-5".into()),
-                    reasoning_effort: None,
-                }],
+                vec![role_config("engineer", Some("gpt-5"), None)],
                 vec![],
-                vec![RoleConfig {
-                    role: "engineer".into(),
-                    model: Some("gpt-5".into()),
-                    reasoning_effort: None,
-                }],
+                vec![role_config("engineer", Some("gpt-5"), None)],
                 "save with None nullable should persist NULL"
             ),
             (
-                vec![RoleConfig {
-                    role: "engineer".into(),
-                    model: Some("claude-4".into()),
-                    reasoning_effort: Some("low".into()),
-                }],
+                vec![role_config("engineer", Some("claude-4"), Some("low"))],
                 vec![],
-                vec![RoleConfig {
-                    role: "engineer".into(),
-                    model: Some("claude-4".into()),
-                    reasoning_effort: Some("low".into()),
-                }],
+                vec![role_config("engineer", Some("claude-4"), Some("low"))],
                 "save should fully replace existing row"
             ),
             (
                 vec![
-                    RoleConfig {
-                        role: "engineer".into(),
-                        model: Some("claude-4".into()),
-                        reasoning_effort: Some("low".into()),
-                    },
-                    RoleConfig {
-                        role: "reviewer".into(),
-                        model: Some("o1".into()),
-                        reasoning_effort: None,
-                    },
+                    role_config("engineer", Some("claude-4"), Some("low")),
+                    role_config("reviewer", Some("o1"), None),
                 ],
                 vec![],
                 vec![
-                    RoleConfig {
-                        role: "engineer".into(),
-                        model: Some("claude-4".into()),
-                        reasoning_effort: Some("low".into()),
-                    },
-                    RoleConfig {
-                        role: "reviewer".into(),
-                        model: Some("o1".into()),
-                        reasoning_effort: None,
-                    },
+                    role_config("engineer", Some("claude-4"), Some("low")),
+                    role_config("reviewer", Some("o1"), None),
                 ],
                 "get_all should return all rows sorted by key"
             ),
             (
-                vec![RoleConfig {
-                    role: "reviewer".into(),
-                    model: Some("o1".into()),
-                    reasoning_effort: None,
-                }],
+                vec![role_config("reviewer", Some("o1"), None)],
                 vec![],
-                vec![RoleConfig {
-                    role: "reviewer".into(),
-                    model: Some("o1".into()),
-                    reasoning_effort: None,
-                },],
+                vec![role_config("reviewer", Some("o1"), None),],
                 "only the saved item should remain after replacement"
             ),
         ]
@@ -426,86 +379,38 @@ mod tests {
         [
             (
                 vec![],
-                vec![ModelRouting {
-                    model: "gpt-4".into(),
-                    provider_order: Some("OpenAI".into()),
-                    allow_fallbacks: Some(true),
-                }],
-                vec![ModelRouting {
-                    model: "gpt-4".into(),
-                    provider_order: Some("OpenAI".into()),
-                    allow_fallbacks: Some(true),
-                }],
+                vec![model_routing("gpt-4", Some("OpenAI"), Some(true))],
+                vec![model_routing("gpt-4", Some("OpenAI"), Some(true))],
                 "save should persist item"
             ),
             (
                 vec![],
-                vec![ModelRouting {
-                    model: "gpt-4".into(),
-                    provider_order: Some("Azure".into()),
-                    allow_fallbacks: None,
-                }],
-                vec![ModelRouting {
-                    model: "gpt-4".into(),
-                    provider_order: Some("Azure".into()),
-                    allow_fallbacks: None,
-                }],
+                vec![model_routing("gpt-4", Some("Azure"), None)],
+                vec![model_routing("gpt-4", Some("Azure"), None)],
                 "save with None nullable should persist NULL"
             ),
             (
                 vec![],
-                vec![ModelRouting {
-                    model: "gpt-4".into(),
-                    provider_order: Some("OpenRouter".into()),
-                    allow_fallbacks: Some(false),
-                }],
-                vec![ModelRouting {
-                    model: "gpt-4".into(),
-                    provider_order: Some("OpenRouter".into()),
-                    allow_fallbacks: Some(false),
-                }],
+                vec![model_routing("gpt-4", Some("OpenRouter"), Some(false))],
+                vec![model_routing("gpt-4", Some("OpenRouter"), Some(false))],
                 "save should fully replace existing row"
             ),
             (
                 vec![],
                 vec![
-                    ModelRouting {
-                        model: "claude-3".into(),
-                        provider_order: None,
-                        allow_fallbacks: Some(true),
-                    },
-                    ModelRouting {
-                        model: "gpt-4".into(),
-                        provider_order: Some("OpenRouter".into()),
-                        allow_fallbacks: Some(false),
-                    },
+                    model_routing("claude-3", None, Some(true)),
+                    model_routing("gpt-4", Some("OpenRouter"), Some(false)),
                 ],
                 vec![
-                    ModelRouting {
-                        model: "claude-3".into(),
-                        provider_order: None,
-                        allow_fallbacks: Some(true),
-                    },
-                    ModelRouting {
-                        model: "gpt-4".into(),
-                        provider_order: Some("OpenRouter".into()),
-                        allow_fallbacks: Some(false),
-                    },
+                    model_routing("claude-3", None, Some(true)),
+                    model_routing("gpt-4", Some("OpenRouter"), Some(false)),
                 ],
                 "get_all should return all rows sorted by key"
             ),
             (
                 vec![],
-                vec![ModelRouting {
-                    model: "claude-3".into(),
-                    provider_order: None,
-                    allow_fallbacks: Some(true),
-                }],
-                vec![ModelRouting {
-                    model: "claude-3".into(),
-                    provider_order: None,
-                    allow_fallbacks: Some(true),
-                },],
+                vec![model_routing("claude-3", None, Some(true))],
+                vec![model_routing("claude-3", None, Some(true)),],
                 "only the saved item should remain after replacement"
             ),
         ]
@@ -619,38 +524,18 @@ mod tests {
         // Pre-insert initial data
         assert_save_configs(
             &store,
-            &[RoleConfig {
-                role: "manager".to_string(),
-                model: Some("old-model".to_string()),
-                reasoning_effort: Some("low".to_string()),
-            }],
-            &[ModelRouting {
-                model: "old-model".to_string(),
-                provider_order: Some("OldProvider".to_string()),
-                allow_fallbacks: Some(false),
-            }],
+            &[role_config("manager", Some("old-model"), Some("low"))],
+            &[model_routing("old-model", Some("OldProvider"), Some(false))],
         )
         .await;
 
         // Replace with completely different data
         assert_save_configs(
             &store,
-            &[RoleConfig {
-                role: "qa".to_string(),
-                model: Some("new-model".to_string()),
-                reasoning_effort: None,
-            }],
+            &[role_config("qa", Some("new-model"), None)],
             &[
-                ModelRouting {
-                    model: "fallback-model".to_string(),
-                    provider_order: None,
-                    allow_fallbacks: None,
-                },
-                ModelRouting {
-                    model: "new-model".to_string(),
-                    provider_order: Some("NewProvider".to_string()),
-                    allow_fallbacks: Some(true),
-                },
+                model_routing("fallback-model", None, None),
+                model_routing("new-model", Some("NewProvider"), Some(true)),
             ],
         )
         .await;
@@ -663,16 +548,8 @@ mod tests {
         // Pre-insert some data via the production batch path
         store
             .save_role_and_routing_configs(
-                &[RoleConfig {
-                    role: "should-be-cleared".into(),
-                    model: Some("x".into()),
-                    reasoning_effort: None,
-                }],
-                &[ModelRouting {
-                    model: "should-be-cleared".into(),
-                    provider_order: Some("y".into()),
-                    allow_fallbacks: Some(true),
-                }],
+                &[role_config("should-be-cleared", Some("x"), None)],
+                &[model_routing("should-be-cleared", Some("y"), Some(true))],
             )
             .await
             .unwrap();
@@ -695,22 +572,10 @@ mod tests {
 
         // Pre-populate with known data.
         let mut original_roles = vec![
-            RoleConfig {
-                role: "alpha".to_string(),
-                model: Some("m1".to_string()),
-                reasoning_effort: None,
-            },
-            RoleConfig {
-                role: "beta".to_string(),
-                model: Some("m2".to_string()),
-                reasoning_effort: Some("low".to_string()),
-            },
+            role_config("alpha", Some("m1"), None),
+            role_config("beta", Some("m2"), Some("low")),
         ];
-        let mut original_routings = vec![ModelRouting {
-            model: "m1".to_string(),
-            provider_order: Some("ProviderX".to_string()),
-            allow_fallbacks: Some(true),
-        }];
+        let mut original_routings = vec![model_routing("m1", Some("ProviderX"), Some(true))];
         original_roles.sort_by(|a, b| a.role.cmp(&b.role));
         original_routings.sort_by(|a, b| a.model.cmp(&b.model));
         store
@@ -721,16 +586,8 @@ mod tests {
         // Attempt to save rows with a duplicate role key.
         // The second INSERT will hit the PRIMARY KEY constraint and fail.
         let conflicting_roles = vec![
-            RoleConfig {
-                role: "collides".to_string(),
-                model: Some("first".to_string()),
-                reasoning_effort: None,
-            },
-            RoleConfig {
-                role: "collides".to_string(),
-                model: Some("second".to_string()),
-                reasoning_effort: Some("high".to_string()),
-            },
+            role_config("collides", Some("first"), None),
+            role_config("collides", Some("second"), Some("high")),
         ];
         let result = store
             .save_role_and_routing_configs(&conflicting_roles, &[])
