@@ -232,7 +232,8 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 #[must_use]
 async fn abort_if_phase_changed(ticket_id: &str, expected: TicketPhase) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
-        clear_assigned_to(ticket_id, &format!("ticket left {expected:?}")).await;
+        let label = format!("ticket left {expected:?}");
+        clear_assigned_to(ticket_id, &label).await;
         return false;
     }
     true
@@ -602,6 +603,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             );
             // Best-effort transition: the ticket may have been moved
             // externally while the dispatch was running.
+            let panic_comment = format!("❌ Dispatch panicked: {msg}");
             let _ = comment_and_transition(
                 TransitionCtx {
                     ticket: &ticket_for_failure,
@@ -610,7 +612,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                     notify: NotifyPolicy::Notify,
                     log_label: "dispatch panic",
                 },
-                (SYSTEM_ROLE, &format!("❌ Dispatch panicked: {msg}")),
+                (SYSTEM_ROLE, &panic_comment),
             )
             .await;
         }
@@ -1243,26 +1245,23 @@ async fn finalize_commit_and_transition(
     // Done ticket (which crash-recovery cannot rescue).
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
-    if crate::turso::with_tx(
-        &board().conn,
-        &ticket.id,
-        &format!(
-            "finalize Done transition from {phase_label} ({})",
-            commit_info.short_hash()
-        ),
-        async |tx| {
-            BoardStore::finalize_done_tx(
-                tx,
-                &ticket.id,
-                &commit_info.hash,
-                commit_info.lines_added,
-                commit_info.lines_removed,
-                &comment,
-                source,
-            )
-            .await
-        },
-    )
+    let label = format!(
+        "finalize Done transition from {phase_label} ({})",
+        commit_info.short_hash()
+    );
+
+    if crate::turso::with_tx(&board().conn, &ticket.id, &label, async |tx| {
+        BoardStore::finalize_done_tx(
+            tx,
+            &ticket.id,
+            &commit_info.hash,
+            commit_info.lines_added,
+            commit_info.lines_removed,
+            &comment,
+            source,
+        )
+        .await
+    })
     .await
     .is_ok()
     {
@@ -2202,13 +2201,14 @@ async fn try_trip_circuit_breaker(
         "Circuit breaker tripped at {count}/{max_count} ({log_label}) — failing ticket"
     );
 
+    let breaker_label = format!("{log_label} circuit breaker");
     if comment_and_transition(
         TransitionCtx {
             ticket,
             source: source_phase,
             target: TicketPhase::Failed,
             notify: NotifyPolicy::Notify,
-            log_label: &format!("{log_label} circuit breaker"),
+            log_label: &breaker_label,
         },
         (SYSTEM_ROLE, &msg),
     )
