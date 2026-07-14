@@ -674,6 +674,19 @@ struct PollPhaseInfo {
     log_label: &'static str,
 }
 
+impl PollPhaseInfo {
+    /// Create a new [`PollPhaseInfo`] with standard defaults:
+    /// [`PipelineCheck::Skip`] and [`CircuitBreakerKind::General`].
+    const fn new(expected_phase: TicketPhase, log_label: &'static str) -> Self {
+        Self {
+            expected_phase,
+            pipeline_check: PipelineCheck::Skip,
+            circuit_breaker_kind: CircuitBreakerKind::General,
+            log_label,
+        }
+    }
+}
+
 /// A single poll phase: maps a `from → to` ticket transition to the agent
 /// that handles it.
 ///
@@ -693,39 +706,23 @@ impl PollPhase {
     /// Return all static metadata for this phase.
     fn info(self) -> PollPhaseInfo {
         match self {
-            Self::BacklogAnalysis => PollPhaseInfo {
-                expected_phase: TicketPhase::Analysis,
-                pipeline_check: PipelineCheck::Skip,
-                circuit_breaker_kind: CircuitBreakerKind::General,
-                log_label: "Analyst",
-            },
+            Self::BacklogAnalysis => PollPhaseInfo::new(TicketPhase::Analysis, "Analyst"),
             Self::EngineerDevelopment => PollPhaseInfo {
-                expected_phase: TicketPhase::InDevelopment,
                 pipeline_check: PipelineCheck::Enforce,
-                circuit_breaker_kind: CircuitBreakerKind::General,
-                log_label: "Engineer",
+                ..PollPhaseInfo::new(TicketPhase::InDevelopment, "Engineer")
             },
             Self::SanitationCheck => PollPhaseInfo {
-                expected_phase: TicketPhase::InSanitation,
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
                 // claim_sanitation in handle_qa_passed.
-                pipeline_check: PipelineCheck::Skip,
                 circuit_breaker_kind: CircuitBreakerKind::Sanitation,
-                log_label: "Sanitation",
+                ..PollPhaseInfo::new(TicketPhase::InSanitation, "Sanitation")
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
-                expected_phase: TicketPhase::InDiagnostics,
-                pipeline_check: PipelineCheck::Skip,
                 circuit_breaker_kind: CircuitBreakerKind::Diagnostics,
-                log_label: "Diagnostics",
+                ..PollPhaseInfo::new(TicketPhase::InDiagnostics, "Diagnostics")
             },
-            Self::VerifierCheck(vi) => PollPhaseInfo {
-                expected_phase: vi.source_phase,
-                pipeline_check: PipelineCheck::Skip,
-                circuit_breaker_kind: CircuitBreakerKind::General,
-                log_label: vi.log_label,
-            },
+            Self::VerifierCheck(vi) => PollPhaseInfo::new(vi.source_phase, vi.log_label),
         }
     }
 }
