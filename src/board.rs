@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     id              TEXT PRIMARY KEY,
     title           TEXT NOT NULL,
     description     TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'backlog',
+    phase          TEXT NOT NULL DEFAULT 'backlog',
     assigned_to     TEXT,
     workspace_name  TEXT NOT NULL,
     created_at      TEXT NOT NULL,
@@ -93,7 +93,7 @@ crate::columns! {
         ID                     => "id",
         TITLE                  => "title",
         DESCRIPTION            => "description",
-        PHASE                  => "status",
+        PHASE                  => "phase",
         ASSIGNED_TO            => "assigned_to",
         WORKSPACE_NAME         => "workspace_name",
         CREATED_AT             => "created_at",
@@ -184,7 +184,7 @@ pub const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::
 /// # Precondition
 ///
 /// The input slice must be non-empty. Passing an empty slice produces
-/// `WHERE status IN ()` which is invalid SQL.
+/// `WHERE phase IN ()` which is invalid SQL.
 fn phase_list_sql_fragment(phases: &[TicketPhase]) -> String {
     phases
         .iter()
@@ -594,8 +594,64 @@ pub(crate) enum LoadComments {
 }
 
 impl BoardStore {
-    /// Post-open FTS index setup.
+    /// Post-open setup: run schema migrations, then create FTS index.
     async fn after_open(&self) -> anyhow::Result<()> {
+        // ── schema migration: rename `status` column to `phase` ───────────
+        let version_rows = self
+            .conn
+            .query("PRAGMA user_version", ())
+            .await
+            .context("Failed to read PRAGMA user_version for schema migration")?;
+        let current_version: i64 = version_rows
+            .first()
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or(0);
+
+        if current_version < 1 {
+            // Check whether the old `status` column still exists (migration needed).
+            let table_info = self
+                .conn
+                .query("PRAGMA table_info('tickets')", ())
+                .await
+                .context("Failed to read PRAGMA table_info for tickets table")?;
+
+            let has_status_column = table_info
+                .iter()
+                .any(|row| row.get::<String>(1).ok().as_deref() == Some("status"));
+
+            if has_status_column {
+                info!("Schema migration: renaming tickets.status to tickets.phase");
+                self.conn
+                    .execute("ALTER TABLE tickets RENAME COLUMN status TO phase", ())
+                    .await
+                    .context(
+                        "Schema migration failed: unable to rename tickets.status to tickets.phase",
+                    )?;
+                // ALTER TABLE auto-commits in SQLite/libSQL, so the rename is
+                // already persisted. Continue to update the schema version.
+            }
+
+            // PRAGMA user_version is NOT transaction-atomic in SQLite — set it
+            // after the ALTER TABLE (which has already auto-committed) to avoid
+            // a version-schema mismatch if a crash occurs between the two.
+            self.conn
+                .execute("PRAGMA user_version = 1", ())
+                .await
+                .context("Schema migration failed: unable to set PRAGMA user_version to 1")?;
+
+            // Persist immediately via WAL checkpoint.
+            self.conn.checkpoint().await.context(
+                "Schema migration failed: unable to checkpoint after renaming tickets.status",
+            )?;
+
+            if has_status_column {
+                info!(
+                    "Schema migration complete: tickets.status renamed to tickets.phase (version 1)"
+                );
+            }
+        }
+
+        // ── FTS index setup (must run after migration) ────────────────────
         crate::turso::ensure_fts_index(
             &self.conn,
             TICKETS_FTS_INDEX_NAME,
@@ -626,7 +682,7 @@ impl BoardStore {
         let now = turso::now();
         let prereqs_json = serde_json::to_string(&params.prerequisites)?;
         tx.execute(
-            "INSERT INTO tickets (id, title, description, status, workspace_name, \
+            "INSERT INTO tickets (id, title, description, phase, workspace_name, \
              created_at, updated_at, prerequisites, supersedes, reporter, embedding) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             turso::params![
@@ -787,7 +843,7 @@ impl BoardStore {
         // between validation and cancellation.
         let rows = tx
             .query(
-                "SELECT workspace_name, status FROM tickets WHERE id = ?1",
+                "SELECT workspace_name, phase FROM tickets WHERE id = ?1",
                 turso::params![supersede_id],
             )
             .await?;
@@ -809,7 +865,7 @@ impl BoardStore {
         let now = turso::now();
         let cancelled_rows = tx
             .execute(
-                "UPDATE tickets SET status = ?1, updated_at = ?2, assigned_to = NULL, \
+                "UPDATE tickets SET phase = ?1, updated_at = ?2, assigned_to = NULL, \
                  superseded_by = ?4, is_archived = 1 WHERE id = ?3",
                 turso::params![
                     TicketPhase::Cancelled.as_ref(),
@@ -890,7 +946,7 @@ impl BoardStore {
     /// that workspace are eligible.
     ///
     /// Only tickets currently in `current_phase` are eligible for claiming.
-    /// The WHERE clause includes `t1.status = ?` bound to `current_phase`,
+    /// The WHERE clause includes `t1.phase = ?` bound to `current_phase`,
     /// providing CAS-style atomicity for phase transitions — if no ticket
     /// matches the current phase, the claim returns `None`.
     ///
@@ -939,7 +995,7 @@ impl BoardStore {
             "AND NOT EXISTS ( \
                SELECT 1 FROM json_each(t1.prerequisites) AS je \
                JOIN tickets t_pre ON t_pre.id = je.value \
-               WHERE t_pre.status NOT IN ({}) \
+               WHERE t_pre.phase NOT IN ({}) \
              )",
             phase_list_sql_fragment(UNBLOCKING_PHASES),
         );
@@ -949,7 +1005,7 @@ impl BoardStore {
             format!(
                 "AND NOT EXISTS (SELECT 1 FROM tickets t2 \
                  WHERE t2.workspace_name = t1.workspace_name \
-                 AND t2.status IN ({blocker_sql}) \
+                 AND t2.phase IN ({blocker_sql}) \
                  AND t2.id != t1.id) "
             )
         } else {
@@ -957,10 +1013,10 @@ impl BoardStore {
         };
 
         let sql = format!(
-            "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
+            "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
              pipeline_reservation = 0 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
-             WHERE t1.status = ?3 AND t1.assigned_to IS NULL AND t1.workspace_name = ?4 \
+             WHERE t1.phase = ?3 AND t1.assigned_to IS NULL AND t1.workspace_name = ?4 \
              AND t1.is_archived = 0 \
              {pipeline_blocker_clause}{prereq_filter} \
              ORDER BY t1.pipeline_reservation DESC, t1.created_at ASC LIMIT 1) \
@@ -1050,7 +1106,7 @@ impl BoardStore {
 
     /// Get a ticket's phase by id — lightweight, no comments loaded.
     pub async fn get_ticket_phase(&self, ticket_id: &str) -> Result<Option<TicketPhase>> {
-        let sql = "SELECT status FROM tickets WHERE id = ?1";
+        let sql = "SELECT phase FROM tickets WHERE id = ?1";
         let rows = self.conn.query(sql, turso::params![ticket_id]).await?;
         match rows.into_iter().next() {
             Some(row) => {
@@ -1104,7 +1160,7 @@ impl BoardStore {
     /// Note: this does **not** use [`Self::build_ticket_update_with_updated_at`]
     /// because it has extra SET columns (`assigned_to = NULL`,
     /// `pipeline_reservation = COALESCE(?5, pipeline_reservation)`) and an
-    /// additional WHERE condition (`AND (?4 IS NULL OR status = ?4)`) that
+    /// additional WHERE condition (`AND (?4 IS NULL OR phase = ?4)`) that
     /// don't fit the helper's fixed pattern.
     fn build_transition_sql(
         ticket_id: &str,
@@ -1114,9 +1170,9 @@ impl BoardStore {
     ) -> PreparedUpdate {
         let now = turso::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
-        let sql = "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
+        let sql = "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
                     pipeline_reservation = COALESCE(?5, pipeline_reservation) \
-                    WHERE id = ?3 AND (?4 IS NULL OR status = ?4)";
+                    WHERE id = ?3 AND (?4 IS NULL OR phase = ?4)";
         let params: Vec<turso::Value> = vec![
             Value::from(target_phase.as_ref()),
             Value::from(now),
@@ -1138,7 +1194,7 @@ impl BoardStore {
     ///
     /// When `reservation` is `None`, the column is left untouched so bounce-back
     /// transitions can set it atomically, and manual transitions leave stale
-    /// reservations inert (claim/blocker queries filter by status). When
+    /// reservations inert (claim/blocker queries filter by phase). When
     /// `Some(value)`, it's set in the same UPDATE to avoid a race on crash/restart
     /// recovery or rework priority.
     ///
@@ -1267,7 +1323,7 @@ impl BoardStore {
                  SET assigned_to = ?1, updated_at = ?2 \
                  WHERE id = ?3 \
                  AND assigned_to IS NULL \
-                 AND status = ?4 \
+                 AND phase = ?4 \
                  AND is_archived = 0",
                 turso::params![
                     assigned_to,
@@ -1305,13 +1361,13 @@ impl BoardStore {
         let blocker =
             phase_list_sql_fragment(&[TicketPhase::InSanitation, TicketPhase::SanitationPassed]);
         let sql = format!(
-            "UPDATE tickets SET status = ?1, assigned_to = ?2, updated_at = ?3 \
-             WHERE id = ?4 AND status = ?5 AND is_archived = 0 \
+            "UPDATE tickets SET phase = ?1, assigned_to = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND phase = ?5 AND is_archived = 0 \
              AND NOT EXISTS (SELECT 1 FROM tickets t2 \
                WHERE t2.workspace_name = \
                  (SELECT workspace_name FROM tickets WHERE id = ?4) \
                AND t2.id != ?4 \
-               AND t2.status IN ({blocker}))"
+               AND t2.phase IN ({blocker}))"
         );
         let rows = self
             .conn
@@ -1471,8 +1527,8 @@ impl BoardStore {
         let now = turso::now();
         for transition in Self::RESET_TRANSITIONS {
             tx.execute(
-                "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2, \
-                 pipeline_reservation = ?4 WHERE status = ?3",
+                "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
+                 pipeline_reservation = ?4 WHERE phase = ?3",
                 turso::params![
                     transition.to.as_ref(),
                     now.clone(),
@@ -1530,13 +1586,13 @@ impl BoardStore {
     ) -> Result<bool> {
         let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
         let rfd_condition = if require_rfd_reservation {
-            "(status = ?3 AND pipeline_reservation = 1)".to_string()
+            "(phase = ?3 AND pipeline_reservation = 1)".to_string()
         } else {
-            "status = ?3".to_string()
+            "phase = ?3".to_string()
         };
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
-             (status IN ({blocker_sql}) OR {rfd_condition}) \
+             (phase IN ({blocker_sql}) OR {rfd_condition}) \
              AND workspace_name = ?1 AND is_archived = 0 \
              AND (?2 IS NULL OR id != ?2) LIMIT 1",
         );
@@ -1747,7 +1803,7 @@ impl BoardStore {
         let phase_str: Option<&str> = phase_filter.as_ref().map(TicketPhase::as_ref);
         self.select_tickets(
             "WHERE (?1 IS NULL OR workspace_name = ?1) \
-             AND (?2 IS NULL OR status = ?2) \
+             AND (?2 IS NULL OR phase = ?2) \
              AND is_archived = 0 \
              ORDER BY created_at DESC",
             turso::params![workspace_name, phase_str],
@@ -1770,7 +1826,7 @@ impl BoardStore {
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM tickets \
-                 WHERE status = ?1 \
+                 WHERE phase = ?1 \
                    AND (?2 IS NULL OR workspace_name = ?2) \
                    AND is_archived = 0",
                 turso::params![phase.as_ref(), workspace_name],
@@ -1820,8 +1876,8 @@ impl BoardStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tickets SET status = ?1, assigned_to = NULL, updated_at = ?2 \
-                 WHERE status = ?3 AND workspace_name = ?4 AND is_archived = 0",
+                "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2 \
+                 WHERE phase = ?3 AND workspace_name = ?4 AND is_archived = 0",
                 turso::params![
                     TicketPhase::Planning.as_ref(),
                     now,
@@ -1840,7 +1896,7 @@ impl BoardStore {
             .conn
             .execute(
                 "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
-                 WHERE status = ?2 AND updated_at < ?3 AND assigned_to IS NULL \
+                 WHERE phase = ?2 AND updated_at < ?3 AND assigned_to IS NULL \
                  AND is_archived = 0",
                 turso::params![now, TicketPhase::Cancelled.as_ref(), cutoff],
             )
@@ -1857,7 +1913,7 @@ impl BoardStore {
         let done_cancelled = [TicketPhase::Done, TicketPhase::Cancelled];
         let sql = format!(
             "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
-             WHERE status IN ({}) AND assigned_to IS NULL AND is_archived = 0 \
+             WHERE phase IN ({}) AND assigned_to IS NULL AND is_archived = 0 \
              AND (?2 IS NULL OR workspace_name = ?2)",
             phase_list_sql_fragment(&done_cancelled),
         );

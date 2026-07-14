@@ -1321,7 +1321,7 @@ async fn test_create_ticket_tool_with_prerequisites() {
 ///
 /// This also implicitly covers superseding an already-cancelled ticket: the
 /// cancellation UPDATE (`supersede_and_create` line 797) has no phase guard
-/// (`WHERE id = ?3` without `AND status = ?`), so it runs identically
+/// (`WHERE id = ?3` without `AND phase = ?`), so it runs identically
 /// regardless of the old ticket's current phase. A separate test with a
 /// `Cancelled` starting phase would exercise the exact same SQL path and
 /// assert the same invariants (`assert_superseded_ticket`, `supersedes`
@@ -2469,4 +2469,190 @@ async fn test_list_archived_with_embeddings_returns_deserialized() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].0, id);
     assert_eq!(candidates[0].1, vec![1.0, 2.0]);
+}
+
+// ── Migration test: rename `status` column to `phase` ──────────────────────
+
+/// Old DDL with the `status` column (pre-migration schema).
+const OLD_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS tickets (
+    id              TEXT PRIMARY KEY,
+    title           TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'backlog',
+    assigned_to     TEXT,
+    workspace_name  TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    prerequisites   TEXT NOT NULL DEFAULT '[]',
+    supersedes      TEXT,
+    superseded_by   TEXT,
+    commit_hash     TEXT,
+    lines_added     INTEGER,
+    lines_removed   INTEGER,
+    reporter        TEXT NOT NULL DEFAULT '',
+    is_archived     INTEGER NOT NULL DEFAULT 0,
+    embedding       BLOB,
+    pipeline_reservation INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ticket_comments (
+    id          TEXT PRIMARY KEY,
+    ticket_id   TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (ticket_id) REFERENCES tickets(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
+CREATE TABLE IF NOT EXISTS ticket_counters (
+    workspace_name TEXT PRIMARY KEY,
+    next_id        INTEGER NOT NULL DEFAULT 1
+);";
+
+/// Validate that the `status` → `phase` migration works correctly:
+///   1. Creates a database with the old schema (`status` column)
+///   2. Inserts sample rows via raw SQL
+///   3. Opens the database via [`BoardStore`], which triggers migration in `after_open`
+///   4. Verifies data survived intact
+///   5. Verifies the column is now named `phase`
+///   6. Verifies `PRAGMA user_version = 1`
+///   7. Re-opens to verify idempotency
+#[tokio::test]
+async fn test_status_to_phase_migration() {
+    let tmp = TempDir::new().expect("temp dir for migration test");
+
+    // ── 1. Create a database with the old schema (`status` column) ──────
+    let db_path = tmp.path().join("db").join("board.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).expect("create db directory");
+
+    let old_conn = crate::turso::open_with_schema(&db_path, OLD_SCHEMA)
+        .await
+        .expect("open database with old schema");
+
+    // ── 2. Insert sample rows using the old column layout ───────────────
+    old_conn
+        .execute(
+            "INSERT INTO tickets (id, title, description, status, workspace_name, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            crate::turso::params![
+                "t1",
+                "Alpha",
+                "First ticket",
+                "backlog",
+                "ws1",
+                "2024-01-01T00:00:00Z",
+                "2024-01-01T00:00:00Z",
+            ],
+        )
+        .await
+        .expect("insert ticket t1");
+    old_conn
+        .execute(
+            "INSERT INTO tickets (id, title, description, status, workspace_name, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            crate::turso::params![
+                "t2",
+                "Beta",
+                "Second ticket",
+                "in_development",
+                "ws1",
+                "2024-01-02T00:00:00Z",
+                "2024-01-02T00:00:00Z",
+            ],
+        )
+        .await
+        .expect("insert ticket t2");
+
+    // Checkpoint and close the old connection.
+    old_conn
+        .checkpoint()
+        .await
+        .expect("checkpoint old connection");
+    drop(old_conn);
+
+    // ── 3. Open via BoardStore — triggers migration in after_open() ─────
+    let store = BoardStore::open(tmp.path())
+        .await
+        .expect("open board store (should trigger migration)");
+
+    // ── 4. Verify data survived intact ─────────────────────────────────
+    let rows = store
+        .conn
+        .query("SELECT id, title, phase FROM tickets ORDER BY id", ())
+        .await
+        .expect("query migrated tickets");
+    assert_eq!(rows.len(), 2, "should have 2 tickets after migration");
+    assert_eq!(rows[0].get::<String>(0).unwrap(), "t1");
+    assert_eq!(rows[0].get::<String>(1).unwrap(), "Alpha");
+    assert_eq!(rows[0].get::<String>(2).unwrap(), "backlog");
+    assert_eq!(rows[1].get::<String>(0).unwrap(), "t2");
+    assert_eq!(rows[1].get::<String>(1).unwrap(), "Beta");
+    assert_eq!(rows[1].get::<String>(2).unwrap(), "in_development");
+
+    // ── 5. Verify column is now named `phase`, not `status` ─────────────
+    let table_info = store
+        .conn
+        .query("PRAGMA table_info('tickets')", ())
+        .await
+        .expect("query table_info after migration");
+    let col_names: Vec<String> = table_info
+        .iter()
+        .filter_map(|r| r.get::<String>(1).ok())
+        .collect();
+    assert!(
+        !col_names.iter().any(|n| n == "status"),
+        "column 'status' should not exist after migration; found: {:?}",
+        col_names,
+    );
+    assert!(
+        col_names.iter().any(|n| n == "phase"),
+        "column 'phase' must exist after migration; found: {:?}",
+        col_names,
+    );
+
+    // ── 6. Verify PRAGMA user_version = 1 ──────────────────────────────
+    let ver_rows = store
+        .conn
+        .query("PRAGMA user_version", ())
+        .await
+        .expect("query user_version after migration");
+    let version: i64 = ver_rows[0].get(0).expect("get user_version value");
+    assert_eq!(version, 1, "user_version should be 1 after migration");
+
+    // ── 7. Re-open to verify idempotency ───────────────────────────────
+    drop(store);
+    let store2 = BoardStore::open(tmp.path())
+        .await
+        .expect("re-open board store (idempotent migration)");
+
+    // Data still intact
+    let count_rows = store2
+        .conn
+        .query("SELECT COUNT(*) FROM tickets", ())
+        .await
+        .expect("query ticket count after re-open");
+    let count: i64 = count_rows[0].get(0).expect("get count");
+    assert_eq!(count, 2, "should still have 2 tickets after re-open");
+
+    // Column still named `phase`
+    let table_info2 = store2
+        .conn
+        .query("PRAGMA table_info('tickets')", ())
+        .await
+        .expect("query table_info after re-open");
+    let has_phase2 = table_info2
+        .iter()
+        .any(|r| r.get::<String>(1).ok().as_deref() == Some("phase"));
+    assert!(has_phase2, "column should still be 'phase' after re-open");
+
+    // Version still 1
+    let ver_rows2 = store2
+        .conn
+        .query("PRAGMA user_version", ())
+        .await
+        .expect("query user_version after re-open");
+    let version2: i64 = ver_rows2[0].get(0).expect("get version");
+    assert_eq!(version2, 1, "user_version should remain 1 after re-open");
 }

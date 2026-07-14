@@ -301,6 +301,6 @@ fn print_usage() {
     eprintln!("  SQL query    read-only SQL, quoted as a single argument");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  mahbot debug --db board \"SELECT status, COUNT(*) FROM tickets GROUP BY status\"");
+    eprintln!("  mahbot debug --db board \"SELECT phase, COUNT(*) FROM tickets GROUP BY phase\"");
     eprintln!("  mahbot debug --db all \"SELECT name FROM sqlite_master WHERE type='table'\"");
 }
