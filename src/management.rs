@@ -1457,23 +1457,21 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
-    let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
 
-    let verdict: crate::SanitationVerdict = match agent
-        .extract_structured(&extraction_prompt, &retry_prompt, 5)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to extract sanitation verdict — clearing assigned_to for retry"
-            );
-            record_sanitation_failure(&ticket.id, format!("verdict extraction error: {e}")).await;
-            return;
-        }
-    };
+    let verdict: crate::SanitationVerdict =
+        match agent.extract_structured(&extraction_prompt, 5).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to extract sanitation verdict — clearing assigned_to for retry"
+                );
+                record_sanitation_failure(&ticket.id, format!("verdict extraction error: {e}"))
+                    .await;
+                return;
+            }
+        };
 
     process_sanitation_verdict(&ticket, verdict).await;
 }
@@ -1801,7 +1799,6 @@ async fn run_parallel_agents(
     extraction_prompt: &str,
 ) -> Vec<ParallelVerdict> {
     let suffix = crate::generate_suffix();
-    let retry_prompt = load_prompt("extraction/retry.md");
     let futures: Vec<_> = (0..PARALLEL_AGENT_COUNT)
         .map(move |i| {
             let ticket = Arc::clone(ticket);
@@ -1810,7 +1807,6 @@ async fn run_parallel_agents(
             let base = ticket_session_key(&ticket.id, role.as_str());
             let session_key = format!("{base}_{i}_{suffix}");
             let extraction_prompt = extraction_prompt.to_string();
-            let retry_prompt = retry_prompt.clone();
             async move {
                 let (agent, response) =
                     run_agent(session_key, role, &ws, Some(&ticket), &prompt).await;
@@ -1824,7 +1820,7 @@ async fn run_parallel_agents(
                 // to the original verifier agent call — the provider can reuse the
                 // cached prefix.
                 let verdict = agent
-                    .extract_structured::<crate::Verdict>(&extraction_prompt, &retry_prompt, 5)
+                    .extract_structured::<crate::Verdict>(&extraction_prompt, 5)
                     .await
                     .ok();
                 match verdict {

@@ -637,7 +637,6 @@ impl Agent {
     pub(crate) async fn extract_structured<T: serde::de::DeserializeOwned>(
         &self,
         extraction_prompt: &str,
-        retry_prompt: &str,
         max_attempts: usize,
     ) -> anyhow::Result<T> {
         // Build a params-only ChatRequest (messages will be substituted by
@@ -646,7 +645,6 @@ impl Agent {
         crate::extraction::retry_extract_structured(
             self.session.history(),
             extraction_prompt,
-            retry_prompt,
             &params,
             max_attempts,
         )

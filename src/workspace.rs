@@ -202,15 +202,12 @@ async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) ->
     // Keep the Agent alive after run_agent() for retry_extract_structured —
     // it needs agent.session.history() and agent.tool_specs.
     let extraction_prompt = crate::prompt::load_prompt("extraction/diagnostics.md");
-    let retry_prompt = crate::prompt::load_prompt("extraction/retry.md");
 
     // KV-cache preservation: `agent.extract_structured` uses the agent's own
     // parameters (model, temperature, reasoning_effort, tools, provider routing)
     // so the extraction call is byte-identical to the original Discovery agent
     // call — the provider can reuse the cached prefix.
-    let cmds: crate::DiagnosticsCommands = agent
-        .extract_structured(&extraction_prompt, &retry_prompt, 3)
-        .await?;
+    let cmds: crate::DiagnosticsCommands = agent.extract_structured(&extraction_prompt, 3).await?;
 
     // Guard against stale writes — see run_workspace_discovery.
     if !check_discovery_generation(&storage, &ws.name, discovery_generation, "diagnostics").await {

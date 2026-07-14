@@ -5,6 +5,7 @@
 
 use serde::de::DeserializeOwned;
 
+use crate::prompt::load_prompt;
 use crate::providers::chat;
 use crate::util::json::parse_fenced_json;
 use crate::{ChatMessage, ChatRequest};
@@ -29,7 +30,6 @@ use crate::{ChatMessage, ChatRequest};
 pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
-    retry_prompt: &str,
     params: &ChatRequest,
     max_attempts: usize,
 ) -> anyhow::Result<T> {
@@ -40,6 +40,7 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
         extraction_history.push(ChatMessage::user(extraction_prompt));
     }
 
+    let retry_prompt = load_prompt("extraction/retry.md");
     let mut last_raw = String::new();
 
     for _attempt in 1..=max_attempts {
@@ -61,7 +62,7 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
 
         // Tool calls or parse failure — push raw assistant text + retry prompt, continue
         extraction_history.push(ChatMessage::assistant(last_raw.clone()));
-        extraction_history.push(ChatMessage::user(retry_prompt));
+        extraction_history.push(ChatMessage::user(retry_prompt.as_str()));
     }
 
     let snippet: String = last_raw.chars().take(300).collect();
