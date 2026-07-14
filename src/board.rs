@@ -803,8 +803,8 @@ impl BoardStore {
              Cross-workspace supersede is not allowed.",
             params.workspace_name,
         );
-        let status_str: String = row.get(1)?;
-        let old_phase: TicketPhase = status_str.parse()?;
+        let phase_str: String = row.get(1)?;
+        let old_phase: TicketPhase = phase_str.parse()?;
 
         let now = turso::now();
         let cancelled_rows = tx
@@ -1054,8 +1054,8 @@ impl BoardStore {
         let rows = self.conn.query(sql, turso::params![ticket_id]).await?;
         match rows.into_iter().next() {
             Some(row) => {
-                let status: String = row.get(0)?;
-                Ok(Some(status.parse()?))
+                let phase: String = row.get(0)?;
+                Ok(Some(phase.parse()?))
             }
             None => Ok(None),
         }
@@ -1742,15 +1742,15 @@ impl BoardStore {
     pub async fn list_all_tickets(
         &self,
         workspace_name: Option<&str>,
-        status_filter: Option<TicketPhase>,
+        phase_filter: Option<TicketPhase>,
     ) -> Result<Vec<Ticket>> {
-        let status_str: Option<&str> = status_filter.as_ref().map(TicketPhase::as_ref);
+        let phase_str: Option<&str> = phase_filter.as_ref().map(TicketPhase::as_ref);
         self.select_tickets(
             "WHERE (?1 IS NULL OR workspace_name = ?1) \
              AND (?2 IS NULL OR status = ?2) \
              AND is_archived = 0 \
              ORDER BY created_at DESC",
-            turso::params![workspace_name, status_str],
+            turso::params![workspace_name, phase_str],
             LoadComments::No,
         )
         .await

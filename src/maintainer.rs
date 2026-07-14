@@ -147,7 +147,7 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
         return false;
     };
 
-    let count_status = |phase: TicketPhase| async move {
+    let count_phase = |phase: TicketPhase| async move {
         match board.count_by_phase(phase, Some(&ws.name)).await {
             Ok(c) => c,
             Err(e) => {
@@ -158,9 +158,9 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
     };
 
     let pre_dev_count = {
-        let analysis = count_status(TicketPhase::Analysis).await;
-        let planning = count_status(TicketPhase::Planning).await;
-        let ready = count_status(TicketPhase::ReadyForDevelopment).await;
+        let analysis = count_phase(TicketPhase::Analysis).await;
+        let planning = count_phase(TicketPhase::Planning).await;
+        let ready = count_phase(TicketPhase::ReadyForDevelopment).await;
         analysis + planning + ready
     };
 
