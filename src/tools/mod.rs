@@ -76,43 +76,6 @@ use crate::util::json::{
     get_usize,
 };
 
-/// Find the path argument value from tool call arguments.
-///
-/// Returns the value of the `"path"` key as a string slice, or `None` if
-/// the key is missing or the value is not a string.
-///
-/// Note: argument aliases (`file`, `filename`) are expected to be remapped
-/// to `path` before reaching this function — callers should normalize via
-/// [`normalize_tool_call`] first.
-///
-/// This is the borrowed counterpart of [`require_path_arg`] — it returns
-/// `Option<&str>` (borrowed, optional) while [`require_path_arg`] returns
-/// `Result<String>` (owned, required).
-#[must_use]
-fn find_path_arg(args: &serde_json::Value) -> Option<&str> {
-    args.get("path")?.as_str()
-}
-
-/// Extract a required `"path"` argument from tool call arguments.
-///
-/// Returns the path as an owned `String`, or a descriptive error if no `"path"`
-/// argument is present.
-///
-/// Note: argument aliases (`file`, `filename`) must be remapped to `path`
-/// before calling this function — see [`normalize_tool_call`].
-///
-/// This is the owned counterpart of [`find_path_arg`] — it returns
-/// `Result<String>` (owned, required) while [`find_path_arg`] returns
-/// `Option<&str>` (borrowed, optional).
-fn require_path_arg(args: &serde_json::Value) -> anyhow::Result<String> {
-    find_path_arg(args).map(ToString::to_string).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Missing required field: 'path'. \
-                     Example: {{\"path\": \"src/main.rs\"}}"
-        )
-    })
-}
-
 /// Returns true when the path looks like a glob rather than a literal file path.
 #[must_use]
 fn path_contains_wildcard(path: &str) -> bool {
@@ -492,26 +455,7 @@ mod tests {
         }
     }
 
-    // ── require_path_arg tests ─────────────────────────────────────────
-
-    /// Basic tests for [`require_path_arg`].
-    /// After the simplification of [`find_path_arg`] (which now only checks
-    /// the `"path"` key), alias resolution is verified exclusively by the
-    /// [`normalize_tool_call_remaps_all_path_aliases`] test below.
-    #[test]
-    fn require_path_arg_path_lookup() {
-        // "path" key works directly
-        assert_eq!(
-            require_path_arg(&serde_json::json!({"path": "src/main.rs"})).unwrap(),
-            "src/main.rs"
-        );
-        // "path" ignored when non-string
-        let err = require_path_arg(&serde_json::json!({"path": ["invalid"]})).unwrap_err();
-        assert!(err.to_string().contains("path"));
-        // Missing path → descriptive error mentioning 'path'
-        let err = require_path_arg(&serde_json::json!({"other": "value"})).unwrap_err();
-        assert!(err.to_string().contains("path"));
-    }
+    // ── normalize_tool_call tests ─────────────────────────────────────
 
     /// Verify that [`normalize_tool_call`] remaps every alias in
     /// [`PATH_ALIAS_KEYS`] to `"path"` unconditionally — the remapping is

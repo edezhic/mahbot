@@ -54,7 +54,7 @@ impl Tool for EditTool {
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
         // ── 1. Extract parameters ──────────────────────────────────
-        let path = super::require_path_arg(&args)?;
+        let path = super::get_str(&args, "path")?.to_string();
 
         let old_string = super::get_opt_str(&args, "old_string");
 
@@ -228,7 +228,7 @@ fn format_file_tool_result(
     args: &serde_json::Value,
     success: bool,
 ) -> String {
-    let path = super::find_path_arg(args).unwrap_or("?");
+    let path = super::get_opt_str(args, "path").unwrap_or("?");
     if !success {
         return format!("❌ {action} attempted on {path}");
     }
