@@ -364,23 +364,15 @@ fn compute_text_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Ra
     let mut matches = Vec::new();
 
     if case_sensitive {
-        let mut offset = 0;
-        while let Some(pos) = text[offset..].find(query) {
-            let abs_start = offset + pos;
-            let abs_end = abs_start + query.len();
-            matches.push(abs_start..abs_end);
-            offset = abs_end;
+        for (start, _) in text.match_indices(query) {
+            matches.push(start..start + query.len());
         }
     } else {
         // Case-insensitive: lowercase both strings (ASCII-only, length-preserving).
         let text_lower = text.to_ascii_lowercase();
         let query_lower = query.to_ascii_lowercase();
-        let mut offset = 0;
-        while let Some(pos) = text_lower[offset..].find(&query_lower) {
-            let abs_start = offset + pos;
-            let abs_end = abs_start + query.len();
-            matches.push(abs_start..abs_end);
-            offset = abs_end;
+        for (start, _) in text_lower.match_indices(&query_lower) {
+            matches.push(start..start + query.len());
         }
     }
 
