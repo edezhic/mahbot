@@ -115,8 +115,23 @@ fn test_ticket_phase_parse_and_roundtrip() {
         assert_eq!(&parsed, &v, "roundtrip failed for {v}");
     }
 
-    // Error case
-    assert!("unknown_phase".parse::<TicketPhase>().is_err());
+    // Error case — verify error message includes helpful details.
+    // Also verifies error message format (formerly test_ticket_phase_from_str_error_message).
+    let err = "unknown_phase".parse::<TicketPhase>().unwrap_err();
+    let msg = format!("{err}");
+
+    assert!(
+        msg.contains("Invalid phase"),
+        "error should mention 'Invalid phase', got: {msg}"
+    );
+    assert!(
+        msg.contains("unknown_phase"),
+        "error should contain the invalid input value, got: {msg}"
+    );
+    assert!(
+        TicketPhase::iter().any(|p| msg.contains(p.as_ref())),
+        "error should list at least one valid phase, got: {msg}"
+    );
 }
 
 #[test]
@@ -131,25 +146,6 @@ fn test_display_name_no_underscores() {
             "display_name for {variant} still has underscore: {name}"
         );
     }
-}
-
-#[test]
-fn test_ticket_phase_from_str_error_message() {
-    let err = "bogus_status".parse::<TicketPhase>().unwrap_err();
-    let msg = format!("{err}");
-
-    assert!(
-        msg.contains("Invalid phase"),
-        "error should mention 'Invalid phase', got: {msg}"
-    );
-    assert!(
-        msg.contains("bogus_status"),
-        "error should contain the invalid input value, got: {msg}"
-    );
-    assert!(
-        TicketPhase::iter().any(|p| msg.contains(p.as_ref())),
-        "error should list at least one valid phase, got: {msg}"
-    );
 }
 
 #[tokio::test]
@@ -1171,11 +1167,34 @@ async fn test_archive_all_done_and_cancelled() {
 
     // Create three tickets: one Done, one Cancelled, one Backlog.
     let done_id = make_ticket(&store, &ws, "done", TicketPhase::Done).await;
-
     let cancelled_id = make_ticket(&store, &ws, "cancelled", TicketPhase::Cancelled).await;
-
     let backlog_id = make_ticket(&store, &ws, "backlog", TicketPhase::Backlog).await;
-    // Leave in Backlog.
+
+    // Before archiving, count_by_phase includes active tickets.
+    let count_done_before = store
+        .count_by_phase(TicketPhase::Done, None)
+        .await
+        .expect("count Done before");
+    assert_eq!(
+        count_done_before, 1,
+        "Should count Done ticket before archive"
+    );
+    let count_cancelled_before = store
+        .count_by_phase(TicketPhase::Cancelled, None)
+        .await
+        .expect("count Cancelled before");
+    assert_eq!(
+        count_cancelled_before, 1,
+        "Should count Cancelled ticket before archive"
+    );
+    let count_backlog_before = store
+        .count_by_phase(TicketPhase::Backlog, None)
+        .await
+        .expect("count Backlog before");
+    assert_eq!(
+        count_backlog_before, 1,
+        "Should count Backlog ticket before archive"
+    );
 
     // Act
     let count = store
@@ -1184,7 +1203,7 @@ async fn test_archive_all_done_and_cancelled() {
         .expect("archive");
     assert_eq!(count, 2, "should archive Done and Cancelled tickets");
 
-    // Assert
+    // Assert per-ticket state
     let done_ticket = crate::util::test::expect_ticket(&store, &done_id).await;
     assert!(done_ticket.is_archived, "Done ticket should be archived");
     assert_eq!(done_ticket.phase, TicketPhase::Done);
@@ -1202,6 +1221,33 @@ async fn test_archive_all_done_and_cancelled() {
         "Backlog ticket should NOT be archived"
     );
     assert_eq!(backlog_ticket.phase, TicketPhase::Backlog);
+
+    // After archiving, count_by_phase excludes archived tickets.
+    // Also verifies count_by_phase excludes archived tickets (formerly test_count_by_phase_excludes_archived).
+    let count_done_after = store
+        .count_by_phase(TicketPhase::Done, None)
+        .await
+        .expect("count Done after");
+    assert_eq!(
+        count_done_after, 0,
+        "Should not count archived Done tickets"
+    );
+    let count_cancelled_after = store
+        .count_by_phase(TicketPhase::Cancelled, None)
+        .await
+        .expect("count Cancelled after");
+    assert_eq!(
+        count_cancelled_after, 0,
+        "Should not count archived Cancelled tickets"
+    );
+    let count_backlog_after = store
+        .count_by_phase(TicketPhase::Backlog, None)
+        .await
+        .expect("count Backlog after");
+    assert_eq!(
+        count_backlog_after, 1,
+        "Should still count non-archived Backlog tickets"
+    );
 }
 
 #[tokio::test]
@@ -1246,47 +1292,6 @@ async fn test_archive_all_done_and_cancelled_workspace_filter() {
         TicketPhase::Done,
         "ws2 ticket should remain Done"
     );
-}
-
-#[tokio::test]
-async fn test_count_by_phase_excludes_archived() {
-    let (store, _tmp) = open_test_store().await;
-    // Create a ticket set to Done.
-    let _id = make_ticket(
-        &store,
-        &test_ws_named("/ws", "ws"),
-        "Test",
-        TicketPhase::Done,
-    )
-    .await;
-
-    // Before archiving, count includes the Done ticket.
-    let count_before = store
-        .count_by_phase(TicketPhase::Done, None)
-        .await
-        .expect("count before");
-    assert_eq!(count_before, 1, "Should count Done ticket before archive");
-
-    // Archive done tickets.
-    let archived = store
-        .archive_all_done_and_cancelled(None)
-        .await
-        .expect("archive");
-    assert_eq!(archived, 1, "Should have archived 1 ticket");
-
-    // After archiving, count_by_phase(Done) should return 0.
-    let count_after = store
-        .count_by_phase(TicketPhase::Done, None)
-        .await
-        .expect("count after");
-    assert_eq!(count_after, 0, "Should not count archived Done tickets");
-
-    // Archived tickets with other statuses should also be excluded.
-    let count_cancelled = store
-        .count_by_phase(TicketPhase::Cancelled, None)
-        .await
-        .expect("count cancelled");
-    assert_eq!(count_cancelled, 0, "No Cancelled tickets exist");
 }
 
 #[tokio::test]
