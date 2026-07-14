@@ -79,28 +79,10 @@ impl Session {
                 .await?;
             history.extend(msgs);
         } else {
-            // ── CACHING DESIGN ─────────────────────────────────────────
-            // System prompts (from build_context_messages, via
-            // build_turn_messages) are intentionally
-            // NOT rebuilt on subsequent turns. The session DB caches the
-            // full message set from the first turn so we only need to
-            // append the new user message here (with a fresh per-turn
-            // datetime prefix).
-            //
-            // This avoids regenerating workspace state and ticket data on
-            // every turn — they are baked at session start and remain
-            // stable. The one exception is `apply_summary` below,
-            // which calls `build_context_messages` fresh when the
-            // conversation exceeds the token budget and requires
-            // compaction.
-            //
-            // If you change what goes into the system prompt, existing
-            // sessions will not pick up the change until summarization
-            // fires or the user runs /new (Session::delete). This is by
-            // design, not a bug. Datetime is no longer part of the system
-            // prompt — it is prepended per-turn to each user message
-            // via `user_msg_with_datetime`.
-            // ────────────────────────────────────────────────────────────
+            // Caching: system prompt is NOT rebuilt on subsequent turns
+            // (see doc comment above). The session DB caches the full
+            // first-turn message set. The only rebuild path is
+            // `apply_summary` below.
             let user_msg = user_msg_with_datetime(msg);
             crate::session::store()
                 .append(session_key, &user_msg)
