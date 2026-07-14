@@ -1682,12 +1682,12 @@ impl BoardStore {
         .await
     }
 
-    /// Insert a comment record into ticket_comments — no `updated_at` UPDATE.
+    /// Transactional variant of [`add_comment`](Self::add_comment) —
+    /// uses an existing transaction instead of opening its own.
+    /// Does NOT commit or rollback; the caller controls outer transaction lifecycle.
     ///
-    /// Use when the caller independently manages the ticket timestamp (e.g.,
-    /// when the calling transaction will also call [`transition_to_tx`](Self::transition_to_tx),
-    /// which updates `updated_at`). This avoids redundant timestamp writes.
-    pub(crate) async fn insert_comment_tx(
+    /// Inserts the comment record AND updates the ticket's `updated_at` timestamp.
+    pub(crate) async fn add_comment_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
         role: &str,
@@ -1701,25 +1701,6 @@ impl BoardStore {
             turso::params![comment_id, ticket_id, role, content, now.as_str()],
         )
         .await?;
-        Ok(())
-    }
-
-    /// Transactional variant of [`add_comment`](Self::add_comment) —
-    /// uses an existing transaction instead of opening its own.
-    /// Does NOT commit or rollback; the caller controls outer transaction lifecycle.
-    ///
-    /// This is a convenience wrapper that calls [`insert_comment_tx`](Self::insert_comment_tx)
-    /// and also updates the ticket's `updated_at` timestamp. Prefer
-    /// [`insert_comment_tx`](Self::insert_comment_tx) when a subsequent
-    /// [`transition_to_tx`](Self::transition_to_tx) will update `updated_at`.
-    pub(crate) async fn add_comment_tx(
-        tx: &TxGuard<'_>,
-        ticket_id: &str,
-        role: &str,
-        content: &str,
-    ) -> Result<()> {
-        let now = turso::now();
-        Self::insert_comment_tx(tx, ticket_id, role, content).await?;
         tx.execute(
             "UPDATE tickets SET updated_at = ?1 WHERE id = ?2",
             turso::params![now.as_str(), ticket_id],
