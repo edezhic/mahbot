@@ -1124,7 +1124,7 @@ async fn transition_ticket_to_done_if_git_unavailable(
     false
 }
 
-/// Check git availability and run `git status --porcelain`.
+/// Ensure git is available and run `git status --porcelain`.
 ///
 /// # Side effects
 ///
@@ -1141,7 +1141,7 @@ async fn transition_ticket_to_done_if_git_unavailable(
 ///   succeeded. The caller should use the output to decide how to finalize.
 /// - `None` — git is unavailable (ticket was already moved to Done) or the
 ///   status query failed (caller should return; the poller will retry).
-async fn check_git_and_get_status(
+async fn ensure_git_and_get_status(
     ticket: &Ticket,
     ws: &Workspace,
     phase: TicketPhase,
@@ -1216,10 +1216,10 @@ async fn finalize_ticket_with_status(
 /// SanitationPassed→Done flows share the same implementation.
 ///
 /// Checks git availability, queries `git status --porcelain` via
-/// [`check_git_and_get_status`], then delegates to
+/// [`ensure_git_and_get_status`], then delegates to
 /// [`finalize_ticket_with_status`] for the commit-or-done decision.
 async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
-    let Some(porcelain) = check_git_and_get_status(&ticket, &ws, source, "finalize").await else {
+    let Some(porcelain) = ensure_git_and_get_status(&ticket, &ws, source, "finalize").await else {
         return;
     };
 
@@ -1312,7 +1312,7 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
 /// Otherwise, commits and transitions to Done (existing behavior).
 async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     let Some(porcelain) =
-        check_git_and_get_status(&ticket, &ws, TicketPhase::QaPassed, "untracked files check")
+        ensure_git_and_get_status(&ticket, &ws, TicketPhase::QaPassed, "untracked files check")
             .await
     else {
         return;
