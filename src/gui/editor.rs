@@ -5107,7 +5107,9 @@ impl EditorState {
             .size(13);
 
         let total = state.matches.len();
-        let match_label = if !state.query.is_empty() && total > 0 {
+        let match_label = if !state.query.is_empty() && state.query.len() < 2 {
+            "Min 2 chars".to_string()
+        } else if !state.query.is_empty() && total > 0 {
             format!("{}/{}", state.current_match_idx.saturating_add(1), total)
         } else if !state.query.is_empty() {
             "0/0".to_string()
