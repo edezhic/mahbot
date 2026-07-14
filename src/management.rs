@@ -308,23 +308,23 @@ struct TransitionCtx<'a> {
 /// function. Do **not** call this on a path where an agent may still be
 /// executing on the ticket.
 #[must_use]
-async fn with_comment_and_transition<F>(args: TransitionCtx<'_>, write_comments: F) -> bool
+async fn with_comment_and_transition<F>(ctx: TransitionCtx<'_>, write_comments: F) -> bool
 where
     F: AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
 {
-    let pipeline_reservation = (args.target == TicketPhase::ReadyForDevelopment).then_some(true);
+    let pipeline_reservation = (ctx.target == TicketPhase::ReadyForDevelopment).then_some(true);
 
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
-        &args.ticket.id,
-        args.log_label,
+        &ctx.ticket.id,
+        ctx.log_label,
         async move |tx| {
             write_comments(tx).await?;
             BoardStore::transition_to_tx(
                 tx,
-                &args.ticket.id,
-                Some(args.source),
-                args.target,
+                &ctx.ticket.id,
+                Some(ctx.source),
+                ctx.target,
                 pipeline_reservation,
             )
             .await?;
@@ -335,19 +335,19 @@ where
     {
         // Use phase values directly (not strings) so phase names can't drift.
         warn!(
-            ticket = %args.ticket.id,
+            ticket = %ctx.ticket.id,
             error = %e,
             "{}: transition to {} failed — ticket stuck in {}",
-            args.log_label, args.target, args.source,
+            ctx.log_label, ctx.target, ctx.source,
         );
         // Clear assigned_to so the ticket can be re-dispatched on the next poll
         // cycle. All call sites set assigned_to before reaching this function, so
         // the field is always populated when this runs.
-        clear_assigned_to_no_cancel(&args.ticket.id, args.log_label).await;
+        clear_assigned_to_no_cancel(&ctx.ticket.id, ctx.log_label).await;
         return false;
     }
 
-    dispatch_notification(args.ticket, args.source, args.target, args.notify).await;
+    dispatch_notification(ctx.ticket, ctx.source, ctx.target, ctx.notify).await;
     true
 }
 
