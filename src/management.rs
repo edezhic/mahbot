@@ -636,15 +636,16 @@ struct VerifierInfo {
     ///   `"Reviewers"` (3 parallel agents)
     log_label: &'static str,
     success_phase: TicketPhase,
-    /// The ticket phase that the verifier treats as its *source* — the phase a
-    /// ticket must be in for the verifier to run (e.g. [`TicketPhase::InReview`]
-    /// for reviewers, [`TicketPhase::InQa`] for QA).  This is the phase that
-    /// transitions *from* when the verifier finishes (to [`success_phase`] on
-    /// success, or to Failed/ReadyForDevelopment on failure).
+    /// The phase the verifier is *actively working in* — the ticket phase
+    /// the ticket occupies while the verifier's agents run (e.g.
+    /// [`TicketPhase::InReview`] for reviewers, [`TicketPhase::InQa`] for QA).
+    /// This is the phase that transitions *from* when the verifier finishes
+    /// (to [`success_phase`] on success, or to Failed/ReadyForDevelopment
+    /// on failure).
     ///
     /// Contrast with [`PollPhaseInfo::expected_phase`] which serves as the
     /// *target* phase for claim transitions in the poll loop.
-    source_phase: TicketPhase,
+    active_phase: TicketPhase,
     prompt_template: &'static str,
     extraction_prompt_path: &'static str,
 }
@@ -653,7 +654,7 @@ const REVIEWER_VI: VerifierInfo = VerifierInfo {
     role: Role::Reviewer,
     log_label: "Reviewers",
     success_phase: TicketPhase::Reviewed,
-    source_phase: TicketPhase::InReview,
+    active_phase: TicketPhase::InReview,
     prompt_template: "review.md",
     extraction_prompt_path: "extraction/reviewer.md",
 };
@@ -662,7 +663,7 @@ const QA_VI: VerifierInfo = VerifierInfo {
     role: Role::Qa,
     log_label: "QA",
     success_phase: TicketPhase::QaPassed,
-    source_phase: TicketPhase::InQa,
+    active_phase: TicketPhase::InQa,
     prompt_template: "qa.md",
     extraction_prompt_path: "extraction/qa.md",
 };
@@ -734,7 +735,7 @@ impl PollPhase {
                 circuit_breaker_kind: CircuitBreakerKind::Diagnostics,
                 ..PollPhaseInfo::new(TicketPhase::InDiagnostics, "Diagnostics")
             },
-            Self::VerifierCheck(vi) => PollPhaseInfo::new(vi.source_phase, vi.log_label),
+            Self::VerifierCheck(vi) => PollPhaseInfo::new(vi.active_phase, vi.log_label),
         }
     }
 }
@@ -2288,7 +2289,7 @@ async fn process_verifier_verdicts(
     if !with_comment_and_transition(
         TransitionCtx {
             ticket,
-            source: verifier.source_phase,
+            source: verifier.active_phase,
             target,
             notify,
             log_label: verifier.log_label,
@@ -2363,7 +2364,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
 
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
     let results = run_parallel_agents(&ticket, &ws, vi.role, &prompt, &extraction_prompt).await;
-    if !is_ticket_in_phase(&ticket.id, vi.source_phase).await {
+    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
         return;
     }
 
