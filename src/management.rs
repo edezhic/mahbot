@@ -510,9 +510,7 @@ pub async fn run_management() {
         if !crate::shutdown::sleep_or_shutdown(interval).await {
             break;
         }
-        if let Err(e) = poll_round().await {
-            error!(error = %e, "Board poller round failed");
-        }
+        poll_round().await;
     }
 }
 
@@ -866,12 +864,12 @@ async fn dispatch_unassigned_in_phase(
 /// (workspace A claims all phases, then workspace B, …). Correctness is preserved
 /// because claims are atomic per-workspace and `PipelineCheck` gates
 /// are checked within each workspace independently.
-async fn poll_round() -> anyhow::Result<()> {
+async fn poll_round() {
     let workspaces = match crate::workspace::store().list().await {
         Ok(ws_list) => ws_list,
         Err(e) => {
             error!(error = %e, "Failed to list workspaces");
-            return Ok(());
+            return;
         }
     };
 
@@ -910,8 +908,6 @@ async fn poll_round() -> anyhow::Result<()> {
         dispatch_unassigned_in_phase(TicketPhase::InSanitation, PollPhase::SanitationCheck, ws)
             .await;
     }
-
-    Ok(())
 }
 
 /// Claim for each pipeline phase in a workspace.
