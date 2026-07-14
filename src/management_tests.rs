@@ -349,13 +349,14 @@ async fn transition_ticket_to_done_buffer_and_notify() {
 // ── try_trip_circuit_breaker — failure counting ──────────────────
 
 /// Verify that circuit breaker counting logic works correctly for each
-/// non-TotalComments breaker variant.
+/// breaker variant.
 ///
 /// For each variant:
-/// - Adds below-max-count failures — verifies the breaker does NOT trip
-/// - Adds more failures to reach the trip count — verifies the breaker
-///   trips, transitions to Failed, and writes a trip comment with the
-///   "Circuit breaker" marker as a SYSTEM_ROLE comment.
+/// - Adds `max_count` failures — verifies the breaker does NOT trip and phase
+///   remains unchanged
+/// - Adds one more failure — verifies the breaker trips, transitions to Failed,
+///   and writes a trip comment with the "Circuit breaker" marker as a
+///   [`SYSTEM_ROLE`] comment.
 #[tokio::test]
 async fn breaker_counts_failures() {
     struct BreakerCase {
@@ -383,11 +384,18 @@ async fn breaker_counts_failures() {
             log_label: "Diagnostics",
             ws_suffix: "diag_breaker_test",
         },
+        BreakerCase {
+            name: "TotalComments",
+            kind: CircuitBreakerKind::TotalComments,
+            source_phase: TicketPhase::InReview,
+            log_label: "TotalComments",
+            ws_suffix: "tc_breaker_test",
+        },
     ];
 
     for case in &cases {
         let max_count = case.kind.max_count();
-        let below_max = max_count - 1; // Won't trip
+        let below_max = max_count; // Won't trip (count == max_count is still ≤ max_count)
         let trip_at = max_count + 1; // Will trip (count > max_count)
 
         let ticket_id = make_ticket(
@@ -398,7 +406,7 @@ async fn breaker_counts_failures() {
         )
         .await;
 
-        // Add below-max-count failures.
+        // Add max-count failures — should NOT trip.
         for _ in 0..below_max {
             add_breaker_failure(case.kind, &ticket_id).await;
         }
@@ -413,7 +421,19 @@ async fn breaker_counts_failures() {
             case.kind.max_count(),
         );
 
-        // Add more failures to reach the trip count.
+        // Verify phase is unchanged after non-trip.
+        let phase = expect_ticket_phase(board(), &ticket_id).await;
+        assert_eq!(
+            phase,
+            case.source_phase,
+            "case {}: phase should remain {} after {} non-tripping failures (max: {})",
+            case.name,
+            case.source_phase,
+            below_max,
+            case.kind.max_count(),
+        );
+
+        // Add one more failure to reach the trip count.
         // Breaker trips when count > max_count.
         for _ in below_max..trip_at {
             add_breaker_failure(case.kind, &ticket_id).await;
@@ -504,9 +524,10 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
             DIAGNOSTICS_ROLE,
             format!("{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{DIAGNOSTICS_FAILED_MARKER} test_step"),
         ),
-        CircuitBreakerKind::TotalComments => {
-            unreachable!("TotalComments breaker not used in failure-counting tests")
-        }
+        CircuitBreakerKind::TotalComments => (
+            "user",
+            "Comment — circuit breaker boundary test".to_string(),
+        ),
     };
     let _ = board().add_comment(ticket_id, role, &comment).await;
 }
@@ -619,103 +640,6 @@ async fn process_verifier_verdicts_cases() {
             "case {}: expected pipeline_reservation={}, got {}",
             case.name, case.expected_pipeline_reservation, ticket.pipeline_reservation,
         );
-    }
-}
-
-// ── try_trip_circuit_breaker — TotalComments circuit breaker ──
-
-/// Verify the circuit breaker trips at the max_count boundary:
-/// - `> CircuitBreakerKind::TotalComments.max_count()` comments → trips (ticket → Failed)
-/// - `= CircuitBreakerKind::TotalComments.max_count()` comments → does NOT trip
-///
-/// When the breaker trips, also verifies the trip comment contains the
-/// "circuit breaker" marker as produced by [`CircuitBreakerKind::should_trip`].
-#[tokio::test]
-async fn circuit_breaker_comment_boundary() {
-    struct Case {
-        name: &'static str,
-        ws_suffix: &'static str,
-        title: &'static str,
-        comment_count: usize,
-        expected_trip: bool,
-        expected_phase: TicketPhase,
-    }
-
-    init_management_test_stores().await;
-
-    let cases = [
-        Case {
-            name: "> max_count trips",
-            ws_suffix: "cb_max_count",
-            title: "CB Max Count",
-            comment_count: CircuitBreakerKind::TotalComments.max_count() + 1,
-            expected_trip: true,
-            expected_phase: TicketPhase::Failed,
-        },
-        Case {
-            name: "= max_count does not trip",
-            ws_suffix: "cb_no_trip",
-            title: "CB No Trip",
-            comment_count: CircuitBreakerKind::TotalComments.max_count(),
-            expected_trip: false,
-            expected_phase: TicketPhase::InReview,
-        },
-    ];
-
-    for case in &cases {
-        let ticket_id = make_ticket(
-            board(),
-            &test_ws_named("/tmp/test", case.ws_suffix),
-            case.title,
-            TicketPhase::InReview,
-        )
-        .await;
-
-        for i in 0..case.comment_count {
-            board()
-                .add_comment(&ticket_id, "user", &format!("Comment {i}"))
-                .await
-                .expect("add_comment");
-        }
-
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        let tripped = try_trip_circuit_breaker(
-            &ticket,
-            TicketPhase::InReview,
-            CircuitBreakerKind::TotalComments,
-            "test",
-        )
-        .await;
-        assert_eq!(
-            tripped, case.expected_trip,
-            "case {}: expected trip={}, got tripped={}",
-            case.name, case.expected_trip, tripped,
-        );
-
-        let phase = expect_ticket_phase(board(), &ticket_id).await;
-        assert_eq!(
-            phase, case.expected_phase,
-            "case {}: expected phase {:?}, got {:?}",
-            case.name, case.expected_phase, phase,
-        );
-
-        // When the breaker trips, verify the trip comment contains the
-        // circuit breaker marker as produced by `CircuitBreakerKind::should_trip`.
-        if tripped {
-            let comments = board()
-                .get_comments(&ticket_id)
-                .await
-                .expect("get_comments");
-            let has_marker = comments
-                .iter()
-                .any(|c| c.content.to_lowercase().contains("circuit breaker"));
-            assert!(
-                has_marker,
-                "case {}: trip comment must contain circuit breaker marker",
-                case.name,
-            );
-        }
     }
 }
 
