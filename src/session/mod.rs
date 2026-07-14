@@ -48,11 +48,6 @@ use chrono::{DateTime, Utc};
 /// | 200K (e.g., Claude 3.5) | ~160K actual + ~15K overhead = ~175K → **~25K headroom** |
 /// | 1M (e.g., DeepSeek V4) | Triggers at ~6.5% of context — very early but cheap |
 ///
-/// ## Configurability
-///
-/// Per-role overrides (via `RoleConfig.summarization_threshold`) can raise
-/// or lower this value for models with unusually large or small context
-/// windows without changing the global default.
 pub const SUMMARIZATION_THRESHOLD: usize = 65_000;
 
 /// Stored session rows and second `history` entry after compaction use this prefix so channel
