@@ -775,7 +775,11 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 ///
 /// Lists tickets via [`BoardStore::list_all_tickets`] with both filters set.
 /// Does NOT load comments — lightweight enough for poll loops.
-async fn for_tickets_in_phase(phase: TicketPhase, workspace_name: &str, action: impl Fn(Ticket)) {
+async fn for_tickets_in_phase(
+    phase: TicketPhase,
+    workspace_name: &str,
+    mut action: impl FnMut(Ticket),
+) {
     match board()
         .list_all_tickets(Some(workspace_name), Some(phase))
         .await
