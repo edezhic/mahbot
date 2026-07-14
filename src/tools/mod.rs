@@ -33,7 +33,9 @@ const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 /// used by [`normalize_tool_arguments`] to remap to the canonical `"path"` key.
 ///
 /// If a new alias needs to be added, update this list — all normalization
-/// picks it up automatically.
+/// that explicitly iterates `PATH_ALIAS_KEYS` picks it up automatically.
+/// Note: each tool must be listed in the match arm of
+/// [`normalize_tool_arguments`] to benefit from alias remapping.
 const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
 /// Check that a file's size is within the allowed limit.
@@ -254,7 +256,7 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
             remap_arg_key(obj, "id", "ticket_id");
             remap_arg_key(obj, "ticket", "ticket_id");
         }
-        "read" | "edit" => {
+        "read" | "edit" | "search" => {
             for &alias in PATH_ALIAS_KEYS {
                 remap_arg_key(obj, alias, "path");
             }
@@ -519,6 +521,7 @@ mod tests {
             for (tool_name, extra) in &[
                 ("read", serde_json::json!({})),
                 ("edit", serde_json::json!({"old_str": "a", "new_str": "b"})),
+                ("search", serde_json::json!({})),
             ] {
                 let mut input = serde_json::json!({});
                 input[alias] = serde_json::json!("src/main.rs");
