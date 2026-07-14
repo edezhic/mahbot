@@ -15,11 +15,8 @@
 //!    applicable for the language).
 //! 4. Add a `language_support` arm in [`crate::tools::read`] if the language
 //!    should have symbol extraction (the `_ => ""` fallback gives empty symbols).
-//! 5. Update [`VARIANT_EXTENSIONS`] in [`crate::gui::highlight`]'s test module
-//!    — this test-side reference list catches drift.
 //!
 //! [`HighlightLanguage`]: crate::gui::highlight::HighlightLanguage
-//! [`VARIANT_EXTENSIONS`]: crate::gui::highlight::tests::VARIANT_EXTENSIONS
 //! [`ALL_TREE_SITTER_EXTENSIONS`]: self::ALL_TREE_SITTER_EXTENSIONS
 
 use tree_sitter::Language;
