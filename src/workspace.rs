@@ -400,7 +400,7 @@ fn ensure_trailing_slash(path: &str) -> String {
 /// Returns a clear error message on failure so callers can surface it
 /// to the user (e.g. "Path does not exist" or "Not a directory").
 fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
-    let expanded = crate::config::expand_tilde(raw);
+    let expanded = crate::util::expand_tilde(raw);
 
     let canonical = std::fs::canonicalize(&expanded).map_err(|e| {
         if expanded.exists() {

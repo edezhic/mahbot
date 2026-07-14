@@ -257,7 +257,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// so that `../` segments introduced by tilde expansion or present in the
 /// original path cannot escape the allowed roots via lexical traversal.
 fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    let expanded = crate::config::expand_tilde(&path.to_string_lossy());
+    let expanded = crate::util::expand_tilde(&path.to_string_lossy());
     let normalized = normalize_path(&expanded);
     roots.iter().any(|root| normalized.starts_with(root))
 }
@@ -284,7 +284,7 @@ fn paths_same_or_canonical(a: &Path, b: &Path) -> bool {
 
 /// Whether `path` is an OS temp directory root (not merely nested under temp).
 fn is_os_temp_root(path: &Path) -> bool {
-    let check_path = crate::config::expand_tilde(&path.to_string_lossy());
+    let check_path = crate::util::expand_tilde(&path.to_string_lossy());
 
     if paths_same_or_canonical(&check_path, &std::env::temp_dir()) {
         return true;
@@ -573,7 +573,7 @@ pub(crate) fn is_path_under_allowed_temp(path: &Path) -> bool {
 /// and once after — and both validations may bypass via `EXTRA_READ_ALLOWED`.
 ///
 /// `~`-prefixed entries are expanded at init time using
-/// [`crate::config::expand_tilde`]. If `$HOME` (and `$USERPROFILE` on Windows)
+/// [`crate::util::expand_tilde`]. If `$HOME` (and `$USERPROFILE` on Windows)
 /// is unset, `~`-prefixed entries are skipped. Entries that follow XDG Base
 /// Directory conventions (`~/.cache/`, `~/.local/share/`, `~/.local/state/`,
 /// `~/.config/`) also generate variants using the corresponding `$XDG_*`
@@ -584,7 +584,7 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     // Dependency source directories (cross-platform)
     for raw_path in EXTRA_ALLOWED_RAW_PATHS {
         if raw_path.starts_with('~') {
-            let expanded = crate::config::expand_tilde(raw_path);
+            let expanded = crate::util::expand_tilde(raw_path);
             // Skip if expansion didn't work (HOME unset → literal ~ kept)
             if expanded.to_string_lossy().starts_with('~') {
                 continue;
@@ -633,7 +633,7 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     if path.starts_with('~') && !path.starts_with("~/") {
         return false;
     }
-    let expanded_path = crate::config::expand_tilde(path);
+    let expanded_path = crate::util::expand_tilde(path);
     if expanded_path.is_absolute() {
         // Lexical prefix check — no sync I/O.
         //
@@ -658,7 +658,7 @@ fn resolve_tool_path_with_base(path: &str, workspace_root: &Path) -> PathBuf {
     if trimmed.is_empty() || trimmed == "~" {
         return workspace_root.to_path_buf();
     }
-    let expanded = crate::config::expand_tilde(trimmed);
+    let expanded = crate::util::expand_tilde(trimmed);
     if expanded.is_absolute() {
         return expanded;
     }

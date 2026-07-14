@@ -485,22 +485,6 @@ fn resolve_list_or(
     vec![resolve_or(fallback_field, default_value)]
 }
 
-/// Expand a leading tilde (`~`) to the user's home directory.
-///
-/// Checks `$HOME` first (Unix, Git Bash on Windows), then `$USERPROFILE`
-/// (cmd.exe / PowerShell). If neither is set, returns the path unchanged
-/// (which means `~`-prefixed entries will be skipped by callers that
-/// check for expansion success).
-pub(crate) fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix('~') {
-        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
-        if let Ok(home) = home {
-            return PathBuf::from(home).join(stripped.trim_start_matches('/'));
-        }
-    }
-    PathBuf::from(path)
-}
-
 // ── ConfigReload — global singleton ──────────────────────────────
 
 /// Global reloadable config singleton.

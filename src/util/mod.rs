@@ -107,6 +107,23 @@ pub(crate) fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Expand a leading tilde (`~`) to the user's home directory.
+///
+/// Checks `$HOME` first (Unix, Git Bash on Windows), then `$USERPROFILE`
+/// (cmd.exe / PowerShell). If neither is set, returns the path unchanged
+/// (which means `~`-prefixed entries will be skipped by callers that
+/// check for expansion success).
+#[must_use]
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix('~') {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        if let Ok(home) = home {
+            return PathBuf::from(home).join(stripped.trim_start_matches('/'));
+        }
+    }
+    PathBuf::from(path)
+}
+
 /// Produce a short human-readable summary of tool arguments.
 #[must_use]
 pub fn summarize_args(args: &serde_json::Value) -> String {
