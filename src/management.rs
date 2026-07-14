@@ -276,11 +276,6 @@ async fn dispatch_notification(
 /// optional), and [`with_comment_and_transition`] delegates all comment
 /// writing to a closure.
 ///
-/// # ⚠ Argument ordering
-///
-/// `source` and `target` are both [`TicketPhase`], so swapping them is a
-/// potential runtime bug (the database rejects the transition). Always use
-/// named fields when constructing this struct.
 #[derive(Debug)]
 struct TransitionCtx<'a> {
     ticket: &'a Ticket,
