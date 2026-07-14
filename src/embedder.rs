@@ -115,6 +115,11 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// |            |            | in [`Embedder::load()`]).                           |
 /// |            |            | [`download_retry_loop()`] transitions state to      |
 /// |            |            | [`STATE_FAILED`] and returns.                       |
+/// | `LOADING`  | `FAILED`   | **HTTP client build failure:** reqwest client      |
+/// |            |            | construction fails in [`download_retry_loop()`]     |
+/// |            |            | (e.g. TLS backend unavailable).                     |
+/// |            |            | [`download_retry_loop()`] transitions state to      |
+/// |            |            | [`STATE_FAILED`] and returns.                       |
 /// | `LOADING`  | `FAILED`   | **Background task panic:** [`EmbedderGuard`]'s      |
 /// |            |            | [`Drop`] guard transitions state to [`STATE_FAILED`]|
 /// |            |            | when [`download_retry_loop()`] is dropped without   |
@@ -122,9 +127,9 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// |            |            | or tokenizers).                                      |
 /// | `LOADING`  | `FAILED`   | **Sync path panic:** [`ensure_embedder()`] wraps    |
 /// |            |            | the sync cache-load + `tokio::spawn` in             |
-/// |            |            | [`catch_unwind`] and transitions to [`STATE_FAILED`]|
-/// |            |            | on panic (e.g. OOM, Candle bug, or `tokio::spawn`   |
-/// |            |            | outside a tokio runtime).                            |
+/// |            |            | [`std::panic::catch_unwind`] and transitions to      |
+/// |            |            | [`STATE_FAILED`] on panic (e.g. OOM, Candle bug,     |
+/// |            |            | or `tokio::spawn` outside a tokio runtime).          |
 ///
 /// Once STATE reaches `READY` or `FAILED` it stays there for the lifetime of the process.
 const STATE_UNINIT: u8 = 0;
@@ -1205,7 +1210,7 @@ mod tests {
 
     /// Test that a panic inside the sync initialisation path (specifically from
     /// `tokio::spawn` when there is no tokio runtime) is caught by
-    /// [`catch_unwind`] and transitions [`STATE`] to [`STATE_FAILED`].
+    /// [`std::panic::catch_unwind`] and transitions [`STATE`] to [`STATE_FAILED`].
     ///
     /// This is a regular `#[test]`, not `#[tokio::test]`, so there is no tokio
     /// runtime active. When `ensure_embedder()` reaches `tokio::spawn(...)` the

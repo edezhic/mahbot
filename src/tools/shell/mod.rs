@@ -120,6 +120,9 @@ pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
 /// workspace root. The environment is cleared and re-populated from
 /// [`SAFE_ENV_VARS`] only — no parent-process environment is inherited. This
 /// prevents leaking API keys and other secrets into subprocesses (CWE-200).
+///
+/// **Note:** `$USER`/`$USERNAME` is an intentional exception — read from the
+/// parent process (usernames are not secrets).
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
     // Platform-specific shell selection and arguments.
     #[cfg(not(target_os = "windows"))]
@@ -2229,7 +2232,8 @@ mod tests {
         assert!(SAFE_ENV_VARS.contains(&"TERM"));
     }
 
-    /// `build_shell_command` clears the parent environment and only exposes
+    /// `build_shell_command` clears the parent environment (except `$USER`
+    /// /`$USERNAME`, see [`build_shell_command()`]) and only exposes
     /// [`SAFE_ENV_VARS`] with baseline values (CWE-200). Verify by running
     /// `env` through the built command.
     ///
