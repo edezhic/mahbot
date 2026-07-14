@@ -947,103 +947,130 @@ async fn handle_qa_passed_clean_tree_to_done() {
 
 // ── process_sanitation_verdict — verdict processing ──────────────────
 
-/// Verify both branches of `process_sanitation_verdict`:
-/// - pass=true → SanitationPassed with a sanitation comment
-/// - pass=false → ReadyForDevelopment with pipeline reservation,
-///   a sanitation comment, and a system circuit-breaker comment
+/// Verify [`process_sanitation_verdict`] across all scenarios:
+/// - pass=true, clean → SanitationPassed, no system comment
+/// - pass=false, garbage → ReadyForDevelopment with pipeline reservation and system comment
+/// - pass=true, reviewed files → SanitationPassed with "(files reviewed)" suffix, no system comment
 #[tokio::test]
 async fn process_sanitation_verdict_cases() {
+    /// All scenarios of [`process_sanitation_verdict`]. The two comment-marker
+    /// fields use different types by design: [`Case::sanit_markers`] is `&[&str]`
+    /// because a Sanitation role comment is *always* created; [`Case::sys_markers`]
+    /// is `Option<&[&str]>` because a SYSTEM circuit-breaker comment is
+    /// *conditional* (only appears on `pass=false`).
+    struct Case {
+        name: &'static str,
+        ws_suffix: &'static str,
+        verdict: crate::SanitationVerdict,
+        expected_phase: TicketPhase,
+        expected_pipeline_reservation: bool,
+        /// Substrings required in a Sanitation role comment (empty = just exists).
+        sanit_markers: &'static [&'static str],
+        /// Substrings required in a SYSTEM role comment. `None` = no system comment.
+        sys_markers: Option<&'static [&'static str]>,
+    }
+
     init_management_test_stores().await;
 
-    // Case 1: pass=true → SanitationPassed
-    let ws_pass = test_ws_named("/tmp/test", "sv_pass");
-    let pass_id = make_ticket(board(), &ws_pass, "SV Pass", TicketPhase::InSanitation).await;
-    let ticket_pass = expect_ticket(board(), &pass_id).await;
-
-    let pass_verdict = crate::SanitationVerdict {
+    let clean = crate::SanitationVerdict {
         pass: true,
         garbage_files: vec![],
         rationale: "All files are legitimate project files.".into(),
     };
-
-    process_sanitation_verdict(&ticket_pass, pass_verdict).await;
-
-    let phase = expect_ticket_phase(board(), &pass_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::SanitationPassed,
-        "pass=true should transition to SanitationPassed, got {phase:?}",
-    );
-
-    // assigned_to must be cleared after a successful transition
-    let ticket = expect_ticket(board(), &pass_id).await;
-    assert!(
-        ticket.assigned_to.is_none(),
-        "assigned_to should be cleared after pass=true",
-    );
-
-    // Verify a sanitation comment was added
-    let comments = board().get_comments(&pass_id).await.expect("get_comments");
-    let has_sanitation_comment = comments.iter().any(|c| c.role == Role::Sanitation.as_str());
-    assert!(
-        has_sanitation_comment,
-        "pass=true should add a sanitation comment",
-    );
-
-    // No system comment (only added in fail path)
-    let has_system_comment = comments.iter().any(|c| c.role == SYSTEM_ROLE);
-    assert!(
-        !has_system_comment,
-        "pass=true should not add a system comment",
-    );
-
-    // Case 2: pass=false → ReadyForDevelopment with pipeline reservation
-    let ws_fail = test_ws_named("/tmp/test", "sv_fail");
-    let fail_id = make_ticket(board(), &ws_fail, "SV Fail", TicketPhase::InSanitation).await;
-    let ticket_fail = expect_ticket(board(), &fail_id).await;
-
-    let fail_verdict = crate::SanitationVerdict {
+    let garbage = crate::SanitationVerdict {
         pass: false,
         garbage_files: vec!["node_modules/".into(), "tmp/scratch.js".into()],
         rationale: "These are intermediate build artifacts.".into(),
     };
+    let reviewed = crate::SanitationVerdict {
+        pass: true,
+        garbage_files: vec!["generated/bundle.js".into()],
+        rationale: "Reviewed, no issues found.".into(),
+    };
 
-    process_sanitation_verdict(&ticket_fail, fail_verdict).await;
+    let cases = [
+        Case {
+            name: "pass=true → SanitationPassed",
+            ws_suffix: "sp",
+            verdict: clean,
+            expected_phase: TicketPhase::SanitationPassed,
+            expected_pipeline_reservation: false,
+            sanit_markers: &[],
+            sys_markers: None,
+        },
+        Case {
+            name: "pass=false → ReadyForDevelopment",
+            ws_suffix: "sf",
+            verdict: garbage,
+            expected_phase: TicketPhase::ReadyForDevelopment,
+            expected_pipeline_reservation: true,
+            sanit_markers: &["node_modules/"],
+            sys_markers: Some(&[SANITATION_FAILED_MARKER]),
+        },
+        Case {
+            name: "pass=true with reviewed files → SanitationPassed (files reviewed)",
+            ws_suffix: "sp_r",
+            verdict: reviewed,
+            expected_phase: TicketPhase::SanitationPassed,
+            expected_pipeline_reservation: false,
+            sanit_markers: &["(files reviewed)"],
+            sys_markers: None,
+        },
+    ];
 
-    let ticket = expect_ticket(board(), &fail_id).await;
-    assert_eq!(
-        ticket.phase,
-        TicketPhase::ReadyForDevelopment,
-        "pass=false should bounce back to ReadyForDevelopment, got {:?}",
-        ticket.phase,
-    );
-    assert!(
-        ticket.pipeline_reservation,
-        "pass=false should set pipeline_reservation=true",
-    );
-    assert!(
-        ticket.assigned_to.is_none(),
-        "assigned_to should be cleared after pass=false transition",
-    );
+    for case in &cases {
+        let ws = test_ws_named("/tmp/test", case.ws_suffix);
+        let id = make_ticket(board(), &ws, case.name, TicketPhase::InSanitation).await;
+        let ticket = expect_ticket(board(), &id).await;
+        process_sanitation_verdict(&ticket, case.verdict.clone()).await;
 
-    // Verify a sanitation comment was added about the garbage files
-    let comments = board().get_comments(&fail_id).await.expect("get_comments");
-    let has_garbage_comment = comments
-        .iter()
-        .any(|c| c.role == Role::Sanitation.as_str() && c.content.contains("node_modules/"));
-    assert!(
-        has_garbage_comment,
-        "pass=false should have a sanitation comment mentioning garbage files",
-    );
+        let phase = expect_ticket_phase(board(), &id).await;
+        assert_eq!(
+            phase, case.expected_phase,
+            "case {}: expected phase {:?}, got {:?}",
+            case.name, case.expected_phase, phase,
+        );
 
-    // Verify a system comment with SANITATION_FAILED_MARKER was added
-    let has_system_breaker = comments
-        .iter()
-        .any(|c| c.role == SYSTEM_ROLE && c.content.contains(SANITATION_FAILED_MARKER));
-    assert!(
-        has_system_breaker,
-        "pass=false should have a system comment with the circuit breaker prefix",
-    );
+        let ticket = expect_ticket(board(), &id).await;
+        assert_eq!(
+            ticket.pipeline_reservation, case.expected_pipeline_reservation,
+            "case {}: pipeline_reservation mismatch",
+            case.name,
+        );
+        assert!(
+            ticket.assigned_to.is_none(),
+            "case {}: assigned_to should be cleared",
+            case.name,
+        );
+
+        let comments = board().get_comments(&id).await.expect("get_comments");
+
+        // Sanitation role check
+        assert!(
+            comments.iter().any(|c| c.role == Role::Sanitation.as_str()
+                && case.sanit_markers.iter().all(|&m| c.content.contains(m))),
+            "case {}: expected Sanitation comment matching {:?}",
+            case.name,
+            case.sanit_markers,
+        );
+
+        // System role check
+        match case.sys_markers {
+            Some(markers) => assert!(
+                comments.iter().any(
+                    |c| c.role == SYSTEM_ROLE && markers.iter().all(|&m| c.content.contains(m))
+                ),
+                "case {}: expected SYSTEM comment matching {:?}",
+                case.name,
+                markers,
+            ),
+            None => assert!(
+                !comments.iter().any(|c| c.role == SYSTEM_ROLE),
+                "case {}: expected no SYSTEM comment",
+                case.name,
+            ),
+        }
+    }
 }
 
 /// Verify [`dispatch_diagnostics`] behaviour across all scenarios:
