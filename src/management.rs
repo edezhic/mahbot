@@ -216,8 +216,6 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// Returns `true` if the ticket is still in `expected` phase.
-/// If not, clears `assigned_to` and returns `false`.
 #[must_use]
 async fn guard_ticket_in_phase(ticket_id: &str, expected: TicketPhase) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
