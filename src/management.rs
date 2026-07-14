@@ -779,6 +779,10 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 ///
 /// Lists tickets via [`BoardStore::list_all_tickets`] with both filters set.
 /// Does NOT load comments — lightweight enough for poll loops.
+///
+/// On DB errors, logs the error and returns without calling `action`. This is
+/// safe because tickets stay in their current phase and will be picked up again
+/// on the next poll cycle (~1s).
 async fn for_tickets_in_phase(
     phase: TicketPhase,
     workspace_name: &str,
@@ -837,6 +841,9 @@ where
 /// and guard against re-dispatch via \`assigned_to IS NULL\` — tickets that
 /// already have an \`assigned_to\` value are mid-execution and should not be
 /// re-dispatched.
+///
+/// Transient DB listing errors are safe: tickets stay in their current phase
+/// and are re-dispatched on the next poll cycle (~1s).
 async fn dispatch_unassigned_in_phase(
     phase: TicketPhase,
     dispatch_phase: PollPhase,
