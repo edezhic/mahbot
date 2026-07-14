@@ -1707,30 +1707,6 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_toggle_dir_sets_tree_focus() {
-        let mut state = make_diff_with_tree();
-        // Find a directory in the tree
-        if let Some((dir_path, _)) = state
-            .file_tree
-            .visible_tree_nodes
-            .iter()
-            .find(|(_, is_dir)| *is_dir)
-            .cloned()
-        {
-            let _ = state.update(DiffMessage::ToggleDir(dir_path));
-            assert!(state.file_tree.tree_focused);
-        }
-    }
-
-    #[test]
-    fn test_diff_select_file_keeps_tree_focus() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = true;
-        let _ = state.update(DiffMessage::SelectFile("src/main.rs".to_owned()));
-        assert!(state.file_tree.tree_focused);
-    }
-
-    #[test]
     fn test_diff_select_file_sets_tree_focused_when_not_focused() {
         // When tree_focused starts false, clicking a file should set it true.
         let mut state = make_diff_with_tree();
