@@ -79,9 +79,6 @@ const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
 /// Max chars of partial output included in timeout error messages.
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
 
-/// Grace period for pipe readers to notice cancellation and return their buffers.
-const READER_CANCEL_GRACE_DURATION: Duration = Duration::from_secs(2);
-
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 #[cfg(not(target_os = "windows"))]
@@ -228,26 +225,6 @@ fn spawn_pipe_reader(
     })
 }
 
-/// Await a pipe reader handle with a grace timeout for cancellation.
-/// If the reader does not complete within the grace window, returns an empty
-/// buffer and logs a warning identifying the pipe.
-async fn await_reader_with_timeout(
-    handle: tokio::task::JoinHandle<Vec<u8>>,
-    pipe_name: &'static str,
-) -> Vec<u8> {
-    tokio::time::timeout(READER_CANCEL_GRACE_DURATION, handle)
-        .await
-        .ok()
-        .and_then(std::result::Result::ok)
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                "{pipe_name} reader did not respond to cancellation within {} s",
-                READER_CANCEL_GRACE_DURATION.as_secs()
-            );
-            Vec::new()
-        })
-}
-
 /// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout`.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
@@ -295,13 +272,26 @@ async fn run_command_with_timeout(
             let _ = child.kill().await;
             cancel.cancel();
 
-            // Give readers a grace window (`READER_CANCEL_GRACE_DURATION`) to
-            // notice cancellation and return their buffers. If a reader takes
-            // longer than that (e.g. because a grandchild keeps the pipe open),
-            // we still get partial data from the buffer it returns after
-            // noticing cancellation.
-            let stdout = await_reader_with_timeout(stdout_handle, "stdout").await;
-            let stderr = await_reader_with_timeout(stderr_handle, "stderr").await;
+            // Give readers a grace window to notice cancellation and return
+            // their buffers. If a reader takes longer than 2 s (e.g. because
+            // a grandchild keeps the pipe open), we still get partial data
+            // from the buffer it returns after noticing cancellation.
+            let stdout = tokio::time::timeout(Duration::from_secs(2), stdout_handle)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .unwrap_or_else(|| {
+                    tracing::warn!("stdout reader did not respond to cancellation within 2 s");
+                    Vec::new()
+                });
+            let stderr = tokio::time::timeout(Duration::from_secs(2), stderr_handle)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .unwrap_or_else(|| {
+                    tracing::warn!("stderr reader did not respond to cancellation within 2 s");
+                    Vec::new()
+                });
             ShellRunResult::TimedOut {
                 stdout,
                 stderr,
