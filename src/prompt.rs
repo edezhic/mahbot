@@ -178,7 +178,14 @@ async fn discover_claude_rules(workspace: &Path) -> Vec<(String, String)> {
 /// Placeholder keys (the text between `{{` and `}}`) must consist entirely
 /// of word characters (`[a-zA-Z0-9_]`). Keys with hyphens (`{{my-key}}`),
 /// dots (`{{config.key}}`), or other non‑word characters will remain in the
-/// output unexpanded.
+/// output unexpanded.  The existing test `all_template_variables_are_word_chars`
+/// enforces this property across all embedded prompt assets.
+///
+/// If a `{{key}}` appears in the template but has no corresponding entry in
+/// `replacements`, a `tracing::warn!` is emitted at runtime and the literal
+/// `{{key}}` string is preserved in the output.  This means a typo in either
+/// the template or the replacement keys will produce a visible warning in the
+/// log rather than silently corrupting the prompt.
 ///
 /// Callers must pass replacement map keys with the full `{{key}}` wrapper
 /// (e.g. `"{{ticket_id}}"`), not just the inner key name.
@@ -190,7 +197,18 @@ pub(crate) fn substitute(template: &str, replacements: &[(&str, &str)]) -> Strin
                 .get(0)
                 .expect("capture group 0 always matches")
                 .as_str();
-            map.get(whole).copied().unwrap_or(whole).to_owned()
+            if let Some(val) = map.get(whole) {
+                (*val).to_owned()
+            } else {
+                tracing::warn!(
+                    template_var = %whole,
+                    "prompt substitution: no replacement provided for '{whole}' — \
+                     literal text will appear in the prompt output. \
+                     Check that the variable name in the template matches a \
+                     replacement key at the call site."
+                );
+                whole.to_owned()
+            }
         })
         .into_owned()
 }
