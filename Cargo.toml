@@ -68,8 +68,7 @@ jsonrepair-rs = "0.2"
 rand = "0.10"
 
 # Memory / persistence
-turso = { version = "0.7.0-pre.17", default-features = false, features = ["fts"] }
-turso_sdk_kit = { version = "0.7.0-pre.17", default-features = false }
+turso = { version = "0.7.0", default-features = false, features = ["fts"] }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 

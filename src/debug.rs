@@ -2,10 +2,14 @@
 //!
 //! Invoked as `mahbot debug --db <name> "SQL query"` from the command line.
 //! Skips tracing initialization, lock acquisition, and GUI startup.
-//! Opens databases with `ReadOnly | NoLock` flags so it works concurrently
-//! with the running daemon without fcntl lock contention on the WAL /
-//! `.tshm` coordination file. Uses the upstream `turso::Connection` for
-//! lazy row iteration with a 10k row limit.
+//! Opens databases using the standard `turso::Builder` API (same experimental
+//! features as the daemon: `index_method` + `multiprocess_wal`). The builder
+//! path in turso 0.7.0 applies `OpenFlags::NoLock` automatically when
+//! `multiprocess_wal` is enabled, preventing fcntl lock contention on the WAL
+//! / `.tshm` coordination file. Read-only safety comes from two layers: an
+//! upfront file-existence check (prevents accidental database creation) and a
+//! SQL mutation keyword blocklist (defense-in-depth). Uses the upstream
+//! `turso::Connection` for lazy row iteration with a 10k row limit.
 //!
 //! ## Read-only safeguard
 //!
@@ -17,19 +21,21 @@
 //! column names like `created_at`.
 //!
 //! `PRAGMA` is intentionally **not** in the blocklist because:
-//! - The connection is opened with `ReadOnly | NoLock`, which prevents actual
-//!   database mutations even if a mutating PRAGMA (e.g. `PRAGMA wal_checkpoint`)
-//!   is issued — the engine returns an error, not a silent write.
-//! - Read-only PRAGMAs like `PRAGMA quick_check` and `PRAGMA integrity_check`
-//!   are valuable on-demand diagnostics. The ReadOnly flag is the primary
-//!   safeguard; the blocklist is defense-in-depth for accidental queries.
+//! - The connection is opened with NoLock via the turso builder (multiprocess_wal
+//!   auto-applies NoLock), and the upfront file-existence check + blocklist
+//!   are the primary safeguards — a PRAGMA that tries to mutate the database
+//!   (e.g. `PRAGMA wal_checkpoint`) would still execute, but cannot create a
+//!   new database file (file must exist) and is caught by the blocklist if it
+//!   contains mutation keywords. In practice, useful read-only PRAGMAs like
+//!   `PRAGMA quick_check` and `PRAGMA integrity_check` don't trigger mutation
+//!   keywords.
+//! - Read-only PRAGMAs are valuable on-demand diagnostics. The upfront
+//!   file-existence check and the mutation blocklist are the primary safeguard;
+//!   the blocklist is defense-in-depth for accidental queries.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use turso::core::{Database, IO, OpenFlags, PlatformIO};
-use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabaseConfig};
 
 use crate::turso as turso_mod;
 
@@ -112,93 +118,46 @@ pub async fn run_debug() -> Result<()> {
             bail!("database file not found: {}", file_path.display());
         }
 
-        // Build an IO backend and open the database directly via the low-level
-        // turso_core API, bypassing TursoDatabase::open() which has a bug that
-        // drops OpenFlags::NoLock (see rsapi.rs:709). This lets us open with
-        // ReadOnly|NoLock so the debug tool works concurrently with the daemon
-        // without fcntl lock contention on the WAL / .tshm coordination file.
+        // Use the high-level turso::Builder (same experimental features as the
+        // daemon), which in turso 0.7.0 correctly applies OpenFlags::NoLock
+        // when multiprocess_wal is enabled (see rsapi.rs). This is simpler and
+        // safer than the previous low-level workaround that bypassed the builder
+        // to work around a NoLock bug — the bug was fixed in the 0.7.0 release.
         //
-        // DatabaseOpts from the shared turso::experimental_database_opts() —
-        // keeps this path in sync with the main daemon's Connection::open.
-        let io: Arc<dyn IO> = Arc::new(
-            PlatformIO::new()
-                .with_context(|| format!("failed to create IO for '{}'", file_path.display()))?,
-        );
-
-        let opts = crate::turso::experimental_database_opts();
-
-        // ReadOnly avoids fcntl lock on the main DB file; NoLock avoids locking
-        // the WAL coordination file. Both flags propagate through the full open
-        // chain including the WAL file path.
-        let open_flags = OpenFlags::ReadOnly | OpenFlags::NoLock;
-
+        // The upfront file-existence check (above) and SQL blocklist (below)
+        // provide read-only safety, compensating for the absence of
+        // OpenFlags::ReadOnly in the builder path. NoLock (automatically added
+        // for multiprocess_wal) prevents fcntl lock contention on both the DB
+        // file and the WAL / .tshm coordination file.
         let path_str = file_path.to_string_lossy().to_string();
 
-        // Database::open_file_with_flags is synchronous — it calls
-        // io_completion.wait() which is a blocking spin loop. Use spawn_blocking
-        // to avoid stalling the Tokio runtime thread. This is acceptable for a
-        // CLI debug tool that only processes one database at a time.
-        let database: Arc<Database> = tokio::task::spawn_blocking(move || {
-            Database::open_file_with_flags(
-                io, &path_str, open_flags, opts,
-                None, // encryption_opts — the daemon doesn't encrypt databases
-            )
-        })
-        .await
-        .context("spawn_blocking panicked opening database")?
-        .with_context(|| format!("failed to open database '{}'", file_path.display()))?;
+        let opts = crate::turso::experimental_database_opts();
+        let db = turso::Builder::new_local(&path_str)
+            .experimental_index_method(opts.enable_index_method)
+            .experimental_multiprocess_wal(opts.enable_multiprocess_wal)
+            .build()
+            .await
+            .with_context(|| format!("failed to open database '{}'", file_path.display()))?;
 
-        // Connect via the core API — returns an Arc<Connection> shared with the
-        // Database.
-        let conn: Arc<turso::core::Connection> = database
+        let wrapper = db
             .connect()
             .with_context(|| format!("failed to connect to database '{}'", file_path.display()))?;
-
-        // Build a minimal TursoDatabaseConfig for TursoConnection::new(). The
-        // experimental_features field is unused by TursoConnection (it's only
-        // read by TursoDatabase::open() which we bypass), but async_io must be
-        // true for the upstream ::turso::Connection async query API to work.
-        let config = TursoDatabaseConfig {
-            path: file_path.to_string_lossy().to_string(),
-            experimental_features: None,
-            async_io: true,
-            encryption: None,
-            vfs: None,
-            io: None,
-            db_file: None,
-        };
-
-        // Wrap the core connection in a TursoConnection so we can use the
-        // upstream ::turso::Connection (with lazy row iteration) and benefit
-        // from the SDK's statement caching and concurrent guard.
-        let turso_conn: Arc<TursoConnection> = TursoConnection::new(&config, conn);
 
         // Set busy_timeout as defense-in-depth against transient lock errors
         // when the daemon holds a write transaction (matching Connection::open
         // in turso.rs line 344). Even with NoLock, this protects against edge
         // cases where the OS or filesystem layer introduces contention.
-        turso_conn.set_busy_timeout(Duration::from_mins(1));
+        wrapper
+            .busy_timeout(Duration::from_mins(1))
+            .with_context(|| format!("failed to set busy timeout for '{}'", file_path.display()))?;
 
-        // Wrap in the upstream turso::Connection (not our crate::turso::Connection
-        // wrapper) for lazy row iteration. We clone the Arc here — turso_conn
-        // retains a separate reference so we can call close() after dropping
-        // the turso::Connection wrapper.
-        let wrapper = ::turso::Connection::create(turso_conn.clone(), None);
-
-        // Capture the query result, then unconditionally close the connection
-        // to trigger checkpoint_shutdown(). This ensures .tshm coordination
-        // state is cleaned up even when the query fails.
+        // Capture the query result, then let the wrapper go out of scope to
+        // release the connection. For a CLI diagnostic tool the OS will clean
+        // up everything on process exit.
         let query_result = execute_query(&wrapper, sql).await;
 
-        drop(wrapper); // Release the wrapper's Arc clone first
-        if let Err(e) = turso_conn.close() {
-            eprintln!(
-                "Warning: failed to close database connection '{}': {e:?}",
-                file_path.display()
-            );
-        }
+        drop(wrapper);
 
-        // Propagate query failure *after* cleanup so close() always runs.
         query_result?;
     }
 
