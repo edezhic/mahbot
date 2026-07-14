@@ -1091,12 +1091,13 @@ impl HomeState {
                 crate::ChatEvent::Typing {
                     user_name,
                     is_typing,
+                    workspace,
                 } => {
-                    // Apply user filter — only show typing indicator for the
-                    // selected user. The Manager queue now sends per-user
-                    // Typing events (one per workspace user), so the indicator
-                    // activates when the selected user matches.
-                    if Some(&user_name) == self.selected_user.as_ref() {
+                    // Apply user + workspace filter — only show typing indicator
+                    // for the selected user in the selected workspace.
+                    if Some(&user_name) == self.selected_user.as_ref()
+                        && Some(workspace.as_str()) == self.resolve_workspace_name().as_deref()
+                    {
                         self.typing = is_typing;
                         if is_typing {
                             self.typing_tick_state = 0;

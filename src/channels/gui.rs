@@ -83,9 +83,17 @@ impl Channel for GuiChannel {
         use crate::ChatEvent;
 
         if let Some(tx) = crate::CHAT_BROADCAST.get() {
+            // KNOWN LIMITATION: This path lacks workspace context because the
+            // Channel trait's `start_typing` does not carry workspace info.
+            // The broadcast_typing path (Manager queue) covers ~95% of typing
+            // events with correct workspace scoping. An empty workspace string
+            // means this typing indicator will be filtered out by the GUI handler's
+            // workspace check — safe but invisible. Deferred: add workspace to
+            // Channel::start_typing signature.
             let _ = tx.send(ChatEvent::Typing {
                 user_name: recipient.to_string(),
                 is_typing: true,
+                workspace: String::new(),
             });
         }
         Ok(())

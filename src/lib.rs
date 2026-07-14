@@ -369,6 +369,8 @@ pub enum ChatEvent {
         user_name: String,
         /// Whether typing started (true) or stopped (false).
         is_typing: bool,
+        /// The workspace this typing indicator belongs to.
+        workspace: String,
     },
 }
 
