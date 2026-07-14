@@ -9,6 +9,9 @@ use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree}
 
 pub struct ReadTool;
 
+/// Recognized sensitive file extensions whose read output should be scrubbed for credentials.
+const SENSITIVE_EXTENSIONS: &[&str] = &["cer", "crt", "env", "key", "p12", "pem", "pfx"];
+
 /// File paths whose read output should be scrubbed for credentials (`.env`, certs, keys).
 /// Other extensions (e.g. `.rs`, `.md`) are left intact so the model sees source accurately.
 #[must_use]
@@ -24,11 +27,7 @@ fn is_sensitive_file_path(path: &str) -> bool {
     // Single rsplit_once handles both dotfiles (.env, .env.local) and regular extensions (.pem, .key).
     // The `name == ".env"` arm catches `.env.local`-style dotfile prefixes.
     match lower.rsplit_once('.') {
-        Some((name, ext)) => {
-            name == ".env"
-                || ext == "env"
-                || matches!(ext, "pem" | "key" | "p12" | "pfx" | "crt" | "cer")
-        }
+        Some((name, ext)) => name == ".env" || SENSITIVE_EXTENSIONS.contains(&ext),
         None => false,
     }
 }
