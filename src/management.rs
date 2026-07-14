@@ -57,7 +57,7 @@ const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 
 /// Marker for sanitation failure system comments — [`CircuitBreakerKind::Sanitation`]'s
-/// [`trip_info`](CircuitBreakerKind::trip_info) depends on substring matching
+/// [`should_trip`](CircuitBreakerKind::should_trip) depends on substring matching
 /// this value, so it must not drift from comment text.
 const SANITATION_FAILED_MARKER: &str = "Sanitation failed";
 
@@ -117,7 +117,7 @@ enum CircuitBreakerKind {
 
 impl CircuitBreakerKind {
     /// Returns the trip-count threshold for this breaker variant.
-    /// The breaker trips when [`trip_info`](CircuitBreakerKind::trip_info) returns
+    /// The breaker trips when [`should_trip`](CircuitBreakerKind::should_trip) returns
     /// `Some` (the count exceeds this threshold).
     const fn threshold(self) -> usize {
         match self {
@@ -127,14 +127,14 @@ impl CircuitBreakerKind {
         }
     }
 
-    /// Compute trip information for this breaker variant.
+    /// Determine whether this breaker variant should trip.
     ///
     /// Counts failures matching this variant's criteria from the ticket comments.
     /// If the count exceeds the variant's threshold, returns
     /// `Some((count, threshold, message))` where `message` is the formatted
     /// trip comment string to post on the ticket. Returns `None` if the breaker
     /// should not trip (count ≤ threshold).
-    fn trip_info(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
+    fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
         let threshold = self.threshold();
         let (count, msg) = match self {
             Self::General => {
@@ -2099,7 +2099,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 }
 
 /// Shared circuit breaker skeleton: fetch comments, evaluate via
-/// [`CircuitBreakerKind::trip_info`], add a system comment via the returned
+/// [`CircuitBreakerKind::should_trip`], add a system comment via the returned
 /// message string, then transition to [`TicketPhase::Failed`].
 ///
 /// All three concrete breakers (General, Sanitation, Diagnostics) delegate to this
@@ -2123,7 +2123,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
 ///   are never counted.
 ///
-/// See each variant's [`CircuitBreakerKind::trip_info`] implementation for
+/// See each variant's [`CircuitBreakerKind::should_trip`] implementation for
 /// the exact filtering logic.
 ///
 /// # Return value
@@ -2150,7 +2150,7 @@ async fn try_trip_circuit_breaker(
         }
     };
 
-    let Some((count, threshold, msg)) = kind.trip_info(&comments) else {
+    let Some((count, threshold, msg)) = kind.should_trip(&comments) else {
         return false;
     };
 
