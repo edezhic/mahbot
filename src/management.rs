@@ -88,7 +88,7 @@ fn board() -> &'static BoardStore {
 /// A concurrent claim may set a new assignee between a phase check and this
 /// clear. That's very low probability and the same race is accepted in
 /// [`record_sanitation_failure`].
-async fn clear_assigned_to(ticket_id: &str, context: &str) {
+async fn clear_assigned_to_no_cancel(ticket_id: &str, context: &str) {
     if let Err(e) = board().clear_assigned_to_no_cancel(ticket_id).await {
         warn!(
             ticket = %ticket_id,
@@ -233,7 +233,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 async fn phase_changed_and_clear_assignment(ticket_id: &str, expected: TicketPhase) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
         let label = format!("ticket left {expected:?}");
-        clear_assigned_to(ticket_id, &label).await;
+        clear_assigned_to_no_cancel(ticket_id, &label).await;
         return true;
     }
     false
@@ -343,7 +343,7 @@ where
         // Clear assigned_to so the ticket can be re-dispatched on the next poll
         // cycle. All call sites set assigned_to before reaching this function, so
         // the field is always populated when this runs.
-        clear_assigned_to(&args.ticket.id, args.log_label).await;
+        clear_assigned_to_no_cancel(&args.ticket.id, args.log_label).await;
         return false;
     }
 
@@ -1937,10 +1937,10 @@ async fn record_verdict_comments_tx(
 ///
 /// The circuit-breaker guard is handled centrally by [`spawn_dispatch`].
 ///
-/// ## Note: no `clear_assigned_to` on post-run phase check
+/// ## Note: no `clear_assigned_to_no_cancel` on post-run phase check
 ///
 /// Unlike [`dispatch_engineer`], [`dispatch_diagnostics`], and [`dispatch_sanitation`],
-/// this function does **not** call [`clear_assigned_to`] when the post-run phase check
+/// this function does **not** call [`clear_assigned_to_no_cancel`] when the post-run phase check
 /// fails (the ticket moved externally during analysis). This is intentional:
 ///
 /// * **`assigned_to` is already `NULL`** — [`claim_ticket_in_workspace`] sets
@@ -1951,7 +1951,7 @@ async fn record_verdict_comments_tx(
 ///   field. The agent registry entries for these parallel agents have already finished
 ///   or been cancelled by the pre-flight [`AGENT_REGISTRY.cancel_by_ticket_id`] call
 ///   in [`spawn_dispatch`].
-/// * **TOCTOU race** — calling [`clear_assigned_to`] would unnecessarily risk
+/// * **TOCTOU race** — calling [`clear_assigned_to_no_cancel`] would unnecessarily risk
 ///   overwriting an assignee that a concurrent claim set between the phase check and
 ///   the clear. Since `assigned_to` is already `NULL`, there is nothing to gain.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
@@ -2347,7 +2347,7 @@ async fn process_verifier_verdicts(
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs [`PARALLEL_AGENT_COUNT`] parallel verifiers of the given role, and processes the verdicts.
 ///
-/// ## Note: no `clear_assigned_to` on post-run phase check
+/// ## Note: no `clear_assigned_to_no_cancel` on post-run phase check
 ///
 /// See [`dispatch_backlog_analysts`] for the full rationale — the same
 /// structural reasons apply here (parallel agents via [`run_parallel_agents`],
