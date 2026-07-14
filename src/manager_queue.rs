@@ -176,6 +176,71 @@ fn broadcast_typing(users: &[UserRecord], is_typing: bool) {
     }
 }
 
+/// Deliver the Manager agent response to all workspace users.
+///
+/// Two-phase delivery:
+/// 1. **Broadcast + persist** once per unique user — sends to GUI dashboard
+///    and persists to chat_history. The channel for chat_history is taken
+///    from the first channel binding (or `"gui"` if none).
+/// 2. **Channel delivery** — sends the response to each user on every channel
+///    binding they have.
+///
+/// Extracted from [`consumer_loop`] to reduce cognitive complexity.
+async fn deliver_manager_response(users: &[UserRecord], content: &str, workspace_name: &str) {
+    // ── Broadcast + persist once per user ─────────────────────────
+    {
+        let mut seen_names = HashSet::new();
+        for user in users {
+            if !seen_names.insert(&user.name) {
+                continue;
+            }
+            let channel = user.channels.first().map_or("gui", |b| b.channel.as_str());
+            broadcast_and_persist_agent_response(
+                &user.name,
+                channel,
+                content,
+                Some("manager".to_string()),
+                workspace_name,
+            )
+            .await;
+        }
+    }
+
+    let channels = crate::channel_registry().list();
+
+    if channels.is_empty() {
+        error!("Manager queue: no channels registered");
+        return;
+    }
+
+    for (channel_name, channel) in &channels {
+        for user in users {
+            // Deliver on all channel bindings for this user.
+            for binding in &user.channels {
+                let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
+                let Some(recipient) = channel.resolve_recipient(&user.name, reply_target) else {
+                    continue;
+                };
+                if let Err(e) = channel
+                    .send(&SendMessage {
+                        content: content.to_string(),
+                        recipient,
+                        reply_markup: None,
+                    })
+                    .await
+                {
+                    error!(
+                        channel = %channel_name,
+                        user = %user.name,
+                        "Manager queue: failed to send response to {}: {e}",
+                        user.name,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The single consumer task that processes Manager jobs one at a time.
 ///
 /// Shutdown-aware loop: checks for global shutdown between jobs, races
@@ -301,68 +366,6 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
             );
         }
 
-        // Extract common broadcast/persist fields once; only `recipient` differs
-        // between the broadcast+persist loop and the channel delivery loop.
-        let content = &response;
-        let agent_role = Some("manager".to_string());
-        let workspace = &job.workspace_name;
-
-        // ── Broadcast + persist once per user ─────────────────────────
-        // Before the channel transport loop: broadcast the agent response
-        // to the GUI dashboard and persist to chat_history once per unique
-        // user. The channel for chat_history is taken from the first channel
-        // binding (or "gui" if none).
-        {
-            let mut seen_names = HashSet::new();
-            for user in &users {
-                if !seen_names.insert(&user.name) {
-                    continue;
-                }
-                let channel = user.channels.first().map_or("gui", |b| b.channel.as_str());
-                broadcast_and_persist_agent_response(
-                    &user.name,
-                    channel,
-                    content,
-                    agent_role.clone(),
-                    workspace,
-                )
-                .await;
-            }
-        }
-
-        let channels = crate::channel_registry().list();
-
-        if channels.is_empty() {
-            error!("Manager queue: no channels registered");
-            continue;
-        }
-
-        for (channel_name, channel) in &channels {
-            for user in &users {
-                // Deliver on all channel bindings for this user.
-                for binding in &user.channels {
-                    let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
-                    let Some(recipient) = channel.resolve_recipient(&user.name, reply_target)
-                    else {
-                        continue;
-                    };
-                    if let Err(e) = channel
-                        .send(&SendMessage {
-                            content: content.clone(),
-                            recipient,
-                            reply_markup: None,
-                        })
-                        .await
-                    {
-                        error!(
-                            channel = %channel_name,
-                            user = %user.name,
-                            "Manager queue: failed to send response to {}: {e}",
-                            user.name,
-                        );
-                    }
-                }
-            }
-        }
+        deliver_manager_response(&users, &response, &job.workspace_name).await;
     }
 }
