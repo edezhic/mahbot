@@ -419,7 +419,10 @@ fn capture_index_to_name(query: &Query, index: u32) -> &str {
         .map_or("text", |s| &s[..])
 }
 
-#[allow(clippy::match_same_arms)]
+#[expect(
+    clippy::match_same_arms,
+    reason = "text.reference and string.escape intentionally return Text, matching the wildcard default"
+)]
 fn capture_class(capture_name: &str) -> HighlightClass {
     match capture_name {
         // Keywords and keyword-like constructs
