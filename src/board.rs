@@ -593,63 +593,66 @@ pub(crate) enum LoadComments {
     No,
 }
 
+/// One-time schema migrations for backward compatibility.
+///
+/// These run only for databases created with older versions.
+/// Can be safely removed once all active databases have been migrated.
+async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
+    // ── schema migration: rename `status` column to `phase` ───────────
+    let version_rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .context("Failed to read PRAGMA user_version for schema migration")?;
+    let current_version: i64 = version_rows
+        .first()
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0);
+
+    if current_version < 1 {
+        // Check whether the old `status` column still exists (migration needed).
+        let table_info = conn
+            .query("PRAGMA table_info('tickets')", ())
+            .await
+            .context("Failed to read PRAGMA table_info for tickets table")?;
+
+        let has_status_column = table_info
+            .iter()
+            .any(|row| row.get::<String>(1).ok().as_deref() == Some("status"));
+
+        if has_status_column {
+            info!("Schema migration: renaming tickets.status to tickets.phase");
+            conn.execute("ALTER TABLE tickets RENAME COLUMN status TO phase", ())
+                .await
+                .context(
+                    "Schema migration failed: unable to rename tickets.status to tickets.phase",
+                )?;
+            // ALTER TABLE auto-commits in SQLite/libSQL, so the rename is
+            // already persisted. Continue to update the schema version.
+        }
+
+        // PRAGMA user_version is NOT transaction-atomic in SQLite — set it
+        // after the ALTER TABLE (which has already auto-committed) to avoid
+        // a version-schema mismatch if a crash occurs between the two.
+        conn.execute("PRAGMA user_version = 1", ())
+            .await
+            .context("Schema migration failed: unable to set PRAGMA user_version to 1")?;
+
+        // Persist immediately via WAL checkpoint.
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after renaming tickets.status",
+        )?;
+
+        if has_status_column {
+            info!("Schema migration complete: tickets.status renamed to tickets.phase (version 1)");
+        }
+    }
+    Ok(())
+}
+
 impl BoardStore {
     /// Post-open setup: run schema migrations, then create FTS index.
     async fn after_open(&self) -> anyhow::Result<()> {
-        // ── schema migration: rename `status` column to `phase` ───────────
-        let version_rows = self
-            .conn
-            .query("PRAGMA user_version", ())
-            .await
-            .context("Failed to read PRAGMA user_version for schema migration")?;
-        let current_version: i64 = version_rows
-            .first()
-            .and_then(|row| row.get::<i64>(0).ok())
-            .unwrap_or(0);
-
-        if current_version < 1 {
-            // Check whether the old `status` column still exists (migration needed).
-            let table_info = self
-                .conn
-                .query("PRAGMA table_info('tickets')", ())
-                .await
-                .context("Failed to read PRAGMA table_info for tickets table")?;
-
-            let has_status_column = table_info
-                .iter()
-                .any(|row| row.get::<String>(1).ok().as_deref() == Some("status"));
-
-            if has_status_column {
-                info!("Schema migration: renaming tickets.status to tickets.phase");
-                self.conn
-                    .execute("ALTER TABLE tickets RENAME COLUMN status TO phase", ())
-                    .await
-                    .context(
-                        "Schema migration failed: unable to rename tickets.status to tickets.phase",
-                    )?;
-                // ALTER TABLE auto-commits in SQLite/libSQL, so the rename is
-                // already persisted. Continue to update the schema version.
-            }
-
-            // PRAGMA user_version is NOT transaction-atomic in SQLite — set it
-            // after the ALTER TABLE (which has already auto-committed) to avoid
-            // a version-schema mismatch if a crash occurs between the two.
-            self.conn
-                .execute("PRAGMA user_version = 1", ())
-                .await
-                .context("Schema migration failed: unable to set PRAGMA user_version to 1")?;
-
-            // Persist immediately via WAL checkpoint.
-            self.conn.checkpoint().await.context(
-                "Schema migration failed: unable to checkpoint after renaming tickets.status",
-            )?;
-
-            if has_status_column {
-                info!(
-                    "Schema migration complete: tickets.status renamed to tickets.phase (version 1)"
-                );
-            }
-        }
+        run_schema_migrations(&self.conn).await?;
 
         // ── FTS index setup (must run after migration) ────────────────────
         crate::turso::ensure_fts_index(
