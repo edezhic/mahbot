@@ -104,9 +104,9 @@ async fn clear_assigned_to_no_cancel(ticket_id: &str, context: &str) {
 /// and trip logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 enum CircuitBreakerKind {
-    /// General comment-count breaker: trips when the total number of comments
+    /// Total-comments breaker: trips when the total number of comments
     /// exceeds 30.
-    General,
+    TotalComments,
     /// Sanitation-failure breaker: trips when cumulative sanitation failures
     /// exceed 3.
     Sanitation,
@@ -121,7 +121,7 @@ impl CircuitBreakerKind {
     /// `Some` (the count exceeds this maximum).
     const fn max_count(self) -> usize {
         match self {
-            Self::General => 30,
+            Self::TotalComments => 30,
             Self::Sanitation => 3,
             Self::Diagnostics => 4,
         }
@@ -137,7 +137,7 @@ impl CircuitBreakerKind {
     fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
         let max_count = self.max_count();
         let (count, msg) = match self {
-            Self::General => {
+            Self::TotalComments => {
                 let count = comments.len();
                 (
                     count,
@@ -692,12 +692,12 @@ struct PollPhaseInfo {
 
 impl PollPhaseInfo {
     /// Create a new [`PollPhaseInfo`] with standard defaults:
-    /// [`PipelineCheck::Skip`] and [`CircuitBreakerKind::General`].
+    /// [`PipelineCheck::Skip`] and [`CircuitBreakerKind::TotalComments`].
     const fn new(expected_phase: TicketPhase, log_label: &'static str) -> Self {
         Self {
             expected_phase,
             pipeline_check: PipelineCheck::Skip,
-            circuit_breaker_kind: CircuitBreakerKind::General,
+            circuit_breaker_kind: CircuitBreakerKind::TotalComments,
             log_label,
         }
     }
@@ -2159,7 +2159,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// [`CircuitBreakerKind::should_trip`], add a system comment via the returned
 /// message string, then transition to [`TicketPhase::Failed`].
 ///
-/// All three concrete breakers (General, Sanitation, Diagnostics) delegate to this
+/// All three concrete breakers (TotalComments, Sanitation, Diagnostics) delegate to this
 /// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum. This
 /// eliminates ~80% structural duplication while preserving exact behavioral semantics.
 ///
@@ -2169,7 +2169,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///
 /// Each breaker variant naturally excludes its own trip comment from counting:
 ///
-/// * **General breaker** — counts all comments via `comments.len()`; it prevents
+/// * **TotalComments breaker** — counts all comments via `comments.len()`; it prevents
 ///   re-dispatch by transitioning to the terminal `Failed` phase before the
 ///   breaker could re-read the same trip comment.
 /// * **Sanitation breaker** — filters comments by role `"system"` and content

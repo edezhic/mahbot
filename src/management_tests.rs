@@ -7,30 +7,30 @@ use crate::util::test::{
 use crate::workspace::test_ws_named;
 use strum::IntoEnumIterator;
 
-/// All non-General circuit breaker variants must have a `max_count` strictly
-/// less than [`CircuitBreakerKind::General`]'s `max_count`.
+/// All non-TotalComments circuit breaker variants must have a `max_count` strictly
+/// less than [`CircuitBreakerKind::TotalComments`]'s `max_count`.
 ///
 /// ## Rationale
 ///
-/// - **Sanitation breaker** (`max_count = 3`): must trip before the general
+/// - **Sanitation breaker** (`max_count = 3`): must trip before the TotalComments
 ///   breaker (`max_count = 30`), otherwise a ticket could accumulate 30+
 ///   comments during repeated sanitation loops without tripping.
 /// - **Diagnostics breaker** (`max_count = 4`): must also trip before the
-///   general breaker. This is a conservative approximation — the general
+///   TotalComments breaker. This is a conservative approximation — the TotalComments
 ///   breaker counts *all* comments (not just diagnostics), but guaranteeing
-///   that diagnostics-only chatter cannot bypass the general breaker prevents
+///   that diagnostics-only chatter cannot bypass the TotalComments breaker prevents
 ///   pathological ticket growth from repeated diagnostic cycles.
 
 #[test]
-fn all_non_general_circuit_breakers_trip_before_general() {
-    let general = CircuitBreakerKind::General.max_count();
+fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
+    let total_comments_max = CircuitBreakerKind::TotalComments.max_count();
     for kind in CircuitBreakerKind::iter() {
-        if kind == CircuitBreakerKind::General {
+        if kind == CircuitBreakerKind::TotalComments {
             continue;
         }
         assert!(
-            kind.max_count() < general,
-            "{kind:?}.max_count() ({}) must be less than General.max_count() ({general})",
+            kind.max_count() < total_comments_max,
+            "{kind:?}.max_count() ({}) must be less than TotalComments.max_count() ({total_comments_max})",
             kind.max_count(),
         );
     }
@@ -74,8 +74,8 @@ async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning()
     .await;
 
     // Add comments to ticket A so the circuit breaker has something to count
-    // (CircuitBreakerKind::General.max_count() + 1 = 31 comments, enough to trip).
-    for i in 0..=CircuitBreakerKind::General.max_count() {
+    // (CircuitBreakerKind::TotalComments.max_count() + 1 = 31 comments, enough to trip).
+    for i in 0..=CircuitBreakerKind::TotalComments.max_count() {
         board()
             .add_comment(&trip_id, SYSTEM_ROLE, &format!("Comment {i}"))
             .await
@@ -88,7 +88,7 @@ async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning()
     let tripped = try_trip_circuit_breaker(
         &ticket_a,
         TicketPhase::ReadyForDevelopment,
-        CircuitBreakerKind::General,
+        CircuitBreakerKind::TotalComments,
         "test",
     )
     .await;
@@ -349,7 +349,7 @@ async fn transition_ticket_to_done_buffer_and_notify() {
 // ── try_trip_circuit_breaker — failure counting ──────────────────
 
 /// Verify that circuit breaker counting logic works correctly for each
-/// non-General breaker variant.
+/// non-TotalComments breaker variant.
 ///
 /// For each variant:
 /// - Adds below-max-count failures — verifies the breaker does NOT trip
@@ -504,8 +504,8 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
             DIAGNOSTICS_ROLE,
             format!("{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{DIAGNOSTICS_FAILED_MARKER} test_step"),
         ),
-        CircuitBreakerKind::General => {
-            unreachable!("General breaker not used in failure-counting tests")
+        CircuitBreakerKind::TotalComments => {
+            unreachable!("TotalComments breaker not used in failure-counting tests")
         }
     };
     let _ = board().add_comment(ticket_id, role, &comment).await;
@@ -622,11 +622,11 @@ async fn process_verifier_verdicts_cases() {
     }
 }
 
-// ── try_trip_circuit_breaker — general circuit breaker ────────
+// ── try_trip_circuit_breaker — TotalComments circuit breaker ──
 
 /// Verify the circuit breaker trips at the max_count boundary:
-/// - `> CircuitBreakerKind::General.max_count()` comments → trips (ticket → Failed)
-/// - `= CircuitBreakerKind::General.max_count()` comments → does NOT trip
+/// - `> CircuitBreakerKind::TotalComments.max_count()` comments → trips (ticket → Failed)
+/// - `= CircuitBreakerKind::TotalComments.max_count()` comments → does NOT trip
 ///
 /// When the breaker trips, also verifies the trip comment contains the
 /// "circuit breaker" marker as produced by [`CircuitBreakerKind::should_trip`].
@@ -648,7 +648,7 @@ async fn circuit_breaker_comment_boundary() {
             name: "> max_count trips",
             ws_suffix: "cb_max_count",
             title: "CB Max Count",
-            comment_count: CircuitBreakerKind::General.max_count() + 1,
+            comment_count: CircuitBreakerKind::TotalComments.max_count() + 1,
             expected_trip: true,
             expected_phase: TicketPhase::Failed,
         },
@@ -656,7 +656,7 @@ async fn circuit_breaker_comment_boundary() {
             name: "= max_count does not trip",
             ws_suffix: "cb_no_trip",
             title: "CB No Trip",
-            comment_count: CircuitBreakerKind::General.max_count(),
+            comment_count: CircuitBreakerKind::TotalComments.max_count(),
             expected_trip: false,
             expected_phase: TicketPhase::InReview,
         },
@@ -683,7 +683,7 @@ async fn circuit_breaker_comment_boundary() {
         let tripped = try_trip_circuit_breaker(
             &ticket,
             TicketPhase::InReview,
-            CircuitBreakerKind::General,
+            CircuitBreakerKind::TotalComments,
             "test",
         )
         .await;
