@@ -118,7 +118,6 @@ fn rows_to_page(rows: Vec<Row>) -> Result<(Vec<ChatHistoryEntry>, bool)> {
     Ok((entries, has_more))
 }
 
-#[allow(clippy::cast_possible_wrap)]
 impl ChatHistoryStore {
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
     /// Silently ignores duplicate `message_id` values (UPSERT no-op).
@@ -154,6 +153,7 @@ impl ChatHistoryStore {
         user_name: &str,
         workspace: &str,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+        #[allow(clippy::cast_possible_wrap)]
         let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
@@ -181,6 +181,7 @@ impl ChatHistoryStore {
         workspace: &str,
         before_id: i64,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+        #[allow(clippy::cast_possible_wrap)]
         let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
         let rows = self
             .conn
