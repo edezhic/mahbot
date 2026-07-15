@@ -769,14 +769,18 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     );
     let mut agent = Agent::new(session_key, effective_role, &ws, None);
     let cancel = agent.cancel_token();
+    let typing_stop = CancellationToken::new();
     let typing_handle = spawn_scoped_typing_task(
         msg.reply_target.clone(),
         msg.channel.clone(),
-        cancel.clone(),
+        typing_stop.clone(),
     );
 
     let agent_result = tokio::select! {
-        () = cancel.cancelled() => return,
+        () = cancel.cancelled() => {
+            typing_stop.cancel();
+            return;
+        },
         result = agent.work(&msg.content) => result,
     };
 
@@ -789,12 +793,13 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     };
 
     if agent.is_cancelled() {
+        typing_stop.cancel();
         stop_typing(typing_handle).await;
         return;
     }
 
     send_channel_reply(response, &msg, Some(effective_role.to_string())).await;
 
-    cancel.cancel();
+    typing_stop.cancel();
     stop_typing(typing_handle).await;
 }
