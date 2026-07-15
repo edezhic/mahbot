@@ -351,7 +351,10 @@ impl DiffState {
         self.diff_loading = true;
         self.generation = self.generation.wrapping_add(1);
         let generation_num = self.generation;
-        let workspace_name = self.selected_workspace_name.clone().unwrap_or_default();
+        let workspace_name = self
+            .selected_workspace_name
+            .clone()
+            .expect("spawn_diff_load called without workspace selected");
         let ws_path = self.personal_workspace_path.clone();
         Task::perform(load_diff(workspace_name, ws_path, commit_ref), move |r| {
             DiffMessage::DiffLoaded(generation_num, r)
@@ -530,7 +533,11 @@ impl DiffState {
                     return Task::none();
                 }
                 self.committing = true;
-                let ws_name = self.selected_workspace_name.clone().unwrap_or_default();
+                let Some(ws_name) = self.selected_workspace_name.clone() else {
+                    tracing::error!("CommitClicked with no workspace selected");
+                    self.committing = false;
+                    return Task::none();
+                };
                 let ws_path_for_commit = self.personal_workspace_path.clone();
                 Task::perform(
                     async move {

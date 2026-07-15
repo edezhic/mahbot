@@ -1042,6 +1042,11 @@ impl Dashboard {
         // Close branch modal synchronously if open.
         // CloseModal always returns Task::none() so discarding is safe.
         let _ = self.git_state.update(git::GitMessage::CloseModal);
+        // `selected_workspace_name` is `None` in Personal workspace mode (no shared
+        // workspace selected). An empty string is the established convention and is
+        // safe here: `ws` is only consumed in the `Some(hash)` branch below — the
+        // `None` branch (working-tree diff, triggered by the git stats button) does
+        // not use it.
         let ws = self.selected_workspace_name.clone().unwrap_or_default();
         let diff_task = match commit_hash {
             Some(hash) => Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
