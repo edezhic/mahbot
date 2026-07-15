@@ -559,8 +559,21 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             return;
         }
         if try_trip_circuit_breaker(&ticket, expected_phase, kind, log_label).await {
-            // Circuit breaker tripped — drain the development pipeline so the
-            // Manager can triage the failure without new tickets auto-starting.
+            // Circuit breaker tripped — unconditionally drain the development
+            // pipeline regardless of which breaker type fired (TotalComments,
+            // Sanitation, Diagnostics). This is a deliberate invariant:
+            //
+            //   Any breaker trip signals a potentially dirty workspace. If the
+            //   drain were narrowed to only some breaker types, the Engineer
+            //   could pick up an unrelated ReadyForDevelopment ticket while the
+            //   workspace still has unfinished changes from the failed ticket —
+            //   leading to cascading failures, wasted API credits, and confused
+            //   agents.
+            //
+            //   Draining ALL ReadyForDevelopment tickets forces the Manager to
+            //   triage the failed ticket first, inspect workspace state, deal
+            //   with any uncommitted changes, and ensure the tree is clean
+            //   before unrelated work safely resumes.
             drain_ready_for_development_siblings(&ticket).await;
             return;
         }
@@ -2104,6 +2117,25 @@ fn format_analyst_summary(
 /// `Planning` tickets are **not** auto-claimed by the poll loop — they require
 /// Manager intervention to advance. This prevents new tickets from silently
 /// proceeding while existing failures are investigated.
+///
+/// # Critical invariant: all breaker types trigger the drain
+///
+/// This function is called unconditionally after **any** circuit breaker trip
+/// (TotalComments, Sanitation, or Diagnostics). This is intentional and
+/// conservative: any breaker trip signals that the workspace may be in a dirty
+/// or contaminated state. If the drain were narrowed to only some breaker
+/// types, an unrelated `ReadyForDevelopment` ticket could auto-start while the
+/// workspace still has unfinished changes from the failed ticket — leading to
+/// cascading failures, wasted API credits, and confused agents.
+///
+/// Draining every `ReadyForDevelopment` ticket forces the Manager to, in order:
+///
+/// 1. Triage the failed ticket first.
+/// 2. Inspect the workspace state and deal with any uncommitted changes.
+/// 3. Ensure the workspace tree is clean before unrelated ticket work resumes.
+///
+/// This invariant must not be weakened without a corresponding mechanism to
+/// guarantee workspace cleanliness before starting new development work.
 ///
 /// Does not push individual buffer entries for the moved tickets; the user is
 /// already notified about the primary ticket's circuit breaker failure, so
