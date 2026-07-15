@@ -136,46 +136,42 @@ impl CircuitBreakerKind {
     /// should not trip (count ≤ max_count).
     fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
         let max_count = self.max_count();
-        let (count, msg) = match self {
-            Self::TotalComments => {
-                let count = comments.len();
-                (
-                    count,
-                    format!(
-                        "Failed after {count} comments — ticket has accumulated too many comments \
-                         (circuit breaker, max: {max_count}). \
-                         Ticket failed — Manager will triage."
-                    ),
-                )
-            }
+        let count = match self {
+            Self::TotalComments => comments.len(),
             Self::Sanitation => {
-                let count =
-                    count_matching_comments(comments, SYSTEM_ROLE, SANITATION_FAILED_MARKER);
-                (
-                    count,
-                    format!(
-                        "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
-                         (max: {max_count})",
-                    ),
-                )
+                count_matching_comments(comments, SYSTEM_ROLE, SANITATION_FAILED_MARKER)
             }
             Self::Diagnostics => {
-                let count =
-                    count_matching_comments(comments, DIAGNOSTICS_ROLE, DIAGNOSTICS_FAILED_MARKER);
-                (
-                    count,
-                    format!(
-                        "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
-                         failures. Failing ticket."
-                    ),
-                )
+                count_matching_comments(comments, DIAGNOSTICS_ROLE, DIAGNOSTICS_FAILED_MARKER)
             }
         };
 
         if count <= max_count {
             None
         } else {
-            Some((count, max_count, msg))
+            Some((count, max_count, self.trip_message(count, max_count)))
+        }
+    }
+
+    /// Format the trip message for this breaker variant.
+    ///
+    /// Called by [`should_trip`](CircuitBreakerKind::should_trip) when the
+    /// failure count exceeds the maximum tolerated count.
+    fn trip_message(self, count: usize, max_count: usize) -> String {
+        match self {
+            Self::TotalComments => format!(
+                "Failed after {count} comments — ticket has accumulated too many comments \
+                 (circuit breaker, max: {max_count}). \
+                 Ticket failed — Manager will triage."
+            ),
+            Self::Sanitation => format!(
+                "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
+                 (max: {max_count})",
+            ),
+            Self::Diagnostics => format!(
+                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
+                 failures. Failing ticket."
+            ),
         }
     }
 }
