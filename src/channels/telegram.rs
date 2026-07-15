@@ -1,5 +1,5 @@
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
-use crate::util::{MEDIA_MARKER_RE, TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
+use crate::util::{TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
 use crate::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -1893,7 +1893,9 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
     }
 
     // Strip media markers so users don't see raw `[IMAGE:...]` syntax in the quote.
-    let content = MEDIA_MARKER_RE.replace_all(trimmed, "").to_string();
+    let content = TELEGRAM_MEDIA_MARKER_RE
+        .replace_all(trimmed, "")
+        .to_string();
     let content = content.trim().to_string();
     if content.is_empty() {
         return; // Media-only message — nothing to quote.

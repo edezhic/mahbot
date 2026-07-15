@@ -1607,28 +1607,54 @@ async fn sends_to_multiple_telegram_bindings() {
     assert!(recipients.contains(&"unique_multi_b"));
 }
 
-#[tokio::test]
-async fn strips_media_markers_from_content() {
+/// Shared helper for media-marker-stripping tests.
+///
+/// Sets up the mirror test environment, binds `user_name` to `reply_target` in the
+/// Telegram channel, mirrors a GUI message with `content`, and asserts that the quoted
+/// output equals `expected_quote`.
+async fn assert_mirror_strips_markers(
+    user_name: &str,
+    reply_target: &str,
+    content: &str,
+    expected_quote: &str,
+) {
     let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("strip_markers", "unique_markers").await;
+    setup_user_with_telegram_binding(user_name, reply_target).await;
 
-    let msg = gui_msg(
-        "strip_markers",
-        "Check this [IMAGE:/tmp/screenshot.png] and my [AUDIO:/tmp/recording.mp3]",
-    );
+    let msg = gui_msg(user_name, content);
     super::mirror_gui_message_to_telegram(&msg).await;
 
     let guard = sent.lock().unwrap_poison();
     let our_msgs: Vec<_> = guard
         .iter()
-        .filter(|m| m.recipient == "unique_markers")
+        .filter(|m| m.recipient == reply_target)
         .collect();
     assert_eq!(our_msgs.len(), 1);
-    // Markers should be stripped entirely (trailing whitespace is trimmed).
-    assert_eq!(
-        our_msgs[0].content,
-        "<blockquote>\nCheck this  and my\n</blockquote>"
-    );
+    assert_eq!(our_msgs[0].content, expected_quote);
+}
+
+#[tokio::test]
+async fn strips_media_markers_from_content() {
+    assert_mirror_strips_markers(
+        "strip_markers",
+        "unique_markers",
+        "Check this [IMAGE:/tmp/screenshot.png] and my [AUDIO:/tmp/recording.mp3]",
+        "<blockquote>\nCheck this  and my\n</blockquote>",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn strips_lowercase_media_markers_from_content() {
+    // Regression test: the mirror path must use a case-insensitive regex
+    // to strip lowercase markers like [image:...] and [audio:...].
+    assert_mirror_strips_markers(
+        "lowercase_markers",
+        "unique_lowercase",
+        "See [image:/tmp/photo.png] and hear [audio:/tmp/sound.mp3]",
+        "<blockquote>\nSee  and hear\n</blockquote>",
+    )
+    .await;
 }
 
 #[tokio::test]
