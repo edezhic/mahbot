@@ -20,7 +20,7 @@
 //! bounce back to ReadyForDevelopment; clean files proceed to Done via commit.
 
 use std::fmt::Write;
-use std::path::Path;
+
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -1093,45 +1093,13 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
     }
 }
 
-/// Transition the ticket to Done if git is unavailable.
-///
-/// Returns `true` if the caller should return immediately (transition to Done
-/// already performed), `false` if git is usable and normal operations should proceed.
-#[must_use]
-async fn transition_ticket_to_done_if_git_unavailable(
-    ticket: &Ticket,
-    repo_path: &Path,
-    source: TicketPhase,
-) -> bool {
-    if !crate::git_commands::git_is_installed().await {
-        transition_ticket_to_done(
-            ticket,
-            source,
-            "Git not installed — moving to Done without commit",
-        )
-        .await;
-        return true;
-    }
-    if !crate::git_commands::is_git_repo(repo_path) {
-        transition_ticket_to_done(
-            ticket,
-            source,
-            "Not a git repo — moving to Done without commit",
-        )
-        .await;
-        return true;
-    }
-    false
-}
-
 /// Ensure git is available and run `git status --porcelain`.
 ///
 /// # Side effects
 ///
 /// **May transition the ticket to Done.** If git is unavailable (`git` not
 /// installed or the workspace is not a git repo), this helper immediately
-/// transitions the ticket to Done (via
-/// [`transition_ticket_to_done_if_git_unavailable`]) and returns `None`. This
+/// transitions the ticket to Done and returns `None`. This
 /// is intentional — the ticket has already reached a terminal pipeline phase
 /// and should not block on infrastructure issues.
 ///
@@ -1149,7 +1117,22 @@ async fn ensure_git_and_get_status(
 ) -> Option<String> {
     let repo_path = ws.as_path();
 
-    if transition_ticket_to_done_if_git_unavailable(ticket, repo_path, phase).await {
+    if !crate::git_commands::git_is_installed().await {
+        transition_ticket_to_done(
+            ticket,
+            phase,
+            "Git not installed — moving to Done without commit",
+        )
+        .await;
+        return None;
+    }
+    if !crate::git_commands::is_git_repo(repo_path) {
+        transition_ticket_to_done(
+            ticket,
+            phase,
+            "Not a git repo — moving to Done without commit",
+        )
+        .await;
         return None;
     }
 
@@ -1170,8 +1153,7 @@ async fn ensure_git_and_get_status(
 
 /// Finalize a ticket given an already-obtained `git status --porcelain` output.
 ///
-/// Callers **must** have already verified git availability via
-/// [`transition_ticket_to_done_if_git_unavailable`] and obtained a porcelain
+/// Callers **must** have already verified git availability and obtained a porcelain
 /// string via [`run_git_status`] before calling this function.
 ///
 /// - **Clean tree** (empty porcelain): transitions directly to Done.
