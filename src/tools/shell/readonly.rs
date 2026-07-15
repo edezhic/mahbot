@@ -461,6 +461,9 @@ const FLAG_CHECKS: &[FlagCheck] = &[
         rejection: "`curl` with output flags (`-o`, `--output`, `-O`, `--remote-name`) is not allowed.",
         suggestion: "use `curl` without output flags to display content in stdout.",
     },
+    // Note: `is_tar_mutating` uses negative detection (see its doc comment).
+    // Unlike the five entries above, the predicate returns `true` for
+    // *anything* not explicitly whitelisted as list-only.
     FlagCheck {
         verb: "tar",
         predicate: is_tar_mutating,
@@ -1096,6 +1099,10 @@ fn has_curl_output_flag(command: &str) -> bool {
 const TAR_SAFE_CHARS: &[char] = &['v', 'f', 'z', 'j', 'J'];
 
 /// Check if tar is using only `-t`/`--list` (list) mode. Handles combined flags.
+///
+/// This is the **whitelist** for [`is_tar_mutating`]'s negative detection
+/// strategy. Add new safe/list-only operations (e.g. `--diff`/`--compare`)
+/// here rather than adding blacklist checks to [`is_tar_mutating`].
 fn is_tar_list_only(command: &str) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     // Find the operation flag/option
@@ -1125,6 +1132,33 @@ fn is_tar_list_only(command: &str) -> bool {
 }
 
 /// Check if `tar` is in mutating mode (i.e., will extract/create).
+///
+/// # Negative detection strategy
+///
+/// Unlike the other [`FLAG_CHECKS`] entries which use **positive detection**
+/// (a predicate that returns `true` only when a specific mutating flag is
+/// found), this function uses **negative detection**: it returns `true` when
+/// the command is *not* explicitly list-only.
+///
+/// The reason is that `tar` combines short flags into strings (e.g. `-xvf`
+/// or `-czf`), making it impractical to enumerate every mutating flag
+/// combination. Instead, it's simpler to maintain a whitelist of safe
+/// operations in [`is_tar_list_only`] and deny everything else.
+///
+/// The `!is_tar_list_only()` fallback automatically catches **all** mutating
+/// operations — extraction (`-x`), creation (`-c`), appending (`-r`), update
+/// (`-u`), deletion (`--delete`), etc. No individual blacklist checks are
+/// needed.
+///
+/// ## For maintainers
+///
+/// *   **New mutating operations** require no changes — they are already
+///     caught by the negative-detection fallback.
+/// *   **New safe/list operations** (e.g. `--diff`/`--compare` for comparing
+///     archive contents without modifying anything) should be added to
+///     [`is_tar_list_only`] to whitelist them.
+/// *   Do **not** add positive blacklist checks to this function — they
+///     would be dead code, masked by the fallback.
 fn is_tar_mutating(command: &str) -> bool {
     !is_tar_list_only(command)
 }
