@@ -126,8 +126,6 @@ const GIT_SAFE_SUBCOMMANDS: &[&str] = &[
     "fmt-merge-msg",
     "fsck",
     "merge-base",
-    "merge-file",
-    "merge-tree",
     "whatchanged",
     "reflog",
     "range-diff",
@@ -137,8 +135,6 @@ const GIT_SAFE_SUBCOMMANDS: &[&str] = &[
     "config --get",
     "config --get-all",
     "hash-object",
-    "mktag",
-    "mktree",
     "stripspace",
     "remote",
     "branch",
@@ -821,6 +817,45 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         );
     }
 
+    // git mktag always writes a tag object to the object database — no read-only mode.
+    if subcommand.starts_with("mktag") {
+        return reject(
+            trimmed,
+            "`git mktag` is not allowed — it always writes a tag object to the object database.",
+            "use `git verify-tag` or `git cat-file` to inspect existing tag objects.",
+        );
+    }
+
+    // git mktree always writes a tree object to the object database — no read-only mode.
+    if subcommand.starts_with("mktree") {
+        return reject(
+            trimmed,
+            "`git mktree` is not allowed — it always writes a tree object to the object database.",
+            "use `git ls-tree` to inspect existing tree objects.",
+        );
+    }
+
+    // git merge-file without -p/--stdout overwrites the <current> file in-place.
+    // Even with -p/--stdout, the --object-id variant writes to the object store.
+    // Rather than a complex multi-flag check, reject entirely for safety.
+    if subcommand.starts_with("merge-file") {
+        return reject(
+            trimmed,
+            "`git merge-file` is not allowed — it mutates files or writes to the object database.",
+            "use `git diff` to compare files, or `diff`/`diff3` for three-way comparisons.",
+        );
+    }
+
+    // git merge-tree since Git 2.40 defaults to --write-tree, which creates tree
+    // objects in the object database. The alternative --trivial-merge is deprecated.
+    if subcommand.starts_with("merge-tree") {
+        return reject(
+            trimmed,
+            "`git merge-tree` is not allowed — it writes tree objects in its default mode.",
+            "use `git merge-base` to find the merge base, or `git diff-tree` to inspect trees.",
+        );
+    }
+
     let matched_safe = GIT_SAFE_SUBCOMMANDS
         .iter()
         .copied()
@@ -835,7 +870,7 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         ));
     }
 
-    // Additional mutation-flag checks for branch/tag/remote
+    // Additional mutation-flag checks for branch/tag/remote/hash-object/reflog
     match matched_safe {
         Some("branch") => {
             check_git_subcommand_mutation(&subcommand, "branch", GIT_BRANCH_MUTATIONS)?;
@@ -843,6 +878,33 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         Some("tag") => check_git_subcommand_mutation(&subcommand, "tag", GIT_TAG_MUTATIONS)?,
         Some("remote") => {
             check_git_subcommand_mutation(&subcommand, "remote", GIT_REMOTE_MUTATIONS)?;
+        }
+        Some("hash-object") => {
+            // git hash-object -w writes the object to the database; without -w
+            // it only computes and outputs the hash (read-only). The -w flag can
+            // appear anywhere in the argument list, so we search the full command.
+            if has_flag(trimmed, "w") {
+                return reject(
+                    trimmed,
+                    "`git hash-object -w` is not allowed — it writes objects to the object database.",
+                    "use `git hash-object` without `-w` to compute the hash without storing the object.",
+                );
+            }
+        }
+        Some("reflog") => {
+            // git reflog expire/delete mutate the reflog. Other subcommands
+            // (show, list, exists, or bare `git reflog`) are read-only.
+            let words: Vec<&str> = subcommand.split_whitespace().collect();
+            if let Some(reflog_sub) = words.get(1)
+                && (*reflog_sub == "expire" || *reflog_sub == "delete") {
+                    return reject(
+                        trimmed,
+                        &format!(
+                            "`git reflog {reflog_sub}` is not allowed — it modifies the reflog."
+                        ),
+                        "use `git reflog show` or bare `git reflog` to view reflog entries.",
+                    );
+                }
         }
         _ => {}
     }
@@ -1207,6 +1269,31 @@ mod tests {
             ("git remote -v", true),
             ("git remote show origin", true),
             ("git remote get-url origin", true),
+            // mktag always mutates
+            ("git mktag <tag_object", false),
+            ("git mktag", false),
+            // mktree always mutates
+            ("git mktree <tree_contents", false),
+            ("git mktree", false),
+            // merge-file always mutates (removed from safe list)
+            ("git merge-file a.txt b.txt c.txt", false),
+            ("git merge-file -p a.txt b.txt c.txt", false),
+            // merge-tree always mutates (removed from safe list)
+            ("git merge-tree base branch1 branch2", false),
+            ("git merge-tree --write-tree base branch1 branch2", false),
+            // hash-object: read-only without -w, mutating with -w
+            ("git hash-object file.txt", true),
+            ("git hash-object --stdin", true),
+            ("git hash-object -w file.txt", false),
+            ("git hash-object -w --stdin", false),
+            ("git hash-object file.txt -w", false),
+            // reflog: read-only commands allowed, expire/delete rejected
+            ("git reflog", true),
+            ("git reflog show", true),
+            ("git reflog list", true),
+            ("git reflog show HEAD", true),
+            ("git reflog expire --all", false),
+            ("git reflog delete HEAD@{0}", false),
         ];
 
         run_cases(&cases);
