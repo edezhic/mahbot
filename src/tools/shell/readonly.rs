@@ -470,7 +470,7 @@ const FLAG_CHECKS: &[FlagCheck] = &[
     },
     FlagCheck {
         verb: "tar",
-        predicate: is_not_tar_list_only,
+        predicate: is_tar_mutating,
         rejection: "`tar` is only allowed with `-t`/`--list` (list) mode.",
         suggestion: "use `tar -tf archive.tar` to list contents.",
     },
@@ -1056,8 +1056,8 @@ fn is_tar_list_only(command: &str) -> bool {
     false
 }
 
-/// Check if `tar` is NOT in list-only mode (i.e., will extract/create).
-fn is_not_tar_list_only(command: &str) -> bool {
+/// Check if `tar` is in mutating mode (i.e., will extract/create).
+fn is_tar_mutating(command: &str) -> bool {
     !is_tar_list_only(command)
 }
 
