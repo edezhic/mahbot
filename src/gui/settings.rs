@@ -1340,127 +1340,52 @@ impl SettingsState {
 
     /// Build the add-workspace modal dialog content.
     fn add_workspace_dialog(&self) -> Element<'_, SettingsMessage> {
-        container(
-            column![
-                text("Add Workspace")
-                    .size(16)
-                    .color(theme::TEXT_PRIMARY)
-                    .font(theme::FONT_BOLD),
-                Space::new().height(16),
-                field_row(
-                    "Name",
-                    text_input("workspace name", &self.add_workspace_name)
-                        .on_input(SettingsMessage::AddWorkspaceName)
-                        .style(widgets::text_input_style)
-                        .width(Length::Fixed(375.0))
-                        .into(),
-                    None,
-                ),
-                Space::new().height(8),
-                field_row(
-                    "Path",
-                    text_input("/path/to/workspace", &self.add_workspace_path)
-                        .on_input(SettingsMessage::AddWorkspacePath)
-                        .style(widgets::text_input_style)
-                        .width(Length::Fixed(375.0))
-                        .into(),
-                    None,
-                ),
-                Space::new().height(16),
-                row![
-                    Space::new().width(Length::Fill),
-                    button(text("Cancel").size(13))
-                        .style(theme::button_secondary)
-                        .on_press(SettingsMessage::ToggleAddWorkspaceModal),
-                    Space::new().width(8),
-                    button(
-                        text(if self.add_workspace_adding {
-                            "Adding..."
-                        } else {
-                            "Add"
-                        })
-                        .size(13),
-                    )
-                    .style(theme::button_primary)
-                    .on_press_maybe(
-                        if self.add_workspace_adding
-                            || self.add_workspace_name.is_empty()
-                            || self.add_workspace_path.is_empty()
-                        {
-                            None
-                        } else {
-                            Some(SettingsMessage::SubmitAddWorkspace)
-                        }
-                    ),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .padding(24),
+        modal_dialog(
+            "Add Workspace",
+            &[
+                DialogField {
+                    label: "Name",
+                    placeholder: "workspace name",
+                    value: &self.add_workspace_name,
+                    on_input: SettingsMessage::AddWorkspaceName,
+                },
+                DialogField {
+                    label: "Path",
+                    placeholder: "/path/to/workspace",
+                    value: &self.add_workspace_path,
+                    on_input: SettingsMessage::AddWorkspacePath,
+                },
+            ],
+            self.add_workspace_adding,
+            !self.add_workspace_name.is_empty() && !self.add_workspace_path.is_empty(),
+            SettingsMessage::ToggleAddWorkspaceModal,
+            SettingsMessage::SubmitAddWorkspace,
         )
-        .width(Length::Fixed(620.0))
-        .style(theme::dialog_container_style)
-        .into()
     }
 
     /// Build the add-user modal dialog content.
     fn add_user_dialog(&self) -> Element<'_, SettingsMessage> {
-        container(
-            column![
-                text("Add User")
-                    .size(16)
-                    .color(theme::TEXT_PRIMARY)
-                    .font(theme::FONT_BOLD),
-                Space::new().height(16),
-                field_row(
-                    "Name",
-                    text_input("user name", &self.add_user_sender)
-                        .on_input(SettingsMessage::AddUserSender)
-                        .style(widgets::text_input_style)
-                        .width(Length::Fixed(375.0))
-                        .into(),
-                    None,
-                ),
-                Space::new().height(8),
-                field_row(
-                    "Permissions",
-                    text_input("optional", &self.add_user_permissions)
-                        .on_input(SettingsMessage::AddUserPermissions)
-                        .style(widgets::text_input_style)
-                        .width(Length::Fixed(375.0))
-                        .into(),
-                    None,
-                ),
-                Space::new().height(16),
-                row![
-                    Space::new().width(Length::Fill),
-                    button(text("Cancel").size(13))
-                        .style(theme::button_secondary)
-                        .on_press(SettingsMessage::ToggleAddUserModal),
-                    Space::new().width(8),
-                    button(
-                        text(if self.add_user_adding {
-                            "Adding..."
-                        } else {
-                            "Add"
-                        })
-                        .size(13),
-                    )
-                    .style(theme::button_primary)
-                    .on_press_maybe(
-                        if self.add_user_adding || self.add_user_sender.is_empty() {
-                            None
-                        } else {
-                            Some(SettingsMessage::SubmitAddUser)
-                        }
-                    ),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .padding(24),
+        modal_dialog(
+            "Add User",
+            &[
+                DialogField {
+                    label: "Name",
+                    placeholder: "user name",
+                    value: &self.add_user_sender,
+                    on_input: SettingsMessage::AddUserSender,
+                },
+                DialogField {
+                    label: "Permissions",
+                    placeholder: "optional",
+                    value: &self.add_user_permissions,
+                    on_input: SettingsMessage::AddUserPermissions,
+                },
+            ],
+            self.add_user_adding,
+            !self.add_user_sender.is_empty(),
+            SettingsMessage::ToggleAddUserModal,
+            SettingsMessage::SubmitAddUser,
         )
-        .width(Length::Fixed(620.0))
-        .style(theme::dialog_container_style)
-        .into()
     }
 
     /// Build the diagnostics modal dialog content for the given workspace.
@@ -2049,6 +1974,92 @@ fn config_text_input<'a>(
             .into(),
         None,
     )
+}
+
+/// Configuration for a single text field in [`modal_dialog`].
+struct DialogField<'a> {
+    label: &'static str,
+    placeholder: &'static str,
+    value: &'a str,
+    /// Function pointer for the text-input `on_input` handler.
+    ///
+    /// Uses `fn(String) -> SettingsMessage` (function pointer) rather than
+    /// `impl Fn(String) -> SettingsMessage + 'a` to keep the struct simple,
+    /// avoid boxing, and rely on monomorphization at the callsite. This works
+    /// because all current callers pass enum tuple-variant constructors (e.g.
+    /// [`SettingsMessage::AddWorkspaceName`]), which coerce to function pointers.
+    ///
+    /// If a future caller needs to capture state in the closure, this field
+    /// must be changed to `Box<dyn Fn(String) -> SettingsMessage + 'a>`.
+    on_input: fn(String) -> SettingsMessage,
+}
+
+/// Build a reusable add-item modal dialog with text fields, a Cancel button,
+/// and a conditionally-enabled Submit (Add) button.
+///
+/// Layout: title, spacer(16), field rows (8 px between), spacer(16), Cancel / Add buttons.
+fn modal_dialog<'a>(
+    title: &'static str,
+    fields: &[DialogField<'a>],
+    adding: bool,
+    submit_enabled: bool,
+    on_cancel: SettingsMessage,
+    on_submit: SettingsMessage,
+) -> Element<'a, SettingsMessage> {
+    let mut col = Column::new().padding(24);
+
+    col = col.push(
+        text(title)
+            .size(16)
+            .color(theme::TEXT_PRIMARY)
+            .font(theme::FONT_BOLD),
+    );
+
+    if !fields.is_empty() {
+        col = col.push(Space::new().height(16));
+    }
+
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            col = col.push(Space::new().height(8));
+        }
+        col = col.push(field_row(
+            field.label,
+            text_input(field.placeholder, field.value)
+                .on_input(field.on_input)
+                .style(widgets::text_input_style)
+                .width(Length::Fixed(375.0))
+                .into(),
+            None,
+        ));
+    }
+
+    if !fields.is_empty() {
+        col = col.push(Space::new().height(16));
+    }
+
+    col = col.push(
+        row![
+            Space::new().width(Length::Fill),
+            button(text("Cancel").size(13))
+                .style(theme::button_secondary)
+                .on_press(on_cancel),
+            Space::new().width(8),
+            button(text(if adding { "Adding..." } else { "Add" }).size(13),)
+                .style(theme::button_primary)
+                .on_press_maybe(if adding || !submit_enabled {
+                    None
+                } else {
+                    Some(on_submit)
+                }),
+        ]
+        .align_y(Alignment::Center),
+    );
+
+    container(col)
+        .width(Length::Fixed(620.0))
+        .style(theme::dialog_container_style)
+        .into()
 }
 
 /// Wrap a dialog element inside a semi-transparent backdrop, centered on screen.
