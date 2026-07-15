@@ -854,12 +854,25 @@ async fn dispatch_unassigned_in_phase(
 
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
-/// Single pass over workspaces — for each, attempt claims across all pipeline
-/// phases, then handle DiagnosticsCheck and QaPassed. Previously phase-major
-/// (all workspaces claim Backlog, then all claim Engineer, …); now workspace-major
-/// (workspace A claims all phases, then workspace B, …). Correctness is preserved
-/// because claims are atomic per-workspace and `PipelineCheck` gates
-/// are checked within each workspace independently.
+/// Single pass over workspaces — for each, the following five steps are
+/// performed in order:
+///
+/// 1. **Pipeline claims** — atomic source→target phase transitions
+///    (`run_claim_pipeline`).
+/// 2. **DiagnosticsCheck** — dispatch unassigned `InDiagnostics` tickets
+///    so diagnostics commands (fmt, lint, build, test) continue running.
+/// 3. **SanitationPassed → Done** — auto-commit tickets that have passed
+///    sanitation, following the same pattern as the QaPassed→Done flow.
+/// 4. **QaPassed** — check the working tree for untracked files; claim to
+///    `InSanitation` if dirty, otherwise commit directly to `Done`.
+/// 5. **SanitationCheck** — dispatch unassigned `InSanitation` tickets
+///    (the claim step inside step 4 already moved dirty tickets there).
+///
+/// Previously phase-major (all workspaces claim Backlog, then all claim
+/// Engineer, …); now workspace-major (workspace A claims all phases, then
+/// workspace B, …). Correctness is preserved because claims are atomic
+/// per-workspace and `PipelineCheck` gates are checked within each
+/// workspace independently.
 async fn poll_round() {
     let workspaces = match crate::workspace::store().list().await {
         Ok(ws_list) => ws_list,
