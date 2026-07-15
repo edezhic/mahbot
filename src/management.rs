@@ -893,9 +893,29 @@ async fn poll_round() {
 
         // 3. SanitationPassed → Done (auto-commit), following the same pattern
         // as the QaPassed→Done commit flow.
-        spawn_for_each_ticket_in_phase(TicketPhase::SanitationPassed, ws, |ticket, ws| {
-            finalize_ticket_from_phase(ticket, ws, TicketPhase::SanitationPassed)
-        })
+        spawn_for_each_ticket_in_phase(
+            TicketPhase::SanitationPassed,
+            ws,
+            |ticket, ws| async move {
+                let Some(porcelain) = ensure_git_or_done_and_get_status(
+                    &ticket,
+                    &ws,
+                    TicketPhase::SanitationPassed,
+                    "finalize",
+                )
+                .await
+                else {
+                    return;
+                };
+                finalize_ticket_with_git_status(
+                    ticket,
+                    ws,
+                    TicketPhase::SanitationPassed,
+                    &porcelain,
+                )
+                .await;
+            },
+        )
         .await;
 
         // 4. Handle QaPassed tickets.
@@ -1203,23 +1223,6 @@ async fn finalize_ticket_with_git_status(
             );
         }
     }
-}
-
-/// Auto-commit changes and move the ticket to Done.
-///
-/// Parameterized by source phase so both the QaPassed→Done and
-/// SanitationPassed→Done flows share the same implementation.
-///
-/// Checks git availability, queries `git status --porcelain` via
-/// [`ensure_git_or_done_and_get_status`], then delegates to
-/// [`finalize_ticket_with_git_status`] for the commit-or-done decision.
-async fn finalize_ticket_from_phase(ticket: Ticket, ws: Workspace, source: TicketPhase) {
-    let Some(porcelain) = ensure_git_or_done_and_get_status(&ticket, &ws, source, "finalize").await
-    else {
-        return;
-    };
-
-    finalize_ticket_with_git_status(ticket, ws, source, &porcelain).await;
 }
 
 /// After a successful `git commit`, persist the metadata and transition the
@@ -2247,7 +2250,7 @@ async fn try_trip_circuit_breaker(
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
 ///    `success_phase` with [`NotifyPolicy::Buffer`]. No immediate notification fires —
 ///    it waits until the ticket reaches Done (after the QaPassed commit succeeds in
-///    [`finalize_ticket_from_phase`]).
+///    [`handle_qa_passed`]).
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_analyst_verdicts`].
