@@ -136,7 +136,9 @@ pub(crate) async fn run_git_output(
 ) -> anyhow::Result<std::process::Output> {
     let mut cmd = git_command();
     cmd.args(args).current_dir(repo_path);
-    cmd.output().await.context("Failed to run git")
+    cmd.output()
+        .await
+        .with_context(|| format!("Failed to run git {}", args.join(" ")))
 }
 
 /// Run a git command and return stdout as string on success.
@@ -147,7 +149,7 @@ pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> anyhow::Result<
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Git command failed: {stderr}");
+        anyhow::bail!("git {} failed: {stderr}", args.join(" "));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
