@@ -410,13 +410,30 @@ fn segment_at(pos: usize, segments: &[Segment]) -> Result<&Segment> {
 }
 
 /// Map a span of normalized byte positions back to original byte positions.
+///
+/// # Approximation in collapsed-whitespace segments
+///
+/// Whitespace normalization collapses runs of consecutive original whitespace
+/// characters into a single space (e.g., 15 spaces → 1 space). This mapping is
+/// **lossy** — given a normalized position inside such a segment, we cannot
+/// determine exactly which original whitespace character it corresponds to.
+///
+/// When `norm_start` or `norm_end` falls inside a collapsed-whitespace segment,
+/// this function maps the normalized position to the **boundary** of the
+/// original whitespace run: the start of the run for `norm_start`, and the end
+/// of the run for `norm_end`. This means the resulting original span may cover
+/// more characters than strictly necessary.
+///
+/// This is an intentional choice: **replacing a bit too much is safer than
+/// replacing too little**. Tools that consume the mapped span should expect
+/// that they may receive a superset of the intended region when whitespace
+/// normalization was involved.
 fn map_norm_span(
     norm_start: usize,
     norm_end: usize,
     segments: &[Segment],
 ) -> Result<(usize, usize)> {
     let seg = segment_at(norm_start, segments)?;
-    // Verbatim segments (strings/regular content) map 1:1; whitespace segments map to the whole run
     let orig_start = if seg.orig_range.len() == seg.norm_range.len() {
         seg.orig_range
             .start
