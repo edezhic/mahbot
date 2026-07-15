@@ -131,10 +131,9 @@ impl CircuitBreakerKind {
     ///
     /// Counts failures matching this variant's criteria from the ticket comments.
     /// If the count exceeds the variant's `max_count`, returns
-    /// `Some((count, max_count, message))` where `message` is the formatted
-    /// trip comment string to post on the ticket. Returns `None` if the breaker
+    /// `Some((count, max_count))`. Returns `None` if the breaker
     /// should not trip (count ≤ max_count).
-    fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize, String)> {
+    fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize)> {
         let max_count = self.max_count();
         let count = match self {
             Self::TotalComments => comments.len(),
@@ -149,14 +148,11 @@ impl CircuitBreakerKind {
         if count <= max_count {
             None
         } else {
-            Some((count, max_count, self.trip_message(count, max_count)))
+            Some((count, max_count))
         }
     }
 
     /// Format the trip message for this breaker variant.
-    ///
-    /// Called by [`should_trip`](CircuitBreakerKind::should_trip) when the
-    /// failure count exceeds the maximum tolerated count.
     fn trip_message(self, count: usize, max_count: usize) -> String {
         match self {
             Self::TotalComments => format!(
@@ -2151,8 +2147,9 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 }
 
 /// Shared circuit breaker skeleton: fetch comments, evaluate via
-/// [`CircuitBreakerKind::should_trip`], add a system comment via the returned
-/// message string, then transition to [`TicketPhase::Failed`].
+/// [`CircuitBreakerKind::should_trip`], format the trip message via
+/// [`CircuitBreakerKind::trip_message`], add a system comment, then
+/// transition to [`TicketPhase::Failed`].
 ///
 /// All three concrete breakers (TotalComments, Sanitation, Diagnostics) delegate to this
 /// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum. This
@@ -2202,9 +2199,11 @@ async fn try_trip_circuit_breaker(
         }
     };
 
-    let Some((count, max_count, msg)) = kind.should_trip(&comments) else {
+    let Some((count, max_count)) = kind.should_trip(&comments) else {
         return false;
     };
+
+    let msg = kind.trip_message(count, max_count);
 
     info!(
         ticket = %ticket.id,
