@@ -494,7 +494,7 @@ impl std::str::FromStr for TicketPhase {
 
 /// Bundles a SQL mutation statement with its parameters and ticket id.
 /// Returned by [`BoardStore::build_transition_sql`]; executed via
-/// [`PreparedUpdate::execute`], [`PreparedUpdate::execute_tx`] or
+/// [`PreparedUpdate::execute_no_cancel`], [`PreparedUpdate::execute_tx`] or
 /// [`PreparedUpdate::execute_and_cancel`].
 struct PreparedUpdate {
     sql: String,
@@ -518,7 +518,7 @@ impl PreparedUpdate {
     /// Use this for post-agent operations where the caller knows no agent
     /// is running and the implicit cancellation of
     /// [`execute_and_cancel`](Self::execute_and_cancel) is unnecessary.
-    async fn execute(self, conn: &turso::Connection) -> Result<()> {
+    async fn execute_no_cancel(self, conn: &turso::Connection) -> Result<()> {
         let rows = conn.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         Ok(())
@@ -533,7 +533,7 @@ impl PreparedUpdate {
     /// # When NOT to use
     ///
     /// Do **not** use this helper for operations where cancellation is
-    /// unnecessary or has different semantics. Prefer [`execute`](Self::execute)
+    /// unnecessary or has different semantics. Prefer [`execute_no_cancel`](Self::execute_no_cancel)
     /// for simple post-agent updates that do not need stale-agent cancellation.
     /// Additionally, avoid this helper for:
     /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
@@ -1279,7 +1279,7 @@ impl BoardStore {
             vec![Value::from(None::<&str>)],
             ticket_id,
         );
-        prepared.execute(&self.conn).await
+        prepared.execute_no_cancel(&self.conn).await
     }
 
     /// Transactional variant of [`set_assigned_to`](Self::set_assigned_to) —
