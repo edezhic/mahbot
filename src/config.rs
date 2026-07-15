@@ -357,7 +357,7 @@ macro_rules! string_config_fields {
             /// Set a string field by its database key. Returns `true` if the key was
             /// recognised and the field was updated, `false` for unknown keys.
             ///
-            /// The value is stored as-is without normalization — call [`Self::finalize`]
+            /// The value is stored as-is without normalization — call [`Self::normalize`]
             /// before using the config to collapse empty/whitespace-only values to `None`.
             ///
             /// `per_role_configs` and `model_routings` are **not** handled here —
@@ -376,7 +376,7 @@ macro_rules! string_config_fields {
             ///
             /// Unlike [`set_string_field`], which stores values as-is, this is the
             /// canonical normalization point — callers that set individual fields
-            /// should ensure [`Self::finalize`] is called before using the config.
+            /// should ensure [`Self::normalize`] is called before using the config.
             fn normalize_string_fields(&mut self) {
                 $(self.$field = non_empty(self.$field.take());)*
             }
@@ -386,7 +386,7 @@ macro_rules! string_config_fields {
         //
         // Dual-normalisation design rationale (defence-in-depth):
         //
-        // • Write-time: `normalize_string_fields()` (called from `finalize()`)
+        // • Write-time: `normalize_string_fields()` (called from `normalize()`)
         //   normalises every string field so that semantically-identical values
         //   (e.g. `Some("")` vs `None`) compare equal — this supports the
         //   snapshot-and-compare logic in `save_and_reload`.
@@ -504,7 +504,7 @@ impl ConfigData {
     /// Every caller that produces a newly-built [`ConfigData`] must call
     /// this before swapping into the global [`CONFIG`] so that the in-memory
     /// representation is the same regardless of which code path produced it.
-    pub(crate) fn finalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         self.normalize_string_fields();
         self.normalize_entries();
         self.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
@@ -797,7 +797,7 @@ pub async fn reload_from_db() -> Result<()> {
 
     // Normalise and sort so the in-memory representation matches
     // save_and_reload's persistence path.
-    config.finalize();
+    config.normalize();
 
     CONFIG.swap(config);
     tracing::info!("Config reloaded from DB");
@@ -832,8 +832,8 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     //  3. The warmup uses exactly the same values that will be swapped
     //     into the global CONFIG — no risk of a valid config change being
     //     rejected due to superficial differences (e.g. leading/trailing
-    //     whitespace) that finalize would have stripped anyway.
-    config.finalize();
+    //     whitespace) that normalize would have stripped anyway.
+    config.normalize();
 
     validate_config(&config)?;
 
@@ -905,12 +905,10 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
 /// Validate a [`ConfigData`] before persisting — rejecting common misconfigurations.
 ///
 /// # Precondition
-///
-/// [`ConfigData::finalize`] MUST have been called before this function.
+///    /// [`ConfigData::normalize`] MUST have been called before this function.
 /// All `Option<String>` fields are assumed to be already trimmed, with
 /// empty/whitespace-only values collapsed to `None` by
-/// [`normalize_string_fields`][ConfigData::normalize_string_fields]
-/// (which `finalize` calls unconditionally for **every** field regardless
+/// [`normalize_string_fields`][ConfigData::normalize_string_fields]    /// (which `normalize` calls unconditionally for **every** field regardless
 /// of its per-field annotation — `non_empty`, `or(…)`, or `list_or(…)`).
 fn validate_config(config: &ConfigData) -> Result<()> {
     if let Some(ref ep) = config.provider_endpoint
@@ -1003,7 +1001,7 @@ mod tests {
             );
         }
 
-        // ── Normalization is handled by finalize(), not set_string_field ──
+        // ── Normalization is handled by normalize(), not set_string_field ──
         // set_string_field stores the raw value as-is.
         let _ = config.set_string_field("provider_key", "");
         let pk = config
@@ -1029,14 +1027,14 @@ mod tests {
             "whitespace-only string stored as-is by set_string_field"
         );
 
-        // After finalize(), empty/whitespace values are collapsed to None.
-        config.finalize();
+        // After normalize(), empty/whitespace values are collapsed to None.
+        config.normalize();
         let pk = config
             .string_fields()
             .iter()
             .find(|(k, _)| *k == "provider_key")
             .and_then(|(_, v)| *v);
-        assert!(pk.is_none(), "finalize() collapses empty string to None");
+        assert!(pk.is_none(), "normalize() collapses empty string to None");
 
         // Unknown key returns false.
         assert!(!config.set_string_field("nonexistent_key", "value"));
@@ -1414,23 +1412,23 @@ mod tests {
             provider_endpoint: Some("https://openrouter.ai/api/v1".into()),
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
-        config.finalize();
+        config.normalize();
         validate_config(&config).unwrap();
     }
 
-    /// A whitespace-padded URL passes validation after `finalize` normalises
+    /// A whitespace-padded URL passes validation after `normalize` normalises
     /// it.  This is a regression test for the latent ordering bug where
     /// `validate_config` (which used untrimmed `starts_with`) ran *before*
-    /// `finalize` (which trims).  The fix ensures `finalize` always runs
+    /// `normalize` (which trims).  The fix ensures `normalize` always runs
     /// first, so validation only ever sees canonical values.
     #[test]
-    fn validate_config_accepts_whitespace_padded_url_after_finalize() {
+    fn validate_config_accepts_whitespace_padded_url_after_normalize() {
         let mut config = ConfigData {
             provider_endpoint: Some("  https://openrouter.ai/api/v1   ".into()),
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
-        config.finalize();
-        // After finalize the value is trimmed — validation sees the canonical form.
+        config.normalize();
+        // After normalize the value is trimmed — validation sees the canonical form.
         validate_config(&config).unwrap();
     }
 
@@ -1441,7 +1439,7 @@ mod tests {
             provider_endpoint: Some("not-a-url".into()),
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
-        config.finalize();
+        config.normalize();
         let err = validate_config(&config).unwrap_err();
         assert!(
             err.to_string()
@@ -1457,7 +1455,7 @@ mod tests {
             provider_key: Some("sk-or-v1-...".into()),
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
-        config.finalize();
+        config.normalize();
         let err = validate_config(&config).unwrap_err();
         assert!(
             err.to_string().contains("placeholder"),
