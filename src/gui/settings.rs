@@ -1580,13 +1580,13 @@ impl SettingsState {
                     "audio_transcription_model",
                 ),
                 config_text_input(
-                    "Transcription Provider",
+                    "Image Provider",
                     "",
                     self.config
-                        .transcription_provider
+                        .image_transcription_provider
                         .as_deref()
                         .unwrap_or_default(),
-                    "transcription_provider",
+                    "image_transcription_provider",
                 ),
                 config_text_input(
                     "Audio Provider",

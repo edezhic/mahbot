@@ -232,8 +232,8 @@ pub struct ConfigData {
     pub image_transcription_model: Option<String>,
     /// Audio transcription model.
     pub audio_transcription_model: Option<String>,
-    /// OpenRouter provider routing for vision/transcription requests.
-    pub transcription_provider: Option<String>,
+    /// OpenRouter provider routing for image transcription requests.
+    pub image_transcription_provider: Option<String>,
     /// Audio transcription provider routing.
     pub audio_transcription_provider: Option<String>,
     /// Image generation model.
@@ -463,7 +463,7 @@ string_config_fields! {
     provider_endpoint [or(DEFAULT_PROVIDER_ENDPOINT)],
     image_transcription_model [or(DEFAULT_IMAGE_TRANSCRIPTION_MODEL)],
     audio_transcription_model [or(DEFAULT_AUDIO_TRANSCRIPTION_MODEL)],
-    transcription_provider [non_empty],
+    image_transcription_provider [non_empty],
     audio_transcription_provider [non_empty],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],

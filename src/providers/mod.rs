@@ -169,7 +169,7 @@ async fn setup_provider_and_transcribers(
             )
             .as_str(),
         ),
-        non_empty(config.transcription_provider.clone()).as_deref(),
+        non_empty(config.image_transcription_provider.clone()).as_deref(),
         ImageTranscriber::from_inner,
     );
     let audio_transcriber = create_transcriber(
