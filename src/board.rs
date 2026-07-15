@@ -667,11 +667,10 @@ impl BoardStore {
 
     /// Shared INSERT logic for [`BoardStore::create_ticket`] and [`BoardStore::supersede_and_create`].
     ///
-    /// The `embedding` column is write-only — stored at creation time and later
-    /// cleared after archival indexing, but never returned by SELECT queries
-    /// (see [`TICKET_COLUMNS`]). The remaining columns with DDL defaults
-    /// (`assigned_to`, `superseded_by`, `commit_hash`, `is_archived`, etc.) are
-    /// set later via dedicated UPDATE statements.
+    /// The `embedding` column is write-once — stored at creation time and later
+    /// read by `list_archived_with_embeddings` for vector search. It is not
+    /// included in `TICKET_COLUMNS` (SELECT queries) because only the dedicated
+    /// `list_archived_with_embeddings` method reads it.
     ///
     /// Computes the timestamp and serializes prerequisites internally. Does NOT
     /// commit the transaction — the caller is responsible for calling
