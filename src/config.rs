@@ -87,6 +87,7 @@
 use crate::Role;
 use crate::config_db::ConfigStore;
 use crate::role::role_info;
+use crate::util::UnwrapPoison;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use std::path::PathBuf;
@@ -636,12 +637,12 @@ impl ConfigReload {
     /// Get a read-locked snapshot of the current config.
     /// Prefer the typed accessors below for individual fields.
     fn read(&self) -> RwLockReadGuard<'_, ConfigData> {
-        self.inner.read().expect("CONFIG inner poisoned")
+        self.inner.read().unwrap_poison()
     }
 
     /// Replace the entire config atomically (used during startup and reload).
     pub(crate) fn swap(&self, new_config: ConfigData) {
-        *self.inner.write().expect("CONFIG inner poisoned") = new_config;
+        *self.inner.write().unwrap_poison() = new_config;
     }
 
     /// Get a full clone of the current config for serialisation / GUI display.
@@ -661,7 +662,7 @@ impl ConfigReload {
     /// keys are silently ignored for forward compatibility).
     #[must_use]
     pub fn set_string_field(&self, key: &str, value: &str) -> bool {
-        let mut guard = self.inner.write().expect("CONFIG inner poisoned");
+        let mut guard = self.inner.write().unwrap_poison();
         guard.set_string_field(key, value)
     }
 
