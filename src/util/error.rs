@@ -28,7 +28,7 @@ pub struct HttpError {
     /// Optional Retry-After duration in milliseconds (from the response header).
     pub retry_after_ms: Option<u64>,
     /// Provider or operation name for display purposes.
-    context: String,
+    pub context: String,
 }
 
 impl HttpError {

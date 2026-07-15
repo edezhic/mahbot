@@ -182,6 +182,23 @@ impl Provider for ReliableProvider {
 
                     let can_retry = class == ErrorClass::Retryable;
 
+                    // When a 429 body doesn't match any known non-retryable
+                    // hint, classify_err falls through to Retryable silently.
+                    // Log the body at debug so operators can detect provider-side
+                    // error-format changes (e.g., "quota_exhausted" → "credit_limit_reached").
+                    if can_retry
+                        && let Some(http_err) = e.downcast_ref::<HttpError>()
+                        && http_err.status == 429
+                    {
+                        tracing::debug!(
+                            provider = self.name,
+                            status = http_err.status,
+                            body = %http_err.body,
+                            "HTTP 429 body did not match any non-retryable \
+                             hint — treating as retryable"
+                        );
+                    }
+
                     if can_retry && attempt < self.max_retries {
                         let wait = Self::compute_backoff(backoff_ms, &e);
 
