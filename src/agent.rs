@@ -211,29 +211,7 @@ impl Agent {
             )
             .await?;
 
-        // Summarize if context window is getting long.
-        // KV-cache preservation: self.summarize() keeps all parameters
-        // identical (see build_chat_request) so the cached prefix is reusable.
-        let history_tokens = crate::session::estimate_tokens(self.session.history());
-        if history_tokens > crate::session::SUMMARIZATION_THRESHOLD {
-            match self.summarize().await {
-                Ok(summary) => {
-                    self.session
-                        .apply_summary(
-                            &self.id,
-                            msg,
-                            &summary,
-                            &self.workspace,
-                            &self.role,
-                            self.ticket.as_ref(),
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Summarization failed — continuing with full history");
-                }
-            }
-        }
+        self.maybe_summarize(msg).await;
 
         let shutdown = crate::shutdown::shutdown_token();
         let response_result = tokio::select! {
@@ -675,6 +653,34 @@ impl Agent {
             .ok_or_else(|| anyhow::anyhow!("summarization produced empty response"))?;
 
         Ok(crate::util::truncate(&summary_text, 32_000))
+    }
+
+    /// Check the session history token count against [`SUMMARIZATION_THRESHOLD`]
+    /// and summarise if necessary.
+    ///
+    /// KV-cache preservation: [`Agent::summarize`] keeps all parameters identical
+    /// (see [`Agent::build_chat_request`]) so the cached prefix is reusable.
+    async fn maybe_summarize(&mut self, msg: &str) {
+        let history_tokens = crate::session::estimate_tokens(self.session.history());
+        if history_tokens > crate::session::SUMMARIZATION_THRESHOLD {
+            match self.summarize().await {
+                Ok(summary) => {
+                    self.session
+                        .apply_summary(
+                            &self.id,
+                            msg,
+                            &summary,
+                            &self.workspace,
+                            &self.role,
+                            self.ticket.as_ref(),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Summarization failed — continuing with full history");
+                }
+            }
+        }
     }
 }
 

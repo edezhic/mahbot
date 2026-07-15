@@ -140,9 +140,10 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 #[must_use]
 pub(crate) fn with_block_in_place<T>(f: impl FnOnce() -> T) -> T {
     if let Ok(handle) = tokio::runtime::Handle::try_current()
-        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-            return tokio::task::block_in_place(f);
-        }
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        return tokio::task::block_in_place(f);
+    }
     f()
 }
 
