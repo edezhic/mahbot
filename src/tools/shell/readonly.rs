@@ -35,15 +35,12 @@ const MUTATING_COMMANDS: &[&str] = &[
     "shred",
     "cp",
     "mv",
-    "touch",
-    "mkdir",
     "mkfifo",
     "mknod",
     "ln",
     "install",
     "truncate",
     "fallocate",
-    "tee",
     "split",
     "csplit",
     "patch",
@@ -696,13 +693,23 @@ fn check_segment(segment: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Check rejection list, with temp-path exception for scratch mutators
-    if MUTATING_COMMANDS.contains(&first_word) {
-        // Allow scratch mutators (tee, touch, mkdir) when all explicit path
-        // arguments are under an allowed temp directory.
-        if SCRATCH_MUTATORS.contains(&first_word) && scratch_paths_under_temp(trimmed) {
+    // Scratch mutators (tee, touch, mkdir) are allowed when all explicit
+    // path arguments are under an allowed temp directory.
+    if SCRATCH_MUTATORS.contains(&first_word) {
+        if scratch_paths_under_temp(trimmed) {
             return Ok(());
         }
+        return reject(
+            trimmed,
+            &format!(
+                "`{first_word}` is not allowed outside temp directories — it modifies the workspace."
+            ),
+            "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
+        );
+    }
+
+    // Unconditional rejections — commands that always mutate.
+    if MUTATING_COMMANDS.contains(&first_word) {
         return reject(
             trimmed,
             &format!("`{first_word}` is not allowed — it modifies the workspace."),
@@ -1777,15 +1784,5 @@ mod tests {
         ];
 
         run_cases(&cases);
-    }
-
-    #[test]
-    fn scratch_mutators_are_subset_of_mutating_commands() {
-        for cmd in SCRATCH_MUTATORS {
-            assert!(
-                MUTATING_COMMANDS.contains(cmd),
-                "SCRATCH_MUTATORS entry '{cmd}' must also be in MUTATING_COMMANDS"
-            );
-        }
     }
 }
