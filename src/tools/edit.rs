@@ -456,10 +456,6 @@ fn find_ws_insensitive(content: &str, old_string: &str) -> Result<Option<WsMatch
     let (norm_content, segments) = normalize_ws(content);
     let (norm_old, _) = normalize_ws(old_string);
 
-    if norm_old.is_empty() {
-        return Ok(None);
-    }
-
     let Some(norm_pos) = norm_content.find(&norm_old) else {
         return Ok(None);
     };
@@ -467,7 +463,7 @@ fn find_ws_insensitive(content: &str, old_string: &str) -> Result<Option<WsMatch
 
     // Check for ambiguity: a second occurrence after the first char of norm_old.
     // Using char boundary instead of raw +1 avoids panicking on multi-byte chars.
-    let first_char_len = norm_old.chars().next().map_or(1, char::len_utf8);
+    let first_char_len = norm_old.chars().next().unwrap().len_utf8();
     let search_start = norm_pos + first_char_len;
     if norm_content[search_start..].find(&norm_old).is_some() {
         anyhow::bail!(
