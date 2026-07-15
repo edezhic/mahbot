@@ -112,7 +112,16 @@ impl DiagnosticsCommands {
 /// Mirrors the `status` TEXT column in the workspaces database table.
 /// Conversion to/from strings happens at the DB boundary only.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Default, strum::Display, strum::AsRefStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Default,
+    strum::Display,
+    strum::AsRefStr,
+    strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -126,22 +135,6 @@ pub enum WorkspaceStatus {
     Ready,
     /// Discovery failed — workspace cannot be used.
     Failed,
-}
-
-impl std::str::FromStr for WorkspaceStatus {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "analyzing" => Ok(Self::Analyzing),
-            "ready" => Ok(Self::Ready),
-            "failed" => Ok(Self::Failed),
-            other => Err(anyhow::anyhow!(
-                "Invalid workspace status '{other}'. Valid statuses: pending, analyzing, ready, failed"
-            )),
-        }
-    }
 }
 
 /// A persisted workspace entry.
