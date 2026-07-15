@@ -507,7 +507,7 @@ pub async fn run_git_discard(
     }
 }
 
-/// Get the last commit's message via `git log -1 --format=%s`.
+/// Get the last commit's subject via `git log -1 --format=%s`.
 ///
 /// If `commit_hash` is `Some`, get the message for that specific commit
 /// instead of HEAD.
