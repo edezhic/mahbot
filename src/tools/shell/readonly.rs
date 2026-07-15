@@ -914,11 +914,21 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// For a matched git subcommand, check if the next token after the
-/// subcommand name is a mutation flag/verb. Reject if it is.
+/// For a matched git subcommand, check for mutation flags/verbs across all
+/// argument positions.
 ///
-/// For `branch` and `tag`: also reject any non-flag first argument (a bare
-/// name like `git branch my-feature` or `git tag v1.0`), since these create
+/// **Flag-based tokens** (those starting with `-`) are checked in all argument
+/// positions — a flag like `-d` or `--delete` can never appear as a legitimate
+/// branch or tag name.
+///
+/// **Bare-word tokens** (remote verbs like `add`, `remove`, `prune`) are checked
+/// only at the first non-flag argument position. They cannot be safely checked
+/// in all positions because they can collide with legitimate names — e.g.,
+/// `git remote show add` is a valid read-only command where `add` is a remote
+/// name, not a mutation verb.
+///
+/// For `branch` and `tag`: also rejects any bare (non-flag) first argument
+/// (e.g., `git branch my-feature` or `git tag v1.0`), since these create
 /// branches/tags rather than listing them.
 ///
 /// Handles both exact flag matches and `flag=value` notation (e.g.,
@@ -933,8 +943,12 @@ fn check_git_subcommand_mutation(
 ) -> Result<(), String> {
     let words: Vec<&str> = subcommand.split_whitespace().collect();
     // words[0] is the subcommand name (e.g., "branch")
+
+    // ── Name-creation check (branch/tag only) ──
+    // Check if the first argument creates a new branch/tag by name.
+    // This check stays on the first argument only — a bare name like
+    // "feature" always creates, regardless of later positions.
     if let Some(first_arg) = words.get(1) {
-        // For `branch` and `tag`, a non-flag first argument is a name being created.
         let is_name_creation = (subcommand_name == "branch" || subcommand_name == "tag")
             && !first_arg.starts_with('-');
         if is_name_creation {
@@ -943,12 +957,25 @@ fn check_git_subcommand_mutation(
                  Suggestion: use `git {subcommand_name} --list` or `git {subcommand_name} --merged` to list existing ones."
             ));
         }
+    }
 
-        // Check the first argument for a mutation token (exact match or `flag=value`)
-        let is_mutating = mutation_tokens.contains(first_arg)
-            || mutation_tokens
+    // Partition mutation tokens into flag-based and bare-word.
+    let (flag_tokens, bare_tokens): (Vec<&str>, Vec<&str>) = mutation_tokens
+        .iter()
+        .copied()
+        .partition(|t| t.starts_with('-'));
+
+    // ── Flag-based mutation token check (all positions) ──
+    // Tokens starting with `-` are safe to check in every argument position
+    // because flags like `-d` or `--delete` can never be legitimate names.
+    for arg in words.iter().skip(1) {
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let is_mutating = flag_tokens.contains(arg)
+            || flag_tokens
                 .iter()
-                .any(|mt| first_arg.starts_with(&format!("{mt}=")));
+                .any(|t| arg.starts_with(&format!("{t}=")));
         if is_mutating {
             return Err(format!(
                 "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
@@ -956,8 +983,26 @@ fn check_git_subcommand_mutation(
             ));
         }
     }
-    // Only check the first argument — if it's safe, the command is safe
-    // (best-effort: `git branch --sort=-committerdate` passes as read-only)
+
+    // ── Bare-word mutation token check (first non-flag argument) ──
+    // Bare-word tokens cannot be safely checked in all positions because
+    // they can collide with legitimate names (e.g., `git remote show add`
+    // where "add" is a remote name, not a mutation verb). Instead, skip
+    // any leading flags and check the first non-flag argument.
+    if !bare_tokens.is_empty()
+        && let Some(first_non_flag_arg) = words.iter().skip(1).find(|w| !w.starts_with('-')) {
+            let is_mutating = bare_tokens.contains(first_non_flag_arg)
+                || bare_tokens
+                    .iter()
+                    .any(|t| first_non_flag_arg.starts_with(&format!("{t}=")));
+            if is_mutating {
+                return Err(format!(
+                    "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
+                     Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
+                ));
+            }
+        }
+
     Ok(())
 }
 
@@ -1451,6 +1496,31 @@ mod tests {
             ("git tag --merged main", true),
             ("git tag --points-at abc123", true),
             ("git tag -n", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Tests that mutation flags in later argument positions are correctly caught,
+    /// and that bare-word remote verbs in position 2+ after a safe sub-subcommand
+    /// are correctly allowed (no false positives).
+    #[test]
+    fn git_mutation_in_later_position() {
+        let cases = [
+            // branch: mutation flag -d in position 2 (after a safe flag)
+            ("git branch --sort=-committerdate -d", false),
+            // branch: mutation flag --delete in position 2 (after a safe flag)
+            ("git branch --sort=-committerdate --delete feature", false),
+            // tag: mutation flag --delete in position 2 (after -l and pattern)
+            ("git tag -l v1.* --delete", false),
+            // tag: mutation flag -d in position 2
+            ("git tag -l v1.* -d", false),
+            // remote: bare-word "add" in position 2 after safe sub-subcommand
+            // should be ALLOWED (it's a remote name, not a mutation verb)
+            ("git remote show add", true),
+            // remote: bare-word verb "update" after a flag should be REJECTED
+            // (first non-flag argument)
+            ("git remote -v update", false),
         ];
 
         run_cases(&cases);
