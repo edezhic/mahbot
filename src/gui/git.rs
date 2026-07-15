@@ -247,7 +247,8 @@ impl GitState {
                                     &path,
                                     &["branch", "--format=%(refname:short)"],
                                 )
-                                .await?;
+                                .await
+                                .map_err(|e| e.to_string())?;
                                 Ok(out.lines().map(ToString::to_string).collect())
                             }
                             None => Ok(Vec::new()),
@@ -277,7 +278,9 @@ impl GitState {
                 Task::perform(
                     async move {
                         match ws_path {
-                            Some(path) => crate::git_commands::run_git_sync(&path).await,
+                            Some(path) => crate::git_commands::run_git_sync(&path)
+                                .await
+                                .map_err(|e| e.to_string()),
                             None => Err("No workspace path".to_string()),
                         }
                     },
@@ -317,7 +320,8 @@ impl GitState {
                                     &path,
                                     &["switch", branch_clone.as_str()],
                                 )
-                                .await?;
+                                .await
+                                .map_err(|e| e.to_string())?;
                                 Ok(())
                             }
                             None => Err("No workspace path".to_string()),
@@ -363,7 +367,8 @@ impl GitState {
                                     &path,
                                     &["switch", "-c", branch_clone.as_str()],
                                 )
-                                .await?;
+                                .await
+                                .map_err(|e| e.to_string())?;
                                 Ok(())
                             }
                             None => Err("No workspace path".to_string()),

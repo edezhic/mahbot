@@ -536,7 +536,9 @@ impl DiffState {
                     async move {
                         let ws_path_buf =
                             resolve_workspace_path(&ws_name, ws_path_for_commit).await?;
-                        run_git_commit(&ws_path_buf, &trimmed).await
+                        run_git_commit(&ws_path_buf, &trimmed)
+                            .await
+                            .map_err(|e| e.to_string())
                     },
                     DiffMessage::CommitResult,
                 )
@@ -594,7 +596,9 @@ impl DiffState {
                 Task::perform(
                     async move {
                         let ws_path_buf = resolve_workspace_path(&ws_name, ws_path).await?;
-                        run_git_discard(&ws_path_buf, &path, target).await
+                        run_git_discard(&ws_path_buf, &path, target)
+                            .await
+                            .map_err(|e| e.to_string())
                     },
                     DiffMessage::DiscardResult,
                 )

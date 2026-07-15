@@ -1249,7 +1249,7 @@ async fn load_git_status(workspace_path: String) -> Result<HashMap<String, GitFi
         return Ok(HashMap::new());
     }
 
-    let output = run_git_status(ws_path).await?;
+    let output = run_git_status(ws_path).await.map_err(|e| e.to_string())?;
     Ok(parse_git_status_porcelain(&output))
 }
 
@@ -1317,7 +1317,9 @@ async fn load_git_ignore(
             .collect()
     };
 
-    let raw_ignored = run_git_check_ignore(repo_path, &adjusted_paths).await?;
+    let raw_ignored = run_git_check_ignore(repo_path, &adjusted_paths)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Strip the prefix back to get workspace-relative paths for the cache.
     let ignored: HashSet<String> = if prefix_empty {

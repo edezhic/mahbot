@@ -3,6 +3,7 @@
 //! Provides `run_git_*` async functions that operate on a repository path
 //! and return results. For diff output parsing, see [`crate::diff_parse`].
 
+use anyhow::Context;
 use std::collections::HashSet;
 use std::path::Path;
 use tracing::warn;
@@ -52,7 +53,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 /// tree sidebar (one `diff --git` block per parent), which is expected — each parent
 /// comparison is a different diff.
 /// `--format=""` suppresses the commit log header.
-pub async fn run_git_diff(repo_path: &Path, commit_ref: Option<&str>) -> Result<String, String> {
+pub async fn run_git_diff(repo_path: &Path, commit_ref: Option<&str>) -> anyhow::Result<String> {
     if let Some(hash) = commit_ref {
         run_git_command(
             repo_path,
@@ -72,7 +73,7 @@ pub async fn run_git_diff(repo_path: &Path, commit_ref: Option<&str>) -> Result<
 }
 
 /// Run `git status --porcelain` and return the output.
-pub async fn run_git_status(repo_path: &Path) -> Result<String, String> {
+pub async fn run_git_status(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(repo_path, &["status", "--porcelain"]).await
 }
 
@@ -132,23 +133,21 @@ fn git_command() -> tokio::process::Command {
 pub(crate) async fn run_git_output(
     repo_path: &Path,
     args: &[&str],
-) -> Result<std::process::Output, String> {
+) -> anyhow::Result<std::process::Output> {
     let mut cmd = git_command();
     cmd.args(args).current_dir(repo_path);
-    cmd.output()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))
+    cmd.output().await.context("Failed to run git")
 }
 
 /// Run a git command and return stdout as string on success.
 ///
 /// Returns an error if git exits with a non-zero status.
-pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String, String> {
+pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> anyhow::Result<String> {
     let output = run_git_output(repo_path, args).await?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("Git command failed: {stderr}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Git command failed: {stderr}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -170,7 +169,7 @@ async fn run_git_with_stdin(
     args: &[&str],
     stdin_lines: &[String],
     name: &str,
-) -> Result<std::process::Output, String> {
+) -> anyhow::Result<std::process::Output> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -183,26 +182,26 @@ async fn run_git_with_stdin(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn git {name}: {e}"))?;
+        .with_context(|| format!("Failed to spawn git {name}"))?;
 
     // Write all lines to stdin, then close it.
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| format!("Failed to capture stdin for git {name}"))?;
+        .with_context(|| format!("Failed to capture stdin for git {name}"))?;
     if !stdin_lines.is_empty() {
         let input = stdin_lines.join("\n");
         stdin
             .write_all(input.as_bytes())
             .await
-            .map_err(|e| format!("Failed to write to git {name} stdin: {e}"))?;
+            .with_context(|| format!("Failed to write to git {name} stdin"))?;
     }
     drop(stdin);
 
     let output = child
         .wait_with_output()
         .await
-        .map_err(|e| format!("Failed to wait for git {name}: {e}"))?;
+        .with_context(|| format!("Failed to wait for git {name}"))?;
 
     Ok(output)
 }
@@ -216,7 +215,7 @@ async fn run_git_with_stdin(
 pub async fn run_git_check_ignore(
     repo_path: &Path,
     paths: &[String],
-) -> Result<HashSet<String>, String> {
+) -> anyhow::Result<HashSet<String>> {
     let output = run_git_with_stdin(
         repo_path,
         &["check-ignore", "--stdin"],
@@ -231,8 +230,8 @@ pub async fn run_git_check_ignore(
     }
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("Git check-ignore failed: {stderr}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Git check-ignore failed: {stderr}");
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -244,13 +243,13 @@ pub async fn run_git_check_ignore(
 /// Runs `git add -A` followed by `git commit -m "<msg>"`,
 /// then captures the full SHA via `git rev-parse HEAD` and
 /// line stats via `git diff --numstat`.
-pub async fn run_git_commit(repo_path: &Path, message: &str) -> Result<CommitInfo, String> {
+pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<CommitInfo> {
     // Stage all changes (tracked, untracked, removed) in the worktree.
     run_git_command(repo_path, &["add", "-A"]).await?;
 
     run_git_command(repo_path, &["commit", "-m", message])
         .await
-        .map_err(|e| format!("Commit failed: {}", e.trim()))?;
+        .context("Failed to commit changes")?;
 
     // Capture the full 40-char SHA — reliable source, not abbreviated.
     let hash = match run_git_command(repo_path, &["rev-parse", "HEAD"]).await {
@@ -362,7 +361,7 @@ pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
 ///
 /// Returns `Ok((lines_added, lines_removed))` on success (even if the diff
 /// is empty). Returns the git error message on failure.
-async fn parse_numstat(repo_path: &Path, args: &[&str]) -> Result<(i64, i64), String> {
+async fn parse_numstat(repo_path: &Path, args: &[&str]) -> anyhow::Result<(i64, i64)> {
     let stdout = run_git_command(repo_path, args).await?;
 
     let mut lines_added: i64 = 0;
@@ -389,7 +388,7 @@ pub async fn git_is_installed() -> bool {
 }
 
 /// Check if a git repo has any commits.
-pub async fn git_has_commits(repo_path: &Path) -> Result<bool, String> {
+pub async fn git_has_commits(repo_path: &Path) -> anyhow::Result<bool> {
     let output = run_git_output(repo_path, &["rev-list", "-n", "1", "HEAD"]).await?;
 
     // If the command fails, there are no commits or something is wrong
@@ -402,7 +401,7 @@ pub async fn git_has_commits(repo_path: &Path) -> Result<bool, String> {
 }
 
 /// Get the current branch name (e.g. `main`, `feature/xyz`).
-pub async fn run_git_current_branch(repo_path: &Path) -> Result<String, String> {
+pub async fn run_git_current_branch(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])
         .await
         .map(|s| s.trim().to_string())
@@ -412,7 +411,7 @@ pub async fn run_git_current_branch(repo_path: &Path) -> Result<String, String> 
 ///
 /// Returns `(behind, ahead)`. If there is no upstream configured, returns
 /// `(0, 0)` without error.
-pub async fn run_git_behind_ahead(repo_path: &Path) -> Result<(usize, usize), String> {
+pub async fn run_git_behind_ahead(repo_path: &Path) -> anyhow::Result<(usize, usize)> {
     match run_git_command(
         repo_path,
         &["rev-list", "--count", "--left-right", "HEAD...@{upstream}"],
@@ -429,7 +428,9 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> Result<(usize, usize), St
                 Ok((0, 0))
             }
         }
-        Err(e) if e.contains("no upstream") || e.contains("upstream") => Ok((0, 0)),
+        Err(e) if e.to_string().contains("no upstream") || e.to_string().contains("upstream") => {
+            Ok((0, 0))
+        }
         Err(e) => Err(e),
     }
 }
@@ -437,14 +438,14 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> Result<(usize, usize), St
 /// Run `git diff --numstat HEAD` and return the total added/removed lines.
 ///
 /// Delegates to `parse_numstat`.
-pub async fn run_git_diff_stats(repo_path: &Path) -> Result<(i64, i64), String> {
+pub async fn run_git_diff_stats(repo_path: &Path) -> anyhow::Result<(i64, i64)> {
     parse_numstat(repo_path, &["diff", "--numstat", "HEAD"]).await
 }
 
 /// Sync with remote: `git pull --ff-only` then `git push`.
 ///
 /// Returns the combined output of both commands.
-pub async fn run_git_sync(repo_path: &Path) -> Result<String, String> {
+pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<String> {
     let pull_out = run_git_command(repo_path, &["pull", "--ff-only"]).await?;
     let push_out = run_git_command(repo_path, &["push"]).await?;
     let combined = if pull_out.trim().is_empty() {
@@ -487,7 +488,7 @@ pub async fn run_git_discard(
     repo_path: &Path,
     path: &str,
     target: DiscardTarget,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let _ = run_git_command(repo_path, &["checkout", "HEAD", "--", path]).await;
 
     let _ = run_git_command(repo_path, &["reset", "HEAD", "--", path]).await;
@@ -501,8 +502,8 @@ pub async fn run_git_discard(
     // Verify: check if any changes remain.
     match run_git_command(repo_path, &["status", "--porcelain", "--", path]).await {
         Ok(status) if status.trim().is_empty() => Ok(()),
-        Ok(status) => Err(format!("Changes remain after discard:\n{}", status.trim())),
-        Err(e) => Err(format!("Discard ran but verification failed: {e}")),
+        Ok(status) => anyhow::bail!("Changes remain after discard:\n{}", status.trim()),
+        Err(e) => anyhow::bail!("Discard ran but verification failed: {e}"),
     }
 }
 
@@ -513,7 +514,7 @@ pub async fn run_git_discard(
 pub async fn run_git_commit_message(
     repo_path: &Path,
     commit_hash: Option<&str>,
-) -> Result<String, String> {
+) -> anyhow::Result<String> {
     let mut args = vec!["log", "-1", "--format=%s"];
     if let Some(hash) = commit_hash {
         args.push(hash);
@@ -529,7 +530,7 @@ pub async fn run_git_commit_message(
 ///
 /// Catches both `??` (untracked) and any entry starting with `A` (staged as new,
 /// including `A ` clean staged and `AM` staged+modified).
-pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> Result<Vec<String>, String> {
+pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> anyhow::Result<Vec<String>> {
     let porcelain = run_git_status(repo_path).await?;
     Ok(parse_new_files_from_porcelain(&porcelain))
 }
@@ -786,7 +787,9 @@ mod tests {
         assert!(result.is_err(), "sync without remote should fail");
         let err = result.unwrap_err();
         assert!(
-            err.contains("remote") || err.contains("push") || err.contains("pull"),
+            err.to_string().contains("remote")
+                || err.to_string().contains("push")
+                || err.to_string().contains("pull"),
             "error should mention remote/push/pull: {err}"
         );
     }
