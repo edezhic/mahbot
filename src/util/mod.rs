@@ -124,6 +124,28 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Run a blocking I/O operation with awareness of the current Tokio runtime.
+///
+/// - **Multi-threaded runtime:** wraps the call in
+///   [`tokio::task::block_in_place`] so the runtime can re-schedule the
+///   blocking thread to other tasks.
+/// - **Current-thread runtime** or **no runtime:** calls `f()` directly —
+///   blocking is safe in those contexts, and `block_in_place` would panic
+///   on a current-thread runtime.
+///
+/// Use this instead of a bare `std::fs::canonicalize` (or other fast blocking
+/// syscall) inside async functions that may run on a multi-threaded worker
+/// pool. Prefer this over [`tokio::task::spawn_blocking`] for operations that
+/// complete in < ~1 ms (where thread-spawn overhead dominates).
+#[must_use]
+pub(crate) fn with_block_in_place<T>(f: impl FnOnce() -> T) -> T {
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(f);
+        }
+    f()
+}
+
 /// Produce a short human-readable summary of tool arguments.
 #[must_use]
 pub fn summarize_args(args: &serde_json::Value) -> String {

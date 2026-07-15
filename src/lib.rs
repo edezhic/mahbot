@@ -218,7 +218,9 @@ impl Workspace {
         // Canonicalize to match production workspace creation (see
         // canonicalize_workspace_path). Falls back to the raw path if the
         // directory does not exist yet (rare in tests, but harmless).
-        let stored = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let stored = crate::util::with_block_in_place(|| {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        });
         Self {
             name: last_path_component(&stored),
             path: stored.to_string_lossy().to_string(),

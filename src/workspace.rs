@@ -400,12 +400,14 @@ fn ensure_trailing_slash(path: &str) -> String {
 fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
     let expanded = crate::util::expand_tilde(raw);
 
-    let canonical = std::fs::canonicalize(&expanded).map_err(|e| {
-        if expanded.exists() {
-            format!("Cannot access path '{}': {e}", expanded.display())
-        } else {
-            format!("Path does not exist: {}", expanded.display())
-        }
+    let canonical = crate::util::with_block_in_place(|| {
+        std::fs::canonicalize(&expanded).map_err(|e| {
+            if expanded.exists() {
+                format!("Cannot access path '{}': {e}", expanded.display())
+            } else {
+                format!("Path does not exist: {}", expanded.display())
+            }
+        })
     })?;
 
     if !canonical.is_dir() {
