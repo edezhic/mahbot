@@ -617,7 +617,7 @@ impl Dashboard {
                 let board_refresh = self.board_state.refresh().map(Message::Board);
                 Task::batch([load_users, snap, board_refresh])
             }
-            Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
+            Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
             Page::Settings => {
                 self.settings_state.refresh();
                 let refresh_workspaces = self
@@ -711,7 +711,7 @@ impl Dashboard {
             }
             Page::Sessions if !self.sessions_state.load_state.loading() => {
                 self.sessions_state.load_state.start_loading();
-                self.sessions_state.refresh().map(Message::Sessions)
+                sessions::SessionsState::refresh().map(Message::Sessions)
             }
             Page::Settings => {
                 // Refresh workspace and user lists when on Settings page

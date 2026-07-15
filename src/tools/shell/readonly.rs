@@ -896,15 +896,14 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
             // (show, list, exists, or bare `git reflog`) are read-only.
             let words: Vec<&str> = subcommand.split_whitespace().collect();
             if let Some(reflog_sub) = words.get(1)
-                && (*reflog_sub == "expire" || *reflog_sub == "delete") {
-                    return reject(
-                        trimmed,
-                        &format!(
-                            "`git reflog {reflog_sub}` is not allowed — it modifies the reflog."
-                        ),
-                        "use `git reflog show` or bare `git reflog` to view reflog entries.",
-                    );
-                }
+                && (*reflog_sub == "expire" || *reflog_sub == "delete")
+            {
+                return reject(
+                    trimmed,
+                    &format!("`git reflog {reflog_sub}` is not allowed — it modifies the reflog."),
+                    "use `git reflog show` or bare `git reflog` to view reflog entries.",
+                );
+            }
         }
         _ => {}
     }

@@ -126,8 +126,7 @@ impl SessionsState {
         self.page_active = active;
     }
 
-    #[allow(clippy::unused_self)]
-    pub(crate) fn refresh(&self) -> Task<SessionsMessage> {
+    pub(crate) fn refresh() -> Task<SessionsMessage> {
         Task::perform(
             async {
                 let store = crate::session::store();
