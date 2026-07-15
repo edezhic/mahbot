@@ -863,25 +863,45 @@ async fn dispatch_unassigned_in_phase(
 
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
-/// Single pass over workspaces — for each, the following five steps are
-/// performed in order:
+/// Workspaces are processed concurrently via [`tokio::spawn`] so that a
+/// slow or panicking workspace does not delay others. Per-workspace steps
+/// within a single workspace remain serial (they share the same git tree and
+/// board-phase sequencing).
+///
+/// The five per-workspace steps (see [`process_single_workspace`]) are:
 ///
 /// 1. **Pipeline claims** — atomic source→target phase transitions
 ///    (`run_claim_pipeline`).
 /// 2. **DiagnosticsCheck** — dispatch unassigned `InDiagnostics` tickets
 ///    so diagnostics commands (fmt, lint, build, test) continue running.
 /// 3. **SanitationPassed → Done** — auto-commit tickets that have passed
-///    sanitation, following the same pattern as the QaPassed→Done flow.
+///    sanitation.
 /// 4. **QaPassed** — check the working tree for untracked files; claim to
 ///    `InSanitation` if dirty, otherwise commit directly to `Done`.
-/// 5. **SanitationCheck** — dispatch unassigned `InSanitation` tickets
-///    (the claim step inside step 4 already moved dirty tickets there).
+/// 5. **SanitationCheck** — dispatch unassigned `InSanitation` tickets.
 ///
-/// Previously phase-major (all workspaces claim Backlog, then all claim
-/// Engineer, …); now workspace-major (workspace A claims all phases, then
-/// workspace B, …). Correctness is preserved because claims are atomic
-/// per-workspace and `PipelineCheck` gates are checked within each
-/// workspace independently.
+/// # Architecture history
+///
+/// The iteration order evolved over three refactors:
+/// 1. **Phase-major** — all workspaces claim Backlog, then all claim Engineer, …
+/// 2. **Workspace-major (serial)** — workspace A claims all phases, then B, …
+/// 3. **Workspace-major (parallel)** — all workspaces processed concurrently.
+///
+/// Step (3) isolates per-workspace panics (a crash in one workspace no longer
+/// permanently kills the management loop) and saves the serial DB-query
+/// overhead that accumulated across many workspaces (~10–15 ms per workspace
+/// per 1‑s cycle). The heavy work (LLM calls, git operations) was already
+/// parallel via internal `tokio::spawn` in earlier iterations.
+///
+/// # Concurrency safety
+///
+/// - The [`BoardStore`] uses a single Turso connection wrapped in
+///   `Arc<tokio::sync::Mutex>>` — SQL operations serialize at the mutex,
+///   so concurrent access is safe. All workspaces share the same `board.db`;
+///   per-workspace isolation is via SQL `WHERE workspace_name = ?` filtering.
+/// - The [`ticket_buffer`] and [`registry::AGENT_REGISTRY`] are
+///   `Mutex`‑protected global singletons; contention is negligible because
+///   phase transitions are infrequent per‑workspace per cycle.
 async fn poll_round() {
     let workspaces = match crate::workspace::store().list().await {
         Ok(ws_list) => ws_list,
@@ -891,61 +911,84 @@ async fn poll_round() {
         }
     };
 
-    for ws in &workspaces {
-        // 1. Pipeline claims — atomic source→target transitions
-        run_claim_pipeline(ws).await;
-
-        // 2. DiagnosticsCheck — diagnostics keeps the ticket in InDiagnostics
-        // while running, so the claim loop isn't applicable.
-        dispatch_unassigned_in_phase(TicketPhase::InDiagnostics, PollPhase::DiagnosticsCheck, ws)
-            .await;
-
-        // 3. SanitationPassed → Done (auto-commit), following the same pattern
-        // as the QaPassed→Done commit flow.
-        spawn_for_each_ticket_in_phase(
-            TicketPhase::SanitationPassed,
-            ws,
-            |ticket, ws| async move {
-                let Some(porcelain) = ensure_git_or_done_and_get_status(
-                    &ticket,
-                    &ws,
-                    TicketPhase::SanitationPassed,
-                    "finalize",
-                )
-                .await
-                else {
-                    return;
-                };
-                finalize_ticket_with_git_status(
-                    ticket,
-                    ws,
-                    TicketPhase::SanitationPassed,
-                    &porcelain,
-                )
-                .await;
-            },
-        )
-        .await;
-
-        // 4. Handle QaPassed tickets.
-        //
-        // For each QaPassed ticket, check whether the working tree has new/untracked
-        // files. If it does, claim the ticket to InSanitation and dispatch a sanitation
-        // agent. Otherwise, commit directly and transition to Done (existing behavior).
-        //
-        // Spawned via tokio::spawn to prevent git operations from blocking the poll loop.
-        // The ticket stays in QaPassed until either the claim or the commit succeeds,
-        // so re-dispatch is harmless.
-        spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, ws, |ticket, ws| {
-            handle_qa_passed(ticket, ws)
+    let tasks: Vec<_> = workspaces
+        .into_iter()
+        .map(|ws| {
+            tokio::spawn(async move {
+                process_single_workspace(ws).await;
+            })
         })
+        .collect();
+
+    let results = join_all(tasks).await;
+    for result in results {
+        if let Err(e) = result {
+            if e.is_panic() {
+                let payload = e.into_panic();
+                error!(
+                    error = %panic_message(&*payload),
+                    "Panic in workspace poll round — management loop continues",
+                );
+            } else {
+                error!("Workspace poll task was cancelled — management loop continues");
+            }
+        }
+    }
+}
+
+/// Process all five pipeline steps for a single workspace.
+///
+/// Steps are performed serially within the workspace because they share the
+/// same git working tree and board-phase sequencing (claims must be ordered).
+/// Across workspaces this function is called concurrently by [`poll_round`].
+async fn process_single_workspace(ws: Workspace) {
+    // 1. Pipeline claims — atomic source→target transitions
+    run_claim_pipeline(&ws).await;
+
+    // 2. DiagnosticsCheck — diagnostics keeps the ticket in InDiagnostics
+    // while running, so the claim loop isn't applicable.
+    dispatch_unassigned_in_phase(TicketPhase::InDiagnostics, PollPhase::DiagnosticsCheck, &ws)
         .await;
 
-        // 5. SanitationCheck — the claim (QaPassed→InSanitation) already happened
-        // inside handle_qa_passed, so we only dispatch unassigned tickets.
-        dispatch_unassigned_in_phase(TicketPhase::InSanitation, PollPhase::SanitationCheck, ws)
-            .await;
-    }
+    // 3. SanitationPassed → Done (auto-commit), following the same pattern
+    // as the QaPassed→Done commit flow.
+    spawn_for_each_ticket_in_phase(
+        TicketPhase::SanitationPassed,
+        &ws,
+        |ticket, ws| async move {
+            let Some(porcelain) = ensure_git_or_done_and_get_status(
+                &ticket,
+                &ws,
+                TicketPhase::SanitationPassed,
+                "finalize",
+            )
+            .await
+            else {
+                return;
+            };
+            finalize_ticket_with_git_status(ticket, ws, TicketPhase::SanitationPassed, &porcelain)
+                .await;
+        },
+    )
+    .await;
+
+    // 4. Handle QaPassed tickets.
+    //
+    // For each QaPassed ticket, check whether the working tree has new/untracked
+    // files. If it does, claim the ticket to InSanitation and dispatch a sanitation
+    // agent. Otherwise, commit directly and transition to Done (existing behavior).
+    //
+    // Spawned via tokio::spawn (inside spawn_for_each_ticket_in_phase) to prevent
+    // git operations from blocking the poll loop. The ticket stays in QaPassed
+    // until either the claim or the commit succeeds, so re-dispatch is harmless.
+    spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, &ws, |ticket, ws| {
+        handle_qa_passed(ticket, ws)
+    })
+    .await;
+
+    // 5. SanitationCheck — the claim (QaPassed→InSanitation) already happened
+    // inside handle_qa_passed, so we only dispatch unassigned tickets.
+    dispatch_unassigned_in_phase(TicketPhase::InSanitation, PollPhase::SanitationCheck, &ws).await;
 }
 
 /// Claim for each pipeline phase in a workspace.
