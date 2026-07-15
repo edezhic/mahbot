@@ -2495,6 +2495,7 @@ CREATE TABLE IF NOT EXISTS ticket_counters (
 ///   5. Verifies the column is now named `phase`
 ///   6. Verifies `PRAGMA user_version = 1`
 ///   7. Re-opens to verify idempotency
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_status_to_phase_migration() {
     let tmp = TempDir::new().expect("temp dir for migration test");
@@ -2581,13 +2582,11 @@ async fn test_status_to_phase_migration() {
         .collect();
     assert!(
         !col_names.iter().any(|n| n == "status"),
-        "column 'status' should not exist after migration; found: {:?}",
-        col_names,
+        "column 'status' should not exist after migration; found: {col_names:?}",
     );
     assert!(
         col_names.iter().any(|n| n == "phase"),
-        "column 'phase' must exist after migration; found: {:?}",
-        col_names,
+        "column 'phase' must exist after migration; found: {col_names:?}",
     );
 
     // ── 6. Verify PRAGMA user_version = 1 ──────────────────────────────

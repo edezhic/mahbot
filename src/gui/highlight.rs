@@ -707,7 +707,7 @@ mod tests {
     fn test_all_queries_compile() {
         // Test all standard HighlightLanguage variants via VARIANTS.
         for variant in HighlightLanguage::VARIANTS {
-            let name = format!("{:?}", variant);
+            let name = format!("{variant:?}");
             // Direct query compilation (doesn't go through the cache layer).
             let (lang, query) = variant.language_and_query();
             let q = tree_sitter::Query::new(&lang, query);
