@@ -34,8 +34,8 @@ use iced::{Color, Event, Length, Point, Rectangle, Size};
 use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 
 use super::text_rendering::{
-    GUTTER_FONT_SIZE, compute_total_height, font_metrics, gutter_clip_rect, iced_color_to_cosmic,
-    push_or_merge, text_area_rect, with_font_system,
+    GUTTER_FONT_SIZE, compute_total_height, draw_highlight_background, font_metrics,
+    gutter_clip_rect, iced_color_to_cosmic, push_or_merge, text_area_rect, with_font_system,
 };
 use super::theme;
 
@@ -490,23 +490,17 @@ where
             let end_cur = global_byte_to_cursor(&buffer_for_draw, end);
 
             for run in buffer_for_draw.layout_runs() {
-                if let Some(highlight) = run.highlight(start_cur, end_cur) {
-                    let sel_rect = Rectangle {
-                        x: text_x + highlight.0,
-                        y: text_y + run.line_top,
-                        width: highlight.1,
-                        height: run.line_height,
-                    };
-                    if let Some(clipped) = text_clip.intersection(&sel_rect) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: clipped,
-                                border: iced::Border::default(),
-                                ..renderer::Quad::default()
-                            },
-                            SELECTION_COLOR,
-                        );
-                    }
+                if let Some((x_offset, width)) = run.highlight(start_cur, end_cur) {
+                    draw_highlight_background(
+                        renderer,
+                        text_clip,
+                        text_x,
+                        text_y,
+                        &run,
+                        x_offset,
+                        width,
+                        SELECTION_COLOR,
+                    );
                 }
             }
         }
