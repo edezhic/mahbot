@@ -34,14 +34,13 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// if `get_workspace` fails or returns `None`.
 async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
     match mahbot::users::get_workspace(&msg.user_name).await {
-        Ok(Some(ws)) => ws,
+        Ok(Some(ws)) => return ws,
         Ok(None) => {
             tracing::warn!(
                 user_name = %msg.user_name,
                 "workspace resolution: selected_workspace points to non-existent workspace; \
                  falling back to personal workspace",
             );
-            personal_workspace(msg)
         }
         Err(e) => {
             tracing::warn!(
@@ -49,9 +48,9 @@ async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
                 error = %e,
                 "workspace resolution: database error; falling back to personal workspace",
             );
-            personal_workspace(msg)
         }
     }
+    personal_workspace(msg)
 }
 
 fn personal_workspace(msg: &ChannelMessage) -> Workspace {
