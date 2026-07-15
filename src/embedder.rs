@@ -147,19 +147,13 @@ static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
 /// Atomic state tracker to coordinate lazy initialization.
 static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 
-/// Returns a reference to the global singleton [`Embedder`] RwLock. Never panics.
-#[must_use]
-fn global_embedder() -> &'static RwLock<Option<Embedder>> {
-    &GLOBAL_EMBEDDER
-}
-
 /// Atomically store a ready [`Embedder`] and transition state to [`STATE_READY`].
 ///
 /// This bundles the two operations (RwLock write + state transition) into a single
 /// call so no future code path can do one without the other.
 #[inline]
 fn set_embedder_ready(emb: Embedder) {
-    *global_embedder().write().unwrap_poison() = Some(emb);
+    *GLOBAL_EMBEDDER.write().unwrap_poison() = Some(emb);
     STATE.store(STATE_READY, Ordering::Release);
 }
 
@@ -261,7 +255,7 @@ where
         return None;
     }
 
-    let guard = global_embedder().read().unwrap_poison();
+    let guard = GLOBAL_EMBEDDER.read().unwrap_poison();
     let emb = guard.as_ref()?;
     f(emb)
 }
@@ -1136,7 +1130,7 @@ mod tests {
 
     /// Reset global embedder state for hermetic testing.
     fn reset_global_state() {
-        *global_embedder().write().unwrap_poison() = None;
+        *GLOBAL_EMBEDDER.write().unwrap_poison() = None;
         STATE.store(STATE_UNINIT, Ordering::Release);
     }
 
@@ -1154,7 +1148,7 @@ mod tests {
         );
 
         // Verify the global embedder is still empty
-        let guard = global_embedder().read().unwrap_poison();
+        let guard = GLOBAL_EMBEDDER.read().unwrap_poison();
         assert!(guard.is_none(), "global embedder should remain None");
     }
 
