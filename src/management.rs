@@ -2246,7 +2246,7 @@ async fn try_trip_circuit_breaker(
     );
 
     let breaker_label = format!("{log_label} circuit breaker");
-    let _ = comment_and_transition(
+    if !comment_and_transition(
         TransitionCtx {
             ticket,
             source: source_phase,
@@ -2257,7 +2257,15 @@ async fn try_trip_circuit_breaker(
         SYSTEM_ROLE,
         &msg,
     )
-    .await;
+    .await
+    {
+        error!(
+            ticket = %ticket.id,
+            source_phase = %source_phase,
+            log_label = %breaker_label,
+            "Circuit breaker transition to Failed failed — ticket may loop indefinitely",
+        );
+    }
 
     true
 }
