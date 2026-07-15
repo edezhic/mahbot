@@ -286,19 +286,8 @@ static TANTIVY_SPECIAL: &[char] = &[
 ///   produce an empty string, allowing callers to short-circuit.
 #[must_use]
 pub fn sanitize_fts_query(query: &str) -> String {
-    let sanitized: String = query
-        .chars()
-        .map(|c| {
-            if c.is_whitespace() || TANTIVY_SPECIAL.contains(&c) {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-
-    sanitized
-        .split_whitespace()
+    query
+        .split(|c: char| c.is_whitespace() || TANTIVY_SPECIAL.contains(&c))
         .map(|word| word.trim_start_matches('/'))
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
