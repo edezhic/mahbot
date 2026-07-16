@@ -262,7 +262,7 @@ mod tests {
                 "unparseable timestamp → parse error → let through",
             ),
             (
-                ws_with(Some(&now_str), 240),
+                ws_with(Some(&now_str), Workspace::MAX_MAINTAINER_DEBOUNCE_MINS),
                 true,
                 "just ran — elapsed ~0s < 240 → skip",
             ),
@@ -302,13 +302,25 @@ mod tests {
         assert_eq!(advance_debounce(6), 12);
         assert_eq!(advance_debounce(60), 120);
 
-        // Cap: 120 doubles to 240, 121 clamps→240, 240 stays at 240.
+        // Cap: 119 doubles to 238; 120 doubles to MAX; 121 clamps→MAX; MAX stays at MAX.
         assert_eq!(advance_debounce(119), 238);
-        assert_eq!(advance_debounce(120), 240);
-        assert_eq!(advance_debounce(121), 240);
-        assert_eq!(advance_debounce(240), 240);
+        assert_eq!(
+            advance_debounce(120),
+            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
+        );
+        assert_eq!(
+            advance_debounce(121),
+            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
+        );
+        assert_eq!(
+            advance_debounce(240),
+            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
+        );
 
-        // Above 240 — clamp brings it down, then double hits cap.
-        assert_eq!(advance_debounce(300), 240);
+        // Above MAX — clamp brings it down, then double hits cap.
+        assert_eq!(
+            advance_debounce(300),
+            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
+        );
     }
 }
