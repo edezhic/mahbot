@@ -5,7 +5,9 @@
 
 use chrono::Utc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+use futures_util::future::join_all;
 
 use crate::Role;
 use crate::Workspace;
@@ -13,6 +15,7 @@ use crate::WorkspaceStatus;
 use crate::agent::run_agent;
 use crate::board::TicketPhase;
 use crate::turso;
+use crate::util::panic_message;
 
 /// Maximum number of tickets allowed in Analysis + Planning + ReadyForDevelopment
 /// before the maintainer pauses ticket creation.
@@ -26,6 +29,31 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 /// otherwise (`advance_debounce`: clamps current to [`MAX_MAINTAINER_DEBOUNCE_MINS`],
 /// doubles, caps at that value — producing the sequence 1 → 10 → 20 → … → `MAX_MAINTAINER_DEBOUNCE_MINS`).
 /// On cancellation or error, debounce and last-run timestamp are left unchanged.
+///
+/// ## Concurrency
+///
+/// Workspaces are processed **concurrently** via `tokio::spawn` + `join_all`,
+/// matching the pattern used by [`poll_round`](crate::management::poll_round).
+/// Each workspace's agent run is independent (disjoint session keys, no shared
+/// mutable state between runs) so concurrency is safe.
+///
+/// ## Behavioural notes
+///
+/// * **Pipeline throttle**: `is_maintainer_pipeline_full` checks run concurrently
+///   for all workspaces rather than sequentially. The
+///   [`MAX_PRE_DEV_TICKETS`] throttle therefore sees a slightly wider window
+///   of concurrent ticket counts — acceptable since the maintainer is
+///   best-effort and the per-workspace count check is still atomic.
+/// * **Shutdown**: all matching workspaces are spawned in a single batch even
+///   if shutdown fires during dispatch; each task independently checks
+///   cancellation before the LLM call. The original sequential loop's
+///   immediate-break-on-cancellation is replaced by a cooperative per-task
+///   check, which is consistent with the rest of the codebase (neither
+///   [`poll_round`](crate::management::poll_round) nor
+///   [`process_single_workspace`](crate::management::process_single_workspace)
+///   check cancellation mid-batch). Mid-execution cancellation within a
+///   running agent is handled by the global `CancellationToken` inside
+///   `Agent::work`.
 pub async fn run_maintainer_loop() {
     let interval = Duration::from_mins(1);
     let shutdown = crate::shutdown::shutdown_token();
@@ -49,64 +77,90 @@ pub async fn run_maintainer_loop() {
             continue;
         }
 
-        for ws in &workspaces {
-            if shutdown.is_cancelled() {
-                break;
-            }
+        // Load prompt once before spawning (each spawned task gets its own clone).
+        let prompt = crate::prompt::load_prompt("maintain.md");
 
-            // Skip workspace if maintainer is not explicitly enabled
-            if !ws.maintenance_enabled {
-                continue;
-            }
-
-            // Only maintain workspaces whose discovery has completed.
-            if ws.status != WorkspaceStatus::Ready {
-                info!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
-                continue;
-            }
-
-            if should_skip_maintainer_debounce(ws) {
-                continue;
-            }
-
-            if is_maintainer_pipeline_full(ws).await {
-                continue;
-            }
-
-            // Unique session key per run — don't accumulate history
-            let run_id = crate::session::maintainer_session_key(&ws.name);
-
-            info!(workspace = %ws.name, run = %run_id, "Maintainer: starting maintenance run");
-
-            let prompt = crate::prompt::load_prompt("maintain.md");
-            let (agent, response) =
-                run_agent(run_id.clone(), Role::Maintainer, ws, None, &prompt).await;
-
-            if let Some(_response) = response {
-                info!(workspace = %ws.name, "Maintainer: run complete");
-
-                // ── Debounce update after successful run ──────────────────
-                let now_str = turso::now();
-                let new_debounce = compute_debounce(
-                    &agent.session_key,
-                    ws.maintainer_debounce_mins,
-                    ws.name.as_str(),
-                )
-                .await;
-
-                if let Err(e) = crate::workspace::store()
-                    .set_maintenance_debounce(&ws.name, new_debounce, &now_str)
-                    .await
-                {
-                    warn!(workspace = %ws.name, error = %e, "Maintainer: failed to update debounce state");
+        // Concurrent dispatch: sync pre-checks in `.filter()`, async DB check
+        // and cancellation check inside each spawned task.
+        let tasks: Vec<_> = workspaces
+            .into_iter()
+            .filter(|ws| {
+                if !ws.maintenance_enabled {
+                    return false;
                 }
-            } else {
-                // Error or cancellation — do NOT advance debounce, do NOT update last_run_at
-                info!(workspace = %ws.name, "Maintainer: run failed or cancelled — debounce unchanged");
-            }
+                if ws.status != WorkspaceStatus::Ready {
+                    info!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
+                    return false;
+                }
+                if should_skip_maintainer_debounce(ws) {
+                    return false;
+                }
+                true
+            })
+            .map(|ws| {
+                let prompt = prompt.clone();
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    // Async pre-check (DB query) — cannot live in a sync .filter closure.
+                    if is_maintainer_pipeline_full(&ws).await {
+                        return;
+                    }
 
-            // Backlog tickets are discovered by the poll loop (BacklogAnalysis),
-            // not via explicit notification — no Manager notification needed here.
+                    // Early cancellation check before expensive LLM call.
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
+
+                    // Unique session key per run — don't accumulate history
+                    let run_id = crate::session::maintainer_session_key(&ws.name);
+
+                    info!(workspace = %ws.name, run = %run_id, "Maintainer: starting maintenance run");
+
+                    let (agent, response) =
+                        run_agent(run_id.clone(), Role::Maintainer, &ws, None, &prompt).await;
+
+                    if let Some(_response) = response {
+                        info!(workspace = %ws.name, "Maintainer: run complete");
+
+                        // ── Debounce update after successful run ──────────────────
+                        let now_str = turso::now();
+                        let new_debounce = compute_debounce(
+                            &agent.session_key,
+                            ws.maintainer_debounce_mins,
+                            ws.name.as_str(),
+                        )
+                        .await;
+
+                        if let Err(e) = crate::workspace::store()
+                            .set_maintenance_debounce(&ws.name, new_debounce, &now_str)
+                            .await
+                        {
+                            warn!(workspace = %ws.name, error = %e, "Maintainer: failed to update debounce state");
+                        }
+                    } else {
+                        // Error or cancellation — do NOT advance debounce, do NOT update last_run_at
+                        info!(workspace = %ws.name, "Maintainer: run failed or cancelled — debounce unchanged");
+                    }
+
+                    // Backlog tickets are discovered by the poll loop (BacklogAnalysis),
+                    // not via explicit notification — no Manager notification needed here.
+                })
+            })
+            .collect();
+
+        let results = join_all(tasks).await;
+        for result in results {
+            if let Err(e) = result {
+                if e.is_panic() {
+                    let payload = e.into_panic();
+                    error!(
+                        error = %panic_message(&*payload),
+                        "Panic in maintainer task — maintainer loop continues",
+                    );
+                } else {
+                    error!("Maintainer task was cancelled — maintainer loop continues");
+                }
+            }
         }
     }
 }
