@@ -906,10 +906,10 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
 /// Validate a [`ConfigData`] before persisting — rejecting common misconfigurations.
 ///
 /// # Precondition
-///    /// [`ConfigData::normalize`] MUST have been called before this function.
+/// [`ConfigData::normalize`] MUST have been called before this function.
 /// All `Option<String>` fields are assumed to be already trimmed, with
 /// empty/whitespace-only values collapsed to `None` by
-/// [`normalize_string_fields`][ConfigData::normalize_string_fields]    /// (which `normalize` calls unconditionally for **every** field regardless
+/// [`normalize_string_fields`][ConfigData::normalize_string_fields] (which `normalize` calls unconditionally for **every** field regardless
 /// of its per-field annotation — `non_empty`, `or(…)`, or `list_or(…)`).
 fn validate_config(config: &ConfigData) -> Result<()> {
     if let Some(ref ep) = config.provider_endpoint
