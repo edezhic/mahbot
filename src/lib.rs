@@ -542,10 +542,10 @@ pub struct Agent {
     /// Session persistence key; also serves as the registry run ID.
     /// Direct-chat agents use `{channel}_{sender}_{role}_{ws_name}` as the key (stable across messages).
     /// Sub-agents and ticket handlers use a fresh NanoID per invocation.
-    pub(crate) id: String,
+    pub(crate) session_key: String,
     /// The agent's role (Manager, Engineer, Analyst, etc.).
     role: Role,
-    /// Agent owns its session — all session methods take the key from `self.id`.
+    /// Agent owns its session — all session methods take the key from `self.session_key`.
     pub(crate) session: Session,
     /// Execution workspace for this agent.
     workspace: Arc<crate::Workspace>,

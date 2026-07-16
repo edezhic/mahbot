@@ -87,9 +87,12 @@ pub async fn run_maintainer_loop() {
 
                 // ── Debounce update after successful run ──────────────────
                 let now_str = turso::now();
-                let new_debounce =
-                    compute_debounce(&agent.id, ws.maintainer_debounce_mins, ws.name.as_str())
-                        .await;
+                let new_debounce = compute_debounce(
+                    &agent.session_key,
+                    ws.maintainer_debounce_mins,
+                    ws.name.as_str(),
+                )
+                .await;
 
                 if let Err(e) = crate::workspace::store()
                     .set_maintenance_debounce(&ws.name, new_debounce, &now_str)
