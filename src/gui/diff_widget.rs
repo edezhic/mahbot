@@ -767,7 +767,7 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff_parse::{DiffFileStatus, DiffLine, DiffLineKind};
+    use crate::diff_parse::{DiffContent, DiffFileStatus, DiffLine, DiffLineKind};
 
     fn make_test_diff_file(
         path: &str,
@@ -817,8 +817,7 @@ mod tests {
                 old_path: None,
                 hunks: Vec::new(),
                 status: DiffFileStatus::Modified,
-                is_binary: true,
-                too_large_size: None,
+                content: DiffContent::Binary,
             },
             None,
             None,
@@ -835,8 +834,7 @@ mod tests {
                 old_path: None,
                 hunks: Vec::new(),
                 status: DiffFileStatus::Modified,
-                is_binary: false,
-                too_large_size: Some(5_000_000),
+                content: DiffContent::TooLarge(5_000_000),
             },
             None,
             None,

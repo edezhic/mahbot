@@ -25,6 +25,17 @@ pub enum DiffFileStatus {
     Untracked,
 }
 
+/// Whether the diff file has parseable content, or a placeholder reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffContent {
+    /// File has parseable text hunks.
+    Parseable,
+    /// File is binary (detected by git).
+    Binary,
+    /// File is too large to diff (size in bytes).
+    TooLarge(u64),
+}
+
 /// A single changed file in the diff.
 #[derive(Debug, Clone)]
 pub struct DiffFile {
@@ -34,15 +45,13 @@ pub struct DiffFile {
     pub hunks: Vec<DiffHunk>,
     /// Change status (Added, Deleted, Renamed, Untracked, or Modified).
     pub status: DiffFileStatus,
-    /// Whether the file is binary (orthogonal — not a status category).
-    pub is_binary: bool,
-    /// If too large to diff, the file size in bytes. None otherwise.
-    pub too_large_size: Option<u64>,
+    /// Content state — parseable hunks, binary, or too-large placeholder.
+    pub content: DiffContent,
 }
 
 impl DiffFile {
     /// Create a new `DiffFile` with the given path, hunks, and status.
-    /// Defaults: `old_path: None`, `is_binary: false`, `too_large_size: None`.
+    /// Defaults: `old_path: None`, `content: DiffContent::Parseable`.
     #[must_use]
     pub fn new(path: String, hunks: Vec<DiffHunk>, status: DiffFileStatus) -> Self {
         Self {
@@ -50,21 +59,19 @@ impl DiffFile {
             old_path: None,
             hunks,
             status,
-            is_binary: false,
-            too_large_size: None,
+            content: DiffContent::Parseable,
         }
     }
 
     /// Create a placeholder entry for binary or too-large untracked files.
     #[must_use]
-    pub const fn placeholder(path: String, is_binary: bool, too_large_size: Option<u64>) -> Self {
+    pub const fn placeholder(path: String, content: DiffContent) -> Self {
         Self {
             path,
             old_path: None,
             hunks: Vec::new(),
             status: DiffFileStatus::Untracked,
-            is_binary,
-            too_large_size,
+            content,
         }
     }
     /// Whether this file has parseable hunk content.
@@ -72,7 +79,7 @@ impl DiffFile {
     /// content lines — they are represented as file headers only.
     #[must_use]
     pub(crate) fn has_parseable_content(&self) -> bool {
-        !self.is_binary && self.too_large_size.is_none()
+        matches!(self.content, DiffContent::Parseable)
     }
 }
 
@@ -267,7 +274,7 @@ impl DiffParser {
             self.handle_rename_from(line);
         } else if line.starts_with("Binary files ") {
             if let Some(ref mut f) = self.current_file {
-                f.is_binary = true;
+                f.content = DiffContent::Binary;
             }
         } else if line.starts_with("@@") {
             self.handle_hunk_header(line);
@@ -538,7 +545,7 @@ Binary files a/image.png and b/image.png differ
 ";
         let output = parse_git_diff(diff);
         assert_eq!(output.len(), 1);
-        assert!(output[0].is_binary);
+        assert_eq!(output[0].content, DiffContent::Binary);
     }
 
     #[test]

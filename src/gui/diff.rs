@@ -14,7 +14,9 @@ use super::diff_widget::{self, DiffBufferWidget, DiffFileBuffer};
 use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
 use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 
-use crate::diff_parse::{DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff};
+use crate::diff_parse::{
+    DiffContent, DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff,
+};
 use crate::git_commands::{
     CommitInfo, DiscardTarget, git_has_commits, git_is_installed, is_git_repo,
     parse_untracked_from_porcelain, run_git_commit, run_git_diff, run_git_discard, run_git_show,
@@ -1019,7 +1021,7 @@ impl DiffState {
                 (lucide::file_plus(), FILE_HEADER_COLOR)
             } else if f.status == DiffFileStatus::Deleted {
                 (lucide::file_minus(), FILE_HEADER_COLOR)
-            } else if f.is_binary {
+            } else if f.content == DiffContent::Binary {
                 (lucide::file(), theme::TEXT_MUTED)
             } else {
                 (lucide::file_text(), FILE_HEADER_COLOR)
@@ -1030,7 +1032,7 @@ impl DiffState {
 
         // Line count labels
         let counts: Element<'_, DiffMessage> = if let Some(f) = file {
-            if f.is_binary {
+            if f.content == DiffContent::Binary {
                 text("binary").size(10).color(theme::TEXT_MUTED).into()
             } else if f.add_count > 0 || f.remove_count > 0 {
                 let mut parts: Vec<Element<'_, DiffMessage>> = Vec::new();
@@ -1197,29 +1199,32 @@ impl DiffState {
             );
 
             // Binary / too-large placeholders
-            if file.is_binary {
-                rows.push(
-                    container(
-                        text(format!("Binary file: {}", file.path))
-                            .size(13)
-                            .color(theme::TEXT_MUTED),
-                    )
-                    .padding([2, 12])
-                    .into(),
-                );
-                continue;
-            }
-            if let Some(sz) = file.too_large_size {
-                rows.push(
-                    container(
-                        text(format!("File too large: {}, {sz} bytes", file.path))
-                            .size(13)
-                            .color(theme::TEXT_MUTED),
-                    )
-                    .padding([2, 12])
-                    .into(),
-                );
-                continue;
+            match file.content {
+                DiffContent::Binary => {
+                    rows.push(
+                        container(
+                            text(format!("Binary file: {}", file.path))
+                                .size(13)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .padding([2, 12])
+                        .into(),
+                    );
+                    continue;
+                }
+                DiffContent::TooLarge(sz) => {
+                    rows.push(
+                        container(
+                            text(format!("File too large: {}, {sz} bytes", file.path))
+                                .size(13)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .padding([2, 12])
+                        .into(),
+                    );
+                    continue;
+                }
+                DiffContent::Parseable => {}
             }
 
             // Find the matching buffer by index
@@ -1367,8 +1372,7 @@ async fn add_untracked_files(
         if meta.len() > MAX_UNTRACKED_SIZE {
             parsed.push(crate::diff_parse::DiffFile::placeholder(
                 path.clone(),
-                false,
-                Some(meta.len()),
+                DiffContent::TooLarge(meta.len()),
             ));
             continue;
         }
@@ -1378,8 +1382,7 @@ async fn add_untracked_files(
         if content.contains(&0) {
             parsed.push(crate::diff_parse::DiffFile::placeholder(
                 path.clone(),
-                true,
-                None,
+                DiffContent::Binary,
             ));
             continue;
         }
@@ -1390,8 +1393,7 @@ async fn add_untracked_files(
             Err(_) => {
                 parsed.push(crate::diff_parse::DiffFile::placeholder(
                     path.clone(),
-                    true,
-                    None,
+                    DiffContent::Binary,
                 ));
             }
         }
@@ -2166,8 +2168,7 @@ mod tests {
                 old_path: None,
                 hunks: Vec::new(),
                 status: crate::diff_parse::DiffFileStatus::Modified,
-                is_binary: true,
-                too_large_size: None,
+                content: DiffContent::Binary,
             },
             None,
             None,
@@ -2181,8 +2182,7 @@ mod tests {
                 old_path: None,
                 hunks: Vec::new(),
                 status: crate::diff_parse::DiffFileStatus::Modified,
-                is_binary: false,
-                too_large_size: Some(5_000_000),
+                content: DiffContent::TooLarge(5_000_000),
             },
             None,
             None,
