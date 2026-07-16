@@ -2496,11 +2496,8 @@ mod tests {
     fn try_spill_to_file_behavior() {
         // Small output passes through unchanged
         let short = "hello".to_string();
-        assert_eq!(
-            try_spill_to_file(short.clone(), 5_000),
-            short,
-            "short output should pass through"
-        );
+        let result = try_spill_to_file(short, 5_000);
+        assert_eq!(result, "hello", "short output should pass through");
 
         // Large single-line output spills
         let large = "x".repeat(10_000);
