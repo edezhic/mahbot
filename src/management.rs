@@ -2367,17 +2367,6 @@ async fn process_verifier_verdicts(
         (verifier.success_phase, NotifyPolicy::Buffer)
     };
 
-    // Build the failure comment string (only used in the all-failed branch).
-    let failure_comment = if all_failed {
-        Some(format!(
-            "❌ All {} agents failed to produce verdicts — \
-             ticket marked as Failed.",
-            verifier.log_label,
-        ))
-    } else {
-        None
-    };
-
     if !with_comment_and_transition(
         TransitionCtx {
             ticket,
@@ -2396,10 +2385,13 @@ async fn process_verifier_verdicts(
             )
             .await?;
 
-            // For the all-failed case, also write the system failure comment
-            // via with_comment_and_transition (matching the sanitation failure path).
-            if let Some(ref fc) = failure_comment {
-                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, fc).await?;
+            if all_failed {
+                let failure_comment = format!(
+                    "❌ All {} agents failed to produce verdicts — \
+                     ticket marked as Failed.",
+                    verifier.log_label,
+                );
+                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &failure_comment).await?;
             }
 
             Ok(())
