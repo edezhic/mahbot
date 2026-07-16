@@ -786,7 +786,7 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 /// On DB errors, logs the error and returns without calling `action`. This is
 /// safe because tickets stay in their current phase and will be picked up again
 /// on the next poll cycle (~1s).
-async fn for_tickets_in_phase(
+async fn for_each_ticket_in_phase(
     phase: TicketPhase,
     workspace_name: &str,
     mut action: impl FnMut(Ticket),
@@ -808,7 +808,7 @@ async fn for_tickets_in_phase(
 
 /// Spawn background tasks for each ticket in the given phase.
 ///
-/// Wraps [`for_tickets_in_phase`] with a `tokio::spawn` for each ticket, so
+/// Wraps [`for_each_ticket_in_phase`] with a `tokio::spawn` for each ticket, so
 /// each ticket is processed concurrently and independently. The ticket stays
 /// in its current phase until processing completes — transient failures cause
 /// a re-dispatch on the next poll cycle rather than a transition to `Failed`.
@@ -826,7 +826,7 @@ where
     F: Fn(Ticket, Workspace) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    for_tickets_in_phase(phase, &ws.name, |ticket| {
+    for_each_ticket_in_phase(phase, &ws.name, |ticket| {
         let f = f.clone();
         let ws = ws.clone();
         tokio::spawn(async move {
@@ -852,7 +852,7 @@ async fn dispatch_unassigned_in_phase(
     dispatch_phase: PollPhase,
     ws: &Workspace,
 ) {
-    for_tickets_in_phase(phase, &ws.name, |ticket| {
+    for_each_ticket_in_phase(phase, &ws.name, |ticket| {
         if ticket.assigned_to.is_some() {
             return;
         }
