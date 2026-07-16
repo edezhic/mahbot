@@ -40,6 +40,21 @@ const MAX_DIFF_LINES: usize = 5000;
 const MAX_HUNKS: usize = 100;
 const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 
+/// Returns `true` if `file` matches the optional `selected_file` path.
+///
+/// When `selected_file` is `None`, every file matches (no filter is active).
+/// When `selected_file` is `Some(path)`, only the file whose `.path` equals
+/// `path` matches.
+///
+/// # Behavioural invariant
+///
+/// This filter must be applied identically in `compute_truncation_index`,
+/// `build_file_buffers`, and `DiffState::view()` so that truncation boundaries
+/// and rendered content agree.  This function is the single point of truth.
+pub(super) fn file_matches_selection(file: &DiffFile, selected_file: Option<&str>) -> bool {
+    selected_file.is_none_or(|sel| file.path == sel)
+}
+
 /// Compute the index of the first [`DiffFile`] to exclude due to truncation limits.
 ///
 /// Iterates over `diff_files`, applying the same `selected_file` filter and
@@ -54,8 +69,8 @@ const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 /// - Truncation is **file-boundary only**: no mid-hunk or mid-file cut-off.
 /// - Binary and too-large files consume no hunk/line capacity but occupy
 ///   array positions — the returned index accounts for them.
-/// - The `selected_file` filter is applied identically to both callers so
-///   that the returned index is consistent.
+/// - File filtering delegates to [`file_matches_selection`] — the single
+///   source of truth.
 pub(super) fn compute_truncation_index(
     diff_files: &[DiffFile],
     selected_file: Option<&str>,
@@ -66,11 +81,8 @@ pub(super) fn compute_truncation_index(
     let mut total_lines = 0usize;
 
     for (idx, file) in diff_files.iter().enumerate() {
-        // Apply the same file-selection filter as the rendering functions.
-        if let Some(sel) = selected_file {
-            if file.path != sel {
-                continue;
-            }
+        if !file_matches_selection(file, selected_file) {
+            continue;
         }
 
         // Binary and too-large files consume no hunk/line capacity.
@@ -1144,10 +1156,8 @@ impl DiffState {
 
         for (idx, file) in self.diff_files.iter().enumerate() {
             // File selection filter
-            if let Some(ref sel) = self.selected_file {
-                if file.path != *sel {
-                    continue;
-                }
+            if !file_matches_selection(file, self.selected_file.as_deref()) {
+                continue;
             }
 
             // Truncation check — stop before the first file that would exceed caps

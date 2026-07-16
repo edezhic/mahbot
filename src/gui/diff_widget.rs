@@ -622,10 +622,8 @@ pub fn build_file_buffers(
     let mut buffers: Vec<DiffFileBuffer> = Vec::new();
 
     for (idx, file) in diff_files.iter().enumerate() {
-        if let Some(sel) = selected_file {
-            if file.path != *sel {
-                continue;
-            }
+        if !super::diff::file_matches_selection(file, selected_file) {
+            continue;
         }
 
         // Truncation check — use the pre-computed index from the shared helper.
