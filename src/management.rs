@@ -2227,7 +2227,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
     }
 }
 
-/// Shared circuit breaker skeleton: fetch comments, evaluate via
+/// Shared circuit breaker skeleton: obtain comments, evaluate via
 /// [`CircuitBreakerKind::should_trip`], format the trip message via
 /// [`CircuitBreakerKind::trip_message`], add a system comment, then
 /// transition to [`TicketPhase::Failed`].
@@ -2269,16 +2269,24 @@ async fn try_trip_circuit_breaker(
     kind: CircuitBreakerKind,
     log_label: &str,
 ) -> bool {
-    let comments = match board().get_comments(&ticket.id).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to fetch comments for circuit breaker — proceeding anyway"
-            );
-            return false;
+    let comments = if ticket.comments.is_empty() {
+        // Comments are only pre-loaded for claim-pipeline tickets
+        // (LoadComments::Yes via claim_ticket_in_workspace). Tickets from
+        // dispatch_unassigned_in_phase (list_all_tickets with LoadComments::No)
+        // have an empty vec — fetch from DB.
+        match board().get_comments(&ticket.id).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to fetch comments for circuit breaker — proceeding anyway"
+                );
+                return false;
+            }
         }
+    } else {
+        ticket.comments.clone()
     };
 
     let Some((count, max_count)) = kind.should_trip(&comments) else {

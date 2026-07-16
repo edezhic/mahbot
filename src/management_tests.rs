@@ -517,8 +517,9 @@ async fn breaker_counts_failures() {
             add_breaker_failure(case.kind, &ticket_id).await;
         }
 
-        // Re-fetch ticket (comments are refetched internally by
-        // try_trip_circuit_breaker, so we just need the ID).
+        // Re-fetch ticket (try_trip_circuit_breaker uses cached comments
+        // when available — expect_ticket uses LoadComments::Yes, so the
+        // cached path is exercised here).
         let ticket = expect_ticket(board(), &ticket_id).await;
 
         let tripped =
