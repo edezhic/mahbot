@@ -36,6 +36,92 @@ fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
     }
 }
 
+/// Verify the self-counting prevention invariant for non-terminal circuit
+/// breakers (Sanitation, Diagnostics).
+///
+/// When a circuit breaker trips, it writes a comment to the ticket. On
+/// re-evaluation, that trip comment must **not** be counted by the same
+/// breaker variant — otherwise the breaker would trip again on every
+/// subsequent poll cycle, creating an infinite loop.
+///
+/// ## How each variant prevents self-counting
+///
+/// | Variant | Role filter | Content filter |
+/// |---------|-------------|----------------|
+/// | **Sanitation** | `SYSTEM_ROLE` (same filter) ⚠ | content does **not** contain `SANITATION_FAILED_MARKER` ✅ |
+/// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain `DIAGNOSTICS_FAILED_MARKER` ✅ |
+/// | **TotalComments** | — | — (terminal `Failed` phase prevents re-evaluation) |
+///
+/// **Risk asymmetry:** The Sanitation breaker has **no role-based protection**
+/// (its filter checks `SYSTEM_ROLE`, and trip comments are also written with
+/// `SYSTEM_ROLE`). It relies entirely on the content-marker mismatch. The
+/// Diagnostics breaker has dual protection (role + content), so it is less
+/// vulnerable to regressions.
+///
+/// This test verifies both the content-substring exclusion (the 80% case) and
+/// — by feeding [`CircuitBreakerKind::should_trip`] with a [`TicketComment`]
+/// constructed from the actual trip message — that the full filtering logic
+/// would not count a trip comment (the 100% case).
+#[test]
+fn circuit_breaker_self_counting_prevention() {
+    // ── Sanitation breaker: content-based exclusion ──
+    {
+        let msg = CircuitBreakerKind::Sanitation.trip_message(99, 3);
+
+        // The trip message must NOT contain SANITATION_FAILED_MARKER.
+        assert!(
+            !msg.contains(SANITATION_FAILED_MARKER),
+            "Sanitation trip message must not contain SANITATION_FAILED_MARKER \
+             ({SANITATION_FAILED_MARKER:?}), otherwise self-counting would occur \
+             on re-evaluation. Trip message: {msg:?}",
+        );
+
+        // Full should_trip verification: a comment with SYSTEM_ROLE and the trip
+        // message content should not be counted (content mismatch).
+        let trip_comment = TicketComment {
+            role: SYSTEM_ROLE.to_owned(),
+            content: msg,
+            created_at: String::new(),
+        };
+        assert!(
+            CircuitBreakerKind::Sanitation
+                .should_trip(&[trip_comment])
+                .is_none(),
+            "Sanitation breaker must NOT count its own trip comment \
+             (relies on content mismatch since role is SYSTEM_ROLE for both)",
+        );
+    }
+
+    // ── Diagnostics breaker: dual role + content exclusion ──
+    {
+        let msg = CircuitBreakerKind::Diagnostics.trip_message(99, 4);
+
+        // The trip message must NOT contain DIAGNOSTICS_FAILED_MARKER.
+        assert!(
+            !msg.contains(DIAGNOSTICS_FAILED_MARKER),
+            "Diagnostics trip message must not contain DIAGNOSTICS_FAILED_MARKER \
+             ({DIAGNOSTICS_FAILED_MARKER:?}), otherwise self-counting would occur \
+             on re-evaluation. Trip message: {msg:?}",
+        );
+
+        // Full should_trip verification: a comment with SYSTEM_ROLE (the role actually
+        // used by try_trip_circuit_breaker) and the trip message content should not be
+        // counted (role mismatch: SYSTEM_ROLE ≠ DIAGNOSTICS_ROLE).
+        let trip_comment = TicketComment {
+            role: SYSTEM_ROLE.to_owned(),
+            content: msg,
+            created_at: String::new(),
+        };
+        assert!(
+            CircuitBreakerKind::Diagnostics
+                .should_trip(&[trip_comment])
+                .is_none(),
+            "Diagnostics breaker must NOT count its own trip comment \
+             (role mismatch: SYSTEM_ROLE != DIAGNOSTICS_ROLE)",
+        );
+    }
+}
+
 /// Verify that when the circuit breaker trips on a ticket, all other
 /// ReadyForDevelopment tickets in the same workspace are moved to Planning.
 /// Tickets in other workspaces must not be affected.
