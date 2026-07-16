@@ -463,7 +463,7 @@ pub fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
     let mut ws = Workspace::from_path(path);
     ws.name = format!("personal:{user_name}");
     ws.status = WorkspaceStatus::Ready;
-    ws.maintainer_debounce_mins = 240;
+    ws.maintainer_debounce_mins = Workspace::MAX_MAINTAINER_DEBOUNCE_MINS;
     let now = turso::now();
     ws.created_at.clone_from(&now);
     ws.updated_at = now;

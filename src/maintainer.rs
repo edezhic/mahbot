@@ -23,8 +23,8 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 /// Runs a Maintainer agent per workspace with the investigation prompt.
 /// On success (agent produced a response), updates `maintainer_last_run_at`
 /// and adjusts debounce: resets to 1 min if tickets were created, advances
-/// otherwise (`advance_debounce`: clamps current to [5, 240], doubles,
-/// caps at 240 — producing the sequence 1 → 10 → 20 → … → 240).
+/// otherwise (`advance_debounce`: clamps current to [`MAX_MAINTAINER_DEBOUNCE_MINS`],
+/// doubles, caps at that value — producing the sequence 1 → 10 → 20 → … → `MAX_MAINTAINER_DEBOUNCE_MINS`).
 /// On cancellation or error, debounce and last-run timestamp are left unchanged.
 pub async fn run_maintainer_loop() {
     let interval = Duration::from_mins(1);
@@ -119,7 +119,9 @@ pub async fn run_maintainer_loop() {
 /// `None` (first run), returns `false` to allow the run.
 fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
     let now = Utc::now();
-    let debounce = ws.maintainer_debounce_mins.clamp(0, 240);
+    let debounce = ws
+        .maintainer_debounce_mins
+        .clamp(0, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS);
     if let Some(ref last_str) = ws.maintainer_last_run_at {
         match turso::parse_utc_timestamp(last_str) {
             Ok(last_time) => {
@@ -184,7 +186,7 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
 /// Compute the new debounce value based on whether the agent produced tickets.
 ///
 /// - If `create_ticket` was called → reset to 1.
-/// - If no `create_ticket` calls → double (clamped to `[5, 240]`, capped at 240).
+/// - If no `create_ticket` calls → double (clamped to `[5, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS]`, capped at `Workspace::MAX_MAINTAINER_DEBOUNCE_MINS`).
 async fn compute_debounce(agent_id: &str, current: i64, ws_name: &str) -> i64 {
     let store = crate::stats::store();
 
@@ -195,8 +197,10 @@ async fn compute_debounce(agent_id: &str, current: i64, ws_name: &str) -> i64 {
         }
         Ok(_) => {
             let new_val = advance_debounce(current);
-            if new_val >= 240 && current < 240 {
-                info!(workspace = %ws_name, "Maintainer: no tickets created — debounce capped at 240");
+            if new_val >= Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
+                && current < Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
+            {
+                info!(workspace = %ws_name, "Maintainer: no tickets created — debounce capped at {}", Workspace::MAX_MAINTAINER_DEBOUNCE_MINS);
             } else {
                 info!(workspace = %ws_name, "Maintainer: no tickets created — debounce advanced to {new_val}");
             }
@@ -209,9 +213,11 @@ async fn compute_debounce(agent_id: &str, current: i64, ws_name: &str) -> i64 {
     }
 }
 
-/// Double the debounce value, clamped to `[5, 240]` with a hard cap at 240.
+/// Double the debounce value, clamped to `[5, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS]`
+/// with a hard cap at `Workspace::MAX_MAINTAINER_DEBOUNCE_MINS`.
 fn advance_debounce(mins: i64) -> i64 {
-    (mins.clamp(5, 240) * 2).min(240)
+    (mins.clamp(5, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS) * 2)
+        .min(Workspace::MAX_MAINTAINER_DEBOUNCE_MINS)
 }
 
 #[cfg(test)]
