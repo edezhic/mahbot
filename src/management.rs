@@ -986,8 +986,11 @@ async fn process_single_workspace(ws: Workspace) {
     })
     .await;
 
-    // 5. SanitationCheck — the claim (QaPassed→InSanitation) already happened
-    // inside handle_qa_passed, so we only dispatch unassigned tickets.
+    // 5. SanitationCheck — handle_qa_passed (step 4) runs in spawned tasks concurrent
+    //    with this step. It may: (a) claim QaPassed→InSanitation with assigned_to set,
+    //    or (b) commit the ticket directly to Done. dispatch_unassigned_in_phase skips
+    //    tickets whose assigned_to.is_some() is true — neither path races with this
+    //    step because the ticket is either in a different phase or already assigned.
     dispatch_unassigned_in_phase(TicketPhase::InSanitation, PollPhase::SanitationCheck, &ws).await;
 }
 
