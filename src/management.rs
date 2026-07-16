@@ -181,7 +181,9 @@ fn count_matching_comments(comments: &[TicketComment], role: &str, marker: &str)
 }
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
-/// Returns `false` if the ticket was moved externally or an error occurred.
+/// Returns `false` otherwise — the ticket may have been moved externally,
+/// not found in the database, or a database error occurred.
+/// The caller should abort its current work on this ticket.
 #[must_use]
 async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> bool {
     match board().get_ticket_phase(ticket_id).await {
