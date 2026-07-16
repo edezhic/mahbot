@@ -1071,7 +1071,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         warn!(
             ticket = %ticket.id,
             error = %e,
-            "Failed to set assigned_to for engineer — stale agent not cancelled",
+            "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment",
         );
     }
 
