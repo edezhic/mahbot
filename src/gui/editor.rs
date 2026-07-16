@@ -920,28 +920,6 @@ fn file_loaded_msg(
 /// Load a file's contents from disk with detection of indent style, line
 /// ending, and trailing newline.
 async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
-    // Check file size first.
-    let metadata = match tokio::fs::metadata(&full_path).await {
-        Ok(m) => m,
-        Err(e) => {
-            return file_loaded_msg(
-                full_path,
-                r#gen,
-                Err(format!("Cannot read file metadata: {e}")),
-            );
-        }
-    };
-    if metadata.len() > MAX_FILE_SIZE {
-        return file_loaded_msg(
-            full_path,
-            r#gen,
-            Err(format!(
-                "File too large ({} bytes, max {MAX_FILE_SIZE})",
-                metadata.len()
-            )),
-        );
-    }
-
     let bytes = match tokio::fs::read(&full_path).await {
         Ok(b) => b,
         Err(e) => {
@@ -949,11 +927,13 @@ async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
         }
     };
 
-    // Size and binary content validation.
+    // Validate size and detect binary content (null bytes).
     if let Err(e) = validate_file_content(&bytes) {
         return file_loaded_msg(full_path, r#gen, Err(e));
     }
-    // UTF-8 validation for binary detection.
+    // Reject invalid UTF-8 — the null-byte check above catches one class of
+    // binary content, but binary data can still contain valid UTF-8 with no
+    // null bytes (e.g. some encoded payloads, structured binary formats).
     let Ok(text) = String::from_utf8(bytes) else {
         return file_loaded_msg(
             full_path,
