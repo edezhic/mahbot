@@ -775,30 +775,30 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         typing_stop.clone(),
     );
 
-    let agent_result = tokio::select! {
-        () = cancel.cancelled() => {
-            typing_stop.cancel();
-            return;
-        },
-        result = agent.work(&msg.content) => result,
-    };
+    // Core work block — cancel/error paths `break 'work` to skip
+    // reply delivery, then cleanup runs unconditionally below.
+    'work: {
+        let agent_result = tokio::select! {
+            () = cancel.cancelled() => { break 'work; },
+            result = agent.work(&msg.content) => result,
+        };
 
-    let response = match agent_result {
-        Ok(response) => response,
-        Err(e) => {
-            tracing::error!("❌ Agent error: {e}");
-            format!("⚠️ `{e}`")
+        let response = match agent_result {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::error!("❌ Agent error: {e}");
+                format!("⚠️ `{e}`")
+            }
+        };
+
+        if agent.is_cancelled() {
+            break 'work;
         }
-    };
 
-    if agent.is_cancelled() {
-        typing_stop.cancel();
-        stop_typing(typing_handle).await;
-        return;
+        send_channel_reply(response, &msg, Some(effective_role.to_string())).await;
     }
 
-    send_channel_reply(response, &msg, Some(effective_role.to_string())).await;
-
+    // Single cleanup — always runs, even on cancellation
     typing_stop.cancel();
     stop_typing(typing_handle).await;
 }
