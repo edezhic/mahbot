@@ -990,18 +990,19 @@ fn check_git_subcommand_mutation(
     // where "add" is a remote name, not a mutation verb). Instead, skip
     // any leading flags and check the first non-flag argument.
     if !bare_tokens.is_empty()
-        && let Some(first_non_flag_arg) = words.iter().skip(1).find(|w| !w.starts_with('-')) {
-            let is_mutating = bare_tokens.contains(first_non_flag_arg)
-                || bare_tokens
-                    .iter()
-                    .any(|t| first_non_flag_arg.starts_with(&format!("{t}=")));
-            if is_mutating {
-                return Err(format!(
-                    "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
+        && let Some(first_non_flag_arg) = words.iter().skip(1).find(|w| !w.starts_with('-'))
+    {
+        let is_mutating = bare_tokens.contains(first_non_flag_arg)
+            || bare_tokens
+                .iter()
+                .any(|t| first_non_flag_arg.starts_with(&format!("{t}=")));
+        if is_mutating {
+            return Err(format!(
+                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
                      Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
-                ));
-            }
+            ));
         }
+    }
 
     Ok(())
 }
