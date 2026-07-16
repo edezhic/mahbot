@@ -1506,44 +1506,56 @@ async fn test_supersede_tool() {
 
 #[tokio::test]
 async fn test_transactional_triple_write() {
-    for should_commit in [false, true] {
-        // Exercise the full pattern used by finalize_commit_and_transition:
-        // all three _tx writes (set_commit_info_tx, transition_to_tx,
-        // add_comment_tx) in one transaction → commit → all visible
-        // (or rollback → none persist).  This is the sole transactional
-        // test for set_commit_info_tx (its standalone test was removed
-        // as subsumed); the commit_hash, lines_added, and lines_removed
-        // assertions below verify its behavior under both commit and
-        // rollback, complementing the non-transactional coverage in
-        // test_ticket_roundtrip_all_fields.
-        // Now delegates to the real production method BoardStore::finalize_done_tx.
+    for should_succeed in [false, true] {
+        // Exercise the transactional pattern that finalize_commit_and_transition
+        // now uses via with_comment_and_transition: all three _tx writes
+        // (set_commit_info_tx, add_comment_tx, transition_to_tx) in one
+        // transaction → commit → all visible (or error rollback → none persist).
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/ws", "ws");
         let id = make_ticket(&store, &ws, "Test", TicketPhase::QaPassed).await;
 
-        let tx = store.conn.begin_tx().await.unwrap();
-        BoardStore::finalize_done_tx(
-            &tx,
-            &id,
-            "abcdef0123456789abcdef0123456789abcd0123",
-            10,
-            5,
-            "triple write comment",
-            TicketPhase::QaPassed,
-        )
-        .await
-        .unwrap();
+        let label = if should_succeed { "commit" } else { "rollback" };
+        let result: anyhow::Result<()> =
+            crate::turso::with_tx(&store.conn, &id, "test_triple_write", async |tx| {
+                BoardStore::set_commit_info_tx(
+                    tx,
+                    &id,
+                    "abcdef0123456789abcdef0123456789abcd0123",
+                    10,
+                    5,
+                )
+                .await?;
+                BoardStore::add_comment_tx(
+                    tx,
+                    &id,
+                    crate::role::SYSTEM_ROLE,
+                    "triple write comment",
+                )
+                .await?;
+                BoardStore::transition_to_tx(
+                    tx,
+                    &id,
+                    Some(TicketPhase::QaPassed),
+                    TicketPhase::Done,
+                    None,
+                )
+                .await?;
+                if !should_succeed {
+                    Err(anyhow::anyhow!("simulated failure for rollback test"))
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
 
-        let label = if should_commit { "commit" } else { "rollback" };
-        if should_commit {
-            tx.commit().await.unwrap();
-        } else {
-            tx.rollback().await.unwrap();
+        if !should_succeed {
+            assert!(result.is_err(), "({label}) expected transaction failure");
         }
 
         let ticket = crate::util::test::expect_ticket(&store, &id).await;
         let comments = store.get_comments(&id).await.expect("get comments");
-        if should_commit {
+        if should_succeed {
             // All three changes should be visible.
             assert_eq!(
                 ticket.commit_hash.as_deref(),
@@ -1559,7 +1571,7 @@ async fn test_transactional_triple_write() {
                 "({label}) comment content"
             );
         } else {
-            // None of the three changes should be visible.
+            // No changes should persist after rollback.
             assert_eq!(
                 ticket.commit_hash, None,
                 "({label}) commit_hash after rollback"

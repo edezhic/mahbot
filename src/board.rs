@@ -1,6 +1,5 @@
 //! Ticket/board system — Turso-backed task management.
 
-use crate::role::SYSTEM_ROLE;
 use crate::turso::{self, IntoParams, TxGuard, Value};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -1415,39 +1414,6 @@ impl BoardStore {
             ticket_id,
         );
         prepared.execute_tx(tx).await
-    }
-
-    /// Finalize a ticket with commit info, comment, and transition to Done
-    /// within a single transaction.
-    ///
-    /// This encapsulates the triple-write pattern
-    /// (`set_commit_info_tx` + `add_comment_tx` + `transition_to_tx`)
-    /// shared by production code and tests. The caller must already have
-    /// a running transaction and is responsible for committing or rolling it
-    /// back after this method returns.
-    ///
-    /// # Parameters
-    ///
-    /// * `tx` — active transaction
-    /// * `ticket_id` — the ticket to finalize
-    /// * `hash` — git commit hash to record
-    /// * `lines_added` — lines added in the commit
-    /// * `lines_removed` — lines removed in the commit
-    /// * `comment` — comment body to add
-    /// * `source` — the ticket's expected current phase (e.g. `QaPassed`)
-    pub(crate) async fn finalize_done_tx(
-        tx: &TxGuard<'_>,
-        ticket_id: &str,
-        hash: &str,
-        lines_added: i64,
-        lines_removed: i64,
-        comment: &str,
-        source: TicketPhase,
-    ) -> Result<()> {
-        Self::set_commit_info_tx(tx, ticket_id, hash, lines_added, lines_removed).await?;
-        Self::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, comment).await?;
-        Self::transition_to_tx(tx, ticket_id, Some(source), TicketPhase::Done, None).await?;
-        Ok(())
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify

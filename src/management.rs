@@ -1283,7 +1283,8 @@ async fn finalize_ticket_with_git_status(
 }
 
 /// After a successful `git commit`, persist the metadata and transition the
-/// ticket to Done atomically within a single DB transaction.
+/// ticket to Done atomically within a single DB transaction via
+/// [`with_comment_and_transition`].
 ///
 /// Parameterized by source phase so both the QaPassed→Done and
 /// SanitationPassed→Done flows share the same implementation.
@@ -1308,37 +1309,37 @@ async fn finalize_commit_and_transition(
     // Done ticket (which crash-recovery cannot rescue).
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
-    let label = format!(
+    let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
+
+    let log_label = format!(
         "finalize Done transition from {phase_label} ({})",
-        commit_info.short_hash()
+        commit_info.short_hash(),
     );
 
-    if crate::turso::with_tx(&board().conn, &ticket.id, &label, async |tx| {
-        BoardStore::finalize_done_tx(
-            tx,
-            &ticket.id,
-            &commit_info.hash,
-            commit_info.lines_added,
-            commit_info.lines_removed,
-            &comment,
+    if with_comment_and_transition(
+        TransitionCtx {
+            ticket,
             source,
-        )
-        .await
-    })
+            target: TicketPhase::Done,
+            notify: notify_policy,
+            log_label: &log_label,
+        },
+        async |tx| {
+            BoardStore::set_commit_info_tx(
+                tx,
+                &ticket.id,
+                &commit_info.hash,
+                commit_info.lines_added,
+                commit_info.lines_removed,
+            )
+            .await?;
+            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
+            Ok(())
+        },
+    )
     .await
-    .is_ok()
     {
         info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
-
-        let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-        dispatch_notification(ticket, source, TicketPhase::Done, notify_policy).await;
-    } else {
-        warn!(
-            ticket = %ticket.id,
-            short_hash = commit_info.short_hash(),
-            "Commit was written to git but board transaction failed — \
-             orphan commit in repo, will retry on next poll cycle",
-        );
     }
 }
 
