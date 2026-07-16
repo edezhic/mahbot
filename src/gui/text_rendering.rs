@@ -7,6 +7,8 @@
 //! All items are `pub(crate)` except [`font_metrics`] which is `pub`.
 
 use iced::advanced::graphics::text::cosmic_text;
+use iced::advanced::layout::Layout;
+use iced::advanced::mouse;
 use iced::advanced::renderer;
 use iced::{Color, Rectangle};
 
@@ -134,6 +136,39 @@ pub(crate) fn text_area_rect(bounds: Rectangle, padding: f32, gutter_width: f32)
         y,
         width,
         height,
+    }
+}
+
+/// Transform a cursor position into buffer-relative coordinates.
+///
+/// Returns `Some((buf_x, buf_y))` with coordinates relative to the text
+/// buffer's origin (i.e., after subtracting padding, gutter, and the 4 px
+/// gap between gutter and text).  Returns `None` if the cursor is outside
+/// the text area (e.g. in the gutter or padding).
+///
+/// # Coordinate system
+///
+/// [`mouse::Cursor::position_in`] (Iced) subtracts `bounds.x` / `bounds.y`
+/// from the absolute cursor position, returning coordinates **relative to
+/// the widget's top-left corner**.  This function then subtracts the
+/// text-area origin (`padding + gutter_width + 4 px`) to obtain
+/// buffer-relative coordinates.  **Do not subtract `bounds.x` / `bounds.y`
+/// again** — that would double-subtract the layout position, breaking hit
+/// detection wherever the widget is not at x = 0 (e.g. beside a sidebar).
+pub(crate) fn cursor_to_buffer_coords(
+    layout: Layout<'_>,
+    cursor: mouse::Cursor,
+    gutter_width: f32,
+    padding: f32,
+) -> Option<(f32, f32)> {
+    let bounds = layout.bounds();
+    let pos = cursor.position_in(bounds)?;
+    let buf_x = pos.x - padding - gutter_width - 4.0;
+    let buf_y = pos.y - padding;
+    if buf_x < 0.0 || buf_y < 0.0 {
+        None
+    } else {
+        Some((buf_x, buf_y))
     }
 }
 

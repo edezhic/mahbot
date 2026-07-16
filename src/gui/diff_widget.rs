@@ -34,8 +34,9 @@ use iced::{Color, Event, Length, Point, Rectangle, Size};
 use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 
 use super::text_rendering::{
-    GUTTER_FONT_SIZE, compute_total_height, draw_highlight_background, font_metrics,
-    gutter_clip_rect, iced_color_to_cosmic, push_or_merge, text_area_rect, with_font_system,
+    GUTTER_FONT_SIZE, compute_total_height, cursor_to_buffer_coords, draw_highlight_background,
+    font_metrics, gutter_clip_rect, iced_color_to_cosmic, push_or_merge, text_area_rect,
+    with_font_system,
 };
 use super::theme;
 
@@ -179,15 +180,17 @@ fn global_byte_to_cursor(buffer: &cosmic_text::Buffer, global: usize) -> cosmic_
 
 /// Hit-test mouse position against the diff text area.
 ///
+/// Returns the global byte offset into the buffer (as returned by
+/// [`hit_to_global_byte`]), or `None` if the cursor is outside the text
+/// area (gutter/padding).
+///
 /// # Coordinate system
 ///
-/// `cursor.position_in(bounds)` (Iced) subtracts `bounds.x`/`bounds.y` from the
-/// absolute cursor position, returning coordinates **relative to the widget's
-/// top-left corner**.  We then subtract `text_x`/`text_y` (text area origin
-/// within the widget) to get buffer-relative coordinates.  **Do not subtract
-/// `bounds.x`/`bounds.y` again** — that would double-subtract the layout
-/// position, breaking hit detection wherever the widget is not at x=0 (e.g.
-/// beside a 260px sidebar).
+/// The preamble (cursor → buffer-relative coordinates) is delegated to
+/// [`cursor_to_buffer_coords`]; see its docstring for the coordinate
+/// convention.  In particular, **do not subtract `bounds.x` / `bounds.y`
+/// again** after calling that helper — see [`cursor_to_buffer_coords`]
+/// for the rationale.
 fn hit_test(
     buffer: &cosmic_text::Buffer,
     layout: Layout<'_>,
@@ -195,18 +198,7 @@ fn hit_test(
     gutter_width: f32,
     padding: f32,
 ) -> Option<usize> {
-    let bounds = layout.bounds();
-    let pos = cursor.position_in(bounds)?;
-
-    let text_x = padding + gutter_width + 4.0;
-    let text_y = padding;
-    let buf_x = pos.x - text_x;
-    let buf_y = pos.y - text_y;
-
-    if buf_x < 0.0 || buf_y < 0.0 {
-        return None;
-    }
-
+    let (buf_x, buf_y) = cursor_to_buffer_coords(layout, cursor, gutter_width, padding)?;
     let hit = buffer.hit(buf_x, buf_y)?;
     Some(hit_to_global_byte(buffer, hit.line, hit.index))
 }

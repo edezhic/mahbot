@@ -10,9 +10,9 @@ use iced::mouse::ScrollDelta;
 
 use super::highlight::{self, FileHighlights, HighlightLanguage};
 use super::text_rendering::{
-    GUTTER_FONT_SIZE, MAX_HIGHLIGHT_SIZE, compute_total_height, draw_highlight_background,
-    font_metrics, gutter_clip_rect, iced_color_to_cosmic, push_or_merge, reshape_and_shape,
-    text_area_rect, with_font_system,
+    GUTTER_FONT_SIZE, MAX_HIGHLIGHT_SIZE, compute_total_height, cursor_to_buffer_coords,
+    draw_highlight_background, font_metrics, gutter_clip_rect, iced_color_to_cosmic, push_or_merge,
+    reshape_and_shape, text_area_rect, with_font_system,
 };
 use crate::util::UnwrapPoison;
 
@@ -2015,6 +2015,11 @@ use super::theme;
 /// Convert a screen-space mouse position to a (line, col) pair using the
 /// cosmic_text Buffer hit-test. Returns `None` if the mouse is outside the
 /// text area (in the gutter/padding area).
+///
+/// The coordinate preamble is delegated to [`cursor_to_buffer_coords`];
+/// see its docstring for the coordinate convention.  Note that the buffer
+/// is accessed via `EditorBuffer::borrow_buffer` before the hit-test,
+/// which does **not** affect the coordinate transformation itself.
 fn hit_test(
     buffer: &EditorBuffer,
     layout: Layout<'_>,
@@ -2022,21 +2027,7 @@ fn hit_test(
     gutter_width: f32,
     padding: f32,
 ) -> Option<(usize, usize)> {
-    let bounds = layout.bounds();
-    let pos = cursor.position_in(bounds)?;
-
-    // Text area origin within the widget
-    let text_x = padding + gutter_width + 4.0; // 4 px gap between gutter and text
-    let text_y = padding;
-
-    let buf_x = pos.x - text_x;
-    let buf_y = pos.y - text_y;
-
-    // Ignore clicks/drags in the gutter/padding area
-    if buf_x < 0.0 || buf_y < 0.0 {
-        return None;
-    }
-
+    let (buf_x, buf_y) = cursor_to_buffer_coords(layout, cursor, gutter_width, padding)?;
     let buf = buffer.borrow_buffer();
     let hit = buf.hit(buf_x, buf_y)?;
     let line_text = buf.lines.get(hit.line).map_or("", |l| l.text());
