@@ -48,15 +48,14 @@ fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
 ///
 /// | Variant | Role filter | Content filter |
 /// |---------|-------------|----------------|
-/// | **Sanitation** | `SYSTEM_ROLE` (same filter) ⚠ | content does **not** contain `SANITATION_FAILED_MARKER` ✅ |
+/// | **Sanitation** | `SYSTEM_ROLE` ≠ `SANITATION_ROLE` ✅ | content does **not** contain `SANITATION_FAILED_MARKER` ✅ |
 /// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain `DIAGNOSTICS_FAILED_MARKER` ✅ |
 /// | **TotalComments** | — | — (terminal `Failed` phase prevents re-evaluation) |
 ///
-/// **Risk asymmetry:** The Sanitation breaker has **no role-based protection**
-/// (its filter checks `SYSTEM_ROLE`, and trip comments are also written with
-/// `SYSTEM_ROLE`). It relies entirely on the content-marker mismatch. The
-/// Diagnostics breaker has dual protection (role + content), so it is less
-/// vulnerable to regressions.
+/// Both Sanitation and Diagnostics breakers now have role-based protection:
+/// trip comments (written with `SYSTEM_ROLE`) are structurally excluded from
+/// counting because the filter checks a different role. This is more robust
+/// than content-substring exclusion alone.
 ///
 /// This test verifies both the content-substring exclusion (the 80% case) and
 /// — by feeding [`CircuitBreakerKind::should_trip`] with a [`TicketComment`]
@@ -64,20 +63,13 @@ fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
 /// would not count a trip comment (the 100% case).
 #[test]
 fn circuit_breaker_self_counting_prevention() {
-    // ── Sanitation breaker: content-based exclusion ──
+    // ── Sanitation breaker: dual role + content exclusion ──
     {
         let msg = CircuitBreakerKind::Sanitation.trip_message(99, 3);
 
-        // The trip message must NOT contain SANITATION_FAILED_MARKER.
-        assert!(
-            !msg.contains(SANITATION_FAILED_MARKER),
-            "Sanitation trip message must not contain SANITATION_FAILED_MARKER \
-             ({SANITATION_FAILED_MARKER:?}), otherwise self-counting would occur \
-             on re-evaluation. Trip message: {msg:?}",
-        );
-
-        // Full should_trip verification: a comment with SYSTEM_ROLE and the trip
-        // message content should not be counted (content mismatch).
+        // Full should_trip verification: a comment with SYSTEM_ROLE (the role actually
+        // used by try_trip_circuit_breaker) and the trip message content should not be
+        // counted (role mismatch: SYSTEM_ROLE ≠ SANITATION_ROLE).
         let trip_comment = TicketComment {
             role: SYSTEM_ROLE.to_owned(),
             content: msg,
@@ -88,7 +80,7 @@ fn circuit_breaker_self_counting_prevention() {
                 .should_trip(&[trip_comment])
                 .is_none(),
             "Sanitation breaker must NOT count its own trip comment \
-             (relies on content mismatch since role is SYSTEM_ROLE for both)",
+             (role mismatch: SYSTEM_ROLE != SANITATION_ROLE)",
         );
     }
 
@@ -596,14 +588,14 @@ fn no_verdict() -> ParallelVerdict {
 /// Add a failure comment for circuit breaker testing, matching the
 /// comment format used for the given breaker variant.
 ///
-/// For [`CircuitBreakerKind::Sanitation`], adds a [`SYSTEM_ROLE`] comment
+/// For [`CircuitBreakerKind::Sanitation`], adds a [`SANITATION_ROLE`] comment
 /// with [`SANITATION_FAILED_MARKER`]. For [`CircuitBreakerKind::Diagnostics`],
 /// adds a [`DIAGNOSTICS_ROLE`] comment with [`DIAGNOSTICS_COMMENT_PREFIX`]
 /// and [`DIAGNOSTICS_FAILED_MARKER`].
 async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
     let (role, comment) = match kind {
         CircuitBreakerKind::Sanitation => (
-            SYSTEM_ROLE,
+            SANITATION_ROLE,
             format!("{SANITATION_FAILED_MARKER} — garbage files: 1"),
         ),
         CircuitBreakerKind::Diagnostics => (
@@ -960,15 +952,15 @@ async fn handle_qa_passed_clean_tree_to_done() {
 // ── process_sanitation_verdict — verdict processing ──────────────────
 
 /// Verify [`process_sanitation_verdict`] across all scenarios:
-/// - pass=true, clean → SanitationPassed, no system comment
-/// - pass=false, garbage → ReadyForDevelopment with pipeline reservation and system comment
-/// - pass=true, reviewed files → SanitationPassed with "(files reviewed)" suffix, no system comment
+/// - pass=true, clean → SanitationPassed, no marker comment
+/// - pass=false, garbage → ReadyForDevelopment with pipeline reservation and marker comment
+/// - pass=true, reviewed files → SanitationPassed with "(files reviewed)" suffix, no marker comment
 #[tokio::test]
 async fn process_sanitation_verdict_cases() {
     /// All scenarios of [`process_sanitation_verdict`]. The two comment-marker
     /// fields use different types by design: [`Case::sanit_markers`] is `&[&str]`
     /// because a Sanitation role comment is *always* created; [`Case::sys_markers`]
-    /// is `Option<&[&str]>` because a SYSTEM circuit-breaker comment is
+    /// is `Option<&[&str]>` because a [`SANITATION_ROLE`] circuit-breaker comment is
     /// *conditional* (only appears on `pass=false`).
     struct Case {
         name: &'static str,
@@ -978,7 +970,8 @@ async fn process_sanitation_verdict_cases() {
         expected_pipeline_reservation: bool,
         /// Substrings required in a Sanitation role comment (empty = just exists).
         sanit_markers: &'static [&'static str],
-        /// Substrings required in a SYSTEM role comment. `None` = no system comment.
+        /// Substrings required in a [`SANITATION_ROLE`] comment (the marker
+        /// comment written when sanitation fails). `None` = no marker comment.
         sys_markers: Option<&'static [&'static str]>,
     }
 
@@ -1066,19 +1059,20 @@ async fn process_sanitation_verdict_cases() {
             case.sanit_markers,
         );
 
-        // System role check
+        // Marker role comment check (written with SANITATION_ROLE on pass=false)
         match case.sys_markers {
-            Some(markers) => assert!(
-                comments.iter().any(
-                    |c| c.role == SYSTEM_ROLE && markers.iter().all(|&m| c.content.contains(m))
-                ),
-                "case {}: expected SYSTEM comment matching {:?}",
-                case.name,
-                markers,
-            ),
+            Some(markers) => {
+                assert!(
+                    comments.iter().any(|c| c.role == SANITATION_ROLE
+                        && markers.iter().all(|&m| c.content.contains(m))),
+                    "case {}: expected SANITATION_ROLE comment matching {:?}",
+                    case.name,
+                    markers,
+                )
+            }
             None => assert!(
-                !comments.iter().any(|c| c.role == SYSTEM_ROLE),
-                "case {}: expected no SYSTEM comment",
+                !comments.iter().any(|c| c.role == SANITATION_ROLE),
+                "case {}: expected no SANITATION_ROLE comment",
                 case.name,
             ),
         }

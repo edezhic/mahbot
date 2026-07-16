@@ -22,6 +22,11 @@ pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 /// implementations. Must stay in sync between all sites to prevent silent miscounting.
 pub(crate) const SYSTEM_ROLE: &str = "system";
 
+/// Role string for sanitation comments — used both when posting sanitation
+/// failure marker comments and in the circuit breaker filter. Must stay in
+/// sync between both sites to prevent silent miscounting on re-dispatch.
+pub(crate) const SANITATION_ROLE: &str = "sanitation_admin";
+
 // ── RoleInfo ──────────────────────────────────────────────────────────────
 
 /// All static metadata for a [`Role`] variant.

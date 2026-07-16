@@ -35,7 +35,7 @@ use crate::git_commands::{
 };
 use crate::manager_queue::{JobKind, ManagerJob};
 use crate::prompt::{load_prompt, substitute};
-use crate::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
+use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
 use crate::session::ticket_session_key;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
@@ -56,7 +56,7 @@ const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
 /// Marker appended when diagnostics fail (includes the failed-at label after it).
 const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
 
-/// Marker for sanitation failure system comments — [`CircuitBreakerKind::Sanitation`]'s
+/// Marker for sanitation failure comments — [`CircuitBreakerKind::Sanitation`]'s
 /// [`should_trip`](CircuitBreakerKind::should_trip) depends on substring matching
 /// this value, so it must not drift from comment text.
 const SANITATION_FAILED_MARKER: &str = "Sanitation failed";
@@ -138,7 +138,7 @@ impl CircuitBreakerKind {
         let count = match self {
             Self::TotalComments => comments.len(),
             Self::Sanitation => {
-                count_matching_comments(comments, SYSTEM_ROLE, SANITATION_FAILED_MARKER)
+                count_matching_comments(comments, SANITATION_ROLE, SANITATION_FAILED_MARKER)
             }
             Self::Diagnostics => {
                 count_matching_comments(comments, DIAGNOSTICS_ROLE, DIAGNOSTICS_FAILED_MARKER)
@@ -1419,7 +1419,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     }
 }
 
-/// Record a sanitation failure: add a system comment for the circuit breaker
+/// Record a sanitation failure: add a [`SANITATION_ROLE`] comment for the circuit breaker
 /// and clear assigned_to so the ticket can be re-dispatched.
 async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
     let reason_str = format!("{SANITATION_FAILED_MARKER} — {reason}");
@@ -1428,7 +1428,7 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
         ticket_id,
         "record sanitation failure",
         async |tx| {
-            BoardStore::add_comment_tx(tx, ticket_id, SYSTEM_ROLE, &reason_str).await?;
+            BoardStore::add_comment_tx(tx, ticket_id, SANITATION_ROLE, &reason_str).await?;
             BoardStore::set_assigned_to_tx(tx, ticket_id, None).await?;
             Ok(())
         },
@@ -1503,7 +1503,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 
     if response.is_none() {
         // Agent failed or was cancelled — record failure and clear assigned_to
-        // for re-dispatch retry. The system comment lets the sanitation circuit
+        // for re-dispatch retry. The marker comment lets the sanitation circuit
         // breaker detect repeated failures.
         warn!(
             ticket = %ticket.id,
@@ -1608,7 +1608,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                     comment.as_str(),
                 )
                 .await?;
-                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, sys_comment.as_str())
+                BoardStore::add_comment_tx(tx, &ticket.id, SANITATION_ROLE, sys_comment.as_str())
                     .await?;
                 Ok(())
             },
@@ -2244,9 +2244,10 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// * **TotalComments breaker** — counts all comments via `comments.len()`; it prevents
 ///   re-dispatch by transitioning to the terminal `Failed` phase before the
 ///   breaker could re-read the same trip comment.
-/// * **Sanitation breaker** — filters comments by role `"system"` and content
-///   containing [`SANITATION_FAILED_MARKER`], but trip comments use different
-///   text, so they are never counted.
+/// * **Sanitation breaker** — filters comments by role `"sanitation_admin"` and content
+///   containing [`SANITATION_FAILED_MARKER`];
+///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
+///   are never counted.
 /// * **Diagnostics breaker** — filters comments by role `"diagnostics"` and content
 ///   containing [`DIAGNOSTICS_FAILED_MARKER`];
 ///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
