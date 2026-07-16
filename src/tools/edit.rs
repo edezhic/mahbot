@@ -20,7 +20,6 @@ use std::path::PathBuf;
 ///   `new_string` may be empty to delete the matched text.
 pub struct EditTool;
 
-#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl Tool for EditTool {
     fn name(&self) -> &'static str {
@@ -53,144 +52,16 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        // ── 1. Extract parameters ──────────────────────────────────
         let path = super::get_str(&args, "path")?.to_string();
-
+        let new_string = super::get_str(&args, "new_string")?;
         let old_string = super::get_opt_str(&args, "old_string");
 
-        let new_string = super::get_str(&args, "new_string")?;
-
-        // ── Write/Edit mode ──────────────────────────────────────
-        // empty old_string deliberately triggers write mode (no way to match/replace empty string in a file)
         match old_string {
-            None | Some("") => {
-                let resolved_target =
-                    super::path::resolve_write_target(ws.as_path(), &path, true).await?;
-
-                if tokio::fs::try_exists(&resolved_target)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Cannot verify whether {path} exists: {e}"))?
-                {
-                    anyhow::bail!(
-                        "File already exists: {path}. Use `old_string` to edit it instead of overwriting."
-                    );
-                }
-
-                tokio::fs::write(&resolved_target, new_string)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to write file: {e}"))?;
-                update_search_index_after_write(ws, &resolved_target);
-                Ok(format!("Written {} bytes to {path}", new_string.len()))
-            }
-            Some(old_string) => {
-                // ── Edit mode ─────────────────────────────────────
+            None | Some("") => self.execute_write(ws, &path, new_string).await,
+            Some(old) => {
                 let multiple = super::get_bool(&args, "multiple", false);
-
-                // ── No-op guard: reject edits where old and new are identical ──
-                // Raw string comparison (no whitespace normalization) so we fail
-                // fast before touching the file.  Accepts the trade-off that a
-                // whitespace-normalization edit (where old == new but the file
-                // bytes actually differ in spacing) will be incorrectly rejected
-                // — this edge case is rare, and the alternative (allowing literal
-                // no-ops to pass through as "replaced 1 occurrence") is worse.
-                if old_string == new_string {
-                    anyhow::bail!("old_string equals new_string — no change needed");
-                }
-
-                // ── 2. Path pre-validation ───────────────────────────────
-                let resolved_target =
-                    super::path::resolve_write_target(ws.as_path(), &path, false).await?;
-
-                let use_ws_matching = is_ws_insensitive_extension(&path);
-
-                // ── 3. Size guard: reject oversized files before read_to_string ──
-                match tokio::fs::metadata(&resolved_target).await {
-                    Ok(meta) => {
-                        super::check_file_size(&meta)?;
-                    }
-                    Err(e) => anyhow::bail!("Cannot access file {path}: {e}"),
-                }
-
-                // ── 4. Read → match → replace → write ───────────────────
-                let content = match tokio::fs::read_to_string(&resolved_target).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        anyhow::bail!("Failed to read file: {e}");
-                    }
-                };
-
-                let new_content;
-                let replaced_count;
-
-                let exact_count = content.matches(old_string).count();
-
-                if multiple {
-                    // Multiple mode: use exact match (whitespace-insensitive multi-replace is a future concern)
-
-                    if exact_count == 0 {
-                        // Try a whitespace-insensitive match for a better error message
-                        if use_ws_matching
-                            && find_ws_insensitive(&content, old_string).is_ok_and(|r| r.is_some())
-                        {
-                            anyhow::bail!(
-                                "old_string not found exactly (whitespace differs); try without multiple=true"
-                            );
-                        }
-                        anyhow::bail!("old_string not found in file (multiple=true mode)");
-                    }
-
-                    new_content = content.replace(old_string, new_string);
-                    replaced_count = exact_count;
-                } else {
-                    // Single mode: try exact match first, fall back to whitespace-insensitive
-
-                    match exact_count {
-                        1 => {
-                            new_content = content.replacen(old_string, new_string, 1);
-                            replaced_count = 1;
-                        }
-                        0 if use_ws_matching => {
-                            // No exact match — try whitespace-insensitive matching
-                            match find_ws_insensitive(&content, old_string) {
-                                Ok(Some(ws_match)) => {
-                                    new_content = format!(
-                                        "{}{}{}",
-                                        &content[..ws_match.start],
-                                        new_string,
-                                        &content[ws_match.end..]
-                                    );
-                                    replaced_count = 1;
-                                }
-                                Ok(None) => {
-                                    anyhow::bail!(
-                                        "old_string not found in file (whitespace-insensitive matching tried)"
-                                    );
-                                }
-                                Err(e) => {
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        0 => {
-                            anyhow::bail!("old_string not found in file (exact match required)");
-                        }
-                        _ => {
-                            anyhow::bail!(
-                                "old_string matches {exact_count} times; must match exactly once (or pass multiple=true to replace all)"
-                            );
-                        }
-                    }
-                }
-
-                tokio::fs::write(&resolved_target, &new_content)
+                self.execute_edit(ws, &path, old, new_string, multiple)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to write file: {e}"))?;
-                update_search_index_after_write(ws, &resolved_target);
-                Ok(format!(
-                    "Edited {path}: replaced {replaced_count} occurrence{} ({} bytes)",
-                    if replaced_count == 1 { "" } else { "s" },
-                    new_content.len()
-                ))
             }
         }
     }
@@ -205,16 +76,159 @@ impl Tool for EditTool {
             ToolOutputPhase::Before => None,
             ToolOutputPhase::After => {
                 let (_output, success) = outcome?;
-                let old_string = super::get_opt_str(args, "old_string").filter(|s| !s.is_empty());
                 let new_string = super::get_opt_str(args, "new_string").unwrap_or("?");
-                if let Some(old) = old_string {
+                if Self::is_write_mode(args) {
+                    Some(format_file_tool_result("Write", new_string, args, success))
+                } else {
+                    let old = super::get_opt_str(args, "old_string")?;
                     let combined = format!("{old}\n-----------\n{new_string}");
                     Some(format_file_tool_result("Edit", &combined, args, success))
-                } else {
-                    Some(format_file_tool_result("Write", new_string, args, success))
                 }
             }
         }
+    }
+}
+
+impl EditTool {
+    /// Determine if this is a write (new file) operation rather than an edit.
+    fn is_write_mode(args: &serde_json::Value) -> bool {
+        super::get_opt_str(args, "old_string").is_none_or(str::is_empty)
+    }
+
+    /// Write a new file with the given content.
+    async fn execute_write(&self, ws: &Workspace, path: &str, new_string: &str) -> Result<String> {
+        let resolved_target = super::path::resolve_write_target(ws.as_path(), path, true).await?;
+
+        if tokio::fs::try_exists(&resolved_target)
+            .await
+            .map_err(|e| anyhow::anyhow!("Cannot verify whether {path} exists: {e}"))?
+        {
+            anyhow::bail!(
+                "File already exists: {path}. Use `old_string` to edit it instead of overwriting."
+            );
+        }
+
+        tokio::fs::write(&resolved_target, new_string)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write file: {e}"))?;
+        update_search_index_after_write(ws, &resolved_target);
+        Ok(format!("Written {} bytes to {path}", new_string.len()))
+    }
+
+    /// Edit an existing file by replacing `old_string` with `new_string`.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_edit(
+        &self,
+        ws: &Workspace,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        multiple: bool,
+    ) -> Result<String> {
+        // ── No-op guard: reject edits where old and new are identical ──
+        // Raw string comparison (no whitespace normalization) so we fail
+        // fast before touching the file.  Accepts the trade-off that a
+        // whitespace-normalization edit (where old == new but the file
+        // bytes actually differ in spacing) will be incorrectly rejected
+        // — this edge case is rare, and the alternative (allowing literal
+        // no-ops to pass through as "replaced 1 occurrence") is worse.
+        if old_string == new_string {
+            anyhow::bail!("old_string equals new_string — no change needed");
+        }
+
+        // ── 1. Path pre-validation ───────────────────────────────
+        let resolved_target = super::path::resolve_write_target(ws.as_path(), path, false).await?;
+
+        let use_ws_matching = is_ws_insensitive_extension(path);
+
+        // ── 2. Size guard: reject oversized files before read_to_string ──
+        match tokio::fs::metadata(&resolved_target).await {
+            Ok(meta) => {
+                super::check_file_size(&meta)?;
+            }
+            Err(e) => anyhow::bail!("Cannot access file {path}: {e}"),
+        }
+
+        // ── 3. Read → match → replace → write ───────────────────
+        let content = match tokio::fs::read_to_string(&resolved_target).await {
+            Ok(c) => c,
+            Err(e) => {
+                anyhow::bail!("Failed to read file: {e}");
+            }
+        };
+
+        let new_content;
+        let replaced_count;
+
+        let exact_count = content.matches(old_string).count();
+
+        if multiple {
+            // Multiple mode: use exact match (whitespace-insensitive multi-replace is a future concern)
+
+            if exact_count == 0 {
+                // Try a whitespace-insensitive match for a better error message
+                if use_ws_matching
+                    && find_ws_insensitive(&content, old_string).is_ok_and(|r| r.is_some())
+                {
+                    anyhow::bail!(
+                        "old_string not found exactly (whitespace differs); try without multiple=true"
+                    );
+                }
+                anyhow::bail!("old_string not found in file (multiple=true mode)");
+            }
+
+            new_content = content.replace(old_string, new_string);
+            replaced_count = exact_count;
+        } else {
+            // Single mode: try exact match first, fall back to whitespace-insensitive
+
+            match exact_count {
+                1 => {
+                    new_content = content.replacen(old_string, new_string, 1);
+                    replaced_count = 1;
+                }
+                0 if use_ws_matching => {
+                    // No exact match — try whitespace-insensitive matching
+                    match find_ws_insensitive(&content, old_string) {
+                        Ok(Some(ws_match)) => {
+                            new_content = format!(
+                                "{}{}{}",
+                                &content[..ws_match.start],
+                                new_string,
+                                &content[ws_match.end..]
+                            );
+                            replaced_count = 1;
+                        }
+                        Ok(None) => {
+                            anyhow::bail!(
+                                "old_string not found in file (whitespace-insensitive matching tried)"
+                            );
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    }
+                }
+                0 => {
+                    anyhow::bail!("old_string not found in file (exact match required)");
+                }
+                _ => {
+                    anyhow::bail!(
+                        "old_string matches {exact_count} times; must match exactly once (or pass multiple=true to replace all)"
+                    );
+                }
+            }
+        }
+
+        tokio::fs::write(&resolved_target, &new_content)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write file: {e}"))?;
+        update_search_index_after_write(ws, &resolved_target);
+        Ok(format!(
+            "Edited {path}: replaced {replaced_count} occurrence{} ({} bytes)",
+            if replaced_count == 1 { "" } else { "s" },
+            new_content.len()
+        ))
     }
 }
 
