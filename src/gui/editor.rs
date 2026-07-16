@@ -417,6 +417,20 @@ pub enum CloseAction {
     Cancel,
 }
 
+/// Pending close action to execute after the next successful save.
+/// Only one such action can be pending at a time.
+#[derive(Debug, Clone)]
+enum PendingCloseAction {
+    /// Close this tab index.
+    CloseTab(usize),
+    /// Close all tabs except `keep_idx`; these dirty tab indices
+    /// still need to be saved first.
+    CloseOthers {
+        keep_idx: usize,
+        remaining_dirty: Vec<usize>,
+    },
+}
+
 /// Raw data loaded from a saved tab entry (string content, not Content).
 #[derive(Debug, Clone)]
 pub struct SavedTabData {
@@ -1461,10 +1475,8 @@ pub struct EditorState {
     tab_contents: HashMap<String, TabData>,
     /// Scrollable ID for the tab bar.
     tab_scroll_id: Id,
-    /// When set, after the next successful save, close this tab (used by Save-from-close-dialog).
-    pending_save_close: Option<usize>,
-    /// Save queue for close-others: (keep_idx, remaining dirty indices to save).
-    pending_close_others: Option<(usize, Vec<usize>)>,
+    /// Pending close action to execute after the next successful save.
+    pending_close: Option<PendingCloseAction>,
     /// Whether the workspace tabs have been loaded at least once this session.
     session_initialized: bool,
     /// When Enter expands a directory that needs async loading, this holds
@@ -1559,8 +1571,7 @@ impl EditorState {
             active_tab_index: 0,
             tab_contents: HashMap::new(),
             tab_scroll_id: Id::new("editor_tabs_bar"),
-            pending_save_close: None,
-            pending_close_others: None,
+            pending_close: None,
             session_initialized: false,
             pending_enter_dir: None,
             git_status_cache: HashMap::new(),
@@ -2087,8 +2098,7 @@ impl EditorState {
         self.git_ignore_loading = false;
         self.session_initialized = false;
         self.active_modal = None;
-        self.pending_save_close = None;
-        self.pending_close_others = None;
+        self.pending_close = None;
         self.file_tree.visible_tree_nodes.clear();
         self.file_tree.tree_focused = false;
         self.file_tree.tree_focus_index = 0;
@@ -2678,37 +2688,45 @@ impl EditorState {
                     }
                 }
 
-                // If this save was triggered by CloseDialog::Save, close the tab now.
-                if let Some(close_idx) = self.pending_save_close.take() {
-                    if close_idx < self.tabs.len() {
-                        self.remove_tab_at(close_idx);
-                        // Save after removal + scroll.
-                        let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-                        if !self.tabs.is_empty() {
-                            tasks.push(self.scroll_to_active_tab());
+                // If this save is part of a pending close action, handle it now.
+                match self.pending_close.take() {
+                    Some(PendingCloseAction::CloseTab(close_idx)) => {
+                        if close_idx < self.tabs.len() {
+                            self.remove_tab_at(close_idx);
+                            // Save after removal + scroll.
+                            let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
+                            if !self.tabs.is_empty() {
+                                tasks.push(self.scroll_to_active_tab());
+                            }
+                            tasks.push(self.save_current_tabs());
+                            return Task::batch(tasks);
                         }
-                        tasks.push(self.save_current_tabs());
-                        return Task::batch(tasks);
                     }
-                }
-                // If this save is part of a close-others save queue, continue.
-                if let Some((keep_idx, mut remaining)) = self.pending_close_others.take() {
-                    return if remaining.is_empty() {
-                        // All dirty tabs saved — close everything except keep_idx.
-                        self.remove_all_tabs_except(keep_idx);
-                        // Save after removal.
-                        self.try_save_current_tabs().map_or_else(Task::none, |t| {
-                            Task::batch([
-                                t,
-                                Task::done(EditorMessage::Toast(super::ToastMessage::Saved)),
-                            ])
-                        })
-                    } else {
-                        // Save the next dirty tab.
-                        let next = remaining.remove(0);
-                        self.pending_close_others = Some((keep_idx, remaining));
-                        build_save_task(&self.tabs, &self.tab_contents, next)
-                    };
+                    Some(PendingCloseAction::CloseOthers {
+                        keep_idx,
+                        remaining_dirty: mut remaining,
+                    }) => {
+                        return if remaining.is_empty() {
+                            // All dirty tabs saved — close everything except keep_idx.
+                            self.remove_all_tabs_except(keep_idx);
+                            // Save after removal.
+                            self.try_save_current_tabs().map_or_else(Task::none, |t| {
+                                Task::batch([
+                                    t,
+                                    Task::done(EditorMessage::Toast(super::ToastMessage::Saved)),
+                                ])
+                            })
+                        } else {
+                            // Save the next dirty tab.
+                            let next = remaining.remove(0);
+                            self.pending_close = Some(PendingCloseAction::CloseOthers {
+                                keep_idx,
+                                remaining_dirty: remaining,
+                            });
+                            build_save_task(&self.tabs, &self.tab_contents, next)
+                        };
+                    }
+                    None => {}
                 }
 
                 // Regular save (not from close dialog) — persist clean state.
@@ -2719,8 +2737,7 @@ impl EditorState {
                 }
             }
             Err(e) => {
-                self.pending_save_close = None;
-                self.pending_close_others = None;
+                self.pending_close = None;
                 let toast = super::ToastMessage::Error(e);
                 Task::done(EditorMessage::Toast(toast))
             }
@@ -2736,16 +2753,13 @@ impl EditorState {
     ///    and `CloseOthers`).
     /// 2. Find/replace bar on the active tab.
     /// 3. File-tree focus.
-    /// 4. Residual [`pending_save_close`] / [`pending_close_others`] state.
+    /// 4. Residual [`pending_close`] state.
     fn escape(&mut self) -> Task<EditorMessage> {
         // Close modal overlays first.
         if let Some(modal) = self.active_modal.take() {
             match modal {
-                ModalKind::CloseDialog(..) => {
-                    self.pending_save_close = None;
-                }
-                ModalKind::CloseOthers(..) => {
-                    self.pending_close_others = None;
+                ModalKind::CloseDialog(..) | ModalKind::CloseOthers(..) => {
+                    self.pending_close = None;
                 }
                 _ => {}
             }
@@ -2768,8 +2782,7 @@ impl EditorState {
             self.pending_enter_dir = None;
             return Task::none();
         }
-        self.pending_save_close = None;
-        self.pending_close_others = None;
+        self.pending_close = None;
         Task::none()
     }
 
@@ -3043,7 +3056,7 @@ impl EditorState {
                 if tab_index < self.tabs.len() {
                     // Clear dialog immediately; close tab after save completes.
                     self.active_modal = None;
-                    self.pending_save_close = Some(tab_index);
+                    self.pending_close = Some(PendingCloseAction::CloseTab(tab_index));
 
                     build_save_task(&self.tabs, &self.tab_contents, tab_index)
                 } else {
@@ -3053,7 +3066,7 @@ impl EditorState {
             }
             CloseAction::Discard => {
                 self.active_modal = None;
-                self.pending_save_close = None;
+                self.pending_close = None;
                 if tab_index < self.tabs.len() {
                     self.remove_tab_at(tab_index);
                 }
@@ -3061,7 +3074,7 @@ impl EditorState {
             }
             CloseAction::Cancel => {
                 self.active_modal = None;
-                self.pending_save_close = None;
+                self.pending_close = None;
                 Task::none()
             }
         }
@@ -3083,19 +3096,22 @@ impl EditorState {
                 }
                 // Start saving the first dirty tab in the queue.
                 let first = dirty.remove(0);
-                self.pending_close_others = Some((keep_idx, dirty));
+                self.pending_close = Some(PendingCloseAction::CloseOthers {
+                    keep_idx,
+                    remaining_dirty: dirty,
+                });
                 build_save_task(&self.tabs, &self.tab_contents, first)
             }
             CloseAction::Discard => {
                 self.active_modal = None;
-                self.pending_close_others = None;
+                self.pending_close = None;
                 // Close all tabs except keep_idx, discarding unsaved changes.
                 self.remove_all_tabs_except(keep_idx);
                 self.save_current_tabs()
             }
             CloseAction::Cancel => {
                 self.active_modal = None;
-                self.pending_close_others = None;
+                self.pending_close = None;
                 Task::none()
             }
         }
