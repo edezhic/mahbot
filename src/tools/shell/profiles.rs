@@ -35,7 +35,8 @@ impl Profile {
     /// Create a new profile that matches `command_pattern` (a regex against the canonical command).
     pub(super) fn new(match_command: &str) -> Self {
         Self {
-            match_command: Regex::new(match_command).expect("bad match_command regex"),
+            match_command: Regex::new(match_command)
+                .unwrap_or_else(|e| panic!("bad match_command regex ({e}): {match_command:?}")),
             strip_lines: None,
             keep_stderr: None,
             max_line_len: None,
@@ -49,7 +50,10 @@ impl Profile {
     }
 
     fn strip(mut self, patterns: &[&str]) -> Self {
-        self.strip_lines = Some(RegexSet::new(patterns).expect("bad strip_lines regex"));
+        self.strip_lines = Some(
+            RegexSet::new(patterns)
+                .unwrap_or_else(|e| panic!("bad strip_lines regex ({e}): {patterns:?}")),
+        );
         self
     }
 
@@ -61,7 +65,10 @@ impl Profile {
     }
 
     fn keep_stderr(mut self, patterns: &[&str]) -> Self {
-        self.keep_stderr = Some(RegexSet::new(patterns).expect("bad keep_stderr regex"));
+        self.keep_stderr = Some(
+            RegexSet::new(patterns)
+                .unwrap_or_else(|e| panic!("bad keep_stderr regex ({e}): {patterns:?}")),
+        );
         self
     }
 
@@ -140,7 +147,9 @@ static CARGO_COMPILE_STRIP: LazyLock<RegexSet> = LazyLock::new(|| {
             .iter()
             .map(|p| format!(r"^\s*{}\s", regex::escape(p))),
     )
-    .expect("bad cargo compile strip regex")
+    .unwrap_or_else(|e| {
+        panic!("bad cargo compile strip regex ({e}): derived from {CARGO_COMPILE_PREFIXES:?}")
+    })
 });
 
 /// Stderr lines *kept* through cargo compile output filtering.
