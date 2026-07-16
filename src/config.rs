@@ -2,7 +2,7 @@
 //!
 //! # Architecture overview
 //!
-//! The config system has a two-tier design: hardcoded defaults in this module
+//! The config system has a layered structure: hardcoded defaults in this module
 //! provide the base values, and the [`ConfigReload`] singleton is then overlayed
 //! with persisted values from the `config.db` Turso database (via
 //! [`crate::config_db`]).
