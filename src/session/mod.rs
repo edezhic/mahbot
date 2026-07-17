@@ -18,11 +18,11 @@ use chrono::{DateTime, Utc};
 /// History-length threshold (in estimated tokens) that triggers summarization.
 ///
 /// This is a conservative default chosen to work across models with varying
-/// context window sizes (128K–1M).  The value of **65,000** estimated tokens
-/// translates to roughly 260K characters of message content under the rough
+/// context window sizes (128K–1M).  The value of **100,000** estimated tokens
+/// translates to roughly 400K characters of message content under the rough
 /// `estimate_tokens` formula (~4 chars/token + 4 tokens per-message overhead).
 ///
-/// ## Why 65K?
+/// ## Why 100K?
 ///
 /// The actual token consumption at request time is higher than `estimate_tokens`
 /// suggests for several reasons:
@@ -40,15 +40,7 @@ use chrono::{DateTime, Utc};
 ///   more tool-call rounds (each adding assistant + tool-result messages) before
 ///   the next threshold check at the start of the following turn.
 ///
-/// ### Context window breakdown for 65K estimated tokens
-///
-/// | Model type                 | Context | Effective margin |
-/// |----------------------------|---------|-----------------|
-/// | 128K (e.g., DeepSeek V4 Flash, GPT-5.5, Claude 4.8) | ~100K actual + ~15K overhead = ~115K → **~13K headroom** |
-/// | 200K+ models               | ~160K actual + ~15K overhead = ~175K → **~25K headroom** |
-/// | 1M (e.g., DeepSeek V4 Pro) | Triggers at ~6.5% of context — very early but cheap |
-///
-pub const SUMMARIZATION_THRESHOLD: usize = 65_000;
+pub const SUMMARIZATION_THRESHOLD: usize = 100_000;
 
 /// Stored session rows and second `history` entry after compaction use this prefix so channel
 /// orchestration can re-inject the summary on later turns (baseline `system` rows stay excluded).
