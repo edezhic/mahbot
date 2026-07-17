@@ -298,6 +298,7 @@ pub(crate) struct TicketBuilder<'a> {
     prereqs: Vec<String>,
     reporter: String,
     embedding: Option<Vec<u8>>,
+    priority: i64,
 }
 
 impl<'a> TicketBuilder<'a> {
@@ -312,6 +313,7 @@ impl<'a> TicketBuilder<'a> {
             prereqs: Vec::new(),
             reporter: "test".into(),
             embedding: None,
+            priority: 1,
         }
     }
 
@@ -351,6 +353,12 @@ impl<'a> TicketBuilder<'a> {
         self
     }
 
+    /// Set the ticket priority (default: `1`). 0 = highest urgency.
+    pub(crate) fn priority(mut self, priority: i64) -> Self {
+        self.priority = priority;
+        self
+    }
+
     /// Create the ticket with the accumulated parameters.
     pub(crate) async fn create(self) -> anyhow::Result<String> {
         let (store, params) = self.into_parts();
@@ -374,6 +382,7 @@ impl<'a> TicketBuilder<'a> {
                 prerequisites: self.prereqs,
                 reporter: self.reporter,
                 embedding: self.embedding,
+                priority: self.priority,
             },
         )
     }

@@ -261,6 +261,43 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     }
 }
 
+// ── Ticket priority chip colors (Flexoki muted palette) ──────────
+//
+// Priority uses the same muted-tone approach as phase badges:
+// darker backgrounds with lighter, readable text on a dark theme.
+//
+// P0 (urgent):     red     — failed-like
+// P1 (high):       orange  — in-development-like
+// P2 (medium):     yellow  — in-diagnostics-like
+// P3 (low):        green   — qa-passed-like
+// P4+ (lowest):    green   — done-like
+
+#[must_use]
+pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
+    match priority {
+        0 => (
+            Color::from_rgb(0.310, 0.114, 0.114),
+            Color::from_rgb(0.878, 0.753, 0.753),
+        ),
+        1 => (
+            Color::from_rgb(0.380, 0.216, 0.078),
+            Color::from_rgb(0.941, 0.878, 0.784),
+        ),
+        2 => (
+            Color::from_rgb(0.310, 0.224, 0.102),
+            Color::from_rgb(0.902, 0.863, 0.784),
+        ),
+        3 => (
+            Color::from_rgb(0.176, 0.310, 0.208),
+            Color::from_rgb(0.784, 0.902, 0.816),
+        ),
+        _ => (
+            Color::from_rgb(0.114, 0.176, 0.114),
+            Color::from_rgb(0.753, 0.816, 0.753),
+        ),
+    }
+}
+
 /// One-shot guard to log timestamp parse failure only once.
 static TIMESTAMP_PARSE_WARNED: AtomicBool = AtomicBool::new(false);
 

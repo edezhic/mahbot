@@ -106,6 +106,7 @@ pub(crate) fn format_ticket_block(ticket: &crate::board::Ticket) -> String {
             ("{{ticket_id}}", &ticket.id),
             ("{{ticket_title}}", &ticket.title),
             ("{{ticket_reporter}}", &ticket.reporter),
+            ("{{ticket_priority}}", &format!("P{}", ticket.priority)),
             ("{{ticket_description}}", &ticket.description),
             ("{{ticket_comments}}", &comments),
         ],

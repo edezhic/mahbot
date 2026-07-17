@@ -37,6 +37,7 @@ impl CreateTicketTool {
         description: &str,
         prerequisites: &[String],
         embedding_bytes: Option<Vec<u8>>,
+        priority: i64,
     ) -> TicketParams {
         TicketParams {
             title: title.to_string(),
@@ -46,6 +47,7 @@ impl CreateTicketTool {
             prerequisites: prerequisites.to_vec(),
             reporter: self.reporter.clone(),
             embedding: embedding_bytes,
+            priority,
         }
     }
 }
@@ -57,30 +59,52 @@ impl Tool for CreateTicketTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        super::tool_params_schema(
-            &json!({
-                "title": {
-                    "type": "string",
-                    "description": "Short title/summary of the task"
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Detailed description of the task"
-                },
-                "prerequisites": {
-                    "type": "array",
-                    "description": "Optional list of ticket IDs that must be completed (done, archived, or cancelled) before this ticket can be claimed",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "supersede": {
-                    "type": "string",
-                    "description": "Optional ticket ID to supersede — atomically cancels the old ticket, creates this one as its replacement, and rewires any dependents to point to the new ID"
-                },
+        let mut props = serde_json::Map::new();
+        props.insert(
+            "title".into(),
+            json!({
+                "type": "string",
+                "description": "Short title/summary of the task"
             }),
-            &["title", "description"],
-        )
+        );
+        props.insert(
+            "description".into(),
+            json!({
+                "type": "string",
+                "description": "Detailed description of the task"
+            }),
+        );
+        props.insert(
+            "prerequisites".into(),
+            json!({
+                "type": "array",
+                "description": "Optional list of ticket IDs that must be completed (done, archived, or cancelled) before this ticket can be claimed",
+                "items": {
+                    "type": "string"
+                }
+            }),
+        );
+        props.insert(
+            "supersede".into(),
+            json!({
+                "type": "string",
+                "description": "Optional ticket ID to supersede — atomically cancels the old ticket, creates this one as its replacement, and rewires any dependents to point to the new ID"
+            }),
+        );
+
+        // Only Manager sees the priority parameter — Maintainer always uses
+        // a hardcoded value and must not have it in the schema.
+        if self.reporter == "manager" {
+            props.insert(
+                "priority".into(),
+                json!({
+                    "type": "integer",
+                    "description": "Priority level: 0 = highest urgency, 1 (default), 2, 3, ... Higher numbers = lower priority"
+                }),
+            );
+        }
+
+        super::tool_params_schema(&serde_json::Value::Object(props), &["title", "description"])
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
@@ -104,6 +128,17 @@ impl Tool for CreateTicketTool {
             None => None,
         };
 
+        // Priority: Manager can set explicitly; Maintainer always uses 3.
+        let priority: i64 = if self.reporter == "manager" {
+            args.get("priority")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1)
+        } else if self.reporter == "maintainer" {
+            3
+        } else {
+            1
+        };
+
         let store = board_store();
         let embedding_bytes: Option<Vec<u8>> =
             crate::embedder::embed_document(title).map(|v| crate::vector::vec_to_bytes(&v));
@@ -114,7 +149,14 @@ impl Tool for CreateTicketTool {
             format!(" with prerequisites: {}", prerequisites.join(", "))
         };
 
-        let params = self.build_params(ws, title, description, &prerequisites, embedding_bytes);
+        let params = self.build_params(
+            ws,
+            title,
+            description,
+            &prerequisites,
+            embedding_bytes,
+            priority,
+        );
         if let Some(supersede_id) = supersede_id {
             guard_not_pipeline_blocking(store, &supersede_id).await?;
 

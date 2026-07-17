@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     reporter        TEXT NOT NULL DEFAULT '',
     is_archived     INTEGER NOT NULL DEFAULT 0,
     embedding       BLOB,
-    pipeline_reservation INTEGER NOT NULL DEFAULT 0
+    pipeline_reservation INTEGER NOT NULL DEFAULT 0,
+    priority        INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS ticket_comments (
     id          TEXT PRIMARY KEY,
@@ -106,6 +107,7 @@ crate::columns! {
         REPORTER               => "reporter",
         IS_ARCHIVED            => "is_archived",
         PIPELINE_RESERVATION   => "pipeline_reservation",
+        PRIORITY               => "priority",
     }
 }
 
@@ -216,6 +218,7 @@ pub(crate) struct TicketParams {
     pub prerequisites: Vec<String>,
     pub reporter: String,
     pub embedding: Option<Vec<u8>>,
+    pub priority: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -262,6 +265,7 @@ pub struct Ticket {
     /// review/QA/diagnostics and awaiting rework). When set, the ticket gets
     /// priority over other ReadyForDevelopment tickets during claim.
     pub pipeline_reservation: bool,
+    pub priority: i64,
 }
 
 impl Ticket {
@@ -298,6 +302,7 @@ impl Ticket {
     ///
     /// - Ticket ID, Title, Description
     /// - Phase (snake_case — e.g. `ready_for_development`)
+    /// - Priority (P0–P4+ label)
     /// - Reporter, Workspace, Created, Updated
     /// - Supersedes, Superseded by, Prerequisites (conditionally when non-empty)
     /// - Archived flag (conditionally when `true`)
@@ -336,7 +341,8 @@ impl Ticket {
              Reporter: {reporter}\n\
              Workspace: {workspace}\n\
              Created: {created}\n\
-             Updated: {updated}\n",
+             Updated: {updated}\n\
+             Priority: P{priority}\n",
             id = self.id,
             title = self.title,
             description = self.description,
@@ -345,6 +351,7 @@ impl Ticket {
             workspace = self.workspace_name,
             created = self.created_at,
             updated = self.updated_at,
+            priority = self.priority,
         );
         if let Some(ref s) = self.supersedes {
             let _ = writeln!(out, "Supersedes: {s}");
@@ -645,6 +652,41 @@ async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
             info!("Schema migration complete: tickets.status renamed to tickets.phase (version 1)");
         }
     }
+
+    // ── schema migration: add `priority` column ────────────────────
+    if current_version < 2 {
+        // Check whether the `priority` column already exists (idempotency).
+        let table_info = conn
+            .query("PRAGMA table_info('tickets')", ())
+            .await
+            .context("Failed to read PRAGMA table_info for tickets table")?;
+
+        let has_priority = table_info
+            .iter()
+            .any(|row| row.get::<String>(1).ok().as_deref() == Some("priority"));
+
+        if !has_priority {
+            info!("Schema migration: adding tickets.priority column");
+            conn.execute(
+                "ALTER TABLE tickets ADD COLUMN priority INTEGER NOT NULL DEFAULT 1",
+                (),
+            )
+            .await
+            .context("Schema migration failed: unable to add tickets.priority")?;
+        }
+
+        conn.execute("PRAGMA user_version = 2", ())
+            .await
+            .context("Schema migration failed: unable to set PRAGMA user_version to 2")?;
+
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after adding tickets.priority",
+        )?;
+
+        if !has_priority {
+            info!("Schema migration complete: added tickets.priority column (version 2)");
+        }
+    }
     Ok(())
 }
 
@@ -684,8 +726,8 @@ impl BoardStore {
         let prereqs_json = serde_json::to_string(&params.prerequisites)?;
         tx.execute(
             "INSERT INTO tickets (id, title, description, phase, workspace_name, \
-             created_at, updated_at, prerequisites, supersedes, reporter, embedding) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             created_at, updated_at, prerequisites, supersedes, reporter, embedding, priority) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             turso::params![
                 ticket_id,
                 params.title.as_str(),
@@ -698,6 +740,7 @@ impl BoardStore {
                 supersedes,
                 params.reporter.as_str(),
                 params.embedding.as_deref(),
+                params.priority,
             ],
         )
         .await?;
@@ -939,6 +982,7 @@ impl BoardStore {
             reporter: row.get::<String>(COL_TICKET_REPORTER)?,
             is_archived: row.get::<bool>(COL_TICKET_IS_ARCHIVED)?,
             pipeline_reservation: row.get::<bool>(COL_TICKET_PIPELINE_RESERVATION)?,
+            priority: row.get::<i64>(COL_TICKET_PRIORITY)?,
         })
     }
 
@@ -970,10 +1014,11 @@ impl BoardStore {
     /// that should not be blocked by in-flight pipeline tickets (e.g., analysis,
     /// review, and QA).
     ///
-    /// The subquery orders by `pipeline_reservation DESC, created_at ASC` so that
+    /// The subquery orders by `pipeline_reservation DESC, priority ASC, created_at ASC` so that
     /// tickets bounced back from review/QA/diagnostics (reservation = 1) are claimed
     /// before fresh tickets at the same phase. Among tickets with equal reservation,
-    /// the oldest ticket (earliest created_at) is claimed first.
+    /// tickets with lower priority (higher urgency) are claimed first, then the oldest ticket
+    /// (earliest created_at) is claimed first.
     ///
     /// Note: the UPDATE sets `assigned_to = NULL` and `pipeline_reservation = 0` —
     /// this intentionally drops the previous claimant and clears any pipeline
@@ -1020,7 +1065,7 @@ impl BoardStore {
              WHERE t1.phase = ?3 AND t1.assigned_to IS NULL AND t1.workspace_name = ?4 \
              AND t1.is_archived = 0 \
              {pipeline_blocker_clause}{prereq_filter} \
-             ORDER BY t1.pipeline_reservation DESC, t1.created_at ASC LIMIT 1) \
+             ORDER BY t1.pipeline_reservation DESC, t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}"
         );
 
@@ -1754,7 +1799,7 @@ impl BoardStore {
             "WHERE (?1 IS NULL OR workspace_name = ?1) \
              AND (?2 IS NULL OR phase = ?2) \
              AND is_archived = 0 \
-             ORDER BY created_at DESC",
+             ORDER BY priority ASC, created_at DESC",
             turso::params![workspace_name, phase_str],
             LoadComments::No,
         )

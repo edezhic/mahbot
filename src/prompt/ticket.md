@@ -2,6 +2,7 @@
 **ID**: {{ticket_id}}
 **Title**: {{ticket_title}}
 **Reporter**: {{ticket_reporter}}
+**Priority**: {{ticket_priority}}
 
 {{ticket_description}}
 

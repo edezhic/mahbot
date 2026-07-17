@@ -260,6 +260,28 @@ impl BoardState {
             .into()
     }
 
+    /// Build a priority chip pill for a ticket priority level.
+    /// Uses Flexoki muted colors from [`theme::ticket_priority_color`].
+    fn priority_badge<'a>(
+        priority: i64,
+        text_size: u32,
+        padding: [u16; 2],
+    ) -> Element<'a, BoardMessage> {
+        let label = format!("P{priority}");
+        let (badge_bg, badge_text) = theme::ticket_priority_color(priority);
+        container(text(label).size(text_size).color(badge_text))
+            .padding(padding)
+            .style(move |_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(badge_bg)),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..iced::Border::default()
+                },
+                ..container::Style::default()
+            })
+            .into()
+    }
+
     /// Compute how many of this ticket's prerequisites are still unfulfilled.
     /// A prerequisite is considered fulfilled if its ticket cannot be found in the
     /// loaded set (per manager clarification: missing = archived = fulfilled) or if
@@ -596,10 +618,20 @@ impl BoardState {
             }
         }
 
-        // Sort: pending and pipeline oldest-first (ASC), completed newest-first (DESC)
+        // Sort: pending and pipeline by priority (ASC), then oldest-first (ASC);
+        // completed newest-first (DESC).
+        // Priority is an integer — 0 = highest, so ASC puts urgent tickets first.
         // Ticket created_at is an ISO 8601 string, so lexical sort = chronological sort
-        pending.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        pipeline.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        pending.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then(a.created_at.cmp(&b.created_at))
+        });
+        pipeline.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then(a.created_at.cmp(&b.created_at))
+        });
         completed.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         (pending, pipeline, completed)
@@ -615,7 +647,11 @@ impl BoardState {
 
         let (unfulfilled_count, unfulfilled_ids) = self.unfulfilled_prereq_count(ticket);
 
-        let mut badge_row = row![Self::phase_badge(ticket.phase, 10, [1, 6]),].spacing(6);
+        let mut badge_row = row![
+            Self::priority_badge(ticket.priority, 10, [1, 6]),
+            Self::phase_badge(ticket.phase, 10, [1, 6]),
+        ]
+        .spacing(6);
 
         if unfulfilled_count > 0 {
             let tooltip_text = format!("Blocked by: {}", unfulfilled_ids.join(", "));
@@ -937,6 +973,7 @@ impl BoardState {
             text(&ticket.id).size(12).color(theme::TEXT_MUTED),
             Space::new().height(6),
             row![
+                Self::priority_badge(ticket.priority, 12, [2, 8]),
                 Self::phase_badge(ticket.phase, 12, [2, 8]),
                 Space::new().width(Length::Fill),
                 icon_row,
