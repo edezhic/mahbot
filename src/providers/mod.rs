@@ -12,7 +12,7 @@ pub mod transcribe;
 
 pub use reasoning::plaintext_for_display;
 
-use crate::config::{CONFIG, non_empty, resolve_or, trimmed_or_none};
+use crate::config::{CONFIG, non_empty, resolve_list_or, resolve_or, trimmed_or_none};
 use crate::util::UnwrapPoison;
 pub use crate::{ChatMessage, ChatRequest, ChatResponse, Provider};
 
@@ -172,19 +172,28 @@ async fn setup_provider_and_transcribers(
         non_empty(config.image_transcription_provider.clone()).as_deref(),
         ImageTranscriber::from_inner,
     );
-    let audio_transcriber = create_transcriber(
-        Some(&endpoint_str),
-        config.provider_key.as_deref(),
-        Some(
-            resolve_or(
+    let audio_transcriber = {
+        let has_key = config
+            .provider_key
+            .as_deref()
+            .and_then(trimmed_or_none)
+            .is_some();
+        if has_key {
+            let models = resolve_list_or(
+                config.audio_transcription_models.as_deref(),
                 config.audio_transcription_model.clone(),
                 crate::config::DEFAULT_AUDIO_TRANSCRIPTION_MODEL,
-            )
-            .as_str(),
-        ),
-        non_empty(config.audio_transcription_provider.clone()).as_deref(),
-        transcribe::AudioTranscriber::from_inner,
-    );
+            );
+            let route = non_empty(config.audio_transcription_provider.clone());
+            Some(transcribe::AudioTranscriber::new(
+                endpoint_str.clone(),
+                models,
+                route,
+            ))
+        } else {
+            None
+        }
+    };
 
     // Now warm up the provider (costly HTTP round-trip).
     match warmup_mode {

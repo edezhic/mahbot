@@ -91,15 +91,35 @@ impl ImageTranscriber {
 
 /// Transcribes audio files via API into text
 /// during message enrichment, so the main agent sees only text.
+///
+/// Supports a configurable fallback chain: multiple models are tried in order,
+/// each with its own retry loop.  Billing/quota errors abort the entire chain;
+/// model-specific errors (404, 400) skip to the next model; transient errors
+/// (rate limits, 5xx) retry with exponential backoff on the current model.
 #[derive(Clone)]
 pub struct AudioTranscriber {
-    inner: MediaTranscriber,
+    api_url: String,
+    models: Vec<String>,
+    provider_route: Option<String>,
 }
 
 impl AudioTranscriber {
     #[must_use]
-    pub(crate) const fn from_inner(inner: MediaTranscriber) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        api_url: String,
+        models: Vec<String>,
+        provider_route: Option<String>,
+    ) -> Self {
+        Self {
+            api_url,
+            models,
+            provider_route,
+        }
+    }
+
+    /// The API base URL (e.g. `https://openrouter.ai/api/v1`).
+    fn base_url(&self) -> String {
+        crate::providers::ensure_base_url(&self.api_url)
     }
 
     /// Transcribe an audio file, returning the transcription text.
@@ -107,14 +127,13 @@ impl AudioTranscriber {
     /// Uses OpenRouter's JSON API format: base64-encodes the audio file and
     /// sends it as `input_audio.data` with the appropriate format string.
     ///
-    /// Retry behaviour follows the same pattern as [`ReliableProvider`](crate::providers::reliable::ReliableProvider):
-    /// exponential backoff with jitter, Retry-After header support,
-    /// non-retryable error classification, and shutdown coordination.
-    /// Audio payloads are larger than typical LLM calls so we use fewer
-    /// retries (3) and a more conservative base backoff (1000 ms).
+    /// Models are tried in order from the configured list (or the single
+    /// fallback model if the list is empty).  Each model gets its own retry
+    /// loop with exponential backoff and jitter.  Billing/quota errors abort
+    /// the entire chain; model-specific errors skip to the next model.
     #[allow(clippy::too_many_lines)]
     pub async fn transcribe(&self, file_path: &Path) -> anyhow::Result<String> {
-        // ── Retry parameters ──────────────────────────────────────────
+        // ── Retry parameters (per-model) ────────────────────────────
         // Mirrors the pattern in ReliableProvider::chat but adapted for
         // audio transcription (larger payloads → conservative backoff).
         const MAX_RETRIES: u32 = 3;
@@ -132,121 +151,167 @@ impl AudioTranscriber {
         }
         .to_lowercase();
 
-        // Base64-encode the audio bytes (done once, cached across retries).
+        // Base64-encode the audio bytes (done once, cached across all models).
         let encoded = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
 
-        let mut body = serde_json::json!({
-            "model": self.inner.model,
-            "input_audio": {
-                "data": encoded,
-                "format": format,
-            },
-        });
+        let url = format!("{}/audio/transcriptions", self.base_url());
 
-        if let Some(route) = &self.inner.provider_route
-            && let Some(routing) = crate::providers::provider_routing_json(route, false)
-        {
-            body["provider"] = routing;
-        }
+        // ── Per-model fallback chain ────────────────────────────────
+        let mut all_failures: Vec<String> = Vec::new();
 
-        let base = crate::providers::ensure_base_url(&self.inner.api_url);
-        let url = format!("{base}/audio/transcriptions");
+        for (model_idx, model) in self.models.iter().enumerate() {
+            let mut body = serde_json::json!({
+                "model": model,
+                "input_audio": {
+                    "data": encoded,
+                    "format": format,
+                },
+            });
 
-        let mut failures: Vec<String> = Vec::new();
-        let mut backoff_ms = BASE_BACKOFF_MS;
-
-        for attempt in 0..=MAX_RETRIES {
-            match crate::util::http::post_json_to_provider(&url, &body, "audio transcription").await
+            if let Some(route) = &self.provider_route
+                && let Some(routing) = crate::providers::provider_routing_json(route, false)
             {
-                Ok(json) => {
-                    let text = json
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("empty transcription response"))?;
+                body["provider"] = routing;
+            }
 
-                    if attempt > 0 {
-                        tracing::info!(attempt, "Audio transcription recovered after retry");
+            let mut backoff_ms = BASE_BACKOFF_MS;
+            let mut model_failures: Vec<String> = Vec::new();
+
+            tracing::debug!(
+                model = %model,
+                model_index = model_idx,
+                total_models = self.models.len(),
+                "Audio transcription: trying model"
+            );
+
+            for attempt in 0..=MAX_RETRIES {
+                match crate::util::http::post_json_to_provider(&url, &body, "audio transcription")
+                    .await
+                {
+                    Ok(json) => {
+                        let text = json
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| anyhow::anyhow!("empty transcription response"))?;
+
+                        if attempt > 0 {
+                            tracing::info!(
+                                attempt,
+                                model = %model,
+                                "Audio transcription succeeded after retry"
+                            );
+                        } else if model_idx > 0 {
+                            tracing::info!(
+                                model = %model,
+                                model_index = model_idx,
+                                "Audio transcription succeeded with fallback model",
+                            );
+                        }
+                        return Ok(text);
                     }
-                    return Ok(text);
-                }
-                Err(e) => {
-                    let class = crate::providers::reliable::classify_err(&e);
-                    let error_detail = e.to_string();
-                    let reason = class.reason_label();
+                    Err(e) => {
+                        let class = crate::providers::reliable::classify_transcriber_err(&e);
+                        let error_detail = e.to_string();
+                        let reason = class.reason_label();
 
-                    failures.push(format!(
-                        "attempt {}/{}: {}; error={}",
-                        attempt + 1,
-                        MAX_RETRIES + 1,
-                        reason,
-                        error_detail,
-                    ));
+                        model_failures.push(format!(
+                            "attempt {}/{}: {}; error={}",
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            reason,
+                            error_detail,
+                        ));
 
-                    // Permanent errors abort immediately — no point retrying.
-                    if class == crate::providers::reliable::ErrorClass::NonRetryable {
-                        tracing::warn!(
-                            error = %error_detail,
-                            "Audio transcription failed with non-retryable error, aborting"
+                        // AbortChain → fatal (auth, billing), abort everything.
+                        if class == crate::providers::reliable::TranscriberErrorClass::AbortChain {
+                            tracing::warn!(
+                                model = %model,
+                                error = %error_detail,
+                                "Audio transcription fatal error (billing/auth), aborting chain"
+                            );
+                            all_failures
+                                .push(format!("[model: {model}] {}", model_failures.join("; ")));
+                            anyhow::bail!(
+                                "Audio transcription failed (fatal) after {} model(s).\n{}",
+                                model_idx + 1,
+                                all_failures.join("\n"),
+                            );
+                        }
+
+                        // SkipModel → model-specific error, try next model.
+                        if class == crate::providers::reliable::TranscriberErrorClass::SkipModel {
+                            tracing::warn!(
+                                model = %model,
+                                error = %error_detail,
+                                "Audio transcription model-specific error, trying next model"
+                            );
+                            break;
+                        }
+
+                        // Last attempt exhausted for this model → next model.
+                        if attempt == MAX_RETRIES {
+                            tracing::warn!(
+                                model = %model,
+                                error = %error_detail,
+                                "Audio transcription exhausted retries for model"
+                            );
+                            break;
+                        }
+
+                        // ── RetryModel: transient, backoff and retry ──
+                        if let Some(http_err) = e.downcast_ref::<HttpError>()
+                            && http_err.status == 429
+                        {
+                            tracing::debug!(
+                                body = %http_err.body,
+                                "HTTP 429 body did not match any non-retryable hint"
+                            );
+                        }
+
+                        let wait = crate::providers::reliable::ReliableProvider::compute_backoff(
+                            backoff_ms, &e,
                         );
-                        break;
-                    }
 
-                    // Last attempt exhausted — exit loop.
-                    if attempt == MAX_RETRIES {
-                        tracing::warn!(
-                            error = %error_detail,
-                            "Audio transcription exhausted retries"
-                        );
-                        break;
-                    }
-
-                    // When a 429 body doesn't match any known non-retryable
-                    // hint, classify_err falls through to Retryable silently.
-                    // Log the body at debug so operators can detect provider-side
-                    // error-format changes (e.g., "quota_exhausted" → "credit_limit_reached").
-                    if class == crate::providers::reliable::ErrorClass::Retryable
-                        && let Some(http_err) = e.downcast_ref::<HttpError>()
-                        && http_err.status == 429
-                    {
-                        tracing::debug!(
-                            body = %http_err.body,
-                            "HTTP 429 body did not match any non-retryable \
-                             hint — treating as retryable"
-                        );
-                    }
-
-                    // Compute backoff duration with Retry-After header support.
-                    // Reuses ReliableProvider::compute_backoff which applies
-                    // jitter and Retry-After clamping with the same formula.
-                    let wait = crate::providers::reliable::ReliableProvider::compute_backoff(
-                        backoff_ms, &e,
-                    );
-
-                    if !crate::shutdown::sleep_or_shutdown(std::time::Duration::from_millis(wait))
+                        if !crate::shutdown::sleep_or_shutdown(std::time::Duration::from_millis(
+                            wait,
+                        ))
                         .await
-                    {
-                        tracing::info!("Audio transcription retry aborted — shutdown in progress");
-                        break;
+                        {
+                            tracing::info!(
+                                "Audio transcription retry aborted — shutdown in progress"
+                            );
+                            all_failures
+                                .push(format!("[model: {model}] {}", model_failures.join("; ")));
+                            anyhow::bail!(
+                                "Audio transcription cancelled (shutdown) after {} model(s).\n{}",
+                                model_idx + 1,
+                                all_failures.join("\n"),
+                            );
+                        }
+
+                        tracing::warn!(
+                            model = %model,
+                            attempt = attempt + 1,
+                            reason,
+                            error = %error_detail,
+                            "Audio transcription failed, retrying"
+                        );
+
+                        backoff_ms = backoff_ms.saturating_mul(2);
                     }
-
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        reason,
-                        error = %error_detail,
-                        "Audio transcription failed, retrying"
-                    );
-
-                    backoff_ms = backoff_ms.saturating_mul(2);
                 }
             }
+
+            // Accumulate model-level failures for the final error message.
+            all_failures.push(format!("[model: {model}] {}", model_failures.join("; ")));
         }
 
         anyhow::bail!(
-            "Audio transcription failed after {} attempts.\n{}",
-            failures.len(),
-            failures.join("\n"),
+            "Audio transcription failed after {} model(s).\n{}",
+            self.models.len(),
+            all_failures.join("\n"),
         )
     }
 }

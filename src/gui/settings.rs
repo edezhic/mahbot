@@ -12,7 +12,7 @@
 use crate::Role;
 use crate::Workspace;
 use crate::config::{CONFIG, ConfigData, ModelRouting, RoleConfig};
-use strum::IntoEnumIterator;
+use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
     Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable, stack,
@@ -184,10 +184,11 @@ fn model_picker_list<'a>(
 // ── Messages ─────────────────────────────────────────────────────
 
 /// Which model picker is being operated on.
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, EnumCount)]
 pub enum ModelPickerTarget {
     ImageGen,
     VideoGen,
+    AudioTranscription,
 }
 
 impl ModelPickerTarget {
@@ -195,6 +196,7 @@ impl ModelPickerTarget {
         match self {
             ModelPickerTarget::ImageGen => 0,
             ModelPickerTarget::VideoGen => 1,
+            ModelPickerTarget::AudioTranscription => 2,
         }
     }
 }
@@ -217,6 +219,10 @@ fn picker_config_fields<'a>(
     match t {
         ModelPickerTarget::ImageGen => (&mut config.image_gen_models, &mut config.image_gen_model),
         ModelPickerTarget::VideoGen => (&mut config.video_gen_models, &mut config.video_gen_model),
+        ModelPickerTarget::AudioTranscription => (
+            &mut config.audio_transcription_models,
+            &mut config.audio_transcription_model,
+        ),
     }
 }
 
@@ -332,7 +338,7 @@ pub struct SettingsState {
 
     // ── Model picker state ────────────────────────────────
     /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
-    model_picker_inputs: [String; 2],
+    model_picker_inputs: [String; ModelPickerTarget::COUNT],
 }
 
 impl SettingsState {
@@ -352,7 +358,7 @@ impl SettingsState {
             add_user_sender: String::new(),
             add_user_permissions: String::new(),
             add_user_adding: false,
-            model_picker_inputs: [String::new(), String::new()],
+            model_picker_inputs: [const { String::new() }; ModelPickerTarget::COUNT],
         }
     }
 
@@ -1571,15 +1577,6 @@ impl SettingsState {
                     "image_transcription_model",
                 ),
                 config_text_input(
-                    "Audio Model",
-                    "openai/whisper-large-v3-turbo",
-                    self.config
-                        .audio_transcription_model
-                        .as_deref()
-                        .unwrap_or_default(),
-                    "audio_transcription_model",
-                ),
-                config_text_input(
                     "Image Provider",
                     "",
                     self.config
@@ -1588,6 +1585,20 @@ impl SettingsState {
                         .unwrap_or_default(),
                     "image_transcription_provider",
                 ),
+                Space::new().height(8),
+                text("Audio Transcription Models")
+                    .size(13)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::ACCENT),
+                Space::new().height(2),
+                model_picker_list(
+                    ModelPickerTarget::AudioTranscription,
+                    self.config.audio_transcription_models.as_deref(),
+                    self.config.audio_transcription_model.as_deref(),
+                    self.model_picker_inputs[ModelPickerTarget::AudioTranscription.idx()].as_str(),
+                    "model name (e.g. openai/whisper-...)",
+                ),
+                Space::new().height(4),
                 config_text_input(
                     "Audio Provider",
                     "",

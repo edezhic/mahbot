@@ -28,6 +28,33 @@ impl ErrorClass {
     }
 }
 
+/// Extended error classification for transcriber fallback chains.
+///
+/// Unlike [`ErrorClass`] (binary Retryable vs NonRetryable), this variant
+/// distinguishes *model-specific* failures (which should fall through to
+/// the next model in the chain) from *global* failures (billing, auth —
+/// abort the entire chain).  Transient errors (rate limits, 5xx, network)
+/// remain retryable on the same model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriberErrorClass {
+    /// Transient error — retry the current model with backoff.
+    RetryModel,
+    /// Model-specific error (404 not found, 400 unsupported) — skip to next model.
+    SkipModel,
+    /// Fatal/global error (auth, billing/quota exhausted) — abort entire chain.
+    AbortChain,
+}
+
+impl TranscriberErrorClass {
+    pub(crate) const fn reason_label(self) -> &'static str {
+        match self {
+            Self::RetryModel => "retry_model",
+            Self::SkipModel => "skip_model",
+            Self::AbortChain => "abort_chain",
+        }
+    }
+}
+
 /// Body-text hints that indicate permanent (non-retryable) errors when the
 /// HTTP status-code check is ambiguous — specifically, HTTP 429 Too Many
 /// Requests is excluded from the status-based classification (rate limits
@@ -94,6 +121,41 @@ pub(crate) fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
         return http_err.retry_after_ms;
     }
     None
+}
+
+/// Classify an error for the transcriber fallback chain.
+///
+/// Returns one of three classes:
+/// * [`RetryModel`](TranscriberErrorClass::RetryModel) — transient, retry the current model.
+/// * [`SkipModel`](TranscriberErrorClass::SkipModel) — model-specific, try the next model.
+/// * [`AbortChain`](TranscriberErrorClass::AbortChain) — fatal (auth, billing), abort all.
+///
+/// The distinction from [`classify_err`] is that model-specific 4xx errors
+/// (400, 404, 403, etc.) are classified as [`SkipModel`] rather than
+/// [`NonRetryable`](ErrorClass::NonRetryable), so the fallback chain can
+/// try the next model instead of aborting.
+#[must_use]
+pub(crate) fn classify_transcriber_err(err: &anyhow::Error) -> TranscriberErrorClass {
+    if let Some(http_err) = err.downcast_ref::<HttpError>() {
+        match http_err.status {
+            // 401 Unauthorized or 402 Payment Required → abort chain.
+            401 | 402 => return TranscriberErrorClass::AbortChain,
+            // 429: billing/quota hints → abort; otherwise retry.
+            429 => {
+                let body_lower = http_err.body.to_lowercase();
+                if NON_RETRYABLE_HINTS.iter().any(|h| body_lower.contains(h)) {
+                    return TranscriberErrorClass::AbortChain;
+                }
+                return TranscriberErrorClass::RetryModel;
+            }
+            // Model-specific 4xx (400, 403, 404, etc.) → skip to next model.
+            400..=499 => return TranscriberErrorClass::SkipModel,
+            // 5xx → transient, retry.
+            _ => return TranscriberErrorClass::RetryModel,
+        }
+    }
+    // Non-HTTP errors (timeouts, DNS, etc.) → transient, retry.
+    TranscriberErrorClass::RetryModel
 }
 
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
@@ -661,5 +723,159 @@ mod tests {
             1,
             "should not retry tool schema errors"
         );
+    }
+
+    // ── Transcriber error classification tests ───────────────
+
+    #[test]
+    fn transcriber_err_abort_chain() {
+        // 401 Unauthorized → abort chain (auth failure)
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(401, "Unauthorized")),
+                TranscriberErrorClass::AbortChain
+            ),
+            "401 should abort chain"
+        );
+        // 402 Payment Required → abort chain
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(402, "Payment Required")),
+                TranscriberErrorClass::AbortChain
+            ),
+            "402 should abort chain"
+        );
+        // 429 with billing/quota hints → abort chain
+        for hint in NON_RETRYABLE_HINTS {
+            let err = test_err(429, hint);
+            assert!(
+                matches!(
+                    classify_transcriber_err(&err),
+                    TranscriberErrorClass::AbortChain
+                ),
+                "429 with hint '{hint}' should abort chain"
+            );
+        }
+    }
+
+    #[test]
+    fn transcriber_err_skip_model() {
+        // 400 Bad Request (model unsupported) → skip to next model
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(400, "model not supported")),
+                TranscriberErrorClass::SkipModel
+            ),
+            "400 should skip model"
+        );
+        // 403 Forbidden (model access denied) → skip to next model
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(403, "Forbidden")),
+                TranscriberErrorClass::SkipModel
+            ),
+            "403 should skip model"
+        );
+        // 404 Not Found (model not found) → skip to next model
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(404, "model not found")),
+                TranscriberErrorClass::SkipModel
+            ),
+            "404 should skip model"
+        );
+        // 408 Request Timeout → skip to next model (unlike classify_err which
+        // retries, the transcriber takes a more aggressive fallback approach)
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(408, "Request Timeout")),
+                TranscriberErrorClass::SkipModel
+            ),
+            "408 should skip model in transcriber"
+        );
+        // 405 Method Not Allowed → skip to next model
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(405, "Method Not Allowed")),
+                TranscriberErrorClass::SkipModel
+            ),
+            "405 should skip model"
+        );
+    }
+
+    #[test]
+    fn transcriber_err_retry_model() {
+        // 429 rate limit (without billing hints) → retry current model
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(429, "Too Many Requests")),
+                TranscriberErrorClass::RetryModel
+            ),
+            "429 without billing hints should retry"
+        );
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(429, "rate limit exceeded")),
+                TranscriberErrorClass::RetryModel
+            ),
+            "429 without billing hints should retry"
+        );
+        // 500 Internal Server Error → retry
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(500, "Internal Server Error")),
+                TranscriberErrorClass::RetryModel
+            ),
+            "500 should retry"
+        );
+        // 502 Bad Gateway → retry
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(502, "Bad Gateway")),
+                TranscriberErrorClass::RetryModel
+            ),
+            "502 should retry"
+        );
+        // 503 Service Unavailable → retry
+        assert!(
+            matches!(
+                classify_transcriber_err(&test_err(503, "Service Unavailable")),
+                TranscriberErrorClass::RetryModel
+            ),
+            "503 should retry"
+        );
+        // Non-HTTP errors (timeouts, DNS) → retry
+        assert!(
+            matches!(
+                classify_transcriber_err(&anyhow::anyhow!("connection reset")),
+                TranscriberErrorClass::RetryModel
+            ),
+            "non-HTTP errors should retry"
+        );
+        assert!(
+            matches!(
+                classify_transcriber_err(&anyhow::anyhow!("timeout")),
+                TranscriberErrorClass::RetryModel
+            ),
+            "non-HTTP errors should retry"
+        );
+    }
+
+    #[test]
+    fn transcriber_err_5xx_with_hint_text_is_retryable() {
+        // Regression: 5xx responses from proxy providers (e.g. OpenRouter
+        // forwarding an upstream error) may contain billing/quota language
+        // in the body. These must remain RetryModel — the issue is a
+        // transient upstream failure, not account exhaustion.
+        for hint in NON_RETRYABLE_HINTS {
+            let err = test_err(502, &format!("upstream error: {hint}"));
+            assert!(
+                matches!(
+                    classify_transcriber_err(&err),
+                    TranscriberErrorClass::RetryModel
+                ),
+                "502 with hint '{hint}' should remain RetryModel"
+            );
+        }
     }
 }

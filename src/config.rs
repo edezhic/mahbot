@@ -230,8 +230,10 @@ pub struct ConfigData {
     pub provider_endpoint: Option<String>,
     /// Image transcription model.
     pub image_transcription_model: Option<String>,
-    /// Audio transcription model.
+    /// Audio transcription model (fallback when the models list is empty).
     pub audio_transcription_model: Option<String>,
+    /// Newline-separated list of available audio transcription models (fallback chain in order).
+    pub audio_transcription_models: Option<String>,
     /// OpenRouter provider routing for image transcription requests.
     pub image_transcription_provider: Option<String>,
     /// Audio transcription provider routing.
@@ -463,6 +465,7 @@ string_config_fields! {
     provider_endpoint [or(DEFAULT_PROVIDER_ENDPOINT)],
     image_transcription_model [or(DEFAULT_IMAGE_TRANSCRIPTION_MODEL)],
     audio_transcription_model [or(DEFAULT_AUDIO_TRANSCRIPTION_MODEL)],
+    audio_transcription_models [list_or(fallback = audio_transcription_model, default = DEFAULT_AUDIO_TRANSCRIPTION_MODEL)],
     image_transcription_provider [non_empty],
     audio_transcription_provider [non_empty],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
@@ -557,7 +560,7 @@ pub(crate) fn resolve_or(val: Option<String>, fallback: &str) -> String {
 /// lines are returned as a `Vec<String>`. Otherwise a single-element vec containing the resolved
 /// value of `fallback_field` (or `default_value`) is returned.
 #[must_use]
-fn resolve_list_or(
+pub(crate) fn resolve_list_or(
     list_field: Option<&str>,
     fallback_field: Option<String>,
     default_value: &str,
