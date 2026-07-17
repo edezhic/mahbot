@@ -82,9 +82,23 @@ pub(crate) struct DiagnosticsCommands {
 }
 
 impl DiagnosticsCommands {
+    /// Number of command categories (must match the array length in [`Self::commands`]).
+    pub const COMMAND_COUNT: usize = 7;
+
+    /// Static labels for the 7 command categories, matching the order in [`Self::commands`].
+    pub const COMMAND_LABELS: [&str; Self::COMMAND_COUNT] = [
+        "format",
+        "format-check",
+        "lint-fix",
+        "lint",
+        "type-check",
+        "build",
+        "unit-test",
+    ];
+
     /// Ordered iterator of (label, command) pairs. `None` entries are undiscovered — skipped.
     #[must_use]
-    pub fn commands(&self) -> [(&'static str, Option<&str>); 7] {
+    pub fn commands(&self) -> [(&'static str, Option<&str>); Self::COMMAND_COUNT] {
         [
             ("format", self.format.as_deref()),
             ("format-check", self.format_check.as_deref()),
@@ -94,6 +108,28 @@ impl DiagnosticsCommands {
             ("build", self.build.as_deref()),
             ("unit-test", self.unit_test.as_deref()),
         ]
+    }
+
+    /// Build `DiagnosticsCommands` from an array of edit buffers (same ordering
+    /// as [`Self::commands`]). Empty strings become `None` — skip during execution.
+    #[must_use]
+    pub fn from_buffers(buffers: &[String; Self::COMMAND_COUNT]) -> Self {
+        fn take_non_empty(s: &str) -> Option<String> {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Self {
+            format: take_non_empty(&buffers[0]),
+            format_check: take_non_empty(&buffers[1]),
+            lint_fix: take_non_empty(&buffers[2]),
+            lint: take_non_empty(&buffers[3]),
+            type_check: take_non_empty(&buffers[4]),
+            build: take_non_empty(&buffers[5]),
+            unit_test: take_non_empty(&buffers[6]),
+        }
     }
 
     /// True if no diagnostics commands were discovered.
@@ -994,6 +1030,64 @@ mod tests {
         assert!(!partial.is_empty());
     }
 
+    #[test]
+    fn from_buffers_roundtrip() {
+        // Test that from_buffers converts the buffer array correctly.
+        let buffers = [
+            "cargo fmt".to_string(),
+            "cargo fmt -- --check".to_string(),
+            "cargo clippy --fix --allow-dirty".to_string(),
+            "cargo clippy -- -D warnings".to_string(),
+            "cargo check".to_string(),
+            "cargo build".to_string(),
+            "cargo test".to_string(),
+        ];
+        let cmds = DiagnosticsCommands::from_buffers(&buffers);
+        assert_eq!(cmds.format.as_deref(), Some("cargo fmt"));
+        assert_eq!(cmds.format_check.as_deref(), Some("cargo fmt -- --check"));
+        assert_eq!(
+            cmds.lint_fix.as_deref(),
+            Some("cargo clippy --fix --allow-dirty")
+        );
+        assert_eq!(cmds.lint.as_deref(), Some("cargo clippy -- -D warnings"));
+        assert_eq!(cmds.type_check.as_deref(), Some("cargo check"));
+        assert_eq!(cmds.build.as_deref(), Some("cargo build"));
+        assert_eq!(cmds.unit_test.as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn from_buffers_empty_strings_become_none() {
+        let buffers = [const { String::new() }; DiagnosticsCommands::COMMAND_COUNT];
+        let cmds = DiagnosticsCommands::from_buffers(&buffers);
+        assert!(cmds.is_empty());
+        assert!(cmds.format.is_none());
+        assert!(cmds.unit_test.is_none());
+    }
+
+    #[test]
+    fn commands_and_from_buffers_are_consistent() {
+        // Verify that commands() and from_buffers() agree on field order.
+        let original = DiagnosticsCommands {
+            format: Some("fmt".into()),
+            format_check: Some("fmt-check".into()),
+            lint_fix: Some("lint-fix".into()),
+            lint: Some("lint".into()),
+            type_check: Some("type-check".into()),
+            build: Some("build".into()),
+            unit_test: Some("test".into()),
+        };
+        let cmds = original.commands();
+        let buffers: [String; DiagnosticsCommands::COMMAND_COUNT] =
+            std::array::from_fn(|i| cmds[i].1.unwrap_or("").to_string());
+        let restored = DiagnosticsCommands::from_buffers(&buffers);
+        assert_eq!(restored.format, original.format);
+        assert_eq!(restored.format_check, original.format_check);
+        assert_eq!(restored.lint_fix, original.lint_fix);
+        assert_eq!(restored.lint, original.lint);
+        assert_eq!(restored.type_check, original.type_check);
+        assert_eq!(restored.build, original.build);
+        assert_eq!(restored.unit_test, original.unit_test);
+    }
     #[test]
     fn is_start_command_coverage() {
         let cases = [

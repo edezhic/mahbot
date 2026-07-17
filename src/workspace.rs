@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     maintainer_last_run_at TEXT,
     diagnostics TEXT,
     diagnostics_updated_at TEXT,
+    diagnostics_generation INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
     discovery_generation INTEGER NOT NULL DEFAULT 0
 );
@@ -130,6 +131,33 @@ async fn check_discovery_generation(
     true
 }
 
+/// Check the diagnostics generation counter: return `true` if the calling task
+/// is still the latest (OK to proceed), `false` if a newer
+/// [`WorkspaceStore::rediscover_diagnostics`] or [`WorkspaceStore::set_diagnostics`]
+/// has been triggered (stale — do not proceed).
+async fn check_diagnostics_generation(
+    storage: &WorkspaceStore,
+    workspace_name: &str,
+    diagnostics_generation: i64,
+    label: &str,
+) -> bool {
+    let current_gen = storage
+        .get_diagnostics_generation(workspace_name)
+        .await
+        .unwrap_or(diagnostics_generation + 1);
+    if current_gen != diagnostics_generation {
+        tracing::warn!(
+            workspace_name,
+            captured_gen = diagnostics_generation,
+            current_gen,
+            label = %label,
+            "Diagnostics generation mismatch — skipping stale write"
+        );
+        return false;
+    }
+    true
+}
+
 /// Run workspace discovery for a single role, returning the result.
 ///
 /// `discovery_generation` is the generation counter captured at spawn time.
@@ -183,11 +211,12 @@ async fn run_workspace_discovery(
 /// to scan build files and identify commands for format, lint, type-check, build,
 /// and unit-test categories. Extracts structured output via [`crate::extraction::retry_extract_structured`].
 ///
-/// `discovery_generation` guards against stale writes — if a newer [`WorkspaceStore::rediscover`]
+/// `diagnostics_generation` guards against stale writes — if a newer
+/// [`WorkspaceStore::rediscover_diagnostics`] or [`WorkspaceStore::set_diagnostics`]
 /// was triggered while diagnostics were being computed, the write is skipped.
 ///
 /// On failure, existing diagnostics data is left untouched.
-async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) -> Result<()> {
+async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) -> Result<()> {
     let storage = WORKSPACES
         .get()
         .context("WORKSPACES not initialized")?
@@ -213,8 +242,10 @@ async fn run_workspace_diagnostics(ws: &Workspace, discovery_generation: i64) ->
     // call — the provider can reuse the cached prefix.
     let cmds: crate::DiagnosticsCommands = agent.extract_structured(&extraction_prompt, 3).await?;
 
-    // Guard against stale writes — see run_workspace_discovery.
-    if !check_discovery_generation(&storage, &ws.name, discovery_generation, "diagnostics").await {
+    // Guard against stale writes — uses diagnostics_generation column.
+    if !check_diagnostics_generation(&storage, &ws.name, diagnostics_generation, "diagnostics")
+        .await
+    {
         return Ok(());
     }
 
@@ -284,7 +315,20 @@ async fn finalize_discovery(
     }
 }
 
-pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
+/// Spawn a background task that runs workspace discovery (per-role context
+/// generation) and optionally diagnostics discovery.
+///
+/// `discovery_generation` is the generation counter captured at spawn time.
+/// Both discovery functions use it to guard against stale writes.
+///
+/// When `discover_diagnostics` is `false` (e.g. during a re-analysis via
+/// [`WorkspaceStore::rediscover`]), diagnostics discovery is skipped so that
+/// user-managed diagnostics survive re-analysis.
+pub fn spawn_workspace_discovery(
+    ws: &Workspace,
+    discovery_generation: i64,
+    discover_diagnostics: bool,
+) {
     let ws = ws.clone();
     tokio::spawn(async move {
         let ws_name = ws.name.clone();
@@ -297,21 +341,38 @@ pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
         // the workspace to "failed". Non-prompt panics will leave the workspace
         // in "analyzing" — visible in logs but not recovered.
         let ws_name_for_finalize = ws_name.clone();
+        let ws_name_for_inner = ws_name.clone();
         let inner = tokio::spawn(async move {
-            // Run role discovery and diagnostics discovery concurrently.
-            let (role_results, diagnostics_result) = tokio::join!(
-                join_all(
-                    Role::iter()
-                        .filter(|r| crate::role::role_info(r).has_discovery)
-                        .map(|role| {
-                            let ws = ws.clone();
-                            async move {
-                                run_workspace_discovery(&ws, role, discovery_generation).await
-                            }
-                        }),
-                ),
-                run_workspace_diagnostics(&ws, discovery_generation),
-            );
+            // Build role discovery futures (always needed).
+            let role_futures: Vec<_> = Role::iter()
+                .filter(|r| crate::role::role_info(r).has_discovery)
+                .map(|role| {
+                    let ws = ws.clone();
+                    async move { run_workspace_discovery(&ws, role, discovery_generation).await }
+                })
+                .collect();
+
+            // Run role discovery always, optionally with diagnostics.
+            let (role_results, diagnostics_result) = if discover_diagnostics {
+                // Read diagnostics generation from DB for the generation guard.
+                // Separate from discovery_generation: both counters are independent
+                // (diagnostics is bumped by set_diagnostics/rediscover_diagnostics,
+                // discovery is bumped by rediscover).
+                let diag_gen = match WORKSPACES.get() {
+                    Some(s) => s
+                        .get_diagnostics_generation(&ws_name_for_inner)
+                        .await
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                tokio::join!(
+                    join_all(role_futures),
+                    run_workspace_diagnostics(&ws, diag_gen),
+                )
+            } else {
+                let roles = join_all(role_futures).await;
+                (roles, Ok(()))
+            };
 
             let mut all_ok = true;
             let mut errors: Vec<String> = Vec::new();
@@ -356,6 +417,47 @@ pub fn spawn_workspace_discovery(ws: &Workspace, discovery_generation: i64) {
                     kind = kind,
                     error = %e,
                     "spawn_workspace_discovery task failed",
+                );
+            }
+        }
+    });
+}
+
+/// Spawn a background task that runs diagnostics discovery only.
+///
+/// Unlike [`spawn_workspace_discovery`], this does **not** run per-role
+/// context discovery — it only re-discovers diagnostics commands.
+/// Used by [`WorkspaceStore::rediscover_diagnostics`] for the "Re-discover
+/// diagnostics" button in the GUI.
+///
+/// `diagnostics_generation` is the generation counter captured at spawn time.
+/// [`run_workspace_diagnostics`] uses it to guard against stale writes via
+/// [`check_diagnostics_generation`].
+pub fn spawn_diagnostics_discovery(ws: &Workspace, diagnostics_generation: i64) {
+    let ws = ws.clone();
+    tokio::spawn(async move {
+        let ws_name = ws.name.clone();
+
+        // Use the same panic-catching pattern as spawn_workspace_discovery.
+        let inner = tokio::spawn(async move {
+            if let Err(e) = run_workspace_diagnostics(&ws, diagnostics_generation).await {
+                tracing::error!(
+                    workspace_name = %ws.name,
+                    error = %e,
+                    "Diagnostics rediscovery failed",
+                );
+            }
+        });
+
+        match inner.await {
+            Ok(()) => {}
+            Err(e) => {
+                let kind = if e.is_panic() { "panic" } else { "cancelled" };
+                tracing::error!(
+                    workspace_name = %ws_name,
+                    kind = kind,
+                    error = %e,
+                    "spawn_diagnostics_discovery task failed",
                 );
             }
         }
@@ -487,7 +589,7 @@ impl WorkspaceStore {
         // Generation 0 means "the first discovery" — if rediscover() bumps
         // the generation before this task finishes, the task's context/
         // diagnostics/status writes will be skipped by the generation guard.
-        spawn_workspace_discovery(&ws, 0);
+        spawn_workspace_discovery(&ws, 0, true);
         // Eagerly initialize the shared search engine for this workspace.
         if let Err(e) =
             crate::search_engine::get_or_init_engine(name, std::path::Path::new(&ws.path))
@@ -638,6 +740,10 @@ impl WorkspaceStore {
     }
 
     /// Store discovered diagnostics commands for a workspace.
+    ///
+    /// Also bumps `diagnostics_generation` so any in-flight diagnostics
+    /// discovery task will see a generation mismatch and skip its stale write
+    /// (see [`check_diagnostics_generation`]).
     pub async fn set_diagnostics(
         &self,
         name: &str,
@@ -647,7 +753,7 @@ impl WorkspaceStore {
         let json = serde_json::to_string(commands)?;
         self.conn
             .execute(
-                "UPDATE workspaces SET diagnostics = ?1, diagnostics_updated_at = ?2, updated_at = ?3 WHERE name = ?4",
+                "UPDATE workspaces SET diagnostics = ?1, diagnostics_updated_at = ?2, diagnostics_generation = diagnostics_generation + 1, updated_at = ?3 WHERE name = ?4",
                 turso::params![json, timestamp, turso::now(), name],
             )
             .await?;
@@ -720,9 +826,29 @@ impl WorkspaceStore {
             .map_err(Into::into)
     }
 
+    /// Read the current `diagnostics_generation` for a workspace.
+    ///
+    /// Used by diagnostics discovery tasks to check whether a newer
+    /// [`WorkspaceStore::rediscover_diagnostics`] or [`WorkspaceStore::set_diagnostics`]
+    /// has been triggered — if the generation no longer matches, the task's
+    /// writes are stale and must be skipped.
+    async fn get_diagnostics_generation(&self, name: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT diagnostics_generation FROM workspaces WHERE name = ?1",
+                turso::params![name],
+                |row| row.get(0),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
     /// Trigger re-analysis of an existing workspace.
-    /// Resets status to "analyzing", clears diagnostics columns, clears stale
-    /// per-role contexts, and spawns analysis with a fresh generation counter.
+    /// Resets status to "analyzing", clears stale per-role contexts, and
+    /// spawns analysis with a fresh generation counter.
+    ///
+    /// Unlike [`Self::rediscover_diagnostics`], this does **not** clear or
+    /// re-discover diagnostics — user-managed diagnostics survive re-analysis.
     pub async fn rediscover(&self, name: &str) -> Result<()> {
         let ws = self
             .get_by_name(name)
@@ -734,9 +860,11 @@ impl WorkspaceStore {
         // Atomically increment the discovery generation counter so any
         // still-running discovery task from a previous rediscover will
         // see a generation mismatch and skip its writes.
+        // NOTE: diagnostics is deliberately NOT cleared — user-managed
+        // diagnostics survive re-analysis.
         self.conn
             .execute(
-                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = 'analyzing', paused = 1, diagnostics = NULL, diagnostics_updated_at = NULL, updated_at = ?1 WHERE name = ?2",
+                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = 'analyzing', paused = 1, updated_at = ?1 WHERE name = ?2",
                 turso::params![now, name],
             )
             .await?;
@@ -746,7 +874,42 @@ impl WorkspaceStore {
         self.clear_contexts(name).await?;
 
         let generation = self.get_discovery_generation(name).await?;
-        spawn_workspace_discovery(&ws, generation);
+        // Skip diagnostics discovery — see Part 1 of mahbot-726.
+        spawn_workspace_discovery(&ws, generation, false);
+
+        Ok(())
+    }
+
+    /// Re-discover diagnostics commands for an existing workspace (without
+    /// re-running per-role context discovery).
+    ///
+    /// Bumps the diagnostics generation (invalidating any in-flight diagnostics
+    /// discovery tasks), clears the current diagnostics, and spawns a lightweight
+    /// diagnostics-only discovery task.
+    ///
+    /// Unlike [`Self::rediscover`], this does **not** touch workspace status,
+    /// paused state, per-role contexts, or [`Self::discovery_generation`].
+    pub async fn rediscover_diagnostics(&self, name: &str) -> Result<()> {
+        let ws = self
+            .get_by_name(name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Workspace {name} not found"))?;
+
+        let now = turso::now();
+
+        // Bump diagnostics_generation and clear diagnostics so the fresh
+        // discovery starts from scratch. The generation bump also cancels
+        // any in-flight diagnostics discovery tasks. Does NOT touch
+        // discovery_generation — role discovery is unaffected.
+        self.conn
+            .execute(
+                "UPDATE workspaces SET diagnostics_generation = diagnostics_generation + 1, diagnostics = NULL, diagnostics_updated_at = NULL, updated_at = ?1 WHERE name = ?2",
+                turso::params![now, name],
+            )
+            .await?;
+
+        let generation = self.get_diagnostics_generation(name).await?;
+        spawn_diagnostics_discovery(&ws, generation);
 
         Ok(())
     }
@@ -891,6 +1054,27 @@ async fn run_workspace_migrations(conn: &turso::Connection) -> anyhow::Result<()
         )?;
         tracing::info!("Schema migration complete: added workspaces.notes column");
     }
+
+    // Migration: add diagnostics_generation column.
+    // This column is used by the generation-guard mechanism to protect user-edited
+    // diagnostics from being overwritten by stale discovery tasks.
+    let has_diag_gen = table_info
+        .iter()
+        .any(|row| row.get::<String>(1).ok().as_deref() == Some("diagnostics_generation"));
+
+    if !has_diag_gen {
+        tracing::info!("Schema migration: adding workspaces.diagnostics_generation column");
+        conn.execute(
+            "ALTER TABLE workspaces ADD COLUMN diagnostics_generation INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+        .context("Schema migration failed: unable to add workspaces.diagnostics_generation")?;
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after adding workspaces.diagnostics_generation",
+        )?;
+        tracing::info!("Schema migration complete: added workspaces.diagnostics_generation column");
+    }
     Ok(())
 }
 
@@ -962,6 +1146,7 @@ mod tests {
         paused: bool,
         maintenance_enabled: bool,
         discovery_generation: i64,
+        diagnostics_generation: i64,
     ) -> Workspace {
         let now = crate::turso::now();
         let paused_int: i64 = i64::from(paused);
@@ -969,9 +1154,9 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at, paused, maintenance, discovery_generation) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                crate::turso::params![name, path, now.clone(), now.clone(), paused_int, maint_int, discovery_generation],
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused, maintenance, discovery_generation, diagnostics_generation) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                crate::turso::params![name, path, now.clone(), now.clone(), paused_int, maint_int, discovery_generation, diagnostics_generation],
             )
             .await
             .expect("insert workspace");
@@ -1022,7 +1207,7 @@ mod tests {
     #[tokio::test]
     async fn set_paused_toggles_pause_state() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "toggle_test", "/tmp/toggle_test", true, false, 0).await;
+        insert_direct(&store, "toggle_test", "/tmp/toggle_test", true, false, 0, 0).await;
 
         // Unpause
         store.set_paused("toggle_test", false).await.unwrap();
@@ -1049,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn set_maintenance_toggles_maintenance_state() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "maint_test", "/tmp/maint_test", true, false, 0).await;
+        insert_direct(&store, "maint_test", "/tmp/maint_test", true, false, 0, 0).await;
 
         // Enable maintenance
         store
@@ -1085,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn set_notes_roundtrip() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "notes_test", "/tmp/notes_test", true, false, 0).await;
+        insert_direct(&store, "notes_test", "/tmp/notes_test", true, false, 0, 0).await;
 
         // Initial state should be empty string (NOT NULL DEFAULT '')
         let ws = store
@@ -1174,10 +1359,10 @@ mod tests {
         let (store, _tmp) = test_store().await;
 
         // Insert two workspaces with different toggle states.
-        insert_direct(&store, "alice", "/tmp/alice", true, false, 0).await;
+        insert_direct(&store, "alice", "/tmp/alice", true, false, 0, 0).await;
         store.set_maintenance_enabled("alice", false).await.unwrap();
 
-        insert_direct(&store, "bob", "/tmp/bob", false, false, 0).await;
+        insert_direct(&store, "bob", "/tmp/bob", false, false, 0, 0).await;
         store.set_maintenance_enabled("bob", true).await.unwrap();
 
         let states = store.list_states().await.expect("list_states");
@@ -1215,6 +1400,7 @@ mod tests {
                 true,
                 false,
                 generation,
+                generation,
             )
             .await;
             finalize_discovery(&store, suffix, generation, true, &[]).await;
@@ -1239,7 +1425,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_discovery_failure_keeps_paused() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "fail_gen0", "/tmp/fail_gen0", true, false, 0).await;
+        insert_direct(&store, "fail_gen0", "/tmp/fail_gen0", true, false, 0, 0).await;
 
         // Act: discovery failed (all_ok = false).
         let errors = vec!["Diagnostics discovery failed: timeout".to_string()];
@@ -1262,7 +1448,7 @@ mod tests {
     async fn finalize_discovery_stale_generation_skips_writes() {
         let (store, _tmp) = test_store().await;
         // Start paused with generation 0.
-        insert_direct(&store, "stale", "/tmp/stale", true, false, 0).await;
+        insert_direct(&store, "stale", "/tmp/stale", true, false, 0, 0).await;
 
         // Bump the generation behind the scenes (simulates a concurrent
         // rediscover() call).
@@ -1308,6 +1494,7 @@ mod tests {
             "/tmp/rediscover_test",
             false,
             false,
+            0,
             0,
         )
         .await;
@@ -1389,7 +1576,7 @@ mod tests {
     #[tokio::test]
     async fn editor_tabs_round_trip_dirty_content() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "ws1", "/tmp/ws1", false, false, 0).await;
+        insert_direct(&store, "ws1", "/tmp/ws1", false, false, 0, 0).await;
 
         let tabs = vec![EditorTabRecord {
             file_path: "notes.md".to_string(),
@@ -1408,5 +1595,186 @@ mod tests {
         assert!(loaded[0].is_active);
         assert!(loaded[0].is_dirty);
         assert_eq!(loaded[0].dirty_content.as_deref(), Some("draft text"));
+    }
+
+    // ── Diagnostics API tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_diagnostics_roundtrip() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "diag_test", "/tmp/diag_test", false, false, 0, 0).await;
+
+        let cmds = crate::DiagnosticsCommands {
+            format: Some("cargo fmt".into()),
+            format_check: Some("cargo fmt -- --check".into()),
+            lint: Some("cargo clippy -- -D warnings".into()),
+            ..Default::default()
+        };
+        let now = crate::turso::now();
+        store
+            .set_diagnostics("diag_test", &cmds, &now)
+            .await
+            .expect("set_diagnostics");
+
+        let loaded = store
+            .get_diagnostics("diag_test")
+            .await
+            .expect("get_diagnostics")
+            .expect("should have diagnostics");
+        assert_eq!(loaded.format.as_deref(), Some("cargo fmt"));
+        assert_eq!(loaded.format_check.as_deref(), Some("cargo fmt -- --check"));
+        assert_eq!(loaded.lint.as_deref(), Some("cargo clippy -- -D warnings"));
+        assert!(loaded.lint_fix.is_none());
+        assert!(loaded.type_check.is_none());
+        assert!(loaded.build.is_none());
+        assert!(loaded.unit_test.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_generation_default() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "gen_test", "/tmp/gen_test", false, false, 5, 3).await;
+
+        let diag_gen_val = store
+            .get_diagnostics_generation("gen_test")
+            .await
+            .expect("get_diagnostics_generation");
+        assert_eq!(
+            diag_gen_val, 3,
+            "Should return the stored diagnostics_generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_diagnostics_bumps_diagnostics_generation() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "bump_test", "/tmp/bump_test", false, false, 0, 0).await;
+
+        let cmds = crate::DiagnosticsCommands::default();
+        let now = crate::turso::now();
+        store
+            .set_diagnostics("bump_test", &cmds, &now)
+            .await
+            .expect("set_diagnostics");
+
+        let diag_gen_val = store
+            .get_diagnostics_generation("bump_test")
+            .await
+            .expect("get_diagnostics_generation");
+        assert_eq!(
+            diag_gen_val, 1,
+            "set_diagnostics should bump diagnostics_generation to 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn rediscover_diagnostics_clears_and_bumps() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "redia_test", "/tmp/redia_test", false, false, 0, 0).await;
+
+        // Set some diagnostics first.
+        let cmds = crate::DiagnosticsCommands {
+            build: Some("cargo build".into()),
+            ..Default::default()
+        };
+        let now = crate::turso::now();
+        store
+            .set_diagnostics("redia_test", &cmds, &now)
+            .await
+            .expect("set_diagnostics");
+        assert!(
+            store
+                .get_diagnostics("redia_test")
+                .await
+                .expect("get_diagnostics")
+                .is_some()
+        );
+
+        // Verify generation before rediscover.
+        let diag_gen_before = store
+            .get_diagnostics_generation("redia_test")
+            .await
+            .expect("get_diagnostics_generation");
+        assert_eq!(diag_gen_before, 1, "Should be 1 after set_diagnostics");
+
+        // Act: rediscover diagnostics (doesn't spawn real agent, just bumps and clears).
+        store
+            .rediscover_diagnostics("redia_test")
+            .await
+            .expect("rediscover_diagnostics");
+
+        // Diagnostics should now be None.
+        assert!(
+            store
+                .get_diagnostics("redia_test")
+                .await
+                .expect("get_diagnostics")
+                .is_none(),
+            "rediscover_diagnostics should clear diagnostics"
+        );
+
+        // Generation should have been bumped.
+        let diag_gen_after = store
+            .get_diagnostics_generation("redia_test")
+            .await
+            .expect("get_diagnostics_generation");
+        assert_eq!(
+            diag_gen_after, 2,
+            "rediscover_diagnostics should bump diagnostics_generation to 2"
+        );
+
+        // discovery_generation should NOT have been touched.
+        let discovery_gen_val = store
+            .get_discovery_generation("redia_test")
+            .await
+            .expect("get_discovery_generation");
+        assert_eq!(
+            discovery_gen_val, 0,
+            "rediscover_diagnostics should NOT affect discovery_generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_generation_guard_skips_stale_writes() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "diag_stale", "/tmp/diag_stale", true, false, 0, 0).await;
+
+        // Set some initial diagnostics (this bumps gen to 1).
+        let cmds = crate::DiagnosticsCommands {
+            format: Some("cargo fmt".into()),
+            ..Default::default()
+        };
+        let now = crate::turso::now();
+        store
+            .set_diagnostics("diag_stale", &cmds, &now)
+            .await
+            .expect("set_diagnostics");
+
+        // Bump the diagnostics_generation behind the scenes (simulates a concurrent
+        // rediscover_diagnostics() or set_diagnostics() call).
+        store
+            .conn
+            .execute(
+                "UPDATE workspaces SET diagnostics_generation = 99 WHERE name = ?1",
+                crate::turso::params!["diag_stale"],
+            )
+            .await
+            .expect("bump diagnostics_generation");
+
+        // Capture the stale generation (1) and verify the guard catches it.
+        let stale_gen_val = 1;
+        let is_ok = check_diagnostics_generation(&store, "diag_stale", stale_gen_val, "test").await;
+        assert!(
+            !is_ok,
+            "check_diagnostics_generation should reject stale generation"
+        );
+
+        // Fresh generation should pass.
+        let fresh_gen_val = 99;
+        let is_ok = check_diagnostics_generation(&store, "diag_stale", fresh_gen_val, "test").await;
+        assert!(
+            is_ok,
+            "check_diagnostics_generation should accept fresh generation"
+        );
     }
 }

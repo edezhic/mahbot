@@ -849,6 +849,14 @@ impl SettingsState {
                                         )
                                     },
                                     Space::new().width(4),
+                                    button(text("Diag").size(11).color(theme::TEXT_MUTED),)
+                                        .style(theme::button_text)
+                                        .on_press(SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::ShowDiagnostics(
+                                                ws_item.name.clone(),
+                                            ),
+                                        )),
+                                    Space::new().width(4),
                                     delete_btn,
                                 ]
                                 .align_y(Alignment::Center)
@@ -897,6 +905,14 @@ impl SettingsState {
                                 .style(theme::button_text)
                                 .on_press(SettingsMessage::WorkspaceMsg(
                                     workspaces::WorkspacesMessage::Reanalyze(ws_item.name.clone(),),
+                                )),
+                            Space::new().width(4),
+                            button(text("Diag").size(11))
+                                .style(theme::button_text)
+                                .on_press(SettingsMessage::WorkspaceMsg(
+                                    workspaces::WorkspacesMessage::ShowDiagnostics(
+                                        ws_item.name.clone(),
+                                    ),
                                 )),
                             Space::new().width(4),
                             button(
@@ -1494,75 +1510,132 @@ impl SettingsState {
     }
 
     /// Build the diagnostics modal dialog content for the given workspace.
+    #[allow(clippy::too_many_lines)]
     fn diagnostics_dialog(&self, diag_ws_name: &str) -> Element<'_, SettingsMessage> {
-        let ws = self
-            .workspaces_state
-            .workspaces
-            .iter()
-            .find(|w| w.name == diag_ws_name);
+        let ws_name = diag_ws_name.to_string();
+        let ws_state = &self.workspaces_state;
 
-        let diag_rows: Element<'_, SettingsMessage> = match ws
-            .and_then(|w| w.diagnostics.as_deref())
-        {
-            Some(diag_json) => {
-                match serde_json::from_str::<crate::DiagnosticsCommands>(diag_json) {
-                    Ok(cmds) => {
-                        let fields: Vec<(&str, String)> = cmds
-                            .commands()
-                            .iter()
-                            .map(|(label, cmd)| (*label, cmd.unwrap_or("Not found").to_string()))
-                            .collect();
-                        let mut rows_col = Column::new().spacing(6);
-                        for (label, cmd) in &fields {
-                            rows_col = rows_col.push(
-                                row![
-                                    text(*label)
-                                        .size(12)
-                                        .color(theme::TEXT_MUTED)
-                                        .width(Length::Fixed(120.0)),
-                                    text(cmd.clone())
-                                        .size(12)
-                                        .color(theme::TEXT_PRIMARY)
-                                        .font(iced::Font::MONOSPACE),
-                                ]
-                                .spacing(8),
-                            );
-                        }
-                        rows_col.into()
-                    }
-                    Err(_) => text("Failed to parse diagnostics data")
+        let is_busy = ws_state.diagnostics_busy;
+        let error = ws_state.diagnostics_error.as_deref();
+
+        // Get the edit buffers — if modal is open they should exist.
+        let buffers: [String; crate::DiagnosticsCommands::COMMAND_COUNT] = ws_state
+            .diagnostics_edit_buffers
+            .get(&ws_name)
+            .cloned()
+            .unwrap_or([const { String::new() }; crate::DiagnosticsCommands::COMMAND_COUNT]);
+
+        // Use static labels from DiagnosticsCommands to avoid duplicating
+        // the label-to-field mapping in two places.
+        let labels = &crate::DiagnosticsCommands::COMMAND_LABELS;
+
+        let mut rows_col = Column::new().spacing(8);
+
+        // Error banner
+        if let Some(err) = error {
+            rows_col = rows_col.push(
+                container(text(err).size(12).color(theme::STATUS_ERROR))
+                    .padding(8)
+                    .style(|_theme: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(
+                            theme::STATUS_ERROR.scale_alpha(0.1),
+                        )),
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..iced::Border::default()
+                        },
+                        ..container::Style::default()
+                    }),
+            );
+        }
+
+        for (i, label) in labels.iter().enumerate() {
+            let value = &buffers[i];
+            rows_col = rows_col.push(
+                row![
+                    text(*label)
                         .size(12)
-                        .color(theme::STATUS_ERROR)
-                        .into(),
-                }
-            }
-            None => text("Not yet discovered")
-                .size(13)
-                .color(theme::TEXT_MUTED)
-                .into(),
-        };
+                        .color(theme::TEXT_MUTED)
+                        .width(Length::Fixed(120.0))
+                        .align_y(Alignment::Center),
+                    text_input("(skipped)", value)
+                        .size(12)
+                        .font(iced::Font::MONOSPACE)
+                        .on_input({
+                            let name = ws_name.clone();
+                            move |v| {
+                                SettingsMessage::WorkspaceMsg(
+                                    workspaces::WorkspacesMessage::DiagnosticsFieldEdited(
+                                        name.clone(),
+                                        i,
+                                        v,
+                                    ),
+                                )
+                            }
+                        })
+                        .width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
 
-        let modal_title = format!("Diagnostics: {diag_ws_name}");
+        rows_col = rows_col.push(Space::new().height(8));
+
+        // Action buttons row: [Re-discover] [Save] [Cancel]
+        rows_col = rows_col.push(
+            row![
+                button(row![
+                    lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+                        .size(12)
+                        .color(theme::TEXT_MUTED),
+                    Space::new().width(4),
+                    text("Re-discover").size(12),
+                ])
+                .style(theme::button_text)
+                .on_press(SettingsMessage::WorkspaceMsg(
+                    workspaces::WorkspacesMessage::RediscoverDiagnostics(ws_name.clone(),),
+                )),
+                Space::new().width(Length::Fill),
+                button(
+                    text(if is_busy { "Working…" } else { "Save" })
+                        .size(12)
+                        .color(if is_busy {
+                            theme::TEXT_MUTED
+                        } else {
+                            theme::ACCENT
+                        }),
+                )
+                .style(theme::button_text)
+                .on_press_maybe(if is_busy {
+                    None
+                } else {
+                    Some(SettingsMessage::WorkspaceMsg(
+                        workspaces::WorkspacesMessage::SaveDiagnostics(ws_name.clone()),
+                    ))
+                }),
+                Space::new().width(8),
+                button(text("Cancel").size(12).color(theme::TEXT_MUTED))
+                    .style(theme::button_text)
+                    .on_press(SettingsMessage::WorkspaceMsg(
+                        workspaces::WorkspacesMessage::Escape,
+                    )),
+            ]
+            .align_y(Alignment::Center),
+        );
+
+        let modal_title = format!("Diagnostics: {ws_name}");
         container(
             column![
                 text(modal_title).size(16).color(theme::TEXT_PRIMARY),
                 Space::new().height(16),
-                diag_rows,
-                Space::new().height(16),
-                row![
-                    Space::new().width(Length::Fill),
-                    button(text("Close").size(13))
-                        .style(theme::button_secondary)
-                        .on_press(SettingsMessage::WorkspaceMsg(
-                            workspaces::WorkspacesMessage::Escape,
-                        )),
-                ],
+                rows_col,
             ]
             .spacing(8)
             .width(Length::Fill)
             .padding(24),
         )
-        .width(500)
+        .width(620)
         .style(theme::dialog_container_style)
         .into()
     }

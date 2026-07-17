@@ -74,6 +74,18 @@ pub enum WorkspacesMessage {
     /// Show diagnostics modal for a workspace.
     ShowDiagnostics(String),
 
+    /// A diagnostics command field was edited: (workspace_name, field_index, new_value).
+    /// Field index corresponds to the order in [`crate::DiagnosticsCommands::commands`].
+    DiagnosticsFieldEdited(String, usize, String),
+    /// Save diagnostics commands for a workspace.
+    SaveDiagnostics(String),
+    /// Async result of saving diagnostics.
+    DiagnosticsSaved(String, Result<(), String>),
+    /// Re-discover diagnostics commands for a workspace (from scratch).
+    RediscoverDiagnostics(String),
+    /// Async result of re-discovering diagnostics.
+    RediscoverDiagnosticsResult(String, Result<(), String>),
+
     /// Dismiss modals/panels (Escape key or Close button).
     Escape,
 
@@ -106,8 +118,17 @@ pub struct WorkspacesState {
 
     /// Right-click context menu target row index.
     pub(crate) context_row: Option<usize>,
-    /// Diagnostics modal: workspace name being viewed.
+    /// Diagnostics modal: workspace name being viewed/edited.
     pub(crate) diagnostics_modal: Option<String>,
+    /// Edit buffers for the 7 diagnostics command fields (when modal is open).
+    /// Keyed by workspace name. Each entry is a 7-element array corresponding
+    /// to the order in [`crate::DiagnosticsCommands::commands`].
+    pub(crate) diagnostics_edit_buffers:
+        HashMap<String, [String; crate::DiagnosticsCommands::COMMAND_COUNT]>,
+    /// Whether a diagnostics save or rediscover operation is in progress.
+    pub(crate) diagnostics_busy: bool,
+    /// Last save error for diagnostics (resets on modal open).
+    pub(crate) diagnostics_error: Option<String>,
 
     // ── User notes editor ────────────────────────────────────────
     /// Open notes editors per workspace (keyed by workspace name).
@@ -128,6 +149,9 @@ impl WorkspacesState {
             context_view_error: None,
             context_row: None,
             diagnostics_modal: None,
+            diagnostics_edit_buffers: HashMap::new(),
+            diagnostics_busy: false,
+            diagnostics_error: None,
             notes_editor_content: HashMap::new(),
             notes_open: HashSet::new(),
         }
@@ -288,8 +312,110 @@ impl WorkspacesState {
             }
             WorkspacesMessage::ShowDiagnostics(name) => {
                 self.context_row = None;
-                self.diagnostics_modal = Some(name);
+                self.diagnostics_modal = Some(name.clone());
+                self.diagnostics_busy = false;
+                self.diagnostics_error = None;
+
+                // Populate edit buffers from current diagnostics (or leave empty).
+                let fields = self
+                    .workspaces
+                    .iter()
+                    .find(|w| w.name == name)
+                    .and_then(|w| w.diagnostics.as_deref())
+                    .and_then(|json| serde_json::from_str::<crate::DiagnosticsCommands>(json).ok())
+                    .map_or(
+                        [const { String::new() }; crate::DiagnosticsCommands::COMMAND_COUNT],
+                        |cmds| {
+                            let mut arr = [const { String::new() };
+                                crate::DiagnosticsCommands::COMMAND_COUNT];
+                            for (i, (_, cmd_opt)) in cmds.commands().iter().enumerate() {
+                                if let Some(cmd) = cmd_opt {
+                                    arr[i] = cmd.to_string();
+                                }
+                            }
+                            arr
+                        },
+                    );
+                self.diagnostics_edit_buffers.insert(name, fields);
                 Task::none()
+            }
+            WorkspacesMessage::DiagnosticsFieldEdited(name, idx, value) => {
+                if let Some(buffers) = self.diagnostics_edit_buffers.get_mut(&name) {
+                    if idx < crate::DiagnosticsCommands::COMMAND_COUNT {
+                        buffers[idx] = value;
+                    }
+                }
+                Task::none()
+            }
+            WorkspacesMessage::SaveDiagnostics(name) => {
+                self.diagnostics_busy = true;
+                self.diagnostics_error = None;
+
+                // Build DiagnosticsCommands from edit buffers using the
+                // canonical from_buffers method.
+                let buffers = self.diagnostics_edit_buffers.get(&name).cloned().unwrap_or(
+                    [const { String::new() }; crate::DiagnosticsCommands::COMMAND_COUNT],
+                );
+
+                let cmds = crate::DiagnosticsCommands::from_buffers(&buffers);
+
+                let name_clone = name.clone();
+                Task::perform(
+                    async move {
+                        let timestamp = crate::turso::now();
+                        crate::workspace::store()
+                            .set_diagnostics(&name_clone, &cmds, &timestamp)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| WorkspacesMessage::DiagnosticsSaved(name, result),
+                )
+            }
+            WorkspacesMessage::DiagnosticsSaved(name, Ok(())) => {
+                self.diagnostics_busy = false;
+                self.diagnostics_edit_buffers.remove(&name);
+                self.diagnostics_modal = None;
+                Task::batch([
+                    self.refresh(),
+                    Task::done(WorkspacesMessage::Toast(super::ToastMessage::Saved)),
+                ])
+            }
+            WorkspacesMessage::DiagnosticsSaved(_name, Err(e)) => {
+                self.diagnostics_busy = false;
+                self.diagnostics_error = Some(e.clone());
+                // Keep modal open so user can retry
+                Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
+            }
+            WorkspacesMessage::RediscoverDiagnostics(name) => {
+                self.context_row = None;
+                self.diagnostics_busy = true;
+                self.diagnostics_error = None;
+                let name_for_task = name.clone();
+                Task::perform(
+                    async move {
+                        crate::workspace::store()
+                            .rediscover_diagnostics(&name_for_task)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| WorkspacesMessage::RediscoverDiagnosticsResult(name, result),
+                )
+            }
+            WorkspacesMessage::RediscoverDiagnosticsResult(name, Ok(())) => {
+                self.diagnostics_busy = false;
+                self.diagnostics_modal = None;
+                self.diagnostics_edit_buffers.remove(&name);
+                Task::batch([
+                    self.refresh(),
+                    Task::done(WorkspacesMessage::Toast(super::ToastMessage::SuccessMsg(
+                        "Diagnostics re-discovery started".into(),
+                    ))),
+                ])
+            }
+            WorkspacesMessage::RediscoverDiagnosticsResult(_name, Err(e)) => {
+                self.diagnostics_busy = false;
+                self.diagnostics_error = Some(e.clone());
+                Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
 
             // ── User notes editor ────────────────────────────────
@@ -375,6 +501,9 @@ impl WorkspacesState {
                 self.context_view_error = None;
                 self.context_row = None;
                 self.diagnostics_modal = None;
+                self.diagnostics_edit_buffers.clear();
+                self.diagnostics_busy = false;
+                self.diagnostics_error = None;
                 self.notes_open.clear();
                 self.notes_editor_content.clear();
                 Task::none()
