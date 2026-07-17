@@ -31,20 +31,29 @@ static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).expect("URL regex must compile"));
 
 /// Transcribe an audio file referenced by a `[AUDIO:...]` marker and return
-/// the annotation text to embed in the message.
-async fn transcribe_audio_marker(path: &str) -> String {
+/// the annotation text to embed in the message along with a success indicator.
+///
+/// Returns `(annotation, true)` on successful transcription, or
+/// `(fallback_text, false)` when transcription fails or no transcriber
+/// is configured.  The caller uses the success flag to decide whether
+/// the temp file should be cleaned up.
+async fn transcribe_audio_marker(path: &str) -> (String, bool) {
     let file_name = extract_file_name(path);
 
-    if let Some(ref transcriber) = crate::providers::audio_transcriber() {
-        match transcriber.transcribe(std::path::Path::new(path)).await {
-            Ok(text) => format!("[Audio transcription of {file_name}]: {text}"),
-            Err(e) => {
-                tracing::warn!(%path, error = %e, "Audio transcription failed");
-                format!("[Audio: {file_name} attached]")
-            }
+    let Some(ref transcriber) = crate::providers::audio_transcriber() else {
+        tracing::warn!("No audio transcriber configured — cannot transcribe {file_name}");
+        return (format!("[Audio: {file_name} attached]"), false);
+    };
+
+    match transcriber.transcribe(std::path::Path::new(path)).await {
+        Ok(text) => (
+            format!("[Audio transcription of {file_name}]: {text}"),
+            true,
+        ),
+        Err(e) => {
+            tracing::warn!(%path, error = %e, "Audio transcription failed");
+            (format!("[Audio: {file_name} attached]"), false)
         }
-    } else {
-        format!("[Audio: {file_name} attached]")
     }
 }
 
@@ -174,14 +183,21 @@ fn extract_file_name(path: &str) -> &str {
 /// | VIDEO | stripped silently | text annotation |
 ///
 /// After processing, markers that were handled are stripped from the content
-/// and annotations are prepended. Audio/video/image temp files are deleted
-/// after processing.
+/// and annotations are prepended. Temp files are preserved when their
+/// processing fails (e.g. audio transcription failure due to a transient
+/// HTTP error) so the file can be recovered; only successfully-processed
+/// markers have their temp files cleaned up.
 pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrategy) {
     let mut annotations: Vec<String> = Vec::new();
     let mut result = msg.content.clone();
     // Accumulates upload path annotations across the for-loop below.
     // Only ever populated in Multimodal/IMAGE branch — always empty otherwise.
     let mut upload_annotations: Vec<String> = Vec::new();
+
+    // Tracks temp files that should be removed after the loop.
+    // Files are added only when the corresponding marker was processed
+    // successfully — on failure the file is preserved for recovery.
+    let mut files_to_delete: Vec<std::path::PathBuf> = Vec::new();
 
     let uploads_dir = match strategy {
         EnrichmentStrategy::Multimodal { workspace_path } => {
@@ -199,7 +215,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
             "IMAGE" => match strategy {
                 EnrichmentStrategy::Multimodal { .. } => {
                     match handle_multimodal_image(path, path_obj, uploads_dir.as_deref()).await {
-                        MultimodalImageAction::Keep => {}
+                        MultimodalImageAction::Keep => {
+                            // HTTP/HTTPS URL — no local file to clean up.
+                        }
                         MultimodalImageAction::Replace {
                             replacement,
                             upload_annotation,
@@ -208,6 +226,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                             if let Some(ann) = upload_annotation {
                                 upload_annotations.push(ann);
                             }
+                            // Local IMAGE temp files are always cleaned up
+                            // (legacy behaviour; image retries tracked in a follow-up).
+                            files_to_delete.push(path_obj.to_path_buf());
                         }
                     }
                 }
@@ -215,21 +236,32 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                     let file_name = extract_file_name(path);
                     let annotation = handle_non_multimodal_image(path_obj, file_name).await;
                     annotations.push(annotation);
+                    // IMAGE temp files cleaned up regardless of outcome.
+                    files_to_delete.push(path_obj.to_path_buf());
                 }
             },
             "AUDIO" => {
-                let annotation = transcribe_audio_marker(path).await;
+                let (annotation, success) = transcribe_audio_marker(path).await;
                 annotations.push(annotation);
+                // Only delete audio temp files on successful transcription.
+                // On failure the file is preserved for potential recovery.
+                if success {
+                    files_to_delete.push(path_obj.to_path_buf());
+                }
             }
             "VIDEO" => match strategy {
                 EnrichmentStrategy::Multimodal { .. } => {
                     // No native video support in chat completions — strip silently.
                     // The marker will be stripped by the marker-stripping logic
                     // below (all non-IMAGE markers are removed in multimodal mode).
+                    // VIDEO temp files are always cleaned up.
+                    files_to_delete.push(path_obj.to_path_buf());
                 }
                 EnrichmentStrategy::NonMultimodal => {
                     let file_name = extract_file_name(path);
                     annotations.push(format!("[Video: {file_name} attached]"));
+                    // VIDEO temp files are always cleaned up.
+                    files_to_delete.push(path_obj.to_path_buf());
                 }
             },
             // NOTE: If a new marker kind is added to MEDIA_MARKER_RE in
@@ -244,12 +276,20 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                 tracing::warn!(kind, %path, "Unknown media marker kind");
             }
         }
+    }
 
-        // Single cleanup point — all media marker temp files are removed here,
-        // regardless of kind or strategy. The helper functions (e.g.
-        // handle_multimodal_image, handle_non_multimodal_image) no longer
-        // perform cleanup themselves.
-        let _ = tokio::fs::remove_file(path_obj).await;
+    // ── File cleanup ────────────────────────────────────────────────
+    // Only files that were successfully processed are deleted.
+    // Failed transcriptions preserve the temp file for potential recovery.
+    // Deletion errors are logged (not silently discarded).
+    for file_path in &files_to_delete {
+        if let Err(e) = tokio::fs::remove_file(file_path).await {
+            tracing::warn!(
+                path = %file_path.display(),
+                error = %e,
+                "Failed to delete temp file after enrichment"
+            );
+        }
     }
 
     // ── Multimodal-specific post-processing ──
@@ -643,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_audio_file_deleted_after_transcription() {
+    async fn enrich_audio_file_preserved_on_failure() {
         let tmp =
             std::env::temp_dir().join(format!("test_enrich_audio_{}.mp3", std::process::id()));
         tokio::fs::write(&tmp, b"fake audio content").await.unwrap();
@@ -652,8 +692,15 @@ mod tests {
         let mut msg = test_msg(&format!("Audio: [AUDIO:{path_str}]"));
         enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
 
-        // Temp file must be deleted after processing
-        assert!(!tmp.exists(), "Audio temp file must be deleted");
+        // Temp file must NOT be deleted when transcription fails
+        // (no transcriber configured in test environment).
+        assert!(
+            tmp.exists(),
+            "Audio temp file must be preserved on transcription failure"
+        );
+
+        // Cleanup: remove file since we asserted it's preserved.
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
 
     #[tokio::test]

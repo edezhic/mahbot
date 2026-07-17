@@ -66,16 +66,11 @@ async fn check_response(
     response: reqwest::Response,
     error_context: &str,
 ) -> anyhow::Result<reqwest::Response> {
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = read_error_body(response, error_context).await;
-        let preview = crate::util::truncate(&error_text, 500);
-        return Err(anyhow::Error::from(super::error::HttpError::new(
-            status.as_u16(),
-            error_context,
-            preview,
-            None,
-        )));
+    if !response.status().is_success() {
+        let mut err = super::error::HttpError::from_response(response, error_context).await;
+        // Truncate the body to keep error messages concise.
+        err.body = crate::util::truncate(&err.body, 500);
+        return Err(anyhow::Error::from(err));
     }
     Ok(response)
 }

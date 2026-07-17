@@ -52,18 +52,27 @@ impl HttpError {
     ///
     /// Extracts HTTP status, response body, and the `Retry-After` header.
     pub async fn from_response(response: reqwest::Response, context: impl Into<String>) -> Self {
+        let context: String = context.into();
         let status = response.status().as_u16();
         let retry_after_ms = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_value);
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.unwrap_or_else(|e| {
+            tracing::warn!(
+                ?e,
+                status,
+                context,
+                "Failed to read HTTP error response body"
+            );
+            String::new()
+        });
         Self {
             status,
-            context: context.into(),
             body,
             retry_after_ms,
+            context,
         }
     }
 }

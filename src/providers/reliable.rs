@@ -11,7 +11,7 @@ use std::time::Duration;
 // on errors that cannot self-heal.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ErrorClass {
+pub(crate) enum ErrorClass {
     /// A transient error that may resolve with retries (timeouts, 5xx, etc.).
     Retryable,
     /// A non-retryable client error (auth, invalid model, billing/quota exhausted,
@@ -20,7 +20,7 @@ enum ErrorClass {
 }
 
 impl ErrorClass {
-    const fn reason_label(self) -> &'static str {
+    pub(crate) const fn reason_label(self) -> &'static str {
         match self {
             Self::Retryable => "retryable",
             Self::NonRetryable => "non_retryable",
@@ -56,7 +56,7 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
 /// 2. **4xx status codes** (except 408 Request Timeout and 429 Too Many Requests)
 ///    — structured [`HttpError`] downcast.
 /// 3. Default to [`Retryable`](ErrorClass::Retryable).
-fn classify_err(err: &anyhow::Error) -> ErrorClass {
+pub(crate) fn classify_err(err: &anyhow::Error) -> ErrorClass {
     // ── Typed path: use structured fields from HttpError directly ──
     if let Some(http_err) = err.downcast_ref::<HttpError>() {
         // Body-text hints indicate permanent errors — only relevant when
@@ -88,7 +88,7 @@ fn classify_err(err: &anyhow::Error) -> ErrorClass {
 /// **Note for future providers**: if a new [`Provider`] implementation returns
 /// errors with Retry-After information that do NOT wrap [`HttpError`],
 /// a string-based fallback path may need to be added here.
-fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
+pub(crate) fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
     // ── Typed path: extract from structured HttpError ──
     if let Some(http_err) = err.downcast_ref::<HttpError>() {
         return http_err.retry_after_ms;
@@ -129,7 +129,7 @@ impl ReliableProvider {
     /// When no Retry-After header exists, jitter is applied within
     /// ±25% of base to prevent thundering herd when multiple agents
     /// retry simultaneously on transient errors (5xx, timeouts, etc.).
-    fn compute_backoff(base: u64, err: &anyhow::Error) -> u64 {
+    pub(crate) fn compute_backoff(base: u64, err: &anyhow::Error) -> u64 {
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Retry-After is authoritative — follow it precisely,
             // clamped to [base, 30_000] ms.
