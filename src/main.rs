@@ -19,11 +19,11 @@ use mahbot::channels::{
 };
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
-use mahbot::is_start_command;
 use mahbot::manager_queue;
+use mahbot::parse_bot_command;
 use mahbot::session::{Session, direct_session_key, session_key};
 use mahbot::util::UnwrapPoison;
-use mahbot::{Agent, Channel, ChannelMessage, Role, Workspace};
+use mahbot::{Agent, BotCommand, Channel, ChannelMessage, Role, Workspace};
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
 const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regular.ttf");
 
@@ -514,7 +514,7 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
             continue;
         }
 
-        if handle_telegram_start_command(&msg).await {
+        if handle_bot_command(&msg).await {
             continue;
         }
 
@@ -522,48 +522,85 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
     }
 }
 
-/// Handle a Telegram `/start` command. Returns `true` if the message was handled
-/// (loop should `continue`), `false` if it should be processed by the agent.
+/// Handle Telegram bot text commands (`/start`, `/clear`, `/models`).
+/// Returns `true` if the message was handled (loop should `continue`),
+/// `false` if it should be processed by the agent pipeline.
 ///
-/// Only Telegram gets the `/start` inline keyboard; GUI and other channels route
-/// `/start` as a normal message (returns false to fall through to
+/// Only Telegram gets command handling; GUI and other channels route
+/// these messages as normal text (returns false to fall through to
 /// `process_channel_message`).
-async fn handle_telegram_start_command(msg: &ChannelMessage) -> bool {
-    if !is_start_command(&msg.content) || msg.channel != "telegram" {
+async fn handle_bot_command(msg: &ChannelMessage) -> bool {
+    let Some(cmd) = parse_bot_command(&msg.content) else {
+        return false;
+    };
+
+    if msg.channel != "telegram" {
         return false;
     }
 
-    handle_start_command(msg).await;
+    match cmd {
+        BotCommand::Start => handle_start_command(msg).await,
+        BotCommand::Clear => handle_clear_command(msg).await,
+        BotCommand::Models => handle_models_command(msg).await,
+    }
     true
 }
 
-/// Handle `/start` command for Telegram — sends an inline keyboard with
-/// context-appropriate action buttons.
+/// Handle `/start` command for Telegram — sends a minimal welcome message
+/// listing available commands (no inline keyboard).
 async fn handle_start_command(msg: &ChannelMessage) {
-    let reply_markup = build_start_keyboard(msg).await;
     let reply = mahbot::SendMessage {
-        content: "Choose an action:".to_string(),
+        content: "\u{1F916} Welcome to MahBot!\n\n\
+                  Available commands:\n\
+                  /start — Show this message\n\
+                  /clear — Reset your session\n\
+                  /models — Select generation models"
+            .to_string(),
+        recipient: msg.reply_target.clone(),
+        reply_markup: None,
+    };
+    if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
+        let _ = channel.send(&reply).await;
+    }
+}
+
+/// Handle `/clear` command for Telegram — deletes the current session.
+async fn handle_clear_command(msg: &ChannelMessage) {
+    let (ws, role) = tokio::join!(
+        resolve_workspace_for_user(msg),
+        mahbot::users::resolve_active_role(&msg.user_name),
+    );
+    let sk = session_key(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
+    let reply = Session::delete(&sk).await;
+    send_channel_reply(reply, msg, None).await;
+}
+
+/// Handle `/models` command for Telegram — shows model selection keyboard
+/// (image and video models for Artist, clear session button for other roles).
+async fn handle_models_command(msg: &ChannelMessage) {
+    let reply_markup = build_models_keyboard(msg).await;
+    let reply = mahbot::SendMessage {
+        content: "Select a model:".to_string(),
         recipient: msg.reply_target.clone(),
         reply_markup: Some(reply_markup),
     };
     // Send directly through the channel so the inline_keyboard structure
     // (rows of buttons) is preserved exactly — send_channel_reply does not
     // support inline keyboards, so this path bypasses it for multi-row
-    // replies like the /start menu.
+    // replies like the /models menu.
     if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
         let _ = channel.send(&reply).await;
     }
 }
 
-/// Build inline keyboard for `/start` based on the user's current role.
+/// Build inline keyboard for model selection based on the user's current role.
 ///
 /// Returns the full Telegram `inline_keyboard` JSON array, where each element
-/// is a row (list of buttons in that row). Currently each button gets its own
-/// row.
+/// is a row (list of buttons in that row). Each button gets its own row.
 ///
 /// For Artist: shows image model selection, video model selection, and clear session.
 /// For other roles: shows only clear session.
-async fn build_start_keyboard(msg: &ChannelMessage) -> serde_json::Value {
+async fn build_models_keyboard(msg: &ChannelMessage) -> serde_json::Value {
     let role = mahbot::users::resolve_active_role(&msg.user_name).await;
 
     let clear_session_btn = serde_json::json!([{

@@ -326,18 +326,33 @@ pub(crate) fn generate_suffix() -> String {
 
 // ── Command predicates ─────────────────────────────────
 
-/// Check whether `content` is a `/start` command.
+/// Represents a recognized Telegram bot text command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotCommand {
+    /// `/start` — show the welcome message.
+    Start,
+    /// `/clear` — reset the user's current session.
+    Clear,
+    /// `/models` — show model selection keyboard.
+    Models,
+}
+
+/// Parse a Telegram bot text command from message content.
 ///
-/// Command names are case-insensitive. `/start` is the only recognized
-/// dispatch-level command. All other `/`-prefixed text is treated as a
-/// normal message (routed to the agent).
+/// Returns `Some(BotCommand)` if the content is a recognised command
+/// (`/start`, `/clear`, or `/models`), case-insensitive. Returns `None`
+/// for all other content, including other `/`-prefixed text which is
+/// routed to the agent pipeline.
 #[must_use]
-pub fn is_start_command(content: &str) -> bool {
+pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
     let content = content.trim();
-    content
-        .split_once(' ')
-        .map_or(content, |(cmd, _)| cmd)
-        .eq_ignore_ascii_case("/start")
+    let cmd = content.split_once(' ').map_or(content, |(cmd, _)| cmd);
+    match cmd.to_ascii_lowercase().as_str() {
+        "/start" => Some(BotCommand::Start),
+        "/clear" => Some(BotCommand::Clear),
+        "/models" => Some(BotCommand::Models),
+        _ => None,
+    }
 }
 
 // ── Channel trait + types ───────────────────────────────────────
@@ -1089,36 +1104,50 @@ mod tests {
         assert_eq!(restored.unit_test, original.unit_test);
     }
     #[test]
-    fn is_start_command_coverage() {
-        let cases = [
+    fn parse_bot_command_coverage() {
+        use BotCommand::*;
+        let cases: Vec<(&str, Option<BotCommand>)> = vec![
             // Positive: exact match
-            ("/start", true),
+            ("/start", Some(Start)),
             // Positive: case-insensitive
-            ("/STart", true),
-            ("/Start", true),
-            ("/START", true),
+            ("/STart", Some(Start)),
+            ("/Start", Some(Start)),
+            ("/START", Some(Start)),
             // Positive: with args/trailing space
-            ("/start foo", true),
-            ("/start   ", true),
+            ("/start foo", Some(Start)),
+            ("/start   ", Some(Start)),
             // Positive: leading/trailing whitespace
-            ("  /start", true),
-            ("/start  ", true),
-            ("  /start  ", true),
-            ("  /start foo  ", true),
+            ("  /start", Some(Start)),
+            ("  /start  ", Some(Start)),
+            ("  /start foo  ", Some(Start)),
+            // /clear
+            ("/clear", Some(Clear)),
+            ("/CLEAR", Some(Clear)),
+            ("/clear session", Some(Clear)),
+            ("  /clear  ", Some(Clear)),
+            // /models
+            ("/models", Some(Models)),
+            ("/Models", Some(Models)),
+            ("/models foo", Some(Models)),
+            ("  /models  ", Some(Models)),
             // Negative: partial /-prefix matches
-            ("/", false),
-            ("/s", false),
-            ("/stard", false),
-            ("/started", false),
-            ("/ reset", false),
+            ("/", None),
+            ("/s", None),
+            ("/stard", None),
+            ("/started", None),
+            ("/cleared", None),
+            ("/model", None),
+            ("/ reset", None),
             // Negative: missing slash or empty
-            ("start", false),
-            ("", false),
-            ("  ", false),
-            ("not a command", false),
+            ("start", None),
+            ("clear", None),
+            ("models", None),
+            ("", None),
+            ("  ", None),
+            ("not a command", None),
         ];
         for (input, expected) in cases {
-            assert_eq!(is_start_command(input), expected, "input: {input:?}");
+            assert_eq!(parse_bot_command(input), expected, "input: {input:?}");
         }
     }
 }
