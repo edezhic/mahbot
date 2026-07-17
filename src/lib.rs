@@ -176,6 +176,11 @@ pub struct Workspace {
     /// RFC 3339 timestamp of the last completed diagnostics discovery run.
     /// `None` before the first diagnostics discovery run.
     pub diagnostics_updated_at: Option<String>,
+    /// Freeform user-curated context notes appended to every agent's
+    /// system prompt. Empty by default. Max 4000 characters.
+    /// Persisted in the `workspaces.notes` column.
+    /// Survives `rediscover()` — never touched by automated analysis.
+    pub notes: String,
 }
 
 impl Default for Workspace {
@@ -192,6 +197,7 @@ impl Default for Workspace {
             maintainer_last_run_at: Option::default(),
             diagnostics: Option::default(),
             diagnostics_updated_at: Option::default(),
+            notes: String::default(),
         }
     }
 }

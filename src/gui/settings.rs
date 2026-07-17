@@ -16,7 +16,7 @@ use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
     Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable, stack,
-    text, text_input, toggler, tooltip,
+    text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -832,6 +832,23 @@ impl SettingsState {
                                         )
                                     ),
                                     Space::new().width(4),
+                                    {
+                                        let is_open = ws.notes_open.contains(&ws_item.name);
+                                        button(
+                                            text(if is_open { "Notes ✓" } else { "Notes" })
+                                                .size(11)
+                                                .color(theme::TEXT_MUTED),
+                                        )
+                                        .style(theme::button_text)
+                                        .on_press(
+                                            SettingsMessage::WorkspaceMsg(
+                                                workspaces::WorkspacesMessage::ToggleNotes(
+                                                    ws_item.name.clone(),
+                                                ),
+                                            ),
+                                        )
+                                    },
+                                    Space::new().width(4),
                                     delete_btn,
                                 ]
                                 .align_y(Alignment::Center)
@@ -907,6 +924,88 @@ impl SettingsState {
                         ..container::Style::default()
                     });
                     rows = rows.push(ctx_actions);
+                }
+
+                // ── Inline notes editor ──────────────────────────────────
+                if ws.notes_open.contains(&ws_item.name) {
+                    // Content is guaranteed to exist in the HashMap because
+                    // ToggleNotes always inserts before adding to notes_open.
+                    let content = ws
+                        .notes_editor_content
+                        .get(&ws_item.name)
+                        .expect("notes editor content must exist when notes_open contains name");
+                    let char_count = content.text().chars().count();
+                    let over_limit = char_count > 4000;
+
+                    let editor = text_editor(content)
+                        .on_action(move |action| {
+                            SettingsMessage::WorkspaceMsg(
+                                workspaces::WorkspacesMessage::NotesEdited(
+                                    ws_item.name.clone(),
+                                    action,
+                                ),
+                            )
+                        })
+                        .placeholder(
+                            "Add manual context notes for all agents… (max 4000 characters)",
+                        )
+                        .min_height(100.0)
+                        .max_height(300.0);
+
+                    let char_counter = text(if over_limit {
+                        format!("{char_count}/4000 — please trim")
+                    } else {
+                        format!("{char_count}/4000")
+                    })
+                    .size(11)
+                    .color(if over_limit {
+                        theme::STATUS_ERROR
+                    } else {
+                        theme::TEXT_MUTED
+                    });
+
+                    let save_btn = button(text("Save Notes").size(12)).style(theme::button_primary);
+                    // Only enable Save when under the character limit
+                    let save_btn = if over_limit {
+                        save_btn
+                    } else {
+                        save_btn.on_press(SettingsMessage::WorkspaceMsg(
+                            workspaces::WorkspacesMessage::SaveNotes(ws_item.name.clone()),
+                        ))
+                    };
+
+                    let cancel_btn = button(text("Cancel").size(12))
+                        .style(theme::button_secondary)
+                        .on_press(SettingsMessage::WorkspaceMsg(
+                            workspaces::WorkspacesMessage::NotesCancel(ws_item.name.clone()),
+                        ));
+
+                    let notes_section = container(
+                        column![
+                            editor,
+                            Space::new().height(4),
+                            row![
+                                char_counter,
+                                Space::new().width(Length::Fill),
+                                save_btn,
+                                Space::new().width(4),
+                                cancel_btn,
+                            ]
+                            .align_y(Alignment::Center),
+                        ]
+                        .spacing(4),
+                    )
+                    .padding([4, 8])
+                    .style(|_theme: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(theme::BG_ELEVATED)),
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..iced::Border::default()
+                        },
+                        ..container::Style::default()
+                    });
+
+                    rows = rows.push(notes_section);
                 }
             }
         }

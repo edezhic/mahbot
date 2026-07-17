@@ -216,10 +216,29 @@ impl Session {
             None => build_workspace_context(ws.as_path()).await,
         };
 
-        let workspace_context = if workspace_context.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\n<workspace-context>\n{workspace_context}\n</workspace-context>\n")
+        let workspace_context = {
+            let mut ctx = String::new();
+
+            // Auto-discovered workspace context block.
+            if !workspace_context.trim().is_empty() {
+                let _ = write!(
+                    ctx,
+                    "\n<workspace-context>\n{workspace_context}\n</workspace-context>\n"
+                );
+            }
+
+            // User-curated manual notes block (survives rediscover).
+            // NOTE: changes to ws.notes do not affect in-flight agent sessions
+            // until summarization compacts the history — identical to all other
+            // system prompt changes (documented caching contract).
+            if !ws.notes.trim().is_empty() {
+                // Safe UTF-8 char-level truncation — must not use byte slicing
+                // which would panic on multi-byte characters at the boundary.
+                let notes: String = ws.notes.chars().take(4000).collect();
+                let _ = write!(ctx, "\n<user-notes>\n{notes}\n</user-notes>\n");
+            }
+
+            ctx
         };
 
         let workspace_boilerplate = substitute(

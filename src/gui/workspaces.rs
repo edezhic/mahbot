@@ -3,7 +3,9 @@
 use crate::Workspace;
 
 use iced::Task;
-use iced::widget::markdown;
+use iced::widget::{markdown, text_editor};
+
+use std::collections::{HashMap, HashSet};
 
 /// Format the time until the next maintainer run, if applicable.
 ///
@@ -77,6 +79,18 @@ pub enum WorkspacesMessage {
 
     /// Request toast notification.
     Toast(super::ToastMessage),
+
+    // ── User notes editor ────────────────────────────────────────
+    /// Toggle the notes editor for a workspace.
+    ToggleNotes(String),
+    /// Notes editor content changed.
+    NotesEdited(String, text_editor::Action),
+    /// Save notes to DB.
+    SaveNotes(String),
+    /// Async result of saving notes.
+    NotesSaved(String, Result<(), String>),
+    /// Discard notes edits and close editor.
+    NotesCancel(String),
 }
 
 pub struct WorkspacesState {
@@ -94,11 +108,17 @@ pub struct WorkspacesState {
     pub(crate) context_row: Option<usize>,
     /// Diagnostics modal: workspace name being viewed.
     pub(crate) diagnostics_modal: Option<String>,
+
+    // ── User notes editor ────────────────────────────────────────
+    /// Open notes editors per workspace (keyed by workspace name).
+    pub(crate) notes_editor_content: HashMap<String, text_editor::Content>,
+    /// Which workspaces have their notes editor expanded.
+    pub(crate) notes_open: HashSet<String>,
 }
 
 impl WorkspacesState {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             workspaces: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
@@ -108,6 +128,8 @@ impl WorkspacesState {
             context_view_error: None,
             context_row: None,
             diagnostics_modal: None,
+            notes_editor_content: HashMap::new(),
+            notes_open: HashSet::new(),
         }
     }
 
@@ -269,12 +291,92 @@ impl WorkspacesState {
                 self.diagnostics_modal = Some(name);
                 Task::none()
             }
+
+            // ── User notes editor ────────────────────────────────
+            WorkspacesMessage::ToggleNotes(name) => {
+                self.context_row = None;
+                if self.notes_open.contains(&name) {
+                    // Close: discard editor state
+                    self.notes_open.remove(&name);
+                    self.notes_editor_content.remove(&name);
+                } else {
+                    // Open: initialize editor from current workspace's notes
+                    let notes = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.name == name)
+                        .map_or("", |w| w.notes.as_str());
+                    self.notes_open.insert(name.clone());
+                    self.notes_editor_content
+                        .insert(name, text_editor::Content::with_text(notes));
+                }
+                Task::none()
+            }
+            WorkspacesMessage::NotesEdited(name, action) => {
+                let name_for_entry = name.clone();
+                let content = self
+                    .notes_editor_content
+                    .entry(name_for_entry)
+                    .or_insert_with(|| {
+                        self.workspaces
+                            .iter()
+                            .find(|w| w.name == name)
+                            .map(|w| text_editor::Content::with_text(&w.notes))
+                            .unwrap_or_default()
+                    });
+                content.perform(action);
+                // Enforce 4000-char limit at the UI level
+                let current = content.text().clone();
+                let truncated: String = current.chars().take(4000).collect();
+                if truncated.len() < current.len() {
+                    *content = text_editor::Content::with_text(&truncated);
+                }
+                Task::none()
+            }
+            WorkspacesMessage::SaveNotes(name) => {
+                let notes = self
+                    .notes_editor_content
+                    .get(&name)
+                    .map(|c| c.text().clone())
+                    .unwrap_or_default();
+                let name_clone = name.clone();
+                Task::perform(
+                    async move {
+                        crate::workspace::store()
+                            .set_notes(&name_clone, &notes)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| WorkspacesMessage::NotesSaved(name, result),
+                )
+            }
+            WorkspacesMessage::NotesSaved(name, Ok(())) => {
+                self.notes_open.remove(&name);
+                self.notes_editor_content.remove(&name);
+                Task::batch([
+                    self.refresh(),
+                    Task::done(WorkspacesMessage::Toast(super::ToastMessage::Saved)),
+                ])
+            }
+            WorkspacesMessage::NotesSaved(_name, Err(e)) => {
+                self.load_state.fail(e.clone());
+                // Keep editor open so user can retry
+                Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
+            }
+            WorkspacesMessage::NotesCancel(name) => {
+                self.notes_open.remove(&name);
+                self.notes_editor_content.remove(&name);
+                Task::none()
+            }
+
             WorkspacesMessage::Escape => {
                 self.delete_target = None;
                 self.context_view = None;
                 self.context_view_error = None;
                 self.context_row = None;
                 self.diagnostics_modal = None;
+                self.notes_open.clear();
+                self.notes_editor_content.clear();
                 Task::none()
             }
             WorkspacesMessage::Toast(_) => Task::none(),

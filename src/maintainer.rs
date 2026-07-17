@@ -292,6 +292,7 @@ mod tests {
             maintainer_last_run_at: last_run_at.map(String::from),
             diagnostics: None,
             diagnostics_updated_at: None,
+            notes: String::new(),
         }
     }
 

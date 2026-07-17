@@ -19,6 +19,7 @@ crate::define_store! {
     pub(crate) static WORKSPACES: WorkspaceStore,
     db_name = "workspaces",
     schema = SCHEMA,
+    post_open = after_open,
     expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",
 }
 
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     maintainer_last_run_at TEXT,
     diagnostics TEXT,
     diagnostics_updated_at TEXT,
+    notes TEXT NOT NULL DEFAULT '',
     discovery_generation INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS workspace_contexts (
@@ -76,6 +78,7 @@ crate::columns! {
         MAINTAINER_LAST_RUN_AT  => "maintainer_last_run_at",
         DIAGNOSTICS           => "diagnostics",
         DIAGNOSTICS_UPDATED_AT => "diagnostics_updated_at",
+        NOTES                  => "notes",
     }
 }
 
@@ -432,6 +435,7 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
         maintainer_last_run_at: row.get::<Option<String>>(COL_WS_MAINTAINER_LAST_RUN_AT)?,
         diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
         diagnostics_updated_at: row.get::<Option<String>>(COL_WS_DIAGNOSTICS_UPDATED_AT)?,
+        notes: row.get::<String>(COL_WS_NOTES)?,
     })
 }
 
@@ -476,6 +480,7 @@ impl WorkspaceStore {
             maintainer_last_run_at: None,
             diagnostics: None,
             diagnostics_updated_at: None,
+            notes: String::new(),
         };
         let _ = self.set_status(name, &WorkspaceStatus::Analyzing).await;
         // New workspace: discovery_generation defaults to 0 in the schema.
@@ -669,6 +674,23 @@ impl WorkspaceStore {
         }
     }
 
+    /// Set freeform user-curated context notes for a workspace.
+    ///
+    /// Truncates to 4000 characters (safe UTF-8) as defense-in-depth against
+    /// prompt bloat. Notes are appended to every agent's system prompt.
+    pub async fn set_notes(&self, name: &str, notes: &str) -> Result<()> {
+        // Safe UTF-8 char-level truncation — must not use byte slicing
+        // which would panic on multi-byte characters at the boundary.
+        let notes: String = notes.chars().take(4000).collect();
+        self.conn
+            .execute(
+                "UPDATE workspaces SET notes = ?1, updated_at = ?2 WHERE name = ?3",
+                turso::params![notes, turso::now(), name],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Clear all per-role workspace contexts for a workspace.
     /// Called by [`Self::rediscover`] before spawning a new discovery task so that
     /// stale context entries from a previous discovery don't persist.
@@ -833,6 +855,45 @@ impl WorkspaceStore {
     }
 }
 
+impl WorkspaceStore {
+    /// Post-open setup: run schema migrations for the workspaces table.
+    async fn after_open(&self) -> anyhow::Result<()> {
+        run_workspace_migrations(&self.conn).await
+    }
+}
+
+/// Run schema migrations for the `workspaces` table.
+///
+/// Currently adds the `notes` column if missing (existing databases).
+/// Uses a `PRAGMA table_info` existence check for idempotency rather than
+/// `PRAGMA user_version` versioning, because there is only a single
+/// migration and no future migrations are planned for this column.
+async fn run_workspace_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
+    let table_info = conn
+        .query("PRAGMA table_info('workspaces')", ())
+        .await
+        .context("Failed to read PRAGMA table_info for workspaces table")?;
+
+    let has_notes = table_info
+        .iter()
+        .any(|row| row.get::<String>(1).ok().as_deref() == Some("notes"));
+
+    if !has_notes {
+        tracing::info!("Schema migration: adding workspaces.notes column");
+        conn.execute(
+            "ALTER TABLE workspaces ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+            (),
+        )
+        .await
+        .context("Schema migration failed: unable to add workspaces.notes")?;
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after adding workspaces.notes",
+        )?;
+        tracing::info!("Schema migration complete: added workspaces.notes column");
+    }
+    Ok(())
+}
+
 /// A single editor tab record for persistence.
 #[derive(Debug, Clone)]
 pub struct EditorTabRecord {
@@ -926,6 +987,7 @@ mod tests {
             maintainer_last_run_at: None,
             diagnostics: None,
             diagnostics_updated_at: None,
+            notes: String::new(),
         }
     }
 
@@ -1017,6 +1079,93 @@ mod tests {
         assert!(
             !fetched.maintenance_enabled,
             "Should have maintenance disabled after set_maintenance_enabled(false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_notes_roundtrip() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "notes_test", "/tmp/notes_test", true, false, 0).await;
+
+        // Initial state should be empty string (NOT NULL DEFAULT '')
+        let ws = store
+            .get_by_name("notes_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(ws.notes.is_empty(), "New workspace should have empty notes");
+
+        // Set notes and verify round-trip
+        let test_notes = "These are important context notes for agents.";
+        store
+            .set_notes("notes_test", test_notes)
+            .await
+            .expect("set_notes");
+        let ws = store
+            .get_by_name("notes_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert_eq!(ws.notes, test_notes, "Notes should round-trip correctly");
+
+        // Verify that updating notes works
+        let updated_notes = "Updated notes with more context.";
+        store
+            .set_notes("notes_test", updated_notes)
+            .await
+            .expect("set_notes");
+        let ws = store
+            .get_by_name("notes_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert_eq!(
+            ws.notes, updated_notes,
+            "Notes update should round-trip correctly"
+        );
+
+        // Verify 4000 char truncation
+        let long_notes = "x".repeat(5000);
+        store
+            .set_notes("notes_test", &long_notes)
+            .await
+            .expect("set_notes");
+        let ws = store
+            .get_by_name("notes_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert_eq!(
+            ws.notes.chars().count(),
+            4000,
+            "Notes should be truncated to 4000 chars"
+        );
+        assert_eq!(
+            ws.notes,
+            "x".repeat(4000),
+            "Notes content should match truncated"
+        );
+
+        // Verify UTF-8 safe truncation (multi-byte characters)
+        let multi_byte = "é".repeat(5000);
+        store
+            .set_notes("notes_test", &multi_byte)
+            .await
+            .expect("set_notes");
+        let ws = store
+            .get_by_name("notes_test")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert_eq!(
+            ws.notes.chars().count(),
+            4000,
+            "Notes should be truncated to 4000 chars (multi-byte)"
+        );
+        assert_eq!(
+            ws.notes,
+            "é".repeat(4000),
+            "Notes content should match truncated (multi-byte, no broken chars)"
         );
     }
 
