@@ -43,7 +43,7 @@ pub mod turso;
 pub mod users;
 pub mod util;
 pub(crate) mod vector;
-pub(crate) mod workspace;
+pub mod workspace;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -217,6 +217,10 @@ pub struct Workspace {
     /// Persisted in the `workspaces.notes` column.
     /// Survives `rediscover()` — never touched by automated analysis.
     pub notes: String,
+    /// The git HEAD commit hash captured after the last successful discovery.
+    /// `None` if the workspace is not a git repository or has no commits.
+    /// Used by the nightly re-analysis check to detect new commits.
+    pub last_analyzed_commit: Option<String>,
 }
 
 impl Default for Workspace {
@@ -234,6 +238,7 @@ impl Default for Workspace {
             diagnostics: Option::default(),
             diagnostics_updated_at: Option::default(),
             notes: String::default(),
+            last_analyzed_commit: Option::default(),
         }
     }
 }

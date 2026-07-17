@@ -293,6 +293,7 @@ mod tests {
             diagnostics: None,
             diagnostics_updated_at: None,
             notes: String::new(),
+            last_analyzed_commit: None,
         }
     }
 

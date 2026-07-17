@@ -10,7 +10,9 @@ use crate::agent::run_agent;
 use crate::session::discovery_session_key;
 use crate::turso::{self};
 use anyhow::{Context, Result};
+use chrono::Timelike;
 use futures_util::future::join_all;
+use std::time::Duration;
 use strum::IntoEnumIterator;
 use tracing::warn;
 
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     diagnostics_updated_at TEXT,
     diagnostics_generation INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
+    last_analyzed_commit TEXT,
     discovery_generation INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS workspace_contexts (
@@ -80,6 +83,7 @@ crate::columns! {
         DIAGNOSTICS           => "diagnostics",
         DIAGNOSTICS_UPDATED_AT => "diagnostics_updated_at",
         NOTES                  => "notes",
+        LAST_ANALYZED_COMMIT   => "last_analyzed_commit",
     }
 }
 
@@ -282,6 +286,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
 async fn finalize_discovery(
     storage: &WorkspaceStore,
     ws_name: &str,
+    ws_path: &str,
     discovery_generation: i64,
     all_ok: bool,
     errors: &[String],
@@ -294,15 +299,33 @@ async fn finalize_discovery(
     }
 
     if all_ok {
-        // Single atomic UPDATE for both status and paused columns, following
-        // the same pattern used by WorkspaceStore::rediscover.
-        let _ = storage
+        // Capture the current git HEAD commit hash for nightly re-analysis detection.
+        // If the git command fails (not a git repo, no commits, or other error),
+        // store NULL — this is not an error for the discovery itself.
+        let commit_hash = crate::git_commands::run_git_command(
+            std::path::Path::new(ws_path),
+            &["rev-parse", "HEAD"],
+        )
+        .await
+        .ok()
+        .map(|h| h.trim().to_string());
+
+        let now = turso::now();
+        if let Err(e) = storage
             .conn
             .execute(
-                "UPDATE workspaces SET status = 'ready', paused = 0, updated_at = ? WHERE name = ?",
-                turso::params![turso::now(), ws_name],
+                "UPDATE workspaces SET status = 'ready', paused = 0, last_analyzed_commit = ?1, updated_at = ?2 WHERE name = ?3",
+                turso::params![commit_hash.as_deref(), now, ws_name],
             )
-            .await;
+            .await
+        {
+            tracing::warn!(
+                workspace = ws_name,
+                error = %e,
+                "Failed to update workspace status after discovery",
+            );
+        }
+
         tracing::info!(workspace = ws_name, "Workspace pipeline resumed");
         tracing::info!(
             workspace_name = ws_name,
@@ -332,6 +355,7 @@ pub fn spawn_workspace_discovery(
     let ws = ws.clone();
     tokio::spawn(async move {
         let ws_name = ws.name.clone();
+        let ws_path = ws.path.clone();
 
         // Run the discovery body in a sub-task so that panics are captured
         // via the JoinHandle instead of being silently swallowed.
@@ -342,6 +366,7 @@ pub fn spawn_workspace_discovery(
         // in "analyzing" — visible in logs but not recovered.
         let ws_name_for_finalize = ws_name.clone();
         let ws_name_for_inner = ws_name.clone();
+        let ws_path_for_finalize = ws_path.clone();
         let inner = tokio::spawn(async move {
             // Build role discovery futures (always needed).
             let role_futures: Vec<_> = Role::iter()
@@ -401,6 +426,7 @@ pub fn spawn_workspace_discovery(
             finalize_discovery(
                 storage,
                 &ws_name_for_finalize,
+                &ws_path_for_finalize,
                 discovery_generation,
                 all_ok,
                 &errors,
@@ -538,6 +564,7 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
         diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
         diagnostics_updated_at: row.get::<Option<String>>(COL_WS_DIAGNOSTICS_UPDATED_AT)?,
         notes: row.get::<String>(COL_WS_NOTES)?,
+        last_analyzed_commit: row.get::<Option<String>>(COL_WS_LAST_ANALYZED_COMMIT)?,
     })
 }
 
@@ -583,6 +610,7 @@ impl WorkspaceStore {
             diagnostics: None,
             diagnostics_updated_at: None,
             notes: String::new(),
+            last_analyzed_commit: None,
         };
         let _ = self.set_status(name, &WorkspaceStatus::Analyzing).await;
         // New workspace: discovery_generation defaults to 0 in the schema.
@@ -1027,10 +1055,9 @@ impl WorkspaceStore {
 
 /// Run schema migrations for the `workspaces` table.
 ///
-/// Currently adds the `notes` column if missing (existing databases).
-/// Uses a `PRAGMA table_info` existence check for idempotency rather than
-/// `PRAGMA user_version` versioning, because there is only a single
-/// migration and no future migrations are planned for this column.
+/// Uses `PRAGMA table_info` existence checks for each expected column
+/// rather than `PRAGMA user_version` versioning. Each migration is
+/// idempotent — it only runs if the column is missing.
 async fn run_workspace_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
     let table_info = conn
         .query("PRAGMA table_info('workspaces')", ())
@@ -1075,6 +1102,29 @@ async fn run_workspace_migrations(conn: &turso::Connection) -> anyhow::Result<()
         )?;
         tracing::info!("Schema migration complete: added workspaces.diagnostics_generation column");
     }
+
+    // Migration: add last_analyzed_commit column.
+    // This column stores the git HEAD commit hash captured after the last
+    // successful discovery, used by the nightly re-analysis check to detect
+    // new commits. NULL for non-git workspaces or workspaces with no commits.
+    let has_lac = table_info
+        .iter()
+        .any(|row| row.get::<String>(1).ok().as_deref() == Some("last_analyzed_commit"));
+
+    if !has_lac {
+        tracing::info!("Schema migration: adding workspaces.last_analyzed_commit column");
+        conn.execute(
+            "ALTER TABLE workspaces ADD COLUMN last_analyzed_commit TEXT",
+            (),
+        )
+        .await
+        .context("Schema migration failed: unable to add workspaces.last_analyzed_commit")?;
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after adding workspaces.last_analyzed_commit",
+        )?;
+        tracing::info!("Schema migration complete: added workspaces.last_analyzed_commit column");
+    }
+
     Ok(())
 }
 
@@ -1095,6 +1145,162 @@ pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
         .get()
         .ok_or_else(|| anyhow::anyhow!("Workspace store not initialized"))?;
     store.list().await
+}
+
+/// Returns `true` when the given local hour falls within the nightly
+/// re-analysis window (3:00–4:00 AM, inclusive of 3, exclusive of 4).
+fn is_nightly_check_hour(local_hour: u32) -> bool {
+    (3..4).contains(&local_hour)
+}
+
+/// Returns `true` when rediscovery should be triggered because the
+/// workspace has new git commits relative to its stored analysis state.
+fn has_new_commits(last_analyzed_commit: Option<&str>, current_hash: &str) -> bool {
+    match last_analyzed_commit {
+        Some(stored) => stored != current_hash,
+        None => true,
+    }
+}
+
+/// Run the nightly re-analysis loop.
+///
+/// Wakes every 30 minutes. During the 3:00–4:00 AM local time window,
+/// checks each Ready workspace for new git commits. When a workspace
+/// has a new HEAD commit (or `last_analyzed_commit` is NULL and the
+/// workspace IS a git repo with commits), triggers [`WorkspaceStore::rediscover`]
+/// to re-analyse the workspace.
+///
+/// Workspaces are processed sequentially — each discovery must complete
+/// before the next workspace is checked, avoiding resource spikes.
+///
+/// ## Edge-case handling
+///
+/// * **Non-git workspaces / no commits**: `git rev-parse HEAD` fails,
+///   these workspaces are skipped with a warning. No infinite re-discovery
+///   loop because `last_analyzed_commit` stays NULL and git keeps failing.
+/// * **Mid-window processing**: if the machine wakes at 3:55 and processing
+///   extends past 4:00, all workspaces in the current batch are still
+///   processed (the time window is checked once per 30-minute wake cycle).
+///   No new processing starts in subsequent wake cycles outside the window.
+/// * **Workspace path gone / git missing**: logged as a warning, the
+///   workspace is skipped.
+pub async fn run_nightly_check_loop() {
+    let interval = Duration::from_mins(30);
+    let shutdown = crate::shutdown::shutdown_token();
+
+    loop {
+        if !crate::shutdown::sleep_or_shutdown(interval).await {
+            break;
+        }
+
+        // Only proceed during the 3:00–4:00 AM local time window.
+        if !is_nightly_check_hour(chrono::Local::now().hour()) {
+            continue;
+        }
+
+        let store = if let Some(s) = WORKSPACES.get() {
+            s.clone()
+        } else {
+            tracing::warn!("Nightly check: WORKSPACES not initialized");
+            continue;
+        };
+
+        let workspaces = match store.list().await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "Nightly check: failed to list workspaces");
+                continue;
+            }
+        };
+
+        // Process Ready workspaces sequentially to avoid LLM resource spikes.
+        for ws in &workspaces {
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            if ws.status != WorkspaceStatus::Ready {
+                continue;
+            }
+
+            let repo_path = std::path::Path::new(&ws.path);
+
+            // Run git rev-parse HEAD to get the current commit.
+            let current_hash =
+                match crate::git_commands::run_git_command(repo_path, &["rev-parse", "HEAD"]).await
+                {
+                    Ok(h) => h.trim().to_string(),
+                    Err(e) => {
+                        // Non-git workspace, no commits, or git not available — skip.
+                        tracing::debug!(
+                            workspace = %ws.name,
+                            error = %e,
+                            "Nightly check: git rev-parse HEAD failed — skipping workspace",
+                        );
+                        continue;
+                    }
+                };
+
+            // Compare with the stored hash.
+            let should_rediscover =
+                has_new_commits(ws.last_analyzed_commit.as_deref(), &current_hash);
+
+            if !should_rediscover {
+                tracing::debug!(
+                    workspace = %ws.name,
+                    "Nightly check: no new commits — skipping",
+                );
+                continue;
+            }
+
+            tracing::info!(
+                workspace = %ws.name,
+                "Nightly check: new commits detected — triggering rediscover",
+            );
+
+            if let Err(e) = store.rediscover(&ws.name).await {
+                tracing::warn!(
+                    workspace = %ws.name,
+                    error = %e,
+                    "Nightly check: rediscover failed",
+                );
+                continue;
+            }
+
+            // Wait for discovery to complete before checking the next workspace.
+            // Poll status every 10 seconds with a generous timeout (4 hours).
+            let deadline = std::time::Instant::now() + Duration::from_hours(4);
+            loop {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        workspace = %ws.name,
+                        "Nightly check: discovery timed out — proceeding to next workspace",
+                    );
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_secs(10)).await;
+
+                match store.get_by_name(&ws.name).await {
+                    Ok(Some(current)) if current.status != WorkspaceStatus::Analyzing => {
+                        break;
+                    }
+                    Ok(_) => {} // Still analyzing — keep polling.
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws.name,
+                            error = %e,
+                            "Nightly check: failed to poll workspace status",
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,6 +1379,7 @@ mod tests {
             diagnostics: None,
             diagnostics_updated_at: None,
             notes: String::new(),
+            last_analyzed_commit: None,
         }
     }
 
@@ -1403,7 +1610,15 @@ mod tests {
                 generation,
             )
             .await;
-            finalize_discovery(&store, suffix, generation, true, &[]).await;
+            finalize_discovery(
+                &store,
+                suffix,
+                &format!("/tmp/{suffix}"),
+                generation,
+                true,
+                &[],
+            )
+            .await;
 
             let ws = store
                 .get_by_name(suffix)
@@ -1429,7 +1644,7 @@ mod tests {
 
         // Act: discovery failed (all_ok = false).
         let errors = vec!["Diagnostics discovery failed: timeout".to_string()];
-        finalize_discovery(&store, "fail_gen0", 0, false, &errors).await;
+        finalize_discovery(&store, "fail_gen0", "/tmp/fail_gen0", 0, false, &errors).await;
 
         let ws = store
             .get_by_name("fail_gen0")
@@ -1463,7 +1678,7 @@ mod tests {
             .expect("bump generation");
 
         // Act: try to finalize with the stale generation 0.
-        finalize_discovery(&store, "stale", 0, true, &[]).await;
+        finalize_discovery(&store, "stale", "/tmp/stale", 0, true, &[]).await;
 
         let ws = store
             .get_by_name("stale")
@@ -1775,6 +1990,77 @@ mod tests {
         assert!(
             is_ok,
             "check_diagnostics_generation should accept fresh generation"
+        );
+    }
+
+    // ── is_nightly_check_hour — time-window boundary tests ────────
+
+    #[test]
+    fn nightly_check_hour_before_window() {
+        assert!(!is_nightly_check_hour(2), "2:00 AM is before the window");
+    }
+
+    #[test]
+    fn nightly_check_hour_start_inclusive() {
+        assert!(
+            is_nightly_check_hour(3),
+            "3:00 AM is the start of the window"
+        );
+    }
+
+    #[test]
+    fn nightly_check_hour_end_exclusive() {
+        assert!(
+            !is_nightly_check_hour(4),
+            "4:00 AM is excluded from the window"
+        );
+    }
+
+    #[test]
+    fn nightly_check_hour_after_window() {
+        assert!(!is_nightly_check_hour(5), "5:00 AM is after the window");
+    }
+
+    #[test]
+    fn nightly_check_hour_off_hours() {
+        assert!(!is_nightly_check_hour(0), "Midnight is outside the window");
+        assert!(!is_nightly_check_hour(12), "Noon is outside the window");
+        assert!(!is_nightly_check_hour(23), "11 PM is outside the window");
+    }
+
+    // ── has_new_commits — commit comparison tests ────────────────
+
+    #[test]
+    fn new_commits_null_stored_triggers_rediscovery() {
+        assert!(
+            has_new_commits(None, "abc123"),
+            "NULL last_analyzed_commit should trigger rediscovery",
+        );
+    }
+
+    #[test]
+    fn new_commits_matching_hash_skips() {
+        assert!(
+            !has_new_commits(Some("abc123"), "abc123"),
+            "Same hash should not trigger rediscovery",
+        );
+    }
+
+    #[test]
+    fn new_commits_different_hash_triggers() {
+        assert!(
+            has_new_commits(Some("abc123"), "def456"),
+            "Different hash should trigger rediscovery",
+        );
+    }
+
+    #[test]
+    fn new_commits_empty_current_hash_triggers() {
+        // Edge case: current_hash is empty (shouldn't happen from git
+        // rev-parse HEAD, but the function handles it gracefully).
+        assert!(
+            has_new_commits(Some("abc123"), ""),
+            "Empty current hash should trigger rediscovery",
         );
     }
 }

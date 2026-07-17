@@ -237,6 +237,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::board::run_archive_cancelled_loop(),
     );
 
+    // Nightly workspace re-analysis: checks for new git commits and
+    // triggers rediscover during the 3-4 AM local time window.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "nightly-check",
+        mahbot::workspace::run_nightly_check_loop(),
+    );
+
     // Eagerly initialize search engines for all existing workspaces.
     spawn_cancellable(
         &mut tasks,
