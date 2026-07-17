@@ -8,6 +8,7 @@ use crate::ChatDirection;
 use crate::Role;
 use crate::chat_history::ChatHistoryEntry;
 use futures_util::SinkExt;
+use iced::widget::rule;
 use iced::widget::{
     Column, Id, Space, button, column, container, row, scrollable, stack, text, text_editor,
 };
@@ -80,7 +81,12 @@ fn build_chat_message(
 /// non-optimistic message.
 fn entry_to_display_message(entry: ChatHistoryEntry) -> DisplayMessage {
     use iced::widget::markdown;
-    let md_items: Vec<markdown::Item> = markdown::parse(&entry.content).collect();
+    let md_items: Vec<markdown::Item> = if entry.direction == ChatDirection::Divider {
+        // Dividers are rendered as horizontal rules — no markdown needed.
+        Vec::new()
+    } else {
+        markdown::parse(&entry.content).collect()
+    };
     DisplayMessage {
         id: Some(entry.id),
         message_id: entry.message_id,
@@ -155,8 +161,8 @@ pub enum HomeMessage {
     WorkspacePicked(String),
     /// Clear chat button pressed — reset session and display.
     ClearChat,
-    /// Chat history cleared successfully — number of rows deleted.
-    ChatCleared(u64),
+    /// Chat history cleared successfully — divider inserted.
+    ChatCleared,
     /// Chat history clear failed.
     ChatClearError(String),
     /// Toast notification to show via Dashboard.
@@ -598,6 +604,39 @@ impl HomeState {
                 .messages
                 .iter()
                 .map(|msg| {
+                    // ── Divider marker ────────────────────────────────────
+                    if msg.direction == ChatDirection::Divider {
+                        // Render as a horizontal rule with a label.
+                        let label: Element<'_, HomeMessage> = container(
+                            text("─ Session cleared ─")
+                                .color(theme::TEXT_MUTED)
+                                .size(12),
+                        )
+                        .center_x(Length::Fill)
+                        .into();
+
+                        let divider = column![
+                            rule::horizontal(1).style(|_: &iced::Theme| rule::Style {
+                                color: theme::TEXT_MUTED,
+                                radius: 0.0.into(),
+                                fill_mode: rule::FillMode::Padded(0),
+                                snap: true,
+                            }),
+                            label,
+                            rule::horizontal(1).style(|_: &iced::Theme| rule::Style {
+                                color: theme::TEXT_MUTED,
+                                radius: 0.0.into(),
+                                fill_mode: rule::FillMode::Padded(0),
+                                snap: true,
+                            }),
+                        ]
+                        .spacing(4)
+                        .padding(8)
+                        .width(Length::Fill);
+
+                        return divider.into();
+                    }
+
                     let is_user = msg.direction == ChatDirection::User;
 
                     // Render markdown content
@@ -1020,33 +1059,33 @@ impl HomeState {
                         // Clear the session.
                         let sk = crate::session::session_key("gui", &sender, &role, &ws);
                         let _ = crate::session::Session::delete(&sk).await;
-                        // Clear chat history so refresh_history doesn't reload old messages.
+                        // Insert a divider marker instead of deleting history.
                         let store = crate::chat_history::store();
-                        match store.delete_for_user(&sender, &ws).await {
-                            Ok(n) => Ok(n),
+                        match store.insert_divider(&sender, "gui", &ws).await {
+                            Ok(()) => Ok(()),
                             Err(e) => {
                                 tracing::warn!(
                                     user = %sender,
                                     workspace = %ws,
                                     error = %e,
-                                    "Home: failed to delete chat history for user"
+                                    "Home: failed to insert chat divider"
                                 );
                                 Err(e.to_string())
                             }
                         }
                     },
                     |result| match result {
-                        Ok(n) => HomeMessage::ChatCleared(n),
+                        Ok(()) => HomeMessage::ChatCleared,
                         Err(e) => HomeMessage::ChatClearError(e),
                     },
                 )
             }
-            HomeMessage::ChatCleared(n) if n > 0 => Task::done(HomeMessage::Toast(
-                ToastMessage::SuccessMsg(format!("Cleared {n} message(s)")),
-            )),
-            HomeMessage::ChatCleared(_) => Task::done(HomeMessage::Toast(ToastMessage::Warning(
-                "No messages found to clear".to_string(),
-            ))),
+            HomeMessage::ChatCleared => {
+                let toast = Task::done(HomeMessage::Toast(ToastMessage::SuccessMsg(
+                    "Session cleared".to_string(),
+                )));
+                Task::batch([self.refresh_history(), toast])
+            }
             HomeMessage::ChatClearError(e) => {
                 Task::done(HomeMessage::Toast(ToastMessage::Error(e)))
             }
@@ -1681,6 +1720,56 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].direction, ChatDirection::Agent);
         assert_eq!(state.messages[0].agent_role.as_deref(), Some("engineer"),);
+    }
+
+    // ------------------------------------------------------------------
+    // entry_to_display_message
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_entry_to_display_message_user() {
+        let entry = ChatHistoryEntry {
+            id: 1,
+            message_id: "msg-1".to_string(),
+            user_name: "alice".to_string(),
+            content: "Hello **world**".to_string(),
+            direction: ChatDirection::User,
+            agent_role: None,
+        };
+        let msg = entry_to_display_message(entry);
+
+        assert_eq!(msg.id, Some(1));
+        assert_eq!(msg.direction, ChatDirection::User);
+        assert_eq!(msg.content, "Hello **world**");
+        assert!(
+            !msg.md_items.is_empty(),
+            "user message should produce markdown items"
+        );
+        assert!(!msg.is_optimistic);
+    }
+
+    #[test]
+    fn test_entry_to_display_message_divider() {
+        let entry = ChatHistoryEntry {
+            id: 42,
+            message_id: "divider-1".to_string(),
+            user_name: "alice".to_string(),
+            content: "2026-07-17T20:30:00Z".to_string(),
+            direction: ChatDirection::Divider,
+            agent_role: None,
+        };
+        let msg = entry_to_display_message(entry);
+
+        assert_eq!(msg.id, Some(42));
+        assert_eq!(msg.direction, ChatDirection::Divider);
+        assert_eq!(msg.content, "2026-07-17T20:30:00Z");
+        // Dividers should produce NO markdown items — they render as rules.
+        assert!(
+            msg.md_items.is_empty(),
+            "divider entry should produce empty markdown items, got {} items",
+            msg.md_items.len()
+        );
+        assert!(!msg.is_optimistic);
     }
 
     // ------------------------------------------------------------------

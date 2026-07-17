@@ -376,9 +376,13 @@ pub trait Channel: Send + Sync {
 
 /// Direction of a chat message: from the user or from an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ChatDirection {
     User,
     Agent,
+    /// System-generated divider marker inserted when a user clears their
+    /// session. Rendered as a horizontal rule with a label in the GUI.
+    Divider,
 }
 
 /// A chat event broadcast to GUI subscribers.

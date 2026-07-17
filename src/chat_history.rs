@@ -91,6 +91,7 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
         content: row.get::<String>(COL_CH_CONTENT)?,
         direction: match row.get::<String>(COL_CH_DIRECTION)?.as_str() {
             "agent" => ChatDirection::Agent,
+            "divider" => ChatDirection::Divider,
             _ => ChatDirection::User,
         },
         agent_role: row.get::<Option<String>>(COL_CH_AGENT_ROLE)?,
@@ -199,18 +200,38 @@ impl ChatHistoryStore {
         rows_to_page(rows)
     }
 
-    /// Delete all chat history entries for a specific user + workspace pair.
-    /// Used by the Home page Clear button to ensure cleared sessions don't
-    /// reappear on history refresh.
-    pub async fn delete_for_user(&self, user_name: &str, workspace: &str) -> Result<u64> {
-        let deleted = self
-            .conn
+    /// Insert a divider marker row into chat history to indicate where a
+    /// session clear occurred. The row uses `role='divider'` and
+    /// `direction='divider'` so the GUI can detect it and render a visible
+    /// separator instead of a chat bubble.
+    pub async fn insert_divider(
+        &self,
+        user_name: &str,
+        channel: &str,
+        workspace: &str,
+    ) -> Result<()> {
+        let message_id = crate::generate_id();
+        let created_at = turso::now();
+        self.conn
             .execute(
-                "DELETE FROM chat_history WHERE user_name = ?1 AND workspace = ?2",
-                turso::params![user_name, workspace],
+                "INSERT INTO chat_history \
+                 (message_id, user_name, channel, role, direction, \
+                  content, agent_role, workspace, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                turso::params![
+                    message_id,
+                    user_name,
+                    channel,
+                    "divider",          // role
+                    "divider",          // direction
+                    created_at.clone(), // content — stores the timestamp
+                    None::<String>,     // agent_role
+                    workspace,
+                    created_at,
+                ],
             )
             .await?;
-        Ok(deleted)
+        Ok(())
     }
 }
 
@@ -264,5 +285,166 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].content, "hello");
         assert!(!has_more);
+    }
+
+    #[tokio::test]
+    async fn test_insert_divider_roundtrip() {
+        let (store, _tmp) = test_setup().await;
+
+        // Insert a divider marker.
+        store
+            .insert_divider("alice", "gui", "ws1")
+            .await
+            .expect("insert_divider should succeed");
+
+        // Load history for the same user+workspace.
+        let (history, has_more) = store
+            .load_for_user("alice", "ws1")
+            .await
+            .expect("load_for_user should succeed");
+
+        // Should have exactly one entry: the divider.
+        assert_eq!(history.len(), 1, "should have exactly one divider entry");
+        assert!(!has_more, "no more entries beyond the divider");
+
+        let entry = &history[0];
+
+        // Verify the entry is detected as a divider.
+        assert_eq!(
+            entry.direction,
+            ChatDirection::Divider,
+            "divider entry should have ChatDirection::Divider"
+        );
+
+        // agent_role should be None for divider rows.
+        assert!(
+            entry.agent_role.is_none(),
+            "divider should have no agent_role"
+        );
+
+        // content should be a non-empty timestamp (RFC 3339).
+        assert!(
+            !entry.content.is_empty(),
+            "divider content (timestamp) should not be empty"
+        );
+        assert!(
+            entry.content.contains('T'),
+            "divider content should be an ISO 8601 timestamp, got: {}",
+            entry.content
+        );
+
+        // Verify the divider is *not* present in another user's history.
+        let (other_history, _) = store
+            .load_for_user("bob", "ws1")
+            .await
+            .expect("other user load should succeed");
+        assert!(
+            other_history.is_empty(),
+            "divider inserted for alice should not appear in bob's history"
+        );
+
+        // Verify the divider is *not* present in another workspace's history.
+        let (other_ws_history, _) = store
+            .load_for_user("alice", "ws2")
+            .await
+            .expect("other workspace load should succeed");
+        assert!(
+            other_ws_history.is_empty(),
+            "divider inserted for ws1 should not appear in ws2's history"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_multiple_dividers() {
+        let (store, _tmp) = test_setup().await;
+
+        // Insert two dividers.
+        store
+            .insert_divider("alice", "gui", "ws1")
+            .await
+            .expect("first divider should succeed");
+        store
+            .insert_divider("alice", "gui", "ws1")
+            .await
+            .expect("second divider should succeed");
+
+        let (history, has_more) = store
+            .load_for_user("alice", "ws1")
+            .await
+            .expect("load should succeed");
+
+        // Both dividers should be present.
+        assert_eq!(history.len(), 2, "should have two dividers");
+        assert!(!has_more);
+        assert_eq!(history[0].direction, ChatDirection::Divider);
+        assert_eq!(history[1].direction, ChatDirection::Divider);
+
+        // The first inserted divider should be older (lower id, ordered chronologically).
+        assert!(
+            history[0].id < history[1].id,
+            "first inserted divider should have a lower id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_divider_mixed_with_messages() {
+        let (store, _tmp) = test_setup().await;
+
+        // Insert a regular user message first.
+        store
+            .insert(&ChatHistoryInsert {
+                message_id: "msg-1".to_string(),
+                user_name: "alice".to_string(),
+                channel: "gui".to_string(),
+                role: "user".to_string(),
+                direction: "user".to_string(),
+                content: "hello".to_string(),
+                agent_role: None,
+                workspace: "ws1".to_string(),
+                created_at: turso::now(),
+            })
+            .await
+            .expect("insert should succeed");
+
+        // Insert a divider.
+        store
+            .insert_divider("alice", "gui", "ws1")
+            .await
+            .expect("insert_divider should succeed");
+
+        // Insert another message after the divider.
+        store
+            .insert(&ChatHistoryInsert {
+                message_id: "msg-2".to_string(),
+                user_name: "alice".to_string(),
+                channel: "gui".to_string(),
+                role: "user".to_string(),
+                direction: "user".to_string(),
+                content: "world".to_string(),
+                agent_role: None,
+                workspace: "ws1".to_string(),
+                created_at: turso::now(),
+            })
+            .await
+            .expect("insert should succeed");
+
+        // Load all three.
+        let (history, has_more) = store
+            .load_for_user("alice", "ws1")
+            .await
+            .expect("load should succeed");
+
+        // Load limit is 100, all three should fit.
+        assert_eq!(history.len(), 3, "should have all three entries");
+        assert!(!has_more);
+
+        // Chronological order (oldest first).
+        assert_eq!(history[0].direction, ChatDirection::User);
+        assert_eq!(history[0].content, "hello");
+
+        assert_eq!(history[1].direction, ChatDirection::Divider);
+
+        assert_eq!(history[2].direction, ChatDirection::User);
+        assert_eq!(history[2].content, "world");
     }
 }

@@ -45,6 +45,9 @@ impl BroadcastPersistEntry {
                 "agent".to_string(),
             ),
             ChatDirection::User => ("user".to_string(), "user".to_string()),
+            ChatDirection::Divider => {
+                unreachable!("Divider markers should not go through broadcast_and_persist")
+            }
         };
 
         if let Some(tx) = crate::CHAT_BROADCAST.get() {
