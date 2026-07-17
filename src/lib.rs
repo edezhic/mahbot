@@ -889,9 +889,10 @@ impl ChatResponse {
     }
 }
 
-/// Default maximum tokens for agent LLM calls.
+/// Default max tokens for LLM calls (32K output generation limit — NOT the context window
+/// size — this is the *generation limit* sent as `max_tokens` to the provider).
 /// Used as the fallback when callers don't explicitly set `max_tokens`.
-pub const DEFAULT_MAX_TOKENS: u32 = 32000;
+pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 #[derive(Debug, Clone)]
 pub struct ChatRequest {

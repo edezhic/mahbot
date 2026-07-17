@@ -342,7 +342,7 @@ async fn parse_update_message_extracts_thread_id_for_forum_topic() {
 fn test_callback_query(overrides: &[(&str, serde_json::Value)]) -> serde_json::Value {
     let mut cq = serde_json::json!({
         "id": "12345",
-        "data": "set_model|gpt-4",
+        "data": "set_model|test-model",
         "from": { "id": 555, "username": "alice" },
         "message": {
             "message_id": 100,
@@ -369,7 +369,7 @@ async fn parse_callback_query_returns_message_with_extracted_fields() {
 
     assert_eq!(msg.user_name, "alice");
     assert_eq!(msg.reply_target, "-100200300");
-    assert_eq!(msg.content, "set_model|gpt-4");
+    assert_eq!(msg.content, "set_model|test-model");
     assert_eq!(msg.channel, "telegram");
     assert_eq!(msg.callback_query_id.as_deref(), Some("12345"));
 }
@@ -446,7 +446,7 @@ async fn parse_callback_query_accepts_null_id() {
         "null id → callback_query_id is None"
     );
     assert_eq!(
-        msg.content, "set_model|gpt-4",
+        msg.content, "set_model|test-model",
         "data should still be extracted"
     );
 }

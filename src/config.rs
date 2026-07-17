@@ -1129,12 +1129,12 @@ mod tests {
                 },
                 RoleConfig {
                     role: "manager".into(),
-                    model: Some("  gpt-4  ".into()),
+                    model: Some("  test-model  ".into()),
                     reasoning_effort: None,
                 },
             ],
             model_routings: vec![ModelRouting {
-                model: "gpt-4".into(),
+                model: "test-model".into(),
                 provider_order: Some("   ".into()),
                 allow_fallbacks: None,
             }],
@@ -1151,7 +1151,7 @@ mod tests {
         );
 
         // Second role: trimmed model preserved, None stays None
-        assert_eq!(config.per_role_configs[1].model, Some("gpt-4".into()));
+        assert_eq!(config.per_role_configs[1].model, Some("test-model".into()));
         assert_eq!(config.per_role_configs[1].reasoning_effort, None);
 
         // Routing: whitespace-only provider_order → None
@@ -1191,7 +1191,7 @@ mod tests {
         }
         // 1b. updates_existing — set reasoning_effort preserves model
         {
-            let mut items = vec![role_config("engineer", Some("gpt-4"), Some("low"))];
+            let mut items = vec![role_config("engineer", Some("test-model"), Some("low"))];
             RoleConfig::upsert(&mut items, "engineer", |item| {
                 item.reasoning_effort = Some("high".into());
             });
@@ -1203,7 +1203,7 @@ mod tests {
             );
             assert_eq!(
                 items[0].model,
-                Some("gpt-4".into()),
+                Some("test-model".into()),
                 "[reasoning_effort] other field preserved"
             );
         }
@@ -1212,13 +1212,13 @@ mod tests {
         {
             let mut items = vec![];
             RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.model = Some("gpt-4".into());
+                item.model = Some("test-model".into());
             });
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].role, "engineer");
             assert_eq!(
                 items[0].model,
-                Some("gpt-4".into()),
+                Some("test-model".into()),
                 "[model] set on new entry"
             );
             assert_eq!(items[0].reasoning_effort, None);
@@ -1241,7 +1241,7 @@ mod tests {
 
         // 3a. can_set_none — clear model, reasoning_effort preserved
         {
-            let mut items = vec![role_config("engineer", Some("gpt-4"), Some("high"))];
+            let mut items = vec![role_config("engineer", Some("test-model"), Some("high"))];
             RoleConfig::upsert(&mut items, "engineer", |item| item.model = None);
             assert_eq!(items[0].model, None, "[model] cleared to None");
             assert_eq!(
@@ -1252,7 +1252,7 @@ mod tests {
         }
         // 3b. can_set_none — clear reasoning_effort, model preserved
         {
-            let mut items = vec![role_config("engineer", Some("gpt-4"), Some("high"))];
+            let mut items = vec![role_config("engineer", Some("test-model"), Some("high"))];
             RoleConfig::upsert(&mut items, "engineer", |item| item.reasoning_effort = None);
             assert_eq!(
                 items[0].reasoning_effort, None,
@@ -1260,7 +1260,7 @@ mod tests {
             );
             assert_eq!(
                 items[0].model,
-                Some("gpt-4".into()),
+                Some("test-model".into()),
                 "[reasoning_effort] other field preserved when clearing"
             );
         }
@@ -1270,8 +1270,8 @@ mod tests {
     fn upsert_model_routing_fields() {
         // 1a. updates_existing — set provider_order preserves allow_fallbacks
         {
-            let mut items = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut items, "gpt-4", |item| {
+            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut items, "test-model", |item| {
                 item.provider_order = Some("Anthropic".into());
             });
             assert_eq!(items.len(), 1);
@@ -1288,8 +1288,8 @@ mod tests {
         }
         // 1b. updates_existing — set allow_fallbacks preserves provider_order
         {
-            let mut items = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut items, "gpt-4", |item| {
+            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut items, "test-model", |item| {
                 item.allow_fallbacks = Some(false);
             });
             assert_eq!(items.len(), 1);
@@ -1308,11 +1308,11 @@ mod tests {
         // 2a. pushes_new_entry — provider_order set, allow_fallbacks is None
         {
             let mut items = vec![];
-            ModelRouting::upsert(&mut items, "gpt-4", |item| {
+            ModelRouting::upsert(&mut items, "test-model", |item| {
                 item.provider_order = Some("OpenAi".into());
             });
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].model, "gpt-4");
+            assert_eq!(items[0].model, "test-model");
             assert_eq!(
                 items[0].provider_order,
                 Some("OpenAi".into()),
@@ -1323,11 +1323,11 @@ mod tests {
         // 2b. pushes_new_entry — allow_fallbacks set, provider_order is None
         {
             let mut items = vec![];
-            ModelRouting::upsert(&mut items, "gpt-4", |item| {
+            ModelRouting::upsert(&mut items, "test-model", |item| {
                 item.allow_fallbacks = Some(false);
             });
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].model, "gpt-4");
+            assert_eq!(items[0].model, "test-model");
             assert_eq!(
                 items[0].allow_fallbacks,
                 Some(false),
@@ -1338,8 +1338,8 @@ mod tests {
 
         // 3a. can_set_none — clear provider_order, allow_fallbacks preserved
         {
-            let mut items = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut items, "gpt-4", |item| item.provider_order = None);
+            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut items, "test-model", |item| item.provider_order = None);
             assert_eq!(
                 items[0].provider_order, None,
                 "[provider_order] cleared to None"
@@ -1352,8 +1352,8 @@ mod tests {
         }
         // 3b. can_set_none — clear allow_fallbacks, provider_order preserved
         {
-            let mut items = vec![model_routing("gpt-4", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut items, "gpt-4", |item| item.allow_fallbacks = None);
+            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
+            ModelRouting::upsert(&mut items, "test-model", |item| item.allow_fallbacks = None);
             assert_eq!(
                 items[0].allow_fallbacks, None,
                 "[allow_fallbacks] cleared to None"
@@ -1373,8 +1373,8 @@ mod tests {
             role_config("manager", Some("model-b"), Some("high")),
         ];
         let mut routings = vec![
-            model_routing("gpt-4", Some("OpenAi"), None),
-            model_routing("claude-3", Some("Anthropic"), Some(true)),
+            model_routing("test-router-a", Some("OpenAi"), None),
+            model_routing("test-router-b", Some("Anthropic"), Some(true)),
         ];
 
         // Each upsert targets exactly one entry by key.
@@ -1390,17 +1390,17 @@ mod tests {
         assert_eq!(configs[1].reasoning_effort, Some("low".into()));
         assert_eq!(configs[0].reasoning_effort, None);
 
-        ModelRouting::upsert(&mut routings, "gpt-4", |mr| {
+        ModelRouting::upsert(&mut routings, "test-router-a", |mr| {
             mr.provider_order = Some("Google".into());
         });
         assert_eq!(routings[0].provider_order, Some("Google".into()));
         assert_eq!(routings[1].provider_order, Some("Anthropic".into()));
 
-        ModelRouting::upsert(&mut routings, "claude-3", |mr| {
+        ModelRouting::upsert(&mut routings, "test-router-b", |mr| {
             mr.allow_fallbacks = Some(false);
         });
-        assert_eq!(routings[1].allow_fallbacks, Some(false));
         assert_eq!(routings[0].allow_fallbacks, None);
+        assert_eq!(routings[1].allow_fallbacks, Some(false));
 
         // Total entries unchanged — no spurious pushes.
         assert_eq!(configs.len(), 2);

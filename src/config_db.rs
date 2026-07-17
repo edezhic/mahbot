@@ -332,39 +332,39 @@ mod tests {
         get_all_role_configs,
         [
             (
-                vec![role_config("engineer", Some("gpt-4"), Some("high"))],
+                vec![role_config("engineer", Some("test-model"), Some("high"))],
                 vec![],
-                vec![role_config("engineer", Some("gpt-4"), Some("high"))],
+                vec![role_config("engineer", Some("test-model"), Some("high"))],
                 "save should persist item"
             ),
             (
-                vec![role_config("engineer", Some("gpt-5"), None)],
+                vec![role_config("engineer", Some("test-model"), None)],
                 vec![],
-                vec![role_config("engineer", Some("gpt-5"), None)],
+                vec![role_config("engineer", Some("test-model"), None)],
                 "save with None nullable should persist NULL"
             ),
             (
-                vec![role_config("engineer", Some("claude-4"), Some("low"))],
+                vec![role_config("engineer", Some("test-model"), Some("low"))],
                 vec![],
-                vec![role_config("engineer", Some("claude-4"), Some("low"))],
+                vec![role_config("engineer", Some("test-model"), Some("low"))],
                 "save should fully replace existing row"
             ),
             (
                 vec![
-                    role_config("engineer", Some("claude-4"), Some("low")),
-                    role_config("reviewer", Some("o1"), None),
+                    role_config("engineer", Some("test-model"), Some("low")),
+                    role_config("reviewer", Some("test-model"), None),
                 ],
                 vec![],
                 vec![
-                    role_config("engineer", Some("claude-4"), Some("low")),
-                    role_config("reviewer", Some("o1"), None),
+                    role_config("engineer", Some("test-model"), Some("low")),
+                    role_config("reviewer", Some("test-model"), None),
                 ],
                 "get_all should return all rows sorted by key"
             ),
             (
-                vec![role_config("reviewer", Some("o1"), None)],
+                vec![role_config("reviewer", Some("test-model"), None)],
                 vec![],
-                vec![role_config("reviewer", Some("o1"), None),],
+                vec![role_config("reviewer", Some("test-model"), None),],
                 "only the saved item should remain after replacement"
             ),
         ]
@@ -376,38 +376,38 @@ mod tests {
         [
             (
                 vec![],
-                vec![model_routing("gpt-4", Some("OpenAI"), Some(true))],
-                vec![model_routing("gpt-4", Some("OpenAI"), Some(true))],
+                vec![model_routing("test-model", Some("OpenAI"), Some(true))],
+                vec![model_routing("test-model", Some("OpenAI"), Some(true))],
                 "save should persist item"
             ),
             (
                 vec![],
-                vec![model_routing("gpt-4", Some("Azure"), None)],
-                vec![model_routing("gpt-4", Some("Azure"), None)],
+                vec![model_routing("test-model", Some("Azure"), None)],
+                vec![model_routing("test-model", Some("Azure"), None)],
                 "save with None nullable should persist NULL"
             ),
             (
                 vec![],
-                vec![model_routing("gpt-4", Some("OpenRouter"), Some(false))],
-                vec![model_routing("gpt-4", Some("OpenRouter"), Some(false))],
+                vec![model_routing("test-model", Some("OpenRouter"), Some(false))],
+                vec![model_routing("test-model", Some("OpenRouter"), Some(false))],
                 "save should fully replace existing row"
             ),
             (
                 vec![],
                 vec![
-                    model_routing("claude-3", None, Some(true)),
-                    model_routing("gpt-4", Some("OpenRouter"), Some(false)),
+                    model_routing("test-model-a", None, Some(true)),
+                    model_routing("test-model-b", Some("OpenRouter"), Some(false)),
                 ],
                 vec![
-                    model_routing("claude-3", None, Some(true)),
-                    model_routing("gpt-4", Some("OpenRouter"), Some(false)),
+                    model_routing("test-model-a", None, Some(true)),
+                    model_routing("test-model-b", Some("OpenRouter"), Some(false)),
                 ],
                 "get_all should return all rows sorted by key"
             ),
             (
                 vec![],
-                vec![model_routing("claude-3", None, Some(true))],
-                vec![model_routing("claude-3", None, Some(true)),],
+                vec![model_routing("test-model", None, Some(true))],
+                vec![model_routing("test-model", None, Some(true)),],
                 "only the saved item should remain after replacement"
             ),
         ]

@@ -42,11 +42,11 @@ use chrono::{DateTime, Utc};
 ///
 /// ### Context window breakdown for 65K estimated tokens
 ///
-/// | Model type         | Context | Effective margin |
-/// |--------------------|---------|-----------------|
-/// | 128K (e.g., GPT-4o) | ~100K actual + ~15K overhead = ~115K → **~13K headroom** |
-/// | 200K (e.g., Claude 3.5) | ~160K actual + ~15K overhead = ~175K → **~25K headroom** |
-/// | 1M (e.g., DeepSeek V4) | Triggers at ~6.5% of context — very early but cheap |
+/// | Model type                 | Context | Effective margin |
+/// |----------------------------|---------|-----------------|
+/// | 128K (e.g., DeepSeek V4 Flash, GPT-5.5, Claude 4.8) | ~100K actual + ~15K overhead = ~115K → **~13K headroom** |
+/// | 200K+ models               | ~160K actual + ~15K overhead = ~175K → **~25K headroom** |
+/// | 1M (e.g., DeepSeek V4 Pro) | Triggers at ~6.5% of context — very early but cheap |
 ///
 pub const SUMMARIZATION_THRESHOLD: usize = 65_000;
 
