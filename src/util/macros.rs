@@ -145,7 +145,7 @@ macro_rules! columns {
 macro_rules! define_store {
     (
         $(#[$attr:meta])*
-        pub static $name:ident: $ty:ident,
+        $vis:vis static $name:ident: $ty:ident,
         db_name = $db_name:literal,
         schema = $schema:ident,
         $(post_open = $method:ident,)?
@@ -153,13 +153,13 @@ macro_rules! define_store {
     ) => {
         $(#[$attr])*
         #[derive(Clone, Debug)]
-        pub struct $ty {
+        $vis struct $ty {
             pub(crate) conn: $crate::turso::Connection,
         }
 
         impl $ty {
             /// Open (or create) the database at `root/db/{name}.db`.
-            pub async fn open(
+            $vis async fn open(
                 root: &std::path::Path,
             ) -> ::anyhow::Result<Self> {
                 let conn = $crate::turso::open_store(root, $db_name, $schema).await?;
@@ -171,7 +171,7 @@ macro_rules! define_store {
 
         $crate::global_store! {
             $(#[$attr])*
-            pub static $name: $ty,
+            $vis static $name: $ty,
             constructor = $ty::open,
             expect = $expect,
         }

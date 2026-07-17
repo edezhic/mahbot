@@ -58,7 +58,7 @@ impl Session {
     /// Summarization is **not** handled here. It is run separately by
     /// `Agent::work` when the conversation exceeds the token budget.
     /// See [`crate::session`] for the summarization constants and helpers.
-    pub async fn init(
+    pub(crate) async fn init(
         &mut self,
         session_key: &str,
         msg: &str,
@@ -98,19 +98,19 @@ impl Session {
 
     /// Read-only access to the in-memory history (for LLM calls).
     #[must_use]
-    pub fn history(&self) -> &[ChatMessage] {
+    pub(crate) fn history(&self) -> &[ChatMessage] {
         &self.history
     }
 
     /// Append an assistant message (final response or intermediate tool-call).
     /// Operates on in-memory history only, not the session store.
-    pub fn push_assistant(&mut self, content: String) {
+    pub(crate) fn push_assistant(&mut self, content: String) {
         self.history.push(ChatMessage::assistant(content));
     }
 
     /// Bulk-append messages to in-memory history.
     /// Operates on in-memory history only, not the session store.
-    pub fn push_messages(&mut self, messages: &[ChatMessage]) {
+    pub(crate) fn push_messages(&mut self, messages: &[ChatMessage]) {
         self.history.extend_from_slice(messages);
     }
 
@@ -169,7 +169,7 @@ impl Session {
 
     /// Persist the final assistant message (last assistant entry in history)
     /// to the session store.
-    pub async fn finalize(&self, session_key: &str) -> Result<()> {
+    pub(crate) async fn finalize(&self, session_key: &str) -> Result<()> {
         let Some(final_msg) = self
             .history
             .last()

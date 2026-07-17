@@ -48,6 +48,10 @@ pub const HOVER_STRONG: Color = Color::from_rgba(0.808, 0.804, 0.765, 0.08);
 
 /// Semi-transparent black used for modal backdrops that capture clicks.
 /// Shared by board.rs, settings.rs, mod.rs, and editor.rs.
+#[expect(
+    dead_code,
+    reason = "Named color constant available for modal/sheet backdrop use; not currently referenced"
+)]
 pub const BACKDROP_COLOR: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.5);
 
 // ── Status colors ─────────────────────────────────────────────────
@@ -87,6 +91,7 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
 /// (it defaults from `BASE_ROLE_INFO`), but the `badge_colors_set` test in
 /// `role.rs` guards against silent black fallthrough.
 #[must_use]
+#[allow(clippy::trivially_copy_pass_by_ref)]
 pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
     let info = crate::role::role_info(role);
     let (r, g, b) = info.badge_fg;
@@ -130,6 +135,7 @@ pub fn role_badge_color(role: &str) -> (Color, Color) {
 /// Callers apply `.size()`, `.color()`, and `.into()` to style the icon
 /// for their specific context.
 #[must_use]
+#[allow(clippy::trivially_copy_pass_by_ref)]
 pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     match role {
         crate::Role::Manager => lucide::bot(),

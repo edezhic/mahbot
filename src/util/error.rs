@@ -34,6 +34,10 @@ pub struct HttpError {
 impl HttpError {
     /// Create a new [`HttpError`] with the given fields.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "Public constructor; kept for API completeness, not currently called"
+    )]
     pub fn new(
         status: u16,
         context: impl Into<String>,

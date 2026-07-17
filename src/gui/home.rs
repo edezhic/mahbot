@@ -36,6 +36,10 @@ pub struct DisplayMessage {
     /// Database row ID (Some for history-loaded, None for live arrivals).
     pub id: Option<i64>,
     pub message_id: String,
+    #[expect(
+        dead_code,
+        reason = "Carried in DisplayMessage for future display use; currently not read"
+    )]
     pub user_name: String,
     pub content: String,
     pub direction: ChatDirection,
@@ -327,12 +331,17 @@ impl HomeState {
     }
 
     /// The global workspace selection changed — refresh history for the new workspace.
+    #[expect(
+        dead_code,
+        reason = "Handler reserved for future workspace selection UI"
+    )]
     pub fn workspace_selected(&mut self, name: Option<String>) -> Task<HomeMessage> {
         self.selected_workspace = name;
         self.refresh_history()
     }
 
     /// Load users for the user picker.
+    #[allow(clippy::unused_self)]
     pub fn load_users(&self) -> Task<HomeMessage> {
         Task::perform(
             async {
@@ -856,6 +865,7 @@ impl HomeState {
             .into()
     }
 
+    #[allow(clippy::unused_self)]
     pub fn subscription(&self) -> iced::Subscription<HomeMessage> {
         let mut subs = vec![
             iced::Subscription::run(chat_stream_producer),

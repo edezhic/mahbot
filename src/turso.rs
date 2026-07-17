@@ -7,13 +7,13 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 use tracing::warn;
 use turso::Builder;
-pub use turso::{IntoParams, Row, Value, params, params_from_iter};
+pub(crate) use turso::{IntoParams, Row, Value, params};
 
 // ── Timestamp helper ────────────────────────────────────────────────
 
 /// Current UTC timestamp in RFC 3339 format for database columns.
 #[must_use]
-pub fn now() -> String {
+pub(crate) fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
@@ -28,7 +28,7 @@ pub fn now() -> String {
 ///
 /// Returns [`chrono::ParseError`] when the input is not a valid RFC 3339
 /// timestamp.
-pub fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
     DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc))
 }
 
@@ -63,7 +63,11 @@ pub fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::ParseError>
 /// See the test `builder_mapping_matches_experimental_features` which verifies that
 /// the field-by-field mapping in [`Connection::open`] enables exactly the features
 /// listed here.
-pub const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];
+#[expect(
+    dead_code,
+    reason = "Referenced only by assertion tests; kept for documentation"
+)]
+pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];
 
 /// Return an iterator over all checkpointable database stores.
 ///
@@ -153,7 +157,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
 /// See [`EXPERIMENTAL_FEATURES`] for known API naming asymmetries between
 /// `DatabaseOpts::with_*()` and `Builder::experimental_*()`.
 #[must_use]
-pub fn experimental_database_opts() -> turso::core::DatabaseOpts {
+pub(crate) fn experimental_database_opts() -> turso::core::DatabaseOpts {
     turso::core::DatabaseOpts::new()
         .with_multiprocess_wal(true)
         .with_index_method(true)
@@ -168,7 +172,7 @@ pub fn experimental_database_opts() -> turso::core::DatabaseOpts {
 ///
 /// # Errors
 /// Returns an error if the store fails to open, or if the cell is already set.
-pub async fn register_global_store<T, F, Fut>(
+pub(crate) async fn register_global_store<T, F, Fut>(
     cell: &OnceCell<T>,
     name: &str,
     open_fn: F,
@@ -208,16 +212,16 @@ macro_rules! global_store {
     // Custom expect form.
     (
         $(#[$attr:meta])*
-        pub static $name:ident: $ty:ty,
+        $vis:vis static $name:ident: $ty:ty,
         constructor = $constructor:expr,
         expect = $expect:expr,
     ) => {
         $(#[$attr])*
-        pub static $name: ::tokio::sync::OnceCell<$ty> =
+        $vis static $name: ::tokio::sync::OnceCell<$ty> =
             ::tokio::sync::OnceCell::const_new();
 
         #[doc = concat!("Initialize the global ", stringify!($name), " store.")]
-        pub async fn init_global() -> ::anyhow::Result<()> {
+        $vis async fn init_global() -> ::anyhow::Result<()> {
             let root = $crate::config::CONFIG.global_storage_root();
             $crate::turso::register_global_store(
                 &$name,
@@ -233,7 +237,7 @@ macro_rules! global_store {
             stringify!($name),
             " store.\n\n# Panics\n\nPanics if the store has not been initialized.",
         )]
-        pub fn store() -> &'static $ty {
+        $vis fn store() -> &'static $ty {
             $name.get().expect($expect)
         }
     };
@@ -285,7 +289,7 @@ static TANTIVY_SPECIAL: &[char] = &[
 /// * Queries consisting entirely of Tantivy special characters (e.g. `+-~`)
 ///   produce an empty string, allowing callers to short-circuit.
 #[must_use]
-pub fn sanitize_fts_query(query: &str) -> String {
+pub(crate) fn sanitize_fts_query(query: &str) -> String {
     query
         .split(|c: char| c.is_whitespace() || TANTIVY_SPECIAL.contains(&c))
         .map(|word| word.trim_start_matches('/'))
@@ -301,17 +305,17 @@ pub fn sanitize_fts_query(query: &str) -> String {
 ///
 /// # Example
 ///
-/// ```
-/// # use mahbot::turso::sql_in_placeholders;
-/// assert_eq!(sql_in_placeholders(3), "?, ?, ?");
-/// assert_eq!(sql_in_placeholders(0), "");
+/// ```ignore
+/// // Internal utility — use `sql_in_placeholders(3)` from crate::turso
+/// assert_eq!("?, ?, ?", vec!["?"; 3].join(", "));
+/// assert_eq!("", vec!["?"; 0].join(", "));
 /// ```
 ///
 /// Note: libSQL/SQLite binds `Vec<Value>` positionally regardless of whether
 /// the SQL uses `?` or `?N`, so numbered placeholders (`?1, ?2, ...`) are
 /// never necessary — use this helper everywhere.
 #[must_use]
-pub fn sql_in_placeholders(count: usize) -> String {
+pub(crate) fn sql_in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
 }
 
@@ -330,7 +334,7 @@ pub fn sql_in_placeholders(count: usize) -> String {
 /// ROLLBACK is executed at the start of the next write operation on any clone
 /// of this Connection.
 #[derive(Clone, Debug)]
-pub struct Connection {
+pub(crate) struct Connection {
     /// Persistent turso connection — reused for all execute/query calls.
     /// Mutex serializes concurrent access since libsql connections
     /// do not support concurrent operations.
@@ -601,7 +605,7 @@ impl Connection {
 
 /// A locked connection handle scoped to a single transaction.
 /// Holds the mutex guard for the entire duration — dropped guard triggers rollback.
-pub struct TxGuard<'a> {
+pub(crate) struct TxGuard<'a> {
     conn: tokio::sync::MutexGuard<'a, turso::Connection>,
     /// Shared flag on the parent Connection; set in Drop to signal a deferred
     /// rollback on the next write operation. Set to None when the transaction
@@ -678,7 +682,7 @@ impl Drop for TxGuard<'_> {
 
 /// Ensure a full-text search index exists with the correct tokenizer.
 /// Drops and recreates if the existing index has a different tokenizer.
-pub async fn ensure_fts_index(
+pub(crate) async fn ensure_fts_index(
     conn: &Connection,
     index_name: &str,
     tokenizer: &str,
@@ -714,7 +718,7 @@ pub async fn ensure_fts_index(
 /// Open a database, create parent directories if needed, and run schema init.
 ///
 /// `schema` is executed via `execute_batch` (multiple DDL statements).
-pub async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Result<Connection> {
+pub(crate) async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Result<Connection> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory: {}", parent.display()))?;

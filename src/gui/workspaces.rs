@@ -111,6 +111,7 @@ impl WorkspacesState {
         }
     }
 
+    #[allow(clippy::unused_self)]
     pub fn refresh(&self) -> Task<WorkspacesMessage> {
         Task::perform(
             async {

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
-pub struct OpenAiCompatibleProvider {
+pub(crate) struct OpenAiCompatibleProvider {
     pub name: String,
     pub base_url: String,
     pub credential: Option<String>,

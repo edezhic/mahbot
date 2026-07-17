@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 crate::define_store! {
     /// Global board store.
-    pub static BOARD: BoardStore,
+    pub(crate) static BOARD: BoardStore,
     db_name = "board",
     schema = SCHEMA,
     post_open = after_open,

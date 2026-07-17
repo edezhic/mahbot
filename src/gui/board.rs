@@ -155,6 +155,7 @@ impl BoardState {
         )
     }
 
+    #[allow(clippy::unused_self)]
     pub fn subscription(&self) -> iced::Subscription<BoardMessage> {
         iced::Subscription::none()
     }

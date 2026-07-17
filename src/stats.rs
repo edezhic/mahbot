@@ -11,7 +11,7 @@ use anyhow::Result;
 
 crate::define_store! {
     /// Global stats store.
-    pub static STATS_STORE: StatsStore,
+    pub(crate) static STATS_STORE: StatsStore,
     db_name = "stats",
     schema = SCHEMA,
     expect = "STATS_STORE not initialized — call init_global() first",

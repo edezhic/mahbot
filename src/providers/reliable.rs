@@ -164,7 +164,7 @@ pub(crate) fn classify_transcriber_err(err: &anyhow::Error) -> TranscriberErrorC
 // error message gives operators a complete diagnostic trail.
 
 /// Provider wrapper with retry logic.
-pub struct ReliableProvider {
+pub(crate) struct ReliableProvider {
     name: String,
     provider: Box<dyn Provider>,
     max_retries: u32,

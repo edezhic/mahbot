@@ -307,7 +307,7 @@ static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
 ///
 /// On success, this function never returns (`std::process::exit(0)`).
 /// On failure, returns an error.
-pub async fn execute_update() -> Result<()> {
+pub(crate) async fn execute_update() -> Result<()> {
     // Concurrent guard — only one update at a time.
     let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
         anyhow::bail!("An update is already in progress. Please wait for it to complete.");

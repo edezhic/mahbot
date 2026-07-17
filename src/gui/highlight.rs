@@ -492,6 +492,7 @@ fn capture_class(capture_name: &str) -> HighlightClass {
 
 /// Supported languages for syntax highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, strum::VariantArray)]
+#[allow(clippy::upper_case_acronyms)]
 #[repr(usize)]
 pub enum HighlightLanguage {
     Rust,

@@ -16,7 +16,7 @@ use tracing::warn;
 
 crate::define_store! {
     /// Global workspace store.
-    pub static WORKSPACES: WorkspaceStore,
+    pub(crate) static WORKSPACES: WorkspaceStore,
     db_name = "workspaces",
     schema = SCHEMA,
     expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",

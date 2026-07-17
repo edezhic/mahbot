@@ -39,6 +39,10 @@ pub struct CursorState {
 impl CursorState {
     /// Create a new cursor state at the given position with no selection.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "Public constructor; kept for API completeness, not currently called"
+    )]
     pub const fn new(line: usize, column: usize) -> Self {
         Self {
             line,
@@ -268,6 +272,10 @@ impl EditorBuffer {
 
     /// Return the text of a specific line (0-based), or `None` if the line
     /// index is out of range.
+    #[expect(
+        dead_code,
+        reason = "Public accessor; kept for API completeness, not currently called"
+    )]
     pub fn line(&self, index: usize) -> Option<String> {
         self.buffer
             .borrow()
@@ -283,6 +291,10 @@ impl EditorBuffer {
 
     /// Return the associated highlight language, if any.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "Public accessor; kept for API completeness, not currently called"
+    )]
     pub const fn language(&self) -> Option<HighlightLanguage> {
         self.language
     }
@@ -453,6 +465,10 @@ impl EditorBuffer {
     /// Replace the entire buffer content with new text. Resets cursor and
     /// selection to the start. Re-applies syntax highlighting if a language
     /// is configured.
+    #[expect(
+        dead_code,
+        reason = "Public setter; kept for API completeness, not currently called"
+    )]
     pub fn set_text(&self, new_text: &str) {
         let language = self.language;
         with_font_system(|font_sys| {

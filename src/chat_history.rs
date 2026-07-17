@@ -11,7 +11,7 @@ use anyhow::Result;
 
 crate::define_store! {
     /// Global chat history store.
-    pub static CHAT_HISTORY: ChatHistoryStore,
+    pub(crate) static CHAT_HISTORY: ChatHistoryStore,
     db_name = "chat_history",
     schema = SCHEMA,
     expect = "CHAT_HISTORY not initialized — call init_global() first",

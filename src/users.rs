@@ -28,7 +28,7 @@ use tracing::warn;
 
 crate::define_store! {
     /// Global user store.
-    pub static USER_STORE: UserStore,
+    pub(crate) static USER_STORE: UserStore,
     db_name = "users",
     schema = SCHEMA,
     post_open = ensure_admin_user,

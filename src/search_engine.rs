@@ -274,7 +274,7 @@ pub(crate) fn get_engine_if_exists(ws: &Workspace) -> Option<Arc<SearchEngineEnt
 /// The persistent query tracker LMDB directory is **not** deleted — that would
 /// require closing the LMDB environment while no readers are active, which is
 /// tricky across threads. The directory is small and harmless to leave behind.
-pub fn remove_engine(workspace_name: &str) {
+pub(crate) fn remove_engine(workspace_name: &str) {
     let mut reg = registry().write().unwrap_poison();
     if let Some(entry) = reg.remove(workspace_name) {
         drop(entry); // explicit: drop Arc before logging

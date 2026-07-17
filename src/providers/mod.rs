@@ -4,17 +4,20 @@
 //! implements the [`Provider`] trait. Currently only OpenAI-compatible providers
 //! are supported, wrapped with automatic retry logic.
 
-pub mod compatible;
-pub mod reasoning;
-pub mod reasoning_roundtrip;
-pub mod reliable;
-pub mod transcribe;
+pub(crate) mod compatible;
+pub(crate) mod reasoning;
+pub(crate) mod reasoning_roundtrip;
+pub(crate) mod reliable;
+pub(crate) mod transcribe;
 
-pub use reasoning::plaintext_for_display;
+pub(crate) use reasoning::plaintext_for_display;
 
 use crate::config::{CONFIG, non_empty, resolve_list_or, resolve_or, trimmed_or_none};
 use crate::util::UnwrapPoison;
-pub use crate::{ChatMessage, ChatRequest, ChatResponse, Provider};
+pub(crate) use crate::{ChatRequest, ChatResponse, Provider};
+
+#[cfg(test)]
+use crate::ChatMessage;
 
 /// Helper for tests that constructs a `ChatRequest` with sensible defaults.
 /// Callers override specific fields via struct update syntax:
@@ -41,7 +44,7 @@ pub(crate) fn test_request(
 
 use std::sync::{Arc, RwLock};
 
-pub use crate::providers::transcribe::ImageTranscriber;
+pub(crate) use crate::providers::transcribe::ImageTranscriber;
 
 use compatible::OpenAiCompatibleProvider;
 use reliable::ReliableProvider;
@@ -231,7 +234,9 @@ pub async fn init_global() -> anyhow::Result<()> {
 /// global `PROVIDER`, `IMAGE_TRANSCRIBER`, or `AUDIO_TRANSCRIBER`.
 /// Used by [`save_and_reload`](crate::config::save_and_reload) as a
 /// pre-commit validation step.
-pub async fn warmup_provider_from_config(config: &crate::config::ConfigData) -> anyhow::Result<()> {
+pub(crate) async fn warmup_provider_from_config(
+    config: &crate::config::ConfigData,
+) -> anyhow::Result<()> {
     let endpoint = config
         .provider_endpoint
         .as_deref()
@@ -247,7 +252,7 @@ pub async fn warmup_provider_from_config(config: &crate::config::ConfigData) -> 
 /// changes take effect without restart. Warmup failures are fatal here
 /// because the config has already been validated by
 /// [`warmup_provider_from_config`] before this point.
-pub async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::Result<()> {
+pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::Result<()> {
     setup_provider_and_transcribers(WarmupMode::Fatal, config).await?;
     tracing::info!("Provider and transcriber singletons recreated");
     Ok(())
@@ -255,13 +260,13 @@ pub async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::Result<
 
 /// Get the global image transcriber, if a vision model is configured.
 #[must_use]
-pub fn image_transcriber() -> Option<ImageTranscriber> {
+pub(crate) fn image_transcriber() -> Option<ImageTranscriber> {
     IMAGE_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
 /// Get the global audio transcriber, if an audio model is configured.
 #[must_use]
-pub fn audio_transcriber() -> Option<transcribe::AudioTranscriber> {
+pub(crate) fn audio_transcriber() -> Option<transcribe::AudioTranscriber> {
     AUDIO_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
@@ -269,7 +274,7 @@ pub fn audio_transcriber() -> Option<transcribe::AudioTranscriber> {
 ///
 /// # Panics
 /// Panics if the provider has not been initialized.
-pub async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
+pub(crate) async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
     let provider = PROVIDER
         .read()
         .unwrap_poison()
@@ -286,7 +291,8 @@ pub async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
 /// providers ignore them harmlessly).
 ///
 /// Returns a reliable provider wrapping an [`OpenAiCompatibleProvider`].
-pub fn create_provider(
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn create_provider(
     api_key: Option<&str>,
     endpoint: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {

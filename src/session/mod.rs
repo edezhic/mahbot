@@ -40,15 +40,15 @@ use chrono::{DateTime, Utc};
 ///   more tool-call rounds (each adding assistant + tool-result messages) before
 ///   the next threshold check at the start of the following turn.
 ///
-pub const SUMMARIZATION_THRESHOLD: usize = 100_000;
+pub(crate) const SUMMARIZATION_THRESHOLD: usize = 100_000;
 
 /// Stored session rows and second `history` entry after compaction use this prefix so channel
 /// orchestration can re-inject the summary on later turns (baseline `system` rows stay excluded).
-pub const PREVIOUS_CONVERSATION_SUMMARY_PREFIX: &str = "Previous conversation summary:\n\n";
+pub(crate) const PREVIOUS_CONVERSATION_SUMMARY_PREFIX: &str = "Previous conversation summary:\n\n";
 
 /// Rough token count for history (~4 chars/token + 4 tokens per-message overhead)
 #[must_use]
-pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
         .map(|m| m.content.len().div_ceil(4) + 4)
@@ -57,7 +57,7 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
 
 crate::define_store! {
     /// Global session store.
-    pub static SESSIONS: SessionStore,
+    pub(crate) static SESSIONS: SessionStore,
     db_name = "sessions",
     schema = SCHEMA,
     expect = "SESSIONS not initialized",
@@ -397,7 +397,7 @@ pub(crate) fn ticket_session_key(ticket_id: &str, role: &str) -> String {
 ///
 /// Format: `manager_{ws_name}`
 #[must_use]
-pub fn manager_session_key(ws_name: &str) -> String {
+pub(crate) fn manager_session_key(ws_name: &str) -> String {
     format!("manager_{ws_name}")
 }
 

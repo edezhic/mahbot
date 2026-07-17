@@ -103,6 +103,7 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
 /// # Panics
 /// Never — this is a complete match over all [`Role`] variants.
 #[must_use]
+#[allow(clippy::trivially_copy_pass_by_ref)]
 pub const fn role_info(role: &Role) -> &'static RoleInfo {
     match role {
         Role::Manager => &RoleInfo {
@@ -277,7 +278,8 @@ impl Role {
 
     /// Build the tool set for this role.
     #[must_use]
-    pub fn tools(&self) -> Vec<Box<dyn Tool>> {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub(crate) fn tools(&self) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
                 let mut t = Self::full_core_tools();

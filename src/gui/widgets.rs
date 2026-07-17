@@ -346,6 +346,10 @@ impl FileTree {
     }
 
     /// Clear all tree state (nodes, expanded dirs, visible list, focus).
+    #[expect(
+        dead_code,
+        reason = "Public method kept for API completeness; not currently called"
+    )]
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.expanded_dirs.clear();

@@ -1,13 +1,13 @@
 //! Utility modules for shared helper functions.
 
-pub mod error;
-pub mod html;
-pub mod http;
-pub mod json;
-pub mod macros;
+pub(crate) mod error;
+pub(crate) mod html;
+pub(crate) mod http;
+pub(crate) mod json;
+pub(crate) mod macros;
 #[cfg(test)]
-pub mod test;
-pub mod tree_sitter;
+pub(crate) mod test;
+pub(crate) mod tree_sitter;
 
 use directories::UserDirs;
 use regex::Regex;

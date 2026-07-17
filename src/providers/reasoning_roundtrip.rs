@@ -136,7 +136,7 @@ fn augment_replay_payload_reasoning_content(payload: &mut Value, has_tool_calls:
 
 /// Build assistant replay payload with reasoning fields preserved for roundtrip.
 #[must_use]
-pub fn assistant_replay_payload(
+pub(crate) fn assistant_replay_payload(
     text: Option<&str>,
     tool_calls: &[ToolCall],
     reasoning: Option<&Reasoning>,

@@ -86,6 +86,7 @@ impl UsersState {
         }
     }
 
+    #[allow(clippy::unused_self)]
     pub fn refresh(&self) -> Task<UsersMessage> {
         Task::perform(
             async {

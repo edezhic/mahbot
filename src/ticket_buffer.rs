@@ -45,7 +45,7 @@ fn buffer() -> &'static Mutex<HashMap<String, VecDeque<Entry>>> {
 /// # Panics
 ///
 /// Panics if the buffer has not been initialized via [`init_global`].
-pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketPhase) {
+pub(crate) fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketPhase) {
     let mut map = buffer().lock().unwrap_poison();
     let deque = map.entry(workspace_name.to_string()).or_default();
     deque.push_back(Entry {
@@ -71,7 +71,7 @@ pub fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketP
 /// • mahbot-2: in_diagnostics → diagnostics_done
 /// ```
 #[must_use]
-pub fn drain(workspace_name: &str) -> String {
+pub(crate) fn drain(workspace_name: &str) -> String {
     let mut map = buffer().lock().unwrap_poison();
     let Some(entries) = map.remove(workspace_name) else {
         return String::new();

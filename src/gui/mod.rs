@@ -4,33 +4,32 @@
 //! bootstraps via a startup [`iced::Task`] before the UI becomes interactive.
 
 #![expect(
-    clippy::new_without_default,
     clippy::struct_excessive_bools,
     clippy::if_not_else,
     clippy::collapsible_if
 )]
 
-pub mod board;
-pub mod common;
-pub mod context_menu;
-pub mod diff;
-pub mod diff_widget;
-pub mod editor;
-pub mod editor_widget;
-pub mod git;
-pub mod highlight;
-pub mod home;
-pub mod logs;
-pub mod sessions;
-pub mod settings;
-pub mod shell;
-pub mod text_rendering;
-pub mod theme;
-pub mod tool_failures;
-pub mod users;
-pub mod widget_helpers;
-pub mod widgets;
-pub mod workspaces;
+pub(crate) mod board;
+pub(crate) mod common;
+pub(crate) mod context_menu;
+pub(crate) mod diff;
+pub(crate) mod diff_widget;
+pub(crate) mod editor;
+pub(crate) mod editor_widget;
+pub(crate) mod git;
+pub(crate) mod highlight;
+pub(crate) mod home;
+pub(crate) mod logs;
+pub(crate) mod sessions;
+pub(crate) mod settings;
+pub(crate) mod shell;
+pub(crate) mod text_rendering;
+pub(crate) mod theme;
+pub(crate) mod tool_failures;
+pub(crate) mod users;
+pub(crate) mod widget_helpers;
+pub(crate) mod widgets;
+pub(crate) mod workspaces;
 
 use crate::board::{Ticket, TicketPhase};
 use crate::logs::LogStore;

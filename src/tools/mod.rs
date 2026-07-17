@@ -1,18 +1,18 @@
 //! Tool implementations for agent-callable capabilities.
 
 use anyhow::Context;
-pub mod ask;
+pub(crate) mod ask;
 pub mod browser;
-pub mod edit;
-pub mod image_gen;
-pub mod path;
-pub mod read;
-pub mod search;
-pub mod search_archived_tickets;
-pub mod shell;
-pub mod ticket;
-pub mod video_gen;
-pub mod web_search;
+pub(crate) mod edit;
+pub(crate) mod image_gen;
+pub(crate) mod path;
+pub(crate) mod read;
+pub(crate) mod search;
+pub(crate) mod search_archived_tickets;
+pub(crate) mod shell;
+pub(crate) mod ticket;
+pub(crate) mod video_gen;
+pub(crate) mod web_search;
 
 /// Maximum file size allowed for read, edit, search tool operations, and the dashboard editor (10 MB).
 /// Guards against OOM when agents or the GUI attempt to read very large files.
@@ -47,19 +47,19 @@ fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
 
 // ── Re-exports ─────────────────────────────────────────────────────────
 
-pub use ask::{AskTool, DispatchMode};
-pub use browser::BrowserTool;
-pub use edit::EditTool;
-pub use image_gen::ImageGenTool;
-pub use read::ReadTool;
-pub use search::SearchTool;
-pub use search_archived_tickets::SearchArchivedTicketsTool;
-pub use shell::{ShellMode, ShellTool};
-pub use ticket::{
+pub(crate) use ask::{AskTool, DispatchMode};
+pub(crate) use browser::BrowserTool;
+pub(crate) use edit::EditTool;
+pub(crate) use image_gen::ImageGenTool;
+pub(crate) use read::ReadTool;
+pub(crate) use search::SearchTool;
+pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
+pub(crate) use shell::{ShellMode, ShellTool};
+pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
-pub use video_gen::VideoGenTool;
-pub use web_search::{WebSearchBackend, WebSearchTool};
+pub(crate) use video_gen::VideoGenTool;
+pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
 
 use crate::{Tool, Workspace};
 use std::path::PathBuf;

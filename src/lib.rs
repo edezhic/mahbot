@@ -10,40 +10,40 @@
     clippy::doc_markdown
 )]
 
-pub mod agent;
+pub(crate) mod agent;
 pub mod board;
 pub mod channels;
-pub mod chat_history;
+pub(crate) mod chat_history;
 pub mod checkpoint;
 pub mod config;
 pub mod config_db;
 pub mod debug;
-pub mod diff_parse;
-pub mod embedder;
-pub mod extraction;
-pub mod git_commands;
+pub(crate) mod diff_parse;
+pub(crate) mod embedder;
+pub(crate) mod extraction;
+pub(crate) mod git_commands;
 pub mod gui;
 pub mod logs;
 pub mod maintainer;
 pub mod management;
 pub mod manager_queue;
-pub mod prompt;
+pub(crate) mod prompt;
 pub mod providers;
 pub mod registry;
-pub mod role;
+pub(crate) mod role;
 pub mod search_engine;
 pub mod self_update;
 pub mod session;
 pub mod shutdown;
-pub mod skills;
-pub mod stats;
+pub(crate) mod skills;
+pub(crate) mod stats;
 pub mod ticket_buffer;
 pub mod tools;
 pub mod turso;
 pub mod users;
 pub mod util;
-pub mod vector;
-pub mod workspace;
+pub(crate) mod vector;
+pub(crate) mod workspace;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,7 @@ use crate::util::UnwrapPoison;
 ///
 /// All fields are optional — `None` means no such tooling was detected.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DiagnosticsCommands {
+pub(crate) struct DiagnosticsCommands {
     /// Auto-formatter command (e.g., `cargo fmt`)
     pub format: Option<String>,
     /// Format check without changes (e.g., `cargo fmt -- --check`)
@@ -271,14 +271,14 @@ fn generate_nanoid(length: usize) -> String {
 
 /// Generate a unique identifier (10-char NanoID, ~60 bits entropy).
 #[must_use]
-pub fn generate_id() -> String {
+pub(crate) fn generate_id() -> String {
     generate_nanoid(10)
 }
 
 /// Generate a short unique suffix (6-char NanoID, ~36 bits entropy).
 /// Used to disambiguate retry cycles in parallel agent dispatches.
 #[must_use]
-pub fn generate_suffix() -> String {
+pub(crate) fn generate_suffix() -> String {
     generate_nanoid(6)
 }
 
@@ -537,7 +537,7 @@ pub enum Role {
 /// Records are accumulated in-memory in the agent and flushed to
 /// `stats.db` on session finalization.
 #[derive(Debug, Clone)]
-pub struct ToolCallRecord {
+pub(crate) struct ToolCallRecord {
     /// The tool's name.
     pub tool_name: String,
     /// Serialized arguments as JSON string (credentials scrubbed).
@@ -583,7 +583,7 @@ pub struct Agent {
 
 /// Result of a single review or QA verification pass.
 #[derive(Clone, Deserialize)]
-pub struct Verdict {
+pub(crate) struct Verdict {
     /// Quality score from 0 (worst) to 10 (best).
     pub score: u8,
     /// Optional constructive critique from the verifier.
@@ -595,7 +595,7 @@ pub struct Verdict {
 
 /// Result of a sanitation agent's file inspection.
 #[derive(Clone, Debug, Deserialize)]
-pub struct SanitationVerdict {
+pub(crate) struct SanitationVerdict {
     /// Whether the ticket passes sanitation (`true` = clean, `false` = garbage detected).
     pub pass: bool,
     /// List of garbage/unwanted files found (empty when `pass` is `true`).
@@ -608,14 +608,14 @@ pub struct SanitationVerdict {
 // ── Tool trait + types ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSpec {
+pub(crate) struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
 }
 
 #[async_trait]
-pub trait Tool: Send + Sync {
+pub(crate) trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     /// Human-readable description of this tool.
     ///
@@ -746,7 +746,7 @@ pub trait Tool: Send + Sync {
 
 /// Phase of tool output notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolOutputPhase {
+pub(crate) enum ToolOutputPhase {
     /// Notification sent before tool execution.
     Before,
     /// Notification sent after tool execution completes.
@@ -764,7 +764,7 @@ pub enum ToolOutputPhase {
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "lowercase")]
-pub enum ChatRole {
+pub(crate) enum ChatRole {
     /// System prompt message.
     System,
     /// User (human) message.
@@ -778,7 +778,7 @@ pub enum ChatRole {
 // ── Provider trait + types ──────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
+pub(crate) struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
 }
@@ -823,7 +823,7 @@ impl ChatMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
+pub(crate) struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
@@ -839,8 +839,9 @@ pub(crate) struct ToolResultPayload {
     pub content: String,
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Reasoning {
+pub(crate) struct Reasoning {
     pub reasoning: Option<String>,
     pub reasoning_content: Option<String>,
     pub reasoning_details: Option<serde_json::Value>,
@@ -871,15 +872,16 @@ impl Reasoning {
     }
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Default)]
-pub struct ProviderUsage {
+pub(crate) struct ProviderUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ChatResponse {
+pub(crate) struct ChatResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<ProviderUsage>,
@@ -896,10 +898,10 @@ impl ChatResponse {
 /// Default max tokens for LLM calls (32K output generation limit — NOT the context window
 /// size — this is the *generation limit* sent as `max_tokens` to the provider).
 /// Used as the fallback when callers don't explicitly set `max_tokens`.
-pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 #[derive(Debug, Clone)]
-pub struct ChatRequest {
+pub(crate) struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<ToolSpec>>,
     pub model: String,
@@ -923,7 +925,7 @@ pub struct ChatRequest {
 }
 
 #[async_trait]
-pub trait Provider: Send + Sync {
+pub(crate) trait Provider: Send + Sync {
     /// Send a chat request using the model specified in the request.
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse>;
 
@@ -938,7 +940,7 @@ pub trait Provider: Send + Sync {
 /// `<workspace>/.agents/skills/<name>/`) and are defined via `SKILL.md`.
 /// They provide instructions and context for the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Skill {
+pub(crate) struct Skill {
     pub name: String,
     pub description: String,
     pub location: PathBuf,
