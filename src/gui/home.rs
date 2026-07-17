@@ -65,7 +65,8 @@ fn build_chat_message(
     is_optimistic: bool,
 ) -> DisplayMessage {
     use iced::widget::markdown;
-    let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
+    let processed = super::media_markers::preprocess(&content);
+    let md_items: Vec<markdown::Item> = markdown::parse(&processed).collect();
     DisplayMessage {
         id: None,
         message_id,
@@ -89,7 +90,8 @@ fn entry_to_display_message(entry: ChatHistoryEntry) -> DisplayMessage {
         // Dividers are rendered as horizontal rules — no markdown needed.
         Vec::new()
     } else {
-        markdown::parse(&entry.content).collect()
+        let processed = super::media_markers::preprocess(&entry.content);
+        markdown::parse(&processed).collect()
     };
     DisplayMessage {
         id: Some(entry.id),
@@ -654,8 +656,12 @@ impl HomeState {
                             .size(13)
                             .into()
                     } else {
-                        iced::widget::markdown::view(&msg.md_items, theme::markdown_settings())
-                            .map(HomeMessage::LinkClicked)
+                        iced::widget::markdown::view_with(
+                            &msg.md_items,
+                            theme::markdown_settings(),
+                            &super::media_markers::MEDIA_VIEWER,
+                        )
+                        .map(HomeMessage::LinkClicked)
                     };
 
                     // Build bubble body: role icon header for agents, or just content for users.

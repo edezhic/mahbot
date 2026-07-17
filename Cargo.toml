@@ -33,7 +33,7 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 tokio-util = { version = "0.7", default-features = false }
 
 # Native GUI dashboard
-iced = { version = "0.14", default-features = false, features = ["tokio", "wgpu", "markdown", "advanced"] }
+iced = { version = "0.14", default-features = false, features = ["tokio", "wgpu", "markdown", "advanced", "image"] }
 iced_fonts = { version = "0.3", default-features = false, features = ["lucide"] }
 iced_anim = "0.3"
 iced_selection = { version = "0.5", features = ["markdown"] }

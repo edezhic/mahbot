@@ -756,8 +756,12 @@ impl SessionsState {
                                 SessionsMessage,
                                 iced::Theme,
                                 iced::Renderer,
-                            > = markdown::view(&md_items[i], theme::markdown_settings())
-                                .map(SessionsMessage::LinkClicked);
+                            > = markdown::view_with(
+                                &md_items[i],
+                                theme::markdown_settings(),
+                                &super::media_markers::MEDIA_VIEWER,
+                            )
+                            .map(SessionsMessage::LinkClicked);
                             md
                         });
                     }
@@ -846,8 +850,12 @@ impl SessionsState {
                                 SessionsMessage,
                                 iced::Theme,
                                 iced::Renderer,
-                            > = markdown::view(&md_items[i], theme::markdown_settings())
-                                .map(SessionsMessage::LinkClicked);
+                            > = markdown::view_with(
+                                &md_items[i],
+                                theme::markdown_settings(),
+                                &super::media_markers::MEDIA_VIEWER,
+                            )
+                            .map(SessionsMessage::LinkClicked);
                             md
                         });
                     }
@@ -1028,7 +1036,8 @@ fn parse_messages_to_md_items(messages: &[ChatMessage]) -> Vec<Vec<markdown::Ite
                     DecodedNativeHistoryMessage::ToolResult { content, .. } => Some(content),
                 })
                 .unwrap_or_else(|| m.content.clone());
-            markdown::parse(&display_text).collect()
+            let processed = super::media_markers::preprocess(&display_text);
+            markdown::parse(&processed).collect()
         })
         .collect()
 }

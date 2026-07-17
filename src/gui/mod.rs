@@ -20,6 +20,7 @@ pub(crate) mod git;
 pub(crate) mod highlight;
 pub(crate) mod home;
 pub(crate) mod logs;
+pub(crate) mod media_markers;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod shell;
