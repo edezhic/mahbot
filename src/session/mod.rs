@@ -117,7 +117,7 @@ pub(crate) const TRANSIENT_AGENT_ID_PREFIXES: &[&str] =
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
-    pub key: String,
+    pub agent_id: String,
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
 }
@@ -139,9 +139,9 @@ fn parse_ts_or_now(s: &str, label: &str) -> DateTime<Utc> {
     })
 }
 
-fn session_metadata_from_row(key: &str, activity_str: &str, count: i64) -> SessionMetadata {
+fn session_metadata_from_row(agent_id: &str, activity_str: &str, count: i64) -> SessionMetadata {
     SessionMetadata {
-        key: key.to_string(),
+        agent_id: agent_id.to_string(),
         last_activity: parse_ts_or_now(activity_str, "last_activity"),
         message_count: usize::try_from(count).unwrap_or(0),
     }

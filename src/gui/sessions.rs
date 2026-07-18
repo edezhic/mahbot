@@ -284,8 +284,8 @@ impl SessionsState {
             .sessions
             .iter()
             .map(|s| CachedSessionItem {
-                key: s.key.clone(),
-                label: s.key.clone(),
+                key: s.agent_id.clone(),
+                label: s.agent_id.clone(),
                 msg_count_label: format!("{} msgs", s.message_count),
                 timestamp_label: theme::format_timestamp(&s.last_activity.to_rfc3339()),
             })
