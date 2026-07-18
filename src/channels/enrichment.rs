@@ -33,28 +33,45 @@ static URL_RE: LazyLock<Regex> =
 /// Transcribe an audio file referenced by a `[AUDIO:...]` marker and return
 /// the annotation text to embed in the message along with a success indicator.
 ///
+/// Transcription strategy (in order):
+/// 1. **Local Qwen3-ASR** — if the local model is loaded and `audio_transcription_use_local`
+///    is enabled in config. Fully offline, no data leaves the machine.
+/// 2. **Fallback annotation** — if local transcription is unavailable, returns a plain
+///    `[Audio: filename attached]` placeholder.
+///
 /// Returns `(annotation, true)` on successful transcription, or
-/// `(fallback_text, false)` when transcription fails or no transcriber
-/// is configured.  The caller uses the success flag to decide whether
-/// the temp file should be cleaned up.
+/// `(fallback_text, false)` when transcription fails.  The caller uses
+/// the success flag to decide whether the temp file should be cleaned up.
 async fn transcribe_audio_marker(path: &str) -> (String, bool) {
     let file_name = extract_file_name(path);
+    let path_buf = std::path::PathBuf::from(path);
 
-    let Some(ref transcriber) = crate::providers::audio_transcriber() else {
-        tracing::warn!("No audio transcriber configured — cannot transcribe {file_name}");
-        return (format!("[Audio: {file_name} attached]"), false);
-    };
+    // ── Step 1: Try local Qwen3-ASR transcription ────────────────────
+    // Default to enabled; only explicitly "false" disables local transcription.
+    let use_local = crate::config::CONFIG
+        .snapshot()
+        .audio_transcription_use_local
+        .as_deref()
+        != Some("false");
 
-    match transcriber.transcribe(std::path::Path::new(path)).await {
-        Ok(text) => (
-            format!("[Audio transcription of {file_name}]: {text}"),
-            true,
-        ),
-        Err(e) => {
-            tracing::warn!(%path, error = %e, "Audio transcription failed");
-            (format!("[Audio: {file_name} attached]"), false)
+    if use_local {
+        match crate::providers::local_transcriber::transcribe_file_async(&path_buf).await {
+            Ok(text) => {
+                tracing::debug!(%path, "Local audio transcription succeeded");
+                return (
+                    format!("[Audio transcription of {file_name}]: {text}"),
+                    true,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(%path, error = %e, "Local audio transcription failed");
+            }
         }
     }
+
+    // ── Step 2: Fallback annotation ───────────────────────────────────
+    tracing::warn!("Audio transcription unavailable — cannot transcribe {file_name}");
+    (format!("[Audio: {file_name} attached]"), false)
 }
 
 /// Save a copy of the image to `workspace/uploads/` for agent tool references.

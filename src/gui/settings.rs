@@ -188,7 +188,6 @@ fn model_picker_list<'a>(
 pub enum ModelPickerTarget {
     ImageGen,
     VideoGen,
-    AudioTranscription,
 }
 
 impl ModelPickerTarget {
@@ -196,7 +195,6 @@ impl ModelPickerTarget {
         match self {
             ModelPickerTarget::ImageGen => 0,
             ModelPickerTarget::VideoGen => 1,
-            ModelPickerTarget::AudioTranscription => 2,
         }
     }
 }
@@ -219,10 +217,6 @@ fn picker_config_fields<'a>(
     match t {
         ModelPickerTarget::ImageGen => (&mut config.image_gen_models, &mut config.image_gen_model),
         ModelPickerTarget::VideoGen => (&mut config.video_gen_models, &mut config.video_gen_model),
-        ModelPickerTarget::AudioTranscription => (
-            &mut config.audio_transcription_models,
-            &mut config.audio_transcription_model,
-        ),
     }
 }
 
@@ -1736,9 +1730,26 @@ impl SettingsState {
     }
 
     fn transcription_section(&self) -> Element<'_, SettingsMessage> {
+        let local_enabled = self.config.audio_transcription_use_local.as_deref() != Some("false");
+
         section(
             "Transcription",
             column![
+                field_row(
+                    "Local Transcription",
+                    toggler(local_enabled)
+                        .on_toggle(move |b| SettingsMessage::ConfigField {
+                            key: "audio_transcription_use_local",
+                            value: if b {
+                                String::new()
+                            } else {
+                                "false".to_string()
+                            },
+                        })
+                        .into(),
+                    Some("Use local Qwen3-ASR (offline) — audio never leaves the machine"),
+                ),
+                Space::new().height(8),
                 config_text_input(
                     "Image Model",
                     "qwen/qwen3.6-plus",
@@ -1756,29 +1767,6 @@ impl SettingsState {
                         .as_deref()
                         .unwrap_or_default(),
                     "image_transcription_provider",
-                ),
-                Space::new().height(8),
-                text("Audio Transcription Models")
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .color(theme::ACCENT),
-                Space::new().height(2),
-                model_picker_list(
-                    ModelPickerTarget::AudioTranscription,
-                    self.config.audio_transcription_models.as_deref(),
-                    self.config.audio_transcription_model.as_deref(),
-                    self.model_picker_inputs[ModelPickerTarget::AudioTranscription.idx()].as_str(),
-                    "model name (e.g. openai/whisper-...)",
-                ),
-                Space::new().height(4),
-                config_text_input(
-                    "Audio Provider",
-                    "",
-                    self.config
-                        .audio_transcription_provider
-                        .as_deref()
-                        .unwrap_or_default(),
-                    "audio_transcription_provider",
                 ),
             ],
         )

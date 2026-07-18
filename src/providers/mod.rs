@@ -5,6 +5,7 @@
 //! are supported, wrapped with automatic retry logic.
 
 pub(crate) mod compatible;
+pub(crate) mod local_transcriber;
 pub(crate) mod reasoning;
 pub(crate) mod reasoning_roundtrip;
 pub(crate) mod reliable;
@@ -12,7 +13,7 @@ pub(crate) mod transcribe;
 
 pub(crate) use reasoning::plaintext_for_display;
 
-use crate::config::{CONFIG, non_empty, resolve_list_or, resolve_or, trimmed_or_none};
+use crate::config::{CONFIG, non_empty, resolve_or, trimmed_or_none};
 use crate::util::UnwrapPoison;
 pub(crate) use crate::{ChatRequest, ChatResponse, Provider};
 
@@ -125,9 +126,6 @@ static PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 /// Global image transcriber (vision model for image descriptions).
 static IMAGE_TRANSCRIBER: RwLock<Option<ImageTranscriber>> = RwLock::new(None);
 
-/// Global audio transcriber.
-static AUDIO_TRANSCRIBER: RwLock<Option<transcribe::AudioTranscriber>> = RwLock::new(None);
-
 /// Controls whether warmup failure should propagate or be non-fatal.
 ///
 /// Used by [`setup_provider_and_transcribers`] to differentiate the two
@@ -142,10 +140,10 @@ enum WarmupMode {
 /// Shared provider and transcriber setup logic.
 ///
 /// Extracts config from the given [`ConfigData`], creates the provider and
-/// constructs both transcribers (synchronous, no I/O), then optionally warms
-/// the provider up (async HTTP call). After warmup (or warmup skip/graceful
-/// failure), all three globals — [`PROVIDER`], [`IMAGE_TRANSCRIBER`],
-/// [`AUDIO_TRANSCRIBER`] — are swapped in together.
+/// constructs the image transcriber (synchronous, no I/O), then optionally
+/// warms the provider up (async HTTP call). After warmup (or warmup
+/// skip/graceful failure), both globals — [`PROVIDER`], [`IMAGE_TRANSCRIBER`]
+/// — are swapped in together.
 ///
 /// Used by [`init_global`] (startup, non-fatal warmup) and [`recreate_all`]
 /// (config reload, fatal warmup) to eliminate ~28 lines of duplication.
@@ -175,28 +173,6 @@ async fn setup_provider_and_transcribers(
         non_empty(config.image_transcription_provider.clone()).as_deref(),
         ImageTranscriber::from_inner,
     );
-    let audio_transcriber = {
-        let has_key = config
-            .provider_key
-            .as_deref()
-            .and_then(trimmed_or_none)
-            .is_some();
-        if has_key {
-            let models = resolve_list_or(
-                config.audio_transcription_models.as_deref(),
-                config.audio_transcription_model.clone(),
-                crate::config::DEFAULT_AUDIO_TRANSCRIPTION_MODEL,
-            );
-            let route = non_empty(config.audio_transcription_provider.clone());
-            Some(transcribe::AudioTranscriber::new(
-                endpoint_str.clone(),
-                models,
-                route,
-            ))
-        } else {
-            None
-        }
-    };
 
     // Now warm up the provider (costly HTTP round-trip).
     match warmup_mode {
@@ -210,10 +186,9 @@ async fn setup_provider_and_transcribers(
         }
     }
 
-    // Atomically swap all three globals after warmup verification.
+    // Atomically swap both globals after warmup verification.
     *PROVIDER.write().unwrap_poison() = Some(provider);
     *IMAGE_TRANSCRIBER.write().unwrap_poison() = image_transcriber;
-    *AUDIO_TRANSCRIBER.write().unwrap_poison() = audio_transcriber;
 
     Ok(())
 }
@@ -222,16 +197,32 @@ async fn setup_provider_and_transcribers(
 ///
 /// Warmup failures are non-fatal at startup — the system can still operate;
 /// retries happen at request time.
+///
+/// Also triggers eager init of the local Qwen3-ASR transcriber, which either
+/// loads from cache (async file verification on a blocking thread) or spawns
+/// a background download task.
 pub async fn init_global() -> anyhow::Result<()> {
     let config = CONFIG.snapshot();
-    setup_provider_and_transcribers(WarmupMode::NonFatal, &config).await
+    setup_provider_and_transcribers(WarmupMode::NonFatal, &config).await?;
+
+    // Eagerly attempt to load the local Qwen3-ASR transcriber from cache.
+    // If files are missing, a background download is spawned automatically.
+    if config.audio_transcription_use_local.as_deref() == Some("false") {
+        tracing::debug!("Local audio transcription is disabled by config");
+    } else if local_transcriber::try_init_from_cache().await {
+        tracing::info!("Local Qwen3-ASR transcriber loaded from cache");
+    } else {
+        tracing::info!("Local Qwen3-ASR transcriber will be downloaded in background");
+    }
+
+    Ok(())
 }
 
 /// Warm up a provider from a config snapshot without swapping globals.
 ///
 /// Returns `Ok(())` if the new API key, endpoint, and models are valid
 /// (the provider responds to a warmup request). Does **not** modify the
-/// global `PROVIDER`, `IMAGE_TRANSCRIBER`, or `AUDIO_TRANSCRIBER`.
+/// global `PROVIDER` or `IMAGE_TRANSCRIBER`.
 /// Used by [`save_and_reload`](crate::config::save_and_reload) as a
 /// pre-commit validation step.
 pub(crate) async fn warmup_provider_from_config(
@@ -252,9 +243,28 @@ pub(crate) async fn warmup_provider_from_config(
 /// changes take effect without restart. Warmup failures are fatal here
 /// because the config has already been validated by
 /// [`warmup_provider_from_config`] before this point.
+///
+/// Also attempts to load the local Qwen3-ASR transcriber from cache if
+/// `audio_transcription_use_local` is enabled and the transcriber isn't
+/// already loaded. If cached files are missing, a background download is
+/// spawned — subsequent transcription requests return a placeholder until
+/// the download completes.
 pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::Result<()> {
     setup_provider_and_transcribers(WarmupMode::Fatal, config).await?;
     tracing::info!("Provider and transcriber singletons recreated");
+
+    // Re-init local transcriber if config enables it and it's not already ready.
+    let use_local = config.audio_transcription_use_local.as_deref() != Some("false");
+    if use_local && !local_transcriber::is_loaded() {
+        if local_transcriber::try_init_from_cache().await {
+            tracing::info!("Local Qwen3-ASR transcriber loaded from cache after config reload");
+        } else {
+            tracing::info!(
+                "Local Qwen3-ASR transcriber will be downloaded in background after config reload"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -262,12 +272,6 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::
 #[must_use]
 pub(crate) fn image_transcriber() -> Option<ImageTranscriber> {
     IMAGE_TRANSCRIBER.read().unwrap_poison().clone()
-}
-
-/// Get the global audio transcriber, if an audio model is configured.
-#[must_use]
-pub(crate) fn audio_transcriber() -> Option<transcribe::AudioTranscriber> {
-    AUDIO_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
 /// Delegate `Provider` trait for the global static.

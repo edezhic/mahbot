@@ -22,7 +22,7 @@
 //!
 //! `config_kv` table → hardcoded default (`const` in this module)
 //!
-//! The 14 fields listed in the `string_config_fields!` invocation
+//! The 13 fields listed in the `string_config_fields!` invocation
 //! belong to this chain. Their accessor methods (generated on [`ConfigReload`])
 //! each follow a per-field annotation:
 //!
@@ -77,6 +77,21 @@
 //! | `config_role` | [`crate::config_db::ConfigStore::get_all_role_configs`] | [`crate::config_db::ConfigStore::save_role_and_routing_configs`] |
 //! | `config_model_routing` | [`crate::config_db::ConfigStore::get_all_model_routings`] | [`crate::config_db::ConfigStore::save_role_and_routing_configs`] |
 //!
+//! # Orphaned database keys
+//!
+//! The following keys may still exist in the `config_kv` table from before the
+//! API audio transcription was removed (mahbot-735), but are **silently
+//! ignored** — they have no corresponding field in [`ConfigData`] and are never
+//! read:
+//!
+//! * `audio_transcription_model` — previously the API audio model name.
+//! * `audio_transcription_models` — previously the newline-separated model list.
+//! * `audio_transcription_provider` — previously the provider routing slug.
+//!
+//! These orphaned entries are harmless and do not require migration. They will
+//! be naturally overwritten if a future config key with the same name is added;
+//! until then they consume negligible space in the `config_kv` table.
+//!
 //! # See also
 //!
 //! * [`crate::config_db`] — database persistence for all three chains.
@@ -101,7 +116,6 @@ pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image-preview";
 const DEFAULT_VIDEO_GEN_MODEL: &str = "google/veo-3.1-lite";
 pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
-pub(crate) const DEFAULT_AUDIO_TRANSCRIPTION_MODEL: &str = "openai/whisper-large-v3-turbo";
 
 // ── Named config structs ───────────────────────────────────────────
 
@@ -230,14 +244,8 @@ pub struct ConfigData {
     pub provider_endpoint: Option<String>,
     /// Image transcription model.
     pub image_transcription_model: Option<String>,
-    /// Audio transcription model (fallback when the models list is empty).
-    pub audio_transcription_model: Option<String>,
-    /// Newline-separated list of available audio transcription models (fallback chain in order).
-    pub audio_transcription_models: Option<String>,
-    /// OpenRouter provider routing for image transcription requests.
+    /// Image transcription provider routing.
     pub image_transcription_provider: Option<String>,
-    /// Audio transcription provider routing.
-    pub audio_transcription_provider: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
@@ -255,6 +263,15 @@ pub struct ConfigData {
     pub web_search_provider: Option<String>,
     /// Telegram Bot API token (hot-reloaded on save).
     pub telegram_bot_token: Option<String>,
+    /// Enable local Qwen3-ASR audio transcription.
+    ///
+    /// When `true` (default) and the model is cached or can be downloaded, audio
+    /// transcription runs fully locally via the `qwen-asr` crate with Qwen3-ASR-0.6B.
+    /// Audio never leaves the machine.
+    ///
+    /// Set to `"false"` to disable audio transcription entirely — audio markers
+    /// in messages are replaced with a "[Audio: filename attached]" placeholder.
+    pub audio_transcription_use_local: Option<String>,
     /// Per-role model overrides.
     pub per_role_configs: Vec<RoleConfig>,
     /// Per-model provider routing.
@@ -464,10 +481,7 @@ string_config_fields! {
     provider_key [non_empty],
     provider_endpoint [or(DEFAULT_PROVIDER_ENDPOINT)],
     image_transcription_model [or(DEFAULT_IMAGE_TRANSCRIPTION_MODEL)],
-    audio_transcription_model [or(DEFAULT_AUDIO_TRANSCRIPTION_MODEL)],
-    audio_transcription_models [list_or(fallback = audio_transcription_model, default = DEFAULT_AUDIO_TRANSCRIPTION_MODEL)],
     image_transcription_provider [non_empty],
-    audio_transcription_provider [non_empty],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
     video_gen_model [or(DEFAULT_VIDEO_GEN_MODEL)],
@@ -476,6 +490,7 @@ string_config_fields! {
     exa_key [non_empty],
     web_search_provider [non_empty],
     telegram_bot_token [non_empty],
+    audio_transcription_use_local [non_empty],
 }
 
 impl ConfigData {

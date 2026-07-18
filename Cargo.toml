@@ -92,6 +92,19 @@ strum = { version = "0.27", features = ["derive"] }
 
 # Tree-sitter for code navigation
 tree-sitter = "0.26"
+
+# Local audio transcription with Qwen3-ASR
+# NOTE: `vdsp` is macOS-only (Accelerate framework for BLAS operations).
+#       For Linux builds, replace with `blas` only, or use a pure-Rust BLAS
+#       backend if the crate adds one.
+qwen-asr = { version = "0.9.0", default-features = false, features = ["blas", "vdsp"] }
+
+# Audio decoding for local transcriber input (OGG/Opus → raw PCM)
+ogg = "0.9"
+opus-decoder = "0.1"
+
+# MP3 decoding
+minimp3 = "0.5"
 tree-sitter-rust = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-python = "0.23"
@@ -123,6 +136,10 @@ incremental = true
 opt-level = 0
 debug = 0
 codegen-units = 256
+
+[profile.dev.package.qwen-asr]
+opt-level = 3
+codegen-units = 1
 
 [profile.dev.build-override]
 opt-level = 0
