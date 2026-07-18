@@ -1466,7 +1466,11 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
 /// delegates to [`process_sanitation_verdict`] for pass/fail processing.
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
-    let agent_id = ticket_agent_id(&ticket.id, Role::Sanitation.as_str());
+    let agent_id = format!(
+        "{}_{}",
+        ticket_agent_id(&ticket.id, Role::Sanitation.as_str()),
+        crate::generate_suffix()
+    );
 
     //
     // Unlike handle_qa_passed (which fails closed on git errors — returning early
