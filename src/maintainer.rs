@@ -34,7 +34,7 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 ///
 /// Workspaces are processed **concurrently** via `tokio::spawn` + `join_all`,
 /// matching the pattern used by [`poll_round`](crate::management::poll_round).
-/// Each workspace's agent run is independent (disjoint session keys, no shared
+/// Each workspace's agent run is independent (disjoint agent IDs, no shared
 /// mutable state between runs) so concurrency is safe.
 ///
 /// ## Behavioural notes
@@ -111,13 +111,13 @@ pub async fn run_maintainer_loop() {
                         return;
                     }
 
-                    // Unique session key per run — don't accumulate history
-                    let run_id = crate::session::maintainer_session_key(&ws.name);
+                    // Unique agent ID per run — don't accumulate history
+                    let agent_id = crate::session::maintainer_agent_id(&ws.name);
 
-                    info!(workspace = %ws.name, run = %run_id, "Maintainer: starting maintenance run");
+                    info!(workspace = %ws.name, agent_id = %agent_id, "Maintainer: starting maintenance run");
 
                     let (agent, response) =
-                        run_agent(run_id.clone(), Role::Maintainer, &ws, None, &prompt, String::new(), String::new()).await;
+                        run_agent(agent_id.clone(), Role::Maintainer, &ws, None, &prompt, String::new(), String::new()).await;
 
                     if let Some(_response) = response {
                         info!(workspace = %ws.name, "Maintainer: run complete");
@@ -125,7 +125,7 @@ pub async fn run_maintainer_loop() {
                         // ── Debounce update after successful run ──────────────────
                         let now_str = turso::now();
                         let new_debounce = compute_debounce(
-                            &agent.session_key,
+                            &agent.agent_id,
                             ws.maintainer_debounce_mins,
                             ws.name.as_str(),
                         )

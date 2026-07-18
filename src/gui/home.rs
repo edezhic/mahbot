@@ -1058,7 +1058,7 @@ impl HomeState {
                 self.typing_tick_state = 0;
                 self.reset_pagination_state();
 
-                // Build session key and schedule async cleanup.
+                // Build agent ID and schedule async cleanup.
                 let sender = match &self.selected_user {
                     Some(s) => s.clone(),
                     None => return Task::none(),
@@ -1075,8 +1075,8 @@ impl HomeState {
                             .flatten()
                             .unwrap_or(Role::Manager.as_str().to_string());
                         // Clear the session.
-                        let sk = crate::session::session_key("gui", &sender, &role, &ws);
-                        let _ = crate::session::Session::delete(&sk).await;
+                        let agent_id = crate::session::resolve_agent_id("gui", &sender, &role, &ws);
+                        let _ = crate::session::Session::delete(&agent_id).await;
                         // Insert a divider marker instead of deleting history.
                         let store = crate::chat_history::store();
                         match store.insert_divider(&sender, "gui", &ws).await {

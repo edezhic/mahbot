@@ -891,14 +891,14 @@ async fn handle_qa_passed_untracked_files_to_insanitation() {
         "QA passed with untracked files should transition to InSanitation"
     );
 
-    // Verify assigned_to is set to the sanitation session key
+    // Verify assigned_to is set to the sanitation agent ID
     let ticket = expect_ticket(board(), &ticket_id).await;
     let expected_key =
-        crate::session::ticket_session_key(&ticket_id, crate::Role::Sanitation.as_str());
+        crate::session::ticket_agent_id(&ticket_id, crate::Role::Sanitation.as_str());
     assert_eq!(
         ticket.assigned_to.as_deref(),
         Some(expected_key.as_str()),
-        "assigned_to should be set to sanitation session key"
+        "assigned_to should be set to sanitation agent ID"
     );
 }
 

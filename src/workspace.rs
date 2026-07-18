@@ -7,7 +7,7 @@ use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::agent::run_agent;
-use crate::session::discovery_session_key;
+use crate::session::discovery_agent_id;
 use crate::turso::{self};
 use anyhow::{Context, Result};
 use chrono::Timelike;
@@ -183,7 +183,7 @@ async fn run_workspace_discovery(
     tracing::info!(workspace_name = ws.name, role = %role, "Starting workspace discovery");
 
     // Create a Discovery agent pointed at the workspace
-    let agent_id = discovery_session_key(&ws.name, role.as_str());
+    let agent_id = discovery_agent_id(&ws.name, role.as_str());
     let prompt = role.discovery_prompt();
     let (_agent, response) = run_agent(
         agent_id,
@@ -237,7 +237,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
 
     tracing::info!(workspace_name = ws.name, "Starting diagnostics discovery");
 
-    let agent_id = discovery_session_key(&ws.name, "diagnostics");
+    let agent_id = discovery_agent_id(&ws.name, "diagnostics");
 
     // Load the diagnostics discovery prompt directly (not a role-specific discovery prompt).
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");

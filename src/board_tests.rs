@@ -1842,8 +1842,7 @@ async fn test_claim_sanitation() {
         let id = make_ticket(&store, &ws, &title, case.phase).await;
 
         // Compute before the call (needed as parameter even for non-claim cases).
-        let expected_key =
-            crate::session::ticket_session_key(&id, crate::Role::Sanitation.as_str());
+        let expected_key = crate::session::ticket_agent_id(&id, crate::Role::Sanitation.as_str());
 
         let claimed = store
             .claim_sanitation(&id, &expected_key)
@@ -1861,7 +1860,7 @@ async fn test_claim_sanitation() {
             assert_eq!(
                 ticket.assigned_to.as_deref(),
                 Some(expected_key.as_str()),
-                "Case '{}': assigned_to should be set to sanitation session key",
+                "Case '{}': assigned_to should be set to sanitation agent ID",
                 case.name
             );
         }
@@ -1879,10 +1878,9 @@ async fn test_claim_sanitation_workspace_serialization() {
     // Second ticket in QaPassed — same workspace
     let second_id = make_ticket(&store, &ws, "Second", TicketPhase::QaPassed).await;
 
-    // Compute session keys before the calls (needed as parameters).
-    let first_key = crate::session::ticket_session_key(&first_id, crate::Role::Sanitation.as_str());
-    let second_key =
-        crate::session::ticket_session_key(&second_id, crate::Role::Sanitation.as_str());
+    // Compute agent IDs before the calls (needed as parameters).
+    let first_key = crate::session::ticket_agent_id(&first_id, crate::Role::Sanitation.as_str());
+    let second_key = crate::session::ticket_agent_id(&second_id, crate::Role::Sanitation.as_str());
 
     // Claim the first — should succeed
     let first_claimed = store
@@ -1931,9 +1929,9 @@ async fn test_claim_sanitation_cross_workspace_serialization() {
     let id_a = make_ticket(&store, &ws_a, "Workspace A", TicketPhase::QaPassed).await;
     let id_b = make_ticket(&store, &ws_b, "Workspace B", TicketPhase::QaPassed).await;
 
-    // Compute session keys before the calls (needed as parameters).
-    let key_a = crate::session::ticket_session_key(&id_a, crate::Role::Sanitation.as_str());
-    let key_b = crate::session::ticket_session_key(&id_b, crate::Role::Sanitation.as_str());
+    // Compute agent IDs before the calls (needed as parameters).
+    let key_a = crate::session::ticket_agent_id(&id_a, crate::Role::Sanitation.as_str());
+    let key_b = crate::session::ticket_agent_id(&id_b, crate::Role::Sanitation.as_str());
 
     // Both should succeed independently (different workspaces)
     let claimed_a = store

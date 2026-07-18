@@ -249,19 +249,16 @@ mod tests {
     async fn test_open_smoke() {
         let (store, _tmp) = test_setup().await;
 
-        // Verify there is no session_key column.
+        // Verify there is no agent_id column.
         let rows = store
             .conn
             .query(
-                "SELECT 1 FROM pragma_table_info('chat_history') WHERE name = 'session_key'",
+                "SELECT 1 FROM pragma_table_info('chat_history') WHERE name = 'agent_id'",
                 turso::params![],
             )
             .await
             .expect("Failed to check column existence");
-        assert!(
-            rows.is_empty(),
-            "session_key should not exist in fresh schema"
-        );
+        assert!(rows.is_empty(), "agent_id should not exist in fresh schema");
 
         // Verify basic insert and load work.
         store

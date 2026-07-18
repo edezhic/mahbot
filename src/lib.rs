@@ -617,13 +617,14 @@ pub(crate) struct ToolCallRecord {
 
 /// Running context for an agent turn.
 pub struct Agent {
-    /// Session persistence key; also serves as the registry run ID.
+    /// Session persistence key; also serves as the registry agent ID.
     /// Direct-chat agents use `{channel}_{sender}_{role}_{ws_name}` as the key (stable across messages).
     /// Sub-agents and ticket handlers use a fresh NanoID per invocation.
-    pub(crate) session_key: String,
+    #[allow(clippy::struct_field_names)]
+    pub(crate) agent_id: String,
     /// The agent's role (Manager, Engineer, Analyst, etc.).
     role: Role,
-    /// Agent owns its session — all session methods take the key from `self.session_key`.
+    /// Agent owns its session — all session methods take the key from `self.agent_id`.
     pub(crate) session: Session,
     /// Execution workspace for this agent.
     workspace: Arc<crate::Workspace>,

@@ -86,7 +86,7 @@ macro_rules! __columns_gen {
 ///
 /// The `=> "..."` syntax accepts any SQL expression as a string literal, so
 /// complex expressions like `"json_each.value AS error"`, `"COUNT(s.id)"`,
-/// or `"sm.session_key"` are fully supported.
+/// or `"sm.agent_id"` are fully supported.
 #[macro_export]
 macro_rules! columns {
     (

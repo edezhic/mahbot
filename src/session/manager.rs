@@ -5,10 +5,10 @@
 //!
 //! ## Usage
 //! 1. `Session::default()` at turn start
-//! 2. `session.init(session_key, msg, ws, role, ticket)` — loads history, builds prompt
+//! 2. `session.init(agent_id, msg, ws, role, ticket)` — loads history, builds prompt
 //!    for new sessions, persists user message, stores history internally
 //! 3. Agent loop calls `session.push_assistant()`, `session.push_messages()`, etc. during tool rounds
-//! 4. `session.finalize(session_key)` on success — persists the final assistant response
+//! 4. `session.finalize(agent_id)` on success — persists the final assistant response
 
 use std::fmt::Write;
 
@@ -33,8 +33,8 @@ impl Session {
     // ── Session lifecycle ──────────────────────────────────────────────
 
     /// Delete a session. Intended for `/new` command handling.
-    pub async fn delete(session_key: &str) -> String {
-        let _ = crate::session::store().delete(session_key).await;
+    pub async fn delete(agent_id: &str) -> String {
+        let _ = crate::session::store().delete(agent_id).await;
         "Session cleared. Starting fresh.".to_string()
     }
 
@@ -60,14 +60,14 @@ impl Session {
     /// See [`crate::session`] for the summarization constants and helpers.
     pub(crate) async fn init(
         &mut self,
-        session_key: &str,
+        agent_id: &str,
         msg: &str,
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::board::Ticket>,
     ) -> Result<()> {
         // Load existing history from DB
-        let mut history = crate::session::store().load(session_key).await;
+        let mut history = crate::session::store().load(agent_id).await;
         let is_new = history.is_empty();
 
         if is_new {
@@ -75,7 +75,7 @@ impl Session {
 
             // Batch-write all messages + metadata and use the same messages for in-memory history
             crate::session::store()
-                .batch_append(session_key, &msgs)
+                .batch_append(agent_id, &msgs)
                 .await?;
             history.extend(msgs);
         } else {
@@ -84,9 +84,7 @@ impl Session {
             // first-turn message set. The only rebuild path is
             // `apply_summary` below.
             let user_msg = user_msg_with_datetime(msg);
-            crate::session::store()
-                .append(session_key, &user_msg)
-                .await?;
+            crate::session::store().append(agent_id, &user_msg).await?;
             history.push(user_msg);
         }
         self.history = history;
@@ -132,7 +130,7 @@ impl Session {
     /// next turn reloads from DB and retries (self-healing).
     pub(crate) async fn apply_summary(
         &mut self,
-        session_key: &str,
+        agent_id: &str,
         msg: &str,
         summary_text: &str,
         ws: &Workspace,
@@ -152,11 +150,11 @@ impl Session {
         // On success, update in-memory history to match. On failure, keep the
         // full in-memory history — next turn reloads from DB and retries.
         if let Err(e) = crate::session::store()
-            .replace_messages(session_key, &compacted)
+            .replace_messages(agent_id, &compacted)
             .await
         {
             tracing::error!(
-                session = %session_key,
+                agent_id = %agent_id,
                 error = %e,
                 "Failed to persist compacted session after summarization"
             );
@@ -169,7 +167,7 @@ impl Session {
 
     /// Persist the final assistant message (last assistant entry in history)
     /// to the session store.
-    pub(crate) async fn finalize(&self, session_key: &str) -> Result<()> {
+    pub(crate) async fn finalize(&self, agent_id: &str) -> Result<()> {
         let Some(final_msg) = self
             .history
             .last()
@@ -178,9 +176,7 @@ impl Session {
             tracing::warn!("finalize called but no assistant message in history");
             return Ok(());
         };
-        crate::session::store()
-            .append(session_key, final_msg)
-            .await?;
+        crate::session::store().append(agent_id, final_msg).await?;
         Ok(())
     }
 

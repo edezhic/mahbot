@@ -7,7 +7,7 @@
 //! agent queue.
 
 use crate::manager_queue::{self, AgentJob, JobKind};
-use crate::session::ask_session_key;
+use crate::session::ask_agent_id;
 use crate::tools::Tool;
 use crate::{Agent, Role, Workspace};
 use anyhow::Result;
@@ -169,9 +169,9 @@ impl Tool for AskTool {
 /// Shared sub-agent runner — creates and executes a sub-agent for the given
 /// role and ask. Used by both sync and async paths of [`AskTool::execute`].
 async fn run_sub_agent(ws: &Workspace, role: Role, ask: &str) -> Result<String> {
-    let sub_id = ask_session_key(&ws.name, role.as_str());
+    let agent_id = ask_agent_id(&ws.name, role.as_str());
 
-    let mut agent = Agent::new(sub_id, role, ws, None, String::new(), String::new());
+    let mut agent = Agent::new(agent_id, role, ws, None, String::new(), String::new());
     let cancel = agent.cancel_token();
 
     let response = tokio::select! {

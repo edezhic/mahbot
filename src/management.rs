@@ -36,7 +36,7 @@ use crate::git_commands::{
 use crate::manager_queue;
 use crate::prompt::{load_prompt, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
-use crate::session::ticket_session_key;
+use crate::session::ticket_agent_id;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::turso::TxGuard;
@@ -419,10 +419,10 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
 /// The caller MUST ensure the failure comment has already been written to the DB
 /// before calling this function (the transition closure runs first in
 /// [`with_comment_and_transition`], so this invariant holds for all call paths).
-/// The session key (`manager_{ws_name}`) is intentionally shared between
+/// The agent ID (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
 /// must see both notification context and user conversation history in a unified
-/// session. Do NOT change this key or add `manager_` to `TRANSIENT_SESSION_PREFIXES`
+/// session. Do NOT change this ID or add `manager_` to `TRANSIENT_AGENT_ID_PREFIXES`
 /// — it would either break context continuity or nuke user conversation history.
 async fn notify_ticket(ticket: &Ticket, source: TicketPhase, target_phase: TicketPhase) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
@@ -1052,7 +1052,7 @@ async fn run_claim_pipeline(ws: &Workspace) {
 /// - InDiagnostics (buffer) on successful completion
 /// - Failed (notify) if the agent failed or returned no output
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
-    let session_key = ticket_session_key(&ticket.id, Role::Engineer.as_str());
+    let agent_id = ticket_agent_id(&ticket.id, Role::Engineer.as_str());
 
     let last_eng_pos = ticket
         .comments
@@ -1071,10 +1071,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         format!("New feedback to address:\n{}", feedback.join("\n---\n"))
     };
 
-    if let Err(e) = board()
-        .set_assigned_to(&ticket.id, Some(&session_key))
-        .await
-    {
+    if let Err(e) = board().set_assigned_to(&ticket.id, Some(&agent_id)).await {
         warn!(
             ticket = %ticket.id,
             error = %e,
@@ -1083,7 +1080,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     let (_agent, response) = run_agent(
-        session_key,
+        agent_id,
         Role::Engineer,
         &ws,
         Some(&ticket),
@@ -1398,8 +1395,8 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     } else {
         // Untracked files exist — claim this specific ticket to InSanitation
         // via the dedicated claim_sanitation method (see BoardStore docs).
-        let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
-        let claimed = match board().claim_sanitation(&ticket.id, &session_key).await {
+        let agent_id = ticket_agent_id(&ticket.id, Role::Sanitation.as_str());
+        let claimed = match board().claim_sanitation(&ticket.id, &agent_id).await {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -1463,7 +1460,7 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
 /// delegates to [`process_sanitation_verdict`] for pass/fail processing.
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
-    let session_key = ticket_session_key(&ticket.id, Role::Sanitation.as_str());
+    let agent_id = ticket_agent_id(&ticket.id, Role::Sanitation.as_str());
 
     //
     // Unlike handle_qa_passed (which fails closed on git errors — returning early
@@ -1505,7 +1502,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     );
 
     let (agent, response) = run_agent(
-        session_key,
+        agent_id,
         Role::Sanitation,
         &ws,
         Some(&ticket),
@@ -1859,7 +1856,7 @@ enum ParallelVerdict {
 /// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
 /// from their responses.
 ///
-/// Session keys are formatted as `ticket_{ticket.id}_{role}_{i}_{suffix}`
+/// Agent IDs are formatted as `ticket_{ticket.id}_{role}_{i}_{suffix}`
 /// where `suffix` is a unique 6-char NanoID for retry-cycle disambiguation.
 /// Each agent creates its own CancellationToken and auto-registers.
 ///
@@ -1880,12 +1877,12 @@ async fn run_parallel_agents(
             let ticket = Arc::clone(ticket);
             let prompt = prompt.to_string();
             let ws = ws.clone();
-            let base = ticket_session_key(&ticket.id, role.as_str());
-            let session_key = format!("{base}_{i}_{suffix}");
+            let base = ticket_agent_id(&ticket.id, role.as_str());
+            let agent_id = format!("{base}_{i}_{suffix}");
             let extraction_prompt = extraction_prompt.to_string();
             async move {
                 let (agent, response) = run_agent(
-                    session_key,
+                    agent_id,
                     role,
                     &ws,
                     Some(&ticket),
@@ -2030,8 +2027,8 @@ async fn record_verdict_comments_tx(
 /// * **`assigned_to` is already `NULL`** — [`claim_ticket_in_workspace`] sets
 ///   `assigned_to = NULL` during the Backlog → InAnalysis claim
 ///   (see [board.rs:906-912]). There is no assigned user to clear.
-/// * **Ephemeral session keys** — [`run_parallel_agents`] generates unique session
-///   keys (`{base}_{i}_{suffix}`) that are never written to the ticket's `assigned_to`
+/// * **Ephemeral agent IDs** — [`run_parallel_agents`] generates unique agent
+///   IDs (`{base}_{i}_{suffix}`) that are never written to the ticket's `assigned_to`
 ///   field. The agent registry entries for these parallel agents have already finished
 ///   or been cancelled by the pre-flight [`AGENT_REGISTRY.cancel_by_ticket_id`] call
 ///   in [`spawn_dispatch`].

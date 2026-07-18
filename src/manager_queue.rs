@@ -16,7 +16,7 @@
 use crate::channels::{
     broadcast_and_persist_agent_response, spawn_scoped_typing_task, stop_typing,
 };
-use crate::session::manager_session_key;
+use crate::session::manager_agent_id;
 use crate::users::UserRecord;
 use crate::{ChatEvent, Role, SendMessage};
 use std::collections::{HashMap, HashSet};
@@ -234,12 +234,12 @@ async fn consumer_loop(role: Role, mut rx: mpsc::UnboundedReceiver<AgentJob>) {
             }
         };
 
-        // ── Role-specific session key ─────────────────────────────────
+        // ── Role-specific agent ID ───────────────────────────────────
         // Manager: workspaces have one session shared by all users.
         // Assistant (and other per-user roles): include user_name so that
         // each user gets an isolated session — no cross-user context leak.
-        let session_key = match role {
-            Role::Manager => manager_session_key(&ws.name),
+        let agent_id = match role {
+            Role::Manager => manager_agent_id(&ws.name),
             _ => format!("queue_{}_{}_{}", role.as_str(), ws.name, job.user_name),
         };
 
@@ -279,7 +279,7 @@ async fn consumer_loop(role: Role, mut rx: mpsc::UnboundedReceiver<AgentJob>) {
 
         // ── Run the agent ────────────────────────────────────────────
         let (_agent, response) = crate::agent::run_agent(
-            session_key,
+            agent_id,
             role,
             &ws,
             None,

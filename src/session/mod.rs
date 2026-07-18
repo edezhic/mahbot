@@ -5,7 +5,7 @@ pub use manager::Session;
 
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 
 // ── Summarization constants ──────────────────────────────────
@@ -60,20 +60,20 @@ crate::define_store! {
     pub(crate) static SESSIONS: SessionStore,
     db_name = "sessions",
     schema = SCHEMA,
+    post_open = after_open,
     expect = "SESSIONS not initialized",
 }
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_key TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
     role        TEXT NOT NULL,
     content     TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_key_id ON sessions(session_key, id);
 
 CREATE TABLE IF NOT EXISTS session_metadata (
-    session_key   TEXT PRIMARY KEY,
+    agent_id      TEXT PRIMARY KEY,
     created_at    TEXT NOT NULL,
     last_activity TEXT NOT NULL
 );";
@@ -88,31 +88,31 @@ crate::columns! {
     }
 }
 
-// Session list with metadata (3-column SELECT: sm.session_key, sm.last_activity,
+// Session list with metadata (3-column SELECT: sm.agent_id, sm.last_activity,
 // COUNT(s.id))
 crate::columns! {
     SESSION_LIST_COLUMNS [SL] {
-        SESSION_KEY    => "sm.session_key",
+        AGENT_ID      => "sm.agent_id",
         LAST_ACTIVITY  => "sm.last_activity",
         MESSAGE_COUNT  => "COUNT(s.id)",
     }
 }
 
-/// Session key prefixes for transient (background-only, non-user-facing) sessions.
+/// Agent ID prefixes for transient (background-only, non-user-facing) agent sessions.
 ///
-/// These sessions are created automatically by agents (analysts, engineers, maintainer,
-/// discovery, etc.) and are cleaned up periodically by
+/// These agents are created automatically (analysts, engineers, maintainer,
+/// discovery, etc.) and their sessions are cleaned up periodically by
 /// [`cleanup_old_transient_sessions`].
 ///
-/// User-facing sessions — those the user can directly converse with — persist
+/// User-facing agents — those the user can directly converse with — persist
 /// indefinitely and are intentionally excluded:
 /// - Direct chat: `{channel}_{user_name}_{role}_{ws_name}`
 /// - Manager: `manager_{ws_name}` — the Manager session carries both chat conversation
 ///   and notification context and must never be added here.
 ///
-/// If a new agent role is added that can talk to users directly, its session key
+/// If a new agent role is added that can talk to users directly, its agent ID prefix
 /// must also be excluded from this list.
-pub(crate) const TRANSIENT_SESSION_PREFIXES: &[&str] =
+pub(crate) const TRANSIENT_AGENT_ID_PREFIXES: &[&str] =
     &["ticket_", "ask_", "maintainer_", "discovery_"];
 
 #[derive(Debug, Clone)]
@@ -151,15 +151,15 @@ fn session_metadata_from_row(key: &str, activity_str: &str, count: i64) -> Sessi
 /// Shared helper used by [`SessionStore::append_messages`].
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
-    session_key: &str,
+    agent_id: &str,
     messages: &[ChatMessage],
 ) -> Result<()> {
     let now = turso::now();
     for msg in messages {
         tx.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![
-                session_key,
+                agent_id,
                 msg.role.to_string(),
                 msg.content.clone(),
                 now.clone()
@@ -168,11 +168,11 @@ async fn insert_messages_in_transaction(
         .await?;
     }
     tx.execute(
-        "INSERT INTO session_metadata (session_key, created_at, last_activity) \
+        "INSERT INTO session_metadata (agent_id, created_at, last_activity) \
          VALUES (?1, ?2, ?3) \
-         ON CONFLICT(session_key) DO UPDATE SET \
+         ON CONFLICT(agent_id) DO UPDATE SET \
          last_activity = excluded.last_activity",
-        params![session_key, now.clone(), now],
+        params![agent_id, now.clone(), now],
     )
     .await?;
     Ok(())
@@ -181,7 +181,7 @@ async fn insert_messages_in_transaction(
 /// Execute a `query_map`, logging warnings on failure and skipping unparseable rows.
 /// Returns an empty [`Vec`] on query error.
 ///
-/// `session_key` is passed as a structured tracing field; when `None`, tracing
+/// `agent_id` is passed as a structured tracing field; when `None`, tracing
 /// automatically suppresses it from the output.
 async fn query_map_collect<T, E>(
     conn: &turso::Connection,
@@ -189,7 +189,7 @@ async fn query_map_collect<T, E>(
     params: impl IntoParams + Send + 'static,
     row_parser: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
     warn_context: &str,
-    session_key: Option<&str>,
+    agent_id: Option<&str>,
 ) -> Vec<T>
 where
     T: Send + 'static,
@@ -198,7 +198,7 @@ where
     let rows = match conn.query_map(sql, params, row_parser).await {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::warn!(error = %e, session_key, "{warn_context}: query failed, returning empty");
+            tracing::warn!(error = %e, agent_id, "{warn_context}: query failed, returning empty");
             return Vec::new();
         }
     };
@@ -206,7 +206,7 @@ where
         .filter_map(|r| match r {
             Ok(val) => Some(val),
             Err(e) => {
-                tracing::warn!(error = %e, session_key, "{warn_context}: row decode failed, skipping");
+                tracing::warn!(error = %e, agent_id, "{warn_context}: row decode failed, skipping");
                 None
             }
         })
@@ -216,74 +216,79 @@ where
 // ── Methods — callable on the static ──────────────────────────
 
 impl SessionStore {
-    pub(crate) async fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+    pub(crate) async fn load(&self, agent_id: &str) -> Vec<ChatMessage> {
         query_map_collect(
             &self.conn,
-            &format!("SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE session_key = ?1 ORDER BY id ASC"),
-            params![session_key],
+            &format!(
+                "SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE agent_id = ?1 ORDER BY id ASC"
+            ),
+            params![agent_id],
             |row| {
                 Ok::<_, anyhow::Error>(ChatMessage {
-                    role: row.get::<String>(COL_SM_ROLE)?.parse::<ChatRole>().map_err(|e| anyhow!(e))?,
+                    role: row
+                        .get::<String>(COL_SM_ROLE)?
+                        .parse::<ChatRole>()
+                        .map_err(|e| anyhow!(e))?,
                     content: row.get(COL_SM_CONTENT)?,
                 })
             },
             "load session",
-            Some(session_key),
+            Some(agent_id),
         )
         .await
     }
 
-    pub(crate) async fn append(&self, session_key: &str, message: &ChatMessage) -> Result<()> {
-        self.batch_append(session_key, std::slice::from_ref(message))
+    pub(crate) async fn append(&self, agent_id: &str, message: &ChatMessage) -> Result<()> {
+        self.batch_append(agent_id, std::slice::from_ref(message))
             .await
     }
 
     async fn append_messages(
         &self,
-        session_key: &str,
+        agent_id: &str,
         messages: &[ChatMessage],
         replace: bool,
     ) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         if replace {
             tx.execute(
-                "DELETE FROM sessions WHERE session_key = ?1",
-                params![session_key],
+                "DELETE FROM sessions WHERE agent_id = ?1",
+                params![agent_id],
             )
             .await?;
         }
-        insert_messages_in_transaction(&tx, session_key, messages).await?;
+        insert_messages_in_transaction(&tx, agent_id, messages).await?;
         tx.commit().await?;
         Ok(())
     }
 
     pub(crate) async fn batch_append(
         &self,
-        session_key: &str,
+        agent_id: &str,
         messages: &[ChatMessage],
     ) -> Result<()> {
-        self.append_messages(session_key, messages, false).await
+        self.append_messages(agent_id, messages, false).await
     }
 
     pub(crate) async fn replace_messages(
         &self,
-        session_key: &str,
+        agent_id: &str,
         messages: &[ChatMessage],
     ) -> Result<()> {
-        self.append_messages(session_key, messages, true).await
+        self.append_messages(agent_id, messages, true).await
     }
 
-    pub(crate) async fn delete(&self, session_key: &str) -> Result<bool> {
+    pub(crate) async fn delete(&self, agent_id: &str) -> Result<bool> {
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
             .execute(
-                "DELETE FROM sessions WHERE session_key = ?1",
-                params![session_key],
+                "DELETE FROM sessions WHERE agent_id = ?1",
+                params![agent_id],
             )
             .await?;
         tx.execute(
-            "DELETE FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
+            "DELETE FROM session_metadata WHERE agent_id = ?1",
+            params![agent_id],
         )
         .await?;
         tx.commit().await?;
@@ -296,14 +301,14 @@ impl SessionStore {
             &format!(
                 "SELECT {SESSION_LIST_COLUMNS} \
                  FROM session_metadata sm \
-                 LEFT JOIN sessions s ON s.session_key = sm.session_key \
-                 GROUP BY sm.session_key \
+                 LEFT JOIN sessions s ON s.agent_id = sm.agent_id \
+                 GROUP BY sm.agent_id \
                  ORDER BY sm.last_activity DESC",
             ),
             (),
             |row| {
                 Ok::<_, anyhow::Error>(session_metadata_from_row(
-                    &row.get::<String>(COL_SL_SESSION_KEY)?,
+                    &row.get::<String>(COL_SL_AGENT_ID)?,
                     &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
                     row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
                 ))
@@ -315,20 +320,119 @@ impl SessionStore {
     }
 }
 
+// ── Schema migration (rename session_key to agent_id) ─────────────
+
+impl SessionStore {
+    /// Post-open setup: run schema migrations, then ensure indexes.
+    async fn after_open(&self) -> anyhow::Result<()> {
+        run_session_migrations(&self.conn).await?;
+        // Index must be created AFTER migration so the column name matches.
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_agent_id \
+                 ON sessions(agent_id, id);",
+            )
+            .await
+            .context("Failed to create sessions index")?;
+        Ok(())
+    }
+}
+
+/// Run schema migrations for the `sessions` and `session_metadata` tables.
+///
+/// Uses `PRAGMA user_version` for versioning (following the board.rs pattern).
+/// Migration v1: rename `session_key` column to `agent_id` in both tables.
+async fn run_session_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
+    let version_rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .context("Failed to read PRAGMA user_version for schema migration")?;
+    let current_version: i64 = version_rows
+        .first()
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0);
+
+    if current_version < 1 {
+        // Check whether the old `session_key` column still exists in sessions table.
+        let table_info = conn
+            .query("PRAGMA table_info('sessions')", ())
+            .await
+            .context("Failed to read PRAGMA table_info for sessions table")?;
+
+        let has_session_key = table_info
+            .iter()
+            .any(|row| row.get::<String>(1).ok().as_deref() == Some("session_key"));
+
+        if has_session_key {
+            tracing::info!("Schema migration: renaming sessions.session_key to sessions.agent_id");
+            conn.execute(
+                "ALTER TABLE sessions RENAME COLUMN session_key TO agent_id",
+                (),
+            )
+            .await
+            .context(
+                "Schema migration failed: unable to rename sessions.session_key to sessions.agent_id",
+            )?;
+        }
+
+        // Same for session_metadata table.
+        let meta_table_info = conn
+            .query("PRAGMA table_info('session_metadata')", ())
+            .await
+            .context("Failed to read PRAGMA table_info for session_metadata table")?;
+
+        let meta_has_session_key = meta_table_info
+            .iter()
+            .any(|row| row.get::<String>(1).ok().as_deref() == Some("session_key"));
+
+        if meta_has_session_key {
+            tracing::info!(
+                "Schema migration: renaming session_metadata.session_key to session_metadata.agent_id"
+            );
+            conn.execute(
+                "ALTER TABLE session_metadata RENAME COLUMN session_key TO agent_id",
+                (),
+            )
+            .await
+            .context(
+                "Schema migration failed: unable to rename session_metadata.session_key to session_metadata.agent_id",
+            )?;
+        }
+
+        // PRAGMA user_version is NOT transaction-atomic in SQLite — set it
+        // after the ALTER TABLE (which has already auto-committed).
+        conn.execute("PRAGMA user_version = 1", ())
+            .await
+            .context("Schema migration failed: unable to set PRAGMA user_version to 1")?;
+
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after renaming session_key columns",
+        )?;
+
+        if has_session_key || meta_has_session_key {
+            tracing::info!(
+                "Schema migration complete: renamed session_key to agent_id (version 1)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Delete all transient (background-only) sessions whose `last_activity` is older than
 /// the given RFC 3339 `cutoff`. Returns the number of deleted session metadata rows.
 ///
-/// Transient session keys start with the prefixes listed in
-/// `TRANSIENT_SESSION_PREFIXES`.
+/// Transient agent IDs start with the prefixes listed in
+/// `TRANSIENT_AGENT_ID_PREFIXES`.
 ///
 /// Both `sessions` and `session_metadata` tables are cleaned up in a single transaction.
 pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     let session_store = store();
     let tx = session_store.conn.begin_tx().await?;
 
-    let likes = TRANSIENT_SESSION_PREFIXES
+    let likes = TRANSIENT_AGENT_ID_PREFIXES
         .iter()
-        .map(|_| "session_key LIKE ?")
+        .map(|_| "agent_id LIKE ?")
         .collect::<Vec<_>>()
         .join(" OR ");
     let prefix_patterns = format!("({likes})");
@@ -336,7 +440,7 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     let build_params = {
         let mut p = vec![Value::Text(cutoff.to_string())];
         p.extend(
-            TRANSIENT_SESSION_PREFIXES
+            TRANSIENT_AGENT_ID_PREFIXES
                 .iter()
                 .map(|prefix| Value::Text(format!("{prefix}%"))),
         );
@@ -346,8 +450,8 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     // Delete session messages for matching transient sessions
     tx.execute(
         &format!(
-            "DELETE FROM sessions WHERE session_key IN ( \
-             SELECT session_key FROM session_metadata \
+            "DELETE FROM sessions WHERE agent_id IN ( \
+             SELECT agent_id FROM session_metadata \
              WHERE last_activity < ? AND {prefix_patterns})"
         ),
         build_params.clone(),
@@ -367,87 +471,90 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     Ok(deleted)
 }
 
-/// Construct a session key for direct (non-ticket) user ↔ agent conversations.
+/// Construct an agent ID for direct user-to-agent chat.
 ///
 /// Format: `{channel}_{user_name}_{role}_{ws_name}`
+/// This ID is stable across messages — the same ID is used for every message
+/// in the same channel/user/role/workspace combination, accumulating conversation
+/// history within a single session.
 #[must_use]
-pub fn direct_session_key(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
+pub fn direct_agent_id(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
     format!("{channel}_{user_name}_{role}_{ws_name}")
 }
 
-/// Construct a base session key for ticket-driven agent work.
+/// Construct a base agent ID for ticket-driven agent work.
 ///
-/// The base key format is `ticket_{ticket_id}_{role}`.
+/// The base ID format is `ticket_{ticket_id}_{role}`.
 ///
 /// ## Usage
 ///
 /// * **Singular dispatch** (e.g., Engineer at `dispatch_engineer`): the base
-///   key is used directly — no suffix is appended.
+///   ID is used directly — no suffix is appended.
 ///
 /// * **Parallel agents** (analysts, reviewers, QA via
 ///   `run_parallel_agents`): the caller appends `_{index}_{suffix}`
-///   for disambiguation, producing keys like
+///   for disambiguation, producing IDs like
 ///   `ticket_{ticket_id}_{role}_0_nano`.
 #[must_use]
-pub(crate) fn ticket_session_key(ticket_id: &str, role: &str) -> String {
+pub(crate) fn ticket_agent_id(ticket_id: &str, role: &str) -> String {
     format!("ticket_{ticket_id}_{role}")
 }
 
-/// Construct a session key for Manager agents (workspace-scoped).
+/// Construct an agent ID for Manager agents (workspace-scoped).
 ///
 /// Format: `manager_{ws_name}`
 #[must_use]
-pub(crate) fn manager_session_key(ws_name: &str) -> String {
+pub(crate) fn manager_agent_id(ws_name: &str) -> String {
     format!("manager_{ws_name}")
 }
 
-/// Construct a session key for a user message, dispatching to the appropriate
-/// key format based on role.
+/// Construct an agent ID for a user message, dispatching to the appropriate
+/// format based on role.
 ///
-/// - **Manager** sessions use workspace-scoped keys (`manager_{ws_name}`).
-/// - **Non-Manager** sessions use channel-scoped keys
+/// - **Manager** agents use workspace-scoped IDs (`manager_{ws_name}`).
+/// - **Non-Manager** agents use channel-scoped IDs
 ///   (`{channel}_{user_name}_{role}_{ws_name}`).
 ///
-/// This is a convenience wrapper around [`manager_session_key`] and
-/// [`direct_session_key`] that selects the right format based on
+/// This is a convenience wrapper around [`manager_agent_id`] and
+/// [`direct_agent_id`] that selects the right format based on
 /// whether `role` is `"manager"`.
 ///
 /// # Parameter order
 ///
-/// Matches [`direct_session_key`]: `channel` first, then `user_name`,
+/// Matches [`direct_agent_id`]: `channel` first, then `user_name`,
 /// `role`, and `ws_name` last.
 #[must_use]
-pub fn session_key(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
+pub fn resolve_agent_id(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
     if role == "manager" {
-        manager_session_key(ws_name)
+        manager_agent_id(ws_name)
     } else {
-        direct_session_key(channel, user_name, role, ws_name)
+        direct_agent_id(channel, user_name, role, ws_name)
     }
 }
 
-/// Construct a session key for Maintainer agents (workspace-scoped, unique per run).
+/// Construct an agent ID for Maintainer agents (workspace-scoped, unique per run).
 ///
 /// Format: `maintainer_{ws_name}_{suffix}`
-/// Each run gets a fresh key (via random suffix) — maintainer runs should not
+/// Each run gets a fresh ID (via random suffix) — maintainer runs should not
 /// accumulate conversation history across maintenance cycles.
 #[must_use]
-pub(crate) fn maintainer_session_key(ws_name: &str) -> String {
+pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
     format!("maintainer_{}_{}", ws_name, crate::generate_suffix())
 }
 
-/// Construct a session key for sub-agent asks (Engineer/Maintainer → sub-agent).
+/// Construct an agent ID for sub-agent asks (Engineer/Maintainer → sub-agent).
 ///
 /// Format: `ask_{ws_name}_{role}_{suffix}`
 #[must_use]
-pub(crate) fn ask_session_key(ws_name: &str, role: &str) -> String {
+pub(crate) fn ask_agent_id(ws_name: &str, role: &str) -> String {
     format!("ask_{}_{}_{}", ws_name, role, crate::generate_suffix())
 }
 
-/// Construct a session key for workspace role discovery.
+/// Construct an agent ID for workspace role discovery.
 ///
 /// Format: `discovery_{ws_name}_{role}_{suffix}`
 #[must_use]
-pub(crate) fn discovery_session_key(ws_name: &str, role: &str) -> String {
+pub(crate) fn discovery_agent_id(ws_name: &str, role: &str) -> String {
     format!(
         "discovery_{}_{}_{}",
         ws_name,
@@ -506,24 +613,225 @@ mod tests {
     }
 }
 
-// ── TRANSIENT SESSION PREFIX GUARDS ───────────────────────────
+/// Validate that the `session_key` → `agent_id` column rename migration works correctly:
+///   1. Creates a database with the old schema (`session_key` columns)
+///   2. Inserts sample rows via raw SQL
+///   3. Opens via [`SessionStore`], which triggers migration in `after_open`
+///   4. Verifies data survived intact
+///   5. Verifies columns are now named `agent_id`
+///   6. Verifies `PRAGMA user_version = 1`
+///   7. Re-opens to verify idempotency
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Old DDL with `session_key` columns (pre-migration schema).
+    const OLD_SESSION_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_session_key ON sessions(session_key, id);
+
+CREATE TABLE IF NOT EXISTS session_metadata (
+    session_key   TEXT PRIMARY KEY,
+    created_at    TEXT NOT NULL,
+    last_activity TEXT NOT NULL
+);";
+
+    #[tokio::test]
+    async fn test_session_key_to_agent_id_migration() {
+        let tmp = TempDir::new().expect("temp dir for migration test");
+
+        // ── 1. Create a database with the old schema (`session_key` columns) ──
+        let db_path = tmp.path().join("db").join("sessions.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create db directory");
+
+        let old_conn = crate::turso::open_with_schema(&db_path, OLD_SESSION_SCHEMA)
+            .await
+            .expect("open database with old schema");
+
+        // ── 2. Insert sample rows using the old column layout ───────────────
+        // Insert into sessions table
+        old_conn
+            .execute(
+                "INSERT INTO sessions (session_key, role, content, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                crate::turso::params!["key-1", "analyst", "Hello", "2024-01-01T00:00:00Z"],
+            )
+            .await
+            .expect("insert session message key-1");
+
+        old_conn
+            .execute(
+                "INSERT INTO sessions (session_key, role, content, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                crate::turso::params!["key-2", "engineer", "World", "2024-01-02T00:00:00Z"],
+            )
+            .await
+            .expect("insert session message key-2");
+
+        // Insert into session_metadata table
+        old_conn
+            .execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity) \
+                 VALUES (?1, ?2, ?3)",
+                crate::turso::params!["key-1", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z",],
+            )
+            .await
+            .expect("insert session metadata key-1");
+
+        // Checkpoint and close the old connection.
+        old_conn
+            .checkpoint()
+            .await
+            .expect("checkpoint old connection");
+        drop(old_conn);
+
+        // ── 3. Open via SessionStore — triggers migration in after_open() ───
+        let store = SessionStore::open(tmp.path())
+            .await
+            .expect("open session store (should trigger migration)");
+
+        // ── 4. Verify data survived intact ─────────────────────────────────
+        let rows = store
+            .conn
+            .query(
+                "SELECT id, agent_id, role, content FROM sessions ORDER BY id",
+                (),
+            )
+            .await
+            .expect("query migrated sessions");
+        assert_eq!(
+            rows.len(),
+            2,
+            "should have 2 session messages after migration"
+        );
+        assert_eq!(rows[0].get::<String>(1).unwrap(), "key-1");
+        assert_eq!(rows[0].get::<String>(2).unwrap(), "analyst");
+        assert_eq!(rows[0].get::<String>(3).unwrap(), "Hello");
+        assert_eq!(rows[1].get::<String>(1).unwrap(), "key-2");
+        assert_eq!(rows[1].get::<String>(2).unwrap(), "engineer");
+        assert_eq!(rows[1].get::<String>(3).unwrap(), "World");
+
+        // Verify session_metadata also migrated
+        let meta_rows = store
+            .conn
+            .query(
+                "SELECT agent_id, created_at FROM session_metadata ORDER BY agent_id",
+                (),
+            )
+            .await
+            .expect("query migrated session_metadata");
+        assert_eq!(
+            meta_rows.len(),
+            1,
+            "should have 1 metadata row after migration"
+        );
+        assert_eq!(meta_rows[0].get::<String>(0).unwrap(), "key-1");
+
+        // ── 5. Verify columns are now named `agent_id`, not `session_key` ──
+        // Check sessions table
+        let sess_info = store
+            .conn
+            .query("PRAGMA table_info('sessions')", ())
+            .await
+            .expect("query table_info for sessions");
+        let sess_col_names: Vec<String> = sess_info
+            .iter()
+            .filter_map(|r| r.get::<String>(1).ok())
+            .collect();
+        assert!(
+            !sess_col_names.iter().any(|n| n == "session_key"),
+            "column 'session_key' should not exist in sessions after migration; \
+             found: {sess_col_names:?}",
+        );
+        assert!(
+            sess_col_names.iter().any(|n| n == "agent_id"),
+            "column 'agent_id' must exist in sessions after migration; \
+             found: {sess_col_names:?}",
+        );
+
+        // Check session_metadata table
+        let meta_info = store
+            .conn
+            .query("PRAGMA table_info('session_metadata')", ())
+            .await
+            .expect("query table_info for session_metadata");
+        let meta_col_names: Vec<String> = meta_info
+            .iter()
+            .filter_map(|r| r.get::<String>(1).ok())
+            .collect();
+        assert!(
+            !meta_col_names.iter().any(|n| n == "session_key"),
+            "column 'session_key' should not exist in session_metadata after migration; \
+             found: {meta_col_names:?}",
+        );
+        assert!(
+            meta_col_names.iter().any(|n| n == "agent_id"),
+            "column 'agent_id' must exist in session_metadata after migration; \
+             found: {meta_col_names:?}",
+        );
+
+        // ── 6. Verify PRAGMA user_version = 1 ──────────────────────────────
+        let ver_rows = store
+            .conn
+            .query("PRAGMA user_version", ())
+            .await
+            .expect("query user_version after migration");
+        let version: i64 = ver_rows[0].get(0).expect("get user_version value");
+        assert_eq!(version, 1, "user_version should be 1 after migration");
+
+        // ── 7. Re-open to verify idempotency ──────────────────────────────
+        drop(store);
+        let store2 = SessionStore::open(tmp.path())
+            .await
+            .expect("re-open session store (idempotent migration)");
+
+        // Data still intact
+        let rows2 = store2
+            .conn
+            .query(
+                "SELECT id, agent_id, role, content FROM sessions ORDER BY id",
+                (),
+            )
+            .await
+            .expect("query sessions after re-open");
+        assert_eq!(rows2.len(), 2, "should still have 2 sessions after re-open");
+
+        // user_version still 1
+        let ver_rows2 = store2
+            .conn
+            .query("PRAGMA user_version", ())
+            .await
+            .expect("query user_version after re-open");
+        let version2: i64 = ver_rows2[0].get(0).expect("get user_version value");
+        assert_eq!(version2, 1, "user_version should remain 1 after re-open");
+    }
+}
+
+// ── TRANSIENT AGENT ID PREFIX GUARDS ──────────────────────────
 //
-// [`TRANSIENT_SESSION_PREFIXES`] controls which sessions are cleaned up by
+// [`TRANSIENT_AGENT_ID_PREFIXES`] controls which sessions are cleaned up by
 // [`cleanup_old_transient_sessions`] (SQL `LIKE '{prefix}%'`, equivalent to
 // `key.starts_with(prefix)`).
 //
 // Two invariants:
-// 1. **Forward (no collision)**: User-facing session keys must never start with
+// 1. **Forward (no collision)**: User-facing agent IDs must never start with
 //    a transient prefix or the periodic cleanup would silently delete user history.
-// 2. **Reverse (inclusion)**: Transient session key builders must produce keys
-//    starting with a prefix registered in [`TRANSIENT_SESSION_PREFIXES`];
+// 2. **Reverse (inclusion)**: Transient agent ID builders must produce IDs
+//    starting with a prefix registered in [`TRANSIENT_AGENT_ID_PREFIXES`];
 //    an unregistered prefix means transient sessions never get cleaned up (leak).
 //
-// Limitations: `forward_no_collision_with_user_facing_sessions` covers
-// `direct_session_key()` and `manager_session_key()` patterns.
+// Limitations: `forward_no_collision_with_user_facing_agent_ids` covers
+// `direct_agent_id()` and `manager_agent_id()` patterns.
 // `reverse_transient_builders_use_registered_prefixes` covers all transient
 // builders (ticket, ask, maintainer, discovery). If a new transient role
-// adds a session key builder, add it to the reverse test.
+// adds an agent ID builder, add it to the reverse test.
 // Channel-name collision (a channel registered as "ticket" or "ask") is an
 // orthogonal risk — `starts_with` matches the first key segment (channel
 // name), which cannot be guarded by assertion because channel names are
@@ -536,38 +844,38 @@ mod tests {
 mod transient_prefix_tests {
     use super::*;
 
-    /// Known channel identifiers in the system. Must never produce keys
+    /// Known channel identifiers in the system. Must never produce agent IDs
     /// matching a transient prefix.
     const SAFE_CHANNELS: &[&str] = &["telegram", "gui"];
 
     #[test]
-    fn forward_no_collision_with_user_facing_sessions() {
+    fn forward_no_collision_with_user_facing_agent_ids() {
         // For every transient prefix, verify that none of the user-facing
-        // session key patterns start with it. Direct keys have the format
+        // agent ID patterns start with it. Direct IDs have the format
         // {channel}_{user}_{role}_{ws}, and `starts_with` only checks the
         // first segment (channel name). Since safe channels ("telegram",
         // "gui") don't match any transient prefix, the role segment (third)
         // has no effect on the assertion outcome — a single role suffices.
-        for prefix in TRANSIENT_SESSION_PREFIXES {
-            // Manager uses a separate key format (manager_{ws_name}).
-            let manager_key = manager_session_key("test-ws");
+        for prefix in TRANSIENT_AGENT_ID_PREFIXES {
+            // Manager uses a separate ID format (manager_{ws_name}).
+            let manager_key = manager_agent_id("test-ws");
             assert!(
                 !manager_key.starts_with(prefix),
-                "MANAGER SESSION KEY COLLISION: \
-                 prefix='{prefix}' matches key='{manager_key}'. \
-                 Fix: remove '{prefix}' from TRANSIENT_SESSION_PREFIXES \
-                 or change the manager_session_key pattern.",
+                "MANAGER AGENT ID COLLISION: \
+                 prefix='{prefix}' matches id='{manager_key}'. \
+                 Fix: remove '{prefix}' from TRANSIENT_AGENT_ID_PREFIXES \
+                 or change the manager_agent_id pattern.",
             );
 
-            // Direct chat keys across all safe channels.
+            // Direct chat IDs across all safe channels.
             for channel in SAFE_CHANNELS {
-                let key = direct_session_key(channel, "testuser", "analyst", "test-ws");
+                let key = direct_agent_id(channel, "testuser", "analyst", "test-ws");
                 assert!(
                     !key.starts_with(prefix),
-                    "DIRECT SESSION KEY COLLISION: prefix='{prefix}' \
-                     matches key='{key}' (channel='{channel}'). \
-                     Fix: remove '{prefix}' from TRANSIENT_SESSION_PREFIXES \
-                     or change the session key pattern.",
+                    "DIRECT AGENT ID COLLISION: prefix='{prefix}' \
+                     matches id='{key}' (channel='{channel}'). \
+                     Fix: remove '{prefix}' from TRANSIENT_AGENT_ID_PREFIXES \
+                     or change the agent ID pattern.",
                 );
             }
         }
@@ -577,61 +885,61 @@ mod transient_prefix_tests {
         assert!(
             key.starts_with(expected_prefix),
             "{builder_expr} = '{key}' does not start with '{expected_prefix}'.\n\
-             Fix: update {builder_expr} to produce keys starting with '{expected_prefix}'.",
+             Fix: update {builder_expr} to produce IDs starting with '{expected_prefix}'.",
         );
         assert!(
-            TRANSIENT_SESSION_PREFIXES.contains(&expected_prefix),
-            "TRANSIENT_SESSION_PREFIXES is missing '{expected_prefix}' — \
+            TRANSIENT_AGENT_ID_PREFIXES.contains(&expected_prefix),
+            "TRANSIENT_AGENT_ID_PREFIXES is missing '{expected_prefix}' — \
              {builder_expr} sessions will never be cleaned up.\n\
-             Fix: add \"{expected_prefix}\" to TRANSIENT_SESSION_PREFIXES.",
+             Fix: add \"{expected_prefix}\" to TRANSIENT_AGENT_ID_PREFIXES.",
         );
     }
 
     #[test]
     fn reverse_transient_builders_use_registered_prefixes() {
-        // Each transient key builder must produce keys starting with a
-        // prefix that is actually registered in TRANSIENT_SESSION_PREFIXES.
+        // Each transient agent ID builder must produce IDs starting with a
+        // prefix that is actually registered in TRANSIENT_AGENT_ID_PREFIXES.
         assert_transient_key(
-            &ticket_session_key("abc123", "analyst"),
+            &ticket_agent_id("abc123", "analyst"),
             "ticket_",
-            "ticket_session_key('abc123', 'analyst')",
+            "ticket_agent_id('abc123', 'analyst')",
         );
         assert_transient_key(
-            &ask_session_key("ws", "coder"),
+            &ask_agent_id("ws", "coder"),
             "ask_",
-            "ask_session_key('ws', 'coder')",
+            "ask_agent_id('ws', 'coder')",
         );
         assert_transient_key(
-            &maintainer_session_key("ws"),
+            &maintainer_agent_id("ws"),
             "maintainer_",
-            "maintainer_session_key('ws')",
+            "maintainer_agent_id('ws')",
         );
         assert_transient_key(
-            &discovery_session_key("ws", "analyst"),
+            &discovery_agent_id("ws", "analyst"),
             "discovery_",
-            "discovery_session_key('ws', 'analyst')",
+            "discovery_agent_id('ws', 'analyst')",
         );
     }
 
     #[test]
-    fn session_key_manager_dispatch() {
-        // Manager role produces a manager-scoped key.
-        let key = session_key("telegram", "alice", "manager", "my-workspace");
+    fn resolve_agent_id_manager_dispatch() {
+        // Manager role produces a manager-scoped ID.
+        let key = resolve_agent_id("telegram", "alice", "manager", "my-workspace");
         assert_eq!(key, "manager_my-workspace");
     }
 
     #[test]
-    fn session_key_non_manager_dispatch() {
-        // Non-Manager role produces a direct channel-scoped key.
-        let key = session_key("discord", "bob", "engineer", "my-workspace");
+    fn resolve_agent_id_non_manager_dispatch() {
+        // Non-Manager role produces a direct channel-scoped ID.
+        let key = resolve_agent_id("discord", "bob", "engineer", "my-workspace");
         assert_eq!(key, "discord_bob_engineer_my-workspace");
     }
 
     #[test]
-    fn session_key_lowercase_manager() {
+    fn resolve_agent_id_lowercase_manager() {
         // The dispatching uses string comparison `"manager"` — verify it works
         // (matches Role::Manager.as_str() which is lowercase).
-        let key = session_key("gui", "carol", "Manager", "ws");
+        let key = resolve_agent_id("gui", "carol", "Manager", "ws");
         assert_ne!(key, "manager_ws", "capital-M 'Manager' should NOT match");
         assert_eq!(key, "gui_carol_Manager_ws");
     }

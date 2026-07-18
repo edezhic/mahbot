@@ -22,7 +22,7 @@ use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::manager_queue;
 use mahbot::parse_bot_command;
-use mahbot::session::{Session, direct_session_key, session_key};
+use mahbot::session::{Session, direct_agent_id, resolve_agent_id};
 use mahbot::util::UnwrapPoison;
 use mahbot::{Agent, BotCommand, Channel, ChannelMessage, Role, Workspace};
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
@@ -567,8 +567,8 @@ async fn handle_clear_command(msg: &ChannelMessage) {
         resolve_workspace_for_user(msg),
         mahbot::users::resolve_active_role(&msg.user_name),
     );
-    let sk = session_key(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
-    let reply = Session::delete(&sk).await;
+    let agent_id = resolve_agent_id(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
+    let reply = Session::delete(&agent_id).await;
     send_channel_reply(reply, msg, None).await;
 }
 
@@ -678,8 +678,8 @@ async fn handle_action_callback(msg: ChannelMessage) {
                 resolve_workspace_for_user(&msg),
                 mahbot::users::resolve_active_role(&msg.user_name),
             );
-            let sk = session_key(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
-            let reply = Session::delete(&sk).await;
+            let agent_id = resolve_agent_id(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
+            let reply = Session::delete(&agent_id).await;
             send_channel_reply(reply, &msg, None).await;
         }
         _ => {
@@ -836,14 +836,14 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // Agent creation, work execution, and reply delivery all happen
     // inline in the calling task.
 
-    let session_key = direct_session_key(
+    let agent_id = direct_agent_id(
         &msg.channel,
         &msg.user_name,
         effective_role.as_str(),
         &ws.name,
     );
     let mut agent = Agent::new(
-        session_key,
+        agent_id,
         effective_role,
         &ws,
         None,

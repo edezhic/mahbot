@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Monotonically increasing generation counter for registry entries.
 /// Used by [`deregister`](AgentRegistry::deregister) to detect stale entries
-/// — when a new agent is registered with the same `run_id` (e.g. the Manager
+/// — when a new agent is registered with the same `agent_id` (e.g. the Manager
 /// interrupt-and-resume pattern), the old entry's generation will not match
 /// the new entry, so `deregister` will not incorrectly remove the replacement.
 static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -20,7 +20,7 @@ static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Public handle returned by `list()` — serializable, no cancel_token exposed.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentHandle {
-    pub run_id: String,
+    pub agent_id: String,
     pub role: String,
     pub ticket_id: Option<String>,
     /// Filesystem path of the workspace (not the name) — this is used for
@@ -49,7 +49,7 @@ impl AgentRegistry {
     /// instead of a guard.
     pub fn register(
         &self,
-        run_id: String,
+        agent_id: String,
         role: String,
         ticket_id: Option<String>,
         ws: &crate::Workspace,
@@ -58,7 +58,7 @@ impl AgentRegistry {
     ) -> u64 {
         let generation = NEXT_ENTRY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let handle = AgentHandle {
-            run_id: run_id.clone(),
+            agent_id: agent_id.clone(),
             role,
             ticket_id,
             workspace_path: ws.path.clone(),
@@ -66,11 +66,11 @@ impl AgentRegistry {
             label,
         };
         let mut map = self.inner.lock().unwrap_poison();
-        if let Some(old) = map.remove(&run_id) {
+        if let Some(old) = map.remove(&agent_id) {
             old.cancel_token.cancel();
         }
         map.insert(
-            run_id,
+            agent_id,
             AgentEntry {
                 generation,
                 handle,
@@ -80,15 +80,15 @@ impl AgentRegistry {
         generation
     }
 
-    /// Cancel a specific agent by run_id. Removes it from the registry.
+    /// Cancel a specific agent by agent_id. Removes it from the registry.
     ///
     /// Prefer [`cancel_by_ticket_id`](AgentRegistry::cancel_by_ticket_id) or
     /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path)
     /// for external callers — this method bypasses the generation-based safety check
-    /// that guards against stale `run_id` references.
-    fn cancel(&self, run_id: &str) {
+    /// that guards against stale `agent_id` references.
+    fn cancel(&self, agent_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
-        if let Some(entry) = map.remove(run_id) {
+        if let Some(entry) = map.remove(agent_id) {
             entry.cancel_token.cancel();
         }
     }
@@ -96,7 +96,7 @@ impl AgentRegistry {
     /// Cancel all agents matching a predicate.
     ///
     /// The lock is dropped **before** calling [`cancel`](AgentRegistry::cancel) on each matched
-    /// run ID to avoid deadlock — `cancel` acquires the same lock internally.
+    /// agent ID to avoid deadlock — `cancel` acquires the same lock internally.
     ///
     /// # Lock-ordering invariant
     ///
@@ -114,8 +114,8 @@ impl AgentRegistry {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        for run_id in to_cancel {
-            self.cancel(&run_id);
+        for agent_id in to_cancel {
+            self.cancel(&agent_id);
         }
     }
 
@@ -160,12 +160,12 @@ impl AgentRegistry {
 
     /// Remove a registry entry only if its generation still matches.
     /// Used by [`crate::Agent::drop`] to safely deregister without stale-removal risk.
-    pub fn deregister(&self, run_id: &str, generation: u64) {
+    pub fn deregister(&self, agent_id: &str, generation: u64) {
         let mut map = self.inner.lock().unwrap_poison();
-        if let Some(entry) = map.get(run_id)
+        if let Some(entry) = map.get(agent_id)
             && entry.generation == generation
         {
-            map.remove(run_id);
+            map.remove(agent_id);
         }
     }
 }

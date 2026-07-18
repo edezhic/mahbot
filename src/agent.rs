@@ -115,14 +115,14 @@ fn extract_media_from_outcomes(
 }
 
 impl Agent {
-    /// Create a new agent with the given session_key, role, workspace, and optional ticket.
+    /// Create a new agent with the given agent_id, role, workspace, and optional ticket.
     ///
     /// Tools are derived from [`crate::Role`] via [`crate::Role::tools`].
     /// Automatically registers with [`crate::registry::AGENT_REGISTRY`] and creates an
     /// internal [`CancellationToken`]. The agent is deregistered on [`Drop`].
     #[must_use]
     pub fn new(
-        session_key: String,
+        agent_id: String,
         role: crate::Role,
         ws: &crate::Workspace,
         ticket: Option<crate::board::Ticket>,
@@ -139,7 +139,7 @@ impl Agent {
             role.to_string()
         };
         let generation = crate::registry::AGENT_REGISTRY.register(
-            session_key.clone(),
+            agent_id.clone(),
             role.to_string(),
             ticket.as_ref().map(|t| t.id.clone()),
             ws,
@@ -148,7 +148,7 @@ impl Agent {
         );
 
         Self {
-            session_key,
+            agent_id,
             role,
             session: Session::default(),
             workspace: Arc::new(ws.clone()),
@@ -167,14 +167,14 @@ impl Agent {
 impl Drop for Agent {
     fn drop(&mut self) {
         if self.generation > 0 {
-            crate::registry::AGENT_REGISTRY.deregister(&self.session_key, self.generation);
+            crate::registry::AGENT_REGISTRY.deregister(&self.agent_id, self.generation);
         }
     }
 }
 
 impl Agent {
     /// Flush accumulated tool stats to `stats.db`, then persist the final
-    /// assistant message via `session.finalize(&self.session_key)`. Flush failures are logged
+    /// assistant message via `session.finalize(&self.agent_id)`. Flush failures are logged
     /// but do not abort finalization.
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
         // Drain accumulated tool usage stats
@@ -185,7 +185,7 @@ impl Agent {
         if !stats.is_empty()
             && let Err(e) = crate::stats::store()
                 .flush_batch(
-                    &self.session_key,
+                    &self.agent_id,
                     self.role.as_str(),
                     &self.workspace.path,
                     &stats,
@@ -193,7 +193,7 @@ impl Agent {
                 .await
         {
             tracing::warn!(
-                agent_id = %self.session_key,
+                agent_id = %self.agent_id,
                 role = %self.role.as_str(),
                 error = %e,
                 "Failed to flush tool usage stats"
@@ -206,13 +206,13 @@ impl Agent {
         // persisted via commit_tool_results inside llm_loop, so no data loss.
         if self.cancel_token.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
             tracing::debug!(
-                agent_id = %self.session_key,
+                agent_id = %self.agent_id,
                 "Session finalize skipped (agent cancelled or shutdown)"
             );
             return Ok(());
         }
 
-        self.session.finalize(&self.session_key).await
+        self.session.finalize(&self.agent_id).await
     }
 
     /// Return a clone of the cancellation token for external use
@@ -234,7 +234,7 @@ impl Agent {
         // Open or resume a session for this agent turn.
         self.session
             .init(
-                &self.session_key,
+                &self.agent_id,
                 msg,
                 &self.workspace,
                 &self.role,
@@ -263,7 +263,7 @@ impl Agent {
 
     /// Run the full agent loop: LLM calls → tool execution → loop until final answer.
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
-        let span = tracing::info_span!("agent", agent_id = %self.session_key, role = %self.role, workspace = %self.workspace.path);
+        let span = tracing::info_span!("agent", agent_id = %self.agent_id, role = %self.role, workspace = %self.workspace.path);
         async {
             let mut iteration = 0usize;
             let mut accumulated_media_paths: Vec<(&'static str, String)> = Vec::new();
@@ -606,7 +606,7 @@ impl Agent {
 
         // Batch-persist all messages in a single transaction.
         crate::session::store()
-            .batch_append(&self.session_key, &db_messages)
+            .batch_append(&self.agent_id, &db_messages)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to persist tool results: {e}"))?;
 
@@ -719,7 +719,7 @@ impl Agent {
                 Ok(summary) => {
                     self.session
                         .apply_summary(
-                            &self.session_key,
+                            &self.agent_id,
                             msg,
                             &summary,
                             &self.workspace,
@@ -800,7 +800,7 @@ fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
 /// Returns `(agent, Some(response))` on success.
 /// Returns `(agent, None)` on cancellation (discard result) or error (already logged).
 pub(crate) async fn run_agent(
-    session_key: String,
+    agent_id: String,
     role: crate::Role,
     ws: &crate::Workspace,
     ticket: Option<&crate::board::Ticket>,
@@ -808,7 +808,7 @@ pub(crate) async fn run_agent(
     user_name: String,
     channel: String,
 ) -> (Agent, Option<String>) {
-    let mut agent = Agent::new(session_key, role, ws, ticket.cloned(), user_name, channel);
+    let mut agent = Agent::new(agent_id, role, ws, ticket.cloned(), user_name, channel);
 
     let result = agent.work(message).await;
 
@@ -897,7 +897,7 @@ mod tests {
     fn make_agent(tools: Vec<Box<dyn Tool>>) -> Agent {
         let tool_specs = tools.iter().map(|t| t.spec()).collect();
         Agent {
-            session_key: "test-agent".into(),
+            agent_id: "test-agent".into(),
             role: crate::Role::Engineer,
             session: Session::default(),
             workspace: std::sync::Arc::new(crate::Workspace::default()),
