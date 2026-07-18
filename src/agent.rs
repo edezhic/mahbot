@@ -17,6 +17,28 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+// ── Per-tool-call user context ─────────────────────────────────────
+// Set by the Agent work loop before each tool execute(), read by tools
+// that need user context (e.g. AskTool async dispatch).
+//
+// # Contract
+// - Set by the Agent work loop before each tool execution.
+// - Must be read synchronously (before any `tokio::spawn` boundary) when
+//   the value is needed across an async boundary.
+// - Falls back to `unwrap_or_default()` → empty string for background
+//   agents (management, maintainer, workspace) that have no user context.
+//
+// # Example (in a tool's execute method)
+// ```ignore
+// let user_name = CURRENT_TOOL_USER_NAME
+//     .try_with(|n| n.clone())
+//     .unwrap_or_default();
+// ```
+tokio::task_local! {
+    pub(crate) static CURRENT_TOOL_USER_NAME: String;
+    pub(crate) static CURRENT_TOOL_CHANNEL: String;
+}
+
 /// Maximum LLM iterations before the agent loop bails out.
 ///
 /// **DO NOT REDUCE this value without benchmarking against real ticket iteration
@@ -104,6 +126,8 @@ impl Agent {
         role: crate::Role,
         ws: &crate::Workspace,
         ticket: Option<crate::board::Ticket>,
+        user_name: String,
+        channel: String,
     ) -> Self {
         let tools = role.tools();
         let tool_specs = tools.iter().map(|t| t.spec()).collect();
@@ -134,6 +158,8 @@ impl Agent {
             ticket,
             generation,
             tool_stats: std::sync::Mutex::new(Vec::new()),
+            user_name,
+            channel,
         }
     }
 }
@@ -319,33 +345,53 @@ impl Agent {
 
         let mut outcomes: Vec<ToolExecutionOutcome> = Vec::with_capacity(tool_calls.len());
         let mut i = 0usize;
-        while i < tool_calls.len() {
-            if side_flags[i] {
-                // Side-effecting: single-call group, executed alone.
-                let outcome = self
-                    .execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone())
+
+        // Set task-locals once for the entire batch of tool executions, rather
+        // than per-call inside execute_tool.  This avoids a race when multiple
+        // read-only tools execute concurrently via join_all in the same task:
+        // per-call scopes would interleave, causing concurrent tools to read
+        // each other's user context.
+        let user_name = self.user_name.clone();
+        let channel = self.channel.clone();
+        CURRENT_TOOL_USER_NAME
+            .scope(user_name, async {
+                CURRENT_TOOL_CHANNEL
+                    .scope(channel, async {
+                        while i < tool_calls.len() {
+                            if side_flags[i] {
+                                // Side-effecting: single-call group, executed alone.
+                                let outcome = self
+                                    .execute_tool(
+                                        &tool_calls[i].name,
+                                        tool_calls[i].arguments.clone(),
+                                    )
+                                    .await;
+                                outcomes.push(outcome);
+                                i += 1;
+                            } else {
+                                // Read-only group: extend while consecutive calls are also read-only.
+                                let group_start = i;
+                                while i < tool_calls.len() && !side_flags[i] {
+                                    i += 1;
+                                }
+                                let group_calls = &tool_calls[group_start..i];
+
+                                // Execute the entire read-only group in parallel.
+                                let group_outcomes: Vec<_> = futures_util::future::join_all(
+                                    group_calls.iter().map(|call| {
+                                        self.execute_tool(&call.name, call.arguments.clone())
+                                    }),
+                                )
+                                .await;
+
+                                outcomes.extend(group_outcomes);
+                            }
+                        }
+                    })
                     .await;
-                outcomes.push(outcome);
-                i += 1;
-            } else {
-                // Read-only group: extend while consecutive calls are also read-only.
-                let group_start = i;
-                while i < tool_calls.len() && !side_flags[i] {
-                    i += 1;
-                }
-                let group_calls = &tool_calls[group_start..i];
+            })
+            .await;
 
-                // Execute the entire read-only group in parallel.
-                let group_outcomes: Vec<_> = futures_util::future::join_all(
-                    group_calls
-                        .iter()
-                        .map(|call| self.execute_tool(&call.name, call.arguments.clone())),
-                )
-                .await;
-
-                outcomes.extend(group_outcomes);
-            }
-        }
         outcomes
     }
 
@@ -374,6 +420,7 @@ impl Agent {
     }
 
     /// Execute a single tool call and return the result.
+    #[allow(clippy::too_many_lines)]
     async fn execute_tool(
         &self,
         call_name: &str,
@@ -741,6 +788,10 @@ fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
 /// CancellationToken), run work, handle cancellation and errors.
 /// Returns the agent (even on failure) and the response on success.
 ///
+/// `user_name` and `channel` identify the origin of the message being
+/// processed — used by tools (e.g. AskTool async dispatch) to route
+/// sub-agent results to the correct user.
+///
 /// **Cancellation safety**: Even if `agent.work()` completes before the token
 /// fires (the classic race), we check `is_cancelled()` after work completes
 /// and discard the result — preventing overwrites of externally-set `cancelled`
@@ -754,8 +805,10 @@ pub(crate) async fn run_agent(
     ws: &crate::Workspace,
     ticket: Option<&crate::board::Ticket>,
     message: &str,
+    user_name: String,
+    channel: String,
 ) -> (Agent, Option<String>) {
-    let mut agent = Agent::new(session_key, role, ws, ticket.cloned());
+    let mut agent = Agent::new(session_key, role, ws, ticket.cloned(), user_name, channel);
 
     let result = agent.work(message).await;
 
@@ -854,6 +907,8 @@ mod tests {
             ticket: None,
             generation: 0,
             tool_stats: std::sync::Mutex::new(Vec::new()),
+            user_name: String::new(),
+            channel: String::new(),
         }
     }
 
@@ -1152,6 +1207,74 @@ mod tests {
             out.output.contains("Agent cancelled"),
             "failure output should mention cancellation: {}",
             out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn task_locals_propagate_to_parallel_tool_execution() {
+        /// Tool that reads CURRENT_TOOL_USER_NAME and CURRENT_TOOL_CHANNEL
+        /// from task-locals and returns them in its output.
+        struct ReadTaskLocalsTool;
+        #[async_trait]
+        impl Tool for ReadTaskLocalsTool {
+            fn name(&self) -> &'static str {
+                "read_task_locals"
+            }
+            fn description(&self) -> String {
+                "test tool that reads task-local user context".into()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(
+                &self,
+                _ws: &crate::Workspace,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<String> {
+                // Read task-locals synchronously (no async boundary) — the
+                // contract is: the Agent work loop sets these before each
+                // tool execution group, and tools must read them before any
+                // tokio::spawn if crossing an async boundary.
+                let user_name = CURRENT_TOOL_USER_NAME
+                    .try_with(String::clone)
+                    .unwrap_or_default();
+                let channel = CURRENT_TOOL_CHANNEL
+                    .try_with(String::clone)
+                    .unwrap_or_default();
+                Ok(format!("user={user_name},channel={channel}"))
+            }
+        }
+
+        let tool: Box<dyn Tool> = Box::new(ReadTaskLocalsTool);
+        let name = tool.name();
+        let mut agent = make_agent(vec![tool]);
+        agent.user_name = "alice".into();
+        agent.channel = "gui".into();
+
+        // Call through execute_tool_group so task-locals are set once for
+        // the entire batch — this is the path used by the agent work loop.
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let outcomes = agent.execute_tool_group(&[call]).await;
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "one tool call should produce one outcome"
+        );
+        assert!(outcomes[0].success, "ReadTaskLocalsTool should succeed");
+        assert!(
+            outcomes[0].output.contains("user=alice"),
+            "should propagate user_name: {}",
+            outcomes[0].output
+        );
+        assert!(
+            outcomes[0].output.contains("channel=gui"),
+            "should propagate channel: {}",
+            outcomes[0].output
         );
     }
 }

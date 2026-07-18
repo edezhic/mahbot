@@ -39,6 +39,37 @@ use iced::{Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Vector
 
 use super::theme;
 
+// ── Menu item ─────────────────────────────────────────────────────
+
+/// A single item in a context menu.
+#[derive(Debug, Clone)]
+pub struct MenuItem<Message> {
+    /// Display label.
+    pub label: String,
+    /// Action to fire when clicked. `None` for disabled items (e.g. current role indicator).
+    pub action: Option<Message>,
+}
+
+impl<Message> MenuItem<Message> {
+    /// Create a new enabled menu item.
+    #[must_use]
+    pub fn new(label: String, action: Message) -> Self {
+        Self {
+            label,
+            action: Some(action),
+        }
+    }
+
+    /// Create a disabled menu item (no action, rendered in muted style).
+    #[must_use]
+    pub fn disabled(label: String) -> Self {
+        Self {
+            label,
+            action: None,
+        }
+    }
+}
+
 // ── Widget ───────────────────────────────────────────────────────────
 
 /// A widget that wraps an underlay element and shows a context menu
@@ -48,7 +79,7 @@ where
     Message: Clone + 'a,
 {
     underlay: Element<'a, Message, Theme, Renderer>,
-    menu_items: Vec<(String, Message)>,
+    menu_items: Vec<MenuItem<Message>>,
 }
 
 impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer>
@@ -62,7 +93,7 @@ where
     #[must_use]
     pub fn new(
         underlay: impl Into<Element<'a, Message, Theme, Renderer>>,
-        menu_items: Vec<(String, Message)>,
+        menu_items: Vec<MenuItem<Message>>,
     ) -> Self {
         Self {
             underlay: underlay.into(),
@@ -308,7 +339,7 @@ where
     show: &'b mut bool,
     hovered: &'b mut Option<usize>,
     position: Point,
-    menu_items: &'a [(String, Message)],
+    menu_items: &'a [MenuItem<Message>],
 }
 
 // Layout constants for the menu.
@@ -345,9 +376,9 @@ where
         let max_label_width: f32 = self
             .menu_items
             .iter()
-            .map(|(label, _)| {
+            .map(|item| {
                 let paragraph = Renderer::Paragraph::with_text(text::Text {
-                    content: label.as_str(),
+                    content: &item.label,
                     bounds: Size::new(f32::MAX, MENU_ITEM_HEIGHT),
                     size: text_size,
                     line_height: text::LineHeight::Relative(1.3),
@@ -404,7 +435,7 @@ where
         let font = renderer.default_font();
         let text_size = Pixels(MENU_FONT_SIZE);
 
-        for (i, (label, _action)) in self.menu_items.iter().enumerate() {
+        for (i, item) in self.menu_items.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             let item_y = bounds.y + MENU_PADDING + i as f32 * MENU_ITEM_HEIGHT;
             let item_bounds = Rectangle {
@@ -414,8 +445,10 @@ where
                 height: MENU_ITEM_HEIGHT,
             };
 
-            // Hover highlight.
-            if *self.hovered == Some(i) {
+            let is_disabled = item.action.is_none();
+
+            // Hover highlight (only for enabled items).
+            if !is_disabled && *self.hovered == Some(i) {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: item_bounds,
@@ -431,14 +464,16 @@ where
             }
 
             // Draw label text using fill_text.
-            let text_color = if *self.hovered == Some(i) {
+            let text_color = if is_disabled {
+                theme::TEXT_MUTED
+            } else if *self.hovered == Some(i) {
                 theme::TEXT_PRIMARY
             } else {
                 theme::TEXT_SECONDARY
             };
 
             let text = text::Text {
-                content: label.clone(),
+                content: item.label.clone(),
                 bounds: Size::new(bounds.width - MENU_PADDING * 2.0, MENU_ITEM_HEIGHT),
                 size: text_size,
                 line_height: text::LineHeight::Relative(1.3),
@@ -484,10 +519,14 @@ where
                             cursor_pos.y - bounds.y - MENU_PADDING,
                             self.menu_items.len(),
                         ) {
-                            // Fire the action and dismiss.
-                            let action = self.menu_items[idx].1.clone();
-                            *self.show = false;
-                            shell.publish(action);
+                            // Only fire action for enabled items
+                            if let Some(action) = self.menu_items[idx].action.clone() {
+                                *self.show = false;
+                                shell.publish(action);
+                                shell.capture_event();
+                                return;
+                            }
+                            // Disabled item: consume click but don't fire
                             shell.capture_event();
                             return;
                         }

@@ -167,6 +167,8 @@ pub enum HomeMessage {
     WorkspacePicked(String),
     /// Clear chat button pressed — reset session and display.
     ClearChat,
+    /// Switch user's active role. Carries (user_name, new_role).
+    SwitchRole(String, Role),
     /// Chat history cleared successfully — divider inserted.
     ChatCleared,
     /// Chat history clear failed.
@@ -1101,6 +1103,11 @@ impl HomeState {
                     "Session cleared".to_string(),
                 )));
                 Task::batch([self.refresh_history(), toast])
+            }
+            HomeMessage::SwitchRole(user, role) => {
+                // Intercepted by Dashboard — no-op in Home
+                tracing::debug!("Home: SwitchRole({user}, {role}) — handled by Dashboard");
+                Task::none()
             }
             HomeMessage::ChatClearError(e) => {
                 Task::done(HomeMessage::Toast(ToastMessage::Error(e)))

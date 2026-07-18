@@ -282,6 +282,22 @@ impl UserStore {
         Ok(users)
     }
 
+    /// Find a single user by exact name, returning their full record with channel bindings.
+    /// Returns `None` if no such user exists.
+    pub async fn find_by_name(&self, user_name: &str) -> Result<Option<UserRecord>> {
+        let rows = self
+            .conn
+            .query(
+                &format!("SELECT {USERS_COLUMNS} FROM users WHERE name = ?1"),
+                turso::params![user_name],
+            )
+            .await?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(Some(self.user_record_from_row(&row).await?)),
+            None => Ok(None),
+        }
+    }
+
     /// List all users.
     pub async fn list_users(&self) -> Result<Vec<UserRecord>> {
         let rows = self

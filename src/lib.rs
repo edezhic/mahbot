@@ -590,6 +590,7 @@ pub enum Role {
     Artist,
     Maintainer,
     Sanitation,
+    Assistant,
 }
 
 // ── Agent ───────────────────────────────────────────────────────
@@ -641,6 +642,11 @@ pub struct Agent {
     /// Flushed to `stats.db` on [`Agent::finalize_session`]; silently
     /// lost if the agent is dropped without finalization.
     tool_stats: std::sync::Mutex<Vec<crate::ToolCallRecord>>,
+    /// The user who triggered this agent run — used by tools (e.g. AskTool)
+    /// to route async sub-agent results back to the correct user.
+    pub(crate) user_name: String,
+    /// The channel origin (gui, telegram, voice) of the triggering message.
+    pub(crate) channel: String,
 }
 
 // ── Verdict type ─────────────────────────────────────────────────

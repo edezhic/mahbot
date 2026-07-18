@@ -117,7 +117,7 @@ pub async fn run_maintainer_loop() {
                     info!(workspace = %ws.name, run = %run_id, "Maintainer: starting maintenance run");
 
                     let (agent, response) =
-                        run_agent(run_id.clone(), Role::Maintainer, &ws, None, &prompt).await;
+                        run_agent(run_id.clone(), Role::Maintainer, &ws, None, &prompt, String::new(), String::new()).await;
 
                     if let Some(_response) = response {
                         info!(workspace = %ws.name, "Maintainer: run complete");

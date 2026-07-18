@@ -14,7 +14,7 @@ use iced::{Alignment, Element, Length, Size, Subscription, Task};
 use iced_fonts::lucide;
 use iced_term::{BackendCommand, TerminalView};
 
-use super::context_menu::ContextMenu;
+use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
 
 // ── Constants ─────────────────────────────────────────────────────────
@@ -250,8 +250,8 @@ impl ShellState {
             let ctx_menu: Element<'_, ShellMessage> = ContextMenu::new(
                 term_container,
                 vec![
-                    ("Clear".into(), ShellMessage::ClearTerminal),
-                    ("Select All".into(), ShellMessage::SelectAll),
+                    MenuItem::new("Clear".into(), ShellMessage::ClearTerminal),
+                    MenuItem::new("Select All".into(), ShellMessage::SelectAll),
                 ],
             )
             .into();

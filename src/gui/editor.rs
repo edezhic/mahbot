@@ -29,7 +29,7 @@ use iced_fonts::lucide;
 use fff_search::grep::{GrepMode, GrepSearchOptions};
 use fff_search::parse_grep_query;
 
-use super::context_menu::ContextMenu;
+use super::context_menu::{ContextMenu, MenuItem};
 
 use crate::git_commands::{is_git_repo, run_git_check_ignore, run_git_output, run_git_status};
 use crate::util::unquote_c_style;
@@ -4592,11 +4592,11 @@ impl EditorState {
         ContextMenu::new(
             panel,
             vec![
-                (
+                MenuItem::new(
                     "New File".into(),
                     EditorMessage::NewFileRequested(String::new()),
                 ),
-                (
+                MenuItem::new(
                     "New Directory".into(),
                     EditorMessage::NewDirectoryRequested(String::new()),
                 ),
@@ -4678,7 +4678,7 @@ impl EditorState {
         name: Element<'a, EditorMessage>,
         highlight: bool,
         message: EditorMessage,
-        extra_context_items: Vec<(String, EditorMessage)>,
+        extra_context_items: Vec<MenuItem<EditorMessage>>,
         full_path: &str,
     ) -> Element<'a, EditorMessage> {
         let guide_text: Element<'a, EditorMessage> = text(guide)
@@ -4700,18 +4700,18 @@ impl EditorState {
 
         let rel_path = full_path.to_string();
 
-        let mut menu_items: Vec<(String, EditorMessage)> = extra_context_items;
-        menu_items.push((
+        let mut menu_items: Vec<MenuItem<EditorMessage>> = extra_context_items;
+        menu_items.push(MenuItem::new(
             "Copy Relative Path".into(),
             EditorMessage::CopyRelativePath(rel_path),
         ));
 
         if let Some(abs_path) = self.abs_path(full_path) {
-            menu_items.push((
+            menu_items.push(MenuItem::new(
                 "Copy Absolute Path".into(),
                 EditorMessage::CopyAbsolutePath(abs_path.clone()),
             ));
-            menu_items.push((
+            menu_items.push(MenuItem::new(
                 "Reveal in Finder".into(),
                 EditorMessage::RevealInFinder(abs_path),
             ));
@@ -4806,19 +4806,19 @@ impl EditorState {
             is_focused,
             EditorMessage::ToggleDir(node.full_path.clone()),
             vec![
-                (
+                MenuItem::new(
                     "New File".into(),
                     EditorMessage::NewFileRequested(node.full_path.clone()),
                 ),
-                (
+                MenuItem::new(
                     "New Directory".into(),
                     EditorMessage::NewDirectoryRequested(node.full_path.clone()),
                 ),
-                (
+                MenuItem::new(
                     "Rename".into(),
                     EditorMessage::RenameRequested(node.full_path.clone()),
                 ),
-                (
+                MenuItem::new(
                     "Delete".into(),
                     EditorMessage::DeleteDirectoryRequested(node.full_path.clone()),
                 ),
@@ -4922,11 +4922,11 @@ impl EditorState {
             is_selected || is_focused,
             EditorMessage::SelectFile(node.full_path.clone()),
             vec![
-                (
+                MenuItem::new(
                     "Rename".into(),
                     EditorMessage::RenameRequested(node.full_path.clone()),
                 ),
-                (
+                MenuItem::new(
                     "Delete".into(),
                     EditorMessage::DeleteFileRequested(node.full_path.clone()),
                 ),
@@ -5043,13 +5043,13 @@ impl EditorState {
             let ctx_menu = ContextMenu::new(
                 tab_btn,
                 vec![
-                    ("Close".into(), EditorMessage::TabClosed(i)),
-                    ("Close Others".into(), EditorMessage::CloseOtherTabs(i)),
-                    (
+                    MenuItem::new("Close".into(), EditorMessage::TabClosed(i)),
+                    MenuItem::new("Close Others".into(), EditorMessage::CloseOtherTabs(i)),
+                    MenuItem::new(
                         "Copy Relative Path".into(),
                         EditorMessage::CopyRelativePath(tab_rel_path),
                     ),
-                    (
+                    MenuItem::new(
                         "Copy Absolute Path".into(),
                         EditorMessage::CopyAbsolutePath(tab_abs_path),
                     ),

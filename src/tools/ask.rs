@@ -1,24 +1,25 @@
 //! AskTool — spawns a sub-agent to ask a question.
 //!
 //! Available to the Engineer and Maintainer agents (sync mode), and to the
-//! Manager agent (async mode). In sync mode the caller blocks until the
-//! sub-agent completes. In async mode the sub-agent is dispatched in a
-//! background task and the result is injected back into the Manager's session
-//! via the serialized [`ManagerQueue`](crate::manager_queue::ManagerQueue).
+//! Manager and Assistant agents (async mode). In sync mode the caller blocks
+//! until the sub-agent completes. In async mode the sub-agent is dispatched
+//! in a background task and the result is injected back via the caller's
+//! agent queue.
 
-use crate::manager_queue::{self, JobKind, ManagerJob};
+use crate::manager_queue::{self, AgentJob, JobKind};
 use crate::session::ask_session_key;
 use crate::tools::Tool;
 use crate::{Agent, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use tracing::error;
 
 /// Controls sub-agent dispatch behaviour.
 ///
 /// [`Sync`](DispatchMode::Sync) blocks the caller until the sub-agent completes.
 /// [`Async`](DispatchMode::Async) dispatches the sub-agent in a background task
-/// and injects the result via the Manager queue.
+/// and injects the result via the caller's agent queue.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DispatchMode {
     Sync,
@@ -38,16 +39,24 @@ pub struct AskTool {
     /// Controls how the sub-agent is dispatched.
     /// - [`DispatchMode::Sync`] — blocks the caller until the sub-agent completes.
     /// - [`DispatchMode::Async`] — dispatches in a background task, result
-    ///   delivered via the Manager queue. Only the Manager role uses this.
+    ///   delivered via the caller's agent queue.
     dispatch_mode: DispatchMode,
+    /// The role of the calling agent. Used to route async results to the
+    /// correct queue (Manager → manager queue, Assistant → assistant queue).
+    pub caller_role: Role,
 }
 
 impl AskTool {
     #[must_use]
-    pub const fn new(allowed_roles: Vec<Role>, dispatch_mode: DispatchMode) -> Self {
+    pub const fn new(
+        allowed_roles: Vec<Role>,
+        dispatch_mode: DispatchMode,
+        caller_role: Role,
+    ) -> Self {
         Self {
             allowed_roles,
             dispatch_mode,
+            caller_role,
         }
     }
 
@@ -108,12 +117,20 @@ impl Tool for AskTool {
             }
         };
 
-        // Async dispatch path — Manager delegates to Analyst in background.
-        // Routing is handled by the consumer loop via DB lookup — no reply
-        // context needed in the job.
+        // Async dispatch path — delegate to sub-agent in background.
+        // Read user context from task-locals (set by Agent work loop
+        // before each tool.execute() call) so the queued result carries
+        // the correct user identity for per-user delivery.
         if self.dispatch_mode.is_async() {
             let ws = ws.clone();
             let ask = ask.to_string();
+            let caller_role = self.caller_role;
+            let user_name = crate::agent::CURRENT_TOOL_USER_NAME
+                .try_with(String::clone)
+                .unwrap_or_default();
+            let channel = crate::agent::CURRENT_TOOL_CHANNEL
+                .try_with(String::clone)
+                .unwrap_or_default();
 
             tokio::spawn(async move {
                 let result = run_sub_agent(&ws, role, &ask).await;
@@ -125,11 +142,20 @@ impl Tool for AskTool {
                     }
                 };
 
-                manager_queue::manager_queue().enqueue(ManagerJob {
-                    content: message,
-                    workspace_name: ws.name.clone(),
-                    kind: JobKind::AskToolResult,
-                });
+                // Route result to the caller's agent queue
+                if let Some(queue) = manager_queue::queue_for(&caller_role) {
+                    queue.enqueue(AgentJob {
+                        content: message,
+                        workspace_name: ws.name.clone(),
+                        user_name,
+                        channel,
+                        kind: JobKind::AskToolResult,
+                    });
+                } else {
+                    error!(
+                        "AskTool: no agent queue for role '{caller_role}' — async result dropped"
+                    );
+                }
             });
 
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
@@ -145,7 +171,7 @@ impl Tool for AskTool {
 async fn run_sub_agent(ws: &Workspace, role: Role, ask: &str) -> Result<String> {
     let sub_id = ask_session_key(&ws.name, role.as_str());
 
-    let mut agent = Agent::new(sub_id, role, ws, None);
+    let mut agent = Agent::new(sub_id, role, ws, None, String::new(), String::new());
     let cancel = agent.cancel_token();
 
     let response = tokio::select! {
@@ -172,6 +198,7 @@ mod tests {
         let tool = AskTool::new(
             vec![Role::Analyst, Role::Coder, Role::Qa],
             DispatchMode::Sync,
+            Role::Engineer,
         );
         let ws = test_ws("/tmp/test_ws");
 
@@ -200,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_unsupported_role() {
-        let tool = AskTool::new(vec![Role::Analyst], DispatchMode::Sync);
+        let tool = AskTool::new(vec![Role::Analyst], DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");
         // "manager" is a valid Role but not one that AskTool can delegate to
         let args = json!({"role": "manager", "ask": "do something"});
@@ -215,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_unknown_role() {
-        let tool = AskTool::new(vec![], DispatchMode::Sync);
+        let tool = AskTool::new(vec![], DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");
         // Truly unknown role string — returns bail!
         let args = json!({"role": "nonexistent", "ask": "do something"});
@@ -261,6 +288,7 @@ mod tests {
             let tool = AskTool::new(
                 vec![Role::Analyst, Role::Coder, Role::Qa],
                 DispatchMode::Sync,
+                Role::Engineer,
             );
             let ws = test_ws("/tmp/test_ws");
             let args = json!({"role": c.role, "ask": c.ask});

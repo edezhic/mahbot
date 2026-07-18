@@ -168,6 +168,13 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             display_label: "Sanitation",
             ..BASE_ROLE_INFO
         },
+        Role::Assistant => &RoleInfo {
+            has_discovery: false,
+            badge_fg: (0.153, 0.820, 0.757),
+            default_reasoning_effort: "medium",
+            display_label: "Assistant",
+            ..BASE_ROLE_INFO
+        },
     }
 }
 
@@ -286,6 +293,7 @@ impl Role {
                 t.push(Box::new(AskTool::new(
                     vec![Role::Analyst, Role::Coder],
                     DispatchMode::Sync,
+                    Role::Engineer,
                 )));
                 t
             }
@@ -297,7 +305,11 @@ impl Role {
                     Box::new(GetTicketTool),
                     Box::new(AddCommentTool),
                     Box::new(SearchArchivedTicketsTool),
-                    Box::new(AskTool::new(vec![Role::Analyst], DispatchMode::Async)),
+                    Box::new(AskTool::new(
+                        vec![Role::Analyst],
+                        DispatchMode::Async,
+                        Role::Manager,
+                    )),
                 ]
             }
             Role::Analyst => {
@@ -322,9 +334,17 @@ impl Role {
                 t.push(Box::new(AskTool::new(
                     vec![Role::Analyst],
                     DispatchMode::Sync,
+                    Role::Maintainer,
                 )));
                 t.push(Box::new(CreateTicketTool::new("maintainer")));
                 t
+            }
+            Role::Assistant => {
+                vec![Box::new(AskTool::new(
+                    vec![Role::Analyst],
+                    DispatchMode::Async,
+                    Role::Assistant,
+                ))]
             }
         };
 

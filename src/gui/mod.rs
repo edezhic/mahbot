@@ -42,6 +42,8 @@ use iced::widget::{Column, Row, button, column, container, row, scrollable, text
 use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
 
+use crate::Role;
+
 use self::context_menu::ContextMenu;
 
 use iced_fonts::lucide;
@@ -275,6 +277,8 @@ pub enum Message {
     OpenDiffModal(Option<String>),
     /// Close the diff modal.
     CloseDiffModal,
+    /// Set the selected user's role for the role switcher indicator.
+    SetSelectedRole(Option<Role>),
 }
 
 // ── Message introspection helpers ────────────────────────────────
@@ -445,6 +449,9 @@ pub struct Dashboard {
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
     selected_user_name: Option<String>,
+    /// Cached selected role for the current user, used by the role switcher
+    /// context menu to visually indicate which role is active.
+    selected_user_role: Option<Role>,
     /// Whether a self-update is available or in progress.
     /// Controls button visibility/disabled state.
     update_status: UpdateStatus,
@@ -479,6 +486,7 @@ impl Dashboard {
             workspaces: HashMap::new(),
             selected_workspace_name: None,
             selected_user_name: None,
+            selected_user_role: None,
             update_status: if update_available {
                 UpdateStatus::Available
             } else {
@@ -587,6 +595,18 @@ impl Dashboard {
         if let Some(ref user_name) = self.selected_user_name {
             self.home_state.selected_user = Some(user_name.clone());
         }
+        // Load the selected user's role for the role switcher indicator.
+        let role_task = self
+            .selected_user_name
+            .as_ref()
+            .map_or(Task::none(), |user| {
+                let user = user.clone();
+                Task::perform(
+                    async move { crate::users::resolve_active_role(&user).await },
+                    |role| Message::SetSelectedRole(Some(role)),
+                )
+            });
+
         let load_users = self.home_state.load_users().map(Message::Home);
 
         // Empty string => "Personal" workspace (no shared workspace).
@@ -597,7 +617,11 @@ impl Dashboard {
             self.selected_workspace_name = Some(restored_name.to_owned());
             restored_name.to_owned()
         };
-        Task::batch([self.propagate_workspace_selection(&ws_name), load_users])
+        Task::batch([
+            role_task,
+            self.propagate_workspace_selection(&ws_name),
+            load_users,
+        ])
     }
 
     /// Navigate to a page, refreshing page-specific state as needed.
@@ -918,7 +942,49 @@ impl Dashboard {
                 // selected_user_name and persist to window state.
                 if let home::HomeMessage::UserSelected(ref user) = msg {
                     self.selected_user_name = Some(user.clone());
+                    self.selected_user_role = None; // reset until loaded
+                    crate::voice::set_active_user_name(user);
                     self.persist_window_state();
+                    let user = user.clone();
+                    let role_task = Task::perform(
+                        async move { crate::users::resolve_active_role(&user).await },
+                        |role| Message::SetSelectedRole(Some(role)),
+                    );
+                    return Task::batch([
+                        role_task,
+                        self.home_state.update(msg.clone()).map(Message::Home),
+                    ]);
+                }
+                // Intercept SwitchRole: user selected a new role from the
+                // chat context menu — persist it and show a toast.
+                if let home::HomeMessage::SwitchRole(ref user_name, ref role) = msg {
+                    self.selected_user_role = Some(*role);
+                    let user = user_name.clone();
+                    let role = *role;
+                    return Task::perform(
+                        async move {
+                            if let Some(store) = crate::users::USER_STORE.get() {
+                                use crate::users::FieldUpdate;
+                                let _ = store
+                                    .update_user(
+                                        &user,
+                                        FieldUpdate::Set(role.as_str()),
+                                        FieldUpdate::Unchanged,
+                                        FieldUpdate::Unchanged,
+                                    )
+                                    .await;
+                            }
+                            role
+                        },
+                        |role| {
+                            Message::Home(home::HomeMessage::Toast(ToastMessage::SuccessMsg(
+                                format!(
+                                    "Switched to {} role",
+                                    crate::role::role_info(&role).display_label
+                                ),
+                            )))
+                        },
+                    );
                 }
                 self.home_state.update(msg).map(Message::Home)
             }
@@ -1025,6 +1091,10 @@ impl Dashboard {
                 Task::none()
             }
             Message::Nop => Task::none(),
+            Message::SetSelectedRole(role) => {
+                self.selected_user_role = role;
+                Task::none()
+            }
         }
     }
 
@@ -1217,19 +1287,50 @@ impl Dashboard {
             Page::Home => {
                 let home_view = self.home_state.view().map(Message::Home);
                 let sidebar = ticket_sidebar(&self.board_state);
-                // Wrap chat area in a right-click context menu with "Clear chat" option.
-                let home_view: Element<'_, Message> = ContextMenu::new(
-                    home_view,
-                    vec![(
+                // Wrap chat area in a right-click context menu with "Clear chat" and role switcher.
+                let mut chat_items: Vec<context_menu::MenuItem<Message>> =
+                    vec![context_menu::MenuItem::new(
                         "Clear chat".into(),
                         Message::Home(home::HomeMessage::ClearChat),
-                    )],
-                )
-                .into();
+                    )];
+
+                // Add role switcher section if a user is selected.
+                // The current role is disabled/grayed out in the menu.
+                // Labels are derived from the canonical role_info().display_label
+                // to prevent drift from the single source of truth.
+                if self.selected_user_name.is_some() {
+                    chat_items.push(context_menu::MenuItem::disabled("── Role ──".into()));
+                    let switch_roles: [crate::Role; 5] = [
+                        crate::Role::Engineer,
+                        crate::Role::Assistant,
+                        crate::Role::Manager,
+                        crate::Role::Analyst,
+                        crate::Role::Artist,
+                    ];
+                    let user_name = self.selected_user_name.clone().unwrap_or_default();
+                    for role in &switch_roles {
+                        let label = crate::role::role_info(role).display_label;
+                        let is_current = self.selected_user_role.as_ref() == Some(role);
+                        if is_current {
+                            chat_items.push(context_menu::MenuItem::disabled(label.to_string()));
+                        } else {
+                            chat_items.push(context_menu::MenuItem::new(
+                                label.to_string(),
+                                Message::Home(home::HomeMessage::SwitchRole(
+                                    user_name.clone(),
+                                    *role,
+                                )),
+                            ));
+                        }
+                    }
+                }
+
+                let home_view: Element<'_, Message> =
+                    ContextMenu::new(home_view, chat_items).into();
                 // Wrap sidebar in a right-click context menu with "Archive done & cancelled" option.
                 let sidebar: Element<'_, Message> = ContextMenu::new(
                     sidebar,
-                    vec![(
+                    vec![context_menu::MenuItem::new(
                         "Archive done & cancelled".into(),
                         Message::Board(board::BoardMessage::ArchiveAllCompleted),
                     )],

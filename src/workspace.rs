@@ -185,7 +185,16 @@ async fn run_workspace_discovery(
     // Create a Discovery agent pointed at the workspace
     let agent_id = discovery_session_key(&ws.name, role.as_str());
     let prompt = role.discovery_prompt();
-    let (_agent, response) = run_agent(agent_id, Role::Discovery, ws, None, &prompt).await;
+    let (_agent, response) = run_agent(
+        agent_id,
+        Role::Discovery,
+        ws,
+        None,
+        &prompt,
+        String::new(),
+        String::new(),
+    )
+    .await;
     let response =
         response.context("Discovery agent returned no response (cancelled or failed)")?;
 
@@ -233,7 +242,16 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
     // Load the diagnostics discovery prompt directly (not a role-specific discovery prompt).
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
 
-    let (agent, response) = run_agent(agent_id, Role::Discovery, ws, None, &prompt).await;
+    let (agent, response) = run_agent(
+        agent_id,
+        Role::Discovery,
+        ws,
+        None,
+        &prompt,
+        String::new(),
+        String::new(),
+    )
+    .await;
     response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
 
     // Keep the Agent alive after run_agent() for retry_extract_structured —

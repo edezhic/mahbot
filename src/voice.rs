@@ -207,9 +207,14 @@ pub struct WakeWordTemplates {
 static VOICE_PIPELINE: OnceLock<RwLock<VoicePipelineState>> = OnceLock::new();
 
 /// The name of the currently active workspace, updated by the GUI when the
-/// user switches workspaces. Used by [`route_to_manager`] to route transcribed
+/// user switches workspaces. Used by [`route_to_agent`] to route transcribed
 /// commands to the correct workspace.
 static LAST_ACTIVE_WORKSPACE: OnceLock<RwLock<String>> = OnceLock::new();
+
+/// The name of the currently active user, updated by the GUI when the
+/// selected user changes. Used by [`route_to_agent`] to route transcribed
+/// voice commands to the correct user's active role.
+static LAST_ACTIVE_USER: OnceLock<RwLock<String>> = OnceLock::new();
 
 /// Set the currently active workspace name (called from GUI on workspace switch).
 pub fn set_active_workspace_name(name: &str) {
@@ -218,8 +223,22 @@ pub fn set_active_workspace_name(name: &str) {
     }
 }
 
+/// Set the currently active user name (called from GUI on user switch).
+pub fn set_active_user_name(name: &str) {
+    if let Some(state) = LAST_ACTIVE_USER.get() {
+        *state.write().unwrap_poison() = name.to_string();
+    }
+}
+
 fn active_workspace_name() -> String {
     LAST_ACTIVE_WORKSPACE
+        .get()
+        .map(|s| s.read().unwrap_poison().clone())
+        .unwrap_or_default()
+}
+
+fn active_user_name() -> String {
+    LAST_ACTIVE_USER
         .get()
         .map(|s| s.read().unwrap_poison().clone())
         .unwrap_or_default()
@@ -251,6 +270,9 @@ pub fn init_global() -> Result<()> {
     LAST_ACTIVE_WORKSPACE
         .set(RwLock::new(String::new()))
         .map_err(|_| anyhow!("LAST_ACTIVE_WORKSPACE already initialized"))?;
+    LAST_ACTIVE_USER
+        .set(RwLock::new(String::new()))
+        .map_err(|_| anyhow!("LAST_ACTIVE_USER already initialized"))?;
 
     VOICE_PIPELINE
         .set(RwLock::new(VoicePipelineState {
@@ -1036,20 +1058,70 @@ fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Routing to Manager
+// Routing to active agent
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Route a transcribed voice command to the appropriate workspace's Manager.
+/// Route a transcribed voice command to the appropriate agent.
 ///
-/// Routes to the currently active workspace (set by the GUI on workspace
-/// switch), falling back to the admin user's configured workspace from DB,
-/// then to the admin's personal workspace.
-async fn route_to_manager(text: String) {
-    // Try active workspace first (set by GUI on workspace switch)
+/// Resolves the active user's role and routes accordingly:
+/// - If the role has an agent queue (Assistant, Manager), enqueues the message.
+/// - Otherwise, builds a ChannelMessage and sends through the normal inline
+///   dispatch path.
+///
+/// Falls back to the Manager queue if no active user can be determined.
+async fn route_to_agent(text: String) {
+    // Try active user first (set by GUI on user switch)
+    let user_name = active_user_name();
+    if !user_name.is_empty() {
+        let role = crate::users::resolve_active_role(&user_name).await;
+        let active_ws = active_workspace_name();
+        let ws_name = if active_ws.is_empty() {
+            // Fallback to user's configured workspace
+            if let Ok(Some(ws)) = crate::users::get_workspace(&user_name).await {
+                ws.name
+            } else {
+                let path = crate::users::personal_workspace_path(&user_name);
+                crate::users::personal_workspace_struct(&user_name, &path).name
+            }
+        } else {
+            active_ws
+        };
+
+        info!("Voice command -> {role} (user: {user_name}, workspace: {ws_name}): {text}",);
+
+        if let Some(queue) = crate::manager_queue::queue_for(&role) {
+            queue.enqueue_user_message(text, ws_name, user_name, "voice".to_string());
+            return;
+        }
+
+        // No queue for this role — use inline dispatch via ChannelMessage
+        let msg = crate::ChannelMessage {
+            content: text,
+            user_name: user_name.clone(),
+            reply_target: user_name.clone(),
+            workspace: ws_name.clone(),
+            channel: "voice".to_string(),
+            optimistic_id: None,
+            callback_query_id: None,
+        };
+
+        // Send through the normal message pipeline
+        if let Some(tx) = crate::MESSAGE_TX.get() {
+            let _ = tx.send(msg).await;
+        }
+        return;
+    }
+
+    // Fallback to active workspace -> Manager (current behavior)
     let active = active_workspace_name();
     if !active.is_empty() {
         info!("Voice command -> Manager (active workspace: {active}): {text}");
-        crate::manager_queue::manager_queue().enqueue_user_message(text, active);
+        crate::manager_queue::manager_queue().enqueue_user_message(
+            text,
+            active,
+            String::new(),
+            String::new(),
+        );
         return;
     }
 
@@ -1071,7 +1143,12 @@ async fn route_to_manager(text: String) {
         "Voice command -> Manager (workspace: {}): {}",
         ws.name, text
     );
-    crate::manager_queue::manager_queue().enqueue_user_message(text, ws.name);
+    crate::manager_queue::manager_queue().enqueue_user_message(
+        text,
+        ws.name,
+        String::new(),
+        String::new(),
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1481,7 +1558,7 @@ async fn handle_recording_audio(
         match transcribe_audio(&cmd_buf).await {
             Ok(transcribed) => {
                 info!("Transcribed: {transcribed}");
-                route_to_manager(transcribed).await;
+                route_to_agent(transcribed).await;
                 set_status(VoiceStatus::Listening);
                 *is_recording = false;
             }

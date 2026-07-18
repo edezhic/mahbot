@@ -1,16 +1,17 @@
-//! Manager queue — serializes all Manager agent requests through a single
-//! consumer task. Eliminates concurrent Manager agent races by processing
-//! one job at a time.
+//! Agent queue infrastructure — serializes agent requests through per-role
+//! consumer tasks. Eliminates concurrent agent races by processing one job
+//! at a time per role.
 //!
-//! Three producer paths feed into the queue:
+//! Three producer paths feed into the queues:
 //! - **User messages** (main.rs): chat messages from users → enqueue
 //! - **Ticket notifications** (management.rs): ticket transitions → enqueue
 //! - **AskTool results** (tools/ask.rs): async sub-agent results → enqueue
 //!
-//! The consumer resolves the workspace, runs the Manager agent, and delivers
-//! the response via the global channel. No inline-button options are extracted
-//! from the session — the button infrastructure and callback handling remain
-//! available for future flows that produce their own reply markup.
+//! Each role that needs async processing gets its own queue. Currently:
+//! - **Manager**: receives user messages, ticket notifications, and ask-tool
+//!   results. Broadcasts responses to all workspace users.
+//! - **Assistant**: receives user messages and ask-tool results. Delivers
+//!   responses to the specific user.
 
 use crate::channels::{
     broadcast_and_persist_agent_response, spawn_scoped_typing_task, stop_typing,
@@ -18,111 +19,117 @@ use crate::channels::{
 use crate::session::manager_session_key;
 use crate::users::UserRecord;
 use crate::{ChatEvent, Role, SendMessage};
-use std::collections::HashSet;
-use tokio::sync::OnceCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::{OnceLock, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 // ── Job definition ─────────────────────────────────────────────────
 
-/// Semantic category of a Manager queue job.
-#[derive(Debug)]
+/// Semantic category of a queue job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
     /// User-typed message (chat or inline-button callback).
-    /// The ticket transition buffer drains before the agent runs so the
-    /// Manager sees accumulated non-critical status changes.
-    /// No inline-button options are extracted — user messages use
-    /// the last stored reply markup.
+    /// For Manager: the ticket transition buffer drains before the agent runs.
+    /// For other roles: no ticket buffer drain.
     UserMessage,
     /// System notification from a ticket transition.
-    /// The buffer drains inside `notify_ticket()` before enqueue,
-    /// so the consumer skips buffer draining for this path.
-    /// No inline-button options are extracted from the session.
+    /// Only enqueued for the Manager role.
     TicketNotify,
-    /// Result from an async AskTool sub-agent, injected into the Manager
-    /// session for the original asker to receive.
-    /// No buffer drain (already done for the user message that
-    /// triggered the ask) and no option extraction (sub-agent results
-    /// don't produce UI buttons).
+    /// Result from an async AskTool sub-agent, injected back into the caller's
+    /// agent session.
     AskToolResult,
 }
 
-/// A single unit of work for the Manager agent consumer.
-pub struct ManagerJob {
-    /// The message content to process. User messages and ticket-notification
-    /// paths enrich (multimodal + link summarization) before enqueuing.
-    /// Option callbacks produce synthetic text with no media or URLs and
-    /// skip enrichment — functionally a no-op.
+/// A single unit of work for an agent consumer.
+#[derive(Debug)]
+pub struct AgentJob {
+    /// The message content to process.
     pub content: String,
     /// Workspace name — resolved to a `Workspace` inside the consumer.
     pub workspace_name: String,
-    /// The semantic job kind — determines whether the consumer drains the
-    /// ticket buffer before running the agent.
+    /// Sender identity — used for per-user response delivery.
+    pub user_name: String,
+    /// Channel origin (gui, telegram, voice).
+    pub channel: String,
+    /// The semantic job kind.
     pub kind: JobKind,
 }
 
 // ── Queue ─────────────────────────────────────────────────────────
 
-/// Global Manager queue — explicitly initialized during startup.
-pub static MANAGER_QUEUE: OnceCell<ManagerQueue> = OnceCell::const_new();
-
-/// Initialize the global Manager queue and spawn the consumer loop.
-/// Must be called after the Tokio runtime is active (i.e., during startup in main()).
-pub fn init_global() -> anyhow::Result<()> {
-    let (tx, rx) = mpsc::unbounded_channel::<ManagerJob>();
-    tokio::spawn(consumer_loop(rx));
-    MANAGER_QUEUE
-        .set(ManagerQueue { tx })
-        .map_err(|_| anyhow::anyhow!("MANAGER_QUEUE already initialized"))?;
-    Ok(())
+/// A serialized queue of agent jobs for a specific role.
+#[derive(Clone)]
+pub struct AgentQueue {
+    tx: mpsc::UnboundedSender<AgentJob>,
 }
 
-/// Get a reference to the global Manager queue.
-/// Panics if not initialized — call `init_global()` during startup.
-pub fn manager_queue() -> &'static ManagerQueue {
-    MANAGER_QUEUE
-        .get()
-        .expect("MANAGER_QUEUE not initialized — call manager_queue::init_global() in main()")
-}
-
-/// A serialized queue of Manager agent jobs.
-pub struct ManagerQueue {
-    tx: mpsc::UnboundedSender<ManagerJob>,
-}
-
-impl ManagerQueue {
-    /// Enqueue a job for the Manager agent consumer.
+impl AgentQueue {
+    /// Enqueue a job for the agent consumer.
     /// Never blocks — unbounded channel.
-    pub fn enqueue(&self, job: ManagerJob) {
+    pub fn enqueue(&self, job: AgentJob) {
         if let Err(e) = self.tx.send(job) {
-            error!("Failed to enqueue Manager job: {e}");
+            error!("Failed to enqueue agent job: {e}");
         }
     }
 
     /// Convenience method to enqueue a user-message job.
-    ///
-    /// Shorthand for constructing a [`ManagerJob`] with [`JobKind::UserMessage`].
-    /// Used when routing chat messages (or synthetic callbacks) to the Manager
-    /// session — bypasses the inline agent dispatch path.
-    pub fn enqueue_user_message(&self, content: String, workspace_name: String) {
-        self.enqueue(ManagerJob {
+    pub fn enqueue_user_message(
+        &self,
+        content: String,
+        workspace_name: String,
+        user_name: String,
+        channel: String,
+    ) {
+        self.enqueue(AgentJob {
             content,
             workspace_name,
+            user_name,
+            channel,
             kind: JobKind::UserMessage,
         });
     }
 }
 
+// ── Registry ─────────────────────────────────────────────────────
+
+/// Global registry of agent queues, keyed by role.
+static AGENT_QUEUES: OnceLock<RwLock<HashMap<Role, AgentQueue>>> = OnceLock::new();
+
+/// Initialize agent queues for all roles that need async processing.
+/// Spawns consumer loops for each role.
+/// Must be called after the Tokio runtime is active (i.e., during startup).
+pub fn init_global() -> anyhow::Result<()> {
+    let mut map = HashMap::new();
+    for role in [Role::Manager, Role::Assistant] {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentJob>();
+        tokio::spawn(consumer_loop(role, rx));
+        map.insert(role, AgentQueue { tx });
+    }
+    AGENT_QUEUES
+        .set(RwLock::new(map))
+        .map_err(|_| anyhow::anyhow!("AGENT_QUEUES already initialized"))?;
+    Ok(())
+}
+
+/// Get the agent queue for a specific role, if it has one.
+pub fn queue_for(role: &Role) -> Option<AgentQueue> {
+    AGENT_QUEUES.get()?.read().unwrap().get(role).cloned()
+}
+
+/// Get the Manager queue (backward-compatible accessor).
+/// Panics if not initialized.
+#[must_use]
+pub fn manager_queue() -> AgentQueue {
+    queue_for(&Role::Manager)
+        .expect("Manager queue not initialized — call manager_queue::init_global()")
+}
+
 // ── Consumer loop ─────────────────────────────────────────────────
 
-/// Set up Telegram typing indicators for all workspace users reachable
-/// on the Telegram channel. Returns a list of (CancellationToken, JoinHandle)
-/// pairs — one per unique Telegram chat (deduplicated by reply_target).
-///
-/// Users without a Telegram channel binding (never received an incoming
-/// message) are silently skipped. If Telegram is not configured
-/// (channel not in registry), returns an empty Vec.
+/// Set up Telegram typing indicators for the given users. Returns a list of
+/// (CancellationToken, JoinHandle) pairs — one per unique Telegram chat.
 async fn setup_telegram_typing(
     users: &[UserRecord],
 ) -> Vec<(CancellationToken, tokio::task::JoinHandle<()>)> {
@@ -135,7 +142,6 @@ async fn setup_telegram_typing(
     let mut seen_targets = HashSet::new();
 
     for user in users {
-        // Check if user has a Telegram channel binding
         let Some(telegram_binding) = user.channels.iter().find(|b| b.channel == "telegram") else {
             continue;
         };
@@ -150,12 +156,10 @@ async fn setup_telegram_typing(
             continue;
         };
 
-        // Immediate typing call — fire before the first periodic tick.
         if let Err(e) = tg_channel.start_typing(&recipient).await {
-            debug!("Manager queue: telegram start_typing failed: {e}");
+            debug!("Agent queue: telegram start_typing failed: {e}");
         }
 
-        // Periodic 4-second refresh for the duration of agent execution.
         let cancel = CancellationToken::new();
         let handle = spawn_scoped_typing_task(recipient, "telegram".to_string(), cancel.clone());
         typing_tasks.push((cancel, handle));
@@ -164,7 +168,7 @@ async fn setup_telegram_typing(
     typing_tasks
 }
 
-/// Broadcast typing indicators to the GUI for all workspace users.
+/// Broadcast typing indicators to the GUI for the given users.
 fn broadcast_typing(users: &[UserRecord], workspace: &str, is_typing: bool) {
     if let Some(tx) = crate::CHAT_BROADCAST.get() {
         for user in users {
@@ -177,44 +181,37 @@ fn broadcast_typing(users: &[UserRecord], workspace: &str, is_typing: bool) {
     }
 }
 
-/// The single consumer task that processes Manager jobs one at a time.
+/// The consumer task that processes agent jobs for a specific role, one at a time.
 ///
-/// Shutdown-aware loop: checks for global shutdown between jobs, races
-/// [`mpsc::UnboundedReceiver::recv`] against the shutdown token while
-/// idle, and never interrupts an in-flight job — the current job (agent
-/// run + post-delivery) completes before the next shutdown check at the
-/// top of the loop.
+/// Shutdown-aware loop: checks for global shutdown between jobs.
 #[allow(clippy::too_many_lines)]
-async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
+async fn consumer_loop(role: Role, mut rx: mpsc::UnboundedReceiver<AgentJob>) {
     let shutdown = crate::shutdown::shutdown_token();
 
     loop {
-        // Between jobs: check if global shutdown has been signalled.
-        // Catches the case where shutdown fired during the previous job.
         if shutdown.is_cancelled() {
-            info!("Manager queue: shutting down — agent queue drained");
+            info!("Agent queue [{role}]: shutting down — queue drained");
             break;
         }
 
-        // While waiting for the next job, race against shutdown so we
-        // don't block indefinitely when the daemon is shutting down.
         let job = tokio::select! {
             job = rx.recv() => {
                 match job {
                     Some(job) => job,
-                    None => break, // channel closed
+                    None => break,
                 }
             }
             () = shutdown.cancelled() => {
-                info!("Manager queue: shutting down (global shutdown)");
+                info!("Agent queue [{role}]: shutting down (global shutdown)");
                 break;
             }
         };
 
         info!(
             workspace = %job.workspace_name,
+            user = %job.user_name,
             kind = ?job.kind,
-            "Manager queue: processing job",
+            "Agent queue [{role}]: processing job",
         );
 
         // Resolve workspace by name
@@ -223,7 +220,7 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
             Ok(None) => {
                 error!(
                     workspace = %job.workspace_name,
-                    "Manager queue: workspace not found — skipping job",
+                    "Agent queue [{role}]: workspace not found — skipping job",
                 );
                 continue;
             }
@@ -231,139 +228,218 @@ async fn consumer_loop(mut rx: mpsc::UnboundedReceiver<ManagerJob>) {
                 error!(
                     workspace = %job.workspace_name,
                     error = %e,
-                    "Manager queue: failed to look up workspace — skipping job",
+                    "Agent queue [{role}]: failed to look up workspace — skipping job",
                 );
                 continue;
             }
         };
 
-        let session_key = manager_session_key(&ws.name);
-
-        // Look up all workspace users before running the agent. Cached here for
-        // both typing-target discovery (Telegram) and response delivery below.
-        // Reusing the list for delivery means users who switch workspaces during
-        // agent execution won't receive this response — an accepted trade-off.
-        let users: Vec<UserRecord> = match crate::users::USER_STORE.get() {
-            Some(store) => store
-                .find_by_workspace(&job.workspace_name)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
+        // ── Role-specific session key ─────────────────────────────────
+        // Manager: workspaces have one session shared by all users.
+        // Assistant (and other per-user roles): include user_name so that
+        // each user gets an isolated session — no cross-user context leak.
+        let session_key = match role {
+            Role::Manager => manager_session_key(&ws.name),
+            _ => format!("queue_{}_{}_{}", role.as_str(), ws.name, job.user_name),
         };
 
-        // ── Telegram typing setup ───────────────────────────────────────
-        let typing_tasks = setup_telegram_typing(&users).await;
+        // ── Role-specific user resolution ─────────────────────────────
+        // Manager: broadcast to all workspace users.
+        // Assistant: deliver to the specific user.
+        let users: Vec<UserRecord> = if role == Role::Manager {
+            match crate::users::USER_STORE.get() {
+                Some(store) => store
+                    .find_by_workspace(&job.workspace_name)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        } else {
+            // For per-user roles, resolve the single user
+            let user = resolve_single_user(&job.user_name).await;
+            user.into_iter().collect()
+        };
 
-        // Send typing start to GUI subscribers for all users in this workspace.
+        // ── Typing indicators ─────────────────────────────────────────
+        let typing_tasks = setup_telegram_typing(&users).await;
         broadcast_typing(&users, &job.workspace_name, true);
 
-        // Drain buffered ticket transitions on user-initiated messages so
-        // the Manager sees accumulated non-critical status changes.
-        // Notification paths drain inside notify_ticket() instead.
-        let message = match job.kind {
-            JobKind::UserMessage => {
+        // ── Ticket buffer drain (Manager only) ────────────────────────
+        let message = match (role, job.kind) {
+            (Role::Manager, JobKind::UserMessage) => {
                 let drained = crate::ticket_buffer::drain(&job.workspace_name);
                 if drained.is_empty() {
-                    job.content
+                    job.content.clone()
                 } else {
                     format!("{drained}\n{content}", content = job.content)
                 }
             }
-            JobKind::TicketNotify | JobKind::AskToolResult => job.content,
+            _ => job.content.clone(),
         };
 
-        // Run the Manager agent (no reply context needed — routing comes from DB).
-        let (_agent, response) =
-            crate::agent::run_agent(session_key, Role::Manager, &ws, None, &message).await;
+        // ── Run the agent ────────────────────────────────────────────
+        let (_agent, response) = crate::agent::run_agent(
+            session_key,
+            role,
+            &ws,
+            None,
+            &message,
+            job.user_name.clone(),
+            job.channel.clone(),
+        )
+        .await;
 
-        // Cancel and await all Telegram typing refresh tasks.
+        // ── Stop typing ──────────────────────────────────────────────
         for (cancel, handle) in typing_tasks {
             cancel.cancel();
             stop_typing(handle).await;
         }
-
-        // Typing stop for GUI.
         broadcast_typing(&users, &job.workspace_name, false);
 
         let Some(response) = response else {
-            // Agent was cancelled or errored — nothing to deliver
             continue;
         };
 
-        // No inline-button options are extracted from agent responses.
-        // The callback parsing infrastructure (`crate::channels::telegram::decode_callback`,
-        // `handle_option_callback`)
-        // remains available for future flows that produce their own reply markup.
-
-        if users.is_empty() {
-            warn!(
-                workspace = %job.workspace_name,
-                "Manager queue: no users with workspace — response delivered to nobody",
-            );
+        // ── Response delivery ────────────────────────────────────────
+        // Manager: broadcast + persist to all workspace users.
+        // Assistant: send reply to the specific user.
+        match role {
+            Role::Manager => {
+                deliver_manager_response(&response, &users, &job).await;
+            }
+            _ => {
+                deliver_single_user_response(&response, &users, &job, &role).await;
+            }
         }
+    }
+}
 
-        // Extract common broadcast/persist fields once; only `recipient` differs
-        // between the broadcast+persist loop and the channel delivery loop.
-        let content = &response;
-        let agent_role = Some("manager".to_string());
-        let workspace = &job.workspace_name;
+/// Deliver a response to all workspace users (Manager role).
+async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &AgentJob) {
+    if users.is_empty() {
+        warn!(
+            workspace = %job.workspace_name,
+            "Agent queue [manager]: no users with workspace — response delivered to nobody",
+        );
+    }
 
-        // ── Broadcast + persist once per user ─────────────────────────
-        // Before the channel transport loop: broadcast the agent response
-        // to the GUI dashboard and persist to chat_history once per unique
-        // user. The channel for chat_history is taken from the first channel
-        // binding (or "gui" if none).
-        {
-            let mut seen_names = HashSet::new();
-            for user in &users {
-                if !seen_names.insert(&user.name) {
+    let agent_role = Some("manager".to_string());
+    let workspace = &job.workspace_name;
+
+    // ── Broadcast + persist once per user ─────────────────────────
+    {
+        let mut seen_names = HashSet::new();
+        for user in users {
+            if !seen_names.insert(&user.name) {
+                continue;
+            }
+            let channel = user.channels.first().map_or("gui", |b| b.channel.as_str());
+            broadcast_and_persist_agent_response(
+                &user.name,
+                channel,
+                response,
+                agent_role.clone(),
+                workspace,
+            )
+            .await;
+        }
+    }
+
+    let channels = crate::channel_registry().list();
+    if channels.is_empty() {
+        error!("Agent queue [manager]: no channels registered");
+        return;
+    }
+
+    for (channel_name, channel) in &channels {
+        for user in users {
+            for binding in &user.channels {
+                let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
+                let Some(recipient) = channel.resolve_recipient(&user.name, reply_target) else {
                     continue;
-                }
-                let channel = user.channels.first().map_or("gui", |b| b.channel.as_str());
-                broadcast_and_persist_agent_response(
-                    &user.name,
-                    channel,
-                    content,
-                    agent_role.clone(),
-                    workspace,
-                )
-                .await;
-            }
-        }
-
-        let channels = crate::channel_registry().list();
-
-        if channels.is_empty() {
-            error!("Manager queue: no channels registered");
-            continue;
-        }
-
-        for (channel_name, channel) in &channels {
-            for user in &users {
-                // Deliver on all channel bindings for this user.
-                for binding in &user.channels {
-                    let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
-                    let Some(recipient) = channel.resolve_recipient(&user.name, reply_target)
-                    else {
-                        continue;
-                    };
-                    if let Err(e) = channel
-                        .send(&SendMessage {
-                            content: content.clone(),
-                            recipient,
-                            reply_markup: None,
-                        })
-                        .await
-                    {
-                        error!(
-                            channel = %channel_name,
-                            user = %user.name,
-                            "Manager queue: failed to send response to {}: {e}",
-                            user.name,
-                        );
-                    }
+                };
+                if let Err(e) = channel
+                    .send(&SendMessage {
+                        content: response.to_string(),
+                        recipient,
+                        reply_markup: None,
+                    })
+                    .await
+                {
+                    error!(
+                        channel = %channel_name,
+                        user = %user.name,
+                        "Agent queue [manager]: failed to send response to {}: {e}",
+                        user.name,
+                    );
                 }
             }
         }
+    }
+}
+
+/// Deliver a response to a single user (Assistant and other per-user roles).
+async fn deliver_single_user_response(
+    response: &str,
+    users: &[UserRecord],
+    job: &AgentJob,
+    role: &Role,
+) {
+    let Some(user) = users.first() else {
+        warn!(
+            workspace = %job.workspace_name,
+            user = %job.user_name,
+            "Agent queue [{role}]: user not found — response delivered to nobody",
+        );
+        return;
+    };
+
+    // Broadcast + persist
+    let channel = job.channel.as_str();
+    broadcast_and_persist_agent_response(
+        &user.name,
+        channel,
+        response,
+        Some(role.as_str().to_string()),
+        &job.workspace_name,
+    )
+    .await;
+
+    // Send via registered channels
+    let channels = crate::channel_registry().list();
+    for (channel_name, channel) in &channels {
+        for binding in &user.channels {
+            let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
+            let Some(recipient) = channel.resolve_recipient(&user.name, reply_target) else {
+                continue;
+            };
+            if let Err(e) = channel
+                .send(&SendMessage {
+                    content: response.to_string(),
+                    recipient,
+                    reply_markup: None,
+                })
+                .await
+            {
+                error!(
+                    channel = %channel_name,
+                    user = %user.name,
+                    "Agent queue [{role}]: failed to send response to {}: {e}",
+                    user.name,
+                );
+            }
+        }
+    }
+}
+
+/// Resolve a single user by name, returning their full record if available.
+/// Uses a targeted database query instead of loading all users.
+async fn resolve_single_user(user_name: &str) -> Vec<UserRecord> {
+    let Some(store) = crate::users::USER_STORE.get() else {
+        return Vec::new();
+    };
+    match store.find_by_name(user_name).await {
+        Ok(Some(user)) => vec![user],
+        _ => Vec::new(),
     }
 }

@@ -33,7 +33,7 @@ use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, Tick
 use crate::git_commands::{
     list_new_or_untracked_files, parse_new_files_from_porcelain, run_git_status,
 };
-use crate::manager_queue::{JobKind, ManagerJob};
+use crate::manager_queue;
 use crate::prompt::{load_prompt, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
 use crate::session::ticket_session_key;
@@ -484,10 +484,12 @@ async fn notify_ticket(ticket: &Ticket, source: TicketPhase, target_phase: Ticke
 
     // Enqueue to the serialized Manager queue instead of spawning a task.
     // Routing is handled by the consumer loop via DB lookup.
-    crate::manager_queue::manager_queue().enqueue(ManagerJob {
+    manager_queue::manager_queue().enqueue(manager_queue::AgentJob {
         content: message,
         workspace_name: ws.name,
-        kind: JobKind::TicketNotify,
+        user_name: String::new(),
+        channel: String::new(),
+        kind: manager_queue::JobKind::TicketNotify,
     });
 }
 
@@ -1080,8 +1082,16 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         );
     }
 
-    let (_agent, response) =
-        run_agent(session_key, Role::Engineer, &ws, Some(&ticket), &message).await;
+    let (_agent, response) = run_agent(
+        session_key,
+        Role::Engineer,
+        &ws,
+        Some(&ticket),
+        &message,
+        String::new(),
+        String::new(),
+    )
+    .await;
 
     // Post-run check still needed for race conditions during agent execution.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
@@ -1494,8 +1504,16 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         ],
     );
 
-    let (agent, response) =
-        run_agent(session_key, Role::Sanitation, &ws, Some(&ticket), &prompt).await;
+    let (agent, response) = run_agent(
+        session_key,
+        Role::Sanitation,
+        &ws,
+        Some(&ticket),
+        &prompt,
+        String::new(),
+        String::new(),
+    )
+    .await;
 
     // Post-run phase check — bail if ticket was moved externally.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
@@ -1866,8 +1884,16 @@ async fn run_parallel_agents(
             let session_key = format!("{base}_{i}_{suffix}");
             let extraction_prompt = extraction_prompt.to_string();
             async move {
-                let (agent, response) =
-                    run_agent(session_key, role, &ws, Some(&ticket), &prompt).await;
+                let (agent, response) = run_agent(
+                    session_key,
+                    role,
+                    &ws,
+                    Some(&ticket),
+                    &prompt,
+                    String::new(),
+                    String::new(),
+                )
+                .await;
                 let response = response.unwrap_or_default();
                 if response.is_empty() {
                     return ParallelVerdict::NoResponse;

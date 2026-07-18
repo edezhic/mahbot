@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use super::context_menu::ContextMenu;
+use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets::{self, FileTree};
 
@@ -985,7 +985,7 @@ impl DiffState {
         } else {
             ContextMenu::new(
                 header_btn,
-                vec![(
+                vec![MenuItem::new(
                     "Discard changes".into(),
                     DiffMessage::DiscardPath(full_path, DiscardTarget::Directory),
                 )],
@@ -1118,7 +1118,7 @@ impl DiffState {
         } else {
             ContextMenu::new(
                 file_btn,
-                vec![(
+                vec![MenuItem::new(
                     "Discard changes".into(),
                     DiffMessage::DiscardPath(full_path, DiscardTarget::File),
                 )],

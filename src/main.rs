@@ -79,7 +79,12 @@ async fn handle_option_callback(mut msg: ChannelMessage) {
 
     // Route directly to Manager session, bypassing resolve_active_role.
     // Enrichment is skipped — synthetic callback text has no media markers or URLs.
-    manager_queue::manager_queue().enqueue_user_message(msg.content, ws.name);
+    manager_queue::manager_queue().enqueue_user_message(
+        msg.content,
+        ws.name,
+        msg.user_name,
+        msg.channel,
+    );
 }
 
 /// Run [`bootstrap_mahbot`] and convert panics into `Err` so the dashboard shows
@@ -819,10 +824,11 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         msg.content = s;
     }
 
-    // Manager messages route through the serialized queue; non-Manager roles
-    // use the traditional inline agent dispatch path.
-    if effective_role == Role::Manager {
-        manager_queue::manager_queue().enqueue_user_message(msg.content, ws.name);
+    // Check if this role has a serialized queue — if so, enqueue instead
+    // of running inline. Manager and Assistant use queues; other roles
+    // (Engineer, Analyst, Artist, etc.) use the traditional inline dispatch.
+    if let Some(queue) = manager_queue::queue_for(&effective_role) {
+        queue.enqueue_user_message(msg.content, ws.name, msg.user_name, msg.channel);
         return;
     }
 
@@ -836,7 +842,14 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         effective_role.as_str(),
         &ws.name,
     );
-    let mut agent = Agent::new(session_key, effective_role, &ws, None);
+    let mut agent = Agent::new(
+        session_key,
+        effective_role,
+        &ws,
+        None,
+        msg.user_name.clone(),
+        msg.channel.clone(),
+    );
     let cancel = agent.cancel_token();
     let typing_stop = CancellationToken::new();
     let typing_handle = spawn_scoped_typing_task(
