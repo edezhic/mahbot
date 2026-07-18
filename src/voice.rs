@@ -12,10 +12,12 @@
 //! 5. **Wake word matching** — DTW with cosine distance against enrolled templates
 //! 6. **Command recording** — record speech until silence or 30s cap
 //! 7. **Transcription** — via existing Qwen3-ASR local transcriber
-//! 8. **Routing** — send transcribed text to the active workspace's Manager
+//! 8. **Routing** — transcribed text is routed to the user's active role via
+//!    [`route_to_agent`] (falls back to the Manager if no active user is determined).
 //!
 //! The Assistant role manages this pipeline. It does NOT use an LLM agent loop.
-//! All transcribed commands are forwarded to the Manager as if the user typed them.
+//! Transcribed commands are routed to the user's currently active role (resolved
+//! via [`route_to_agent`]) as if the user typed them.
 //!
 //! # Model files
 //!
