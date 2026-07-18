@@ -79,12 +79,12 @@ impl BroadcastPersistEntry {
 /// Broadcast an agent response to CHAT_BROADCAST for live GUI display and
 /// persist it to chat_history. This is the canonical entry point for all
 /// agent responses — both the non-Manager path
-/// ([`send_channel_reply`]) and the Manager queue consumer
-/// in [`crate::manager_queue`].
+/// ([`send_channel_reply`]) and the per-agent consumer loop
+/// in [`crate::message_router`].
 ///
 /// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
 /// and primitive fields — does **not** depend on [`SendMessage`], so it can be used
-/// from the Manager queue which works from [`crate::users::UserRecord`].
+/// from the per-agent consumer loop which works from [`crate::users::UserRecord`].
 pub(crate) async fn broadcast_and_persist_agent_response(
     user_name: &str,
     channel: &str,

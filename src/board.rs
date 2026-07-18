@@ -1687,7 +1687,7 @@ impl BoardStore {
     /// each other as active and both buffer their Done transitions. In this
     /// scenario all tickets are already in Done in the database — the only
     /// consequence is that Done notifications are delayed until the next
-    /// [`crate::manager_queue::JobKind::UserMessage`] drains the buffer. This is an accepted trade-off:
+    /// [`crate::message_router::JobKind::UserMessage`] drains the buffer. This is an accepted trade-off:
     /// the race window is small and the buffer always drains eventually.
     pub async fn has_active_tickets_excluding(
         &self,

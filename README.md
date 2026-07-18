@@ -80,8 +80,8 @@ Other harnesses efficiency heavily relies on huge discrepancy between subscripti
 flowchart TD
     User[User] --> Channels[GUI or Telegram]
     Channels --> MessagePipeline[Message Pipeline]
-    MessagePipeline --> AgentQueue[Agent Queue]
-    AgentQueue --> Board[Ticket Board]
+    MessagePipeline --> MessageRouter[Message Router]
+    MessageRouter --> Board[Ticket Board]
     Board --> Analysts[3 Analysts]
     Board --> Engineer[Engineer]
     Board --> Diagnostics[Diagnostics Runner]
@@ -92,11 +92,11 @@ flowchart TD
     QaCheck -->|no| AutoCommit[Auto Commit]
     Sanitation -->|pass| AutoCommit
     AutoCommit --> Done[Done]
-    Done --> AgentQueue
+    Done --> MessageRouter
 ```
 
 - **Channels** — GUI and Telegram share one message pipeline and channel registry (`src/channels/`, `src/main.rs`).
-- **Agent queue** — user messages, ticket notifications, and async `ask` results enqueue; consumer runs one job at a time (`src/manager_queue.rs`).
+- **Agent queue** — user messages, ticket notifications, and async `ask` results are routed through per-agent-ID channels for true instance-level parallelism (`src/message_router.rs`).
 - **Board poller** — `management.rs` claims tickets per workspace and dispatches agents by phase.
 - **Persistence** — under configurable storage root (`~/.mahbot/`): config, sessions, board, workspaces, users, stats, logs, chat history (`src/turso.rs`, module stores).
 - **Search** — per-workspace `fff-search` index with persistent query boosting; archived tickets use FTS + embeddings (`src/search_engine.rs`, `src/embedder.rs`).

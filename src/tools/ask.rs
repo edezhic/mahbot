@@ -3,17 +3,16 @@
 //! Available to the Engineer and Maintainer agents (sync mode), and to the
 //! Manager and Assistant agents (async mode). In sync mode the caller blocks
 //! until the sub-agent completes. In async mode the sub-agent is dispatched
-//! in a background task and the result is injected back via the caller's
-//! agent queue.
+//! in a background task and the result is injected back to the caller's
+//! agent channel via [`crate::message_router::route`].
 
-use crate::manager_queue::{self, AgentJob, JobKind};
-use crate::session::ask_agent_id;
+use crate::message_router::{self, AgentJob, JobKind};
+use crate::session::{ask_agent_id, direct_agent_id, manager_agent_id};
 use crate::tools::Tool;
 use crate::{Agent, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::error;
 
 /// Controls sub-agent dispatch behaviour.
 ///
@@ -42,7 +41,7 @@ pub struct AskTool {
     ///   delivered via the caller's agent queue.
     dispatch_mode: DispatchMode,
     /// The role of the calling agent. Used to route async results to the
-    /// correct queue (Manager → manager queue, Assistant → assistant queue).
+    /// correct agent channel (Manager → manager_{ws}, Assistant → direct_{...}).
     pub caller_role: Role,
 }
 
@@ -142,20 +141,26 @@ impl Tool for AskTool {
                     }
                 };
 
-                // Route result to the caller's agent queue
-                if let Some(queue) = manager_queue::queue_for(&caller_role) {
-                    queue.enqueue(AgentJob {
+                // Route result to the caller's agent channel.
+                // Manager callers route to `manager_{ws_name}`.
+                // Assistant callers route to `{channel}_{user_name}_{ws_name}_assistant`.
+                let target_agent_id = if caller_role == Role::Manager {
+                    manager_agent_id(&ws.name)
+                } else {
+                    direct_agent_id(&channel, &user_name, caller_role.as_str(), &ws.name)
+                };
+                message_router::route(
+                    &target_agent_id,
+                    AgentJob {
                         content: message,
                         workspace_name: ws.name.clone(),
                         user_name,
                         channel,
                         kind: JobKind::AskToolResult,
-                    });
-                } else {
-                    error!(
-                        "AskTool: no agent queue for role '{caller_role}' — async result dropped"
-                    );
-                }
+                        role: caller_role,
+                        reply_target: None,
+                    },
+                );
             });
 
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());

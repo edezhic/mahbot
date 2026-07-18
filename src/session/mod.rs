@@ -106,7 +106,7 @@ crate::columns! {
 ///
 /// User-facing agents — those the user can directly converse with — persist
 /// indefinitely and are intentionally excluded:
-/// - Direct chat: `{channel}_{user_name}_{role}_{ws_name}`
+/// - Direct chat: `{channel}_{user_name}_{ws_name}_{role}`
 /// - Manager: `manager_{ws_name}` — the Manager session carries both chat conversation
 ///   and notification context and must never be added here.
 ///
@@ -473,13 +473,18 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
 
 /// Construct an agent ID for direct user-to-agent chat.
 ///
-/// Format: `{channel}_{user_name}_{role}_{ws_name}`
+/// Format: `{channel}_{user_name}_{ws_name}_{role}`
+/// Role is the last segment for consistent identification in logs and
+/// debugging. The role-last format is immune to underscores in user/workspace
+/// names since the role is always the final `_`-delimited segment, but note
+/// that the router no longer parses agent ID strings — the role is embedded
+/// directly in [`AgentJob`](crate::message_router::AgentJob).
 /// This ID is stable across messages — the same ID is used for every message
 /// in the same channel/user/role/workspace combination, accumulating conversation
 /// history within a single session.
 #[must_use]
 pub fn direct_agent_id(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
-    format!("{channel}_{user_name}_{role}_{ws_name}")
+    format!("{channel}_{user_name}_{ws_name}_{role}")
 }
 
 /// Construct a base agent ID for ticket-driven agent work.
@@ -494,7 +499,7 @@ pub fn direct_agent_id(channel: &str, user_name: &str, role: &str, ws_name: &str
 /// * **Parallel agents** (analysts, reviewers, QA via
 ///   `run_parallel_agents`): the caller appends `_{index}_{suffix}`
 ///   for disambiguation, producing IDs like
-///   `ticket_{ticket_id}_{role}_0_nano`.
+///   `ticket_{ticket_id}_0_nano_{role}` (role last).
 #[must_use]
 pub(crate) fn ticket_agent_id(ticket_id: &str, role: &str) -> String {
     format!("ticket_{ticket_id}_{role}")
@@ -504,7 +509,7 @@ pub(crate) fn ticket_agent_id(ticket_id: &str, role: &str) -> String {
 ///
 /// Format: `manager_{ws_name}`
 #[must_use]
-pub(crate) fn manager_agent_id(ws_name: &str) -> String {
+pub fn manager_agent_id(ws_name: &str) -> String {
     format!("manager_{ws_name}")
 }
 
@@ -513,7 +518,7 @@ pub(crate) fn manager_agent_id(ws_name: &str) -> String {
 ///
 /// - **Manager** agents use workspace-scoped IDs (`manager_{ws_name}`).
 /// - **Non-Manager** agents use channel-scoped IDs
-///   (`{channel}_{user_name}_{role}_{ws_name}`).
+///   (`{channel}_{user_name}_{ws_name}_{role}`).
 ///
 /// This is a convenience wrapper around [`manager_agent_id`] and
 /// [`direct_agent_id`] that selects the right format based on
@@ -544,22 +549,24 @@ pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
 
 /// Construct an agent ID for sub-agent asks (Engineer/Maintainer → sub-agent).
 ///
-/// Format: `ask_{ws_name}_{role}_{suffix}`
+/// Format: `ask_{ws_name}_{suffix}_{role}`
+/// Role is the LAST segment — see [`direct_agent_id`] for rationale.
 #[must_use]
 pub(crate) fn ask_agent_id(ws_name: &str, role: &str) -> String {
-    format!("ask_{}_{}_{}", ws_name, role, crate::generate_suffix())
+    format!("ask_{}_{}_{}", ws_name, crate::generate_suffix(), role)
 }
 
 /// Construct an agent ID for workspace role discovery.
 ///
-/// Format: `discovery_{ws_name}_{role}_{suffix}`
+/// Format: `discovery_{ws_name}_{suffix}_{role}`
+/// Role is the LAST segment — see [`direct_agent_id`] for rationale.
 #[must_use]
 pub(crate) fn discovery_agent_id(ws_name: &str, role: &str) -> String {
     format!(
         "discovery_{}_{}_{}",
         ws_name,
-        role,
-        crate::generate_suffix()
+        crate::generate_suffix(),
+        role
     )
 }
 
@@ -852,10 +859,11 @@ mod transient_prefix_tests {
     fn forward_no_collision_with_user_facing_agent_ids() {
         // For every transient prefix, verify that none of the user-facing
         // agent ID patterns start with it. Direct IDs have the format
-        // {channel}_{user}_{role}_{ws}, and `starts_with` only checks the
+        // {channel}_{user}_{ws}_{role}, and `starts_with` only checks the
         // first segment (channel name). Since safe channels ("telegram",
-        // "gui") don't match any transient prefix, the role segment (third)
-        // has no effect on the assertion outcome — a single role suffices.
+        // "gui") don't match any transient prefix, the workspace and role
+        // segments have no effect on the assertion outcome — a single role
+        // and workspace suffice.
         for prefix in TRANSIENT_AGENT_ID_PREFIXES {
             // Manager uses a separate ID format (manager_{ws_name}).
             let manager_key = manager_agent_id("test-ws");
@@ -931,8 +939,9 @@ mod transient_prefix_tests {
     #[test]
     fn resolve_agent_id_non_manager_dispatch() {
         // Non-Manager role produces a direct channel-scoped ID.
+        // Role is the LAST segment.
         let key = resolve_agent_id("discord", "bob", "engineer", "my-workspace");
-        assert_eq!(key, "discord_bob_engineer_my-workspace");
+        assert_eq!(key, "discord_bob_my-workspace_engineer");
     }
 
     #[test]
@@ -941,7 +950,7 @@ mod transient_prefix_tests {
         // (matches Role::Manager.as_str() which is lowercase).
         let key = resolve_agent_id("gui", "carol", "Manager", "ws");
         assert_ne!(key, "manager_ws", "capital-M 'Manager' should NOT match");
-        assert_eq!(key, "gui_carol_Manager_ws");
+        assert_eq!(key, "gui_carol_ws_Manager");
     }
 }
 

@@ -419,27 +419,27 @@ pub async fn init_test_stores() {
 /// the ticket buffer.
 ///
 /// Calls [`init_test_stores`] (all test DBs) then initializes the global
-/// manager queue. The manager queue consumer is required by callers that
+/// message_router. The router is required by callers that
 /// exercise [`notify_ticket`](crate::management::notify_ticket) which
-/// enqueues notifications via [`crate::manager_queue::manager_queue`].
+/// enqueues notifications via [`crate::message_router::route`].
 ///
 /// # Panics
 ///
-/// Panics if [`init_test_stores`] has not been called first (the manager
-/// queue depends on stores being available), or if initialization of the
-/// manager queue fails.
+/// Panics if [`init_test_stores`] has not been called first (the route
+/// depends on stores being available), or if initialization of the
+/// router fails.
 ///
 /// # Idempotency note
 ///
 /// [`init_test_stores`] is idempotent (uses a [`tokio::sync::OnceCell`]).
-/// [`crate::manager_queue::init_global`] spawns a consumer loop before
-/// setting its [`OnceCell`](tokio::sync::OnceCell), so calling this
-/// function more than once leaks a background task — ensure callers
-/// initialize once per process lifetime.
+/// [`crate::message_router::init_global`] initialises the router's internal
+/// [`HashMap`](std::collections::HashMap) (via [`std::sync::OnceLock`]).
+/// No consumer loops are spawned until the first [`route`](crate::message_router::route)
+/// to each agent ID.
 pub async fn init_management_test_stores() {
     init_test_stores().await;
 
-    let _ = crate::manager_queue::init_global();
+    let _ = crate::message_router::init_global();
 }
 
 /// Create a test workspace by inserting it into the test DB and returning

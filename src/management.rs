@@ -33,10 +33,10 @@ use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, Tick
 use crate::git_commands::{
     list_new_or_untracked_files, parse_new_files_from_porcelain, run_git_status,
 };
-use crate::manager_queue;
+use crate::message_router;
 use crate::prompt::{load_prompt, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
-use crate::session::ticket_agent_id;
+use crate::session::{manager_agent_id, ticket_agent_id};
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::turso::TxGuard;
@@ -399,7 +399,7 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
 ///
 /// Renders a template with the ticket ID, title, target phase, transition log,
 /// and the workspace's buffered non-critical transitions (see "Side effects"
-/// below), then enqueues the result into the serialized Manager queue.
+/// below), then routes the result through the message router.
 ///
 /// This function does NOT pause the workspace — the Manager handles failed
 /// tickets autonomously via the triage prompt.
@@ -482,15 +482,21 @@ async fn notify_ticket(ticket: &Ticket, source: TicketPhase, target_phase: Ticke
         message.push_str(&warning);
     }
 
-    // Enqueue to the serialized Manager queue instead of spawning a task.
-    // Routing is handled by the consumer loop via DB lookup.
-    manager_queue::manager_queue().enqueue(manager_queue::AgentJob {
-        content: message,
-        workspace_name: ws.name,
-        user_name: String::new(),
-        channel: String::new(),
-        kind: manager_queue::JobKind::TicketNotify,
-    });
+    // Route through the agent-ID message router.
+    // The consumer loop resolves the workspace and runs the agent.
+    let agent_id = manager_agent_id(&ws.name);
+    message_router::route(
+        &agent_id,
+        message_router::AgentJob {
+            content: message,
+            workspace_name: ws.name,
+            user_name: String::new(),
+            channel: String::new(),
+            kind: message_router::JobKind::TicketNotify,
+            role: crate::Role::Manager,
+            reply_target: None,
+        },
+    );
 }
 
 pub async fn run_management() {
@@ -1856,7 +1862,7 @@ enum ParallelVerdict {
 /// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
 /// from their responses.
 ///
-/// Agent IDs are formatted as `ticket_{ticket.id}_{role}_{i}_{suffix}`
+/// Agent IDs are formatted as `ticket_{ticket.id}_{i}_{suffix}_{role}`
 /// where `suffix` is a unique 6-char NanoID for retry-cycle disambiguation.
 /// Each agent creates its own CancellationToken and auto-registers.
 ///
@@ -1877,8 +1883,8 @@ async fn run_parallel_agents(
             let ticket = Arc::clone(ticket);
             let prompt = prompt.to_string();
             let ws = ws.clone();
-            let base = ticket_agent_id(&ticket.id, role.as_str());
-            let agent_id = format!("{base}_{i}_{suffix}");
+            let suffix = suffix.clone();
+            let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
             let extraction_prompt = extraction_prompt.to_string();
             async move {
                 let (agent, response) = run_agent(

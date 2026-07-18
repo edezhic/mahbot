@@ -14,17 +14,14 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use mahbot::channels::telegram::{decode_action, decode_callback};
-use mahbot::channels::{
-    broadcast_incoming_message, persist_incoming_message, send_channel_reply,
-    spawn_scoped_typing_task, stop_typing,
-};
+use mahbot::channels::{broadcast_incoming_message, persist_incoming_message, send_channel_reply};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
-use mahbot::manager_queue;
+use mahbot::message_router::{self, AgentJob, JobKind};
 use mahbot::parse_bot_command;
-use mahbot::session::{Session, direct_agent_id, resolve_agent_id};
+use mahbot::session::{Session, manager_agent_id, resolve_agent_id};
 use mahbot::util::UnwrapPoison;
-use mahbot::{Agent, BotCommand, Channel, ChannelMessage, Role, Workspace};
+use mahbot::{BotCommand, Channel, ChannelMessage, Role, Workspace};
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
 const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regular.ttf");
 
@@ -79,11 +76,18 @@ async fn handle_option_callback(mut msg: ChannelMessage) {
 
     // Route directly to Manager session, bypassing resolve_active_role.
     // Enrichment is skipped — synthetic callback text has no media markers or URLs.
-    manager_queue::manager_queue().enqueue_user_message(
-        msg.content,
-        ws.name,
-        msg.user_name,
-        msg.channel,
+    let agent_id = manager_agent_id(&ws.name);
+    message_router::route(
+        &agent_id,
+        AgentJob {
+            content: msg.content,
+            workspace_name: ws.name,
+            user_name: msg.user_name,
+            channel: msg.channel,
+            kind: JobKind::UserMessage,
+            role: Role::Manager,
+            reply_target: None,
+        },
     );
 }
 
@@ -113,7 +117,7 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     mahbot::search_engine::init_global(); // sync — no I/O
     mahbot::ticket_buffer::init_global(); // sync — no I/O
-    mahbot::manager_queue::init_global()?;
+    mahbot::message_router::init_global()?;
     mahbot::voice::init_global()?;
 
     mahbot::turso::init_all_stores().await?;
@@ -824,64 +828,26 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         msg.content = s;
     }
 
-    // Check if this role has a serialized queue — if so, enqueue instead
-    // of running inline. Manager and Assistant use queues; other roles
-    // (Engineer, Analyst, Artist, etc.) use the traditional inline dispatch.
-    if let Some(queue) = manager_queue::queue_for(&effective_role) {
-        queue.enqueue_user_message(msg.content, ws.name, msg.user_name, msg.channel);
-        return;
-    }
-
-    // ── Non-Manager inline agent dispatch ─────────────────────────
-    // Agent creation, work execution, and reply delivery all happen
-    // inline in the calling task.
-
-    let agent_id = direct_agent_id(
+    // ── Route through the agent-ID message router ─────────────────
+    // Every message resolves to a deterministic agent ID and routes
+    // through the per-agent consumer loop.  Different agent IDs get
+    // different consumer loops = true parallelism.
+    let agent_id = resolve_agent_id(
         &msg.channel,
         &msg.user_name,
         effective_role.as_str(),
         &ws.name,
     );
-    let mut agent = Agent::new(
-        agent_id,
-        effective_role,
-        &ws,
-        None,
-        msg.user_name.clone(),
-        msg.channel.clone(),
+    message_router::route(
+        &agent_id,
+        AgentJob {
+            content: msg.content,
+            workspace_name: ws.name,
+            user_name: msg.user_name,
+            channel: msg.channel,
+            kind: JobKind::UserMessage,
+            role: effective_role,
+            reply_target: Some(msg.reply_target),
+        },
     );
-    let cancel = agent.cancel_token();
-    let typing_stop = CancellationToken::new();
-    let typing_handle = spawn_scoped_typing_task(
-        msg.reply_target.clone(),
-        msg.channel.clone(),
-        typing_stop.clone(),
-    );
-
-    // Core work block — cancel/error paths `break 'work` to skip
-    // reply delivery, then cleanup runs unconditionally below.
-    'work: {
-        let agent_result = tokio::select! {
-            () = cancel.cancelled() => { break 'work; },
-            result = agent.work(&msg.content) => result,
-        };
-
-        let response = match agent_result {
-            Ok(response) => response,
-            Err(e) => {
-                tracing::error!("❌ Agent error: {e}");
-                format!("⚠️ `{e}`")
-            }
-        };
-
-        if agent.is_cancelled() {
-            break 'work;
-        }
-
-        send_channel_reply(response, &msg, Some(effective_role.to_string())).await;
-    }
-
-    // Single cleanup — always runs, even on cancellation
-    typing_stop.cancel();
-    stop_typing(typing_handle).await;
 }

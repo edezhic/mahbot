@@ -26,7 +26,7 @@ pub mod gui;
 pub mod logs;
 pub mod maintainer;
 pub mod management;
-pub mod manager_queue;
+pub mod message_router;
 pub(crate) mod prompt;
 pub mod providers;
 pub mod registry;

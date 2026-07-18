@@ -1063,12 +1063,10 @@ fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
 
 /// Route a transcribed voice command to the appropriate agent.
 ///
-/// Resolves the active user's role and routes accordingly:
-/// - If the role has an agent queue (Assistant, Manager), enqueues the message.
-/// - Otherwise, builds a ChannelMessage and sends through the normal inline
-///   dispatch path.
+/// Resolves the active user's role and computes the deterministic agent ID,
+/// then routes through the agent-ID message router.
 ///
-/// Falls back to the Manager queue if no active user can be determined.
+/// Falls back to the Manager router if no active user can be determined.
 async fn route_to_agent(text: String) {
     // Try active user first (set by GUI on user switch)
     let user_name = active_user_name();
@@ -1089,26 +1087,20 @@ async fn route_to_agent(text: String) {
 
         info!("Voice command -> {role} (user: {user_name}, workspace: {ws_name}): {text}",);
 
-        if let Some(queue) = crate::manager_queue::queue_for(&role) {
-            queue.enqueue_user_message(text, ws_name, user_name, "voice".to_string());
-            return;
-        }
-
-        // No queue for this role — use inline dispatch via ChannelMessage
-        let msg = crate::ChannelMessage {
-            content: text,
-            user_name: user_name.clone(),
-            reply_target: user_name.clone(),
-            workspace: ws_name.clone(),
-            channel: "voice".to_string(),
-            optimistic_id: None,
-            callback_query_id: None,
-        };
-
-        // Send through the normal message pipeline
-        if let Some(tx) = crate::MESSAGE_TX.get() {
-            let _ = tx.send(msg).await;
-        }
+        let agent_id =
+            crate::session::resolve_agent_id("voice", &user_name, role.as_str(), &ws_name);
+        crate::message_router::route(
+            &agent_id,
+            crate::message_router::AgentJob {
+                content: text,
+                workspace_name: ws_name,
+                user_name,
+                channel: "voice".to_string(),
+                kind: crate::message_router::JobKind::UserMessage,
+                role,
+                reply_target: None,
+            },
+        );
         return;
     }
 
@@ -1116,11 +1108,18 @@ async fn route_to_agent(text: String) {
     let active = active_workspace_name();
     if !active.is_empty() {
         info!("Voice command -> Manager (active workspace: {active}): {text}");
-        crate::manager_queue::manager_queue().enqueue_user_message(
-            text,
-            active,
-            String::new(),
-            String::new(),
+        let agent_id = crate::session::manager_agent_id(&active);
+        crate::message_router::route(
+            &agent_id,
+            crate::message_router::AgentJob {
+                content: text,
+                workspace_name: active,
+                user_name: String::new(),
+                channel: String::new(),
+                kind: crate::message_router::JobKind::UserMessage,
+                role: crate::Role::Manager,
+                reply_target: None,
+            },
         );
         return;
     }
@@ -1143,11 +1142,18 @@ async fn route_to_agent(text: String) {
         "Voice command -> Manager (workspace: {}): {}",
         ws.name, text
     );
-    crate::manager_queue::manager_queue().enqueue_user_message(
-        text,
-        ws.name,
-        String::new(),
-        String::new(),
+    let agent_id = crate::session::manager_agent_id(&ws.name);
+    crate::message_router::route(
+        &agent_id,
+        crate::message_router::AgentJob {
+            content: text,
+            workspace_name: ws.name,
+            user_name: String::new(),
+            channel: String::new(),
+            kind: crate::message_router::JobKind::UserMessage,
+            role: crate::Role::Manager,
+            reply_target: None,
+        },
     );
 }
 
