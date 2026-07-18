@@ -45,6 +45,8 @@ pub mod util;
 pub(crate) mod vector;
 pub mod workspace;
 
+pub mod voice;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

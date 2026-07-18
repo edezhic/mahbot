@@ -2359,7 +2359,6 @@ impl EditorState {
 
         let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
 
-        // Update selected workspace.
         self.selected_workspace_name = Some(name.to_string());
         self.selected_workspace_path = path.map(std::string::ToString::to_string);
 

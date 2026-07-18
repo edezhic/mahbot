@@ -109,6 +109,7 @@ async fn bootstrap_mahbot() -> Result<()> {
     mahbot::search_engine::init_global(); // sync — no I/O
     mahbot::ticket_buffer::init_global(); // sync — no I/O
     mahbot::manager_queue::init_global()?;
+    mahbot::voice::init_global()?;
 
     mahbot::turso::init_all_stores().await?;
 
@@ -225,6 +226,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &shutdown_token,
         "search-engine-init",
         mahbot::search_engine::init_all_engines(),
+    );
+
+    // Voice assistant pipeline — runs in background, manages wake word
+    // detection, command recording, transcription, and routing.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "voice-pipeline",
+        mahbot::voice::run_voice_pipeline(),
     );
 
     let rx = init_message_pipeline(&mut tasks, &shutdown_token);

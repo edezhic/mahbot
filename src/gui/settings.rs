@@ -292,6 +292,11 @@ pub enum SettingsMessage {
         target: ModelPickerTarget,
         action: ModelPickerAction,
     },
+    // ── Voice assistant messages ──────────────────────────
+    /// Start enrollment session for wake word.
+    StartVoiceEnrollment,
+    /// Cancel enrollment session.
+    CancelVoiceEnrollment,
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -449,11 +454,32 @@ impl SettingsState {
             SettingsMessage::SaveResult(Ok(())) => {
                 self.saving = false;
                 self.refresh();
+
+                // Sync voice assistant state with config
+                let voice_enabled = CONFIG.voice_enabled().as_deref() == Some("true");
+                if voice_enabled {
+                    crate::voice::set_enabled(true);
+                    crate::voice::send_command(crate::voice::VoiceCommand::StartListening);
+                } else {
+                    crate::voice::set_enabled(false);
+                    crate::voice::send_command(crate::voice::VoiceCommand::StopListening);
+                }
+
                 Task::none()
             }
             SettingsMessage::SaveResult(Err(e)) => {
                 self.saving = false;
                 self.error = Some(e);
+                Task::none()
+            }
+
+            // ── Voice assistant enrollment ───────────────────────
+            SettingsMessage::StartVoiceEnrollment => {
+                crate::voice::send_command(crate::voice::VoiceCommand::StartEnrollment);
+                Task::none()
+            }
+            SettingsMessage::CancelVoiceEnrollment => {
+                crate::voice::send_command(crate::voice::VoiceCommand::CancelEnrollment);
                 Task::none()
             }
 
@@ -635,6 +661,8 @@ impl SettingsState {
             self.routing_section(),
             Space::new().height(16),
             self.transcription_section(),
+            Space::new().height(16),
+            self.voice_section(),
             Space::new().height(16),
             self.generation_section(),
             Space::new().height(16),
@@ -1886,6 +1914,102 @@ impl SettingsState {
                 ),
             ],
         )
+    }
+
+    /// Voice Assistant section — enable/disable, enrollment, status.
+    fn voice_section(&self) -> Element<'_, SettingsMessage> {
+        use iced::widget::Text;
+
+        let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
+        let status = crate::voice::get_status();
+        let templates = crate::voice::get_templates();
+        let has_templates = !templates.templates.is_empty();
+
+        let status_text: Element<'_, SettingsMessage> = match status.clone() {
+            crate::voice::VoiceStatus::Disabled => Text::new("Disabled").into(),
+            crate::voice::VoiceStatus::LoadingModels => Text::new("Loading models…").into(),
+            crate::voice::VoiceStatus::ModelError => Text::new("Model error").into(),
+            crate::voice::VoiceStatus::Listening => Text::new("Listening for wake word").into(),
+            crate::voice::VoiceStatus::Recording => Text::new("Recording command").into(),
+            crate::voice::VoiceStatus::Transcribing => Text::new("Transcribing…").into(),
+            crate::voice::VoiceStatus::MicPermissionDenied => {
+                Text::new("Microphone permission denied").into()
+            }
+            crate::voice::VoiceStatus::MicDisconnected => {
+                Text::new("Microphone disconnected").into()
+            }
+            crate::voice::VoiceStatus::Enrolling { sample, total } => {
+                let remaining = total.saturating_sub(sample);
+                let msg = if remaining > 0 {
+                    format!("Say the wake word: {remaining} more time(s)…")
+                } else {
+                    "Processing…".to_string()
+                };
+                Text::new(msg).into()
+            }
+            crate::voice::VoiceStatus::Enrolled => Text::new("Enrolled").into(),
+            crate::voice::VoiceStatus::Error(msg) => Text::new(msg).into(),
+        };
+
+        // Enrollment progress UI (shown during active enrollment)
+        let enrollment_ui: Option<Element<'_, SettingsMessage>> = match status {
+            crate::voice::VoiceStatus::Enrolling { .. } => {
+                let cancel_btn: Element<'_, SettingsMessage> = container(
+                    button(Text::new("Cancel").size(13))
+                        .on_press(SettingsMessage::CancelVoiceEnrollment)
+                        .style(theme::button_danger)
+                        .padding(6),
+                )
+                .into();
+                Some(
+                    Column::new()
+                        .push(iced::widget::Space::new().height(8))
+                        .push(cancel_btn)
+                        .into(),
+                )
+            }
+            _ => None,
+        };
+
+        let enroll_btn: Element<'_, SettingsMessage> = if voice_enabled {
+            container(
+                iced::widget::button(Text::new("Enroll Wake Word").size(13))
+                    .on_press(SettingsMessage::StartVoiceEnrollment)
+                    .style(theme::button_primary)
+                    .padding(6),
+            )
+            .into()
+        } else {
+            container(Text::new("")).into()
+        };
+
+        let wake_word_row = if voice_enabled && has_templates {
+            field_row("Wake Word", Text::new("custom").size(13).into(), None)
+        } else {
+            iced::widget::Space::new().height(0).into()
+        };
+
+        let mut column = Column::new()
+            .push(field_row(
+                "Enable Voice",
+                iced::widget::toggler(voice_enabled)
+                    .on_toggle(move |b| SettingsMessage::ConfigField {
+                        key: "voice_enabled",
+                        value: if b { "true".to_string() } else { String::new() },
+                    })
+                    .into(),
+                Some("Hands-free voice commands with wake word detection"),
+            ))
+            .push(iced::widget::Space::new().height(8))
+            .push(field_row("Status", status_text, None))
+            .push(wake_word_row)
+            .push(enroll_btn);
+
+        if let Some(ui) = enrollment_ui {
+            column = column.push(ui);
+        }
+
+        section("Voice Assistant", column)
     }
 
     fn routing_section(&self) -> Element<'_, SettingsMessage> {

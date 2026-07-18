@@ -1133,6 +1133,10 @@ impl Dashboard {
         let home_task: Task<Message> =
             Task::done(home::HomeMessage::WorkspaceChanged(Some(home_name))).map(Message::Home);
 
+        // Update voice assistant's active workspace so transcribed commands
+        // are routed to the correct context.
+        crate::voice::set_active_workspace_name(name);
+
         Task::batch([
             board_refresh,
             editor_task,

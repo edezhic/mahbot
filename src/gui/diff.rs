@@ -387,7 +387,7 @@ impl DiffState {
                     return Task::none();
                 }
                 self.clear_diff_state();
-                self.selected_workspace_name = Some(name);
+                self.selected_workspace_name = Some(name.clone());
                 self.personal_workspace_path.clone_from(&path_override);
                 self.diff_has_loaded = false;
                 self.spawn_diff_load(None)

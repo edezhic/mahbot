@@ -86,6 +86,10 @@ paste = "1.0"
 tokenizers = "0.22"
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
+candle-onnx = "0.10.2"
+
+# Audio capture for voice assistant
+cpal = "0.15"
 
 # Enum derive helpers
 strum = { version = "0.27", features = ["derive"] }
