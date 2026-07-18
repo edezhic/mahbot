@@ -76,7 +76,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 regex = "1.10"
 
 # Fast file/content search for the tools
-fff-search = "0.9"
+fff-search = "0.10"
 
 # SHA256 checksum verification for model downloads
 sha2 = "0.10"
