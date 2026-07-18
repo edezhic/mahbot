@@ -3464,7 +3464,7 @@ impl EditorState {
                     // Case-only rename: rename to a temp name first, then to the target.
                     let temp_name = format!(
                         "{}_{}",
-                        &trimmed,
+                        trimmed,
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |d| d.as_nanos())
@@ -3580,7 +3580,7 @@ impl EditorState {
                     // Re-key tab_contents for affected files.
                     rekey_map_prefix(
                         &mut self.tab_contents,
-                        &format!("{}/", &old_abs),
+                        &format!("{old_abs}/"),
                         &new_abs,
                         |_| {},
                     );

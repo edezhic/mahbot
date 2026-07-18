@@ -2668,7 +2668,6 @@ where
                 modifiers,
                 physical_key,
                 text,
-                modified_key: _,
                 ..
             }) => {
                 // Skip keyboard processing when another UI element has

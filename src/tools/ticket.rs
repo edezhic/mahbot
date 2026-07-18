@@ -128,15 +128,12 @@ impl Tool for CreateTicketTool {
             None => None,
         };
 
-        // Priority: Manager can set explicitly; Maintainer always uses 3.
-        let priority: i64 = if self.reporter == "manager" {
-            args.get("priority")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(1)
-        } else if self.reporter == "maintainer" {
-            3
+        // Priority: Manager can set explicitly; otherwise inherit from the
+        // superseded ticket (if superseding) or use the role default.
+        let explicit_priority: Option<i64> = if self.reporter == "manager" {
+            args.get("priority").and_then(serde_json::Value::as_i64)
         } else {
-            1
+            None
         };
 
         let store = board_store();
@@ -147,6 +144,30 @@ impl Tool for CreateTicketTool {
             String::new()
         } else {
             format!(" with prerequisites: {}", prerequisites.join(", "))
+        };
+
+        let priority: i64 = match (&supersede_id, explicit_priority) {
+            (Some(supersede_id), None) => {
+                // No explicit priority — inherit from the superseded ticket.
+                // Priority is immutable after ticket creation, so reading it
+                // outside the supersede transaction has no TOCTOU race.
+                match store.get_ticket_priority(supersede_id).await? {
+                    Some(p) => p,
+                    None => anyhow::bail!(
+                        "Superseded ticket {supersede_id} not found when reading priority",
+                    ),
+                }
+            }
+            (_, Some(p)) => p,
+            (None, None) => {
+                if self.reporter == "manager" {
+                    1
+                } else if self.reporter == "maintainer" {
+                    3
+                } else {
+                    1
+                }
+            }
         };
 
         let params = self.build_params(
@@ -397,6 +418,7 @@ async fn guard_not_pipeline_blocking(
 mod tests {
     use super::*;
     use crate::util::test::TicketBuilder;
+    use crate::util::test::expect_ticket;
     use crate::util::test::make_ticket;
     use crate::workspace::test_ws;
     use serde_json::json;
@@ -691,6 +713,92 @@ mod tests {
         assert!(
             result.is_err(),
             "Supersede should be rejected for pipeline-blocking tickets"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supersede_inherits_priority() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/tmp/test_ws_supersede_priority");
+
+        // Create a ticket with a non-default priority (0 = highest urgency).
+        let old_id = TicketBuilder::new(store, &ws)
+            .title("Urgent")
+            .priority(0)
+            .create()
+            .await
+            .expect("create old ticket");
+
+        // Supersede without specifying priority — should inherit priority 0.
+        let tool = CreateTicketTool::new("manager");
+        let args = json!({
+            "title": "Replacement",
+            "description": "superseding the urgent ticket",
+            "supersede": old_id,
+        });
+        let result = tool
+            .execute(&ws, args)
+            .await
+            .expect("supersede should succeed");
+        assert!(result.contains("Superseded"), "Expected supersede output");
+
+        // Find the new ticket ID via the old ticket's superseded_by link.
+        let old_ticket = expect_ticket(store, &old_id).await;
+        let new_id = old_ticket
+            .superseded_by
+            .as_deref()
+            .expect("old ticket should have superseded_by");
+
+        // Verify the new ticket inherited priority 0 from the old ticket.
+        let new_ticket = expect_ticket(store, new_id).await;
+        assert_eq!(
+            new_ticket.priority, 0,
+            "Should inherit priority from superseded ticket"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supersede_explicit_priority_overrides_inheritance() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/tmp/test_ws_supersede_explicit_priority");
+
+        // Create a ticket with a non-default priority.
+        let old_id = TicketBuilder::new(store, &ws)
+            .title("Old ticket")
+            .priority(0)
+            .create()
+            .await
+            .expect("create old ticket");
+
+        // Supersede with explicit priority — should use the explicit value,
+        // not inherit the old ticket's priority.
+        let tool = CreateTicketTool::new("manager");
+        let args = json!({
+            "title": "Replacement",
+            "description": "superseding with explicit priority",
+            "supersede": old_id,
+            "priority": 5,
+        });
+        let result = tool
+            .execute(&ws, args)
+            .await
+            .expect("supersede should succeed");
+        assert!(result.contains("Superseded"), "Expected supersede output");
+
+        let old_ticket = expect_ticket(store, &old_id).await;
+        let new_id = old_ticket
+            .superseded_by
+            .as_deref()
+            .expect("old ticket should have superseded_by");
+
+        let new_ticket = expect_ticket(store, new_id).await;
+        assert_eq!(
+            new_ticket.priority, 5,
+            "Explicit priority should override inheritance from old ticket"
         );
     }
 

@@ -1163,6 +1163,20 @@ impl BoardStore {
         }
     }
 
+    /// Get a ticket's priority by id — lightweight, no comments loaded.
+    ///
+    /// Used by the priority-inheritance path in `CreateTicketTool::execute` to
+    /// read the superseded ticket's priority without loading comments. Priority
+    /// is immutable after ticket creation, so this single-column read outside
+    /// the supersede transaction is safe — there is no TOCTOU race with the
+    /// supersede transaction's own SELECT for existence/workspace/phase checks.
+    pub(crate) async fn get_ticket_priority(&self, ticket_id: &str) -> Result<Option<i64>> {
+        let sql = "SELECT priority FROM tickets WHERE id = ?1";
+        self.conn
+            .query_optional(sql, turso::params![ticket_id], |row| row.get::<i64>(0))
+            .await
+    }
+
     /// Build a [`PreparedUpdate`] for an `UPDATE tickets` statement, appending
     /// `updated_at = ?` and `WHERE id = ?` as the last two parameters.
     ///
