@@ -101,8 +101,6 @@ pub async fn verify_all_databases() {
         match conn.quick_check().await {
             Ok(()) => info!(db = %name, "Database integrity check passed"),
             Err(e) => {
-                error!(error = %e, db = %name, "Database integrity check failed, running full diagnostic");
-
                 // Run the full integrity_check to get the complete diagnostic
                 // report so operators can triage without running debug CLI.
                 match conn.integrity_check().await {
@@ -115,14 +113,13 @@ pub async fn verify_all_databases() {
                         );
                     }
                     Ok(problems) => {
-                        for problem in &problems {
-                            error!(db = %name, problem = %problem, "Integrity issue");
-                        }
                         let count = problems.len();
+                        let problems_joined = problems.join("; ");
                         error!(
-                            db = %name, count,
-                            "Full integrity check found {} issue(s) in {}",
-                            count, name,
+                            error = %e, db = %name, count,
+                            problems = %problems_joined,
+                            "Integrity check failed for {} ({} issue(s)): {}",
+                            name, count, problems_joined,
                         );
                     }
                     Err(diag_err) => {
