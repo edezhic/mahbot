@@ -13,7 +13,7 @@ pub(crate) use turso::{IntoParams, Row, Value, params};
 
 /// Current UTC timestamp in RFC 3339 format for database columns.
 #[must_use]
-pub(crate) fn now() -> String {
+pub fn now() -> String {
     Utc::now().to_rfc3339()
 }
 

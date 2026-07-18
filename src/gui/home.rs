@@ -1325,8 +1325,8 @@ impl HomeState {
         // can display the user's message immediately and replace it when the
         // pipeline confirmation arrives. Commands (starting with "/") are NOT
         // optimistically shown because `handle_bot_command` intercepts
-        // them before `write_incoming_to_broadcast` — the confirmation never
-        // arrives, so an optimistic entry would become an orphan.
+        // them before the GUI broadcast in `process_channel_message` — the
+        // confirmation never arrives, so an optimistic entry would become an orphan.
         let is_command = content.starts_with('/');
         let optimistic_id = if is_command {
             None

@@ -29,8 +29,6 @@ impl BroadcastPersistEntry {
     /// Broadcast this entry to [`crate::CHAT_BROADCAST`] and persist it to
     /// `chat_history`.
     async fn broadcast_and_persist(self) {
-        use crate::ChatEvent;
-
         debug_assert!(
             self.direction != ChatDirection::Agent || self.agent_role.is_some(),
             "BroadcastPersistEntry: direction=Agent but agent_role is None"
@@ -50,18 +48,16 @@ impl BroadcastPersistEntry {
             }
         };
 
-        if let Some(tx) = crate::CHAT_BROADCAST.get() {
-            let _ = tx.send(ChatEvent::Message {
-                message_id: message_id.clone(),
-                user_name: self.user_name.clone(),
-                content: self.content.clone(),
-                direction: self.direction,
-                timestamp: timestamp.clone(),
-                agent_role: self.agent_role.clone(),
-                workspace: self.workspace.clone(),
-                optimistic_id: self.optimistic_id,
-            });
-        }
+        broadcast_chat_event(
+            &message_id,
+            &self.user_name,
+            &self.content,
+            self.direction,
+            self.agent_role.clone(),
+            &self.workspace,
+            self.optimistic_id.clone(),
+            &timestamp,
+        );
 
         let store = crate::chat_history::store();
         let _ = store
@@ -109,21 +105,94 @@ pub(crate) async fn broadcast_and_persist_agent_response(
     .await;
 }
 
-/// Write an incoming user message to CHAT_BROADCAST for immediate GUI display
-/// and persist it to chat_history. Uses `msg.channel` for the channel
-/// field so it works for both Telegram and GUI-originated messages.
-pub async fn write_incoming_to_broadcast(msg: &ChannelMessage) {
-    BroadcastPersistEntry {
-        user_name: msg.user_name.clone(),
-        channel: msg.channel.clone(),
-        content: msg.content.clone(),
-        direction: ChatDirection::User,
-        agent_role: None, // user messages have no agent role
-        workspace: msg.workspace.clone(),
-        optimistic_id: msg.optimistic_id.clone(), // GUI uses this for replacement
+/// Send a [`ChatEvent::Message`] to the broadcast channel.
+///
+/// This is the single shared entry point for all broadcast operations,
+/// ensuring consistent message construction across user messages, agent
+/// responses, and any future message types.  The caller is responsible
+/// for generating a stable [`message_id`] and [`timestamp`] if they need
+/// to correlate the broadcast event with a persist operation.
+#[allow(clippy::too_many_arguments)]
+fn broadcast_chat_event(
+    message_id: &str,
+    user_name: &str,
+    content: &str,
+    direction: ChatDirection,
+    agent_role: Option<String>,
+    workspace: &str,
+    optimistic_id: Option<String>,
+    timestamp: &str,
+) {
+    use crate::ChatEvent;
+
+    if let Some(tx) = crate::CHAT_BROADCAST.get() {
+        let _ = tx.send(ChatEvent::Message {
+            message_id: message_id.to_string(),
+            user_name: user_name.to_string(),
+            content: content.to_string(),
+            direction,
+            timestamp: timestamp.to_string(),
+            agent_role,
+            workspace: workspace.to_string(),
+            optimistic_id,
+        });
     }
-    .broadcast_and_persist()
-    .await;
+}
+
+/// Broadcast an incoming user message to CHAT_BROADCAST for immediate GUI display,
+/// without persisting to chat_history. Use [`persist_incoming_message`] to persist
+/// separately — this allows broadcasting enriched content while persisting the original
+/// (e.g. to avoid storing large data URIs in chat_history).
+///
+/// The `message_id` and `timestamp` should be the same values used in the corresponding
+/// [`persist_incoming_message`] call so the broadcast event and chat_history record are
+/// correlated.
+pub fn broadcast_incoming_message(
+    msg: &ChannelMessage,
+    content: &str,
+    message_id: &str,
+    timestamp: &str,
+) {
+    broadcast_chat_event(
+        message_id,
+        &msg.user_name,
+        content,
+        ChatDirection::User,
+        None,
+        &msg.workspace,
+        msg.optimistic_id.clone(),
+        timestamp,
+    );
+}
+
+/// Persist an incoming user message to chat_history, without broadcasting to GUI.
+/// Use [`broadcast_incoming_message`] to broadcast separately — this allows persisting
+/// the original content while broadcasting enriched content (e.g. to avoid storing
+/// large data URIs in chat_history).
+///
+/// The `message_id` and `timestamp` should be the same values used in the corresponding
+/// [`broadcast_incoming_message`] call so the chat_history record and broadcast event are
+/// correlated.
+pub async fn persist_incoming_message(
+    msg: &ChannelMessage,
+    content: &str,
+    message_id: &str,
+    timestamp: &str,
+) {
+    let store = crate::chat_history::store();
+    let _ = store
+        .insert(&ChatHistoryInsert {
+            message_id: message_id.to_string(),
+            user_name: msg.user_name.clone(),
+            channel: msg.channel.clone(),
+            role: "user".to_string(),
+            direction: "user".to_string(),
+            content: content.to_string(),
+            agent_role: None,
+            workspace: msg.workspace.clone(),
+            created_at: timestamp.to_string(),
+        })
+        .await;
 }
 
 /// Send a reply through a channel.

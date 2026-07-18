@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use mahbot::channels::telegram::{decode_action, decode_callback};
 use mahbot::channels::{
-    send_channel_reply, spawn_scoped_typing_task, stop_typing, write_incoming_to_broadcast,
+    broadcast_incoming_message, persist_incoming_message, send_channel_reply,
+    spawn_scoped_typing_task, stop_typing,
 };
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
@@ -56,34 +57,6 @@ async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
 fn personal_workspace(msg: &ChannelMessage) -> Workspace {
     let path = mahbot::users::personal_workspace_path(&msg.user_name);
     mahbot::users::personal_workspace_struct(&msg.user_name, &path)
-}
-
-/// Enrich a message with multimodal transcription and link summarization.
-///
-/// Multimodal enrichment dispatches by role: full transcription if the role
-/// requires it (currently only Artist), otherwise non-multimodal processing
-/// (text extraction from photos/audio). Link enrichment always runs,
-/// prepending URL summaries to the message content.
-async fn enrich_message_for_role(msg: &mut ChannelMessage, role: Role, ws: &Workspace) {
-    let strategy = if role.requires_multimodal() {
-        mahbot::channels::EnrichmentStrategy::Multimodal {
-            workspace_path: Some(ws.as_path().to_path_buf()),
-        }
-    } else {
-        mahbot::channels::EnrichmentStrategy::NonMultimodal
-    };
-    mahbot::channels::enrich_message(msg, &strategy).await;
-
-    // Link enrichment always runs, regardless of modality.
-    let enriched = mahbot::channels::enrich_links(&msg.content).await;
-    if let Cow::Owned(s) = enriched {
-        tracing::info!(
-            channel = %msg.channel,
-            user_name = %msg.user_name,
-            "Link enricher: prepended URL summaries to message"
-        );
-        msg.content = s;
-    }
 }
 
 /// Handle a dynamic option callback (prefixed `__opt__`).
@@ -771,16 +744,6 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // msg.workspace for broadcast filtering).
     msg.workspace = ws.name.clone();
 
-    // Broadcast incoming user message to GUI dashboard + persist to
-    // chat_history, and mirror GUI messages to the user's Telegram
-    // chats as blockquotes. Workspace resolution must happen first so
-    // the workspace field is correct. Both run before enrichment so
-    // the original user-typed text is preserved.
-    tokio::join!(
-        write_incoming_to_broadcast(&msg),
-        mahbot::channels::mirror_gui_message_to_telegram(&msg),
-    );
-
     // Personal workspaces do not support the Manager agent — no board
     // pipeline, no maintainer. If the role is Manager and we're in a
     // personal workspace, fall back to Analyst.
@@ -791,9 +754,60 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         role
     };
 
-    // Enrichment: multimodal + link summarization — applied after
-    // effective_role resolution so the correct role's settings are used.
-    enrich_message_for_role(&mut msg, effective_role, &ws).await;
+    // Save original content before enrichment so we persist the raw
+    // user-typed text to chat_history (avoids storing large data URIs from
+    // multimodal image processing in the Artist role).
+    let original_content = msg.content.clone();
+
+    // ── Media-marker enrichment (audio transcription, image processing) ──
+    // Runs BEFORE broadcast so the GUI receives transcription text instead
+    // of raw `[AUDIO:path]` markers.  Link enrichment runs separately AFTER
+    // broadcast to avoid showing AI-generated URL summaries in the user's
+    // own message bubble.
+    let strategy = if effective_role.requires_multimodal() {
+        mahbot::channels::EnrichmentStrategy::Multimodal {
+            workspace_path: Some(ws.as_path().to_path_buf()),
+        }
+    } else {
+        mahbot::channels::EnrichmentStrategy::NonMultimodal
+    };
+    mahbot::channels::enrich_message(&mut msg, &strategy).await;
+
+    // ── Broadcast, persist, and mirror ─────────────────────────────────
+    // Broadcast enriched content to GUI (audio transcription visible, data
+    // URI images renderable).  Persist original content to chat_history (no
+    // data URI bloat).  Mirror original content to Telegram (media markers
+    // stripped by the mirror function).
+    //
+    // A single message_id and timestamp are generated here so the broadcast
+    // event and chat_history record share both values — consistent with how
+    // BroadcastPersistEntry generates shared IDs and timestamps for agent
+    // responses.  Broadcast is synchronous (non-blocking send to broadcast
+    // channel) so it runs outside the join.
+    let message_id = mahbot::generate_id();
+    let timestamp = mahbot::turso::now();
+    broadcast_incoming_message(&msg, &msg.content, &message_id, &timestamp);
+    tokio::join!(
+        persist_incoming_message(&msg, &original_content, &message_id, &timestamp),
+        async {
+            let mut mirror_msg = msg.clone();
+            mirror_msg.content = original_content.clone();
+            mahbot::channels::mirror_gui_message_to_telegram(&mirror_msg).await;
+        },
+    );
+
+    // ── Link enrichment (URL summaries for agent context) ─────────────
+    // Runs after broadcast so AI-generated summaries don't appear in the
+    // user's own message bubble.
+    let enriched = mahbot::channels::enrich_links(&msg.content).await;
+    if let Cow::Owned(s) = enriched {
+        tracing::info!(
+            channel = %msg.channel,
+            user_name = %msg.user_name,
+            "Link enricher: prepended URL summaries to message"
+        );
+        msg.content = s;
+    }
 
     // Manager messages route through the serialized queue; non-Manager roles
     // use the traditional inline agent dispatch path.

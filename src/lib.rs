@@ -318,7 +318,7 @@ fn generate_nanoid(length: usize) -> String {
 
 /// Generate a unique identifier (10-char NanoID, ~60 bits entropy).
 #[must_use]
-pub(crate) fn generate_id() -> String {
+pub fn generate_id() -> String {
     generate_nanoid(10)
 }
 
