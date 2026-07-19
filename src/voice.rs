@@ -1936,6 +1936,7 @@ fn handle_wake_word_detection(
                 is_recording,
                 command_buffer,
                 silence_since,
+                audio_buffer,
             ) {
                 return;
             }
@@ -1952,6 +1953,7 @@ fn handle_wake_word_detection(
                 is_recording,
                 command_buffer,
                 silence_since,
+                audio_buffer,
             ) {
                 return;
             }
@@ -2038,6 +2040,7 @@ fn try_match_wake_word_and_push_embedding(
     is_recording: &mut bool,
     command_buffer: &mut Vec<f32>,
     silence_since: &mut Option<Instant>,
+    audio_buffer: &mut Vec<f32>,
 ) -> bool {
     if mel_frame_buffer.is_empty() {
         return false;
@@ -2101,6 +2104,7 @@ fn try_match_wake_word_and_push_embedding(
         *silence_since = None;
         mel_frame_buffer.clear();
         embedding_ring.clear();
+        audio_buffer.clear();
         set_status(VoiceStatus::Recording);
         true
     } else {
