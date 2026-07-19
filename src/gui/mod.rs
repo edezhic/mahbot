@@ -594,6 +594,7 @@ impl Dashboard {
         // a previous user was saved.
         if let Some(ref user_name) = self.selected_user_name {
             self.home_state.selected_user = Some(user_name.clone());
+            crate::voice::set_active_user_name(user_name);
         }
         // Load the selected user's role for the role switcher indicator.
         let role_task = self
