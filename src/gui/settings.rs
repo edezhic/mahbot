@@ -1988,14 +1988,30 @@ impl SettingsState {
             crate::voice::VoiceStatus::Enrolling { sample, total } => {
                 let remaining = total.saturating_sub(sample);
                 let msg = if remaining > 0 {
-                    format!(
-                        "Say the wake word: {remaining} more — speak clearly, then pause for {:.1} seconds…",
-                        crate::voice::SILENCE_DURATION.as_secs_f32(),
-                    )
+                    let silence_secs = crate::voice::SILENCE_DURATION.as_secs_f32();
+                    // Note: `{:.0}` rounds to the nearest integer (half away from zero),
+                    // so SILENCE_DURATION=1.5s displays as "2 seconds".
+                    // This is intentional — the hint tells users to expect a ~2s pause.
+                    // If you change SILENCE_DURATION, update this format accordingly.
+                    if remaining == 1 {
+                        format!(
+                            "Say the wake word once, then stay silent for {silence_secs:.0} seconds. Repeat 1 more time.",
+                        )
+                    } else {
+                        format!(
+                            "Say the wake word once, then stay silent for {silence_secs:.0} seconds. Repeat {remaining} times.",
+                        )
+                    }
                 } else {
                     "Processing…".to_string()
                 };
                 Text::new(msg).into()
+            }
+            crate::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
+                Text::new("Listening…").into()
+            }
+            crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
+                Text::new("Keep silent to confirm…").into()
             }
             crate::voice::VoiceStatus::Enrolled => Text::new("Enrolled").into(),
             crate::voice::VoiceStatus::Error(msg) => Text::new(msg).into(),
@@ -2003,7 +2019,9 @@ impl SettingsState {
 
         // Enrollment progress UI (shown during active enrollment)
         let enrollment_ui: Option<Element<'_, SettingsMessage>> = match status {
-            crate::voice::VoiceStatus::Enrolling { .. } => {
+            crate::voice::VoiceStatus::Enrolling { .. }
+            | crate::voice::VoiceStatus::ListeningDuringEnrollment { .. }
+            | crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
                 let cancel_btn: Element<'_, SettingsMessage> = container(
                     button(Text::new("Cancel").size(13))
                         .on_press(SettingsMessage::CancelVoiceEnrollment)

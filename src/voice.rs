@@ -87,8 +87,8 @@ const EMBED_MODEL_SHA256: &str = "70d164290c1d095d1d4ee149bc5e00543250a7316b59f3
 const VOICE_BATCH_SIZE: usize = 2048;
 
 /// Maximum number of recent embeddings to keep in the ring buffer.
-/// With 75% overlap (stride = EMBEDDING_WINDOW_FRAMES / 4 = 19 mel frames),
-/// this keeps ~19 embeddings = ~6 seconds of context.
+/// With stride=8 (~89.5% overlap), each new embedding covers ~1.2s of audio
+/// and arrives every ~128ms, keeping ~19 embeddings = ~2.4 seconds of context.
 const EMBEDDING_RING_MAX: usize = 19;
 
 /// Number of enrollment samples required.
@@ -183,7 +183,20 @@ pub enum VoiceStatus {
     Transcribing,
     MicPermissionDenied,
     MicDisconnected,
-    Enrolling { sample: usize, total: usize },
+    Enrolling {
+        sample: usize,
+        total: usize,
+    },
+    /// Actively capturing speech during enrollment.
+    ListeningDuringEnrollment {
+        sample: usize,
+        total: usize,
+    },
+    /// Speech detected, waiting for silence to confirm utterance end.
+    WaitingForSilenceDuringEnrollment {
+        sample: usize,
+        total: usize,
+    },
     Enrolled,
     Error(String),
 }
@@ -363,6 +376,16 @@ fn load_onnx_models(dir: &Path) -> Result<OnnxModels> {
     })
 }
 
+/// Scale audio samples from float [-1, 1] range to approximate int16 range
+/// using the 32768.0 multiplier from the OpenWakeWord reference.
+///
+/// This is what the mel model was trained with — changing to the exact int16
+/// max (32767.0) would shift the numerical values and degrade model accuracy.
+/// The slight offset (1.0 → 32768.0, 1 LSB above int16 max) is intentional.
+fn scale_to_int16_range(samples: &[f32]) -> Vec<f32> {
+    samples.iter().map(|s| s * 32768.0).collect()
+}
+
 /// Compute mel spectrogram frames from raw audio samples.
 fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<Vec<f32>>> {
     use candle_core::Tensor;
@@ -372,7 +395,8 @@ fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<V
     }
 
     let sample_len = samples.len();
-    let input_tensor = Tensor::from_slice(samples, (1, sample_len), &models.device)?;
+    let scaled = scale_to_int16_range(samples);
+    let input_tensor = Tensor::from_slice(&scaled, (1, sample_len), &models.device)?;
 
     let input_name = models
         .mel_model
@@ -455,9 +479,12 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
     }
 
     let flat: Vec<f32> = mel_frames.iter().flatten().copied().collect();
+    // ONNX model declares rank-3 input (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS).
+    // The trailing channel dimension is implicit; candle_onnx strict rank validation
+    // rejects rank-4 tensors.
     let input_tensor = Tensor::from_slice(
         &flat,
-        (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS, 1),
+        (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS),
         &models.device,
     )?;
 
@@ -510,7 +537,7 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
     }
 
     let mut embeddings = Vec::new();
-    let stride = EMBEDDING_WINDOW_FRAMES / 4; // 75% overlap
+    let stride: usize = 8; // OpenWakeWord reference uses stride=8 (~89.5% overlap)
 
     let mut start = 0;
     while start + EMBEDDING_WINDOW_FRAMES <= mel_frames.len() {
@@ -1375,6 +1402,7 @@ impl PipelineCtx {
 }
 
 /// Run the voice pipeline background task.
+#[allow(clippy::too_many_lines)]
 pub async fn run_voice_pipeline() {
     info!("Voice pipeline starting...");
 
@@ -1445,14 +1473,11 @@ pub async fn run_voice_pipeline() {
                 };
 
                 if ctx.enrollment_mode {
-                    handle_enrollment_audio(
-                        &samples,
-                        &mut ctx.audio_buffer,
-                        &mut ctx.utterance_buf,
-                        &mut ctx.utterance_had_speech,
-                        &mut ctx.utterance_silence_since,
-                        &mut ctx.enrollment_pending,
-                    );
+                    let (sample, total) = {
+                        let state = voice_state().read().unwrap_poison();
+                        (state.enrollment_buffer.len(), NUM_ENROLLMENT_SAMPLES)
+                    };
+                    handle_enrollment_audio(&samples, &mut ctx, sample, total);
                 } else if ctx.is_recording {
                     handle_recording_audio(
                         samples,
@@ -1737,40 +1762,51 @@ fn handle_wake_word_detection(
 /// inline processing (avoids race conditions with the command channel).
 /// The entire utterance (speech + trailing silence) is captured so the ONNX
 /// embedding model has enough audio data to produce a reliable template.
-fn handle_enrollment_audio(
-    samples: &[f32],
-    audio_buffer: &mut Vec<f32>,
-    utterance_buf: &mut Vec<f32>,
-    utterance_had_speech: &mut bool,
-    utterance_silence_since: &mut Option<Instant>,
-    enrollment_pending: &mut Option<Vec<f32>>,
-) {
-    audio_buffer.extend_from_slice(samples);
+///
+/// Updates voice status dynamically to reflect the enrollment phase:
+/// - No speech yet: caller's `Enrolling` text persists
+/// - Speech detected: `ListeningDuringEnrollment`
+/// - Speech ended, awaiting silence: `WaitingForSilenceDuringEnrollment`
+fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
+    ctx.audio_buffer.extend_from_slice(samples);
 
-    while audio_buffer.len() >= FRAME_LENGTH {
-        let frame: Vec<f32> = audio_buffer[..FRAME_LENGTH].to_vec();
-        audio_buffer.drain(..HOP_LENGTH);
+    while ctx.audio_buffer.len() >= FRAME_LENGTH {
+        let frame: Vec<f32> = ctx.audio_buffer[..FRAME_LENGTH].to_vec();
+        ctx.audio_buffer.drain(..HOP_LENGTH);
 
         // Accumulate every frame into the utterance — both speech and silence.
         // We need the full recording (not just speech frames) to pass to
         // extract_embeddings_from_audio, which expects continuous audio.
-        utterance_buf.extend_from_slice(&frame);
+        ctx.utterance_buf.extend_from_slice(&frame);
 
         if is_speech(&frame, VAD_THRESHOLD) {
-            *utterance_had_speech = true;
-            *utterance_silence_since = None;
-        } else if *utterance_had_speech {
+            let was_waiting_for_silence = ctx.utterance_silence_since.is_some();
+            if !ctx.utterance_had_speech || was_waiting_for_silence {
+                // Transition from silence to speech, or speech resumed after
+                // a pause before the 1.5s timeout — show "Listening…"
+                set_status(VoiceStatus::ListeningDuringEnrollment { sample, total });
+            }
+            ctx.utterance_had_speech = true;
+            ctx.utterance_silence_since = None;
+        } else if ctx.utterance_had_speech {
             // After speech: track silence duration to detect utterance end.
-            let sil_start = utterance_silence_since.get_or_insert_with(Instant::now);
+            let sil_start = ctx.utterance_silence_since.get_or_insert_with(Instant::now);
             if sil_start.elapsed() >= SILENCE_DURATION {
                 // Utterance is complete — set pending for inline processing
                 // instead of sending a command through the channel (which
                 // competes with continuously-arriving audio chunks).
-                *enrollment_pending = Some(std::mem::take(utterance_buf));
-                *utterance_had_speech = false;
-                *utterance_silence_since = None;
-                audio_buffer.clear();
+                ctx.enrollment_pending = Some(std::mem::take(&mut ctx.utterance_buf));
+                ctx.utterance_had_speech = false;
+                ctx.utterance_silence_since = None;
+                ctx.audio_buffer.clear();
                 break;
+            }
+            // Set status during the first ~200ms of silence to show
+            // "Keep silent to confirm…". The gate is intentionally wider
+            // than a single frame (16ms) so the UI reliably transitions
+            // even under scheduling jitter. The status write is idempotent.
+            if sil_start.elapsed() < Duration::from_millis(200) {
+                set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
             }
         }
     }
@@ -2132,5 +2168,117 @@ mod tests {
             voice_state().write().unwrap_poison().enabled = false;
             MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
         }
+
+        // ── handle_enrollment_audio status transitions ───────────────
+        {
+            voice_state().write().unwrap_poison().enabled = true;
+            ctx.is_listening = true;
+            ctx.enrollment_mode = true;
+            ctx.utterance_buf.clear();
+            ctx.utterance_had_speech = false;
+            ctx.utterance_silence_since = None;
+            ctx.audio_buffer.clear();
+            ctx.enrollment_pending = None;
+            voice_state()
+                .write()
+                .unwrap_poison()
+                .enrollment_buffer
+                .clear();
+
+            // Start enrollment at sample 0 of 3
+            set_status(VoiceStatus::Enrolling {
+                sample: 0,
+                total: 3,
+            });
+
+            // 1. Silence frames: no speech detected — status stays Enrolling
+            let silence = vec![0.0f32; FRAME_LENGTH];
+            handle_enrollment_audio(&silence, &mut ctx, 0, 3);
+            assert!(
+                matches!(get_status(), VoiceStatus::Enrolling { .. }),
+                "silence before speech should not change status from Enrolling"
+            );
+
+            // 2. Speech starts → ListeningDuringEnrollment
+            let speech = vec![0.5f32; FRAME_LENGTH];
+            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
+            assert!(
+                matches!(get_status(), VoiceStatus::ListeningDuringEnrollment { .. }),
+                "speech should trigger ListeningDuringEnrollment"
+            );
+            assert!(
+                ctx.utterance_had_speech,
+                "utterance_had_speech should be set"
+            );
+
+            // 3. Continued speech: status stays ListeningDuringEnrollment
+            //    (utterance_had_speech was set by step 2, so the
+            //    !utterance_had_speech gate in the function prevents re-setting)
+            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
+            assert!(
+                matches!(get_status(), VoiceStatus::ListeningDuringEnrollment { .. }),
+                "continued speech should remain ListeningDuringEnrollment"
+            );
+
+            // 4. Silence after speech → WaitingForSilenceDuringEnrollment
+            handle_enrollment_audio(&silence, &mut ctx, 0, 3);
+            assert!(
+                matches!(
+                    get_status(),
+                    VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+                ),
+                "silence after speech should trigger WaitingForSilenceDuringEnrollment"
+            );
+
+            // 5. Speech resumes before 1.5s timeout → back to ListeningDuringEnrollment
+            //    This validates the was_waiting_for_silence fix for the speech-resume glitch.
+            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
+            assert!(
+                matches!(get_status(), VoiceStatus::ListeningDuringEnrollment { .. }),
+                "speech resumed after pause should revert to ListeningDuringEnrollment"
+            );
+
+            // Clean up
+            voice_state().write().unwrap_poison().enabled = false;
+            ctx.is_listening = false;
+            ctx.enrollment_mode = false;
+        }
+    }
+
+    // ── Audio scaling (int16 range) ─────────────────────────────────────
+
+    /// Verify that audio samples in [-1, 1] scale correctly to int16 range
+    /// via `scale_to_int16_range`, the same function used by
+    /// `compute_mel_spectrogram`. This ensures the mel model receives values
+    /// in the range it was trained on.
+    #[test]
+    fn test_audio_scaling_to_int16_range() {
+        // Corner cases: full scale, zero, and midpoint values.
+        // All inputs are exact f32 powers-of-2, so multiplication by 32768.0
+        // (also exact) produces exact results — f32::EPSILON (~1.19e-7) is
+        // the correct tolerance here. For non-exact inputs (e.g. 0.1) use a
+        // larger tolerance (e.g. 1e-3).
+        let samples = vec![-1.0, 0.0, 1.0, 0.5, -0.5];
+        let scaled = scale_to_int16_range(&samples);
+        assert!(
+            (scaled[0] + 32768.0).abs() < f32::EPSILON,
+            "-1.0 should map to -32768"
+        );
+        assert!(
+            (scaled[1] - 0.0).abs() < f32::EPSILON,
+            "0.0 should map to 0"
+        );
+        assert!(
+            (scaled[2] - 32768.0).abs() < f32::EPSILON,
+            "1.0 should map to 32768"
+        );
+        assert!(
+            (scaled[3] - 16384.0).abs() < f32::EPSILON,
+            "0.5 should map to 16384"
+        );
+        assert!(
+            (scaled[4] + 16384.0).abs() < f32::EPSILON,
+            "-0.5 should map to -16384"
+        );
     }
 }
