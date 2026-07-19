@@ -566,11 +566,17 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
     let mel_frames = compute_mel_spectrogram(models, samples)?;
 
     if mel_frames.len() < EMBEDDING_WINDOW_FRAMES {
-        anyhow::bail!(
-            "Audio too short: got {} mel frames, need at least {}",
-            mel_frames.len(),
-            EMBEDDING_WINDOW_FRAMES
-        );
+        // Audio too short for a full 76-frame window — pad with silence
+        // frames so at least one embedding can be computed.  Without this,
+        // short wake words (e.g. 0.5s) would be silently discarded during
+        // enrollment, making enrollment impossible for brief utterances.
+        let mut padded = mel_frames;
+        let silence_frame = vec![0.0; NUM_MEL_BANDS];
+        while padded.len() < EMBEDDING_WINDOW_FRAMES {
+            padded.push(silence_frame.clone());
+        }
+        let embedding = compute_embedding(models, &padded)?;
+        return Ok(vec![embedding]);
     }
 
     let mut embeddings = Vec::new();
@@ -607,6 +613,7 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     if live.is_empty() || template.is_empty() {
         return f32::MAX;
@@ -615,24 +622,55 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     let m = template.len();
     let mut prev = vec![f32::MAX; m];
     let mut curr = vec![f32::MAX; m];
+    // Track path length alongside cumulative cost so we can normalise by
+    // path length.  Without this, the cumulative distance grows with
+    // template length (enrollment concatenates all samples into one long
+    // template), making the runtime cumulative distance always exceed
+    // the threshold calibrated on short pairwise DTW between individual
+    // samples.
+    let mut prev_len = vec![0usize; m];
+    let mut curr_len = vec![0usize; m];
 
     for (i, live_i) in live.iter().enumerate() {
         for (j, tpl_j) in template.iter().enumerate() {
             let cost = cosine_distance(live_i, tpl_j);
             if i == 0 && j == 0 {
                 curr[j] = cost;
+                curr_len[j] = 1;
             } else if i == 0 {
                 curr[j] = cost + curr[j - 1];
+                curr_len[j] = curr_len[j - 1] + 1;
             } else if j == 0 {
                 curr[j] = cost + prev[j];
+                curr_len[j] = prev_len[j] + 1;
             } else {
-                curr[j] = cost + prev[j].min(prev[j - 1].min(curr[j - 1]));
+                let vert = prev[j];
+                let diag = prev[j - 1];
+                let horiz = curr[j - 1];
+                if vert <= diag && vert <= horiz {
+                    curr[j] = cost + vert;
+                    curr_len[j] = prev_len[j] + 1;
+                } else if diag <= horiz {
+                    curr[j] = cost + diag;
+                    curr_len[j] = prev_len[j - 1] + 1;
+                } else {
+                    curr[j] = cost + horiz;
+                    curr_len[j] = curr_len[j - 1] + 1;
+                }
             }
         }
         std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(&mut prev_len, &mut curr_len);
     }
 
-    prev[m - 1]
+    // Return average distance per step (normalised cumulative).
+    // This makes the distance length-invariant — a 2-second utterance
+    // matches its template as well as a 0.3-second one.
+    if prev_len[m - 1] > 0 {
+        prev[m - 1] / prev_len[m - 1] as f32
+    } else {
+        f32::MAX
+    }
 }
 
 /// Match a live embedding sequence against all enrolled templates.
@@ -668,6 +706,23 @@ fn is_speech(samples: &[f32], threshold: f32) -> bool {
     rms > threshold
 }
 
+/// Detect whether a microphone-error report is caused by OS-level
+/// permission denial (rather than a transient device issue).
+///
+/// On macOS, CoreAudio returns `kAudioUnitErr_NoConnection` (-10875)
+/// when the application has not been granted microphone access.  We
+/// also check for common cross-platform error-text patterns so the
+/// user sees a clear `MicPermissionDenied` status instead of a
+/// generic `MicDisconnected`.
+fn is_mic_permission_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("NoConnection")
+        || msg.contains("-10875")
+        || msg.contains("permission")
+        || msg.contains("denied")
+        || msg.to_lowercase().contains("access denied")
+}
+
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -679,19 +734,44 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     }
     let ratio = f64::from(to_rate) / f64::from(from_rate);
     let output_len = (samples.len() as f64 * ratio).ceil() as usize;
+
+    // Anti-aliasing filter: when downsampling (from_rate > to_rate),
+    // apply a simple binomial low-pass filter to attenuate frequencies
+    // above the new Nyquist before decimation.  Without this filter,
+    // linear interpolation introduces aliasing — high-frequency content
+    // above to_rate/2 folds back into the audible range as noise,
+    // degrading mel spectrogram feature quality.
+    //
+    // The 3-tap binomial [0.25, 0.5, 0.25] gives reasonable stopband
+    // attenuation (~6 dB at 0.25 normalised) for speech audio.  For
+    // 48 kHz → 16 kHz this attenuates content above ~8 kHz.
+    let filtered: Vec<f32> = if from_rate > to_rate && samples.len() >= 3 {
+        let mut out = Vec::with_capacity(samples.len());
+        // First sample (asymmetric boundary)
+        out.push(samples[0] * 0.75 + samples[1] * 0.25);
+        for i in 1..samples.len() - 1 {
+            out.push(samples[i - 1] * 0.25 + samples[i] * 0.5 + samples[i + 1] * 0.25);
+        }
+        // Last sample (asymmetric boundary)
+        out.push(samples[samples.len() - 2] * 0.25 + samples[samples.len() - 1] * 0.75);
+        out
+    } else {
+        samples.to_vec()
+    };
+
     let mut output = Vec::with_capacity(output_len);
 
     for i in 0..output_len {
         let src_pos = i as f64 / ratio;
         let src_idx = src_pos as usize;
         let frac = src_pos - src_idx as f64;
-        if src_idx + 1 < samples.len() {
+        if src_idx + 1 < filtered.len() {
             output.push(
-                (f64::from(samples[src_idx]) * (1.0 - frac)
-                    + f64::from(samples[src_idx + 1]) * frac) as f32,
+                (f64::from(filtered[src_idx]) * (1.0 - frac)
+                    + f64::from(filtered[src_idx + 1]) * frac) as f32,
             );
-        } else if src_idx < samples.len() {
-            output.push(samples[src_idx]);
+        } else if src_idx < filtered.len() {
+            output.push(filtered[src_idx]);
         } else {
             output.push(0.0);
         }
@@ -1356,7 +1436,11 @@ impl PipelineCtx {
                 }
                 Err(e) => {
                     warn!("Failed to start microphone: {e}");
-                    set_status(VoiceStatus::MicDisconnected);
+                    set_status(if is_mic_permission_error(&e) {
+                        VoiceStatus::MicPermissionDenied
+                    } else {
+                        VoiceStatus::MicDisconnected
+                    });
                     // auto_start_pending is NOT set here — the user must
                     // re-toggle Voice OFF/ON to retry after resolving the
                     // mic issue.
@@ -1703,7 +1787,7 @@ async fn handle_recording_audio(
 /// `block_in_place` so the tokio runtime can run other tasks on this thread
 /// during inference, consistent with the enrollment path which uses
 /// `spawn_blocking` for the same purpose.
-fn flush_voice_batch(voice_batch: &[f32], mel_frame_buffer: &mut Vec<Vec<f32>>) {
+fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<f32>>) {
     if voice_batch.len() < FRAME_LENGTH {
         return; // not enough for a single frame
     }
@@ -1711,7 +1795,7 @@ fn flush_voice_batch(voice_batch: &[f32], mel_frame_buffer: &mut Vec<Vec<f32>>) 
         return;
     };
 
-    let batch = voice_batch.to_vec();
+    let batch = voice_batch.clone();
     let frames = crate::util::with_block_in_place(|| compute_mel_spectrogram(models, &batch));
     match frames {
         Ok(frames) => {
@@ -1721,6 +1805,17 @@ fn flush_voice_batch(voice_batch: &[f32], mel_frame_buffer: &mut Vec<Vec<f32>>) 
             // Keep buffer bounded — older frames are discarded
             while mel_frame_buffer.len() > EMBEDDING_WINDOW_FRAMES {
                 mel_frame_buffer.remove(0);
+            }
+            // Keep only the last (FRAME_LENGTH - HOP_LENGTH) samples for overlap
+            // context, ensuring temporal continuity across batch boundaries.  The
+            // remaining samples provide the context needed for the first mel frame
+            // of the next batch to have the correct 256-sample hop from the last
+            // frame of this batch (rather than being computed from a new disjoint
+            // window, which would create a 512-sample gap).
+            let keep = FRAME_LENGTH.saturating_sub(HOP_LENGTH);
+            if voice_batch.len() > keep {
+                let drain_to = voice_batch.len() - keep;
+                voice_batch.drain(..drain_to);
             }
         }
         Err(e) => warn!("Mel spectrogram failed: {e}"),
@@ -1782,7 +1877,6 @@ fn handle_wake_word_detection(
         // (every ~128ms instead of every 32ms)
         if voice_batch.len() >= VOICE_BATCH_SIZE {
             flush_voice_batch(voice_batch, mel_frame_buffer);
-            voice_batch.clear();
             if try_match_wake_word_and_push_embedding(
                 mel_frame_buffer,
                 embedding_ring,
@@ -1865,15 +1959,35 @@ fn try_match_wake_word_and_push_embedding(
     command_buffer: &mut Vec<f32>,
     silence_since: &mut Option<Instant>,
 ) -> bool {
-    if mel_frame_buffer.len() != EMBEDDING_WINDOW_FRAMES {
+    if mel_frame_buffer.is_empty() {
         return false;
     }
     let Some(models) = ONNX_MODELS.get() else {
         return false;
     };
 
+    // If the mel buffer is shorter than the required embedding window (76 frames),
+    // pad it with silence frames so an embedding can always be computed.  Without
+    // this, short wake words (e.g. 0.5s → ~32 mel frames) would silently be
+    // discarded and never detected.
+    let padded_window: Vec<Vec<f32>>;
+    let embed_input: &[Vec<f32>] = if mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES {
+        padded_window = {
+            let mut p = mel_frame_buffer.clone();
+            let silence_frame = vec![0.0; NUM_MEL_BANDS];
+            while p.len() < EMBEDDING_WINDOW_FRAMES {
+                p.push(silence_frame.clone());
+            }
+            p
+        };
+        &padded_window
+    } else {
+        // Take the most recent EMBEDDING_WINDOW_FRAMES
+        &mel_frame_buffer[mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES..]
+    };
+
     let embedding =
-        match crate::util::with_block_in_place(|| compute_embedding(models, mel_frame_buffer)) {
+        match crate::util::with_block_in_place(|| compute_embedding(models, embed_input)) {
             Ok(emb) => emb,
             Err(e) => {
                 warn!("Wake word matching: compute_embedding failed: {e:#}");

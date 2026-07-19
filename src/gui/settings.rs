@@ -458,7 +458,16 @@ impl SettingsState {
             SettingsMessage::Save => {
                 self.saving = true;
                 self.error = None;
-                let config = self.config.clone();
+                let mut config = self.config.clone();
+                // Preserve wake word templates from the live CONFIG.  The
+                // local snapshot may have been captured before enrollment,
+                // and saving without them would write `None` to the DB,
+                // silently erasing all enrolled templates.
+                if config.wake_word_templates.is_none() {
+                    if let Some(json) = crate::config::CONFIG.wake_word_templates() {
+                        config.wake_word_templates = Some(json);
+                    }
+                }
                 Task::perform(
                     async move {
                         crate::config::save_and_reload(config)
