@@ -296,7 +296,10 @@ pub enum SettingsMessage {
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
     VoiceToggle(bool),
     /// Result of async DB persistence after a voice toggle.
-    VoiceToggleResult(Result<(), String>),
+    /// The `u64` is a generation counter used to detect stale results
+    /// from rapid toggling — if it doesn't match `SettingsState::voice_toggle_gen`,
+    /// the result is ignored as stale.
+    VoiceToggleResult(u64, Result<(), String>),
     /// Start enrollment session for wake word.
     StartVoiceEnrollment,
     /// Cancel enrollment session.
@@ -344,6 +347,13 @@ pub struct SettingsState {
     // ── Model picker state ────────────────────────────────
     /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
     model_picker_inputs: [String; ModelPickerTarget::COUNT],
+
+    // ── Voice assistant state ─────────────────────────────
+    /// Generation counter for voice toggle operations.
+    /// Incremented before each `VoiceToggle`; the expected value is
+    /// passed through to `VoiceToggleResult` so stale results from
+    /// earlier toggles are detected and ignored.
+    voice_toggle_gen: u64,
 }
 
 /// Sync the voice assistant pipeline state with `CONFIG.voice_enabled()`.
@@ -377,6 +387,7 @@ impl SettingsState {
             add_user_permissions: String::new(),
             add_user_adding: false,
             model_picker_inputs: [const { String::new() }; ModelPickerTarget::COUNT],
+            voice_toggle_gen: 0,
         }
     }
 
@@ -460,16 +471,11 @@ impl SettingsState {
             SettingsMessage::Save => {
                 self.saving = true;
                 self.error = None;
-                let mut config = self.config.clone();
-                // Preserve wake word templates from the live CONFIG.  The
-                // local snapshot may have been captured before enrollment,
-                // and saving without them would write `None` to the DB,
-                // silently erasing all enrolled templates.
-                if config.wake_word_templates.is_none() {
-                    if let Some(json) = crate::config::CONFIG.wake_word_templates() {
-                        config.wake_word_templates = Some(json);
-                    }
-                }
+                let config = self.config.clone();
+                // NOTE: wake_word_templates is intentionally NOT preserved
+                // here — save_and_reload skips it, leaving the voice pipeline
+                // (persist_templates) as the sole owner of that key.
+                // This avoids the dual-writer race entirely.
                 Task::perform(
                     async move {
                         crate::config::save_and_reload(config)
@@ -507,12 +513,17 @@ impl SettingsState {
                 // Activate/deactivate the pipeline immediately.
                 sync_voice_state(enabled);
 
+                // Bump generation so stale VoiceToggleResult from a
+                // previous toggle is detected and ignored.
+                self.voice_toggle_gen += 1;
+                let toggle_gen = self.voice_toggle_gen;
+
                 // Persist to DB asynchronously, reporting errors via VoiceToggleResult.
                 // When disabled, delete the key so it's truly absent (None on reload).
                 Task::perform(
                     async move {
                         let store = crate::config_db::store();
-                        if enabled {
+                        let result = if enabled {
                             store
                                 .set_kv("voice_enabled", "true")
                                 .await
@@ -522,15 +533,38 @@ impl SettingsState {
                                 .delete_kv("voice_enabled")
                                 .await
                                 .map_err(|e| e.to_string())
-                        }
+                        };
+                        (toggle_gen, result)
                     },
-                    SettingsMessage::VoiceToggleResult,
+                    |(g, result)| SettingsMessage::VoiceToggleResult(g, result),
                 )
             }
-            SettingsMessage::VoiceToggleResult(Ok(())) => Task::none(),
-            SettingsMessage::VoiceToggleResult(Err(e)) => {
-                self.error = Some(e);
-                Task::none()
+            SettingsMessage::VoiceToggleResult(g, result) => {
+                // Stale result from a previous toggle?  The user toggled
+                // again before the DB write completed — ignore the stale
+                // response to avoid reverting to the wrong state.
+                if g != self.voice_toggle_gen {
+                    return Task::none();
+                }
+                match result {
+                    Ok(()) => Task::none(),
+                    Err(e) => {
+                        self.error = Some(e);
+
+                        // DB write failed — revert the in-memory state so the UI and
+                        // pipeline stay consistent with the persisted config.
+                        // Without this, the toggle appears Enabled but the change is
+                        // lost on restart because it was never persisted.
+                        let current_enabled = self.config.voice_enabled.as_deref() == Some("true");
+                        let target_state = !current_enabled;
+                        let val = if target_state { "true" } else { "" };
+                        let _ = self.config.set_string_field("voice_enabled", val);
+                        let _ = crate::config::CONFIG.set_string_field("voice_enabled", val);
+                        sync_voice_state(target_state);
+
+                        Task::none()
+                    }
+                }
             }
             SettingsMessage::StartVoiceEnrollment => {
                 crate::voice::send_command(crate::voice::VoiceCommand::StartEnrollment);
@@ -2678,5 +2712,113 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    // ── Voice assistant toggle — generation counter & rollback ───
+
+    #[test]
+    fn voice_toggle_generation_counter_and_rollback() {
+        // The update handler calls sync_voice_state which accesses voice pipeline
+        // globals.  Initialise the pipeline state (no-op if already initialised
+        // by another test — OnceCell::set only succeeds once).
+        let _ = crate::voice::init_global();
+
+        let mut state = SettingsState::new();
+
+        // ── Initial state ──
+        assert_eq!(state.voice_toggle_gen, 0, "initial gen is 0");
+        assert_eq!(
+            state.config.voice_enabled.as_deref(),
+            None,
+            "voice starts disabled"
+        );
+        assert!(state.error.is_none(), "no error initially");
+
+        // ── Toggle ON ──
+        let _task = state.update(SettingsMessage::VoiceToggle(true));
+        assert_eq!(state.voice_toggle_gen, 1, "gen incremented after toggle ON");
+        assert_eq!(
+            state.config.voice_enabled.as_deref(),
+            Some("true"),
+            "voice_enabled set to Some(\"true\") after toggle ON"
+        );
+
+        // ── Stale result from previous generation must be ignored ──
+        let _task = state.update(SettingsMessage::VoiceToggleResult(
+            0,
+            Err("stale result".into()),
+        ));
+        assert_eq!(
+            state.config.voice_enabled.as_deref(),
+            Some("true"),
+            "stale VoiceToggleResult with Err must NOT revert the state"
+        );
+        assert_eq!(state.voice_toggle_gen, 1, "gen unchanged by stale result");
+
+        // ── Correct generation + DB error → rollback to disabled ──
+        let _task = state.update(SettingsMessage::VoiceToggleResult(
+            1,
+            Err("db write failed".into()),
+        ));
+        assert!(
+            state.config.voice_enabled.as_deref() != Some("true"),
+            "errant VoiceToggleResult must revert voice_enabled away from Some(\"true\")"
+        );
+        assert_eq!(
+            state.error.as_deref(),
+            Some("db write failed"),
+            "error message set after failed toggle"
+        );
+        assert_eq!(state.voice_toggle_gen, 1, "gen unchanged after rollback");
+
+        // ── Toggle ON again, succeed this time ──
+        state.error = None; // clear previous error
+        let _task = state.update(SettingsMessage::VoiceToggle(true));
+        assert_eq!(
+            state.voice_toggle_gen, 2,
+            "gen incremented on second toggle"
+        );
+        let _task = state.update(SettingsMessage::VoiceToggleResult(2, Ok(())));
+        assert_eq!(
+            state.config.voice_enabled.as_deref(),
+            Some("true"),
+            "successful VoiceToggleResult must keep enabled state"
+        );
+        assert!(state.error.is_none(), "no error after successful toggle");
+
+        // ── Stale result from old generation must also be ignored ──
+        let _task = state.update(SettingsMessage::VoiceToggleResult(
+            1,
+            Err("stale from old gen".into()),
+        ));
+        assert_eq!(
+            state.config.voice_enabled.as_deref(),
+            Some("true"),
+            "stale VoiceToggleResult from gen=1 must NOT revert state when current gen=2"
+        );
+        assert!(state.error.is_none(), "stale result must NOT set error");
+
+        // ── Toggle OFF with DB error → rollback back to enabled ──
+        let _task = state.update(SettingsMessage::VoiceToggle(false));
+        assert_eq!(state.voice_toggle_gen, 3, "gen incremented on toggle OFF");
+        assert_eq!(
+            state.config.voice_enabled.as_deref(),
+            Some(""),
+            "voice_enabled set to Some(\"\") after toggle OFF"
+        );
+        let _task = state.update(SettingsMessage::VoiceToggleResult(
+            3,
+            Err("db delete failed".into()),
+        ));
+        assert_eq!(
+            state.config.voice_enabled.as_deref(),
+            Some("true"),
+            "errant VoiceToggleResult(false) must revert back to enabled"
+        );
+        assert_eq!(
+            state.error.as_deref(),
+            Some("db delete failed"),
+            "error set after failed disable toggle"
+        );
     }
 }

@@ -233,14 +233,18 @@ pub enum VoiceStatus {
 /// A single enrollment template.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WakeWordTemplate {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub embeddings: Vec<Vec<f32>>,
+    #[serde(default)]
     pub threshold: f32,
 }
 
 /// Collection of enrolled wake word templates.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct WakeWordTemplates {
+    #[serde(default)]
     pub templates: Vec<WakeWordTemplate>,
 }
 
@@ -1688,14 +1692,19 @@ pub async fn run_voice_pipeline() {
     }
 
     // Load persisted templates from config on startup
-    if let Some(json) = CONFIG.wake_word_templates()
-        && let Ok(templates) = serde_json::from_str::<WakeWordTemplates>(&json)
-    {
-        set_templates(Arc::new(templates));
-        info!(
-            "Loaded {} wake word template(s) from config",
-            get_templates().templates.len()
-        );
+    if let Some(json) = CONFIG.wake_word_templates() {
+        match serde_json::from_str::<WakeWordTemplates>(&json) {
+            Ok(templates) => {
+                set_templates(Arc::new(templates));
+                info!(
+                    "Loaded {} wake word template(s) from config",
+                    get_templates().templates.len()
+                );
+            }
+            Err(e) => {
+                warn!("Failed to deserialize stored wake word templates: {e}");
+            }
+        }
     }
 
     // Start model download in background
@@ -1908,11 +1917,17 @@ async fn persist_templates() {
         if let Err(e) = store.set_kv("wake_word_templates", &json).await {
             warn!("Failed to persist wake word templates: {e}");
         } else {
-            // Update CONFIG in-memory so that the next `save_and_reload()`
-            // sees `wake_word_templates` as `Some(json)` rather than `None`.
-            // Without this, `save_and_reload` would delete the key on save
-            // (None fields trigger delete_kv_tx), silently erasing templates.
-            let _ = CONFIG.set_string_field("wake_word_templates", &json);
+            // Update CONFIG in-memory so that GUI snapshot readers / pipeline
+            // restart see the latest templates.  `save_and_reload` no longer
+            // touches `wake_word_templates` (it's skipped in the write loop),
+            // so this update is about cross-session visibility, not deletion
+            // prevention.
+            if !CONFIG.set_string_field("wake_word_templates", &json) {
+                warn!(
+                    "Failed to update CONFIG with wake word templates (key not recognized by \
+                     set_string_field — it may have drifted from the `stringify!` arms)"
+                );
+            }
             info!("Wake word templates persisted to config");
         }
     }
@@ -3356,5 +3371,79 @@ mod tests {
         ctx.last_model_retry = None;
         tokio::task::yield_now().await;
         MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
+    }
+
+    // ── Template serde: forward-compatibility and default handling ──────
+    //
+    // These tests verify that WakeWordTemplate and WakeWordTemplates
+    // tolerate missing fields (forward compat) and extra unknown fields
+    // (future-proofing).  See mahbot-758.
+
+    #[test]
+    fn test_template_serde_roundtrip() {
+        let tpl = WakeWordTemplate {
+            name: "hello".into(),
+            embeddings: vec![vec![1.0, 2.0, 3.0]],
+            threshold: 0.5,
+        };
+        let json = serde_json::to_string(&tpl).unwrap();
+        let deserialized: WakeWordTemplate = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "hello");
+        assert_eq!(deserialized.embeddings, vec![vec![1.0, 2.0, 3.0]]);
+        assert!((deserialized.threshold - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_template_serde_missing_fields_use_defaults() {
+        // Forward-compat: a template stored before a hypothetical new field
+        // was added should deserialize with missing fields defaulted.
+        let json = r#"{"name":"legacy","embeddings":[[0.1],[0.2]]}"#;
+        let tpl: WakeWordTemplate = serde_json::from_str(json).unwrap();
+        assert_eq!(tpl.name, "legacy");
+        assert_eq!(tpl.embeddings, vec![vec![0.1], vec![0.2]]);
+        // threshold was missing → default 0.0
+        assert!((tpl.threshold - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_template_serde_empty_json_uses_defaults() {
+        // Minimal JSON: all fields missing → all defaults.
+        let tpl: WakeWordTemplate = serde_json::from_str("{}").unwrap();
+        assert!(tpl.name.is_empty());
+        assert!(tpl.embeddings.is_empty());
+        assert!((tpl.threshold - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_template_serde_unknown_fields_ignored() {
+        // Forward-compat: extra fields from a future version are silently
+        // ignored (serde does not have deny_unknown_fields on this type).
+        let json =
+            r#"{"name":"x","embeddings":[],"threshold":0.3,"future_field":"v1","another":42}"#;
+        let tpl: WakeWordTemplate = serde_json::from_str(json).unwrap();
+        assert_eq!(tpl.name, "x");
+        assert!(tpl.embeddings.is_empty());
+        assert!((tpl.threshold - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_templates_serde_roundtrip() {
+        let templates = WakeWordTemplates {
+            templates: vec![WakeWordTemplate {
+                name: "alpha".into(),
+                embeddings: vec![vec![1.0]],
+                threshold: 0.5,
+            }],
+        };
+        let json = serde_json::to_string(&templates).unwrap();
+        let deserialized: WakeWordTemplates = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.templates.len(), 1);
+        assert_eq!(deserialized.templates[0].name, "alpha");
+    }
+
+    #[test]
+    fn test_templates_serde_empty_list() {
+        let tpl: WakeWordTemplates = serde_json::from_str(r#"{"templates":[]}"#).unwrap();
+        assert!(tpl.templates.is_empty());
     }
 }

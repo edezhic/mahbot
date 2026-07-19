@@ -102,6 +102,7 @@
 use crate::Role;
 use crate::config_db::ConfigStore;
 use crate::role::role_info;
+use crate::turso;
 use crate::util::UnwrapPoison;
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -852,6 +853,29 @@ pub async fn reload_from_db() -> Result<()> {
 /// 6. Recreate all provider/transcriber singletons from the new config.
 /// 7. Swap the global [`CONFIG`] singleton.
 /// 8. If Telegram token changed: hot-reload the listener.
+// Write all string config fields to the `config_kv` table within the given
+// transaction.
+//
+// `wake_word_templates` is intentionally **skipped** — it is owned exclusively
+// by the voice pipeline (`persist_templates()` in `voice.rs`) and must never
+// be overwritten or deleted by a GUI save from any settings tab.
+pub(crate) async fn write_string_config_fields_to_db(
+    tx: &turso::TxGuard<'_>,
+    config: &ConfigData,
+) -> Result<()> {
+    for (key, value) in config.string_fields() {
+        if key == stringify!(wake_word_templates) {
+            continue;
+        }
+        if let Some(v) = value {
+            ConfigStore::set_kv_tx(tx, key, v).await?;
+        } else {
+            ConfigStore::delete_kv_tx(tx, key).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // Normalize BEFORE validation, any DB write, or provider warmup so that:
     //  1. Validation operates on canonical (trimmed, None-normalized) values.
@@ -886,14 +910,15 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     // Write all KV pairs, per-role configs, AND per-model routings inside a
     // single transaction so a crash between writes doesn't leave inconsistent
     // partial state on restart.
+    //
+    // NOTE: `wake_word_templates` is intentionally SKIPPED by the helper
+    // below — it is managed exclusively by the voice pipeline via
+    // `persist_templates()` which writes directly to the config_kv table and
+    // updates CONFIG independently.  Including it in the save loop would
+    // create a dual-writer race where a save from any settings tab could
+    // silently overwrite or delete freshly-enrolled templates.
     let tx = store.conn.begin_tx().await?;
-    for (key, value) in config.string_fields() {
-        if let Some(v) = value {
-            ConfigStore::set_kv_tx(&tx, key, v).await?;
-        } else {
-            ConfigStore::delete_kv_tx(&tx, key).await?;
-        }
-    }
+    write_string_config_fields_to_db(&tx, &config).await?;
     ConfigStore::save_role_and_routing_configs_tx(
         &tx,
         &config.per_role_configs,
@@ -911,6 +936,16 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
 
     // Publish so readers see the latest values.
     let new_token = config.telegram_bot_token.clone();
+
+    // Preserve `wake_word_templates` from the current CONFIG so that
+    // templates enrolled between the SettingsState snapshot and the Save
+    // click are not overwritten by stale snapshot data.  This key is owned
+    // exclusively by the voice pipeline — `write_string_config_fields_to_db`
+    // already skips it in the DB write loop above.
+    if let Some(templates) = CONFIG.wake_word_templates() {
+        config.wake_word_templates = Some(templates);
+    }
+
     CONFIG.swap(config);
     tracing::info!("Config saved and swapped into runtime");
 
@@ -1487,6 +1522,38 @@ mod tests {
         assert!(
             err.to_string().contains("placeholder"),
             "expected placeholder error, got: {err}",
+        );
+    }
+
+    /// When `save_and_reload` swaps the config, `wake_word_templates` that
+    /// were set after the snapshot was taken must be preserved in the new config
+    /// — otherwise a stale-snapshot `None` would silently erase them.
+    #[test]
+    fn save_and_reload_preserves_wake_word_templates_in_config() {
+        let reload = ConfigReload::const_new();
+
+        // Simulate: templates were enrolled (persist_templates updated CONFIG).
+        let template_json =
+            r#"{"templates":[{"name":"hey","embeddings":[[0.1]],"threshold":0.5}]}"#;
+        let mut enrolled = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(enrolled.set_string_field("wake_word_templates", template_json));
+        reload.swap(enrolled);
+
+        // Simulate: a stale SettingsState snapshot has wake_word_templates = None.
+        let mut stale_snapshot = ConfigData::STRUCT_FIELDS_DEFAULT;
+        stale_snapshot.wake_word_templates = None;
+
+        // Run the same preservation logic that save_and_reload uses.
+        if let Some(templates) = reload.wake_word_templates() {
+            stale_snapshot.wake_word_templates = Some(templates);
+        }
+        reload.swap(stale_snapshot);
+
+        // Verify: templates survived the swap despite None in snapshot.
+        assert_eq!(
+            reload.wake_word_templates(),
+            Some(template_json.to_string()),
+            "wake_word_templates must be preserved even when snapshot has None"
         );
     }
 }

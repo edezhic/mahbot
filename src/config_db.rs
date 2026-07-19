@@ -605,4 +605,54 @@ mod tests {
             "model routings should be unchanged after rollback"
         );
     }
+
+    /// `save_and_reload` must NOT overwrite or delete the `wake_word_templates`
+    /// [`write_string_config_fields_to_db`] intentionally skips the
+    /// `wake_word_templates` key because that key is owned exclusively by the voice pipeline
+    /// (`persist_templates`).  This test delegates to the shared helper
+    /// [`crate::config::write_string_config_fields_to_db`] — the same helper
+    /// that `save_and_reload` uses — so any change to the skip logic is
+    /// automatically reflected here.
+    #[tokio::test]
+    async fn test_write_string_config_fields_skips_wake_word_templates() {
+        use crate::config::ConfigData;
+
+        let (store, _dir) = setup().await;
+
+        // Simulate a freshly-enrolled template set.
+        let template_json =
+            r#"{"templates":[{"name":"hey","embeddings":[[0.1]],"threshold":0.5}]}"#;
+        store
+            .set_kv("wake_word_templates", template_json)
+            .await
+            .unwrap();
+
+        // Build a config that has wake_word_templates = None (as would happen
+        // if the SettingsState snapshot was taken before enrollment).
+        let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
+        config.wake_word_templates = None;
+
+        // Use the same helper that `save_and_reload` calls.
+        let tx = store.conn.begin_tx().await.unwrap();
+        crate::config::write_string_config_fields_to_db(&tx, &config)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Verify: wake_word_templates survived despite being None in config.
+        let saved = store
+            .conn
+            .query_optional(
+                "SELECT value FROM config_kv WHERE key = ?1",
+                ::turso::params!["wake_word_templates"],
+                |row| row.get::<String>(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.as_deref(),
+            Some(template_json),
+            "wake_word_templates must NOT be deleted by save_and_reload's write loop"
+        );
+    }
 }
