@@ -36,7 +36,7 @@ use crate::channels::{
 };
 use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
-use crate::{ChatEvent, Role, SendMessage};
+use crate::{ChatEvent, Role, SendMessage, Workspace};
 
 // ── Job definition ─────────────────────────────────────────────────────────
 
@@ -183,6 +183,34 @@ pub fn route(agent_id: &str, job: AgentJob) {
     guard.insert(agent_id.to_string(), tx);
 }
 
+// ── Workspace resolution ───────────────────────────────────────────────────
+
+/// Resolve a workspace by name, with personal workspace fallback.
+///
+/// Personal workspaces (names starting with `"personal:"`) are NOT stored
+/// in `workspaces.db` — they live at `~/.mahbot/userspaces/<user>/` and are
+/// constructed on the fly as ephemeral [`Workspace`] structs.
+///
+/// Returns `Ok(Some(ws))` when the workspace is found or constructed.
+/// Returns `Ok(None)` when the workspace genuinely does not exist
+/// (and is not a personal workspace).
+/// Returns `Err(e)` on database errors.
+async fn resolve_workspace(workspace_name: &str) -> anyhow::Result<Option<Workspace>> {
+    match crate::workspace::get_by_name(workspace_name).await? {
+        Some(ws) => Ok(Some(ws)),
+        None if crate::users::is_personal_workspace(workspace_name) => {
+            let user_name = workspace_name
+                .strip_prefix("personal:")
+                .expect("invariant: is_personal_workspace checked prefix");
+            let path = crate::users::personal_workspace_path(user_name);
+            Ok(Some(crate::users::personal_workspace_struct(
+                user_name, &path,
+            )))
+        }
+        None => Ok(None),
+    }
+}
+
 // ── Consumer loop ─────────────────────────────────────────────────────────
 
 /// The consumer task that processes agent jobs for a single agent instance,
@@ -225,7 +253,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         );
 
         // ── Resolve workspace by name ─────────────────────────────────
-        let ws = match crate::workspace::get_by_name(&job.workspace_name).await {
+        let ws = match resolve_workspace(&job.workspace_name).await {
             Ok(Some(ws)) => ws,
             Ok(None) => {
                 error!(
@@ -751,6 +779,54 @@ mod tests {
         assert!(
             cleaned_up,
             "consumer should have exited and its cleanup wrapper should have removed the entry",
+        );
+    }
+
+    // ── Workspace resolution tests ─────────────────────────────────────
+
+    /// Resolving a workspace that exists in the DB returns it.
+    #[tokio::test]
+    async fn test_resolve_workspace_found() {
+        crate::util::test::init_management_test_stores().await;
+
+        let ws =
+            crate::util::test::create_test_workspace("/tmp/test_resolve_ws", "test_resolve_ws")
+                .await;
+
+        let result = resolve_workspace("test_resolve_ws").await;
+        let resolved = result.expect("resolve should succeed for DB workspace");
+        assert!(resolved.is_some(), "DB workspace should be found");
+        assert_eq!(resolved.unwrap().name, "test_resolve_ws");
+    }
+
+    /// Resolving a personal workspace constructs it on the fly when
+    /// it is NOT in the DB.
+    #[tokio::test]
+    async fn test_resolve_workspace_personal() {
+        crate::util::test::init_management_test_stores().await;
+
+        let result = resolve_workspace("personal:liliana").await;
+        let resolved = result.expect("resolve should succeed for personal workspace");
+        let ws = resolved.expect("personal workspace should be constructed on the fly");
+
+        assert_eq!(ws.name, "personal:liliana");
+        assert_eq!(ws.status, crate::WorkspaceStatus::Ready);
+        // Path should point to the userspace directory.
+        let expected_path = crate::users::personal_workspace_path("liliana");
+        assert_eq!(ws.path, expected_path);
+    }
+
+    /// Resolving a workspace that genuinely does not exist (and is not
+    /// a personal workspace) returns `Ok(None)`.
+    #[tokio::test]
+    async fn test_resolve_workspace_not_found() {
+        crate::util::test::init_management_test_stores().await;
+
+        let result = resolve_workspace("nonexistent_workspace").await;
+        let resolved = result.expect("resolve should succeed (no error) for missing workspace");
+        assert!(
+            resolved.is_none(),
+            "nonexistent workspace should not be found",
         );
     }
 
