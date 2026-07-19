@@ -323,6 +323,8 @@ pub fn set_templates(templates: Arc<WakeWordTemplates>) {
 pub fn send_command(cmd: VoiceCommand) {
     if let Some(tx) = &voice_state().read().unwrap_poison().cmd_tx {
         let _ = tx.send(cmd);
+    } else {
+        warn!("Voice pipeline not initialized — dropping command {cmd:?}");
     }
 }
 
@@ -1244,7 +1246,20 @@ impl PipelineCtx {
     }
 
     fn handle_start_listening(&mut self) {
+        // Defense-in-depth: reject if voice has been disabled between the
+        // time the command was sent and the time it's processed. This
+        // mirrors the guard in handle_start_enrollment.
+        if !is_enabled() {
+            self.auto_start_pending = false;
+            warn!("Ignoring start_listening — voice assistant is disabled");
+            return;
+        }
         if !models_ready() {
+            // Models are still loading — mark pending so check_auto_start
+            // retries when they become ready (satisfies ticket req #2:
+            // auto-start when models transition to Ready). This is NOT set
+            // on mic failure, preventing a continuous retry loop.
+            self.auto_start_pending = true;
             warn!("Voice models not ready yet");
             return;
         }
@@ -1264,6 +1279,9 @@ impl PipelineCtx {
                 Err(e) => {
                     warn!("Failed to start microphone: {e}");
                     set_status(VoiceStatus::MicDisconnected);
+                    // auto_start_pending is NOT set here — the user must
+                    // re-toggle Voice OFF/ON to retry after resolving the
+                    // mic issue.
                 }
             }
         }
@@ -1273,6 +1291,7 @@ impl PipelineCtx {
         self.is_listening = false;
         self.is_recording = false;
         self.enrollment_mode = false;
+        self.auto_start_pending = false;
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
         self.utterance_silence_since = None;
@@ -1283,6 +1302,13 @@ impl PipelineCtx {
     }
 
     fn handle_start_enrollment(&mut self) {
+        if !self.is_listening {
+            warn!("Cannot start enrollment: microphone not running");
+            set_status(VoiceStatus::Error(
+                "Microphone not running — enable Voice first".to_string(),
+            ));
+            return;
+        }
         self.enrollment_mode = true;
         self.audio_buffer.clear();
         self.utterance_buf.clear();
@@ -1323,7 +1349,11 @@ impl PipelineCtx {
     }
 
     fn check_auto_start(&mut self) {
-        if self.auto_start_pending && models_ready() && !self.is_listening {
+        // One-shot retry: only fires when auto_start_pending is true (set at
+        // pipeline creation or by handle_start_listening when models weren't
+        // ready yet). Cleared after the first attempt — no continuous retry
+        // loop on mic failure.
+        if models_ready() && !self.is_listening && self.auto_start_pending {
             self.auto_start_pending = false;
             send_command(VoiceCommand::StartListening);
         }
@@ -1773,6 +1803,17 @@ fn try_match_wake_word_and_push_embedding(
 
 #[cfg(test)]
 mod tests {
+    //! ## Test constraints
+    //!
+    //! - **`VOICE_PIPELINE`** must be uninitialized before
+    //!   `test_voice_pipeline_commands_and_enrollment_guard` runs. Do not call
+    //!   [`voice::init_global`](crate::voice::init_global) or set
+    //!   `VOICE_PIPELINE` in any other test without updating this one.
+    //! - **Global `CONFIG`** is read by [`PipelineCtx::new()`] to set
+    //!   `auto_start_pending`. Tests implicitly depend on `CONFIG` being in its
+    //!   default state (all fields `None`). If a preceding test modifies
+    //!   `CONFIG`, `auto_start_pending` may be non-`false`, which this test's
+    //!   assertions must still tolerate.
     use super::*;
     use std::f32::consts::PI;
 
@@ -1987,5 +2028,86 @@ mod tests {
 
     fn approx_eq(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-5, "expected approx {a} == {b}");
+    }
+
+    // ── PipelineCtx tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_voice_pipeline_commands_and_enrollment_guard() {
+        // Initialize global VOICE_PIPELINE once for all checks below.
+        // Using assert!(is_ok()) so that parallel test execution would fail
+        // fast rather than silently giving stale state.
+        assert!(
+            VOICE_PIPELINE
+                .set(RwLock::new(VoicePipelineState {
+                    enabled: false,
+                    status: VoiceStatus::Disabled,
+                    templates: Arc::new(WakeWordTemplates::default()),
+                    enrollment_buffer: Vec::new(),
+                    cmd_tx: None,
+                }))
+                .is_ok(),
+            "VOICE_PIPELINE already initialized — tests must not share state",
+        );
+
+        // ── handle_start_enrollment guard ─────────────────────────
+        let mut ctx = PipelineCtx::new();
+        assert!(!ctx.is_listening, "default state should not be listening");
+        assert!(
+            !ctx.enrollment_mode,
+            "should not be in enrollment mode initially"
+        );
+
+        ctx.handle_start_enrollment();
+
+        assert!(
+            !ctx.enrollment_mode,
+            "enrollment should be rejected when mic is not running"
+        );
+
+        // ── send_command with cmd_tx = None ─────────────────────────
+        // None of these should panic — they log a warning and return.
+        send_command(VoiceCommand::StartListening);
+        send_command(VoiceCommand::StopListening);
+        send_command(VoiceCommand::StartEnrollment);
+        send_command(VoiceCommand::CancelEnrollment);
+
+        // ── Model-ready retry path (ticket req #2) ─────────────────
+        // Verify that handle_start_listening sets auto_start_pending when
+        // models aren't ready, and check_auto_start consumes the flag once
+        // models transition to Ready.
+        {
+            // Enable voice so the retry path is exercised.
+            voice_state().write().unwrap_poison().enabled = true;
+
+            // Models not yet ready — handle_start_listening should set
+            // auto_start_pending (one-shot retry flag).
+            MODELS_STATE.store(ModelState::Loading, Ordering::Release);
+            ctx.handle_start_listening();
+            assert!(
+                ctx.auto_start_pending,
+                "auto_start_pending should be set when models are not ready"
+            );
+
+            // Models become ready — check_auto_start should consume the flag.
+            MODELS_STATE.store(ModelState::Ready, Ordering::Release);
+            ctx.check_auto_start();
+            assert!(
+                !ctx.auto_start_pending,
+                "auto_start_pending should be cleared after check_auto_start"
+            );
+
+            // Second call to check_auto_start is a no-op (one-shot).
+            ctx.check_auto_start();
+            assert!(
+                !ctx.auto_start_pending,
+                "auto_start_pending must remain false after one-shot consumed"
+            );
+
+            // Clean up: reset for other checks (the actual pipeline will set
+            // its own state).
+            voice_state().write().unwrap_poison().enabled = false;
+            MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
+        }
     }
 }

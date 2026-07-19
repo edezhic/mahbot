@@ -293,6 +293,10 @@ pub enum SettingsMessage {
         action: ModelPickerAction,
     },
     // ── Voice assistant messages ──────────────────────────
+    /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
+    VoiceToggle(bool),
+    /// Result of async DB persistence after a voice toggle.
+    VoiceToggleResult(Result<(), String>),
     /// Start enrollment session for wake word.
     StartVoiceEnrollment,
     /// Cancel enrollment session.
@@ -338,6 +342,19 @@ pub struct SettingsState {
     // ── Model picker state ────────────────────────────────
     /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
     model_picker_inputs: [String; ModelPickerTarget::COUNT],
+}
+
+/// Sync the voice assistant pipeline state with `CONFIG.voice_enabled()`.
+/// Called both from the immediate `VoiceToggle` handler and from `SaveResult`
+/// (after a full Save where the config may have changed).
+fn sync_voice_state(enabled: bool) {
+    if enabled {
+        crate::voice::set_enabled(true);
+        crate::voice::send_command(crate::voice::VoiceCommand::StartListening);
+    } else {
+        crate::voice::set_enabled(false);
+        crate::voice::send_command(crate::voice::VoiceCommand::StopListening);
+    }
 }
 
 impl SettingsState {
@@ -456,14 +473,7 @@ impl SettingsState {
                 self.refresh();
 
                 // Sync voice assistant state with config
-                let voice_enabled = CONFIG.voice_enabled().as_deref() == Some("true");
-                if voice_enabled {
-                    crate::voice::set_enabled(true);
-                    crate::voice::send_command(crate::voice::VoiceCommand::StartListening);
-                } else {
-                    crate::voice::set_enabled(false);
-                    crate::voice::send_command(crate::voice::VoiceCommand::StopListening);
-                }
+                sync_voice_state(crate::config::CONFIG.voice_enabled().as_deref() == Some("true"));
 
                 Task::none()
             }
@@ -473,7 +483,44 @@ impl SettingsState {
                 Task::none()
             }
 
-            // ── Voice assistant enrollment ───────────────────────
+            // ── Voice assistant ─────────────────────────────────
+            SettingsMessage::VoiceToggle(enabled) => {
+                // Update in-memory config snapshot so the UI reflects the change.
+                // When disabling, use an empty string so that the [non_empty]
+                // accessor collapses it to None (absent = disabled).
+                let val = if enabled { "true" } else { "" };
+                let _ = self.config.set_string_field("voice_enabled", val);
+                // Update global CONFIG so refresh() doesn't revert.
+                let _ = crate::config::CONFIG.set_string_field("voice_enabled", val);
+
+                // Activate/deactivate the pipeline immediately.
+                sync_voice_state(enabled);
+
+                // Persist to DB asynchronously, reporting errors via VoiceToggleResult.
+                // When disabled, delete the key so it's truly absent (None on reload).
+                Task::perform(
+                    async move {
+                        let store = crate::config_db::store();
+                        if enabled {
+                            store
+                                .set_kv("voice_enabled", "true")
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            store
+                                .delete_kv("voice_enabled")
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                    },
+                    SettingsMessage::VoiceToggleResult,
+                )
+            }
+            SettingsMessage::VoiceToggleResult(Ok(())) => Task::none(),
+            SettingsMessage::VoiceToggleResult(Err(e)) => {
+                self.error = Some(e);
+                Task::none()
+            }
             SettingsMessage::StartVoiceEnrollment => {
                 crate::voice::send_command(crate::voice::VoiceCommand::StartEnrollment);
                 Task::none()
@@ -1993,10 +2040,7 @@ impl SettingsState {
             .push(field_row(
                 "Enable Voice",
                 iced::widget::toggler(voice_enabled)
-                    .on_toggle(move |b| SettingsMessage::ConfigField {
-                        key: "voice_enabled",
-                        value: if b { "true".to_string() } else { String::new() },
-                    })
+                    .on_toggle(SettingsMessage::VoiceToggle)
                     .into(),
                 Some("Hands-free voice commands with wake word detection"),
             ))
