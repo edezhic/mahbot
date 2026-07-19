@@ -72,7 +72,7 @@ const MAX_RECORD_SECS: usize = 30;
 const VAD_THRESHOLD: f32 = 0.01;
 
 /// Minimum silence duration before stopping command recording.
-const SILENCE_DURATION: Duration = Duration::from_millis(1500);
+pub(crate) const SILENCE_DURATION: Duration = Duration::from_millis(1500);
 
 /// Maximum number of download retries.
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
@@ -409,6 +409,13 @@ fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<V
         } else {
             anyhow::bail!("Unexpected mel shape: {shape:?} (expected {NUM_MEL_BANDS} bands)")
         }
+    } else if shape.len() == 4
+        && shape[0] == 1
+        && shape[1] == 1
+        && shape[3] as usize == NUM_MEL_BANDS
+    {
+        // 4D NHWC output: (1, 1, num_frames, NUM_MEL_BANDS) — squeeze batch and channel dims.
+        (shape[2] as usize, shape[3] as usize)
     } else {
         anyhow::bail!("Unexpected mel output shape: {shape:?}");
     };
@@ -450,7 +457,7 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
     let flat: Vec<f32> = mel_frames.iter().flatten().copied().collect();
     let input_tensor = Tensor::from_slice(
         &flat,
-        (1, 1, NUM_MEL_BANDS, EMBEDDING_WINDOW_FRAMES),
+        (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS, 1),
         &models.device,
     )?;
 
@@ -839,6 +846,13 @@ async fn download_retry_loop() {
                     if ONNX_MODELS.set(models).is_ok() {
                         MODELS_STATE.store(ModelState::Ready, Ordering::Release);
                         info!("Voice models loaded successfully");
+                        // Clear "Loading models" status — if enabled, auto-start
+                        // transitions to Listening on the next pipeline tick.
+                        set_status(if is_enabled() {
+                            VoiceStatus::Listening
+                        } else {
+                            VoiceStatus::Disabled
+                        });
                         return;
                     }
                 }
@@ -1471,6 +1485,15 @@ pub async fn run_voice_pipeline() {
         // handle_enrollment_sample uses spawn_blocking so it doesn't block.
         if let Some(samples) = ctx.enrollment_pending.take() {
             handle_enrollment_sample(samples).await;
+            // Reset enrollment_mode only on successful completion, not on
+            // failure — if finalize_enrollment failed, the user can retry
+            // by speaking the wake word again without re-initiating enrollment.
+            if matches!(
+                voice_state().read().unwrap_poison().status,
+                VoiceStatus::Enrolled
+            ) {
+                ctx.enrollment_mode = false;
+            }
         }
 
         // Auto-start when models become ready (async download case).

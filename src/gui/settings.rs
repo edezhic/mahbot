@@ -1988,7 +1988,10 @@ impl SettingsState {
             crate::voice::VoiceStatus::Enrolling { sample, total } => {
                 let remaining = total.saturating_sub(sample);
                 let msg = if remaining > 0 {
-                    format!("Say the wake word: {remaining} more time(s)…")
+                    format!(
+                        "Say the wake word: {remaining} more — speak clearly, then pause for {:.1} seconds…",
+                        crate::voice::SILENCE_DURATION.as_secs_f32(),
+                    )
                 } else {
                     "Processing…".to_string()
                 };
