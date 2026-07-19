@@ -873,6 +873,9 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     output
 }
 
+/// Convert multi-channel audio to mono by averaging channels.
+/// Kept for test use; production uses the fused [`convert_and_send_audio_to_pipeline`].
+#[cfg(test)]
 fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     if channels == 1 {
         return samples.to_vec();
@@ -1159,14 +1162,50 @@ fn retry_model_loading() -> bool {
 // Microphone capture
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Convert audio data to mono and resample if needed, then send to pipeline.
-fn send_audio_to_pipeline(
+/// Convert raw audio samples to mono f32 and send to the pipeline.
+///
+/// Combines the format conversion and channel-averaging into a single pass,
+/// avoiding the intermediate `Vec<f32>` allocation that separate convert-then-
+/// to_mono steps would incur.  This reduces allocator pressure in the audio
+/// input callback, which runs at audio hardware interrupt frequency.
+///
+/// When `T = f32` and `convert` is the identity closure `|&s| s`, this
+/// function handles the F32 path identically to the integer format paths.
+fn convert_and_send_audio_to_pipeline<T, F>(
     tx: &mpsc::UnboundedSender<Vec<f32>>,
-    float_data: &[f32],
+    data: &[T],
     channels: u16,
     sample_rate: u32,
-) {
-    let mono = to_mono(float_data, channels);
+    convert: F,
+) where
+    F: Fn(&T) -> f32,
+{
+    // Fast path: single channel — no averaging needed, just convert and send.
+    if channels == 1 {
+        let mono: Vec<f32> = data.iter().map(&convert).collect();
+        let resampled = if sample_rate == SAMPLE_RATE {
+            mono
+        } else {
+            resample_audio(&mono, sample_rate, SAMPLE_RATE)
+        };
+        let _ = tx.send(resampled);
+        return;
+    }
+
+    let ch = channels as usize;
+    let frames = data.len() / ch;
+    let remainder = data.len() % ch;
+    if remainder != 0 {
+        warn!(
+            "convert_and_send: discarding {remainder} sample(s) from non-aligned audio (channels={channels})",
+        );
+    }
+    let mut mono = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let start = f * ch;
+        let sum: f32 = data[start..start + ch].iter().map(&convert).sum();
+        mono.push(sum / f32::from(channels));
+    }
     let resampled = if sample_rate == SAMPLE_RATE {
         mono
     } else {
@@ -1207,16 +1246,21 @@ fn start_microphone() -> Result<(mpsc::UnboundedReceiver<Vec<f32>>, cpal::Stream
     let sample_tx = Arc::new(tx);
 
     // Helper to build audio stream for integer sample formats that need
-    // conversion to f32. The F32 case is handled separately since it can
-    // pass data directly without conversion.
+    // conversion to f32.  Uses the combined convert+to_mono path to avoid
+    // an intermediate `Vec<f32>` allocation on every callback.
     macro_rules! build_int_stream {
         ($device:expr, $config:expr, $sample_tx:expr, $channels:expr, $sample_rate:expr, $fmt:ty, $convert:expr) => {{
             let tx = $sample_tx.clone();
             $device.build_input_stream::<$fmt, _, _>(
                 &($config).into(),
                 move |data, _| {
-                    let float_data: Vec<f32> = data.iter().map($convert).collect();
-                    send_audio_to_pipeline(&tx, &float_data, $channels, $sample_rate);
+                    convert_and_send_audio_to_pipeline(
+                        &tx,
+                        data,
+                        $channels,
+                        $sample_rate,
+                        $convert,
+                    );
                 },
                 mic_error,
                 None,
@@ -1231,7 +1275,10 @@ fn start_microphone() -> Result<(mpsc::UnboundedReceiver<Vec<f32>>, cpal::Stream
             device.build_input_stream::<f32, _, _>(
                 &config.into(),
                 move |data, _| {
-                    send_audio_to_pipeline(&tx, data, channels, sample_rate);
+                    // F32 can use the generic path with identity conversion,
+                    // benefiting from the single-channel fast-path in
+                    // convert_and_send_audio_to_pipeline.
+                    convert_and_send_audio_to_pipeline(&tx, data, channels, sample_rate, |&s| s);
                 },
                 mic_error,
                 None,
@@ -2180,13 +2227,15 @@ fn handle_wake_word_detection(
 ) {
     audio_buffer.extend_from_slice(samples);
 
-    while audio_buffer.len() >= FRAME_LENGTH {
-        // ✅ FIX: Read the frame BEFORE draining (was: drain-before-read bug)
-        let frame: Vec<f32> = audio_buffer[..FRAME_LENGTH].to_vec();
-        audio_buffer.drain(..HOP_LENGTH);
+    // Process frames from the buffer without per-iteration O(n) drain shifts.
+    // Track a consumed offset and drain everything once after the loop.
+    let len = audio_buffer.len();
+    let mut consumed = 0;
+    while consumed + FRAME_LENGTH <= len {
+        let frame = &audio_buffer[consumed..consumed + FRAME_LENGTH];
 
         // VAD gate — skip silence to avoid wasted ONNX compute
-        if is_speech(&frame, VAD_THRESHOLD) {
+        if is_speech(frame, VAD_THRESHOLD) {
             // Add only the NEW samples (HOP_LENGTH per frame) to avoid
             // duplicating overlapping audio. Each frame overlaps the previous
             // by 50% (HOP_LENGTH = FRAME_LENGTH/2), so appending the full
@@ -2207,6 +2256,7 @@ fn handle_wake_word_detection(
             ) {
                 return;
             }
+            consumed += HOP_LENGTH;
             continue;
         }
 
@@ -2225,6 +2275,12 @@ fn handle_wake_word_detection(
                 return;
             }
         }
+        consumed += HOP_LENGTH;
+    }
+
+    // Single O(remaining) drain instead of O(remaining) per frame iteration.
+    if consumed > 0 {
+        audio_buffer.drain(..consumed);
     }
 }
 
@@ -2252,11 +2308,13 @@ fn handle_wake_word_detection(
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
     ctx.audio_buffer.extend_from_slice(samples);
 
-    while ctx.audio_buffer.len() >= FRAME_LENGTH {
-        let frame: Vec<f32> = ctx.audio_buffer[..FRAME_LENGTH].to_vec();
-        ctx.audio_buffer.drain(..HOP_LENGTH);
+    // Process frames with offset tracking instead of per-iteration O(n) drain.
+    let len = ctx.audio_buffer.len();
+    let mut consumed = 0;
+    while consumed + FRAME_LENGTH <= len {
+        let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
-        if is_speech(&frame, VAD_THRESHOLD) {
+        if is_speech(frame, VAD_THRESHOLD) {
             // VAD-positive: accumulate only the new samples (HOP_LENGTH per
             // frame) into the utterance buffer. Adding the full FRAME_LENGTH
             // frame would duplicate overlapping audio since consecutive frames
@@ -2300,7 +2358,12 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 ctx.utterance_had_speech = false;
                 ctx.utterance_silence_samples = 0;
                 ctx.enrollment_no_speech_frame_count = 0;
-                ctx.audio_buffer.clear();
+                // Mark ALL samples as consumed so the post-loop drain removes
+                // everything (including the unconsumed tail).  This replaces
+                // the original `clear()` while working correctly even when
+                // `consumed > 0` — the original `clear()` + post-loop
+                // `drain(..consumed)` would panic on an empty buffer.
+                consumed = len;
                 break;
             }
             // Set status during the first 200ms of silence to show
@@ -2327,6 +2390,12 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // or the user re-initiates enrollment.
             }
         }
+        consumed += HOP_LENGTH;
+    }
+
+    // Single O(remaining) drain instead of O(remaining) per frame iteration.
+    if consumed > 0 {
+        ctx.audio_buffer.drain(..consumed);
     }
 }
 
@@ -3507,6 +3576,83 @@ mod tests {
         assert_eq!(
             ctx.utterance_speech_end_len, 0,
             "speech_end_len should reset"
+        );
+    }
+
+    #[test]
+    fn test_enrollment_audio_break_with_consumed_frames() {
+        // Regression test for the fix replacing audio_buffer.clear() with
+        // consumed = len at the silence-threshold break point.
+        //
+        // When the break fires on a frame after the first within a single call
+        // (i.e., consumed > 0), the old `clear()` + post-loop `drain(..consumed)`
+        // sequence would panic because the clear() emptied the buffer before the
+        // drain.  The fix marks everything as consumed (consumed = len) so the
+        // post-loop drain removes all samples in one go.
+        //
+        // This test exercises the break on frame 2 of a 2-frame buffer — the
+        // break fires after consumed has been advanced to HOP_LENGTH, so
+        // consumed > 0 at the break point.
+        let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
+            enabled: true,
+            status: VoiceStatus::Disabled,
+            templates: Arc::new(WakeWordTemplates::default()),
+            enrollment_buffer: Vec::new(),
+            cmd_tx: None,
+        }));
+
+        let mut ctx = PipelineCtx::new();
+        ctx.is_listening = true;
+        ctx.enrollment_mode = true;
+
+        // Pre-fill audio_buffer with 2 frames of silence (1024 samples).
+        // The call to handle_enrollment_audio below will process these frames
+        // without any additional input (empty slice).
+        ctx.audio_buffer = vec![0.0f32; FRAME_LENGTH * 2];
+
+        // Simulate prior speech by setting utterance_had_speech directly.
+        ctx.utterance_had_speech = true;
+
+        // Set silence_samples so the threshold is reached on the 2nd frame:
+        //
+        //   Frame 1 (samples 0-511): silence
+        //     → utterance_silence_samples += 256 → 23744 (< 24000, no break)
+        //     → consumed = 256
+        //
+        //   Frame 2 (samples 256-767): silence
+        //     → utterance_silence_samples += 256 → 24000 (>= 24000, BREAK)
+        //     → consumed = len (= 1024)  ← the fix
+        //
+        //   Post-loop: drain(..1024) removes all samples without panic.
+        ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES - 2 * HOP_LENGTH;
+
+        // Process the pre-filled buffer with no additional samples.
+        handle_enrollment_audio(&[], &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+
+        // Verify the break path was reached and state was properly reset.
+        assert!(
+            ctx.enrollment_pending.is_some(),
+            "silence threshold should have triggered break and stored utterance"
+        );
+        assert!(
+            ctx.utterance_buf.is_empty(),
+            "utterance_buf should be empty after mem::take in break path"
+        );
+        assert!(
+            !ctx.utterance_had_speech,
+            "utterance_had_speech should be reset after break"
+        );
+        assert_eq!(
+            ctx.utterance_silence_samples, 0,
+            "utterance_silence_samples should be reset after break"
+        );
+        assert_eq!(
+            ctx.utterance_speech_end_len, 0,
+            "utterance_speech_end_len should be reset after break"
+        );
+        assert!(
+            ctx.audio_buffer.is_empty(),
+            "audio_buffer should be fully drained by post-loop drain"
         );
     }
 
