@@ -2052,18 +2052,13 @@ impl SettingsState {
             crate::voice::VoiceStatus::Enrolling { sample, total } => {
                 let remaining = total.saturating_sub(sample);
                 let msg = if remaining > 0 {
-                    let silence_secs = crate::voice::SILENCE_DURATION.as_secs_f32();
-                    // Note: `{:.0}` rounds to the nearest integer (half away from zero),
-                    // so SILENCE_DURATION=1.5s displays as "2 seconds".
-                    // This is intentional — the hint tells users to expect a ~2s pause.
-                    // If you change SILENCE_DURATION, update this format accordingly.
                     if remaining == 1 {
                         format!(
-                            "Say the wake word once, then stay silent for {silence_secs:.0} seconds. Repeat 1 more time.",
+                            "Sample {sample}/{total} — say the wake word once, then stay silent. 1 more time."
                         )
                     } else {
                         format!(
-                            "Say the wake word once, then stay silent for {silence_secs:.0} seconds. Repeat {remaining} times.",
+                            "Sample {sample}/{total} — say the wake word once, then stay silent. {remaining} more times."
                         )
                     }
                 } else {

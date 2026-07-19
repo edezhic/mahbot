@@ -86,6 +86,19 @@ const SILENCE_THRESHOLD_SAMPLES: usize =
 /// even under scheduling jitter.
 const SILENCE_UI_GATE_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 
+/// Duration of non-VAD audio before showing "speak louder" warning during
+/// enrollment (~5s).  Derived from SAMPLE_RATE and HOP_LENGTH so the threshold
+/// stays correct if frame/hop sizes are adjusted (mahbot-765).
+const ENROLLMENT_NO_SPEECH_DURATION: Duration = Duration::from_secs(5);
+
+/// Consecutive non-VAD frame threshold for enrollment no-speech warning.
+/// Each frame iteration processes HOP_LENGTH new samples, so the threshold
+/// is (duration × sample_rate) / hop_length to be robust against frame/hop
+/// size changes.
+const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
+    (ENROLLMENT_NO_SPEECH_DURATION.as_millis() as usize * SAMPLE_RATE as usize)
+        / (HOP_LENGTH * 1000);
+
 /// Maximum number of download retries.
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
 
@@ -104,13 +117,18 @@ const VOICE_BATCH_SIZE: usize = 2048;
 const EMBEDDING_RING_MAX: usize = 19;
 
 /// Number of enrollment samples required.
-const NUM_ENROLLMENT_SAMPLES: usize = 3;
+///
+/// Increased from 3 to 10 (mahbot-765) to provide more representative
+/// statistics for the threshold formula `max(mean + 2×σ, mean + 0.05)`.
+/// With only 3 samples, σ is unstable and the threshold margin can
+/// collapse below 1%, causing false negatives during live detection.
+const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
 /// Multiplier for auto-calibrated threshold (mean + MULTIPLIER * std).
 const THRESHOLD_MULTIPLIER: f32 = 2.0;
 
 /// Minimum absolute separation between the mean pairwise distance and the
-/// acceptance threshold.  With only [`NUM_ENROLLMENT_SAMPLES`] (3) samples,
+/// acceptance threshold.  With only [`NUM_ENROLLMENT_SAMPLES`] (10) samples,
 /// standard deviation estimates are unreliable — a single outlier or three
 /// artificially similar samples can produce an unrealistically tight std,
 /// collapsing the threshold to nearly-equal the mean.  This floor ensures
@@ -251,6 +269,11 @@ pub struct WakeWordTemplate {
     pub embeddings: Vec<Vec<f32>>,
     #[serde(default)]
     pub threshold: f32,
+    /// Number of enrollment samples used to create this template.
+    /// Templates enrolled with fewer than [`NUM_ENROLLMENT_SAMPLES`] samples
+    /// are invalid and require re-enrollment (mahbot-765).
+    #[serde(default)]
+    pub enrollment_samples: usize,
 }
 
 /// Collection of enrolled wake word templates.
@@ -1344,6 +1367,7 @@ fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
         name: wake_word_name.to_string(),
         embeddings: all_embeddings,
         threshold,
+        enrollment_samples: NUM_ENROLLMENT_SAMPLES,
     })
 }
 
@@ -1540,6 +1564,10 @@ struct PipelineCtx {
     /// Silence duration in samples for enrollment utterance detection
     /// (sample-based to avoid wall-clock drift under load).
     utterance_silence_samples: usize,
+    /// Counter of consecutive non-VAD frames during enrollment.
+    /// Used to detect when the user has not spoken for too long
+    /// and show a "speak louder" warning (mahbot-765).
+    enrollment_no_speech_frame_count: usize,
     audio_buffer: Vec<f32>,
     mel_frame_buffer: Vec<Vec<f32>>,
     embedding_ring: Vec<Vec<f32>>,
@@ -1571,6 +1599,7 @@ impl PipelineCtx {
             utterance_buf: Vec::new(),
             utterance_had_speech: false,
             utterance_silence_samples: 0,
+            enrollment_no_speech_frame_count: 0,
             audio_buffer: Vec::new(),
             mel_frame_buffer: Vec::new(),
             embedding_ring: Vec::new(),
@@ -1580,6 +1609,35 @@ impl PipelineCtx {
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
             last_model_retry: None,
         }
+    }
+
+    /// Clear all audio buffers and processing state.
+    ///
+    /// Must be called at every state transition to prevent stale audio from
+    /// contaminating the new pipeline phase (mahbot-765).  Resets:
+    /// - `voice_batch`, `mel_frame_buffer`, `embedding_ring`
+    /// - `audio_buffer`, `command_buffer`
+    /// - `utterance_buf` and enrollment tracking fields
+    /// - `enrollment_no_speech_frame_count`
+    /// - `enrollment_pending` (stale utterance after cancel)
+    /// - `voice_state().enrollment_buffer` (global enrollment buffer)
+    fn clear_pipeline_buffers(&mut self) {
+        self.voice_batch.clear();
+        self.mel_frame_buffer.clear();
+        self.embedding_ring.clear();
+        self.audio_buffer.clear();
+        self.command_buffer.clear();
+        self.utterance_buf.clear();
+        self.utterance_had_speech = false;
+        self.utterance_silence_samples = 0;
+        self.utterance_speech_end_len = 0;
+        self.enrollment_no_speech_frame_count = 0;
+        self.enrollment_pending = None;
+        voice_state()
+            .write()
+            .unwrap_poison()
+            .enrollment_buffer
+            .clear();
     }
 
     fn handle_start_listening(&mut self) {
@@ -1609,15 +1667,13 @@ impl PipelineCtx {
             return;
         }
         if !self.is_listening {
+            self.clear_pipeline_buffers();
             drop(self.mic_stream.take());
             match start_microphone() {
                 Ok((rx, stream)) => {
                     self.mic_rx = Some(rx);
                     self.mic_stream.set(stream);
                     self.is_listening = true;
-                    self.audio_buffer.clear();
-                    self.mel_frame_buffer.clear();
-                    self.embedding_ring.clear();
                     set_status(VoiceStatus::Listening);
                     info!("Voice pipeline: started listening");
                 }
@@ -1637,14 +1693,11 @@ impl PipelineCtx {
     }
 
     fn handle_stop_listening(&mut self) {
+        self.clear_pipeline_buffers();
         self.is_listening = false;
         self.is_recording = false;
         self.enrollment_mode = false;
         self.auto_start_pending = false;
-        self.utterance_buf.clear();
-        self.utterance_had_speech = false;
-        self.utterance_silence_samples = 0;
-        self.utterance_speech_end_len = 0;
         drop(self.mic_stream.take());
         self.mic_rx = None;
         set_status(VoiceStatus::Disabled);
@@ -1659,17 +1712,8 @@ impl PipelineCtx {
             ));
             return;
         }
+        self.clear_pipeline_buffers();
         self.enrollment_mode = true;
-        self.audio_buffer.clear();
-        self.utterance_buf.clear();
-        self.utterance_had_speech = false;
-        self.utterance_silence_samples = 0;
-        self.utterance_speech_end_len = 0;
-        voice_state()
-            .write()
-            .unwrap_poison()
-            .enrollment_buffer
-            .clear();
         set_status(VoiceStatus::Enrolling {
             sample: 0,
             total: NUM_ENROLLMENT_SAMPLES,
@@ -1678,16 +1722,8 @@ impl PipelineCtx {
     }
 
     fn handle_cancel_enrollment(&mut self) {
+        self.clear_pipeline_buffers();
         self.enrollment_mode = false;
-        self.utterance_buf.clear();
-        self.utterance_had_speech = false;
-        self.utterance_silence_samples = 0;
-        self.utterance_speech_end_len = 0;
-        voice_state()
-            .write()
-            .unwrap_poison()
-            .enrollment_buffer
-            .clear();
         set_status(if self.is_listening {
             VoiceStatus::Listening
         } else {
@@ -1754,7 +1790,21 @@ pub async fn run_voice_pipeline() {
     // Load persisted templates from config on startup
     if let Some(json) = CONFIG.wake_word_templates() {
         match serde_json::from_str::<WakeWordTemplates>(&json) {
-            Ok(templates) => {
+            Ok(mut templates) => {
+                // Filter out templates enrolled with fewer samples than
+                // NUM_ENROLLMENT_SAMPLES.  Old 3-sample templates are
+                // incompatible with the new 10-sample threshold formula
+                // and require re-enrollment (mahbot-765).
+                let before = templates.templates.len();
+                templates
+                    .templates
+                    .retain(|t| t.enrollment_samples >= NUM_ENROLLMENT_SAMPLES);
+                let filtered = before - templates.templates.len();
+                if filtered > 0 {
+                    warn!(
+                        "Filtered out {filtered} wake word template(s) enrolled with <{NUM_ENROLLMENT_SAMPLES} samples — re-enrollment required (mahbot-765)"
+                    );
+                }
                 set_templates(Arc::new(templates));
                 info!(
                     "Loaded {} wake word template(s) from config",
@@ -1877,6 +1927,10 @@ pub async fn run_voice_pipeline() {
                 voice_state().read().unwrap_poison().status,
                 VoiceStatus::Enrolled
             ) {
+                // Clear all audio buffers BEFORE resetting enrollment_mode
+                // to prevent stale audio from leaking into detection mode
+                // during the ~1.5s status delay (mahbot-765 Race condition fix).
+                ctx.clear_pipeline_buffers();
                 ctx.enrollment_mode = false;
                 // Schedule transition to Listening after showing "Enrolled"
                 // for 1.5 seconds, so the user gets visual confirmation that
@@ -2180,17 +2234,19 @@ fn handle_wake_word_detection(
 /// When a complete utterance is detected (speech followed by silence exceeding
 /// `SILENCE_DURATION`), stores the utterance in `enrollment_pending` for
 /// inline processing (avoids race conditions with the command channel).
-/// The utterance is accumulated until a silence timeout of
-/// [`SILENCE_DURATION`] fires.  Trailing silence is then trimmed so only the
-/// active speech portion contributes to the template — preventing the
-/// silence-content mismatch between enrollment (real-noise silence) and live
-/// detection (all-zero padding) that inflates DTW distances (mahbot-755 Fix 1).
-/// If the trimmed audio is shorter than [`EMBEDDING_WINDOW_FRAMES`] mel frames,
-/// [`extract_embeddings_from_audio`] handles the short audio by padding with
-/// all-zero silence frames so at least one embedding can be computed.
+///
+/// **VAD symmetry** (mahbot-765): Only VAD-positive frames are accumulated
+/// into the utterance buffer, mirroring the detection pipeline
+/// ([`handle_wake_word_detection`]). This eliminates the asymmetry where
+/// enrollment built templates on audio that the detector never processes.
+/// Utterance end is detected after [`SILENCE_THRESHOLD_SAMPLES`] consecutive
+/// non-VAD-positive frames, matching the detection-side behavior.
+///
+/// If no speech has been detected for a prolonged period (~5s), a warning
+/// status is set to prompt the user to speak louder or move closer to the mic.
 ///
 /// Updates voice status dynamically to reflect the enrollment phase:
-/// - No speech yet: caller's `Enrolling` text persists
+/// - No speech yet: caller's `Enrolling` text persists (or no-speech warning)
 /// - Speech detected: `ListeningDuringEnrollment`
 /// - Speech ended, awaiting silence: `WaitingForSilenceDuringEnrollment`
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
@@ -2200,20 +2256,23 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
         let frame: Vec<f32> = ctx.audio_buffer[..FRAME_LENGTH].to_vec();
         ctx.audio_buffer.drain(..HOP_LENGTH);
 
-        // Accumulate only the new samples (HOP_LENGTH per frame) into
-        // the utterance buffer. Adding the full FRAME_LENGTH frame would
-        // duplicate overlapping audio since consecutive frames overlap by 50%.
-        // The utterance buffer is later passed to extract_embeddings_from_audio
-        // which expects continuous raw audio, not overlapping frames.
-        ctx.utterance_buf.extend_from_slice(&frame[..HOP_LENGTH]);
-
         if is_speech(&frame, VAD_THRESHOLD) {
+            // VAD-positive: accumulate only the new samples (HOP_LENGTH per
+            // frame) into the utterance buffer. Adding the full FRAME_LENGTH
+            // frame would duplicate overlapping audio since consecutive frames
+            // overlap by 50%. The utterance buffer is later passed to
+            // extract_embeddings_from_audio which expects continuous raw audio,
+            // not overlapping frames.
+            ctx.utterance_buf.extend_from_slice(&frame[..HOP_LENGTH]);
+
             let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
             if !ctx.utterance_had_speech || was_waiting_for_silence {
                 // Transition from silence to speech, or speech resumed after
                 // a pause before the 1.5s timeout — show "Listening…"
                 set_status(VoiceStatus::ListeningDuringEnrollment { sample, total });
             }
+            // Reset the no-speech warning counter on any VAD-positive frame.
+            ctx.enrollment_no_speech_frame_count = 0;
             ctx.utterance_had_speech = true;
             ctx.utterance_speech_end_len = ctx.utterance_buf.len();
             ctx.utterance_silence_samples = 0;
@@ -2231,16 +2290,16 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             // operate at different granularities (frame-level vs chunk-level).
             ctx.utterance_silence_samples += HOP_LENGTH;
             if ctx.utterance_silence_samples >= SILENCE_THRESHOLD_SAMPLES {
-                // Utterance is complete — trim trailing silence so only
-                // the active speech portion contributes to the template.
-                // This prevents the silence-content mismatch between
-                // enrollment (real-noise silence) and live detection
-                // (all-zero padding) that inflates DTW distances (mahbot-755).
+                // Utterance is complete. With VAD-gated accumulation,
+                // utterance_buf already only contains speech frames, but
+                // we still truncate to utterance_speech_end_len for safety
+                // in edge cases.
                 ctx.utterance_buf.truncate(ctx.utterance_speech_end_len);
                 ctx.enrollment_pending = Some(std::mem::take(&mut ctx.utterance_buf));
                 ctx.utterance_speech_end_len = 0;
                 ctx.utterance_had_speech = false;
                 ctx.utterance_silence_samples = 0;
+                ctx.enrollment_no_speech_frame_count = 0;
                 ctx.audio_buffer.clear();
                 break;
             }
@@ -2248,6 +2307,24 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             // "Keep silent to confirm…".
             if ctx.utterance_silence_samples < SILENCE_UI_GATE_SAMPLES {
                 set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
+            }
+        } else if !ctx.utterance_had_speech {
+            // Pre-speech silence: increment no-speech counter.  When the
+            // count reaches ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES (~5 seconds
+            // of non-VAD audio), show a warning so the user knows to speak
+            // louder or move closer (mahbot-765 VAD symmetry mitigation).
+            ctx.enrollment_no_speech_frame_count += 1;
+            // Warn after the derived frame threshold.  The constant is
+            // computed from ENROLLMENT_NO_SPEECH_DURATION × SAMPLE_RATE /
+            // HOP_LENGTH, so the threshold stays correct if frame/hop sizes
+            // are adjusted (mahbot-765).
+            if ctx.enrollment_no_speech_frame_count >= ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES {
+                set_status(VoiceStatus::Error(
+                    "No speech detected — try speaking louder or move closer to microphone"
+                        .to_string(),
+                ));
+                // Don't reset the counter; the status persists until VAD fires
+                // or the user re-initiates enrollment.
             }
         }
     }
@@ -2653,16 +2730,16 @@ mod tests {
                 .enrollment_buffer
                 .clear();
 
-            // Start enrollment at sample 0 of 3
+            // Start enrollment at sample 0 of NUM_ENROLLMENT_SAMPLES
             set_status(VoiceStatus::Enrolling {
                 sample: 0,
-                total: 3,
+                total: NUM_ENROLLMENT_SAMPLES,
             });
 
             // 1. Silence before speech: no speech detected — utterance_had_speech
             //    stays false, and silence_samples starts accumulating.
             let silence = vec![0.0f32; FRAME_LENGTH];
-            handle_enrollment_audio(&silence, &mut ctx, 0, 3);
+            handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 !ctx.utterance_had_speech,
                 "silence before speech must not set utterance_had_speech"
@@ -2671,6 +2748,8 @@ mod tests {
             // utterance_silence_samples is 0 because neither
             // branch fires for pre-speech silence in frame-level
             // processing (the silence-before-speech path is a no-op).
+            // With VAD-gated accumulation the else branch also doesn't
+            // fire because utterance_had_speech is false.
             assert_eq!(
                 ctx.utterance_silence_samples, 0,
                 "silence before speech should not accumulate silence_samples"
@@ -2679,7 +2758,7 @@ mod tests {
             // 2. Speech starts → utterance_had_speech becomes true,
             //    utterance_speech_end_len tracks the buffer end.
             let speech = vec![0.5f32; FRAME_LENGTH];
-            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
+            handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 ctx.utterance_had_speech,
                 "utterance_had_speech should be set after speech"
@@ -2691,7 +2770,7 @@ mod tests {
 
             // 3. Continued speech: utterance_had_speech stays true,
             //    utterance_speech_end_len extends with each speech frame.
-            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
+            handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 ctx.utterance_had_speech,
                 "utterance_had_speech should remain true on continued speech"
@@ -2702,14 +2781,13 @@ mod tests {
             );
 
             // 4. Silence after speech → silence_samples accumulates
-            //    (the early warning path at 3200 samples fires, then
-            //     the full timeout at SILENCE_THRESHOLD_SAMPLES stores
+            //    (the full timeout at SILENCE_THRESHOLD_SAMPLES stores
             //     the utterance in enrollment_pending).
             //    Clear audio_buffer first so leftover speech from step 3
             //    doesn't contaminate the first silence frame.
             ctx.audio_buffer.clear();
             ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES - 1;
-            handle_enrollment_audio(&silence, &mut ctx, 0, 3);
+            handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 ctx.enrollment_pending.is_some(),
                 "silence timeout should store utterance in enrollment_pending"
@@ -2729,7 +2807,7 @@ mod tests {
             //    new utterance (utterance_had_speech transitions to true).
             //    This validates the resumed-speech gate.
             ctx.enrollment_pending = None;
-            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
+            handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 ctx.utterance_had_speech,
                 "utterance_had_speech should become true after speech resumes"
@@ -2743,6 +2821,197 @@ mod tests {
             voice_state().write().unwrap_poison().enabled = false;
             ctx.is_listening = false;
             ctx.enrollment_mode = false;
+        }
+
+        // ── clear_pipeline_buffers — full buffer cleanup ──────────────
+        {
+            // Fill all buffers with test data
+            ctx.voice_batch = vec![1.0; 100];
+            ctx.mel_frame_buffer = vec![vec![1.0; 10]; 5];
+            ctx.embedding_ring = vec![vec![1.0; 5]; 3];
+            ctx.audio_buffer = vec![1.0; 200];
+            ctx.command_buffer = vec![1.0; 300];
+            ctx.utterance_buf = vec![1.0; 400];
+            ctx.utterance_had_speech = true;
+            ctx.utterance_silence_samples = 500;
+            ctx.utterance_speech_end_len = 600;
+            ctx.enrollment_no_speech_frame_count = 700;
+            ctx.enrollment_pending = Some(vec![1.0; 50]);
+            voice_state()
+                .write()
+                .unwrap_poison()
+                .enrollment_buffer
+                .push(vec![vec![1.0; 10]; 3]);
+            voice_state()
+                .write()
+                .unwrap_poison()
+                .enrollment_buffer
+                .push(vec![vec![1.0; 10]; 3]);
+
+            ctx.clear_pipeline_buffers();
+
+            assert!(ctx.voice_batch.is_empty(), "voice_batch should be cleared");
+            assert!(
+                ctx.mel_frame_buffer.is_empty(),
+                "mel_frame_buffer should be cleared"
+            );
+            assert!(
+                ctx.embedding_ring.is_empty(),
+                "embedding_ring should be cleared"
+            );
+            assert!(
+                ctx.audio_buffer.is_empty(),
+                "audio_buffer should be cleared"
+            );
+            assert!(
+                ctx.command_buffer.is_empty(),
+                "command_buffer should be cleared"
+            );
+            assert!(
+                ctx.utterance_buf.is_empty(),
+                "utterance_buf should be cleared"
+            );
+            assert!(
+                !ctx.utterance_had_speech,
+                "utterance_had_speech should be reset to false"
+            );
+            assert_eq!(
+                ctx.utterance_silence_samples, 0,
+                "utterance_silence_samples should be reset to 0"
+            );
+            assert_eq!(
+                ctx.utterance_speech_end_len, 0,
+                "utterance_speech_end_len should be reset to 0"
+            );
+            assert_eq!(
+                ctx.enrollment_no_speech_frame_count, 0,
+                "enrollment_no_speech_frame_count should be reset to 0"
+            );
+            assert!(
+                ctx.enrollment_pending.is_none(),
+                "enrollment_pending should be reset to None"
+            );
+            assert!(
+                voice_state()
+                    .read()
+                    .unwrap_poison()
+                    .enrollment_buffer
+                    .is_empty(),
+                "voice_state().enrollment_buffer should be cleared"
+            );
+        }
+
+        // ── VAD symmetry: enrollment only accumulates VAD-positive frames ──
+        //
+        // Verify that handle_enrollment_audio mirrors the detection pipeline:
+        // only VAD-positive frames contribute to utterance_buf (mahbot-765).
+        {
+            voice_state().write().unwrap_poison().enabled = true;
+            ctx.is_listening = true;
+            ctx.enrollment_mode = true;
+            ctx.clear_pipeline_buffers();
+
+            // Send two silence frames (non-VAD) — should NOT accumulate
+            let silence = vec![0.0f32; FRAME_LENGTH];
+            handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+            handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+            assert!(
+                ctx.utterance_buf.is_empty(),
+                "VAD-gated enrollment: silence frames must not accumulate in utterance_buf"
+            );
+            assert!(
+                !ctx.utterance_had_speech,
+                "VAD-gated enrollment: silence must not set utterance_had_speech"
+            );
+
+            // Send a speech frame — should accumulate.
+            // Clear audio_buffer first so leftover silence from the previous
+            // step doesn't create a mixed frame (preventing deterministic
+            // frame counting).
+            ctx.audio_buffer.clear();
+            let speech = vec![0.5f32; FRAME_LENGTH];
+            handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+            assert!(
+                ctx.utterance_had_speech,
+                "VAD-gated enrollment: speech must set utterance_had_speech"
+            );
+            // With VAD-gating, utterance_buf should contain exactly HOP_LENGTH
+            // samples per speech frame (not the full FRAME_LENGTH).
+            assert_eq!(
+                ctx.utterance_buf.len(),
+                HOP_LENGTH,
+                "VAD-gated enrollment: utterance_buf should contain HOP_LENGTH samples per speech frame"
+            );
+
+            // Send another speech frame — should extend utterance_buf.
+            // Clear audio_buffer again so only the new speech frame is processed.
+            ctx.audio_buffer.clear();
+            handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+            assert_eq!(
+                ctx.utterance_buf.len(),
+                HOP_LENGTH * 2,
+                "VAD-gated enrollment: utterance_buf should contain 2× HOP_LENGTH after two speech frames"
+            );
+
+            // Silence after speech should NOT add to utterance_buf, but
+            // should be tracked for utterance end detection.  The silence
+            // timeout clears utterance_buf into enrollment_pending.
+            ctx.audio_buffer.clear();
+            ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES - 1;
+            handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+            // Utterance_buf is cleared by the timeout (taken into
+            // enrollment_pending), so it should be empty.
+            assert!(
+                ctx.utterance_buf.is_empty(),
+                "VAD-gated enrollment: utterance_buf should be cleared after silence timeout"
+            );
+            // The silence timeout should fire and store enrollment_pending
+            assert!(
+                ctx.enrollment_pending.is_some(),
+                "VAD-gated enrollment: silence timeout must store utterance in enrollment_pending"
+            );
+
+            // Clean up
+            voice_state().write().unwrap_poison().enabled = false;
+            ctx.is_listening = false;
+            ctx.enrollment_mode = false;
+        }
+
+        // ── Template invalidation: old enrollment_samples < NUM_ENROLLMENT_SAMPLES ──
+        {
+            let old_tpl = WakeWordTemplate {
+                name: "legacy".into(),
+                embeddings: vec![vec![1.0, 2.0]],
+                threshold: 0.15,
+                enrollment_samples: 0, // old format — field didn't exist, defaults to 0
+            };
+            let new_tpl = WakeWordTemplate {
+                name: "new".into(),
+                embeddings: vec![vec![3.0, 4.0]],
+                threshold: 0.25,
+                enrollment_samples: NUM_ENROLLMENT_SAMPLES,
+            };
+            let mut templates = WakeWordTemplates {
+                templates: vec![old_tpl, new_tpl],
+            };
+            let before = templates.templates.len();
+            templates
+                .templates
+                .retain(|t| t.enrollment_samples >= NUM_ENROLLMENT_SAMPLES);
+            let filtered = before - templates.templates.len();
+            assert_eq!(
+                filtered, 1,
+                "old template with enrollment_samples=0 should be filtered out"
+            );
+            assert_eq!(
+                templates.templates.len(),
+                1,
+                "only the valid template should remain"
+            );
+            assert_eq!(
+                templates.templates[0].name, "new",
+                "the remaining template should be 'new'"
+            );
         }
     }
 
@@ -2988,7 +3257,7 @@ mod tests {
     #[test]
     fn test_threshold_floor_invariant() {
         // The acceptance threshold MUST NOT collapse to nearly-equal the mean
-        // when std_dev is tiny (3 enrollment samples give unreliable variance).
+        // when std_dev is tiny (see NUM_ENROLLMENT_SAMPLES doc).
         //
         // Formula: threshold = max(mean + THRESHOLD_MULTIPLIER * std_dev,
         //                           mean + MIN_THRESHOLD_FLOOR)
@@ -3049,6 +3318,7 @@ mod tests {
                 vec![0.0, 0.0, 1.0],
             ],
             threshold: 0.5,
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
         };
 
         let non_matching_tpl = WakeWordTemplate {
@@ -3059,6 +3329,7 @@ mod tests {
                 vec![0.0, 0.0, -1.0],
             ],
             threshold: 0.1, // very tight — only near-identical will match
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
         };
 
         let templates = WakeWordTemplates {
@@ -3114,6 +3385,7 @@ mod tests {
             name: "strict".into(),
             embeddings: vec![vec![1.0, 0.0, 0.0]],
             threshold: 0.01, // extremely tight — only exact match passes
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
         };
         let templates = WakeWordTemplates {
             templates: vec![tpl],
@@ -3136,6 +3408,7 @@ mod tests {
             name: "any".into(),
             embeddings: vec![vec![1.0, 0.0, 0.0]],
             threshold: 10.0, // would match anything
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
         };
         let templates = WakeWordTemplates {
             templates: vec![tpl],
@@ -3170,7 +3443,7 @@ mod tests {
         // Feed 2 speech frames (each call processes one 512-sample frame
         // and accumulates HOP_LENGTH=256 new samples per frame into
         // utterance_buf).
-        handle_enrollment_audio(&speech_frame, &mut ctx, 0, 3);
+        handle_enrollment_audio(&speech_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
         assert!(ctx.utterance_had_speech);
         assert_eq!(
             ctx.utterance_speech_end_len,
@@ -3179,7 +3452,7 @@ mod tests {
         );
         assert_eq!(ctx.utterance_speech_end_len, HOP_LENGTH);
 
-        handle_enrollment_audio(&speech_frame, &mut ctx, 0, 3);
+        handle_enrollment_audio(&speech_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
         // With 512-sample input, each call processes 1+ additional frame
         // due to leftover samples in audio_buffer, adding ~3 HOP frames total.
         assert_eq!(
@@ -3203,7 +3476,7 @@ mod tests {
 
         // Feed a silence frame (all zeros → RMS ≈ 0.0 < VAD_THRESHOLD).
         let silence_frame = vec![0.0f32; FRAME_LENGTH];
-        handle_enrollment_audio(&silence_frame, &mut ctx, 0, 3);
+        handle_enrollment_audio(&silence_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
 
         // After truncation: enrollment_pending should contain the speech-only
         // audio data, and utterance_buf should be empty.
@@ -3499,12 +3772,17 @@ mod tests {
             name: "hello".into(),
             embeddings: vec![vec![1.0, 2.0, 3.0]],
             threshold: 0.5,
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
         };
         let json = serde_json::to_string(&tpl).unwrap();
         let deserialized: WakeWordTemplate = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "hello");
         assert_eq!(deserialized.embeddings, vec![vec![1.0, 2.0, 3.0]]);
         assert!((deserialized.threshold - 0.5).abs() < 1e-6);
+        assert_eq!(
+            deserialized.enrollment_samples, NUM_ENROLLMENT_SAMPLES,
+            "enrollment_samples must survive roundtrip"
+        );
     }
 
     #[test]
@@ -3517,6 +3795,11 @@ mod tests {
         assert_eq!(tpl.embeddings, vec![vec![0.1], vec![0.2]]);
         // threshold was missing → default 0.0
         assert!((tpl.threshold - 0.0).abs() < 1e-6);
+        // enrollment_samples was missing → default 0
+        assert_eq!(
+            tpl.enrollment_samples, 0,
+            "enrollment_samples should default to 0 when missing (old format)"
+        );
     }
 
     #[test]
@@ -3526,6 +3809,10 @@ mod tests {
         assert!(tpl.name.is_empty());
         assert!(tpl.embeddings.is_empty());
         assert!((tpl.threshold - 0.0).abs() < 1e-6);
+        assert_eq!(
+            tpl.enrollment_samples, 0,
+            "enrollment_samples should default to 0 for empty JSON"
+        );
     }
 
     #[test]
@@ -3538,6 +3825,8 @@ mod tests {
         assert_eq!(tpl.name, "x");
         assert!(tpl.embeddings.is_empty());
         assert!((tpl.threshold - 0.3).abs() < 1e-6);
+        // enrollment_samples was missing → default 0
+        assert_eq!(tpl.enrollment_samples, 0);
     }
 
     #[test]
@@ -3547,12 +3836,17 @@ mod tests {
                 name: "alpha".into(),
                 embeddings: vec![vec![1.0]],
                 threshold: 0.5,
+                enrollment_samples: NUM_ENROLLMENT_SAMPLES,
             }],
         };
         let json = serde_json::to_string(&templates).unwrap();
         let deserialized: WakeWordTemplates = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.templates.len(), 1);
         assert_eq!(deserialized.templates[0].name, "alpha");
+        assert_eq!(
+            deserialized.templates[0].enrollment_samples, NUM_ENROLLMENT_SAMPLES,
+            "enrollment_samples must survive WakeWordTemplates roundtrip"
+        );
     }
 
     #[test]
