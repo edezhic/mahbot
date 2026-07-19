@@ -479,12 +479,12 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
     }
 
     let flat: Vec<f32> = mel_frames.iter().flatten().copied().collect();
-    // ONNX model declares rank-3 input (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS).
-    // The trailing channel dimension is implicit; candle_onnx strict rank validation
-    // rejects rank-4 tensors.
+    // ONNX model declares 4D NHWC input (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS, 1).
+    // candle_onnx::simple_eval performs strict rank validation and requires the
+    // tensor rank to match the model declaration.
     let input_tensor = Tensor::from_slice(
         &flat,
-        (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS),
+        (1, EMBEDDING_WINDOW_FRAMES, NUM_MEL_BANDS, 1),
         &models.device,
     )?;
 
