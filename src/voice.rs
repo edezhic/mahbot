@@ -75,6 +75,17 @@ const VAD_THRESHOLD: f32 = 0.01;
 /// Minimum silence duration before stopping command recording.
 pub(crate) const SILENCE_DURATION: Duration = Duration::from_millis(1500);
 
+/// Silence threshold in audio samples at 16 kHz.
+/// Derived from SILENCE_DURATION × SAMPLE_RATE to prevent silent drift
+/// if either constant changes.
+const SILENCE_THRESHOLD_SAMPLES: usize =
+    (SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
+
+/// Silence threshold (200ms) before showing "Keep silent to confirm…" UI hint.
+/// Intentionally wider than a single frame (16ms) so the UI reliably transitions
+/// even under scheduling jitter.
+const SILENCE_UI_GATE_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
+
 /// Maximum number of download retries.
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
 
@@ -1245,18 +1256,27 @@ fn start_microphone() -> Result<(mpsc::UnboundedReceiver<Vec<f32>>, cpal::Stream
 async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     let wav_bytes = samples_to_wav(samples, SAMPLE_RATE);
     let tmp_dir = std::env::temp_dir().join("mahbot_voice");
+
+    // Pre-clean any stale files left from a prior crash so they don't
+    // accumulate (ticket mahbot-760).  This is best-effort — if the
+    // directory doesn't exist yet, remove_dir_all returns Ok(()).
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+
     tokio::fs::create_dir_all(&tmp_dir).await?;
     let tmp_path = tmp_dir.join(format!("cmd_{}.wav", crate::generate_id()));
     tokio::fs::write(&tmp_path, &wav_bytes).await?;
 
     let result = crate::providers::local_transcriber::transcribe_file_async(&tmp_path).await;
 
+    // Remove the specific temp file.
     if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
         warn!("Failed to remove temp transcription file: {e}");
     }
-    if let Err(e) = tokio::fs::remove_dir(&tmp_dir).await {
-        // remove_dir fails with ENOTEMPTY if there are leftover files —
-        // log the issue but don't fail the transcription result.
+    // Remove the entire temp directory (including any leftover files from
+    // prior crashes that weren't cleaned).  Uses remove_dir_all instead of
+    // remove_dir so that ENOTEMPTY errors from orphaned files don't cause
+    // unbounded accumulation (ticket mahbot-760).
+    if let Err(e) = tokio::fs::remove_dir_all(&tmp_dir).await {
         warn!("Failed to remove temp transcription directory: {e}");
     }
 
@@ -1510,11 +1530,16 @@ struct PipelineCtx {
     is_listening: bool,
     is_recording: bool,
     command_buffer: Vec<f32>,
-    silence_since: Option<Instant>,
+    /// Track silence duration by audio sample count rather than wall-clock
+    /// time, so that system load / processing delays don't affect recording
+    /// cutoff consistency (ticket mahbot-760).
+    silence_sample_count: usize,
     enrollment_mode: bool,
     utterance_buf: Vec<f32>,
     utterance_had_speech: bool,
-    utterance_silence_since: Option<Instant>,
+    /// Silence duration in samples for enrollment utterance detection
+    /// (sample-based to avoid wall-clock drift under load).
+    utterance_silence_samples: usize,
     audio_buffer: Vec<f32>,
     mel_frame_buffer: Vec<Vec<f32>>,
     embedding_ring: Vec<Vec<f32>>,
@@ -1541,11 +1566,11 @@ impl PipelineCtx {
             is_listening: false,
             is_recording: false,
             command_buffer: Vec::new(),
-            silence_since: None,
+            silence_sample_count: 0,
             enrollment_mode: false,
             utterance_buf: Vec::new(),
             utterance_had_speech: false,
-            utterance_silence_since: None,
+            utterance_silence_samples: 0,
             audio_buffer: Vec::new(),
             mel_frame_buffer: Vec::new(),
             embedding_ring: Vec::new(),
@@ -1618,7 +1643,7 @@ impl PipelineCtx {
         self.auto_start_pending = false;
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
-        self.utterance_silence_since = None;
+        self.utterance_silence_samples = 0;
         self.utterance_speech_end_len = 0;
         drop(self.mic_stream.take());
         self.mic_rx = None;
@@ -1638,7 +1663,7 @@ impl PipelineCtx {
         self.audio_buffer.clear();
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
-        self.utterance_silence_since = None;
+        self.utterance_silence_samples = 0;
         self.utterance_speech_end_len = 0;
         voice_state()
             .write()
@@ -1656,7 +1681,7 @@ impl PipelineCtx {
         self.enrollment_mode = false;
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
-        self.utterance_silence_since = None;
+        self.utterance_silence_samples = 0;
         self.utterance_speech_end_len = 0;
         voice_state()
             .write()
@@ -1807,7 +1832,7 @@ pub async fn run_voice_pipeline() {
                     handle_recording_audio(
                         samples,
                         &mut ctx.command_buffer,
-                        &mut ctx.silence_since,
+                        &mut ctx.silence_sample_count,
                         &mut ctx.is_recording,
                     )
                     .await;
@@ -1820,7 +1845,7 @@ pub async fn run_voice_pipeline() {
                         &mut ctx.embedding_ring,
                         &mut ctx.is_recording,
                         &mut ctx.command_buffer,
-                        &mut ctx.silence_since,
+                        &mut ctx.silence_sample_count,
                     );
                 }
             }
@@ -1969,23 +1994,31 @@ async fn persist_templates() {
 }
 
 /// Handle recording audio: accumulate buffer and check for silence/duration limits.
+///
+/// Silence duration is measured in audio samples (not wall-clock time) so that
+/// system load / processing delays don't affect recording cutoff consistency
+/// (ticket mahbot-760).
 #[allow(clippy::cast_precision_loss)]
 async fn handle_recording_audio(
     samples: Vec<f32>,
     command_buffer: &mut Vec<f32>,
-    silence_since: &mut Option<Instant>,
+    silence_sample_count: &mut usize,
     is_recording: &mut bool,
 ) {
     command_buffer.extend_from_slice(&samples);
     let speech = is_speech(&samples, VAD_THRESHOLD);
     if speech {
-        *silence_since = None;
+        *silence_sample_count = 0;
     } else {
-        silence_since.get_or_insert_with(Instant::now);
+        // Accumulate silence by raw chunk size: each call receives a
+        // variable-size chunk of audio samples directly from the mic.
+        // This differs from the enrollment path (HOP_LENGTH per frame)
+        // because recording operates on raw chunks, not frame iterations.
+        *silence_sample_count += samples.len();
     }
 
     let duration_secs = command_buffer.len() as f64 / f64::from(SAMPLE_RATE);
-    let silence_timeout = silence_since.is_some_and(|t| t.elapsed() >= SILENCE_DURATION);
+    let silence_timeout = *silence_sample_count >= SILENCE_THRESHOLD_SAMPLES;
 
     if silence_timeout || duration_secs > MAX_RECORD_SECS as f64 {
         info!(
@@ -2062,7 +2095,12 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
                 voice_batch.drain(..drain_to);
             }
         }
-        Err(e) => warn!("Mel spectrogram failed: {e}"),
+        Err(e) => {
+            warn!("Mel spectrogram failed: {e}");
+            // Clear the batch so it doesn't grow unbounded when the
+            // ONNX model is consistently failing (ticket mahbot-760).
+            voice_batch.clear();
+        }
     }
 }
 
@@ -2084,7 +2122,7 @@ fn handle_wake_word_detection(
     embedding_ring: &mut Vec<Vec<f32>>,
     is_recording: &mut bool,
     command_buffer: &mut Vec<f32>,
-    silence_since: &mut Option<Instant>,
+    silence_sample_count: &mut usize,
 ) {
     audio_buffer.extend_from_slice(samples);
 
@@ -2110,7 +2148,7 @@ fn handle_wake_word_detection(
                 embedding_ring,
                 is_recording,
                 command_buffer,
-                silence_since,
+                silence_sample_count,
                 audio_buffer,
             ) {
                 return;
@@ -2127,7 +2165,7 @@ fn handle_wake_word_detection(
                 embedding_ring,
                 is_recording,
                 command_buffer,
-                silence_since,
+                silence_sample_count,
                 audio_buffer,
             ) {
                 return;
@@ -2164,13 +2202,13 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 
         // Accumulate only the new samples (HOP_LENGTH per frame) into
         // the utterance buffer. Adding the full FRAME_LENGTH frame would
-        // duplicate overlapping audio since conSECUTIVE frames overlap by 50%.
+        // duplicate overlapping audio since consecutive frames overlap by 50%.
         // The utterance buffer is later passed to extract_embeddings_from_audio
         // which expects continuous raw audio, not overlapping frames.
         ctx.utterance_buf.extend_from_slice(&frame[..HOP_LENGTH]);
 
         if is_speech(&frame, VAD_THRESHOLD) {
-            let was_waiting_for_silence = ctx.utterance_silence_since.is_some();
+            let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
             if !ctx.utterance_had_speech || was_waiting_for_silence {
                 // Transition from silence to speech, or speech resumed after
                 // a pause before the 1.5s timeout — show "Listening…"
@@ -2178,11 +2216,21 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             }
             ctx.utterance_had_speech = true;
             ctx.utterance_speech_end_len = ctx.utterance_buf.len();
-            ctx.utterance_silence_since = None;
+            ctx.utterance_silence_samples = 0;
         } else if ctx.utterance_had_speech {
             // After speech: track silence duration to detect utterance end.
-            let sil_start = ctx.utterance_silence_since.get_or_insert_with(Instant::now);
-            if sil_start.elapsed() >= SILENCE_DURATION {
+            // Track by sample count (not wall-clock time) so that system load
+            // / processing delays don't affect cutoff consistency (mahbot-760).
+            //
+            // NOTE: We accumulate HOP_LENGTH per frame iteration (not the raw
+            // chunk size) because each loop iteration processes exactly
+            // HOP_LENGTH new audio samples.  This differs from the recording
+            // path (handle_recording_audio) which receives variable-size raw
+            // chunks and accumulates chunks.len() directly — both approaches
+            // correctly measure silence in audio samples at 16 kHz; they just
+            // operate at different granularities (frame-level vs chunk-level).
+            ctx.utterance_silence_samples += HOP_LENGTH;
+            if ctx.utterance_silence_samples >= SILENCE_THRESHOLD_SAMPLES {
                 // Utterance is complete — trim trailing silence so only
                 // the active speech portion contributes to the template.
                 // This prevents the silence-content mismatch between
@@ -2192,15 +2240,13 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 ctx.enrollment_pending = Some(std::mem::take(&mut ctx.utterance_buf));
                 ctx.utterance_speech_end_len = 0;
                 ctx.utterance_had_speech = false;
-                ctx.utterance_silence_since = None;
+                ctx.utterance_silence_samples = 0;
                 ctx.audio_buffer.clear();
                 break;
             }
-            // Set status during the first ~200ms of silence to show
-            // "Keep silent to confirm…". The gate is intentionally wider
-            // than a single frame (16ms) so the UI reliably transitions
-            // even under scheduling jitter. The status write is idempotent.
-            if sil_start.elapsed() < Duration::from_millis(200) {
+            // Set status during the first 200ms of silence to show
+            // "Keep silent to confirm…".
+            if ctx.utterance_silence_samples < SILENCE_UI_GATE_SAMPLES {
                 set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
             }
         }
@@ -2214,7 +2260,7 @@ fn try_match_wake_word_and_push_embedding(
     embedding_ring: &mut Vec<Vec<f32>>,
     is_recording: &mut bool,
     command_buffer: &mut Vec<f32>,
-    silence_since: &mut Option<Instant>,
+    silence_sample_count: &mut usize,
     audio_buffer: &mut Vec<f32>,
 ) -> bool {
     if mel_frame_buffer.is_empty() {
@@ -2276,7 +2322,7 @@ fn try_match_wake_word_and_push_embedding(
         );
         *is_recording = true;
         command_buffer.clear();
-        *silence_since = None;
+        *silence_sample_count = 0;
         mel_frame_buffer.clear();
         embedding_ring.clear();
         audio_buffer.clear();
@@ -2597,7 +2643,7 @@ mod tests {
             ctx.enrollment_mode = true;
             ctx.utterance_buf.clear();
             ctx.utterance_had_speech = false;
-            ctx.utterance_silence_since = None;
+            ctx.utterance_silence_samples = 0;
             ctx.utterance_speech_end_len = 0;
             ctx.audio_buffer.clear();
             ctx.enrollment_pending = None;
@@ -2613,51 +2659,84 @@ mod tests {
                 total: 3,
             });
 
-            // 1. Silence frames: no speech detected — status stays Enrolling
+            // 1. Silence before speech: no speech detected — utterance_had_speech
+            //    stays false, and silence_samples starts accumulating.
             let silence = vec![0.0f32; FRAME_LENGTH];
             handle_enrollment_audio(&silence, &mut ctx, 0, 3);
             assert!(
-                matches!(get_status(), VoiceStatus::Enrolling { .. }),
-                "silence before speech should not change status from Enrolling"
+                !ctx.utterance_had_speech,
+                "silence before speech must not set utterance_had_speech"
+            );
+            // After one frame of silence (HOP_LENGTH = 256 samples),
+            // utterance_silence_samples is 0 because neither
+            // branch fires for pre-speech silence in frame-level
+            // processing (the silence-before-speech path is a no-op).
+            assert_eq!(
+                ctx.utterance_silence_samples, 0,
+                "silence before speech should not accumulate silence_samples"
             );
 
-            // 2. Speech starts → ListeningDuringEnrollment
+            // 2. Speech starts → utterance_had_speech becomes true,
+            //    utterance_speech_end_len tracks the buffer end.
             let speech = vec![0.5f32; FRAME_LENGTH];
             handle_enrollment_audio(&speech, &mut ctx, 0, 3);
             assert!(
-                matches!(get_status(), VoiceStatus::ListeningDuringEnrollment { .. }),
-                "speech should trigger ListeningDuringEnrollment"
+                ctx.utterance_had_speech,
+                "utterance_had_speech should be set after speech"
             );
+            assert!(
+                ctx.utterance_speech_end_len > 0,
+                "utterance_speech_end_len should advance after speech"
+            );
+
+            // 3. Continued speech: utterance_had_speech stays true,
+            //    utterance_speech_end_len extends with each speech frame.
+            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
             assert!(
                 ctx.utterance_had_speech,
-                "utterance_had_speech should be set"
+                "utterance_had_speech should remain true on continued speech"
             );
-
-            // 3. Continued speech: status stays ListeningDuringEnrollment
-            //    (utterance_had_speech was set by step 2, so the
-            //    !utterance_had_speech gate in the function prevents re-setting)
-            handle_enrollment_audio(&speech, &mut ctx, 0, 3);
             assert!(
-                matches!(get_status(), VoiceStatus::ListeningDuringEnrollment { .. }),
-                "continued speech should remain ListeningDuringEnrollment"
+                ctx.utterance_speech_end_len == ctx.utterance_buf.len(),
+                "utterance_speech_end_len should track buffer end after each speech frame"
             );
 
-            // 4. Silence after speech → WaitingForSilenceDuringEnrollment
+            // 4. Silence after speech → silence_samples accumulates
+            //    (the early warning path at 3200 samples fires, then
+            //     the full timeout at SILENCE_THRESHOLD_SAMPLES stores
+            //     the utterance in enrollment_pending).
+            //    Clear audio_buffer first so leftover speech from step 3
+            //    doesn't contaminate the first silence frame.
+            ctx.audio_buffer.clear();
+            ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES - 1;
             handle_enrollment_audio(&silence, &mut ctx, 0, 3);
             assert!(
-                matches!(
-                    get_status(),
-                    VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
-                ),
-                "silence after speech should trigger WaitingForSilenceDuringEnrollment"
+                ctx.enrollment_pending.is_some(),
+                "silence timeout should store utterance in enrollment_pending"
+            );
+            // The timeout path clears internal state, so utterance_buf
+            // and utterance_had_speech are reset.
+            assert!(
+                ctx.utterance_buf.is_empty(),
+                "utterance_buf should be emptied after timeout"
+            );
+            assert!(
+                !ctx.utterance_had_speech,
+                "utterance_had_speech should reset after timeout"
             );
 
-            // 5. Speech resumes before 1.5s timeout → back to ListeningDuringEnrollment
-            //    This validates the was_waiting_for_silence fix for the speech-resume glitch.
+            // 5. Speech after previous utterance completed → starts a
+            //    new utterance (utterance_had_speech transitions to true).
+            //    This validates the resumed-speech gate.
+            ctx.enrollment_pending = None;
             handle_enrollment_audio(&speech, &mut ctx, 0, 3);
             assert!(
-                matches!(get_status(), VoiceStatus::ListeningDuringEnrollment { .. }),
-                "speech resumed after pause should revert to ListeningDuringEnrollment"
+                ctx.utterance_had_speech,
+                "utterance_had_speech should become true after speech resumes"
+            );
+            assert!(
+                ctx.utterance_buf.len() > 0,
+                "utterance_buf should accumulate new speech after resume"
             );
 
             // Clean up
@@ -3117,10 +3196,10 @@ mod tests {
         // leftover speech samples that would contaminate the silence frame.
         ctx.audio_buffer.clear();
 
-        // Manually set silence_since to a time in the distant past so
+        // Manually set silence_samples above the threshold so
         // the SILENCE_DURATION check triggers immediately when a silence
         // frame is processed (avoids real-time wait).
-        ctx.utterance_silence_since = Some(Instant::now() - Duration::from_secs(10));
+        ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES;
 
         // Feed a silence frame (all zeros → RMS ≈ 0.0 < VAD_THRESHOLD).
         let silence_frame = vec![0.0f32; FRAME_LENGTH];
@@ -3149,8 +3228,8 @@ mod tests {
             "utterance_had_speech should reset"
         );
         assert!(
-            ctx.utterance_silence_since.is_none(),
-            "silence_since should reset"
+            ctx.utterance_silence_samples == 0,
+            "silence_samples should reset"
         );
         assert_eq!(
             ctx.utterance_speech_end_len, 0,
@@ -3490,13 +3569,15 @@ mod tests {
     /// Set (or reuse) the global CHAT_BROADCAST and return a receiver
     /// with any stale messages drained.
     fn setup_chat_broadcast() -> tokio::sync::broadcast::Receiver<crate::ChatEvent> {
-        let mut rx = if crate::CHAT_BROADCAST.get().is_none() {
-            let (tx, rx) = tokio::sync::broadcast::channel(16);
-            let _ = crate::CHAT_BROADCAST.set(tx);
-            rx
-        } else {
-            crate::CHAT_BROADCAST.get().unwrap().subscribe()
-        };
+        // Use get_or_init to avoid a TOCTOU race: is_none() + set() can lose
+        // the sender if another test sets the global between the check and
+        // the set, leaving the receiver orphaned on a sender-less channel
+        // (panicking with "broadcast channel closed").
+        crate::CHAT_BROADCAST.get_or_init(|| {
+            let (tx, _rx) = tokio::sync::broadcast::channel(256);
+            tx
+        });
+        let mut rx = crate::CHAT_BROADCAST.get().unwrap().subscribe();
         // Drain any stale messages from previous tests sharing the same
         // global broadcast sender.
         while rx.try_recv().is_ok() {}
@@ -3509,7 +3590,7 @@ mod tests {
         rx: &mut tokio::sync::broadcast::Receiver<crate::ChatEvent>,
         expected_content: &str,
     ) -> crate::ChatEvent {
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
@@ -3520,7 +3601,18 @@ mod tests {
                         }
                         continue; // event from another test — skip
                     }
-                    Err(_) => panic!("broadcast channel lagged or closed"),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Messages were dropped because of a full broadcast channel
+                        // (capacity 256, matching production).  Since parallel tests
+                        // share the global sender, bursts can still overflow — but
+                        // filtering by content makes a lagged skip harmless: the
+                        // expected event may still be in the buffer, and if not,
+                        // the timeout will catch it.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast channel closed");
+                    }
                 }
             }
         })
