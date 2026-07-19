@@ -147,16 +147,36 @@ impl AtomicModelState {
     }
 
     fn load(&self, order: Ordering) -> ModelState {
-        match self.0.load(order) {
+        Self::from_u8(self.0.load(order))
+    }
+
+    fn store(&self, state: ModelState, order: Ordering) {
+        self.0.store(state as u8, order);
+    }
+
+    /// Atomically compare-and-exchange the current state.
+    ///
+    /// See [`AtomicU8::compare_exchange`] for ordering semantics.
+    fn compare_exchange(
+        &self,
+        expected: ModelState,
+        new: ModelState,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<ModelState, ModelState> {
+        self.0
+            .compare_exchange(expected as u8, new as u8, success, failure)
+            .map(Self::from_u8)
+            .map_err(Self::from_u8)
+    }
+
+    fn from_u8(v: u8) -> ModelState {
+        match v {
             1 => ModelState::Loading,
             2 => ModelState::Ready,
             3 => ModelState::Failed,
             _ => ModelState::Uninit,
         }
-    }
-
-    fn store(&self, state: ModelState, order: Ordering) {
-        self.0.store(state as u8, order);
     }
 }
 
@@ -282,6 +302,7 @@ pub enum VoiceCommand {
     StopListening,
     StartEnrollment,
     CancelEnrollment,
+    RetryModelLoading,
     Shutdown,
 }
 
@@ -970,17 +991,25 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
     tokio::fs::create_dir_all(&dir).await?;
 
     let mel_path = dir.join(MEL_MODEL_FILENAME);
-    if mel_path.exists() {
-        verify_sha256(&mel_path, MEL_MODEL_SHA256)?;
-    } else {
+    if mel_path.exists()
+        && let Err(e) = verify_sha256(&mel_path, MEL_MODEL_SHA256)
+    {
+        warn!("Mel spectrogram model corrupt, re-downloading: {e}");
+        tokio::fs::remove_file(&mel_path).await?;
+    }
+    if !mel_path.exists() {
         info!("Downloading mel spectrogram model...");
         download_model(MEL_MODEL_URL, &mel_path, MEL_MODEL_SIZE, MEL_MODEL_SHA256).await?;
     }
 
     let embed_path = dir.join(EMBED_MODEL_FILENAME);
-    if embed_path.exists() {
-        verify_sha256(&embed_path, EMBED_MODEL_SHA256)?;
-    } else {
+    if embed_path.exists()
+        && let Err(e) = verify_sha256(&embed_path, EMBED_MODEL_SHA256)
+    {
+        warn!("Embedding model corrupt, re-downloading: {e}");
+        tokio::fs::remove_file(&embed_path).await?;
+    }
+    if !embed_path.exists() {
         info!("Downloading embedding model...");
         download_model(
             EMBED_MODEL_URL,
@@ -1005,7 +1034,7 @@ async fn download_retry_loop() {
     let mut retry_count = 0u32;
 
     loop {
-        if MODELS_STATE.load(Ordering::Acquire) >= ModelState::Ready {
+        if MODELS_STATE.load(Ordering::Acquire) == ModelState::Ready {
             return;
         }
 
@@ -1032,6 +1061,16 @@ async fn download_retry_loop() {
                         });
                         return;
                     }
+                    // Another instance already set the models — adopt Ready
+                    // state and exit (avoids wasted retry loops).
+                    MODELS_STATE.store(ModelState::Ready, Ordering::Release);
+                    info!("Voice models already loaded by another task");
+                    set_status(if is_enabled() {
+                        VoiceStatus::Listening
+                    } else {
+                        VoiceStatus::Disabled
+                    });
+                    return;
                 }
                 Err(e) => warn!("Failed to load voice models (will retry): {e}"),
             },
@@ -1039,13 +1078,42 @@ async fn download_retry_loop() {
             Err(_) => warn!("Voice model download timed out (will retry)"),
         }
 
-        if MODELS_STATE.load(Ordering::Acquire) >= ModelState::Failed {
+        if MODELS_STATE.load(Ordering::Acquire) == ModelState::Failed {
             return;
         }
 
         tokio::time::sleep(retry_delay).await;
         retry_delay = (retry_delay * 2).min(Duration::from_mins(2));
     }
+}
+
+/// Atomically reset the model state from `Failed` to `Uninit` and re-spawn
+/// the download retry loop.  Returns `true` if a retry was initiated, `false`
+/// if the state was not `Failed` (e.g. already loading or ready).
+///
+/// This is the primary recovery mechanism for [`VoiceStatus::ModelError`].
+/// Callers that hold a [`PipelineCtx`] should prefer the debounced
+/// [`PipelineCtx::try_retry_models`] instead to avoid rapid retry storms.
+fn retry_model_loading() -> bool {
+    // Atomically transition from Failed → Uninit.  If another task already
+    // changed the state (e.g. concurrent `retry_model_loading` call or the
+    // original retry loop is still running), this is a no-op.
+    if MODELS_STATE
+        .compare_exchange(
+            ModelState::Failed,
+            ModelState::Uninit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+
+    set_status(VoiceStatus::LoadingModels);
+    tokio::spawn(download_retry_loop());
+    info!("Voice models: retrying model load after previous failure");
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1420,6 +1488,10 @@ struct PipelineCtx {
     /// (Root Cause 1 in mahbot-755).
     utterance_speech_end_len: usize,
     auto_start_pending: bool,
+    /// Timestamp of the last automatic model retry attempt.  Used to debounce
+    /// so we don't spam the retry loop every 1-second tick when models are in
+    /// [`ModelState::Failed`] (the periodic wake-up checks the state).
+    last_model_retry: Option<Instant>,
 }
 
 impl PipelineCtx {
@@ -1442,6 +1514,7 @@ impl PipelineCtx {
             enrollment_pending: None,
             utterance_speech_end_len: 0,
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
+            last_model_retry: None,
         }
     }
 
@@ -1459,6 +1532,14 @@ impl PipelineCtx {
             // retries when they become ready (satisfies ticket req #2:
             // auto-start when models transition to Ready). This is NOT set
             // on mic failure, preventing a continuous retry loop.
+            //
+            // If models have previously failed (ModelError trap state),
+            // trigger a retry immediately so the user doesn't need to
+            // restart the app (ticket mahbot-757).
+            if MODELS_STATE.load(Ordering::Acquire) == ModelState::Failed {
+                warn!("Voice models previously failed — triggering retry...");
+                self.try_retry_models();
+            }
             self.auto_start_pending = true;
             warn!("Voice models not ready yet");
             return;
@@ -1555,12 +1636,38 @@ impl PipelineCtx {
         drop(self.mic_stream.take());
     }
 
+    /// Attempt to retry model loading, debounced to at most once every
+    /// 30 seconds.  This prevents rapid retry storms from the periodic
+    /// 1-second wake-up in the main pipeline loop.
+    fn try_retry_models(&mut self) {
+        let cooldown = Duration::from_secs(30);
+        if self
+            .last_model_retry
+            .is_some_and(|t| t.elapsed() < cooldown)
+        {
+            return;
+        }
+        if retry_model_loading() {
+            self.last_model_retry = Some(Instant::now());
+        }
+    }
+
     fn check_auto_start(&mut self) {
         // One-shot retry: only fires when auto_start_pending is true (set at
         // pipeline creation or by handle_start_listening when models weren't
         // ready yet). Cleared after the first attempt — no continuous retry
         // loop on mic failure.
-        if models_ready() && !self.is_listening && self.auto_start_pending {
+        //
+        // Model error recovery (Failed state) is handled by two paths:
+        // - Fast path: handle_start_listening() triggers try_retry_models
+        //   immediately when a user explicitly starts listening (voice toggle).
+        // - Periodic path: the post-select block in run_voice_pipeline runs
+        //   every iteration and triggers try_retry_models unconditionally
+        //   (debounced to 30s) for self-healing without user interaction.
+        //
+        // Once models transition back to Ready, this function picks them up
+        // via the auto_start_pending flag (set by handle_start_listening).
+        if self.auto_start_pending && models_ready() && !self.is_listening {
             self.auto_start_pending = false;
             send_command(VoiceCommand::StartListening);
         }
@@ -1620,6 +1727,14 @@ pub async fn run_voice_pipeline() {
                     Some(VoiceCommand::StopListening) => ctx.handle_stop_listening(),
                     Some(VoiceCommand::StartEnrollment) => ctx.handle_start_enrollment(),
                     Some(VoiceCommand::CancelEnrollment) => ctx.handle_cancel_enrollment(),
+                    Some(VoiceCommand::RetryModelLoading) => {
+                        // Explicit retry from GUI — bypass debounce
+                        if retry_model_loading() {
+                            ctx.last_model_retry = Some(Instant::now());
+                        } else {
+                            warn!("RetryModelLoading: models are not in Failed state");
+                        }
+                    }
                     Some(VoiceCommand::Shutdown) | None => break,
                 }
             }
@@ -1666,9 +1781,19 @@ pub async fn run_voice_pipeline() {
                 }
             }
 
-            // Periodic wake-up so check_auto_start can fire when async model
-            // downloads complete after the initial select! entry.
+            // Periodic wake-up so auto-recovery can fire when async model
+            // downloads complete or models transition to Ready/Failed after
+            // the initial select! entry.  check_auto_start runs in the
+            // post-select section below so we don't duplicate it here.
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+
+        // Periodic auto-recovery: if models are in Failed state, attempt to
+        // retry loading (debounced to at most once every 30s).  This runs
+        // regardless of auto_start_pending so that the model error state is
+        // self-healing even when voice is toggled off/on manually.
+        if MODELS_STATE.load(Ordering::Acquire) == ModelState::Failed {
+            ctx.try_retry_models();
         }
 
         // Process any pending enrollment utterance (accumulated inline to avoid
@@ -2981,5 +3106,255 @@ mod tests {
             ctx.utterance_speech_end_len, 0,
             "speech_end_len should reset"
         );
+    }
+
+    // ── AtomicModelState compare_exchange ──────────────────────────────
+
+    #[test]
+    fn test_atomic_model_state_compare_exchange() {
+        // Verifies the wrapper method added for mahbot-757 encapsulation.
+        // Test each possible transition directly on the global static.
+
+        // Start from a known clean state.
+        MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
+
+        // CAS Uninit → Loading (success).
+        assert_eq!(
+            MODELS_STATE.compare_exchange(
+                ModelState::Uninit,
+                ModelState::Loading,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(ModelState::Uninit),
+            "CAS Uninit→Loading should succeed",
+        );
+        assert_eq!(MODELS_STATE.load(Ordering::Acquire), ModelState::Loading,);
+
+        // CAS Uninit → Ready (fail — current is Loading).
+        assert_eq!(
+            MODELS_STATE.compare_exchange(
+                ModelState::Uninit,
+                ModelState::Ready,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Err(ModelState::Loading),
+            "CAS Uninit→Ready should fail when current is Loading",
+        );
+
+        // CAS Loading → Ready (success).
+        assert_eq!(
+            MODELS_STATE.compare_exchange(
+                ModelState::Loading,
+                ModelState::Ready,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(ModelState::Loading),
+            "CAS Loading→Ready should succeed",
+        );
+        assert_eq!(MODELS_STATE.load(Ordering::Acquire), ModelState::Ready);
+
+        // CAS Failed → Uninit (fail — current is Ready).
+        assert_eq!(
+            MODELS_STATE.compare_exchange(
+                ModelState::Failed,
+                ModelState::Uninit,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Err(ModelState::Ready),
+            "CAS Failed→Uninit should fail when current is Ready",
+        );
+
+        // CAS Ready → Failed (success).
+        assert_eq!(
+            MODELS_STATE.compare_exchange(
+                ModelState::Ready,
+                ModelState::Failed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(ModelState::Ready),
+            "CAS Ready→Failed should succeed",
+        );
+        assert_eq!(MODELS_STATE.load(Ordering::Acquire), ModelState::Failed);
+
+        // Restore clean state for other tests.
+        MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_handle_start_listening_failed_state_triggers_retry() {
+        // When models are in Failed state, handle_start_listening should
+        // trigger retry_model_loading (via try_retry_models) so the user
+        // doesn't need to restart the app (mahbot-757 req #2).
+        let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
+            enabled: false,
+            status: VoiceStatus::Disabled,
+            templates: Arc::new(WakeWordTemplates::default()),
+            enrollment_buffer: Vec::new(),
+            cmd_tx: None,
+        }));
+        // Force-enable so handle_start_listening passes the is_enabled() guard.
+        voice_state().write().unwrap_poison().enabled = true;
+
+        let mut ctx = PipelineCtx::new();
+        ctx.last_model_retry = None;
+        ctx.auto_start_pending = false;
+
+        MODELS_STATE.store(ModelState::Failed, Ordering::Release);
+
+        ctx.handle_start_listening();
+
+        // Should have triggered retry — last_model_retry timestamp set.
+        assert!(
+            ctx.last_model_retry.is_some(),
+            "handle_start_listening should trigger retry when models are Failed",
+        );
+
+        // auto_start_pending should be set because models weren't ready.
+        assert!(
+            ctx.auto_start_pending,
+            "auto_start_pending should be set when models are not ready",
+        );
+
+        // Clean up.
+        voice_state().write().unwrap_poison().enabled = false;
+        ctx.auto_start_pending = false;
+        ctx.last_model_retry = None;
+        tokio::task::yield_now().await;
+        MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_start_does_not_handle_failed() {
+        // After consolidation (mahbot-757), check_auto_start no longer
+        // handles Failed state — that's delegated to the post-select block
+        // in run_voice_pipeline. Verify it does NOT trigger a retry.
+        let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
+            enabled: true,
+            status: VoiceStatus::Disabled,
+            templates: Arc::new(WakeWordTemplates::default()),
+            enrollment_buffer: Vec::new(),
+            cmd_tx: None,
+        }));
+
+        let mut ctx = PipelineCtx::new();
+        ctx.auto_start_pending = true;
+        ctx.last_model_retry = None;
+
+        MODELS_STATE.store(ModelState::Failed, Ordering::Release);
+
+        ctx.check_auto_start();
+
+        // Should NOT have triggered retry — last_model_retry remains None.
+        assert!(
+            ctx.last_model_retry.is_none(),
+            "check_auto_start should not handle Failed state after consolidation",
+        );
+        // auto_start_pending should remain true (didn't start).
+        assert!(ctx.auto_start_pending);
+
+        // Clean up.
+        voice_state().write().unwrap_poison().enabled = false;
+        ctx.auto_start_pending = false;
+        tokio::task::yield_now().await;
+        MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
+    }
+
+    // ── SHA256 verification (corrupt-file guard) ─────────────────────────
+
+    #[test]
+    fn test_verify_sha256_correct_hash() {
+        // A file with matching content passes SHA256 verification.
+        let tmp = std::env::temp_dir().join("test_verify_sha256_correct.txt");
+        let content = b"hello world from mahbot voice test";
+        std::fs::write(&tmp, content).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let correct_hash = hex_string(&hasher.finalize());
+
+        assert!(verify_sha256(&tmp, &correct_hash).is_ok());
+        // File still exists after successful verification.
+        assert!(tmp.exists());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_verify_sha256_wrong_hash() {
+        // A file with non-matching content fails SHA256 verification.
+        // This is the guard condition that triggers the corrupt-file delete
+        // in ensure_models_downloaded (the key fix for mahbot-757).
+        let tmp = std::env::temp_dir().join("test_verify_sha256_wrong.txt");
+        std::fs::write(&tmp, b"some content").unwrap();
+
+        assert!(
+            verify_sha256(
+                &tmp,
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err(),
+            "wrong hash should produce an error",
+        );
+        // File still exists after failed verification (verify_sha256 is
+        // read-only — deletion happens at the caller in ensure_models_downloaded).
+        assert!(tmp.exists());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── try_retry_models debounce cooldown ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_try_retry_models_debounce() {
+        // Verify the 30-second debounce cooldown in try_retry_models:
+        // (a) first call with no recent retry proceeds,
+        // (b) second immediate call is debounced (timestamp unchanged),
+        // (c) call with last_model_retry set to 31s ago proceeds past cooldown.
+        let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
+            enabled: false,
+            status: VoiceStatus::Disabled,
+            templates: Arc::new(WakeWordTemplates::default()),
+            enrollment_buffer: Vec::new(),
+            cmd_tx: None,
+        }));
+
+        let mut ctx = PipelineCtx::new();
+        ctx.last_model_retry = None;
+
+        // (a) First call: no recent retry → should proceed.
+        MODELS_STATE.store(ModelState::Failed, Ordering::Release);
+        ctx.try_retry_models();
+        assert!(
+            ctx.last_model_retry.is_some(),
+            "first try_retry_models should set last_model_retry",
+        );
+
+        // (b) Second immediate call: debounced (< 30s) → timestamp unchanged.
+        let first_ts = ctx.last_model_retry;
+        ctx.try_retry_models();
+        assert_eq!(
+            ctx.last_model_retry, first_ts,
+            "debounce should prevent second immediate retry",
+        );
+
+        // (c) Past cooldown: set last_model_retry to 31s ago → should proceed
+        //     (Instant::now() - 31s creates a valid past instant).
+        MODELS_STATE.store(ModelState::Failed, Ordering::Release);
+        ctx.last_model_retry = Some(Instant::now() - Duration::from_secs(31));
+        ctx.try_retry_models();
+        assert!(
+            ctx.last_model_retry.unwrap() > first_ts.unwrap(),
+            "should update last_model_retry after cooldown expires",
+        );
+
+        // Clean up.
+        ctx.last_model_retry = None;
+        tokio::task::yield_now().await;
+        MODELS_STATE.store(ModelState::Uninit, Ordering::Release);
     }
 }

@@ -301,6 +301,8 @@ pub enum SettingsMessage {
     StartVoiceEnrollment,
     /// Cancel enrollment session.
     CancelVoiceEnrollment,
+    /// Retry loading voice models after a [`VoiceStatus::ModelError`].
+    RetryVoiceModels,
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -536,6 +538,10 @@ impl SettingsState {
             }
             SettingsMessage::CancelVoiceEnrollment => {
                 crate::voice::send_command(crate::voice::VoiceCommand::CancelEnrollment);
+                Task::none()
+            }
+            SettingsMessage::RetryVoiceModels => {
+                crate::voice::send_command(crate::voice::VoiceCommand::RetryModelLoading);
                 Task::none()
             }
 
@@ -1973,6 +1979,7 @@ impl SettingsState {
     }
 
     /// Voice Assistant section — enable/disable, enrollment, status.
+    #[allow(clippy::too_many_lines)]
     fn voice_section(&self) -> Element<'_, SettingsMessage> {
         use iced::widget::Text;
 
@@ -1984,7 +1991,21 @@ impl SettingsState {
         let status_text: Element<'_, SettingsMessage> = match status.clone() {
             crate::voice::VoiceStatus::Disabled => Text::new("Disabled").into(),
             crate::voice::VoiceStatus::LoadingModels => Text::new("Loading models…").into(),
-            crate::voice::VoiceStatus::ModelError => Text::new("Model error").into(),
+            crate::voice::VoiceStatus::ModelError => {
+                // Show retry button inline so the user can trigger recovery
+                // without toggling voice off/on (ticket mahbot-757).
+                let retry_btn = iced::widget::button(Text::new("   Retry   ").size(13))
+                    .on_press(SettingsMessage::RetryVoiceModels)
+                    .style(theme::button_danger)
+                    .padding(4);
+                iced::widget::row![
+                    Text::new("Model error").size(14),
+                    iced::widget::Space::new().width(8),
+                    retry_btn,
+                ]
+                .align_y(iced::Alignment::Center)
+                .into()
+            }
             crate::voice::VoiceStatus::Listening => Text::new("Listening for wake word").into(),
             crate::voice::VoiceStatus::Recording => Text::new("Recording command").into(),
             crate::voice::VoiceStatus::Transcribing => Text::new("Transcribing…").into(),
