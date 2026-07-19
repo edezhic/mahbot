@@ -119,21 +119,25 @@ const EMBEDDING_RING_MAX: usize = 19;
 /// Number of enrollment samples required.
 ///
 /// Increased from 3 to 10 (mahbot-765) to provide more representative
-/// statistics for the threshold formula `max(mean + 2×σ, mean + 0.05)`.
-/// With only 3 samples, σ is unstable and the threshold margin can
-/// collapse below 1%, causing false negatives during live detection.
+/// statistics for the MAD-based threshold formula
+/// `threshold = min(max(median + K_MAD×mad, median + 0.05), max(median×2, 0.20))`.
+/// With only 3 samples, the median absolute deviation is unstable and the
+/// threshold margin can collapse below 1%, causing false negatives during
+/// live detection.
 const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
-/// Multiplier for auto-calibrated threshold (mean + MULTIPLIER * std).
-const THRESHOLD_MULTIPLIER: f32 = 2.0;
+/// MAD multiplier for robust threshold calibration.
+///
+/// K_MAD = 3.0 is equivalent to ~2σ for normally-distributed data
+/// (since MAD ≈ 0.6745×σ for normal distributions, 3.0×MAD ≈ 2.0×σ).
+const K_MAD: f32 = 3.0;
 
-/// Minimum absolute separation between the mean pairwise distance and the
+/// Minimum absolute separation between the median distance and the
 /// acceptance threshold.  With only [`NUM_ENROLLMENT_SAMPLES`] (10) samples,
-/// standard deviation estimates are unreliable — a single outlier or three
-/// artificially similar samples can produce an unrealistically tight std,
-/// collapsing the threshold to nearly-equal the mean.  This floor ensures
-/// at least 0.05 of margin so genuine wake-word utterances have room to
-/// match (mahbot-755 Fix 2).
+/// the median absolute deviation is robust (50% breakdown point), but
+/// artificially similar samples can still produce unrealistically tight
+/// thresholds.  This floor ensures at least 0.05 of margin so genuine
+/// wake-word utterances have room to match (mahbot-755 Fix 2).
 const MIN_THRESHOLD_FLOOR: f32 = 0.05;
 
 // ── Model URLs and filenames ────────────────────────────────────────────
@@ -693,10 +697,11 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     let mut curr = vec![f32::MAX; m];
     // Track path length alongside cumulative cost so we can normalise by
     // path length.  Without this, the cumulative distance grows with
-    // template length (enrollment concatenates all samples into one long
-    // template), making the runtime cumulative distance always exceed
-    // the threshold calibrated on short pairwise DTW between individual
-    // samples.
+    // template length — a 2-second utterance would always cost more than
+    // a 0.3-second one even if they match equally well.  Normalising by
+    // path length gives a length-invariant distance so that thresholds
+    // calibrated on pairwise DTW between utterances of one length work
+    // correctly when the live sequence is a different length.
     let mut prev_len = vec![0usize; m];
     let mut curr_len = vec![0usize; m];
 
@@ -1365,54 +1370,141 @@ pub fn process_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
     extract_embeddings_from_audio(models, samples)
 }
 
-/// Finalize enrollment: compute threshold from pairwise DTW distances.
-#[allow(clippy::cast_precision_loss)]
-fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
-    let state = voice_state().read().unwrap_poison();
-    let samples = &state.enrollment_buffer;
+/// Compute the median of a sorted slice of f32 values.
+/// The slice MUST be sorted in ascending order and MUST NOT be empty.
+#[inline]
+fn median_of_sorted(sorted: &[f32]) -> f32 {
+    assert!(!sorted.is_empty(), "median_of_sorted called on empty slice");
+    if sorted.len().is_multiple_of(2) {
+        let mid = sorted.len() / 2;
+        f32::midpoint(sorted[mid - 1], sorted[mid])
+    } else {
+        sorted[sorted.len() / 2]
+    }
+}
 
-    if samples.len() < 2 {
-        anyhow::bail!("Need at least 2 enrollment samples, got {}", samples.len());
+/// Compute the average DTW distance from each sample to every other sample.
+///
+/// Returns a vector of length `samples.len()` where the i-th entry is the
+/// average (asymmetric min) DTW distance from sample i to all other samples.
+/// Used by [`calibrate_threshold`] for best-template selection (GRT strategy).
+#[allow(clippy::cast_precision_loss)]
+fn compute_avg_dtw_distances(samples: &[Vec<Vec<f32>>]) -> Vec<f32> {
+    let n = samples.len();
+    assert!(
+        n >= 2,
+        "compute_avg_dtw_distances requires at least 2 samples, got {n}",
+    );
+    let mut avg_distances: Vec<f32> = Vec::with_capacity(n);
+    for (i, s_i) in samples.iter().enumerate() {
+        let mut sum = 0.0f32;
+        for (j, s_j) in samples.iter().enumerate() {
+            if i != j {
+                let d1 = dtw_distance(s_i, s_j);
+                let d2 = dtw_distance(s_j, s_i);
+                sum += d1.min(d2);
+            }
+        }
+        avg_distances.push(sum / (n - 1) as f32);
+    }
+    avg_distances
+}
+
+/// Compute the best template and MAD-based threshold from enrollment samples.
+///
+/// Returns `(best_embeddings, threshold)` where:
+/// - `best_embeddings` is the single most representative utterance's embedding
+///   sequence (length = one utterance, not a concatenation of all samples).
+/// - `threshold` is the calibrated acceptance distance.
+///
+/// # Algorithm
+///
+/// 1. **Best-template selection** (GRT strategy): compute the average DTW
+///    distance from each sample to all other samples.  Select the sample with
+///    the minimum average distance — this is the most representative utterance.
+/// 2. **MAD-based threshold**: compute DTW distances from the best template to
+///    every other sample.  Compute the median and Median Absolute Deviation of
+///    these distances.  Set threshold = median + K_MAD × mad.
+/// 3. **Absolute cap**: clamp threshold to at most max(median × 2.0, 0.20) to
+///    prevent over-permissive thresholds from pathological enrollment.
+/// 4. **MIN_THRESHOLD_FLOOR**: clamp threshold to at least median + 0.05 to
+///    protect against the opposite problem (threshold collapsing toward median
+///    when samples are nearly identical).
+///
+/// This function is pure (no global state) so it can be tested directly without
+/// setting up VOICE_PIPELINE.  The caller is responsible for providing at least
+/// 2 samples.
+#[allow(clippy::cast_precision_loss)]
+fn calibrate_threshold(samples: &[Vec<Vec<f32>>]) -> Result<(Vec<Vec<f32>>, f32)> {
+    let n = samples.len();
+    if n < 2 {
+        anyhow::bail!("Need at least 2 enrollment samples, got {n}");
     }
 
-    let mut distances = Vec::new();
-    for i in 0..samples.len() {
-        for j in (i + 1)..samples.len() {
-            let d1 = dtw_distance(&samples[i], &samples[j]);
-            let d2 = dtw_distance(&samples[j], &samples[i]);
+    // ── Step 1: Best-template selection ──
+    let avg_distances = compute_avg_dtw_distances(samples);
+
+    let best_idx = avg_distances
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("average distances must be finite"))
+        .map(|(idx, _)| idx)
+        .expect("n >= 2 guarantees at least 2 entries in avg_distances");
+
+    let best_embeddings = samples[best_idx].clone();
+
+    // ── Step 2: Compute DTW distances from best template to all others ──
+    let mut distances: Vec<f32> = Vec::with_capacity(n - 1);
+    for (j, sample) in samples.iter().enumerate() {
+        if j != best_idx {
+            let d1 = dtw_distance(&best_embeddings, sample);
+            let d2 = dtw_distance(sample, &best_embeddings);
             distances.push(d1.min(d2));
         }
     }
+    // distances.len() == n - 1, guaranteed >= 1 by the n >= 2 check above.
 
-    if distances.is_empty() {
-        anyhow::bail!("Could not compute pairwise distances");
-    }
+    // ── Step 3: Compute median and MAD ──
+    distances.sort_unstable_by(|a, b| a.partial_cmp(b).expect("distances must be finite"));
+    let median = median_of_sorted(&distances);
+    let mut abs_devs: Vec<f32> = distances.iter().map(|d| (d - median).abs()).collect();
+    abs_devs.sort_unstable_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("absolute deviations must be finite")
+    });
+    let mad = median_of_sorted(&abs_devs);
 
-    let mean: f32 = distances.iter().sum::<f32>() / distances.len() as f32;
-    let variance: f32 =
-        distances.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / distances.len() as f32;
-    let std_dev = variance.sqrt();
-    let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
+    // ── Step 4: Compute threshold with cap and floor ──
+    let mut threshold = median + K_MAD * mad;
+
+    // Absolute cap: threshold ≤ max(median × 2.0, 0.20)
+    let cap = (median * 2.0).max(0.20);
+    threshold = threshold.min(cap);
+
+    // MIN_THRESHOLD_FLOOR: threshold ≥ median + 0.05
+    threshold = threshold.max(median + MIN_THRESHOLD_FLOOR);
 
     info!(
-        "Enrollment calibration: mean={mean:.4}, std={std_dev:.4}, threshold={threshold:.4} (min floor: mean+{MIN_THRESHOLD_FLOOR})"
+        "Enrollment calibration: best_template={best_idx}, median={median:.4}, mad={mad:.4}, \
+         threshold={threshold:.4} (cap={cap:.4}, min_floor=median+{MIN_THRESHOLD_FLOOR})"
+    );
+    info!(
+        "Enrollment: {n} samples → best template (sample {best_idx}) with {} embedding vectors",
+        best_embeddings.len(),
     );
 
-    // Concatenate all embeddings from all enrollment samples into one template.
-    // This gives the DTW matcher more reference data to match against.
-    let mut all_embeddings = Vec::new();
-    for sample_embeddings in samples {
-        all_embeddings.extend(sample_embeddings.iter().cloned());
-    }
-    info!(
-        "Enrollment: {} samples → {} embedding vectors",
-        samples.len(),
-        all_embeddings.len()
-    );
+    Ok((best_embeddings, threshold))
+}
+
+/// Finalize enrollment: wraps [`calibrate_threshold`] to build a
+/// [`WakeWordTemplate`] from the current [`voice_state`] enrollment buffer.
+fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
+    let state = voice_state().read().unwrap_poison();
+    let (embeddings, threshold) = calibrate_threshold(&state.enrollment_buffer)?;
 
     Ok(WakeWordTemplate {
         name: wake_word_name.to_string(),
-        embeddings: all_embeddings,
+        embeddings,
         threshold,
         enrollment_samples: NUM_ENROLLMENT_SAMPLES,
     })
@@ -3321,51 +3413,137 @@ mod tests {
         );
     }
 
-    // ── Threshold floor (mahbot-755 Fix 2) ─────────────────────────────
+    // ── MAD-based threshold (mahbot-769) ────────────────────────────────
 
     #[test]
-    fn test_threshold_floor_invariant() {
-        // The acceptance threshold MUST NOT collapse to nearly-equal the mean
-        // when std_dev is tiny (see NUM_ENROLLMENT_SAMPLES doc).
+    fn test_mad_threshold_invariants() {
+        // The acceptance threshold uses three protecting stages:
+        //   1. threshold = median + K_MAD × mad          (MAD-based estimate)
+        //   2. threshold = threshold.min(max(median*2, 0.20))   (absolute cap)
+        //   3. threshold = threshold.max(median + 0.05)         (floor)
         //
-        // Formula: threshold = max(mean + THRESHOLD_MULTIPLIER * std_dev,
-        //                           mean + MIN_THRESHOLD_FLOOR)
-        //
-        // These tests verify the invariant without requiring VOICE_PIPELINE
+        // These tests verify each stage without requiring VOICE_PIPELINE
         // initialisation — they exercise the same calculation that
         // finalize_enrollment applies to real enrollment data.
 
-        // Case 1: nearly identical samples (std_dev → 0, mean very small).
-        // Floor should dominate: threshold = mean + MIN_THRESHOLD_FLOOR = 0.051
-        let mean: f32 = 0.001;
-        let std_dev: f32 = 0.0005;
-        let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
-        let expected = mean + MIN_THRESHOLD_FLOOR;
+        // ── Helper: compute threshold from a sorted list of distances ──
+        let compute = |sorted: &[f32]| {
+            let median = super::median_of_sorted(sorted);
+            let abs_devs: Vec<f32> = sorted.iter().map(|d| (d - median).abs()).collect();
+            // abs_devs is already in the same order as sorted — sort it.
+            let mut ad_sorted = abs_devs;
+            ad_sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            let mad = super::median_of_sorted(&ad_sorted);
+            let threshold = median + K_MAD * mad;
+            let cap = (median * 2.0).max(0.20);
+            threshold.min(cap).max(median + MIN_THRESHOLD_FLOOR)
+        };
+
+        // Case 1: nearly identical samples (all distances tiny).
+        //   Floor dominates: threshold = median + MIN_THRESHOLD_FLOOR.
+        let mut d = vec![
+            0.001, 0.002, 0.001, 0.003, 0.002, 0.001, 0.002, 0.001, 0.003,
+        ];
+        d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let threshold = compute(&d);
+        let median = super::median_of_sorted(&d);
+        let expected = median + MIN_THRESHOLD_FLOOR;
         assert!(
             (threshold - expected).abs() < 1e-6,
-            "nearly-identical samples: expected {expected}, got {threshold} (floor should dominate)"
+            "nearly-identical samples: expected {expected}, got {threshold} (floor should dominate)",
         );
 
-        // Case 2: moderate mean where floor still applies.
-        // mean + 2*std = 0.14 < mean + 0.05 = 0.15 → floor at 0.15
-        let mean: f32 = 0.10;
-        let std_dev: f32 = 0.02;
-        let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
-        let expected = mean + MIN_THRESHOLD_FLOOR;
+        // Case 2: moderate spread.
+        //   median = 0.15, mad = 0.02
+        //   MAD formula: median + K_MAD * mad = 0.15 + 3.0*0.02 = 0.21
+        //   cap = max(0.15 * 2, 0.20) = 0.30
+        //   floor = 0.15 + 0.05 = 0.20
+        //   → threshold = 0.21 (MAD dominates, under cap, above floor)
+        let mut d = vec![0.10, 0.12, 0.13, 0.14, 0.15, 0.15, 0.16, 0.18, 0.20];
+        d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let threshold = compute(&d);
+        let median = super::median_of_sorted(&d);
+        let abs_devs: Vec<f32> = d.iter().map(|x| (x - median).abs()).collect();
+        let mut ad = abs_devs;
+        ad.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad = super::median_of_sorted(&ad);
+        let mad_based = median + K_MAD * mad;
         assert!(
-            (threshold - expected).abs() < 1e-6,
-            "moderate mean with small std: expected {expected}, got {threshold}"
+            (threshold - mad_based).abs() < 1e-6,
+            "moderate spread: expected MAD-based {mad_based}, got {threshold}",
         );
 
-        // Case 3: large std_dev — standard formula dominates, floor irrelevant.
-        // mean + 2*std = 0.30 > mean + 0.05 = 0.15 → threshold = 0.30
-        let mean: f32 = 0.10;
-        let std_dev: f32 = 0.10;
-        let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
-        let expected = mean + THRESHOLD_MULTIPLIER * std_dev;
+        // Case 3: extreme spread — absolute cap applies.
+        //   median = 0.18, mad = 0.10
+        //   MAD-based: 0.18 + 3.0 * 0.10 = 0.48
+        //   cap = max(0.18 * 2, 0.20) = 0.36
+        //   floor = 0.18 + 0.05 = 0.23
+        //   → threshold = 0.36 (clamped to cap)
+        let mut d = vec![0.08, 0.10, 0.12, 0.15, 0.18, 0.50, 0.55, 0.60, 0.65];
+        d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let threshold = compute(&d);
+        let median = super::median_of_sorted(&d);
+        let cap = (median * 2.0).max(0.20);
         assert!(
-            (threshold - expected).abs() < 1e-6,
-            "large std: expected {expected}, got {threshold} (std-based formula should dominate)"
+            (threshold - cap).abs() < 1e-6,
+            "extreme spread: expected cap {cap}, got {threshold}",
+        );
+    }
+
+    /// Verify that a single outlier does not significantly affect the
+    /// MAD-based threshold (MAD's 50% breakdown point robustness).
+    #[test]
+    fn test_mad_outlier_robustness() {
+        // Without outlier: 9 similar distances → threshold should be tight.
+        let mut clean = vec![0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18];
+        clean.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let clean_median = super::median_of_sorted(&clean);
+        let clean_abs: Vec<f32> = clean.iter().map(|d| (d - clean_median).abs()).collect();
+        let mut ca = clean_abs;
+        ca.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let clean_mad = super::median_of_sorted(&ca);
+        let clean_threshold = (clean_median + K_MAD * clean_mad)
+            .min((clean_median * 2.0).max(0.20))
+            .max(clean_median + MIN_THRESHOLD_FLOOR);
+
+        // With one extreme outlier: 8 similar + 1 very different.
+        // MAD should remain nearly unchanged (breakdown point = 50%).
+        let mut with_outlier = vec![0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 5.0];
+        with_outlier.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let outlier_median = super::median_of_sorted(&with_outlier);
+        let outlier_abs: Vec<f32> = with_outlier
+            .iter()
+            .map(|d| (d - outlier_median).abs())
+            .collect();
+        let mut oa = outlier_abs;
+        oa.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let outlier_mad = super::median_of_sorted(&oa);
+        let outlier_threshold = (outlier_median + K_MAD * outlier_mad)
+            .min((outlier_median * 2.0).max(0.20))
+            .max(outlier_median + MIN_THRESHOLD_FLOOR);
+
+        // The median should be the same (both sets have 0.14 as the 5th element).
+        assert!(
+            (clean_median - outlier_median).abs() < 1e-6,
+            "median shifted from {clean_median} to {outlier_median}",
+        );
+
+        // MAD should be nearly identical (outlier's absolute deviation is
+        // large but falls in the upper half and doesn't affect the median
+        // of absolute deviations).
+        let mad_diff = (clean_mad - outlier_mad).abs();
+        assert!(
+            mad_diff < 1e-6,
+            "MAD changed from {clean_mad} to {outlier_mad} (diff={mad_diff}) — \
+             single outlier should not affect MAD",
+        );
+
+        // Threshold should therefore remain nearly unchanged.
+        let thresh_diff = (clean_threshold - outlier_threshold).abs();
+        assert!(
+            thresh_diff < 1e-6,
+            "threshold changed from {clean_threshold} to {outlier_threshold} \
+             (diff={thresh_diff}) — single outlier should not affect threshold",
         );
     }
 
@@ -3484,6 +3662,153 @@ mod tests {
         };
         let result = match_against_templates(&[], &templates);
         assert!(result.is_none(), "empty live should not match");
+    }
+
+    // ── calibrate_threshold (pure) and median_of_sorted ────────────────
+
+    /// Table-driven test for [`median_of_sorted`].
+    #[test]
+    fn test_median_of_sorted() {
+        struct Case {
+            input: Vec<f32>,
+            expected: f32,
+        }
+        let cases = [
+            Case {
+                input: vec![42.0],
+                expected: 42.0,
+            },
+            Case {
+                input: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                expected: 3.0,
+            },
+            Case {
+                input: vec![1.0, 2.0, 3.0, 4.0],
+                expected: 2.5,
+            },
+            Case {
+                input: vec![10.0, 20.0, 30.0],
+                expected: 20.0,
+            },
+            Case {
+                input: vec![0.0, 100.0],
+                expected: 50.0,
+            },
+        ];
+        for (i, case) in cases.iter().enumerate() {
+            let got = super::median_of_sorted(&case.input);
+            assert!(
+                (got - case.expected).abs() < 1e-6,
+                "case {i}: median_of_sorted({:?}) = {got}, expected {}",
+                case.input,
+                case.expected,
+            );
+        }
+    }
+
+    /// Calling [`median_of_sorted`] on an empty slice should panic
+    /// (precondition violation — guards against invariant drift).
+    #[test]
+    #[should_panic(expected = "empty slice")]
+    fn test_median_of_sorted_empty_panics() {
+        let empty: Vec<f32> = Vec::new();
+        super::median_of_sorted(&empty);
+    }
+
+    /// Verify that [`calibrate_threshold`] picks the most representative
+    /// sample as the best template.
+    #[test]
+    fn test_best_template_selection() {
+        // Three synthetic samples with 2-dimensional embeddings so
+        // cosine_distance gives predictable results.
+        //
+        // Sample 0: [1,0] (unit x-axis)
+        // Sample 1: [0,1] (unit y-axis) — orthogonal to 0, "far" from it
+        // Sample 2: [0.7, 0.7] (≈45°) — roughly equidistant between 0 and 1
+        //
+        // Expected: sample 2 (45°) has the lowest average distance and should
+        // be selected as best template.
+        //
+        // dtw(0↔1) = cosine_dist([1,0], [0,1]) = 1.0  (orthogonal → distance 1)
+        // dtw(0↔2) = cosine_dist([1,0], [0.7,0.7]) = 1 - 0.7/√0.98 ≈ 1 - 0.707 = 0.293
+        // dtw(1↔2) = cosine_dist([0,1], [0.7,0.7]) = 1 - 0.7/√0.98 ≈ 1 - 0.707 = 0.293
+        //
+        // Avg distance for sample 0: (1.0 + 0.293) / 2 ≈ 0.646
+        // Avg distance for sample 1: (1.0 + 0.293) / 2 ≈ 0.646
+        // Avg distance for sample 2: (0.293 + 0.293) / 2 ≈ 0.293
+        //
+        // The embeddings are 2D in this synthetic test, so we verify
+        // that the returned template is exactly sample 2's embeddings.
+        let samples = vec![
+            vec![vec![1.0, 0.0]],
+            vec![vec![0.0, 1.0]],
+            vec![vec![0.7, 0.7]],
+        ];
+
+        let (embeddings, threshold) =
+            super::calibrate_threshold(&samples).expect("calibrate_threshold should succeed");
+
+        // Threshold must be finite and positive (sample 2 is representative).
+        assert!(
+            threshold.is_finite() && threshold > 0.0,
+            "threshold should be finite and positive, got {threshold}",
+        );
+        assert_eq!(
+            embeddings,
+            vec![vec![0.7, 0.7]],
+            "best template should be sample 2 (45°)",
+        );
+    }
+
+    /// Full end-to-end test of [`calibrate_threshold`] with synthetic
+    /// two-cluster embeddings.
+    #[test]
+    fn test_enrollment_threshold_with_known_distances() {
+        // Build 9 × 96-dim unit vectors in two clusters:
+        //   Cluster A (5 samples): near [1, 0, 0, ...]
+        //   Cluster B (4 samples): near [-1, 0, 0, ...]
+        //
+        // The larger cluster (A) should supply the best template, and the
+        // threshold should reflect intra-cluster distances rather than
+        // inter-cluster distances (best-template selection eliminates the
+        // inter-cluster noise from the statistic).
+        let mut samples: Vec<Vec<Vec<f32>>> = Vec::with_capacity(9);
+        for angle in [0.0_f32, 0.05, 0.10, -0.05, -0.10] {
+            let mut emb = vec![0.0_f32; EMBEDDING_DIM];
+            emb[0] = angle.cos();
+            emb[1] = angle.sin();
+            samples.push(vec![emb]);
+        }
+        for angle in [
+            std::f32::consts::PI,
+            std::f32::consts::PI + 0.08_f32,
+            std::f32::consts::PI - 0.08,
+            std::f32::consts::PI + 0.16,
+        ] {
+            let mut emb = vec![0.0_f32; EMBEDDING_DIM];
+            emb[0] = angle.cos();
+            emb[1] = angle.sin();
+            samples.push(vec![emb]);
+        }
+
+        let (embeddings, threshold) = super::calibrate_threshold(&samples)
+            .expect("calibrate_threshold should succeed with 9 samples");
+
+        // The threshold must be finite and positive.
+        assert!(
+            threshold.is_finite() && threshold > 0.0,
+            "threshold should be finite and positive, got {threshold}",
+        );
+
+        // The best template should come from the larger cluster (A: near
+        // [1,0,…]) rather than the smaller cluster (B: near [-1,0,…]).
+        // Since cluster-A embeddings have a positive first dimension, an
+        // embedding[0][0] > 0.9 confirms the best template is from cluster A.
+        assert!(
+            embeddings[0][0] > 0.9,
+            "best template should be from the larger cluster (A), got [0][0]={}",
+            embeddings[0][0],
+        );
     }
 
     // ── Utterance buffer truncation (mahbot-755 Fix 1) ─────────────────
