@@ -172,7 +172,11 @@ impl QwenLocalTranscriber {
     fn try_load() -> Option<Self> {
         let dir = model_dir()?;
         let dir_str = dir.to_string_lossy().to_string();
-        let ctx = qwen_asr::context::QwenCtx::load(&dir_str)?;
+        let mut ctx = qwen_asr::context::QwenCtx::load(&dir_str)?;
+        // Enable automatic language detection so the model transcribes audio
+        // in its natural language (Russian → Russian, English → English, etc.)
+        // instead of defaulting to English-only output.
+        ctx.want_language_detection = true;
         Some(Self {
             ctx: Arc::new(Mutex::new(ctx)),
         })
