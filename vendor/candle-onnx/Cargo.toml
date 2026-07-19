@@ -1,0 +1,17 @@
+[package]
+name = "candle-onnx"
+version = "0.10.2"
+edition = "2021"
+description = "ONNX support for Candle (patched for MahBot: Max op, Conv padding)"
+repository = "https://github.com/huggingface/candle"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+prost = "0.14.1"
+
+[build-dependencies]
+prost-build = "0.14.1"

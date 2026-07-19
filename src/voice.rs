@@ -386,6 +386,19 @@ fn scale_to_int16_range(samples: &[f32]) -> Vec<f32> {
     samples.iter().map(|s| s * 32768.0).collect()
 }
 
+/// Logs mel spectrogram statistics on first call to verify pipeline health.
+static LOG_MEL_STATS: std::sync::Once = std::sync::Once::new();
+
+/// Apply the mandatory spec/10 + 2 transform from the OpenWakeWord reference.
+///
+/// The mel model was ported from TensorFlow and its output range differs from
+/// what the embedding model was trained on. Without this transform the
+/// embedding model receives out-of-distribution values and produces garbage
+/// embeddings. Extracted as a named function for testability.
+fn spec_transform(v: f32) -> f32 {
+    v / 10.0 + 2.0
+}
+
 /// Compute mel spectrogram frames from raw audio samples.
 fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<Vec<f32>>> {
     use candle_core::Tensor;
@@ -450,9 +463,33 @@ fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<V
     for f in 0..num_frames {
         let start = f * num_features;
         if start + num_features <= output_data.len() {
-            frames.push(output_data[start..start + num_features].to_vec());
+            // Apply the mandatory spec/10 + 2 transform from the OpenWakeWord
+            // reference. The mel model was ported from TensorFlow and its output
+            // range differs from what the embedding model expects. Without this
+            // transform the embedding model receives out-of-distribution values
+            // and produces garbage embeddings.
+            let frame: Vec<f32> = output_data[start..start + num_features]
+                .iter()
+                .map(|&v| spec_transform(v))
+                .collect();
+            frames.push(frame);
         }
     }
+
+    // Log mel spectrogram statistics on first call to verify pipeline health.
+    LOG_MEL_STATS.call_once(|| {
+        if let (Some(min), Some(max)) = (
+            frames.iter().flatten().copied().reduce(f32::min),
+            frames.iter().flatten().copied().reduce(f32::max),
+        ) {
+            info!(
+                num_frames = frames.len(),
+                min_val = min,
+                max_val = max,
+                "Mel spectrogram: first call statistics"
+            );
+        }
+    });
 
     Ok(frames)
 }
@@ -544,7 +581,7 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
         let window = &mel_frames[start..start + EMBEDDING_WINDOW_FRAMES];
         match compute_embedding(models, window) {
             Ok(emb) => embeddings.push(emb),
-            Err(e) => debug!("Skipping embedding window: {e}"),
+            Err(e) => warn!("Skipping embedding window: {e}"),
         }
         start += stride;
     }
@@ -1686,7 +1723,7 @@ fn flush_voice_batch(voice_batch: &[f32], mel_frame_buffer: &mut Vec<Vec<f32>>) 
                 mel_frame_buffer.remove(0);
             }
         }
-        Err(e) => debug!("Mel spectrogram failed: {e}"),
+        Err(e) => warn!("Mel spectrogram failed: {e}"),
     }
 }
 
@@ -1719,7 +1756,12 @@ fn handle_wake_word_detection(
 
         // VAD gate — skip silence to avoid wasted ONNX compute
         if is_speech(&frame, VAD_THRESHOLD) {
-            voice_batch.extend_from_slice(&frame);
+            // Add only the NEW samples (HOP_LENGTH per frame) to avoid
+            // duplicating overlapping audio. Each frame overlaps the previous
+            // by 50% (HOP_LENGTH = FRAME_LENGTH/2), so appending the full
+            // frame would duplicate half the audio — corrupting the mel model
+            // input with repeated segments.
+            voice_batch.extend_from_slice(&frame[..HOP_LENGTH]);
         } else if !voice_batch.is_empty() {
             // Silence transition: flush accumulated voiced batch
             flush_voice_batch(voice_batch, mel_frame_buffer);
@@ -1774,10 +1816,12 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
         let frame: Vec<f32> = ctx.audio_buffer[..FRAME_LENGTH].to_vec();
         ctx.audio_buffer.drain(..HOP_LENGTH);
 
-        // Accumulate every frame into the utterance — both speech and silence.
-        // We need the full recording (not just speech frames) to pass to
-        // extract_embeddings_from_audio, which expects continuous audio.
-        ctx.utterance_buf.extend_from_slice(&frame);
+        // Accumulate only the new samples (HOP_LENGTH per frame) into
+        // the utterance buffer. Adding the full FRAME_LENGTH frame would
+        // duplicate overlapping audio since conSECUTIVE frames overlap by 50%.
+        // The utterance buffer is later passed to extract_embeddings_from_audio
+        // which expects continuous raw audio, not overlapping frames.
+        ctx.utterance_buf.extend_from_slice(&frame[..HOP_LENGTH]);
 
         if is_speech(&frame, VAD_THRESHOLD) {
             let was_waiting_for_silence = ctx.utterance_silence_since.is_some();
@@ -1828,11 +1872,14 @@ fn try_match_wake_word_and_push_embedding(
         return false;
     };
 
-    let Ok(embedding) =
-        crate::util::with_block_in_place(|| compute_embedding(models, mel_frame_buffer))
-    else {
-        return false;
-    };
+    let embedding =
+        match crate::util::with_block_in_place(|| compute_embedding(models, mel_frame_buffer)) {
+            Ok(emb) => emb,
+            Err(e) => {
+                warn!("Wake word matching: compute_embedding failed: {e:#}");
+                return false;
+            }
+        };
 
     embedding_ring.push(embedding);
     while embedding_ring.len() > EMBEDDING_RING_MAX {
@@ -2279,6 +2326,206 @@ mod tests {
         assert!(
             (scaled[4] + 16384.0).abs() < f32::EPSILON,
             "-0.5 should map to -16384"
+        );
+    }
+
+    // ── spec/10 + 2 transform (Regression: mahbot-752) ──────────────
+
+    #[test]
+    fn test_spec_transform_zero() {
+        // v = 0.0 → 0.0/10.0 + 2.0 = 2.0
+        let result = spec_transform(0.0);
+        assert!(
+            (result - 2.0).abs() < f32::EPSILON,
+            "expected 2.0, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_spec_transform_positive() {
+        // v = 10.0 → 10.0/10.0 + 2.0 = 3.0
+        let result = spec_transform(10.0);
+        assert!(
+            (result - 3.0).abs() < f32::EPSILON,
+            "expected 3.0, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_spec_transform_negative() {
+        // v = -10.0 → -10.0/10.0 + 2.0 = 1.0
+        let result = spec_transform(-10.0);
+        assert!(
+            (result - 1.0).abs() < f32::EPSILON,
+            "expected 1.0, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_spec_transform_typical_mel_value() {
+        // Typical ONNX mel output values like -4.0 should map to 1.6
+        let result = spec_transform(-4.0);
+        assert!(
+            (result - 1.6).abs() < f32::EPSILON * 2.0,
+            "expected 1.6, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_spec_transform_idempotent_inverse() {
+        // Verify that applying the inverse operation recovers the original value.
+        // This locks in the mathematical relationship: spec_transform(v) * 10.0 - 20.0 == v
+        // which is: (v/10.0 + 2.0) * 10.0 - 20.0 = v + 20.0 - 20.0 = v
+        let orig = 42.0;
+        let transformed = spec_transform(orig);
+        let recovered = transformed * 10.0 - 20.0;
+        assert!(
+            (recovered - orig).abs() < f32::EPSILON * 10.0,
+            "expected {orig}, got {recovered} after round-trip"
+        );
+    }
+
+    // ── Overlapping frames truncation (Regression: mahbot-752) ──────
+
+    #[test]
+    fn test_frame_truncation_to_hop_length() {
+        // HOP_LENGTH must be exactly half of FRAME_LENGTH (50% overlap).
+        // frame[..HOP_LENGTH] extracts only the NEW samples per iteration.
+        assert_eq!(FRAME_LENGTH, 512, "FRAME_LENGTH must be 512");
+        assert_eq!(HOP_LENGTH, 256, "HOP_LENGTH must be 256");
+        assert_eq!(
+            FRAME_LENGTH,
+            HOP_LENGTH * 2,
+            "FRAME_LENGTH must be exactly twice HOP_LENGTH (50% overlap)"
+        );
+
+        // Verify that frame[..HOP_LENGTH] extracts the correct subset
+        // and excludes the overlapping portion.
+        let frame: Vec<f32> = (0..FRAME_LENGTH).map(|i| i as f32).collect();
+        let truncated = &frame[..HOP_LENGTH];
+        assert_eq!(truncated.len(), HOP_LENGTH, "truncated slice length");
+
+        // First element is the start of the frame
+        assert_eq!(truncated[0], 0.0, "first element should be 0.0");
+
+        // Last truncated element is HOP_LENGTH - 1
+        assert_eq!(
+            truncated[HOP_LENGTH - 1],
+            (HOP_LENGTH - 1) as f32,
+            "last truncated element should be {}",
+            HOP_LENGTH - 1
+        );
+
+        // The overlapping portion (HOP_LENGTH..FRAME_LENGTH) is excluded
+        assert!(
+            !truncated.contains(&(HOP_LENGTH as f32)),
+            "overlapping element {} should not be in truncated slice",
+            HOP_LENGTH
+        );
+    }
+
+    // ── Max operator via candle-core broadcast_maximum (Regression: mahbot-752) ──
+
+    #[test]
+    fn test_max_operator_elementwise() {
+        use candle_core::Tensor;
+        let device = &candle_core::Device::Cpu;
+
+        // Test the broadcast_maximum function that the Max op handler uses.
+        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0, -5.0], (1, 4), device).unwrap();
+        let b = Tensor::from_slice(&[0.0f32, 10.0, 3.0, -4.0], (1, 4), device).unwrap();
+        let result = a.broadcast_maximum(&b).unwrap();
+        let result_vec: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Element-wise max: max(1,0)=1, max(2,10)=10, max(3,3)=3, max(-5,-4)=-4
+        assert!(
+            (result_vec[0] - 1.0).abs() < f32::EPSILON,
+            "expected 1.0, got {}",
+            result_vec[0]
+        );
+        assert!(
+            (result_vec[1] - 10.0).abs() < f32::EPSILON,
+            "expected 10.0, got {}",
+            result_vec[1]
+        );
+        assert!(
+            (result_vec[2] - 3.0).abs() < f32::EPSILON,
+            "expected 3.0, got {}",
+            result_vec[2]
+        );
+        assert!(
+            (result_vec[3] + 4.0).abs() < f32::EPSILON,
+            "expected -4.0, got {}",
+            result_vec[3]
+        );
+    }
+
+    #[test]
+    fn test_max_operator_broadcasting() {
+        use candle_core::Tensor;
+        let device = &candle_core::Device::Cpu;
+
+        // Test broadcasting: (1,4) vs (1,1) — scalar broadcast.
+        let a = Tensor::from_slice(&[1.0f32, -5.0, 10.0, 0.0], (1, 4), device).unwrap();
+        let b = Tensor::from_slice(&[2.0f32], (1, 1), device).unwrap();
+        let result = a.broadcast_maximum(&b).unwrap();
+        let result_vec: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+
+        // max(1,2)=2, max(-5,2)=2, max(10,2)=10, max(0,2)=2
+        assert!(
+            (result_vec[0] - 2.0).abs() < f32::EPSILON,
+            "expected 2.0, got {}",
+            result_vec[0]
+        );
+        assert!(
+            (result_vec[1] - 2.0).abs() < f32::EPSILON,
+            "expected 2.0, got {}",
+            result_vec[1]
+        );
+        assert!(
+            (result_vec[2] - 10.0).abs() < f32::EPSILON,
+            "expected 10.0, got {}",
+            result_vec[2]
+        );
+        assert!(
+            (result_vec[3] - 2.0).abs() < f32::EPSILON,
+            "expected 2.0, got {}",
+            result_vec[3]
+        );
+    }
+
+    #[test]
+    fn test_max_operator_variadic() {
+        use candle_core::Tensor;
+        let device = &candle_core::Device::Cpu;
+
+        // The Max op can take more than 2 inputs (variadic max).
+        // Test that max(max(a,b),c) produces the element-wise maximum.
+        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0], (1, 3), device).unwrap();
+        let b = Tensor::from_slice(&[-1.0f32, 10.0, 0.0], (1, 3), device).unwrap();
+        let c = Tensor::from_slice(&[0.0f32, 5.0, 7.0], (1, 3), device).unwrap();
+
+        // Chained broadcast_maximum simulates the Max op's variadic behavior:
+        // the handler iterates over all inputs, folding with broadcast_maximum.
+        let ab = a.broadcast_maximum(&b).unwrap();
+        let result = ab.broadcast_maximum(&c).unwrap();
+        let result_vec: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+
+        // max(1,-1,0)=1, max(2,10,5)=10, max(3,0,7)=7
+        assert!(
+            (result_vec[0] - 1.0).abs() < f32::EPSILON,
+            "expected 1.0, got {}",
+            result_vec[0]
+        );
+        assert!(
+            (result_vec[1] - 10.0).abs() < f32::EPSILON,
+            "expected 10.0, got {}",
+            result_vec[1]
+        );
+        assert!(
+            (result_vec[2] - 7.0).abs() < f32::EPSILON,
+            "expected 7.0, got {}",
+            result_vec[2]
         );
     }
 }

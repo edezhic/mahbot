@@ -903,8 +903,6 @@ dependencies = [
 [[package]]
 name = "candle-onnx"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c26833f7747d202a47a1678c0fe11ab85c67b765a8aa99335672e4d81407a32"
 dependencies = [
  "candle-core",
  "candle-nn",

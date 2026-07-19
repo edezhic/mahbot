@@ -163,3 +163,6 @@ panic = "unwind"
 inherits = "dev"
 debug = 0
 codegen-units = 256
+
+[patch.crates-io]
+candle-onnx = { path = "vendor/candle-onnx" }
