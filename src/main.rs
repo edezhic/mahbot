@@ -371,6 +371,12 @@ fn init_message_pipeline(
         });
     }
 
+    // Always register the voice channel so the message routing system can
+    // resolve the "voice" channel name when delivering agent responses.
+    // There is no listener — the voice pipeline runs its own mic-capture
+    // loop managed by `run_voice_pipeline`.
+    mahbot::channels::voice::register_global();
+
     rx
 }
 

@@ -28,6 +28,7 @@
 //! Both from `littlebearlabs/openwakeword-features` (Apache 2.0).
 //! Stored in `~/.mahbot/models/openwakeword/`.
 
+use crate::ChatDirection;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use anyhow::{Context, Result, anyhow};
@@ -1330,6 +1331,34 @@ fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
 // Routing to active agent
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Broadcast a voice transcript to the GUI chat view.
+///
+/// Delegates to the shared [`broadcast_and_persist_user_message`] when a
+/// user identity is available (broadcast + persist).  For anonymous fallback
+/// paths (empty `user_name`) only the broadcast is done — inserting a
+/// chat_history record with no user identity would create orphaned entries.
+async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace: &str) {
+    if user_name.is_empty() {
+        let message_id = crate::generate_id();
+        let timestamp = crate::turso::now();
+        crate::channels::broadcast_chat_event(
+            &message_id,
+            "",
+            transcript,
+            ChatDirection::User,
+            None,
+            workspace,
+            None,
+            &timestamp,
+        );
+    } else {
+        crate::channels::broadcast_and_persist_user_message(
+            user_name, "voice", transcript, workspace,
+        )
+        .await;
+    }
+}
+
 /// Route a transcribed voice command to the appropriate agent.
 ///
 /// Resolves the active user's role and computes the deterministic agent ID,
@@ -1356,6 +1385,10 @@ async fn route_to_agent(text: String) {
 
         info!("Voice command -> {role} (user: {user_name}, workspace: {ws_name}): {text}",);
 
+        // Broadcast before routing so the transcript appears immediately
+        // while the agent is still working.
+        broadcast_voice_transcript(&text, &user_name, &ws_name).await;
+
         let agent_id =
             crate::session::resolve_agent_id("voice", &user_name, role.as_str(), &ws_name);
         crate::message_router::route(
@@ -1373,10 +1406,11 @@ async fn route_to_agent(text: String) {
         return;
     }
 
-    // Fallback to active workspace -> Manager (current behavior)
     let active = active_workspace_name();
     if !active.is_empty() {
         info!("Voice command -> Manager (active workspace: {active}): {text}");
+        broadcast_voice_transcript(&text, "", &active).await;
+
         let agent_id = crate::session::manager_agent_id(&active);
         crate::message_router::route(
             &agent_id,
@@ -1384,7 +1418,7 @@ async fn route_to_agent(text: String) {
                 content: text,
                 workspace_name: active,
                 user_name: String::new(),
-                channel: String::new(),
+                channel: "voice".to_string(),
                 kind: crate::message_router::JobKind::UserMessage,
                 role: crate::Role::Manager,
                 reply_target: None,
@@ -1393,7 +1427,6 @@ async fn route_to_agent(text: String) {
         return;
     }
 
-    // Fallback to admin's configured workspace
     let ws = match crate::users::get_workspace("admin").await {
         Ok(Some(ws)) => ws,
         Ok(None) => {
@@ -1411,6 +1444,8 @@ async fn route_to_agent(text: String) {
         "Voice command -> Manager (workspace: {}): {}",
         ws.name, text
     );
+    broadcast_voice_transcript(&text, "", &ws.name).await;
+
     let agent_id = crate::session::manager_agent_id(&ws.name);
     crate::message_router::route(
         &agent_id,
@@ -1418,7 +1453,7 @@ async fn route_to_agent(text: String) {
             content: text,
             workspace_name: ws.name,
             user_name: String::new(),
-            channel: String::new(),
+            channel: "voice".to_string(),
             kind: crate::message_router::JobKind::UserMessage,
             role: crate::Role::Manager,
             reply_target: None,
@@ -3445,5 +3480,132 @@ mod tests {
     fn test_templates_serde_empty_list() {
         let tpl: WakeWordTemplates = serde_json::from_str(r#"{"templates":[]}"#).unwrap();
         assert!(tpl.templates.is_empty());
+    }
+
+    // ── broadcast_voice_transcript ────────────────────────────────────
+    //
+    // These tests verify that broadcast_voice_transcript correctly emits
+    // a ChatEvent::Message with direction:User on CHAT_BROADCAST.
+
+    /// Set (or reuse) the global CHAT_BROADCAST and return a receiver
+    /// with any stale messages drained.
+    fn setup_chat_broadcast() -> tokio::sync::broadcast::Receiver<crate::ChatEvent> {
+        let mut rx = if crate::CHAT_BROADCAST.get().is_none() {
+            let (tx, rx) = tokio::sync::broadcast::channel(16);
+            let _ = crate::CHAT_BROADCAST.set(tx);
+            rx
+        } else {
+            crate::CHAT_BROADCAST.get().unwrap().subscribe()
+        };
+        // Drain any stale messages from previous tests sharing the same
+        // global broadcast sender.
+        while rx.try_recv().is_ok() {}
+        rx
+    }
+
+    /// Wait for a ChatEvent::Message with the given content on the broadcast
+    /// channel. Filters out events from other tests sharing the global sender.
+    async fn recv_chat_event_by_content(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::ChatEvent>,
+        expected_content: &str,
+    ) -> crate::ChatEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let crate::ChatEvent::Message { ref content, .. } = event {
+                            if content == expected_content {
+                                return event;
+                            }
+                        }
+                        continue; // event from another test — skip
+                    }
+                    Err(_) => panic!("broadcast channel lagged or closed"),
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for expected ChatEvent::Message")
+    }
+
+    /// Empty user_name path — broadcast-only, no chat_history persist.
+    /// Verifies that the event appears on CHAT_BROADCAST with the correct
+    /// direction, content, and workspace.
+    #[tokio::test]
+    async fn test_broadcast_voice_transcript_empty_user() {
+        let mut rx = setup_chat_broadcast();
+
+        let transcript = "test voice command";
+        broadcast_voice_transcript(transcript, "", "testws").await;
+
+        let received = recv_chat_event_by_content(&mut rx, transcript).await;
+
+        match received {
+            crate::ChatEvent::Message {
+                content,
+                direction,
+                user_name,
+                workspace,
+                ..
+            } => {
+                assert_eq!(content, transcript, "transcript text must match");
+                assert_eq!(
+                    direction,
+                    crate::ChatDirection::User,
+                    "voice transcript must be a User-direction event"
+                );
+                assert_eq!(
+                    user_name, "",
+                    "empty user_name path must produce empty user_name"
+                );
+                assert_eq!(workspace, "testws", "workspace must match");
+            }
+            _ => panic!("Expected ChatEvent::Message, got a different variant"),
+        }
+    }
+
+    /// Non-empty user_name path — full broadcast + persist.
+    /// Verifies the event appears on CHAT_BROADCAST and that a matching
+    /// record is written to chat_history.
+    #[tokio::test]
+    async fn test_broadcast_voice_transcript_known_user() {
+        crate::util::test::init_test_stores().await;
+        let mut rx = setup_chat_broadcast();
+
+        let transcript = "hello from voice";
+        broadcast_voice_transcript(transcript, "admin", "default").await;
+
+        // Verify broadcast event (content-filtered against parallel-test noise).
+        let received = recv_chat_event_by_content(&mut rx, transcript).await;
+
+        match received {
+            crate::ChatEvent::Message {
+                content,
+                direction,
+                user_name,
+                workspace,
+                ..
+            } => {
+                assert_eq!(content, transcript);
+                assert_eq!(direction, crate::ChatDirection::User);
+                assert_eq!(user_name, "admin");
+                assert_eq!(workspace, "default");
+            }
+            _ => panic!("Expected ChatEvent::Message, got a different variant"),
+        }
+
+        // Verify it was also persisted to chat_history.
+        let store = crate::chat_history::store();
+        let rows = store
+            .conn
+            .query("SELECT user_name, content, direction, channel FROM chat_history WHERE user_name = 'admin' ORDER BY created_at DESC LIMIT 1", ())
+            .await
+            .expect("query chat_history");
+        assert!(!rows.is_empty(), "should have a matching chat_history row");
+        let row = &rows[0];
+        assert_eq!(row.get::<String>(0).unwrap(), "admin");
+        assert_eq!(row.get::<String>(1).unwrap(), transcript);
+        assert_eq!(row.get::<String>(2).unwrap(), "user");
+        assert_eq!(row.get::<String>(3).unwrap(), "voice");
     }
 }
