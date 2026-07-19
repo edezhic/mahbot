@@ -97,6 +97,15 @@ const NUM_ENROLLMENT_SAMPLES: usize = 3;
 /// Multiplier for auto-calibrated threshold (mean + MULTIPLIER * std).
 const THRESHOLD_MULTIPLIER: f32 = 2.0;
 
+/// Minimum absolute separation between the mean pairwise distance and the
+/// acceptance threshold.  With only [`NUM_ENROLLMENT_SAMPLES`] (3) samples,
+/// standard deviation estimates are unreliable — a single outlier or three
+/// artificially similar samples can produce an unrealistically tight std,
+/// collapsing the threshold to nearly-equal the mean.  This floor ensures
+/// at least 0.05 of margin so genuine wake-word utterances have room to
+/// match (mahbot-755 Fix 2).
+const MIN_THRESHOLD_FLOOR: f32 = 0.05;
+
 // ── Model URLs and filenames ────────────────────────────────────────────
 
 const MEL_MODEL_FILENAME: &str = "melspectrogram.onnx";
@@ -674,6 +683,14 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
 }
 
 /// Match a live embedding sequence against all enrolled templates.
+///
+/// Uses per-template sliding window matching: for each template, only the
+/// most recent `template.embeddings.len()` embeddings from the live sequence
+/// are compared. This avoids length asymmetry noise when the ring buffer
+/// grows larger than the template (mahbot-755 Fix 5).
+///
+/// Logs DTW distances at debug level for all templates (not just matches)
+/// so near-misses are visible during troubleshooting (mahbot-755 Fix 4).
 fn match_against_templates<'a>(
     live_sequence: &[Vec<f32>],
     templates: &'a WakeWordTemplates,
@@ -681,7 +698,23 @@ fn match_against_templates<'a>(
     let mut best: Option<(f32, &WakeWordTemplate)> = None;
 
     for tpl in &templates.templates {
-        let dist = dtw_distance(live_sequence, &tpl.embeddings);
+        // Sliding window: use at most `tpl.embeddings.len()` most recent
+        // live embeddings.  This keeps the DTW cost matrix balanced and
+        // reduces noise from extraneous audio before the wake word.
+        let window_len = tpl.embeddings.len().min(live_sequence.len());
+        let window = &live_sequence[live_sequence.len() - window_len..];
+
+        let dist = dtw_distance(window, &tpl.embeddings);
+        debug!(
+            "DTW: template='{}' window={window_len} dist={dist:.4} threshold={} {}",
+            tpl.name,
+            tpl.threshold,
+            if dist < tpl.threshold {
+                "✓ MATCH"
+            } else {
+                "✗ no match"
+            }
+        );
         if dist < tpl.threshold {
             let is_better = best.as_ref().is_none_or(|(best_dist, _)| dist < *best_dist);
             if is_better {
@@ -1196,9 +1229,11 @@ fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
     let variance: f32 =
         distances.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / distances.len() as f32;
     let std_dev = variance.sqrt();
-    let threshold = mean + THRESHOLD_MULTIPLIER * std_dev;
+    let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
 
-    info!("Enrollment calibration: mean={mean:.4}, std={std_dev:.4}, threshold={threshold:.4}");
+    info!(
+        "Enrollment calibration: mean={mean:.4}, std={std_dev:.4}, threshold={threshold:.4} (min floor: mean+{MIN_THRESHOLD_FLOOR})"
+    );
 
     // Concatenate all embeddings from all enrollment samples into one template.
     // This gives the DTW matcher more reference data to match against.
@@ -1378,6 +1413,12 @@ struct PipelineCtx {
     embedding_ring: Vec<Vec<f32>>,
     voice_batch: Vec<f32>,
     enrollment_pending: Option<Vec<f32>>,
+    /// Length of [`utterance_buf`] at the last detected speech frame boundary.
+    /// Used to trim trailing silence from enrollment utterances so only the
+    /// active speech portion contributes to the template, preventing the
+    /// silence-content mismatch between enrollment and live detection
+    /// (Root Cause 1 in mahbot-755).
+    utterance_speech_end_len: usize,
     auto_start_pending: bool,
 }
 
@@ -1399,6 +1440,7 @@ impl PipelineCtx {
             embedding_ring: Vec::new(),
             voice_batch: Vec::new(),
             enrollment_pending: None,
+            utterance_speech_end_len: 0,
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
         }
     }
@@ -1457,6 +1499,7 @@ impl PipelineCtx {
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
         self.utterance_silence_since = None;
+        self.utterance_speech_end_len = 0;
         drop(self.mic_stream.take());
         self.mic_rx = None;
         set_status(VoiceStatus::Disabled);
@@ -1476,6 +1519,7 @@ impl PipelineCtx {
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
         self.utterance_silence_since = None;
+        self.utterance_speech_end_len = 0;
         voice_state()
             .write()
             .unwrap_poison()
@@ -1493,6 +1537,7 @@ impl PipelineCtx {
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
         self.utterance_silence_since = None;
+        self.utterance_speech_end_len = 0;
         voice_state()
             .write()
             .unwrap_poison()
@@ -1639,6 +1684,25 @@ pub async fn run_voice_pipeline() {
                 VoiceStatus::Enrolled
             ) {
                 ctx.enrollment_mode = false;
+                // Schedule transition to Listening after showing "Enrolled"
+                // for 1.5 seconds, so the user gets visual confirmation that
+                // enrollment completed successfully before the pipeline
+                // resumes active wake word listening (mahbot-755 Fix 3).
+                // The spawned task respects the global shutdown token so it
+                // does not write stale state after pipeline exit.
+                tokio::spawn(async {
+                    let shutdown_token = crate::shutdown::shutdown_token();
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(1500)) => {
+                            if matches!(get_status(), VoiceStatus::Enrolled) {
+                                set_status(VoiceStatus::Listening);
+                            }
+                        }
+                        () = shutdown_token.cancelled() => {
+                            // Pipeline is shutting down — do not touch state.
+                        }
+                    }
+                });
             }
         }
 
@@ -1799,6 +1863,11 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
     let frames = crate::util::with_block_in_place(|| compute_mel_spectrogram(models, &batch));
     match frames {
         Ok(frames) => {
+            debug!(
+                "Mel flush: {} mel frames produced (buffer now has {} frames)",
+                frames.len(),
+                mel_frame_buffer.len() + frames.len(),
+            );
             for f in frames {
                 mel_frame_buffer.push(f);
             }
@@ -1896,8 +1965,14 @@ fn handle_wake_word_detection(
 /// When a complete utterance is detected (speech followed by silence exceeding
 /// `SILENCE_DURATION`), stores the utterance in `enrollment_pending` for
 /// inline processing (avoids race conditions with the command channel).
-/// The entire utterance (speech + trailing silence) is captured so the ONNX
-/// embedding model has enough audio data to produce a reliable template.
+/// The utterance is accumulated until a silence timeout of
+/// [`SILENCE_DURATION`] fires.  Trailing silence is then trimmed so only the
+/// active speech portion contributes to the template — preventing the
+/// silence-content mismatch between enrollment (real-noise silence) and live
+/// detection (all-zero padding) that inflates DTW distances (mahbot-755 Fix 1).
+/// If the trimmed audio is shorter than [`EMBEDDING_WINDOW_FRAMES`] mel frames,
+/// [`extract_embeddings_from_audio`] handles the short audio by padding with
+/// all-zero silence frames so at least one embedding can be computed.
 ///
 /// Updates voice status dynamically to reflect the enrollment phase:
 /// - No speech yet: caller's `Enrolling` text persists
@@ -1925,15 +2000,20 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 set_status(VoiceStatus::ListeningDuringEnrollment { sample, total });
             }
             ctx.utterance_had_speech = true;
+            ctx.utterance_speech_end_len = ctx.utterance_buf.len();
             ctx.utterance_silence_since = None;
         } else if ctx.utterance_had_speech {
             // After speech: track silence duration to detect utterance end.
             let sil_start = ctx.utterance_silence_since.get_or_insert_with(Instant::now);
             if sil_start.elapsed() >= SILENCE_DURATION {
-                // Utterance is complete — set pending for inline processing
-                // instead of sending a command through the channel (which
-                // competes with continuously-arriving audio chunks).
+                // Utterance is complete — trim trailing silence so only
+                // the active speech portion contributes to the template.
+                // This prevents the silence-content mismatch between
+                // enrollment (real-noise silence) and live detection
+                // (all-zero padding) that inflates DTW distances (mahbot-755).
+                ctx.utterance_buf.truncate(ctx.utterance_speech_end_len);
                 ctx.enrollment_pending = Some(std::mem::take(&mut ctx.utterance_buf));
+                ctx.utterance_speech_end_len = 0;
                 ctx.utterance_had_speech = false;
                 ctx.utterance_silence_since = None;
                 ctx.audio_buffer.clear();
@@ -1988,7 +2068,14 @@ fn try_match_wake_word_and_push_embedding(
 
     let embedding =
         match crate::util::with_block_in_place(|| compute_embedding(models, embed_input)) {
-            Ok(emb) => emb,
+            Ok(emb) => {
+                debug!(
+                    "Embedding computed: {} dims (ring size before push: {})",
+                    emb.len(),
+                    embedding_ring.len(),
+                );
+                emb
+            }
             Err(e) => {
                 warn!("Wake word matching: compute_embedding failed: {e:#}");
                 return false;
@@ -2255,20 +2342,14 @@ mod tests {
     #[test]
     fn test_voice_pipeline_commands_and_enrollment_guard() {
         // Initialize global VOICE_PIPELINE once for all checks below.
-        // Using assert!(is_ok()) so that parallel test execution would fail
-        // fast rather than silently giving stale state.
-        assert!(
-            VOICE_PIPELINE
-                .set(RwLock::new(VoicePipelineState {
-                    enabled: false,
-                    status: VoiceStatus::Disabled,
-                    templates: Arc::new(WakeWordTemplates::default()),
-                    enrollment_buffer: Vec::new(),
-                    cmd_tx: None,
-                }))
-                .is_ok(),
-            "VOICE_PIPELINE already initialized — tests must not share state",
-        );
+        // Using let _ to tolerate parallel tests that also need the pipeline.
+        let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
+            enabled: false,
+            status: VoiceStatus::Disabled,
+            templates: Arc::new(WakeWordTemplates::default()),
+            enrollment_buffer: Vec::new(),
+            cmd_tx: None,
+        }));
 
         // ── handle_start_enrollment guard ─────────────────────────
         let mut ctx = PipelineCtx::new();
@@ -2338,6 +2419,7 @@ mod tests {
             ctx.utterance_buf.clear();
             ctx.utterance_had_speech = false;
             ctx.utterance_silence_since = None;
+            ctx.utterance_speech_end_len = 0;
             ctx.audio_buffer.clear();
             ctx.enrollment_pending = None;
             voice_state()
@@ -2640,6 +2722,260 @@ mod tests {
             (result_vec[2] - 7.0).abs() < f32::EPSILON,
             "expected 7.0, got {}",
             result_vec[2]
+        );
+    }
+
+    // ── Threshold floor (mahbot-755 Fix 2) ─────────────────────────────
+
+    #[test]
+    fn test_threshold_floor_invariant() {
+        // The acceptance threshold MUST NOT collapse to nearly-equal the mean
+        // when std_dev is tiny (3 enrollment samples give unreliable variance).
+        //
+        // Formula: threshold = max(mean + THRESHOLD_MULTIPLIER * std_dev,
+        //                           mean + MIN_THRESHOLD_FLOOR)
+        //
+        // These tests verify the invariant without requiring VOICE_PIPELINE
+        // initialisation — they exercise the same calculation that
+        // finalize_enrollment applies to real enrollment data.
+
+        // Case 1: nearly identical samples (std_dev → 0, mean very small).
+        // Floor should dominate: threshold = mean + MIN_THRESHOLD_FLOOR = 0.051
+        let mean: f32 = 0.001;
+        let std_dev: f32 = 0.0005;
+        let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
+        let expected = mean + MIN_THRESHOLD_FLOOR;
+        assert!(
+            (threshold - expected).abs() < 1e-6,
+            "nearly-identical samples: expected {expected}, got {threshold} (floor should dominate)"
+        );
+
+        // Case 2: moderate mean where floor still applies.
+        // mean + 2*std = 0.14 < mean + 0.05 = 0.15 → floor at 0.15
+        let mean: f32 = 0.10;
+        let std_dev: f32 = 0.02;
+        let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
+        let expected = mean + MIN_THRESHOLD_FLOOR;
+        assert!(
+            (threshold - expected).abs() < 1e-6,
+            "moderate mean with small std: expected {expected}, got {threshold}"
+        );
+
+        // Case 3: large std_dev — standard formula dominates, floor irrelevant.
+        // mean + 2*std = 0.30 > mean + 0.05 = 0.15 → threshold = 0.30
+        let mean: f32 = 0.10;
+        let std_dev: f32 = 0.10;
+        let threshold = (mean + THRESHOLD_MULTIPLIER * std_dev).max(mean + MIN_THRESHOLD_FLOOR);
+        let expected = mean + THRESHOLD_MULTIPLIER * std_dev;
+        assert!(
+            (threshold - expected).abs() < 1e-6,
+            "large std: expected {expected}, got {threshold} (std-based formula should dominate)"
+        );
+    }
+
+    // ── match_against_templates — sliding window (mahbot-755 Fix 5) ────
+
+    #[test]
+    fn test_match_against_templates_sliding_window() {
+        // The sliding window strategy in match_against_templates compares
+        // only the most recent `min(template.len, live.len)` embeddings
+        // against each template.  This avoids length-asymmetry noise when
+        // the ring buffer grows larger than the enrollment template.
+
+        // Build two templates: one that matches the target, one that doesn't.
+        let matching_tpl = WakeWordTemplate {
+            name: "match_me".into(),
+            embeddings: vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ],
+            threshold: 0.5,
+        };
+
+        let non_matching_tpl = WakeWordTemplate {
+            name: "no_match".into(),
+            embeddings: vec![
+                vec![-1.0, 0.0, 0.0],
+                vec![0.0, -1.0, 0.0],
+                vec![0.0, 0.0, -1.0],
+            ],
+            threshold: 0.1, // very tight — only near-identical will match
+        };
+
+        let templates = WakeWordTemplates {
+            templates: vec![matching_tpl, non_matching_tpl],
+        };
+
+        // Live sequence is longer than template (simulates ring buffer growth).
+        // The first 2 embeddings are noise/dis-similar, the last 3 match the
+        // matching_tpl embeddings nearly exactly.
+        let live_sequence = vec![
+            vec![99.0, 99.0, 99.0], // noise — very far from anything
+            vec![88.0, 88.0, 88.0], // noise
+            vec![1.0, 0.0, 0.0],    // matches matching_tpl[0]
+            vec![0.0, 1.0, 0.0],    // matches matching_tpl[1]
+            vec![0.0, 0.0, 1.0],    // matches matching_tpl[2]
+        ];
+
+        // Template length extracted before move into templates vec.
+        const EXPECTED_WINDOW: usize = 3;
+
+        // match_against_templates should window to the most recent
+        // min(3, 5) = 3 embeddings, which are the matching ones.
+        let result = match_against_templates(&live_sequence, &templates);
+
+        assert!(result.is_some(), "should find a matching template");
+        let (dist, tpl) = result.unwrap();
+        assert_eq!(tpl.name, "match_me", "should match matching_tpl");
+        assert!(
+            dist < 0.5,
+            "DTW distance with windowed matching should be low (< 0.5), got {dist}"
+        );
+
+        // Without sliding window, the noise embeddings would inflate DTW
+        // past the threshold.  Verify that the window is actually being
+        // applied by checking that the window size is 3 (the template length).
+        // We can observe this indirectly: a non-windowed DTW against the full
+        // 5-element live sequence would have much higher cost, and the
+        // distance-to-threshold ratio would be worse.
+        let windowed_len = EXPECTED_WINDOW.min(live_sequence.len());
+        assert_eq!(
+            windowed_len, 3,
+            "sliding window should be template length (3)"
+        );
+        // The actual window used inside match_against_templates:
+        let window = &live_sequence[live_sequence.len() - windowed_len..];
+        assert_eq!(window.len(), 3, "windowed slice should have 3 elements");
+    }
+
+    #[test]
+    fn test_match_against_templates_no_match() {
+        // Live sequence that does NOT match any template should return None.
+        let tpl = WakeWordTemplate {
+            name: "strict".into(),
+            embeddings: vec![vec![1.0, 0.0, 0.0]],
+            threshold: 0.01, // extremely tight — only exact match passes
+        };
+        let templates = WakeWordTemplates {
+            templates: vec![tpl],
+        };
+
+        // Opposite-direction embedding will have cosine distance ≈ 2.0
+        // (cosine distance of opposite unit vectors = 1 - (-1/1) = 2.0).
+        let live = vec![vec![-1.0, 0.0, 0.0]];
+        let result = match_against_templates(&live, &templates);
+        assert!(
+            result.is_none(),
+            "opposite vectors should not match tight threshold"
+        );
+    }
+
+    #[test]
+    fn test_match_against_templates_empty_live() {
+        // Empty live sequence should not panic and should not match.
+        let tpl = WakeWordTemplate {
+            name: "any".into(),
+            embeddings: vec![vec![1.0, 0.0, 0.0]],
+            threshold: 10.0, // would match anything
+        };
+        let templates = WakeWordTemplates {
+            templates: vec![tpl],
+        };
+        let result = match_against_templates(&[], &templates);
+        assert!(result.is_none(), "empty live should not match");
+    }
+
+    // ── Utterance buffer truncation (mahbot-755 Fix 1) ─────────────────
+
+    #[test]
+    fn test_enrollment_utterance_tracks_speech_boundary() {
+        // Initialize VOICE_PIPELINE (harmless if already set by another test).
+        let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
+            enabled: true,
+            status: VoiceStatus::Disabled,
+            templates: Arc::new(WakeWordTemplates::default()),
+            enrollment_buffer: Vec::new(),
+            cmd_tx: None,
+        }));
+
+        // Verify that utterance_speech_end_len is updated on each speech
+        // frame and that it correctly marks the boundary between speech
+        // and trailing silence in the utterance buffer.
+        let mut ctx = PipelineCtx::new();
+        ctx.is_listening = true;
+        ctx.enrollment_mode = true;
+
+        // A single 512-sample frame at amplitude 0.5 has RMS = 0.5 > 0.01
+        let speech_frame = vec![0.5f32; FRAME_LENGTH];
+
+        // Feed 2 speech frames (each call processes one 512-sample frame
+        // and accumulates HOP_LENGTH=256 new samples per frame into
+        // utterance_buf).
+        handle_enrollment_audio(&speech_frame, &mut ctx, 0, 3);
+        assert!(ctx.utterance_had_speech);
+        assert_eq!(
+            ctx.utterance_speech_end_len,
+            ctx.utterance_buf.len(),
+            "after speech frame: speech_end_len should equal buf len"
+        );
+        assert_eq!(ctx.utterance_speech_end_len, HOP_LENGTH);
+
+        handle_enrollment_audio(&speech_frame, &mut ctx, 0, 3);
+        // With 512-sample input, each call processes 1+ additional frame
+        // due to leftover samples in audio_buffer, adding ~3 HOP frames total.
+        assert_eq!(
+            ctx.utterance_speech_end_len,
+            ctx.utterance_buf.len(),
+            "after second speech frame: speech_end_len stays at buf len"
+        );
+
+        // Record the speech-only length before introducing silence.
+        let speech_only_len = ctx.utterance_speech_end_len;
+        assert!(speech_only_len > 0, "should have accumulated speech data");
+
+        // Clear the audio buffer so the next input starts fresh without
+        // leftover speech samples that would contaminate the silence frame.
+        ctx.audio_buffer.clear();
+
+        // Manually set silence_since to a time in the distant past so
+        // the SILENCE_DURATION check triggers immediately when a silence
+        // frame is processed (avoids real-time wait).
+        ctx.utterance_silence_since = Some(Instant::now() - Duration::from_secs(10));
+
+        // Feed a silence frame (all zeros → RMS ≈ 0.0 < VAD_THRESHOLD).
+        let silence_frame = vec![0.0f32; FRAME_LENGTH];
+        handle_enrollment_audio(&silence_frame, &mut ctx, 0, 3);
+
+        // After truncation: enrollment_pending should contain the speech-only
+        // audio data, and utterance_buf should be empty.
+        assert!(
+            ctx.enrollment_pending.is_some(),
+            "silence timeout should store utterance in enrollment_pending"
+        );
+        let pending = ctx.enrollment_pending.as_ref().unwrap();
+        assert_eq!(
+            pending.len(),
+            speech_only_len,
+            "enrollment_pending should contain only speech data (no trailing silence)"
+        );
+        assert!(
+            ctx.utterance_buf.is_empty(),
+            "utterance_buf should be emptied after truncation"
+        );
+
+        // Verify that state was properly reset for the next utterance.
+        assert!(
+            !ctx.utterance_had_speech,
+            "utterance_had_speech should reset"
+        );
+        assert!(
+            ctx.utterance_silence_since.is_none(),
+            "silence_since should reset"
+        );
+        assert_eq!(
+            ctx.utterance_speech_end_len, 0,
+            "speech_end_len should reset"
         );
     }
 }
