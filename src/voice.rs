@@ -157,6 +157,29 @@ const K_MAD: f32 = 3.0;
 ///   due to 18% silence-padding during live detection's final embedding).
 const MAD_THRESHOLD_FLOOR: f32 = 0.10;
 
+/// Threshold for detecting clipping: samples at or above this absolute
+/// value are considered clipped (near i16::MAX = 32767 in f32 [-1, 1]).
+const ENROLLMENT_QUALITY_CLIPPING_THRESHOLD: f32 = 0.999;
+
+/// Minimum acceptable utterance duration in ms for quality scoring.
+const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
+
+/// Maximum acceptable utterance duration in ms for quality scoring.
+/// Utterances longer than this may contain too much silence padding.
+const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
+
+/// Fraction of enrollment utterances that must pass self-test (≥8/10).
+const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
+
+/// Enrollment prompts for multi-position guidance (mahbot-778).
+/// Each entry is (prompt_text, count_of_samples_for_this_prompt).
+const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
+    ("Say it normally", 3),
+    ("Say it a bit further from the mic", 3),
+    ("Say it at a slightly different angle", 2),
+    ("Say it with your normal morning voice", 2),
+];
+
 /// Minimum gap between sorted average DTW distances to consider the
 /// distribution bimodal.  DTW distances are in the 0.0–2.0 range (cosine
 /// distance), and intra-cluster variation is typically < 0.04 even for
@@ -446,10 +469,12 @@ pub enum VoiceStatus {
     /// Actively enrolled, waiting for the next sample.
     /// `sample` = completed samples, `total` = required, `duration_ms` = most recent
     /// utterance duration in milliseconds (0 if not yet available).
+    /// `quality` = per-utterance quality score (None before the first sample).
     Enrolling {
         sample: usize,
         total: usize,
         duration_ms: u64,
+        quality: Option<UtteranceQuality>,
     },
     /// Actively capturing speech during enrollment.
     ListeningDuringEnrollment {
@@ -512,6 +537,58 @@ impl Default for WakeWordTemplates {
             verifier: VoiceVerifier::default(),
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Enrollment quality scoring (mahbot-778)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Quality level for a single enrollment utterance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QualityLevel {
+    Good,       // score > 0.7
+    Acceptable, // score 0.4–0.7
+    Poor,       // score < 0.4
+}
+
+impl QualityLevel {
+    fn from_score(score: f32) -> Self {
+        if score > 0.7 {
+            Self::Good
+        } else if score >= 0.4 {
+            Self::Acceptable
+        } else {
+            Self::Poor
+        }
+    }
+
+    /// Returns a user-facing label for this quality level.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Good => "✅ Good sample — clear and consistent",
+            Self::Acceptable => "⚠️ Acceptable — a bit quiet, try speaking closer to the mic",
+            Self::Poor => "❌ Poor sample — too much noise, please re-record",
+        }
+    }
+}
+
+/// Per-utterance quality assessment result.
+#[derive(Debug, Clone)]
+pub struct UtteranceQuality {
+    /// Composite quality score 0.0–1.0 (weighted combination of all factors).
+    pub score: f32,
+    /// Quality level derived from `score`.
+    pub level: QualityLevel,
+    /// Whether clipping was detected (samples at or near i16::MAX).
+    pub clipping_detected: bool,
+    /// Utterance duration in milliseconds.
+    pub duration_ms: u64,
+    /// Estimated signal-to-noise ratio in dB, NaN if estimation failed.
+    pub snr_db: f32,
+    /// Average DTW distance to all other enrollment utterances (lower = more
+    /// consistent).  Set to 0.0 when there are fewer than 2 utterances.
+    pub avg_dtw_distance: f32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1839,6 +1916,246 @@ fn compute_cluster_mad(samples: &[Vec<Vec<f32>>], indices: &[usize]) -> f32 {
     median_of_sorted(&abs_devs)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Enrollment quality scoring (mahbot-778)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Compute a per-utterance quality score from the raw audio and extracted
+/// embeddings, comparing against previously collected enrollment samples.
+///
+/// The composite score (0.0–1.0) is a weighted combination of:
+/// - **DTW self-consistency** (50%): average DTW distance to other utterances,
+///   lower = more consistent = higher quality.
+/// - **Duration** (20%): whether the utterance is in [400ms, 2000ms].
+/// - **Clipping** (15%): penalty if any sample hit i16::MAX.
+/// - **SNR** (15%): estimated signal-to-noise ratio.
+///
+/// # Parameters
+/// - `samples`: raw audio samples of the utterance.
+/// - `embeddings`: extracted embeddings for this utterance.
+/// - `enrollment_buffer`: all previously collected enrollment embeddings
+///   (used for DTW self-consistency comparison).
+#[expect(clippy::cast_precision_loss)]
+fn compute_utterance_quality(
+    samples: &[f32],
+    embeddings: &[Vec<f32>],
+    enrollment_buffer: &[Vec<Vec<f32>>],
+) -> UtteranceQuality {
+    let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
+
+    // ── Clipping detection ───────────────────────────────────────────
+    let clipping_detected = samples
+        .iter()
+        .any(|&s| s.abs() >= ENROLLMENT_QUALITY_CLIPPING_THRESHOLD);
+
+    // ── SNR estimation ───────────────────────────────────────────────
+    // Simple energy-based VAD: frame the audio, compute RMS per frame,
+    // classify high-RMS frames as speech and low-RMS as noise.
+    let snr_db = estimate_snr_energy(samples);
+
+    // ── DTW self-consistency ─────────────────────────────────────────
+    let avg_dtw_distance = if enrollment_buffer.is_empty() {
+        // No other utterances to compare against — neutral score.
+        0.0
+    } else {
+        let mut sum = 0.0f32;
+        let mut count = 0;
+        for other in enrollment_buffer {
+            let d1 = dtw_distance(embeddings, other);
+            let d2 = dtw_distance(other, embeddings);
+            sum += d1.min(d2);
+            count += 1;
+        }
+        sum / count as f32
+    };
+
+    // ── Composite score ──────────────────────────────────────────────
+    // DTW consistency component: DTW is in range [0, ~2] for cosine
+    // distance.  Score = 1.0 - min(dtw / 1.0, 1.0).  So a DTW of 0.0
+    // gives 1.0, a DTW of 1.0+ gives 0.0.
+    let dtw_score = (1.0f32 - (avg_dtw_distance / 1.0).min(1.0)).max(0.0);
+
+    // Duration score: 0.0 if too short or too long, ramping up in range.
+    let duration_score = if duration_ms < ENROLLMENT_QUALITY_DURATION_MIN_MS {
+        0.0
+    } else if duration_ms > ENROLLMENT_QUALITY_DURATION_MAX_MS {
+        0.3 // Long utterances still have some value (contain the wake word)
+    } else {
+        // Normalize to [0.6, 1.0] within the valid range
+        0.6 + (0.4 * (duration_ms - ENROLLMENT_QUALITY_DURATION_MIN_MS) as f32
+            / (ENROLLMENT_QUALITY_DURATION_MAX_MS - ENROLLMENT_QUALITY_DURATION_MIN_MS) as f32)
+    };
+
+    // Clipping penalty: 1.0 if no clipping, 0.0 if clipping detected.
+    let clipping_score = if clipping_detected { 0.0 } else { 1.0 };
+
+    // SNR score: 0.0 at 0 dB, 1.0 at 20+ dB (with smooth ramp).
+    let snr_score = if snr_db.is_finite() {
+        (snr_db / 20.0).clamp(0.0, 1.0)
+    } else {
+        // If SNR estimation fails (e.g. all samples silence), give a
+        // moderate score — don't penalise the caller for our estimation
+        // limitations.
+        0.5
+    };
+
+    let score = dtw_score * 0.50 + duration_score * 0.20 + clipping_score * 0.15 + snr_score * 0.15;
+
+    UtteranceQuality {
+        score,
+        level: QualityLevel::from_score(score),
+        clipping_detected,
+        duration_ms,
+        snr_db,
+        avg_dtw_distance,
+    }
+}
+
+/// Estimate SNR using energy-based VAD (no neural model dependency).
+///
+/// Frames audio into 512-sample windows, computes RMS per frame,
+/// classifies the top 40% RMS frames as "speech" and bottom 40% as
+/// "noise" (middle 20% is ambiguous transition region).  Returns the
+/// ratio in dB, clamped to [0, 40] dB to avoid extreme values from
+/// synthetic/test signals.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn estimate_snr_energy(samples: &[f32]) -> f32 {
+    if samples.len() < FRAME_LENGTH * 3 {
+        return f32::NAN; // Too short for meaningful estimation
+    }
+
+    let mut frame_rms: Vec<f32> = Vec::new();
+    for chunk in samples.chunks(FRAME_LENGTH) {
+        if chunk.len() < FRAME_LENGTH / 2 {
+            continue; // Skip partial trailing frames
+        }
+        let len = chunk.len().min(FRAME_LENGTH) as f32;
+        let sum_sq: f32 = chunk.iter().map(|&s| s * s).sum();
+        frame_rms.push((sum_sq / len).sqrt());
+    }
+
+    if frame_rms.len() < 3 {
+        return f32::NAN;
+    }
+
+    frame_rms.sort_unstable_by(|a, b| a.partial_cmp(b).expect("RMS values must be finite"));
+    let n = frame_rms.len();
+
+    // Bottom 40% = noise floor
+    let noise_len = (n as f32 * 0.4).ceil() as usize;
+    let noise_rms: f32 = frame_rms[..noise_len.min(n)].iter().sum::<f32>() / noise_len as f32;
+
+    // Top 40% = speech
+    let speech_start = (n as f32 * 0.6).ceil() as usize;
+    let speech_len = n.saturating_sub(speech_start);
+    let speech_rms = if speech_len > 0 {
+        frame_rms[speech_start..].iter().sum::<f32>() / speech_len as f32
+    } else {
+        return f32::NAN;
+    };
+
+    if noise_rms <= 1e-10 || speech_rms <= noise_rms {
+        return 0.0; // No discernible signal
+    }
+
+    let snr = 20.0 * (speech_rms / noise_rms).log10();
+    snr.clamp(0.0, 40.0)
+}
+
+/// Run a self-test of enrolled templates against the enrollment buffer.
+///
+/// Simulates the live detection pipeline for each enrollment utterance: feeds
+/// embeddings one by one through the embedding ring, calls
+/// [`score_matching_templates`] (sequence-level DTW) on each frame, and runs
+/// the result through [`process_wake_word_score`] with a rolling window.
+///
+/// This replicates the exact same matching algorithm used in the real detection
+/// loop, unlike a per-frame cosine-matching approach which would diverge from
+/// live behaviour.  An utterance "triggers" if the rolling window sum exceeds
+/// [`match_threshold`] at any point.
+///
+/// Returns `Ok(())` if the self-test passes, or `Err` with a descriptive
+/// message if too many utterances fail to trigger detection.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn run_enrollment_self_test(
+    enrollment_buffer: &[Vec<Vec<f32>>],
+    templates: &WakeWordTemplates,
+) -> Result<(), String> {
+    if enrollment_buffer.is_empty() || templates.templates.is_empty() {
+        return Err("Self-test skipped: no enrollment samples or no templates".to_string());
+    }
+
+    let mut passed = 0usize;
+
+    for utterance in enrollment_buffer {
+        // Fresh simulation for each utterance: no cross-utterance state.
+        let mut embedding_ring: Vec<Vec<f32>> = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+        let mut detected = false;
+
+        for embedding in utterance {
+            // Same ring-buffer logic as the live detection loop.
+            embedding_ring.push(embedding.clone());
+            while embedding_ring.len() > EMBEDDING_RING_MAX {
+                embedding_ring.remove(0);
+            }
+
+            // Sequence-level DTW matching — identical to the live pipeline.
+            let total_score = score_matching_templates(&embedding_ring, templates);
+            if process_wake_word_score(total_score, &mut score_window, templates.minimum_matches) {
+                detected = true;
+                break;
+            }
+        }
+
+        if detected {
+            passed += 1;
+        }
+    }
+
+    let required = (enrollment_buffer.len() as f32 * ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION)
+        .ceil() as usize;
+
+    if passed < required {
+        Err(format!(
+            "Self-test failed: only {passed}/{} utterances triggered detection (need ≥{required}). \
+             Try re-enrolling with clearer, more consistent speech.",
+            enrollment_buffer.len(),
+        ))
+    } else {
+        info!(
+            "Enrollment self-test passed: {passed}/{} utterances triggered detection \
+             (threshold ≥{required})",
+            enrollment_buffer.len(),
+        );
+        Ok(())
+    }
+}
+
+/// Resolve the enrollment prompt for a given sample index (0-based).
+/// Returns a static string with guidance for the user's next utterance
+/// (e.g. "Say it normally", "Say it further from the mic", etc.).
+#[must_use]
+pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
+    let mut cumulative = 0;
+    for &(prompt, count) in ENROLLMENT_PROMPTS {
+        cumulative += count;
+        if sample < cumulative {
+            return prompt;
+        }
+    }
+    // Fallback (shouldn't happen with well-formed prompts)
+    "Say the wake word clearly"
+}
+
 /// Compute the top-K most representative templates and MAD-based thresholds.
 ///
 /// Returns a vector of up to `MAX_TEMPLATES` (K=3) tuples `(embeddings, threshold)`,
@@ -2035,6 +2352,29 @@ fn finalize_enrollment(wake_word_name: &str) -> Result<(Vec<WakeWordTemplate>, u
 
     // Minimum matches: at least 2 for multi-template, 1 for single.
     let minimum_matches = count.min(2);
+
+    // ── Self-test: verify ≥80% of enrollment utterances trigger detection ──
+    // Re-processes each enrollment utterance through the live DTW matching
+    // pipeline to catch egregious pipeline failures (dimension mismatches,
+    // zero-length data, calibration bugs).  Note: since the templates are
+    // calibrated FROM these same 10 utterances, the self-test cannot detect
+    // generalisation problems where templates work on enrollment data but fail
+    // on the user's actual voice at a different mic distance/angle.
+    //
+    // Known limitation: the self-test does NOT exercise the second-stage
+    // logistic-regression verifier (mahbot-777), which is trained AFTER this
+    // self-test runs.  A corrupted verifier would pass the self-test but fail
+    // in live detection — this is a deliberate trade-off to keep the feedback
+    // loop tight during the enrollment UI flow (mahbot-778).
+    let ww_templates = WakeWordTemplates {
+        templates: templates.clone(),
+        minimum_matches,
+        ..Default::default()
+    };
+    if let Err(msg) = run_enrollment_self_test(&state.enrollment_buffer, &ww_templates) {
+        warn!("{msg}");
+        return Err(anyhow!("{msg}"));
+    }
 
     Ok((templates, minimum_matches))
 }
@@ -2478,6 +2818,7 @@ impl PipelineCtx {
             sample: 0,
             total: NUM_ENROLLMENT_SAMPLES,
             duration_ms: 0,
+            quality: None,
         });
         info!("Voice pipeline: enrollment started");
     }
@@ -2735,11 +3076,11 @@ fn check_enrollment_utterance_length(
             "Utterance produced no embeddings ({duration_ms}ms) — speak longer"
         ));
     }
-    // Duration floor: reject noise blips and coughs shorter than 400ms while
-    // accepting any real wake word utterance (mahbot-772).  Single-embedding
+    // Duration floor: reject noise blips and coughs (mahbot-772) using the
+    // same threshold as the quality scoring pipeline.  Single-embedding
     // utterances are accepted — the Google speech_embedding/1 model produces
     // exactly 1 embedding from any 76-frame window, which is its full output.
-    if duration_ms < 400 {
+    if duration_ms < ENROLLMENT_QUALITY_DURATION_MIN_MS {
         Err(format!(
             "Utterance too short ({duration_ms}ms, {embeddings_len} embedding(s)) — speak longer"
         ))
@@ -2765,6 +3106,10 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
     // Compute utterance duration before moving `samples` into the closure.
     let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
+    // Clone samples for quality computation (they will be moved into
+    // spawn_blocking for ONNX inference).
+    let samples_for_quality = samples.clone();
+
     // Run ONNX inference on a blocking thread to avoid blocking the async pipeline.
     let embeddings_result =
         tokio::task::spawn_blocking(move || process_enrollment_sample(&samples))
@@ -2780,12 +3125,21 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
                 return;
             }
 
-            let count = {
+            let (count, quality) = {
                 let mut state = voice_state().write().unwrap_poison();
+
+                // Compute quality BEFORE pushing: compare against existing samples
+                // (without the current sample in the comparison set).
+                let quality = Some(compute_utterance_quality(
+                    &samples_for_quality,
+                    &embeddings,
+                    &state.enrollment_buffer,
+                ));
+
                 state.enrollment_buffer.push(embeddings);
                 let count = state.enrollment_buffer.len();
                 // state dropped here — no lock held across await
-                count
+                (count, quality)
             };
 
             if count >= NUM_ENROLLMENT_SAMPLES {
@@ -2861,6 +3215,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
                     sample: count,
                     total: NUM_ENROLLMENT_SAMPLES,
                     duration_ms,
+                    quality,
                 });
             }
         }
@@ -3383,6 +3738,8 @@ mod tests {
     //!   `test_voice_pipeline_commands_and_enrollment_guard` runs. Do not call
     //!   [`voice::init_global`](crate::voice::init_global) or set
     //!   `VOICE_PIPELINE` in any other test without updating this one.
+    //!   `test_finalize_enrollment_naming` uses `get_or_init` + state reset so
+    //!   it tolerates an already-initialised pipeline.
     //! - **Global `CONFIG`** is read by [`PipelineCtx::new()`] to set
     //!   `auto_start_pending`. Tests implicitly depend on `CONFIG` being in its
     //!   default state (all fields `None`). If a preceding test modifies
@@ -3757,6 +4114,7 @@ mod tests {
                 sample: 0,
                 total: NUM_ENROLLMENT_SAMPLES,
                 duration_ms: 0,
+                quality: None,
             });
 
             // 1. Silence before speech: no speech detected — utterance_had_speech
@@ -6550,4 +6908,229 @@ mod tests {
     // verified at the integration-test level (test_voice_pipeline_commands_*)
     // via the pipeline end-to-end.  A unit test that asserts a literal constant
     // would only replicate the declaration with no behavioral coverage.
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Enrollment quality scoring and self-test (mahbot-778)
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Helper: create a single embedding vector from a 2D coordinate.
+    fn emb_2d(x: f32, y: f32) -> Vec<f32> {
+        vec![x, y]
+    }
+
+    /// Helper: create an enrollment utterance (sequence of 2D embeddings).
+    fn utterance_2d(points: &[[f32; 2]]) -> Vec<Vec<f32>> {
+        points.iter().map(|&[x, y]| emb_2d(x, y)).collect()
+    }
+
+    /// A consistent utterance for testing: all embeddings point along (0.7, 0.7).
+    fn consistent_utterance() -> Vec<Vec<f32>> {
+        utterance_2d(&[[0.7, 0.7], [0.7, 0.7], [0.7, 0.7]])
+    }
+
+    /// An outlier utterance for testing: embeddings point in opposite direction.
+    fn outlier_utterance() -> Vec<Vec<f32>> {
+        utterance_2d(&[[-0.7, -0.7], [-0.7, -0.7], [-0.7, -0.7]])
+    }
+
+    #[test]
+    fn test_utterance_quality_score_clipping() {
+        // ── Sample with clipping ──────────────────────────────────
+        let mut samples_clip = vec![0.5f32; 16000]; // ~1 second of audio at 16kHz
+        samples_clip[8000] = 1.0; // Hit i16::MAX equivalent
+        let embeddings = vec![emb_2d(0.7, 0.7); 5];
+        let quality = compute_utterance_quality(&samples_clip, &embeddings, &[]);
+        assert!(
+            quality.clipping_detected,
+            "clipping should be detected when a sample hits 1.0"
+        );
+        assert!(
+            quality.score < 1.0,
+            "clipping should reduce quality score, got {}",
+            quality.score,
+        );
+
+        // ── Sample without clipping ───────────────────────────────
+        let samples_clean = vec![0.5f32; 16000]; // No sample near 1.0
+        let quality_clean = compute_utterance_quality(&samples_clean, &embeddings, &[]);
+        assert!(
+            !quality_clean.clipping_detected,
+            "clean sample should not have clipping detected"
+        );
+        assert!(
+            quality_clean.score > quality.score,
+            "clean sample should have higher quality score than clipped sample ({} vs {})",
+            quality_clean.score,
+            quality.score,
+        );
+    }
+
+    #[test]
+    fn test_utterance_quality_score_consistency() {
+        // 5 nearly-identical utterances (all pointing along (0.7, 0.7))
+        let consistent = vec![
+            consistent_utterance(),
+            consistent_utterance(),
+            consistent_utterance(),
+            consistent_utterance(),
+            consistent_utterance(),
+        ];
+
+        // 1 outlier (pointing along (-0.7, -0.7) — very different)
+        let outlier = outlier_utterance();
+
+        // Samples placeholder (any non-empty value — quality uses samples for
+        // duration/clipping/SNR, not for consistency).
+        let samples = vec![0.5f32; 16000];
+
+        // Compute quality for a consistent utterance (compared against the 4
+        // OTHER consistent utterances — the 5th consistent utterance is the
+        // one being scored, excluded from enrollment_buffer).
+        let quality_consistent =
+            compute_utterance_quality(&samples, &consistent[0], &consistent[1..]);
+
+        // Compute quality for the outlier (compared against the 5 consistent ones).
+        let quality_outlier = compute_utterance_quality(&samples, &outlier, &consistent);
+
+        // The outlier should have a HIGHER average DTW distance (lower consistency)
+        // and thus a LOWER quality score.
+        assert!(
+            quality_outlier.avg_dtw_distance > quality_consistent.avg_dtw_distance,
+            "outlier DTW distance ({}) should be higher than consistent DTW distance ({})",
+            quality_outlier.avg_dtw_distance,
+            quality_consistent.avg_dtw_distance,
+        );
+        assert!(
+            quality_outlier.score < quality_consistent.score,
+            "outlier quality score ({}) should be lower than consistent score ({})",
+            quality_outlier.score,
+            quality_consistent.score,
+        );
+    }
+
+    #[test]
+    fn test_enrollment_self_test_passes() {
+        // 10 identical utterances (all consistent)
+        let utterance = utterance_2d(&[[0.7, 0.7], [0.7, 0.7], [0.7, 0.7]]);
+        let enrollment_buffer: Vec<Vec<Vec<f32>>> = vec![utterance.clone(); 10];
+
+        // Build a template from the same data (as calibrate_threshold would)
+        let template = WakeWordTemplate {
+            name: "test".to_string(),
+            embeddings: utterance.clone(),
+            threshold: 0.10, // MAD_THRESHOLD_FLOOR
+            enrollment_samples: 10,
+        };
+        let templates = vec![template; 3]; // K=3
+        let ww_templates = WakeWordTemplates {
+            templates,
+            minimum_matches: 2,
+            ..Default::default()
+        };
+
+        let result = run_enrollment_self_test(&enrollment_buffer, &ww_templates);
+        assert!(
+            result.is_ok(),
+            "self-test with consistent utterances should pass, got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_enrollment_self_test_fails() {
+        // Build a template from a "good" utterance
+        let good_utterance = utterance_2d(&[[0.7, 0.7], [0.7, 0.7], [0.7, 0.7]]);
+
+        // Enrollment buffer: 10 silent-like utterances (all-zero embeddings)
+        // that do NOT match the template.  Each "utterance" has a single
+        // zero embedding to ensure dtw_distance can run (non-empty).
+        let zero_emb = emb_2d(0.0, 0.0);
+        let silence_utterance = vec![zero_emb.clone(), zero_emb.clone(), zero_emb.clone()];
+        let enrollment_buffer: Vec<Vec<Vec<f32>>> = vec![silence_utterance; 10];
+
+        let template = WakeWordTemplate {
+            name: "test".to_string(),
+            embeddings: good_utterance,
+            threshold: 0.10,
+            enrollment_samples: 10,
+        };
+        let templates = vec![template]; // K=1
+        let ww_templates = WakeWordTemplates {
+            templates,
+            minimum_matches: 1,
+            ..Default::default()
+        };
+
+        let result = run_enrollment_self_test(&enrollment_buffer, &ww_templates);
+        assert!(
+            result.is_err(),
+            "self-test with silent utterances against active template should fail",
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Self-test failed"),
+            "error message should indicate self-test failure: {msg}",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn test_finalize_enrollment_naming() {
+        // Set up voice state with 10 identical enrollment samples so that
+        // calibrate_threshold produces K=3 templates and self-test passes.
+        let pipeline = VOICE_PIPELINE.get_or_init(|| {
+            RwLock::new(VoicePipelineState {
+                enabled: false,
+                status: VoiceStatus::Disabled,
+                templates: Arc::new(WakeWordTemplates::default()),
+                enrollment_buffer: Vec::new(),
+                cmd_tx: None,
+            })
+        });
+        // Always reset to clean state, even if a previous serial test already
+        // initialised the pipeline (handles test-ordering fragility).
+        {
+            let mut state = pipeline.write().unwrap_poison();
+            state.enabled = false;
+            state.status = VoiceStatus::Disabled;
+            state.templates = Arc::new(WakeWordTemplates::default());
+            state.enrollment_buffer.clear();
+            state.cmd_tx = None;
+        }
+
+        // Push 10 identical utterances into the enrollment buffer.
+        let utterance = utterance_2d(&[[0.7, 0.7], [0.7, 0.7], [0.7, 0.7], [0.7, 0.7]]);
+        {
+            let mut state = voice_state().write().unwrap_poison();
+            for _ in 0..10 {
+                state.enrollment_buffer.push(utterance.clone());
+            }
+        }
+
+        let result = finalize_enrollment("custom");
+        assert!(
+            result.is_ok(),
+            "finalize_enrollment with consistent samples should succeed, got: {:?}",
+            result,
+        );
+        let (templates, minimum_matches) = result.unwrap();
+
+        // K=3 → 3 templates with expected names
+        assert_eq!(templates.len(), 3, "should produce 3 templates for K=3",);
+        assert_eq!(
+            templates[0].name, "custom",
+            "first template should be named 'custom'",
+        );
+        assert_eq!(
+            templates[1].name, "custom_2",
+            "second template should be named 'custom_2'",
+        );
+        assert_eq!(
+            templates[2].name, "custom_3",
+            "third template should be named 'custom_3'",
+        );
+
+        // K≥2 → minimum_matches = 2
+        assert_eq!(minimum_matches, 2, "minimum_matches should be 2 for K=3",);
+    }
 }

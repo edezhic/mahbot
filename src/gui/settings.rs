@@ -2053,39 +2053,75 @@ impl SettingsState {
                 sample,
                 total,
                 duration_ms,
+                quality,
             } => {
                 let remaining = total.saturating_sub(sample);
-                let msg = if remaining > 0 {
-                    let duration_hint = if duration_ms > 0 {
-                        if duration_ms >= 2000 {
-                            format!(
-                                " — captured {}.{}s ✅",
-                                duration_ms / 1000,
-                                (duration_ms % 1000) / 100
-                            )
-                        } else {
-                            format!(
-                                " — captured {}.{}s ⚠ too short",
-                                duration_ms / 1000,
-                                (duration_ms % 1000) / 100
-                            )
-                        }
-                    } else {
-                        String::new()
-                    };
-                    if remaining == 1 {
+                let mut lines: Vec<String> = Vec::new();
+
+                // Main status line with sample count and duration hint
+                let duration_hint = if duration_ms > 0 {
+                    if duration_ms >= 2000 {
                         format!(
-                            "Sample {sample}/{total}{duration_hint} — say the wake word once, then stay silent. 1 more time."
+                            " — captured {}.{}s ✅",
+                            duration_ms / 1000,
+                            (duration_ms % 1000) / 100
                         )
                     } else {
                         format!(
-                            "Sample {sample}/{total}{duration_hint} — say the wake word once, then stay silent. {remaining} more times."
+                            " — captured {}.{}s ⚠ too short",
+                            duration_ms / 1000,
+                            (duration_ms % 1000) / 100
                         )
                     }
                 } else {
-                    "Processing…".to_string()
+                    String::new()
                 };
-                Text::new(msg).into()
+
+                if remaining > 0 {
+                    if remaining == 1 {
+                        lines.push(format!(
+                            "Sample {sample}/{total}{duration_hint} — 1 more time."
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "Sample {sample}/{total}{duration_hint} — {remaining} more times."
+                        ));
+                    }
+
+                    // Enrollment prompt for multi-position guidance.
+                    // Show a prompt as long as there's at least one more
+                    // utterance to record (including before the first one).
+                    if sample < total {
+                        // `sample` is the count of completed samples; the prompt for
+                        // the NEXT utterance is at index `sample` (0-based).
+                        let prompt = crate::voice::enrollment_prompt_for_sample(sample);
+                        lines.push(format!("📢 {prompt}"));
+                    }
+
+                    // Quality feedback for the most recent sample
+                    if let Some(ref q) = quality {
+                        let quality_line = format!("{} (score: {:.2})", q.level.label(), q.score);
+                        lines.push(quality_line);
+
+                        if q.clipping_detected {
+                            lines.push(
+                                "⚠️ Clipping detected — your microphone gain may be too high"
+                                    .to_string(),
+                            );
+                        }
+                        if q.snr_db.is_finite() && q.snr_db < 10.0 {
+                            lines.push(
+                                "⚠️ Low signal-to-noise ratio — try speaking closer to the mic"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                } else {
+                    lines.push("Processing…".to_string());
+                }
+
+                let text = lines.join("\n");
+                Text::new(text).into()
             }
             crate::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
                 Text::new("Listening…").into()
