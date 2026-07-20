@@ -228,6 +228,15 @@ const NO_MATCH_RESET_THRESHOLD: f32 = 0.3;
 /// accumulated weight instead of a strict consecutive binary counter.
 const ROLLING_WINDOW_N: usize = 3;
 
+/// Compile-time invariant: EMBEDDING_RING_MAX must be at least
+/// ROLLING_WINDOW_N so the ring buffer can supply enough embeddings
+/// for matching while the rolling window accumulates scores.
+const _: () = assert!(
+    EMBEDDING_RING_MAX >= ROLLING_WINDOW_N,
+    "EMBEDDING_RING_MAX must be >= ROLLING_WINDOW_N to hold enough embeddings \
+     for template matching"
+);
+
 /// Factor applied to `minimum_matches × ROLLING_WINDOW_N` to compute the
 /// detection threshold (mahbot-773).  At 0.65, the average per-frame soft
 /// score must exceed ~65% of the consensus level for detection to fire.
@@ -6305,16 +6314,235 @@ mod tests {
         );
     }
 
-    // ── Rolling window + ring-buffer size invariants (mahbot-773) ─────
+    // ═════════════════════════════════════════════════════════════════════
+    // Regression tests for wake word detection pipeline infrastructure
+    // (cooldown, VAD gating, ring buffer, mel padding)
+    // Ticket: mahbot-779
+    // ═════════════════════════════════════════════════════════════════════
 
-    /// Compile-time invariant: EMBEDDING_RING_MAX must be at least
-    /// ROLLING_WINDOW_N so the ring buffer can supply enough embeddings
-    /// for matching while the rolling window accumulates scores.
-    const _: () = assert!(
-        EMBEDDING_RING_MAX >= ROLLING_WINDOW_N,
-        "EMBEDDING_RING_MAX must be >= ROLLING_WINDOW_N to hold enough embeddings \
-         for template matching"
-    );
+    // ── pad_mel_frames_to_window ───────────────────────────────────────
+
+    #[test]
+    fn test_pad_mel_frames_to_window() {
+        // 1. Empty sequence → get EMBEDDING_WINDOW_FRAMES silence frames
+        let empty: Vec<Vec<f32>> = Vec::new();
+        let padded = super::pad_mel_frames_to_window(&empty);
+        assert_eq!(
+            padded.len(),
+            EMBEDDING_WINDOW_FRAMES,
+            "empty sequence should be padded to {EMBEDDING_WINDOW_FRAMES} frames",
+        );
+        let silence_val = super::spec_transform(0.0);
+        let eps = 1e-6; // relaxed tolerance for silence-padding values (~2.0)
+        for (i, frame) in padded.iter().enumerate() {
+            assert_eq!(
+                frame.len(),
+                NUM_MEL_BANDS,
+                "each frame should have {NUM_MEL_BANDS} mel bands, got {} at frame {i}",
+                frame.len(),
+            );
+            for (b, &val) in frame.iter().enumerate() {
+                assert!(
+                    (val - silence_val).abs() < eps,
+                    "frame {i}, band {b}: expected {silence_val}, got {val}",
+                );
+            }
+        }
+
+        // 2. Partial sequence (30 frames) → get EMBEDDING_WINDOW_FRAMES
+        //    frames total, with silence padding at end
+        let mut partial = Vec::with_capacity(30);
+        for i in 0..30 {
+            partial.push(vec![i as f32; NUM_MEL_BANDS]);
+        }
+        let padded = super::pad_mel_frames_to_window(&partial);
+        assert_eq!(
+            padded.len(),
+            EMBEDDING_WINDOW_FRAMES,
+            "partial sequence should be padded to {EMBEDDING_WINDOW_FRAMES} frames",
+        );
+        // First 30 frames are unchanged
+        for (i, frame) in padded[..30].iter().enumerate() {
+            assert_eq!(frame.len(), NUM_MEL_BANDS);
+            assert!(
+                (frame[0] - i as f32).abs() < f32::EPSILON,
+                "frame {i} should be unchanged, got frame[0]={}",
+                frame[0],
+            );
+        }
+        // Remaining frames are silence padding
+        for frame in padded[30..].iter() {
+            assert_eq!(frame.len(), NUM_MEL_BANDS);
+            for &val in frame.iter() {
+                assert!(
+                    (val - silence_val).abs() < eps,
+                    "silence padding frame: expected {silence_val}, got {val}",
+                );
+            }
+        }
+
+        // 3. Already at EMBEDDING_WINDOW_FRAMES → unchanged
+        let mut exact = Vec::with_capacity(EMBEDDING_WINDOW_FRAMES);
+        for i in 0..EMBEDDING_WINDOW_FRAMES {
+            exact.push(vec![(i * 2) as f32; NUM_MEL_BANDS]);
+        }
+        let padded = super::pad_mel_frames_to_window(&exact);
+        assert_eq!(
+            padded.len(),
+            EMBEDDING_WINDOW_FRAMES,
+            "exact-length sequence should stay at {EMBEDDING_WINDOW_FRAMES}",
+        );
+        for (i, frame) in padded.iter().enumerate() {
+            assert!(
+                (frame[0] - (i * 2) as f32).abs() < f32::EPSILON,
+                "frame {i} should be unchanged, got frame[0]={}",
+                frame[0],
+            );
+        }
+
+        // 4. Over EMBEDDING_WINDOW_FRAMES → unchanged (guard clause)
+        let mut over = Vec::with_capacity(EMBEDDING_WINDOW_FRAMES + 5);
+        for i in 0..EMBEDDING_WINDOW_FRAMES + 5 {
+            over.push(vec![i as f32; NUM_MEL_BANDS]);
+        }
+        let padded = super::pad_mel_frames_to_window(&over);
+        assert_eq!(
+            padded.len(),
+            EMBEDDING_WINDOW_FRAMES + 5,
+            "over-length sequence should be unchanged",
+        );
+    }
+
+    // ── handle_wake_word_detection cooldown ──────────────────────────
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn test_handle_wake_word_detection_cooldown() {
+        let mut ctx = PipelineCtx::new();
+
+        // ── Cooldown ACTIVE: all buffers cleared, no processing ──
+        ctx.last_wake_word_detection = Some(Instant::now());
+        let last_detection_saved = ctx.last_wake_word_detection;
+
+        // Pre-populate buffers to verify they get cleared by the cooldown path
+        ctx.audio_buffer = vec![1.0f32; 512];
+        ctx.voice_batch = vec![2.0f32; 256];
+        ctx.mel_frame_buffer = vec![vec![3.0f32; NUM_MEL_BANDS]];
+        ctx.embedding_ring = vec![vec![4.0f32; EMBEDDING_DIM]];
+        ctx.score_window = vec![0.5f32; 3];
+
+        // Feed audio — cooldown should discard it and clear everything
+        let samples = vec![5.0f32; FRAME_LENGTH];
+        handle_wake_word_detection(&samples, &mut ctx);
+
+        assert!(
+            ctx.audio_buffer.is_empty(),
+            "audio_buffer should be cleared during cooldown",
+        );
+        assert!(
+            ctx.voice_batch.is_empty(),
+            "voice_batch should be cleared during cooldown",
+        );
+        assert!(
+            ctx.mel_frame_buffer.is_empty(),
+            "mel_frame_buffer should be cleared during cooldown",
+        );
+        assert!(
+            ctx.embedding_ring.is_empty(),
+            "embedding_ring should be cleared during cooldown",
+        );
+        assert!(
+            ctx.score_window.is_empty(),
+            "score_window should be cleared during cooldown",
+        );
+        assert_eq!(
+            ctx.last_wake_word_detection, last_detection_saved,
+            "last_wake_word_detection should remain unchanged after cooldown early-return",
+        );
+
+        // ── Cooldown EXPIRED: processing proceeds normally ──
+        ctx.last_wake_word_detection =
+            Some(Instant::now() - WAKE_WORD_COOLDOWN - Duration::from_secs(1));
+        reset_vad();
+
+        let speech = speech_frame();
+        handle_wake_word_detection(&speech, &mut ctx);
+
+        // With cooldown expired and speech frame: voice_batch should
+        // accumulate audio (one frame adds HOP_LENGTH = 256 samples).
+        assert_eq!(
+            ctx.voice_batch.len(),
+            HOP_LENGTH,
+            "voice_batch should accumulate {} samples after cooldown expired",
+            HOP_LENGTH,
+        );
+    }
+
+    // ── handle_wake_word_detection VAD gating ───────────────────────
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn test_handle_wake_word_detection_vad_gating() {
+        let mut ctx = PipelineCtx::new();
+
+        // 1. Silence → voice_batch stays empty, no mel flush.
+        //    Inject audio_buffer directly with exactly FRAME_LENGTH silence
+        //    and call with empty samples to avoid accumulation overlap.
+        assert!(
+            ctx.last_wake_word_detection.is_none(),
+            "PipelineCtx::new() should initialize last_wake_word_detection to None",
+        );
+        reset_vad();
+        ctx.audio_buffer = vec![0.0f32; FRAME_LENGTH + HOP_LENGTH];
+        handle_wake_word_detection(&[], &mut ctx);
+
+        assert!(
+            ctx.voice_batch.is_empty(),
+            "voice_batch should stay empty after silence",
+        );
+        assert!(
+            ctx.mel_frame_buffer.is_empty(),
+            "mel_frame_buffer should stay empty after silence",
+        );
+
+        // 2. Speech → voice_batch accumulates audio (HOP_LENGTH per frame).
+        //    Feed 3 speech frames (5 processing iterations with 50% overlap).
+        reset_vad();
+        let mut speech_audio = speech_frame(); // frame 1
+        speech_audio.extend_from_slice(&speech_frame()); // frame 2
+        speech_audio.extend_from_slice(&speech_frame()); // frame 3
+        // 3 × FRAME_LENGTH with overlap: the buffer processes
+        // floor((total - FRAME_LENGTH) / HOP_LENGTH) + 1 = floor((1536-512)/256)+1 = 5 frames
+        ctx.audio_buffer = speech_audio;
+        handle_wake_word_detection(&[], &mut ctx);
+        // Each speech frame contributes HOP_LENGTH samples to voice_batch
+        // (frame[..HOP_LENGTH]), so 5 iterations → 5 × HOP_LENGTH = 1280.
+        assert_eq!(
+            ctx.voice_batch.len(),
+            5 * HOP_LENGTH,
+            "voice_batch should accumulate exactly {} samples after 5 speech frames",
+            5 * HOP_LENGTH,
+        );
+
+        // 3. Speech → silence transition → flush_voice_batch called,
+        //    voice_batch cleared.  Explicitly populate voice_batch to make
+        //    this step self-contained (not reliant on Part 2's side effects).
+        ctx.voice_batch = vec![1.0f32; HOP_LENGTH];
+        reset_vad();
+        ctx.audio_buffer = vec![0.0f32; FRAME_LENGTH + HOP_LENGTH];
+        handle_wake_word_detection(&[], &mut ctx);
+
+        // The first frame processed in this call (silence) hits the else-if
+        // branch: voice_batch is non-empty → flush + clear.
+        assert!(
+            ctx.voice_batch.is_empty(),
+            "voice_batch should be cleared after silence transition",
+        );
+        assert!(
+            ctx.mel_frame_buffer.is_empty(),
+            "mel_frame_buffer should be empty (no ONNX models loaded)",
+        );
+    }
 
     // ── Cooldown constant sanity (mahbot-770 Fix 2) ───────────────────
     //
