@@ -47,6 +47,7 @@ pub(crate) mod vector;
 pub mod workspace;
 
 pub mod voice;
+pub(crate) mod voice_verifier;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

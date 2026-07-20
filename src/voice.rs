@@ -31,6 +31,7 @@
 use crate::ChatDirection;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
+use crate::voice_verifier::{EMBEDDING_DIM, VoiceVerifier};
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
@@ -66,9 +67,6 @@ const NUM_MEL_BANDS: usize = 32;
 /// Embedding window: 76 consecutive mel frames (~760ms with the ONNX mel
 /// model's 10ms internal stride, not 16ms — see HOP_LENGTH note above).
 const EMBEDDING_WINDOW_FRAMES: usize = 76;
-
-/// Embedding dimensionality.
-const EMBEDDING_DIM: usize = 96;
 
 /// Maximum command recording duration (30 seconds).
 const MAX_RECORD_SECS: usize = 30;
@@ -485,6 +483,11 @@ pub struct WakeWordTemplates {
     /// uses minimum_matches=2 so that ≥2 templates must agree.
     #[serde(default = "default_minimum_matches")]
     pub minimum_matches: usize,
+    /// Second-stage logistic regression verifier for false-trigger suppression
+    /// (mahbot-777).  When [`VoiceVerifier::is_trained`] is false, all frames
+    /// pass through (no-op / graceful degradation).
+    #[serde(default)]
+    pub verifier: crate::voice_verifier::VoiceVerifier,
 }
 
 /// Serde default: single-template legacy behavior.
@@ -497,6 +500,7 @@ impl Default for WakeWordTemplates {
         Self {
             templates: Vec::new(),
             minimum_matches: 1,
+            verifier: VoiceVerifier::default(),
         }
     }
 }
@@ -2777,11 +2781,47 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
 
             if count >= NUM_ENROLLMENT_SAMPLES {
                 match finalize_enrollment(WAKE_WORD_NAME) {
-                    Ok((templates, minimum_matches)) => {
+                    Ok((new_templates, minimum_matches)) => {
                         info!(
                             "Enrollment complete: wake word '{WAKE_WORD_NAME}' ({} templates, minimum_matches={minimum_matches})",
-                            templates.len(),
+                            new_templates.len(),
                         );
+
+                        // ── Train verifier (mahbot-777) ──────────────
+                        // Extract mean-pooled positive embeddings from
+                        // the enrollment buffer, then train the logistic
+                        // regression verifier with synthetic negatives.
+                        let positive_embeddings = {
+                            let state = voice_state().read().unwrap_poison();
+                            state
+                                .enrollment_buffer
+                                .iter()
+                                .map(|sample| crate::voice_verifier::mean_pool_embeddings(sample))
+                                .filter(|e| !e.is_empty())
+                                .collect::<Vec<Vec<f32>>>()
+                        };
+
+                        let verifier = if positive_embeddings.is_empty() {
+                            warn!(
+                                "Could not train verifier: no valid positive embeddings \
+                                     from {} enrollment samples",
+                                positive_embeddings.len(),
+                            );
+                            crate::voice_verifier::VoiceVerifier::untrained()
+                        } else {
+                            let v = crate::voice_verifier::VoiceVerifier::
+                                    train_with_synthetic_negatives(
+                                        &positive_embeddings,
+                                        0.5,
+                                    );
+                            info!(
+                                "Verifier trained from {} enrollment utterance(s) \
+                                     + synthetic negatives",
+                                positive_embeddings.len(),
+                            );
+                            v
+                        };
+
                         let mut existing = get_templates();
                         let existing_mut = Arc::make_mut(&mut existing);
                         // Remove any existing templates with the same base name
@@ -2791,8 +2831,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
                             t.name != base_name
                                 && !t.name.starts_with(&format!("{WAKE_WORD_NAME}_"))
                         });
-                        existing_mut.templates.extend(templates);
+                        existing_mut.templates.extend(new_templates);
                         existing_mut.minimum_matches = minimum_matches;
+                        existing_mut.verifier = verifier;
                         set_templates(existing);
 
                         // Persist templates to config DB
@@ -3283,6 +3324,31 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
         &mut ctx.score_window,
         templates.minimum_matches,
     ) {
+        // ── Verifier gate (mahbot-777) ────────────────────────────
+        // After the rolling window check passes, run the second-stage
+        // logistic regression verifier on the current embedding to catch
+        // false positives that survived DTW matching.  Near-zero CPU
+        // overhead (~1 μs per frame) since it only runs on candidate
+        // frames that already passed the rolling window.
+        if templates.verifier.is_trained() {
+            let score = ctx
+                .embedding_ring
+                .last()
+                .map_or(0.0, |emb| templates.verifier.predict(emb));
+            if score < templates.verifier.threshold {
+                debug!(
+                    "Wake word suppressed by verifier: score={score:.4} < threshold={}",
+                    templates.verifier.threshold,
+                );
+                // Clear the score window to prevent immediate re-triggering
+                // on the very next frame.  The verifier has rejected this
+                // frame, so the accumulated scores should not count toward
+                // a future detection.
+                ctx.score_window.clear();
+                return false;
+            }
+        }
+
         // Wake word detected — clear pipeline state and start recording.
         ctx.is_recording = true;
         ctx.command_buffer.clear();
@@ -4018,6 +4084,7 @@ mod tests {
             let mut templates = WakeWordTemplates {
                 templates: vec![old_tpl, new_tpl],
                 minimum_matches: 1,
+                ..Default::default()
             };
             let before = templates.templates.len();
             templates
@@ -4665,6 +4732,7 @@ mod tests {
         let templates = WakeWordTemplates {
             templates: vec![matching_tpl, non_matching_tpl],
             minimum_matches: 1,
+            ..Default::default()
         };
 
         // Live sequence is longer than template (simulates ring buffer growth).
@@ -4723,6 +4791,7 @@ mod tests {
         let templates = WakeWordTemplates {
             templates: vec![tpl],
             minimum_matches: 1,
+            ..Default::default()
         };
 
         // Opposite-direction embedding will have cosine distance ≈ 2.0
@@ -4748,6 +4817,7 @@ mod tests {
         let templates = WakeWordTemplates {
             templates: vec![tpl],
             minimum_matches: 1,
+            ..Default::default()
         };
 
         // Empty live — score must be 0.0
@@ -4792,6 +4862,7 @@ mod tests {
         let templates = WakeWordTemplates {
             templates: vec![tpl1, tpl2, tpl3],
             minimum_matches: 2,
+            ..Default::default()
         };
         let total_score = score_matching_templates(&live, &templates);
 
@@ -5730,6 +5801,7 @@ mod tests {
                 enrollment_samples: NUM_ENROLLMENT_SAMPLES,
             }],
             minimum_matches: 1,
+            ..Default::default()
         };
         let json = serde_json::to_string(&templates).unwrap();
         let deserialized: WakeWordTemplates = serde_json::from_str(&json).unwrap();
