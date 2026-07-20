@@ -2060,9 +2060,15 @@ impl SettingsState {
 
                 // Main status line with sample count and duration hint
                 let duration_hint = if duration_ms > 0 {
-                    if duration_ms >= 2000 {
+                    if duration_ms >= crate::voice::ENROLLMENT_QUALITY_DURATION_MAX_MS {
                         format!(
                             " — captured {}.{}s ✅",
+                            duration_ms / 1000,
+                            (duration_ms % 1000) / 100
+                        )
+                    } else if duration_ms >= crate::voice::ENROLLMENT_QUALITY_DURATION_MIN_MS {
+                        format!(
+                            " — captured {}.{}s 📝",
                             duration_ms / 1000,
                             (duration_ms % 1000) / 100
                         )

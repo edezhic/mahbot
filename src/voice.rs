@@ -162,11 +162,11 @@ const MAD_THRESHOLD_FLOOR: f32 = 0.10;
 const ENROLLMENT_QUALITY_CLIPPING_THRESHOLD: f32 = 0.999;
 
 /// Minimum acceptable utterance duration in ms for quality scoring.
-const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
+pub(crate) const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
 
 /// Maximum acceptable utterance duration in ms for quality scoring.
 /// Utterances longer than this may contain too much silence padding.
-const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
+pub(crate) const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
 
 /// Fraction of enrollment utterances that must pass self-test (≥8/10).
 const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
