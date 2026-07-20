@@ -91,6 +91,9 @@ candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-onnx = "0.10.2"
 
+# Neural voice activity detection (replaces RMS-based VAD)
+earshot = "1.1"
+
 # Audio capture for voice assistant
 cpal = "0.15"
 
@@ -135,6 +138,7 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 http = "1.4"
 tempfile = "3"
+serial_test = "3"
 
 [profile.dev]
 incremental = true

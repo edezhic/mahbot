@@ -69,9 +69,6 @@ const EMBEDDING_DIM: usize = 96;
 /// Maximum command recording duration (30 seconds).
 const MAX_RECORD_SECS: usize = 30;
 
-/// Silence threshold for VAD (RMS below this = silence).
-const VAD_THRESHOLD: f32 = 0.01;
-
 /// Minimum silence duration before stopping command recording.
 pub(crate) const SILENCE_DURATION: Duration = Duration::from_millis(1500);
 
@@ -101,6 +98,12 @@ const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
 
 /// Maximum number of download retries.
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
+
+/// Default wake word name used by the enrollment pipeline.
+/// Making this a named constant ensures that [`handle_enrollment_sample`]
+/// and [`finalize_enrollment`] stay in sync if the name ever changes
+/// (mahbot-771 Fix 4).
+const WAKE_WORD_NAME: &str = "custom";
 
 /// Expected SHA256 hashes for model files.
 const MEL_MODEL_SHA256: &str = "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f";
@@ -179,6 +182,21 @@ const CONSECUTIVE_MATCHES_REQUIRED: usize = 3;
 /// is stretched to match the entire template.  Industry standard is 3-5%;
 /// we use 5% which is slightly more permissive.
 const SAKOE_CHIBA_BAND_FRACTION: f64 = 0.05;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Neural VAD (Earshot) — replaces RMS-based `is_speech`
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Global Earshot VAD detector instance. Thread-safe behind a mutex because
+/// `predict_f32` completes in ~5-6 µs, so lock contention is negligible.
+/// The detector has internal state (768-sample ring buffer, pre-emphasis filter,
+/// 3-frame feature context) that must be kept in sync with the audio stream.
+/// Created once in [`init_global`].
+static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::new();
+
+/// Earshot VAD threshold: scores >= this are considered speech.
+/// The default (0.5) works well across environments.
+const VAD_THRESHOLD: f32 = 0.5;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Model loading state machine
@@ -307,10 +325,30 @@ pub struct WakeWordTemplate {
 }
 
 /// Collection of enrolled wake word templates.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WakeWordTemplates {
     #[serde(default)]
     pub templates: Vec<WakeWordTemplate>,
+    /// Minimum number of templates that must match simultaneously for a
+    /// detection frame to count.  Defaults to 1 for backward compatibility
+    /// with single-template enrollments.  Multi-template consensus (K=3, M=2)
+    /// uses minimum_matches=2 so that ≥2 templates must agree.
+    #[serde(default = "default_minimum_matches")]
+    pub minimum_matches: usize,
+}
+
+/// Serde default: single-template legacy behavior.
+fn default_minimum_matches() -> usize {
+    1
+}
+
+impl Default for WakeWordTemplates {
+    fn default() -> Self {
+        Self {
+            templates: Vec::new(),
+            minimum_matches: 1,
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -381,6 +419,8 @@ fn voice_state() -> &'static RwLock<VoicePipelineState> {
 
 /// Initialize the voice pipeline state. Called during startup.
 pub fn init_global() -> Result<()> {
+    VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
+
     LAST_ACTIVE_WORKSPACE
         .set(RwLock::new(String::new()))
         .map_err(|_| anyhow!("LAST_ACTIVE_WORKSPACE already initialized"))?;
@@ -825,61 +865,101 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     }
 }
 
-/// Match a live embedding sequence against all enrolled templates.
+/// Count how many enrolled templates match the current live embedding sequence.
 ///
-/// Uses per-template sliding window matching: for each template, only the
-/// most recent `template.embeddings.len()` embeddings from the live sequence
-/// are compared. This avoids length asymmetry noise when the ring buffer
-/// grows larger than the template (mahbot-755 Fix 5).
+/// Each template uses sliding-window matching: only the most recent
+/// `tpl.embeddings.len()` embeddings from `live_sequence` are compared,
+/// avoiding length asymmetry noise (mahbot-755 Fix 5).
 ///
-/// Logs DTW distances at debug level for all templates (not just matches)
-/// so near-misses are visible during troubleshooting (mahbot-755 Fix 4).
-fn match_against_templates<'a>(
-    live_sequence: &[Vec<f32>],
-    templates: &'a WakeWordTemplates,
-) -> Option<(f32, &'a WakeWordTemplate)> {
-    let mut best: Option<(f32, &WakeWordTemplate)> = None;
+/// Logs DTW distances for all templates at debug level for troubleshooting
+/// (mahbot-755 Fix 4).
+fn count_matching_templates(live_sequence: &[Vec<f32>], templates: &WakeWordTemplates) -> usize {
+    let mut count = 0;
 
     for tpl in &templates.templates {
         // Sliding window: use at most `tpl.embeddings.len()` most recent
-        // live embeddings.  This keeps the DTW cost matrix balanced and
-        // reduces noise from extraneous audio before the wake word.
+        // embeddings.  This keeps the DTW cost matrix balanced and reduces
+        // noise from extraneous audio before the wake word.
         let window_len = tpl.embeddings.len().min(live_sequence.len());
         let window = &live_sequence[live_sequence.len() - window_len..];
 
         let dist = dtw_distance(window, &tpl.embeddings);
+        let matched = dist < tpl.threshold;
         debug!(
             "DTW: template='{}' window={window_len} dist={dist:.4} threshold={} {}",
             tpl.name,
             tpl.threshold,
-            if dist < tpl.threshold {
-                "✓ MATCH"
-            } else {
-                "✗ no match"
-            }
+            if matched { "✓ MATCH" } else { "✗ no match" }
         );
-        if dist < tpl.threshold {
-            let is_better = best.as_ref().is_none_or(|(best_dist, _)| dist < *best_dist);
-            if is_better {
-                best = Some((dist, tpl));
-            }
+        if matched {
+            count += 1;
         }
     }
 
-    best
+    count
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Audio utilities
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[allow(clippy::cast_precision_loss)]
-fn is_speech(samples: &[f32], threshold: f32) -> bool {
+fn is_speech(samples: &[f32]) -> bool {
+    let detector = VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
+    let mut detector = detector.lock().unwrap_poison();
+    is_speech_with_detector(samples, &mut detector)
+}
+
+/// Inner VAD check using an explicit detector reference.  Used by
+/// [`is_speech`] (which locks the global [`VAD_DETECTOR`]) and by tests
+/// that want to supply their own detector to avoid cross-test contamination.
+///
+/// Processes ALL 256-sample chunks through the detector to keep its internal
+/// state (ring buffer + pre-emphasis filter) synchronized with the audio
+/// stream, even when speech is detected early in the frame (mahbot-771 Fix 2).
+fn is_speech_with_detector(samples: &[f32], detector: &mut earshot::Detector) -> bool {
     if samples.is_empty() {
         return false;
     }
-    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
-    rms > threshold
+
+    let mut any_speech = false;
+
+    // Process each complete 256-sample frame (Earshot requires exactly 256
+    // samples per call at 16 kHz).  A typical call receives 512-sample frame
+    // (FRAME_LENGTH) from the wake-word / enrollment paths, which naturally
+    // splits into two 256-sample chunks.  Always process both chunks to keep
+    // the detector's sliding window in sync with the actual audio stream.
+    for chunk in samples.chunks_exact(256) {
+        if detector.predict_f32(chunk) >= VAD_THRESHOLD {
+            any_speech = true;
+        }
+    }
+
+    // Trailing partial frame (<256 samples) — pad with silence to avoid
+    // discarding the tail of a short burst.  Zero-padding is safe because
+    // Earshot's neural model correctly rejects silence-padded frames
+    // (the spectral pattern is not speech-like).
+    let remainder = samples.len() % 256;
+    if remainder > 0 {
+        let mut padded = [0.0f32; 256];
+        padded[..remainder].copy_from_slice(&samples[samples.len() - remainder..]);
+        if detector.predict_f32(&padded) >= VAD_THRESHOLD {
+            any_speech = true;
+        }
+    }
+
+    any_speech
+}
+
+/// Reset the Earshot VAD detector's internal state (ring buffer, feature
+/// context).  Used by tests and when the audio source changes to prevent
+/// stale context from contaminating a new stream.
+#[doc(hidden)]
+pub fn reset_vad() {
+    if let Some(detector) = VAD_DETECTOR.get()
+        && let Ok(mut d) = detector.lock()
+    {
+        d.reset();
+    }
 }
 
 /// Detect whether a microphone-error report is caused by OS-level
@@ -1488,103 +1568,139 @@ fn compute_avg_dtw_distances(samples: &[Vec<Vec<f32>>]) -> Vec<f32> {
     avg_distances
 }
 
-/// Compute the best template and MAD-based threshold from enrollment samples.
+/// Compute the top-K most representative templates and MAD-based thresholds.
 ///
-/// Returns `(best_embeddings, threshold)` where:
-/// - `best_embeddings` is the single most representative utterance's embedding
-///   sequence (length = one utterance, not a concatenation of all samples).
-/// - `threshold` is the calibrated acceptance distance.
+/// Returns a vector of up to `MAX_TEMPLATES` (K=3) tuples `(embeddings, threshold)`,
+/// ranked by how representative each sample is (lowest average pairwise DTW
+/// distance to other samples = most representative).
+///
+/// Each template gets its own individually calibrated threshold using the
+/// existing MAD-based formula against the other N-1 samples (excluding itself).
 ///
 /// # Algorithm
 ///
-/// 1. **Best-template selection** (GRT strategy): compute the average DTW
-///    distance from each sample to all other samples.  Select the sample with
-///    the minimum average distance — this is the most representative utterance.
-/// 2. **MAD-based threshold**: compute DTW distances from the best template to
-///    every other sample.  Compute the median and Median Absolute Deviation of
-///    these distances.  Set threshold = median + K_MAD × mad.
-/// 3. **Absolute cap**: clamp threshold to at most max(median × 2.0, 0.20) to
-///    prevent over-permissive thresholds from pathological enrollment.
+/// 1. **Rank by representativeness** (GRT strategy): compute the average DTW
+///    distance from each sample to all other samples.  Sort by ascending average
+///    distance — the most representative sample comes first.
+/// 2. **Per-template MAD-based threshold**: for each of the top-K samples,
+///    compute DTW distances to every *other* sample.  Compute the median and
+///    Median Absolute Deviation of those distances.  Set
+///    `threshold = min(median + K_MAD × mad, max(median × 2, 0.20))`.
+/// 3. **Rank preservation**: templates are returned in order of increasing
+///    average distance (most representative first), matching the old single-best
+///    behavior for index 0.
 ///
-/// The threshold floor (`median + MIN_THRESHOLD_FLOOR`) was removed in
-/// mahbot-770 Fix 5 — the cap alone provides sufficient protection against
-/// degenerate thresholds.
+/// The threshold cap (`max(median × 2, 0.20)`) prevents over-permissive
+/// thresholds from pathological enrollment (mahbot-770 Fix 5 removed the
+/// original floor, preserving only the cap).
 ///
-/// This function is pure (no global state) so it can be tested directly without
-/// setting up VOICE_PIPELINE.  The caller is responsible for providing at least
-/// 2 samples.
+/// This function is pure (no global state) so it can be tested directly.
+/// The caller is responsible for providing at least 2 samples.
+///
+/// NOTE: `MAX_TEMPLATES` is capped at 3 (K=3 per the multi-template consensus
+/// design).  When `samples.len() < MAX_TEMPLATES`, all available samples are
+/// returned.
+const MAX_TEMPLATES: usize = 3;
+
 #[allow(clippy::cast_precision_loss)]
-fn calibrate_threshold(samples: &[Vec<Vec<f32>>]) -> Result<(Vec<Vec<f32>>, f32)> {
+fn calibrate_threshold(samples: &[Vec<Vec<f32>>]) -> Result<Vec<(Vec<Vec<f32>>, f32)>> {
     let n = samples.len();
     if n < 2 {
         anyhow::bail!("Need at least 2 enrollment samples, got {n}");
     }
 
-    // ── Step 1: Best-template selection ──
+    // ── Step 1: Rank by average pairwise DTW distance ──
     let avg_distances = compute_avg_dtw_distances(samples);
 
-    let best_idx = avg_distances
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("average distances must be finite"))
-        .map(|(idx, _)| idx)
-        .expect("n >= 2 guarantees at least 2 entries in avg_distances");
-
-    let best_embeddings = samples[best_idx].clone();
-
-    // ── Step 2: Compute DTW distances from best template to all others ──
-    let mut distances: Vec<f32> = Vec::with_capacity(n - 1);
-    for (j, sample) in samples.iter().enumerate() {
-        if j != best_idx {
-            let d1 = dtw_distance(&best_embeddings, sample);
-            let d2 = dtw_distance(sample, &best_embeddings);
-            distances.push(d1.min(d2));
-        }
-    }
-    // distances.len() == n - 1, guaranteed >= 1 by the n >= 2 check above.
-
-    // ── Step 3: Compute median and MAD ──
-    distances.sort_unstable_by(|a, b| a.partial_cmp(b).expect("distances must be finite"));
-    let median = median_of_sorted(&distances);
-    let mut abs_devs: Vec<f32> = distances.iter().map(|d| (d - median).abs()).collect();
-    abs_devs.sort_unstable_by(|a, b| {
-        a.partial_cmp(b)
-            .expect("absolute deviations must be finite")
+    // Sort indices by ascending average distance (most representative first).
+    let mut ranked: Vec<usize> = (0..n).collect();
+    ranked.sort_unstable_by(|&a, &b| {
+        avg_distances[a]
+            .partial_cmp(&avg_distances[b])
+            .expect("average distances must be finite")
     });
-    let mad = median_of_sorted(&abs_devs);
 
-    // ── Step 4: Apply absolute cap ──
-    // The threshold floor (median + MIN_THRESHOLD_FLOOR) was removed in
-    // mahbot-770 Fix 5: let the MAD-based formula determine the threshold
-    // directly.  The cap alone prevents degenerate thresholds.
-    let threshold = median + K_MAD * mad;
-    let cap = (median * 2.0).max(0.20);
-    let threshold = threshold.min(cap);
+    // Take the top K (or all if < K available).
+    let k = ranked.len().min(MAX_TEMPLATES);
+    let top_indices = &ranked[..k];
 
-    info!(
-        "Enrollment calibration: best_template={best_idx}, median={median:.4}, mad={mad:.4}, \
-         threshold={threshold:.4} (cap={cap:.4})"
-    );
-    info!(
-        "Enrollment: {n} samples → best template (sample {best_idx}) with {} embedding vectors",
-        best_embeddings.len(),
-    );
+    let mut results: Vec<(Vec<Vec<f32>>, f32)> = Vec::with_capacity(k);
 
-    Ok((best_embeddings, threshold))
+    for &idx in top_indices {
+        let candidate = &samples[idx];
+
+        // ── Step 2: Compute DTW distances from this candidate to all others ──
+        let mut distances: Vec<f32> = Vec::with_capacity(n - 1);
+        for (j, sample) in samples.iter().enumerate() {
+            if j != idx {
+                let d1 = dtw_distance(candidate, sample);
+                let d2 = dtw_distance(sample, candidate);
+                distances.push(d1.min(d2));
+            }
+        }
+        // distances.len() == n - 1, guaranteed >= 1 by the n >= 2 check above.
+
+        // ── Step 3: Compute median and MAD ──
+        distances.sort_unstable_by(|a, b| a.partial_cmp(b).expect("distances must be finite"));
+        let median = median_of_sorted(&distances);
+        let mut abs_devs: Vec<f32> = distances.iter().map(|d| (d - median).abs()).collect();
+        abs_devs.sort_unstable_by(|a, b| {
+            a.partial_cmp(b)
+                .expect("absolute deviations must be finite")
+        });
+        let mad = median_of_sorted(&abs_devs);
+
+        // ── Step 4: Apply absolute cap ──
+        let threshold = median + K_MAD * mad;
+        let cap = (median * 2.0).max(0.20);
+        let threshold = threshold.min(cap);
+
+        info!(
+            "Enrollment calibration: candidate={idx}, median={median:.4}, mad={mad:.4}, \
+             threshold={threshold:.4} (cap={cap:.4})"
+        );
+
+        results.push((candidate.clone(), threshold));
+    }
+
+    info!("Enrollment: {n} samples → {k} template(s): indices={top_indices:?}",);
+
+    Ok(results)
 }
 
-/// Finalize enrollment: wraps [`calibrate_threshold`] to build a
-/// [`WakeWordTemplate`] from the current [`voice_state`] enrollment buffer.
-fn finalize_enrollment(wake_word_name: &str) -> Result<WakeWordTemplate> {
+/// Finalize enrollment: wraps [`calibrate_threshold`] to build up to K
+/// [`WakeWordTemplate`]s from the current [`voice_state`] enrollment buffer.
+///
+/// Returns the list of templates and the `minimum_matches` consensus count
+/// (defaults to `min(num_templates, 2)` so that ≥2 templates must agree when
+/// K ≥ 2, and a single template suffices for legacy enrollments).
+fn finalize_enrollment(wake_word_name: &str) -> Result<(Vec<WakeWordTemplate>, usize)> {
     let state = voice_state().read().unwrap_poison();
-    let (embeddings, threshold) = calibrate_threshold(&state.enrollment_buffer)?;
+    let templates_data = calibrate_threshold(&state.enrollment_buffer)?;
 
-    Ok(WakeWordTemplate {
-        name: wake_word_name.to_string(),
-        embeddings,
-        threshold,
-        enrollment_samples: NUM_ENROLLMENT_SAMPLES,
-    })
+    let count = templates_data.len();
+    let templates: Vec<WakeWordTemplate> = templates_data
+        .into_iter()
+        .enumerate()
+        .map(|(i, (embeddings, threshold))| {
+            let name = if i == 0 {
+                wake_word_name.to_string()
+            } else {
+                format!("{wake_word_name}_{}", i + 1)
+            };
+            WakeWordTemplate {
+                name,
+                embeddings,
+                threshold,
+                enrollment_samples: NUM_ENROLLMENT_SAMPLES,
+            }
+        })
+        .collect();
+
+    // Minimum matches: at least 2 for multi-template, 1 for single.
+    let minimum_matches = count.min(2);
+
+    Ok((templates, minimum_matches))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1897,6 +2013,11 @@ impl PipelineCtx {
         }
         if !self.is_listening {
             self.clear_pipeline_buffers();
+            // Reset VAD detector state when re-creating the mic stream to
+            // prevent stale ring buffer + pre-emphasis filter state from
+            // the previous stream misclassifying the first few frames
+            // (mahbot-771 Fix 3).
+            reset_vad();
             drop(self.mic_stream.take());
             match start_microphone() {
                 Ok((rx, stream)) => {
@@ -2241,14 +2362,24 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
             };
 
             if count >= NUM_ENROLLMENT_SAMPLES {
-                match finalize_enrollment("custom") {
-                    Ok(template) => {
-                        info!("Enrollment complete: wake word 'custom'");
-                        let mut templates = get_templates();
-                        let templates_mut = Arc::make_mut(&mut templates);
-                        templates_mut.templates.retain(|t| t.name != "custom");
-                        templates_mut.templates.push(template);
-                        set_templates(templates);
+                match finalize_enrollment(WAKE_WORD_NAME) {
+                    Ok((templates, minimum_matches)) => {
+                        info!(
+                            "Enrollment complete: wake word '{WAKE_WORD_NAME}' ({} templates, minimum_matches={minimum_matches})",
+                            templates.len(),
+                        );
+                        let mut existing = get_templates();
+                        let existing_mut = Arc::make_mut(&mut existing);
+                        // Remove any existing templates with the same base name
+                        // (e.g. "custom", "custom_2", "custom_3").
+                        let base_name = WAKE_WORD_NAME.to_string();
+                        existing_mut.templates.retain(|t| {
+                            t.name != base_name
+                                && !t.name.starts_with(&format!("{WAKE_WORD_NAME}_"))
+                        });
+                        existing_mut.templates.extend(templates);
+                        existing_mut.minimum_matches = minimum_matches;
+                        set_templates(existing);
 
                         // Persist templates to config DB
                         persist_templates().await;
@@ -2308,7 +2439,7 @@ async fn persist_templates() {
 #[allow(clippy::cast_precision_loss)]
 async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     ctx.command_buffer.extend_from_slice(&samples);
-    let speech = is_speech(&samples, VAD_THRESHOLD);
+    let speech = is_speech(&samples);
     if speech {
         ctx.silence_sample_count = 0;
     } else {
@@ -2452,7 +2583,7 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
         let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
         // VAD gate — skip silence to avoid wasted ONNX compute
-        if is_speech(frame, VAD_THRESHOLD) {
+        if is_speech(frame) {
             // Add only the NEW samples (HOP_LENGTH per frame) to avoid
             // duplicating overlapping audio. Each frame overlaps the previous
             // by 50% (HOP_LENGTH = FRAME_LENGTH/2), so appending the full
@@ -2517,7 +2648,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
     while consumed + FRAME_LENGTH <= len {
         let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
-        if is_speech(frame, VAD_THRESHOLD) {
+        if is_speech(frame) {
             // VAD-positive: accumulate only the new samples (HOP_LENGTH per
             // frame) into the utterance buffer. Adding the full FRAME_LENGTH
             // frame would duplicate overlapping audio since consecutive frames
@@ -2654,32 +2785,32 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
     }
 
     let templates = get_templates();
-    if !templates.templates.is_empty()
-        && !ctx.embedding_ring.is_empty()
-        && let Some((dist, tpl)) = match_against_templates(&ctx.embedding_ring, &templates)
-    {
+    let match_count = if !templates.templates.is_empty() && !ctx.embedding_ring.is_empty() {
+        count_matching_templates(&ctx.embedding_ring, &templates)
+    } else {
+        0
+    };
+
+    if match_count >= templates.minimum_matches {
         // ── Consecutive match tracking (mahbot-770 Fix 4) ──
         //
-        // NOTE: The counter increments on any template match, not per-template.
-        // With multiple wake words (e.g. "computer" + "hey mahbot"), alternating
-        // matches could accumulate to CONSECUTIVE_MATCHES_REQUIRED without
-        // sustained similarity to a single template.  This is acceptable because:
-        // (a) most users enroll a single wake word, (b) false triggers from
-        // alternating templates are self-limiting (the cooldown resets after
-        // detection), and (c) matching the same template consecutively still
-        // requires genuine acoustic similarity.  Per-template tracking would
-        // add complexity with negligible benefit for the common single-template
-        // case.
+        // With multi-template consensus (K=3, M=2), the counter only increments
+        // when ≥minimum_matches templates agree on a frame.  This creates a
+        // compound defense: random speech must simultaneously match multiple
+        // distinct temporal patterns for 3 consecutive windows.
         ctx.consecutive_wake_matches += 1;
         debug!(
-            "Wake word match: consecutive_matches={}/{} (template='{}', dist={dist:.4})",
-            ctx.consecutive_wake_matches, CONSECUTIVE_MATCHES_REQUIRED, tpl.name
+            "Wake word match: {match_count}/{}/{} consecutive_matches={}/{}",
+            templates.templates.len(),
+            templates.minimum_matches,
+            ctx.consecutive_wake_matches,
+            CONSECUTIVE_MATCHES_REQUIRED,
         );
 
         if ctx.consecutive_wake_matches >= CONSECUTIVE_MATCHES_REQUIRED {
             info!(
-                "Wake word '{}' detected! (dist={dist:.4}, threshold={}, consecutive_matches={})",
-                tpl.name, tpl.threshold, ctx.consecutive_wake_matches
+                "Wake word detected! (matches={match_count}/{}, consecutive_matches={})",
+                templates.minimum_matches, ctx.consecutive_wake_matches,
             );
             ctx.is_recording = true;
             ctx.command_buffer.clear();
@@ -2697,11 +2828,14 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
             false
         }
     } else {
-        // No match this frame — reset consecutive counter
+        // Not enough templates matched this frame — reset consecutive counter
         if ctx.consecutive_wake_matches > 0 {
             debug!(
-                "Wake word match lost after {}/{} consecutive matches",
-                ctx.consecutive_wake_matches, CONSECUTIVE_MATCHES_REQUIRED
+                "Wake word match lost after {}/{} consecutive matches \
+                 (matched {match_count}/{} templates)",
+                ctx.consecutive_wake_matches,
+                CONSECUTIVE_MATCHES_REQUIRED,
+                templates.minimum_matches,
             );
         }
         ctx.consecutive_wake_matches = 0;
@@ -2724,6 +2858,30 @@ mod tests {
     //!   assertions must still tolerate.
     use super::*;
     use std::f32::consts::PI;
+
+    /// Generate a speech-like 512-sample frame (32 ms at 16 kHz) that Earshot's
+    /// neural VAD classifies as speech.  Uses a harmonic series (F0 + formants)
+    /// to simulate vowel-like spectral structure.  All samples are in [-1, 1].
+    fn speech_frame() -> Vec<f32> {
+        let mut frame = Vec::with_capacity(FRAME_LENGTH);
+        for i in 0..FRAME_LENGTH {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            // Harmonic series with formant-like structure.
+            // Individual amplitudes ensure the sum never exceeds 1.0.
+            let sample = (2.0 * PI * 130.0 * t).sin() * 0.4      // F0 ~130 Hz (male voice)
+                + (2.0 * PI * 520.0 * t).sin() * 0.25    // H2 (1st formant region)
+                + (2.0 * PI * 910.0 * t).sin() * 0.15    // H3
+                + (2.0 * PI * 1300.0 * t).sin() * 0.1    // H4 (2nd formant region)
+                + (2.0 * PI * 2600.0 * t).sin() * 0.05; // H6 (3rd formant region)
+            frame.push(sample);
+        }
+        // Verify within [-1, 1] (amplitudes sum to 0.95 < 1.0).
+        debug_assert!(
+            frame.iter().all(|&s| s.abs() <= 1.0),
+            "speech_frame exceeds [-1, 1] range"
+        );
+        frame
+    }
 
     // ── cosine_distance ───────────────────────────────────────────────────
 
@@ -2795,36 +2953,47 @@ mod tests {
         );
     }
 
-    // ── is_speech (VAD) ──────────────────────────────────────────────────
+    // ── is_speech (VAD — Earshot neural VAD) ──────────────────────────────
 
     #[test]
+    #[serial_test::serial(voice)]
     fn test_is_speech_silence() {
+        super::reset_vad();
         let silence = vec![0.0f32; 512];
-        assert!(!super::is_speech(&silence, 0.01));
+        assert!(!super::is_speech(&silence));
     }
 
     #[test]
+    #[serial_test::serial(voice)]
     fn test_is_speech_loud() {
-        let loud = vec![0.5f32; 512];
-        assert!(super::is_speech(&loud, 0.01));
+        super::reset_vad();
+        // Speech-like frame with harmonic content
+        let loud = speech_frame();
+        assert!(super::is_speech(&loud));
     }
 
     #[test]
+    #[serial_test::serial(voice)]
     fn test_is_speech_moderate() {
-        let modr = vec![0.02f32; 512];
-        assert!(super::is_speech(&modr, 0.01));
+        super::reset_vad();
+        // Moderate-amplitude speech-like frame (70% of full speech_frame)
+        let modr: Vec<f32> = speech_frame().iter().map(|s| s * 0.7).collect();
+        assert!(super::is_speech(&modr));
     }
 
     #[test]
+    #[serial_test::serial(voice)]
     fn test_is_speech_empty() {
-        assert!(!super::is_speech(&[], 0.01));
+        assert!(!super::is_speech(&[]));
     }
 
     #[test]
-    fn test_is_speech_high_threshold() {
-        let quiet = vec![0.005f32; 512];
-        assert!(!super::is_speech(&quiet, 0.01));
-        assert!(super::is_speech(&quiet, 0.001));
+    #[serial_test::serial(voice)]
+    fn test_is_speech_tiny() {
+        super::reset_vad();
+        // Audio below the neural VAD threshold — too quiet for speech
+        let quiet = vec![0.001f32; 512];
+        assert!(!super::is_speech(&quiet));
     }
 
     // ── to_mono ──────────────────────────────────────────────────────────
@@ -2941,6 +3110,7 @@ mod tests {
     // ── PipelineCtx tests ────────────────────────────────────────────────
 
     #[test]
+    #[serial_test::serial(voice)]
     fn test_voice_pipeline_commands_and_enrollment_guard() {
         // Initialize global VOICE_PIPELINE once for all checks below.
         // Using let _ to tolerate parallel tests that also need the pipeline.
@@ -3014,6 +3184,7 @@ mod tests {
 
         // ── handle_enrollment_audio status transitions ───────────────
         {
+            reset_vad();
             voice_state().write().unwrap_poison().enabled = true;
             ctx.is_listening = true;
             ctx.enrollment_mode = true;
@@ -3057,7 +3228,7 @@ mod tests {
 
             // 2. Speech starts → utterance_had_speech becomes true,
             //    utterance_speech_end_len tracks the buffer end.
-            let speech = vec![0.5f32; FRAME_LENGTH];
+            let speech = speech_frame();
             handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 ctx.utterance_had_speech,
@@ -3083,10 +3254,14 @@ mod tests {
             // 4. Silence after speech → silence_samples accumulates
             //    (the full timeout at SILENCE_THRESHOLD_SAMPLES stores
             //     the utterance in enrollment_pending).
+            //    Reset the VAD so the silence frame is classified with a
+            //    clean slate (no pre-emphasis transient from previous speech).
             //    Clear audio_buffer first so leftover speech from step 3
             //    doesn't contaminate the first silence frame.
             ctx.audio_buffer.clear();
+            reset_vad();
             ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES - 1;
+            let silence = vec![0.0f32; FRAME_LENGTH];
             handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 ctx.enrollment_pending.is_some(),
@@ -3222,6 +3397,7 @@ mod tests {
             ctx.clear_pipeline_buffers();
 
             // Send two silence frames (non-VAD) — should NOT accumulate
+            reset_vad();
             let silence = vec![0.0f32; FRAME_LENGTH];
             handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
@@ -3239,7 +3415,7 @@ mod tests {
             // step doesn't create a mixed frame (preventing deterministic
             // frame counting).
             ctx.audio_buffer.clear();
-            let speech = vec![0.5f32; FRAME_LENGTH];
+            let speech = speech_frame();
             handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             assert!(
                 ctx.utterance_had_speech,
@@ -3266,7 +3442,10 @@ mod tests {
             // Silence after speech should NOT add to utterance_buf, but
             // should be tracked for utterance end detection.  The silence
             // timeout clears utterance_buf into enrollment_pending.
+            // Reset VAD to prevent pre-emphasis transient from previous
+            // speech frames causing the silence to be classified as speech.
             ctx.audio_buffer.clear();
+            reset_vad();
             ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES - 1;
             handle_enrollment_audio(&silence, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
             // Utterance_buf is cleared by the timeout (taken into
@@ -3303,6 +3482,7 @@ mod tests {
             };
             let mut templates = WakeWordTemplates {
                 templates: vec![old_tpl, new_tpl],
+                minimum_matches: 1,
             };
             let before = templates.templates.len();
             templates
@@ -3696,11 +3876,11 @@ mod tests {
         );
     }
 
-    // ── match_against_templates — sliding window (mahbot-755 Fix 5) ────
+    // ── count_matching_templates — sliding window (mahbot-755 Fix 5) ──
 
     #[test]
-    fn test_match_against_templates_sliding_window() {
-        // The sliding window strategy in match_against_templates compares
+    fn test_count_matching_templates_sliding_window() {
+        // The sliding window strategy in count_matching_templates compares
         // only the most recent `min(template.len, live.len)` embeddings
         // against each template.  This avoids length-asymmetry noise when
         // the ring buffer grows larger than the enrollment template.
@@ -3730,6 +3910,7 @@ mod tests {
 
         let templates = WakeWordTemplates {
             templates: vec![matching_tpl, non_matching_tpl],
+            minimum_matches: 1,
         };
 
         // Live sequence is longer than template (simulates ring buffer growth).
@@ -3746,37 +3927,28 @@ mod tests {
         // Template length extracted before move into templates vec.
         const EXPECTED_WINDOW: usize = 3;
 
-        // match_against_templates should window to the most recent
-        // min(3, 5) = 3 embeddings, which are the matching ones.
-        let result = match_against_templates(&live_sequence, &templates);
+        // count_matching_templates should window to the most recent
+        // min(3, 5) = 3 embeddings and find 1 matching template.
+        let count = count_matching_templates(&live_sequence, &templates);
 
-        assert!(result.is_some(), "should find a matching template");
-        let (dist, tpl) = result.unwrap();
-        assert_eq!(tpl.name, "match_me", "should match matching_tpl");
-        assert!(
-            dist < 0.5,
-            "DTW distance with windowed matching should be low (< 0.5), got {dist}"
-        );
+        assert_eq!(count, 1, "should find exactly 1 matching template");
 
         // Without sliding window, the noise embeddings would inflate DTW
         // past the threshold.  Verify that the window is actually being
         // applied by checking that the window size is 3 (the template length).
-        // We can observe this indirectly: a non-windowed DTW against the full
-        // 5-element live sequence would have much higher cost, and the
-        // distance-to-threshold ratio would be worse.
         let windowed_len = EXPECTED_WINDOW.min(live_sequence.len());
         assert_eq!(
             windowed_len, 3,
             "sliding window should be template length (3)"
         );
-        // The actual window used inside match_against_templates:
+        // The actual window used inside count_matching_templates:
         let window = &live_sequence[live_sequence.len() - windowed_len..];
         assert_eq!(window.len(), 3, "windowed slice should have 3 elements");
     }
 
     #[test]
-    fn test_match_against_templates_no_match() {
-        // Live sequence that does NOT match any template should return None.
+    fn test_count_matching_templates_no_match() {
+        // Live sequence that does NOT match any template should return 0.
         let tpl = WakeWordTemplate {
             name: "strict".into(),
             embeddings: vec![vec![1.0, 0.0, 0.0]],
@@ -3785,20 +3957,21 @@ mod tests {
         };
         let templates = WakeWordTemplates {
             templates: vec![tpl],
+            minimum_matches: 1,
         };
 
         // Opposite-direction embedding will have cosine distance ≈ 2.0
         // (cosine distance of opposite unit vectors = 1 - (-1/1) = 2.0).
         let live = vec![vec![-1.0, 0.0, 0.0]];
-        let result = match_against_templates(&live, &templates);
-        assert!(
-            result.is_none(),
+        let count = count_matching_templates(&live, &templates);
+        assert_eq!(
+            count, 0,
             "opposite vectors should not match tight threshold"
         );
     }
 
     #[test]
-    fn test_match_against_templates_empty_live() {
+    fn test_count_matching_templates_empty_live() {
         // Empty live sequence should not panic and should not match.
         let tpl = WakeWordTemplate {
             name: "any".into(),
@@ -3808,9 +3981,68 @@ mod tests {
         };
         let templates = WakeWordTemplates {
             templates: vec![tpl],
+            minimum_matches: 1,
         };
-        let result = match_against_templates(&[], &templates);
-        assert!(result.is_none(), "empty live should not match");
+        let count = count_matching_templates(&[], &templates);
+        assert_eq!(count, 0, "empty live should return 0 matches");
+    }
+
+    #[test]
+    fn test_count_matching_templates_multi_template_consensus() {
+        // Multi-template consensus (K=3, M=2): verify that the match counter
+        // requires at least `minimum_matches` templates to agree.  This tests
+        // the compound defense where random speech must simultaneously match
+        // multiple distinct temporal patterns (mahbot-771 Part 2).
+
+        // Template 1: matches target pattern
+        let tpl1 = WakeWordTemplate {
+            name: "tpl1".into(),
+            embeddings: vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            threshold: 0.5,
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
+        };
+        // Template 2: matches target pattern (same direction)
+        let tpl2 = WakeWordTemplate {
+            name: "tpl2".into(),
+            embeddings: vec![vec![0.9, 0.1, 0.0], vec![0.1, 0.9, 0.0]],
+            threshold: 0.5,
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
+        };
+        // Template 3: does NOT match (opposite direction)
+        let tpl3 = WakeWordTemplate {
+            name: "tpl3".into(),
+            embeddings: vec![vec![-1.0, 0.0, 0.0], vec![0.0, -1.0, 0.0]],
+            threshold: 0.1,
+            enrollment_samples: NUM_ENROLLMENT_SAMPLES,
+        };
+
+        // Live sequence matching templates 1 and 2 (not 3)
+        let live = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
+
+        // With minimum_matches=2 and 2 matching templates out of 3, the
+        // consensus is reached.
+        let templates_consensus = WakeWordTemplates {
+            templates: vec![tpl1.clone(), tpl2.clone(), tpl3.clone()],
+            minimum_matches: 2,
+        };
+        let count = count_matching_templates(&live, &templates_consensus);
+        assert_eq!(count, 2, "multi-template: 2 out of 3 should match");
+        assert!(
+            count >= templates_consensus.minimum_matches,
+            "consensus reached when count >= minimum_matches"
+        );
+
+        // With minimum_matches=3 and only 2 matching, consensus fails.
+        let templates_need_three = WakeWordTemplates {
+            templates: vec![tpl1, tpl2, tpl3],
+            minimum_matches: 3,
+        };
+        let count = count_matching_templates(&live, &templates_need_three);
+        assert_eq!(count, 2, "still 2 matching templates");
+        assert!(
+            count < templates_need_three.minimum_matches,
+            "consensus must fail when count < minimum_matches"
+        );
     }
 
     // ── calibrate_threshold (pure) and median_of_sorted ────────────────
@@ -3894,16 +4126,21 @@ mod tests {
             vec![vec![0.7, 0.7]],
         ];
 
-        let (embeddings, threshold) =
+        let results =
             super::calibrate_threshold(&samples).expect("calibrate_threshold should succeed");
+        // With K=3, all three samples are returned as templates.
+        assert_eq!(results.len(), 3, "should return all 3 samples as templates");
+
+        // The most representative template (index 0) should be sample 2 (45°).
+        let (embeddings, threshold) = &results[0];
 
         // Threshold must be finite and positive (sample 2 is representative).
         assert!(
-            threshold.is_finite() && threshold > 0.0,
+            threshold.is_finite() && *threshold > 0.0,
             "threshold should be finite and positive, got {threshold}",
         );
         assert_eq!(
-            embeddings,
+            *embeddings,
             vec![vec![0.7, 0.7]],
             "best template should be sample 2 (45°)",
         );
@@ -3940,19 +4177,25 @@ mod tests {
             samples.push(vec![emb]);
         }
 
-        let (embeddings, threshold) = super::calibrate_threshold(&samples)
+        let results = super::calibrate_threshold(&samples)
             .expect("calibrate_threshold should succeed with 9 samples");
-
-        // The threshold must be finite and positive.
-        assert!(
-            threshold.is_finite() && threshold > 0.0,
-            "threshold should be finite and positive, got {threshold}",
+        assert_eq!(
+            results.len(),
+            3,
+            "should return top 3 templates from 9 samples"
         );
 
-        // The best template should come from the larger cluster (A: near
-        // [1,0,…]) rather than the smaller cluster (B: near [-1,0,…]).
-        // Since cluster-A embeddings have a positive first dimension, an
-        // embedding[0][0] > 0.9 confirms the best template is from cluster A.
+        // The most representative template (index 0) should come from the
+        // larger cluster (A: near [1,0,…]) rather than the smaller cluster
+        // (B: near [-1,0,…]).  Since cluster-A embeddings have a positive
+        // first dimension, an embedding[0][0] > 0.9 confirms the best
+        // template is from cluster A.
+        let (embeddings, threshold) = &results[0];
+        // The threshold must be finite and positive.
+        assert!(
+            threshold.is_finite() && *threshold > 0.0,
+            "threshold should be finite and positive, got {threshold}",
+        );
         assert!(
             embeddings[0][0] > 0.9,
             "best template should be from the larger cluster (A), got [0][0]={}",
@@ -3963,7 +4206,9 @@ mod tests {
     // ── Utterance buffer truncation (mahbot-755 Fix 1) ─────────────────
 
     #[test]
+    #[serial_test::serial(voice)]
     fn test_enrollment_utterance_tracks_speech_boundary() {
+        reset_vad();
         // Initialize VOICE_PIPELINE (harmless if already set by another test).
         let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
             enabled: true,
@@ -3980,8 +4225,9 @@ mod tests {
         ctx.is_listening = true;
         ctx.enrollment_mode = true;
 
-        // A single 512-sample frame at amplitude 0.5 has RMS = 0.5 > 0.01
-        let speech_frame = vec![0.5f32; FRAME_LENGTH];
+        // A speech-like 512-sample frame with harmonic content that Earshot
+        // classifies as speech.
+        let speech_frame = speech_frame();
 
         // Feed 2 speech frames (each call processes one 512-sample frame
         // and accumulates HOP_LENGTH=256 new samples per frame into
@@ -4017,7 +4263,11 @@ mod tests {
         // frame is processed (avoids real-time wait).
         ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES;
 
-        // Feed a silence frame (all zeros → RMS ≈ 0.0 < VAD_THRESHOLD).
+        // Reset the VAD detector so the silence frame is classified with a
+        // clean slate (no pre-emphasis transient from the previous speech).
+        reset_vad();
+
+        // Feed a silence frame (all zeros → Earshot score ≈ 0.0 < VAD_THRESHOLD).
         let silence_frame = vec![0.0f32; FRAME_LENGTH];
         handle_enrollment_audio(&silence_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
 
@@ -4054,7 +4304,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(voice)]
     fn test_enrollment_audio_break_with_consumed_frames() {
+        reset_vad();
         // Regression test for the fix replacing audio_buffer.clear() with
         // consumed = len at the silence-threshold break point.
         //
@@ -4099,6 +4351,10 @@ mod tests {
         //
         //   Post-loop: drain(..1024) removes all samples without panic.
         ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES - 2 * HOP_LENGTH;
+
+        // Reset VAD immediately before processing so no other test's VAD
+        // state contaminates this silence classification.
+        reset_vad();
 
         // Process the pre-filled buffer with no additional samples.
         handle_enrollment_audio(&[], &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
@@ -4458,6 +4714,7 @@ mod tests {
                 threshold: 0.5,
                 enrollment_samples: NUM_ENROLLMENT_SAMPLES,
             }],
+            minimum_matches: 1,
         };
         let json = serde_json::to_string(&templates).unwrap();
         let deserialized: WakeWordTemplates = serde_json::from_str(&json).unwrap();
@@ -4467,12 +4724,21 @@ mod tests {
             deserialized.templates[0].enrollment_samples, NUM_ENROLLMENT_SAMPLES,
             "enrollment_samples must survive WakeWordTemplates roundtrip"
         );
+        // minimum_matches survives roundtrip (1 is the default)
+        assert_eq!(
+            deserialized.minimum_matches, 1,
+            "minimum_matches must survive WakeWordTemplates roundtrip"
+        );
     }
 
     #[test]
     fn test_templates_serde_empty_list() {
         let tpl: WakeWordTemplates = serde_json::from_str(r#"{"templates":[]}"#).unwrap();
         assert!(tpl.templates.is_empty());
+        assert_eq!(
+            tpl.minimum_matches, 1,
+            "minimum_matches must default to 1 for backward compat"
+        );
     }
 
     // ── broadcast_voice_transcript ────────────────────────────────────
