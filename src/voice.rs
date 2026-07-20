@@ -890,6 +890,30 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+fn mean_embedding(seq: &[Vec<f32>]) -> Vec<f32> {
+    assert!(
+        !seq.is_empty(),
+        "mean_embedding requires non-empty sequence"
+    );
+    let dim = seq[0].len();
+    let mut mean = vec![0.0f32; dim];
+    for emb in seq {
+        for (i, v) in emb.iter().enumerate() {
+            mean[i] += v;
+        }
+    }
+    let n = seq.len() as f32;
+    for v in &mut mean {
+        *v /= n;
+    }
+    mean
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     if live.is_empty() || template.is_empty() {
         return f32::MAX;
@@ -898,11 +922,16 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     let n = live.len();
     let m = template.len();
 
-    // Sakoe-Chiba band constraint (mahbot-770 Fix 6): limit warping to
-    // at most `window` steps away from the diagonal.  This prevents
-    // pathological alignments where a short noise burst is stretched to
-    // match the entire template.  Industry standard is 3-5% of the longer
-    // sequence length; we use SAKOE_CHIBA_BAND_FRACTION (5%).
+    // Sakoe-Chiba band constraint: limit warping to at most `window` steps
+    // away from the diagonal.  This prevents pathological alignments where
+    // a short noise burst is stretched to match a much longer template.
+    // Industry standard is 3-5% of the longer sequence length; we use
+    // SAKOE_CHIBA_BAND_FRACTION (5%).
+    //
+    // The floor of 2 (mahbot-774) ensures that moderate length differences
+    // (e.g. 2 vs 4 embeddings) still allow the endpoint to be reached.
+    // Using n.max(m) means the band always scales with the longer sequence
+    // regardless of which argument is live vs template.
     //
     // NOTE: [`calibrate_threshold`] computes DTW in both directions and takes
     // the asymmetric minimum (d1.min(d2) in Step 2) when comparing enrollment
@@ -913,7 +942,7 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     // calibration path should preserve this bidirectional safety check.
     let window = (SAKOE_CHIBA_BAND_FRACTION * n.max(m) as f64)
         .ceil()
-        .max(1.0) as usize;
+        .max(2.0) as usize;
 
     let mut prev = vec![f32::MAX; m];
     let mut curr = vec![f32::MAX; m];
@@ -976,7 +1005,16 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     if prev_len[m - 1] > 0 {
         prev[m - 1] / prev_len[m - 1] as f32
     } else {
-        f32::MAX
+        // Guard: if DTW could not reach the final column (f32::MAX), log a
+        // warning and fall back to mean-embedding cosine distance so the
+        // caller does not silently receive infinity (mahbot-774).
+        warn!(
+            "DTW failed to reach endpoint: live={n}, template={m}, window={window}. \
+             Falling back to mean-embedding cosine distance."
+        );
+        let mean_live = mean_embedding(live);
+        let mean_template = mean_embedding(template);
+        cosine_distance(&mean_live, &mean_template)
     }
 }
 
@@ -5225,32 +5263,28 @@ mod tests {
     // ── Sakoe-Chiba band constraint (mahbot-770 Fix 6) ─────────────────
 
     /// Verify the Sakoe-Chiba band window calculation for various sequence
-    /// lengths.  window = ceil(0.05 × max(n, m)), minimum 1.
+    /// lengths.  window = ceil(0.05 × max(n, m)), minimum 2 (mahbot-774).
     #[test]
     fn test_sakoe_chiba_window_calculation() {
         // Replicate the window formula from dtw_distance.
         let band_window = |n: usize, m: usize| -> usize {
             ((SAKOE_CHIBA_BAND_FRACTION * n.max(m) as f64)
                 .ceil()
-                .max(1.0)) as usize
+                .max(2.0)) as usize
         };
 
-        // Equal-length small sequences: 5% of max rounds to ceil.
-        assert_eq!(band_window(3, 3), 1); // ceil(0.05×3) = ceil(0.15) = 1
+        // Equal-length small sequences: floor of 2 applies.
+        assert_eq!(band_window(3, 3), 2); // ceil(0.05×3) = ceil(0.15) = 1, max(2)
+        assert_eq!(band_window(1, 1), 2); // ceil(0.05×1) = ceil(0.05) = 1, max(2)
+        assert_eq!(band_window(2, 2), 2); // ceil(0.05×2) = ceil(0.1) = 1, max(2)
 
-        // Unequal lengths: max dominates.
-        assert_eq!(band_window(1, 20), 1); // ceil(0.05×20) = ceil(1.0) = 1
+        // Larger: 5% of 100 = 5, exceeds floor.
+        assert_eq!(band_window(100, 100), 5);
+
+        // Asymmetric: max dominates even for 1-vs-20 (ceil(1.0)=1 → floor 2).
+        assert_eq!(band_window(1, 20), 2);
         assert_eq!(band_window(1, 40), 2); // ceil(0.05×40) = ceil(2.0) = 2
-
-        // Floor of 1 for tiny sequences.
-        assert_eq!(band_window(1, 1), 1); // ceil(0.05×1) = ceil(0.05) = 1, max(1)
-        assert_eq!(band_window(2, 2), 1); // ceil(0.05×2) = ceil(0.1) = 1, max(1)
-
-        // Larger: 5% of 100 = 5, no rounding needed.
-        assert_eq!(band_window(100, 100), 5); // ceil(0.05×100) = ceil(5.0) = 5
-
-        // Asymmetric: max(50, 100) = 100 → 5.
-        assert_eq!(band_window(50, 100), 5);
+        assert_eq!(band_window(50, 100), 5); // max(50,100)=100 → 5% = 5
     }
 
     /// Identical sequences should produce near-zero DTW distance even with
@@ -5259,8 +5293,8 @@ mod tests {
     #[test]
     fn test_dtw_identical_sequences_with_band() {
         // 10 identical 2D unit vectors.  On-diagonal: i == j for all frames,
-        // so the band (window=1 for max(10,10)*0.05=0.5→ceil→1) is not
-        // restrictive — on-diagonal always satisfies |i-j| ≤ 1.
+        // so the band (window=2 for max(10,10)*0.05=0.5→ceil→1→max(2)) is
+        // not restrictive — on-diagonal always satisfies |i-j| ≤ 2.
         let vec = vec![0.7071, 0.7071]; // unit vector
         let seq = vec![vec.clone(); 10];
         let dist = dtw_distance(&seq, &seq);
@@ -5272,33 +5306,75 @@ mod tests {
 
     /// The Sakoe-Chiba band prevents pathological alignments where a short
     /// live sequence warps far from the diagonal to find a matching template
-    /// frame.  With live[0] orthogonal to the first window+1 template frames
-    /// but similar to a frame far beyond the band, the band forces a high
-    /// distance that reflects the true acoustic mismatch.
+    /// frame.  With window=2 (the new floor for max(10,10)*0.05=0.5→ceil→1),
+    /// the band constrains |i-j| ≤ 2, so live[0] (j=0) cannot reach a match
+    /// at template[3] (|0-3| = 3 > 2).  The resulting DTW path is forced
+    /// through orthogonal frames, giving a positive distance.
     #[test]
     fn test_sakoe_chiba_prevents_pathological_alignment() {
-        // Template: 20 frames where:
-        //   frames 0..6 = [1.0, 0.0]  (x-axis, orthogonal to live[0])
-        //   frame 10    = [0.0, 1.0]  (y-axis, matches live[0])
-        //   frames 11..19 = [0.0, 1.0]  (y-axis)
+        // Template: 5 frames where frames 0-2 = [1.0, 0.0] (orthogonal),
+        // frames 3-4 = [0.0, 1.0] (matches live).
         //
-        // Live: 1 frame [0.0, 1.0] (y-axis).
+        // Live: 3 frames [0.0, 1.0], [0.0, 1.0], [0.0, 1.0].
         //
-        // Without the Sakoe-Chiba band, DTW would align live[0] to
-        // template[10] (distance 0), giving a low overall distance.
-        // With the band (window=1 for max(1,20)*0.05=1), live[0] can only
-        // match template[0] or template[1] — both orthogonal → distance ≈ 2.0.
+        // Ratio = 5/3 ≈ 1.67 < 2 → DTW runs with window=2.
+        // Without the band (|i-j| unlimited), live[0] could map to
+        // template[3] (cost 0) for total distance 0.
+        //
+        // With the band (window=2): live[0] is restricted to j=0,1,2
+        // (all orthogonal, cost 1.0).  The constrained optimal path is:
+        //   (0,0)→(0,1)→(0,2)→(1,3)→(2,4)
+        // with costs 1.0 + 1.0 + 1.0 + 0.0 + 0.0 = 3.0 over 5 steps
+        // → normalised 0.6.
         let template: Vec<Vec<f32>> = {
             let mut t = Vec::new();
-            for _ in 0..7 {
-                t.push(vec![1.0, 0.0]); // orthogonal to live
+            t.push(vec![1.0, 0.0]); // orthogonal
+            t.push(vec![1.0, 0.0]); // orthogonal
+            t.push(vec![1.0, 0.0]); // orthogonal
+            t.push(vec![0.0, 1.0]); // matches live
+            t.push(vec![0.0, 1.0]); // matches live
+            t
+        };
+        assert_eq!(template.len(), 5, "template must have 5 frames");
+
+        let live = vec![vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]];
+        let dist = dtw_distance(&live, &template);
+
+        assert!(
+            dist.is_finite(),
+            "DTW should succeed with window=2 for n=3, m=5, got {dist}"
+        );
+        assert!(
+            dist > 0.0,
+            "band should force a positive distance by blocking the direct match"
+        );
+        // The expected normalised distance is 0.6 (three orthogonal steps at
+        // 1.0 each distributed over 5 path steps).  We allow a small tolerance
+        // for floating-point variation in the DTW path selection.
+        assert!(
+            (dist - 0.6).abs() < 0.01,
+            "expected band-constrained distance ~0.60, got {dist}"
+        );
+    }
+
+    /// When DTW cannot reach the final template column (e.g. extreme length
+    /// asymmetry where |n-m| exceeds the band window), the endpoint guard
+    /// falls back to mean-embedding cosine distance instead of returning
+    /// f32::MAX.  This test verifies that n=1, m=20 (|1-20| = 19 > window=2)
+    /// triggers the guard and produces a reasonable finite distance.
+    #[test]
+    fn test_dtw_endpoint_guard_fallback() {
+        // Template: 20 frames, even mix of [1,0] and [0,1].
+        // Live: 1 frame [0, 1].
+        // Window = max(2, ceil(0.05*20)) = max(2, 1) = 2.
+        // |n-m| = 19 > 2 → template[19] unreachable → guard triggers.
+        let template: Vec<Vec<f32>> = {
+            let mut t = Vec::new();
+            for _ in 0..10 {
+                t.push(vec![1.0, 0.0]); // orthogonal
             }
-            for _ in 7..10 {
-                t.push(vec![1.0, 0.0]); // still orthogonal (just fillers)
-            }
-            t.push(vec![0.0, 1.0]); // would match, but out of band
-            for _ in 11..20 {
-                t.push(vec![0.0, 1.0]); // would match, but out of band
+            for _ in 10..20 {
+                t.push(vec![0.0, 1.0]); // matches live
             }
             t
         };
@@ -5307,16 +5383,169 @@ mod tests {
         let live = vec![vec![0.0, 1.0]];
         let dist = dtw_distance(&live, &template);
 
-        // The band restricts to j in [0, min(0+1+1, 20)) = [0, 2) → j=0 or 1.
-        // Both frames are [1.0, 0.0] (orthogonal to live[0] = [0.0, 1.0]),
-        // so cosine_distance = 1.0 for both.
-        // Since j_end = 2, only columns 0 and 1 are computed — columns 2..19
-        // retain their initial f32::MAX.  When only one row exists (n=1),
-        // prev[m-1] = prev[19] was never set → remains f32::MAX → return f32::MAX.
-        assert_eq!(
-            dist,
-            f32::MAX,
-            "short live sequence should not reach template frames beyond the band"
+        // Guard fallback: mean of template is [0.5, 0.5], live is [0, 1].
+        // Cosine distance = 1 - 0.5/sqrt(0.5) ≈ 0.293.
+        assert!(
+            dist.is_finite(),
+            "endpoint guard should produce finite distance, got {dist}"
+        );
+        assert!(
+            (dist - 0.293).abs() < 0.01,
+            "expected mean-cosine distance ~0.293, got {dist}"
+        );
+    }
+
+    /// Asymmetric length test (mahbot-774): verify that DTW with the improved
+    /// band (floor=2) can still match 2-vs-4 and 4-vs-2 embedding sequences
+    /// without returning f32::MAX.  This is the exact bug scenario: multi-
+    /// embedding templates from slow enrollment vs short live sequences.
+    #[test]
+    fn test_sakoe_chiba_band_asymmetric_short_vs_long() {
+        // A simple 2D unit vector sequence where all frames are the same.
+        // This ensures any DTW failure is purely from the band constraint,
+        // not from embedding mismatch.
+        let unit = vec![0.7071, 0.7071];
+
+        // Case 1: live=2, template=4 (fast speech vs slow enrollment).
+        let live_short = vec![unit.clone(), unit.clone()];
+        let template_long = vec![unit.clone(), unit.clone(), unit.clone(), unit.clone()];
+        let dist_short_live = dtw_distance(&live_short, &template_long);
+        assert!(
+            dist_short_live.is_finite(),
+            "2-frame live vs 4-frame template should produce finite distance, got {dist_short_live}"
+        );
+        assert!(
+            dist_short_live < 1e-6,
+            "identical embedding sequences should have near-zero distance, got {dist_short_live}"
+        );
+
+        // Case 2: live=4, template=2 (slow speech vs fast enrollment).
+        let live_long = vec![unit.clone(), unit.clone(), unit.clone(), unit.clone()];
+        let template_short = vec![unit.clone(), unit.clone()];
+        let dist_long_live = dtw_distance(&live_long, &template_short);
+        assert!(
+            dist_long_live.is_finite(),
+            "4-frame live vs 2-frame template should produce finite distance, got {dist_long_live}"
+        );
+        assert!(
+            dist_long_live < 1e-6,
+            "identical embedding sequences should have near-zero distance, got {dist_long_live}"
+        );
+
+        // Case 3: different spectral content — verify that 2-vs-4 still
+        // gives a meaningful non-zero distance (not f32::MAX).
+        let x_vec = vec![1.0, 0.0];
+        let y_vec = vec![0.0, 1.0];
+        let live_xy = vec![x_vec.clone(), x_vec.clone()]; // [1,0], [1,0]
+        let template_yx = vec![y_vec.clone(), y_vec.clone(), y_vec.clone(), y_vec.clone()]; // [0,1], [0,1], [0,1], [0,1]
+
+        let dist_diff = dtw_distance(&live_xy, &template_yx);
+        assert!(
+            dist_diff.is_finite(),
+            "2-frame [1,0] vs 4-frame [0,1] should produce finite distance, got {dist_diff}"
+        );
+        assert!(
+            dist_diff > 0.0,
+            "orthogonal embeddings should give positive distance"
+        );
+    }
+
+    /// Endpoint guard fallback for extreme asymmetry (mahbot-774): when DTW
+    /// cannot reach the final template frame because |n-m| > window, verify
+    /// the guard returns mean-embedding cosine distance instead of f32::MAX.
+    #[test]
+    fn test_dtw_endpoint_guard_extreme_asymmetry() {
+        // Ratio = 10/1 = 10 > 2 → triggers fallback.
+        let unit = vec![0.7071, 0.7071];
+        let short = vec![unit.clone()];
+        let long = vec![unit.clone(); 10];
+
+        // All-identical embeddings should still produce near-zero distance
+        // via the mean-embedding fallback.
+        let dist = dtw_distance(&short, &long);
+        assert!(
+            dist.is_finite(),
+            "1-frame vs 10-frame should produce finite fallback distance, got {dist}"
+        );
+        assert!(
+            dist < 1e-6,
+            "identical mean embeddings should give near-zero distance, got {dist}"
+        );
+
+        // Ratio = 19/2 = 9.5 > 2 → triggers fallback with different content.
+        let x_vec = vec![1.0, 0.0];
+        let y_vec = vec![0.0, 1.0];
+        let short_xy = vec![x_vec.clone(), x_vec.clone()]; // [1,0], [1,0]
+        let long_y = vec![y_vec.clone(); 19]; // [0,1] × 19
+
+        let dist_ortho = dtw_distance(&short_xy, &long_y);
+        assert!(
+            dist_ortho.is_finite(),
+            "2-frame [1,0] vs 19-frame [0,1] should produce finite fallback distance, got {dist_ortho}"
+        );
+
+        // Mean of short: [1.0, 0.0]; mean of long: [0.0, 1.0].
+        // Cosine distance = 1 - 0 / (1×1) = 1.0.
+        assert!(
+            (dist_ortho - 1.0).abs() < 0.01,
+            "orthogonal unit vectors should give cosine distance of 1.0, got {dist_ortho}"
+        );
+    }
+
+    /// Verify that the Sakoe-Chiba band scales correctly with the longer
+    /// sequence (mahbot-774).  The window formula uses `max(n, m)`, so
+    /// dtw_distance(live, template) and dtw_distance(template, live) should
+    /// produce the same window size and thus comparable distances for
+    /// symmetric-length inputs.
+    #[test]
+    fn test_sakoe_chiba_band_scales_with_longer_sequence() {
+        // Use a non-trivial sequence where the order matters for DTW.
+        let frame_a = vec![1.0, 0.0];
+        let frame_b = vec![0.5, 0.5];
+        let frame_c = vec![0.0, 1.0];
+        let frame_d = vec![1.0, 1.0];
+
+        let seq_short = vec![frame_a.clone(), frame_b.clone()];
+        let seq_long = vec![
+            frame_a.clone(),
+            frame_b.clone(),
+            frame_c.clone(),
+            frame_d.clone(),
+        ];
+
+        // Both directions use the same window because n.max(m) is always 4
+        // (max(2,4) = max(4,2) = 4).  The window after floor(max(2.0)) is 2:
+        //   ceil(0.05 × 4).max(2.0) = ceil(0.2).max(2.0) = 1.max(2.0) = 2.
+        // The distances may differ (DTW is asymmetric), but both should be
+        // finite and within comparable range — neither direction should
+        // produce f32::MAX from an unreachable endpoint.
+        let d1 = dtw_distance(&seq_short, &seq_long);
+        let d2 = dtw_distance(&seq_long, &seq_short);
+
+        assert!(
+            d1.is_finite(),
+            "2→4 direction should produce finite distance, got {d1}"
+        );
+        assert!(
+            d2.is_finite(),
+            "4→2 direction should produce finite distance, got {d2}"
+        );
+        assert!(
+            d1 > 0.0,
+            "2→4 direction should give positive distance for different content"
+        );
+        assert!(
+            d2 > 0.0,
+            "4→2 direction should give positive distance for different content"
+        );
+
+        // Both distances should be of comparable magnitude (not one being
+        // f32::MAX while the other is ~0).  A factor of 2 is reasonable
+        // for DTW on asymmetric-length inputs with the same window.
+        let (lo, hi) = if d1 < d2 { (d1, d2) } else { (d2, d1) };
+        assert!(
+            hi / lo < 2.0,
+            "distances for 2→4 ({d1}) and 4→2 ({d2}) should be within a factor of 2"
         );
     }
 
