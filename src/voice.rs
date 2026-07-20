@@ -175,11 +175,111 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 /// `refractory_sec=2.0`, openWakeWord uses patience counters.
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
-/// Number of consecutive DTW matches required before triggering wake word
-/// detection (mahbot-770 Fix 4).  Every production system (openWakeWord,
-/// Porcupine, Snips/Rhasspy) requires 2-3 consecutive matches before firing.
-/// N=3 represents ~384-480ms of sustained similarity with the current stride.
-const CONSECUTIVE_MATCHES_REQUIRED: usize = 3;
+/// Sigmoid steepness for per-template soft scoring (mahbot-773).
+///
+/// k=10 produces a smooth transition near each template's threshold:
+/// a distance 0.02 below threshold scores ~0.55, while one 0.02 above
+/// scores ~0.45.  This preserves near-binary character for clear matches
+/// while smoothly degrading for borderline frames, eliminating the hard
+/// binary on/off that caused false rejects.
+const SIGMOID_K: f32 = 10.0;
+
+/// Minimum per-frame soft score below which the rolling window is reset
+/// entirely (mahbot-773).  Prevents slow accumulation from noise frames
+/// while allowing smooth degradation for borderline matches.
+const NO_MATCH_RESET_THRESHOLD: f32 = 0.3;
+
+/// Number of recent per-frame scores to keep in the rolling sum window
+/// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
+/// covers ~384ms — matching the original temporal window but using
+/// accumulated weight instead of a strict consecutive binary counter.
+const ROLLING_WINDOW_N: usize = 3;
+
+/// Factor applied to `minimum_matches × ROLLING_WINDOW_N` to compute the
+/// detection threshold (mahbot-773).  At 0.65, the average per-frame soft
+/// score must exceed ~65% of the consensus level for detection to fire.
+const MATCH_THRESHOLD_FACTOR: f32 = 0.65;
+
+/// Detection threshold for the rolling sum of soft scores (mahbot-773).
+/// Computed as: `minimum_matches × ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`.
+/// This requires the average per-frame soft score to exceed ~65% of the
+/// `minimum_matches` consensus level, providing smooth degradation for
+/// borderline frames while preventing noise accumulation.
+///
+/// # Safety / precision
+/// The `usize → f32` casts are safe because both `minimum_matches` and
+/// `ROLLING_WINDOW_N` are at most 3 (a trivially small value that fits
+/// exactly in f32's 23-bit mantissa).
+#[expect(clippy::cast_precision_loss)]
+fn match_threshold(minimum_matches: usize) -> f32 {
+    (minimum_matches as f32) * (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR
+}
+
+/// Sigmoid function for soft scoring: maps a raw DTW distance through a
+/// threshold-centred sigmoid.  Output is ~1.0 when dist ≪ threshold, ~0.5
+/// at dist ≈ threshold, and ~0.0 when dist ≫ threshold.
+fn sigmoid_score(dist: f32, threshold: f32) -> f32 {
+    1.0 / (1.0 + (SIGMOID_K * (dist - threshold)).exp())
+}
+
+/// Process a per-frame soft score through the rolling window and determine
+/// whether wake word detection should fire (mahbot-773).
+///
+/// Returns `true` when the rolling sum of recent scores meets or exceeds
+/// `match_threshold(minimum_matches)`.  When the incoming score is below
+/// [`NO_MATCH_RESET_THRESHOLD`], the window is cleared entirely to prevent
+/// slow accumulation from noise.  On detection the score window is NOT
+/// cleared here — the caller is responsible for full pipeline cleanup.
+///
+/// This function is pure with respect to global state: it only reads its
+/// parameters and modifies `score_window` in place.  This makes it directly
+/// testable without ONNX models or voice pipeline initialization.
+fn process_wake_word_score(
+    total_score: f32,
+    score_window: &mut Vec<f32>,
+    minimum_matches: usize,
+) -> bool {
+    if total_score < NO_MATCH_RESET_THRESHOLD {
+        // Far from matching — reset the entire rolling window to prevent
+        // slow accumulation from noise.
+        if !score_window.is_empty() {
+            debug!(
+                "Wake word match lost: total_score={total_score:.4} < NO_MATCH_RESET_THRESHOLD \
+                 (window reset, had {} scores)",
+                score_window.len(),
+            );
+        }
+        score_window.clear();
+        false
+    } else {
+        // Good-enough frame: append score to rolling window.
+        score_window.push(total_score);
+        // Keep window at most ROLLING_WINDOW_N frames.
+        while score_window.len() > ROLLING_WINDOW_N {
+            score_window.remove(0);
+        }
+
+        let rolling_sum: f32 = score_window.iter().sum();
+        let threshold = match_threshold(minimum_matches);
+
+        debug!(
+            "Wake word score: total_score={total_score:.4} rolling_sum={rolling_sum:.4}/ \
+             threshold={threshold:.2} window={} (M={minimum_matches})",
+            score_window.len(),
+        );
+
+        if rolling_sum >= threshold {
+            info!(
+                "Wake word detected! rolling_sum={rolling_sum:.4} >= {threshold:.2} \
+                 (window={} scores, M={minimum_matches})",
+                score_window.len(),
+            );
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Sakoe-Chiba band width as a fraction of the longer sequence (mahbot-770
 /// Fix 6).  Prevents pathological DTW alignments where a short noise burst
@@ -880,38 +980,33 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     }
 }
 
-/// Count how many enrolled templates match the current live embedding sequence.
+/// Compute a soft total score across all enrolled templates against the
+/// current live embedding sequence (mahbot-773).
 ///
-/// Each template uses sliding-window matching: only the most recent
-/// `tpl.embeddings.len()` embeddings from `live_sequence` are compared,
-/// avoiding length asymmetry noise (mahbot-755 Fix 5).
+/// Each template contributes a sigmoid score (0.0–1.0) based on DTW distance
+/// relative to its threshold, replacing the old binary match/miss.  Scores
+/// are summed across all K templates to produce a continuous `total_score`.
+/// The sliding window (most recent `tpl.embeddings.len()` embeddings) is
+/// still applied to avoid length-asymmetry noise (mahbot-755 Fix 5).
 ///
-/// Logs DTW distances for all templates at debug level for troubleshooting
-/// (mahbot-755 Fix 4).
-fn count_matching_templates(live_sequence: &[Vec<f32>], templates: &WakeWordTemplates) -> usize {
-    let mut count = 0;
+/// Logs DTW distances and per-template scores at debug level.
+fn score_matching_templates(live_sequence: &[Vec<f32>], templates: &WakeWordTemplates) -> f32 {
+    let mut total_score = 0.0;
 
     for tpl in &templates.templates {
-        // Sliding window: use at most `tpl.embeddings.len()` most recent
-        // embeddings.  This keeps the DTW cost matrix balanced and reduces
-        // noise from extraneous audio before the wake word.
         let window_len = tpl.embeddings.len().min(live_sequence.len());
         let window = &live_sequence[live_sequence.len() - window_len..];
 
         let dist = dtw_distance(window, &tpl.embeddings);
-        let matched = dist < tpl.threshold;
+        let score = sigmoid_score(dist, tpl.threshold);
         debug!(
-            "DTW: template='{}' window={window_len} dist={dist:.4} threshold={} {}",
-            tpl.name,
-            tpl.threshold,
-            if matched { "✓ MATCH" } else { "✗ no match" }
+            "DTW: template='{}' window={window_len} dist={dist:.4} threshold={} score={score:.4}",
+            tpl.name, tpl.threshold,
         );
-        if matched {
-            count += 1;
-        }
+        total_score += score;
     }
 
-    count
+    total_score
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1956,11 +2051,13 @@ struct PipelineCtx {
     /// Used to enforce a cooldown period after detection to prevent rapid
     /// consecutive false triggers.
     last_wake_word_detection: Option<Instant>,
-    /// Consecutive successful DTW matches against enrolled templates
-    /// (mahbot-770 Fix 4).  Detection is only triggered when this counter
-    /// reaches [`CONSECUTIVE_MATCHES_REQUIRED`].  Reset to 0 on any failed
-    /// match or when the pipeline state is reset.
-    consecutive_wake_matches: usize,
+    /// Rolling window of per-frame soft scores from template matching
+    /// (mahbot-773).  Each element is the `total_score` (sum of sigmoid
+    /// scores across all K templates) for one embedding frame (~128ms of
+    /// speech).  Detection fires when the sum over this window reaches
+    /// [`match_threshold`].  Cleared entirely when a frame's score drops
+    /// below [`NO_MATCH_RESET_THRESHOLD`] to prevent noise accumulation.
+    score_window: Vec<f32>,
 }
 
 impl PipelineCtx {
@@ -1987,7 +2084,7 @@ impl PipelineCtx {
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
             last_model_retry: None,
             last_wake_word_detection: None,
-            consecutive_wake_matches: 0,
+            score_window: Vec::new(),
             vad_threshold: VAD_THRESHOLD,
         }
     }
@@ -2015,7 +2112,7 @@ impl PipelineCtx {
         self.enrollment_no_speech_frame_count = 0;
         self.vad_positives_in_a_row = 0;
         self.enrollment_pending = None;
-        self.consecutive_wake_matches = 0;
+        self.score_window.clear();
         self.vad_threshold = VAD_THRESHOLD;
         self.last_wake_word_detection = None;
         voice_state()
@@ -2601,9 +2698,9 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 ///
 /// Batching reduces ONNX inference calls from ~62/sec (per-frame) to ~8/sec.
 ///
-/// Implements cooldown (mahbot-770 Fix 2) and consecutive-match confirmation
-/// (mahbot-770 Fix 4) via the `last_wake_word_detection` and
-/// `consecutive_wake_matches` fields.
+/// Implements cooldown (mahbot-770 Fix 2) and soft-scoring + rolling window
+/// detection (mahbot-773) via the `last_wake_word_detection` and
+/// `score_window` fields.
 fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // ── Cooldown check (mahbot-770 Fix 2) ──
     // If we recently detected the wake word, skip ALL processing for this
@@ -2623,7 +2720,7 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
         ctx.voice_batch.clear();
         ctx.mel_frame_buffer.clear();
         ctx.embedding_ring.clear();
-        ctx.consecutive_wake_matches = 0;
+        ctx.score_window.clear();
         return;
     }
 
@@ -2805,11 +2902,13 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 
 /// Compute embedding from mel frames, push to ring buffer, and match against templates.
 ///
-/// Implements consecutive-match confirmation (mahbot-770 Fix 4): detection is
-/// only triggered after [`CONSECUTIVE_MATCHES_REQUIRED`] consecutive successful
-/// matches against enrolled templates.  The counter is reset on any failed
-/// match.  On detection, the cooldown timestamp is set (mahbot-770 Fix 2) and
-/// `voice_batch` is cleared to prevent stale audio from the next window.
+/// Implements soft scoring + rolling window detection (mahbot-773): each
+/// template contributes a sigmoid score (0.0–1.0) based on DTW distance;
+/// scores are summed across all templates and accumulated in a rolling window.
+/// Detection fires when the rolling sum exceeds [`match_threshold`].
+/// The window is reset entirely when a frame's score drops below
+/// [`NO_MATCH_RESET_THRESHOLD`] to prevent noise accumulation.
+/// On detection, the cooldown timestamp is set and `voice_batch` is cleared.
 ///
 /// Returns `true` if wake word was detected (caller should clear state and return).
 fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
@@ -2855,60 +2954,35 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
     }
 
     let templates = get_templates();
-    let match_count = if !templates.templates.is_empty() && !ctx.embedding_ring.is_empty() {
-        count_matching_templates(&ctx.embedding_ring, &templates)
+    let total_score = if !templates.templates.is_empty() && !ctx.embedding_ring.is_empty() {
+        score_matching_templates(&ctx.embedding_ring, &templates)
     } else {
-        0
+        0.0
     };
 
-    if match_count >= templates.minimum_matches {
-        // ── Consecutive match tracking (mahbot-770 Fix 4) ──
-        //
-        // With multi-template consensus (K=3, M=2), the counter only increments
-        // when ≥minimum_matches templates agree on a frame.  This creates a
-        // compound defense: random speech must simultaneously match multiple
-        // distinct temporal patterns for 3 consecutive windows.
-        ctx.consecutive_wake_matches += 1;
-        debug!(
-            "Wake word match: {match_count}/{}/{} consecutive_matches={}/{}",
-            templates.templates.len(),
-            templates.minimum_matches,
-            ctx.consecutive_wake_matches,
-            CONSECUTIVE_MATCHES_REQUIRED,
-        );
-
-        if ctx.consecutive_wake_matches >= CONSECUTIVE_MATCHES_REQUIRED {
-            info!(
-                "Wake word detected! (matches={match_count}/{}, consecutive_matches={})",
-                templates.minimum_matches, ctx.consecutive_wake_matches,
-            );
-            ctx.is_recording = true;
-            ctx.command_buffer.clear();
-            ctx.silence_sample_count = 0;
-            ctx.mel_frame_buffer.clear();
-            ctx.embedding_ring.clear();
-            ctx.audio_buffer.clear();
-            ctx.voice_batch.clear();
-            ctx.last_wake_word_detection = Some(Instant::now());
-            ctx.consecutive_wake_matches = 0;
-            set_status(VoiceStatus::Recording);
-            true
-        } else {
-            // Not enough consecutive matches yet — keep listening.
-            false
-        }
+    // ── Soft scoring + rolling window (mahbot-773) ──
+    //
+    // Delegates to `process_wake_word_score()` which encapsulates the
+    // no-match reset, score accumulation, window trimming, and threshold
+    // check.  Extracted into a pure function for direct unit testability.
+    if process_wake_word_score(
+        total_score,
+        &mut ctx.score_window,
+        templates.minimum_matches,
+    ) {
+        // Wake word detected — clear pipeline state and start recording.
+        ctx.is_recording = true;
+        ctx.command_buffer.clear();
+        ctx.silence_sample_count = 0;
+        ctx.mel_frame_buffer.clear();
+        ctx.embedding_ring.clear();
+        ctx.audio_buffer.clear();
+        ctx.voice_batch.clear();
+        ctx.score_window.clear();
+        ctx.last_wake_word_detection = Some(Instant::now());
+        set_status(VoiceStatus::Recording);
+        true
     } else {
-        // Not enough templates matched this frame — reset consecutive counter
-        if ctx.consecutive_wake_matches > 0 {
-            debug!(
-                "Wake word match lost after {}/{} consecutive matches \
-                 (matched {match_count}/{} templates)",
-                ctx.consecutive_wake_matches,
-                CONSECUTIVE_MATCHES_REQUIRED,
-                templates.minimum_matches,
-            );
-        }
-        ctx.consecutive_wake_matches = 0;
         false
     }
 }
@@ -3413,7 +3487,7 @@ mod tests {
             ctx.utterance_speech_end_len = 600;
             ctx.enrollment_no_speech_frame_count = 700;
             ctx.enrollment_pending = Some(vec![1.0; 50]);
-            ctx.consecutive_wake_matches = 3;
+            ctx.score_window = vec![1.5, 2.0, 0.8]; // simulated scores
             ctx.vad_positives_in_a_row = 2;
             ctx.vad_threshold = ENROLLMENT_VAD_THRESHOLD;
             ctx.last_wake_word_detection = Some(Instant::now());
@@ -3483,9 +3557,9 @@ mod tests {
                     .is_empty(),
                 "voice_state().enrollment_buffer should be cleared"
             );
-            assert_eq!(
-                ctx.consecutive_wake_matches, 0,
-                "consecutive_wake_matches should be reset to 0"
+            assert!(
+                ctx.score_window.is_empty(),
+                "score_window should be cleared"
             );
             assert!(
                 ctx.last_wake_word_detection.is_none(),
@@ -4013,11 +4087,11 @@ mod tests {
         );
     }
 
-    // ── count_matching_templates — sliding window (mahbot-755 Fix 5) ──
+    // ── score_matching_templates — sliding window (mahbot-773) ──
 
     #[test]
-    fn test_count_matching_templates_sliding_window() {
-        // The sliding window strategy in count_matching_templates compares
+    fn test_score_matching_templates_sliding_window() {
+        // The sliding window strategy in score_matching_templates compares
         // only the most recent `min(template.len, live.len)` embeddings
         // against each template.  This avoids length-asymmetry noise when
         // the ring buffer grows larger than the enrollment template.
@@ -4064,11 +4138,23 @@ mod tests {
         // Template length extracted before move into templates vec.
         const EXPECTED_WINDOW: usize = 3;
 
-        // count_matching_templates should window to the most recent
-        // min(3, 5) = 3 embeddings and find 1 matching template.
-        let count = count_matching_templates(&live_sequence, &templates);
+        // score_matching_templates should window to the most recent
+        // min(3, 5) = 3 embeddings and find matching_tpl scoring near 1.0
+        // while non_matching_tpl scores near 0.0.
+        let total_score = score_matching_templates(&live_sequence, &templates);
 
-        assert_eq!(count, 1, "should find exactly 1 matching template");
+        // The matching template should contribute ~1.0 (identical vectors,
+        // threshold=0.5, sigmoid(0, 0.5) ≈ 0.993).
+        // The non-matching template should contribute ~0.0 (opposite vectors,
+        // threshold=0.1, sigmoid(2.0, 0.1) ≈ 0.0).
+        assert!(
+            total_score > 0.9,
+            "matching template should contribute ~1.0, got {total_score}"
+        );
+        assert!(
+            total_score < 1.1,
+            "non-matching template should contribute ~0.0, got {total_score}"
+        );
 
         // Without sliding window, the noise embeddings would inflate DTW
         // past the threshold.  Verify that the window is actually being
@@ -4078,14 +4164,13 @@ mod tests {
             windowed_len, 3,
             "sliding window should be template length (3)"
         );
-        // The actual window used inside count_matching_templates:
+        // The actual window used inside score_matching_templates:
         let window = &live_sequence[live_sequence.len() - windowed_len..];
         assert_eq!(window.len(), 3, "windowed slice should have 3 elements");
     }
-
     #[test]
-    fn test_count_matching_templates_no_match() {
-        // Live sequence that does NOT match any template should return 0.
+    fn test_score_matching_templates_no_match() {
+        // Live sequence that does NOT match any template should return near 0.
         let tpl = WakeWordTemplate {
             name: "strict".into(),
             embeddings: vec![vec![1.0, 0.0, 0.0]],
@@ -4099,17 +4184,18 @@ mod tests {
 
         // Opposite-direction embedding will have cosine distance ≈ 2.0
         // (cosine distance of opposite unit vectors = 1 - (-1/1) = 2.0).
+        // sigmoid(10 * (2.0 - 0.01)) ≈ e^(-19.9) ≈ 0.0
         let live = vec![vec![-1.0, 0.0, 0.0]];
-        let count = count_matching_templates(&live, &templates);
-        assert_eq!(
-            count, 0,
-            "opposite vectors should not match tight threshold"
+        let total_score = score_matching_templates(&live, &templates);
+        assert!(
+            total_score < 0.01,
+            "opposite vectors should score near 0, got {total_score}"
         );
     }
 
     #[test]
-    fn test_count_matching_templates_empty_live() {
-        // Empty live sequence should not panic and should not match.
+    fn test_score_matching_templates_empty_live() {
+        // Empty live sequence should not panic and should return 0.0.
         let tpl = WakeWordTemplate {
             name: "any".into(),
             embeddings: vec![vec![1.0, 0.0, 0.0]],
@@ -4120,16 +4206,20 @@ mod tests {
             templates: vec![tpl],
             minimum_matches: 1,
         };
-        let count = count_matching_templates(&[], &templates);
-        assert_eq!(count, 0, "empty live should return 0 matches");
+
+        // Empty live — score must be 0.0
+        let total_score = score_matching_templates(&[], &templates);
+        assert!(
+            (total_score - 0.0).abs() < f32::EPSILON,
+            "empty live should score 0.0, got {total_score}"
+        );
     }
 
     #[test]
-    fn test_count_matching_templates_multi_template_consensus() {
-        // Multi-template consensus (K=3, M=2): verify that the match counter
-        // requires at least `minimum_matches` templates to agree.  This tests
-        // the compound defense where random speech must simultaneously match
-        // multiple distinct temporal patterns (mahbot-771 Part 2).
+    fn test_score_matching_templates_multi_template() {
+        // Multi-template scoring (K=3): verify that the total score
+        // correctly reflects how many templates match.  Templates that
+        // match well contribute ~1.0 each, non-matching contribute ~0.0.
 
         // Template 1: matches target pattern
         let tpl1 = WakeWordTemplate {
@@ -4156,29 +4246,135 @@ mod tests {
         // Live sequence matching templates 1 and 2 (not 3)
         let live = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
 
-        // With minimum_matches=2 and 2 matching templates out of 3, the
-        // consensus is reached.
-        let templates_consensus = WakeWordTemplates {
-            templates: vec![tpl1.clone(), tpl2.clone(), tpl3.clone()],
+        let templates = WakeWordTemplates {
+            templates: vec![tpl1, tpl2, tpl3],
             minimum_matches: 2,
         };
-        let count = count_matching_templates(&live, &templates_consensus);
-        assert_eq!(count, 2, "multi-template: 2 out of 3 should match");
-        assert!(
-            count >= templates_consensus.minimum_matches,
-            "consensus reached when count >= minimum_matches"
-        );
+        let total_score = score_matching_templates(&live, &templates);
 
-        // With minimum_matches=3 and only 2 matching, consensus fails.
-        let templates_need_three = WakeWordTemplates {
-            templates: vec![tpl1, tpl2, tpl3],
-            minimum_matches: 3,
-        };
-        let count = count_matching_templates(&live, &templates_need_three);
-        assert_eq!(count, 2, "still 2 matching templates");
+        // tpl1 (identical vectors): ~0.993
+        // tpl2 (cosine dist ≈ 0.1, threshold=0.5): ~0.982
+        // tpl3 (cosine dist ≈ 2.0, threshold=0.1): ~0.0
+        // Total ≈ 1.975
         assert!(
-            count < templates_need_three.minimum_matches,
-            "consensus must fail when count < minimum_matches"
+            total_score > 1.5,
+            "two matching templates should score > 1.5, got {total_score}"
+        );
+        assert!(
+            total_score < 2.5,
+            "non-matching template should add ~0, got {total_score}"
+        );
+    }
+
+    // ── process_wake_word_score — rolling window detection ────────────
+
+    #[test]
+    fn test_process_wake_word_score_below_reset_clears_window() {
+        // When total_score < NO_MATCH_RESET_THRESHOLD, the window should be
+        // cleared and the function should return false (no detection).
+        let mut window = vec![0.9, 0.8]; // previously accumulated scores
+        let detected = process_wake_word_score(0.1, &mut window, 1);
+        assert!(!detected, "below-reset score should not detect");
+        assert!(
+            window.is_empty(),
+            "below-reset score should clear the window"
+        );
+    }
+
+    #[test]
+    fn test_process_wake_word_score_below_reset_empty_window_stays_empty() {
+        // When total_score < NO_MATCH_RESET_THRESHOLD and the window is
+        // already empty, it should stay empty (no-op).
+        let mut window: Vec<f32> = Vec::new();
+        let detected = process_wake_word_score(0.1, &mut window, 1);
+        assert!(!detected);
+        assert!(window.is_empty(), "window should remain empty");
+    }
+
+    #[test]
+    fn test_process_wake_word_score_single_frame_not_enough() {
+        // A single good frame (score above NO_MATCH_RESET_THRESHOLD) with
+        // minimum_matches=2 needs rolling_sum >= 2*3*0.65 = 3.9.  One frame
+        // of score 1.5 is not enough.
+        let mut window: Vec<f32> = Vec::new();
+        let detected = process_wake_word_score(1.5, &mut window, 2);
+        assert!(!detected, "single frame should not reach M=2 threshold");
+        assert_eq!(window.len(), 1, "good frame should be appended to window");
+        assert!((window[0] - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_process_wake_word_score_accumulation_across_frames() {
+        // M=1, ROLLING_WINDOW_N=3 → threshold = 1 * 3 * 0.65 = 1.95.
+        // First frame of 0.7 is not enough.  Second frame of 0.8 makes
+        // rolling_sum = 1.5, still not enough.  Third frame of 0.6 makes
+        // rolling_sum = 2.1 > 1.95 → detection.
+        let mut window: Vec<f32> = Vec::new();
+
+        // Frame 1: score 0.7 → rolling_sum = 0.7 < 1.95 → no detection
+        let detected = process_wake_word_score(0.7, &mut window, 1);
+        assert!(!detected, "frame 1 should not detect yet");
+        assert_eq!(window.len(), 1);
+
+        // Frame 2: score 0.8 → rolling_sum = 0.7 + 0.8 = 1.5 < 1.95
+        let detected = process_wake_word_score(0.8, &mut window, 1);
+        assert!(!detected, "frame 2 should not detect yet");
+        assert_eq!(window.len(), 2);
+
+        // Frame 3: score 0.6 → rolling_sum = 0.7 + 0.8 + 0.6 = 2.1 >= 1.95 → detect
+        let detected = process_wake_word_score(0.6, &mut window, 1);
+        assert!(detected, "frame 3 should trigger detection");
+        assert_eq!(
+            window.len(),
+            3,
+            "window should have 3 scores before caller clears it"
+        );
+    }
+
+    #[test]
+    fn test_process_wake_word_score_window_trims_to_n() {
+        // With ROLLING_WINDOW_N=3, after 5 good scores the window should
+        // contain only the 3 most recent.
+        let mut window: Vec<f32> = Vec::new();
+        for _ in 0..5 {
+            process_wake_word_score(0.8, &mut window, 3);
+        }
+        assert_eq!(
+            window.len(),
+            ROLLING_WINDOW_N,
+            "window should be trimmed to ROLLING_WINDOW_N"
+        );
+        // All entries should be 0.8
+        for (i, &v) in window.iter().enumerate() {
+            assert!(
+                (v - 0.8).abs() < f32::EPSILON,
+                "window[{i}] should be 0.8, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_process_wake_word_score_borderline_below_reset() {
+        // Exactly at NO_MATCH_RESET_THRESHOLD should NOT reset (it's >= not >).
+        let mut window: Vec<f32> = Vec::new();
+        let detected = process_wake_word_score(NO_MATCH_RESET_THRESHOLD, &mut window, 1);
+        // Single score = 0.3, threshold = 1.95 for M=1 → no detection.
+        assert!(!detected, "at-threshold score should not reset");
+        assert_eq!(window.len(), 1, "at-threshold score should be appended");
+    }
+
+    #[test]
+    fn test_process_wake_word_score_exact_threshold_detects() {
+        // Rolling sum exactly equal to match_threshold should detect.
+        // M=1 → threshold = 1 * 3 * 0.65 = 1.95.
+        // Three frames of 0.65 each → rolling_sum = 1.95 exactly.
+        let mut window: Vec<f32> = Vec::new();
+        process_wake_word_score(0.65, &mut window, 1);
+        process_wake_word_score(0.65, &mut window, 1);
+        let detected = process_wake_word_score(0.65, &mut window, 1);
+        assert!(
+            detected,
+            "rolling sum exactly at match_threshold should detect"
         );
     }
 
@@ -5172,16 +5368,15 @@ mod tests {
         );
     }
 
-    // ── Consecutive match counter (mahbot-770 Fix 4) ──────────────────
+    // ── Rolling window + ring-buffer size invariants (mahbot-773) ─────
 
-    /// Compile-time invariant: EMBEDDING_RING_MAX must be large enough to hold
-    /// CONSECUTIVE_MATCHES_REQUIRED embeddings (the ring accumulates one
-    /// embedding per ~128ms of speech, so 3 consecutive matches need at least
-    /// 3 embeddings in the ring).
+    /// Compile-time invariant: EMBEDDING_RING_MAX must be at least
+    /// ROLLING_WINDOW_N so the ring buffer can supply enough embeddings
+    /// for matching while the rolling window accumulates scores.
     const _: () = assert!(
-        EMBEDDING_RING_MAX >= CONSECUTIVE_MATCHES_REQUIRED,
-        "EMBEDDING_RING_MAX must be >= CONSECUTIVE_MATCHES_REQUIRED to hold enough embeddings \
-         for consecutive matching"
+        EMBEDDING_RING_MAX >= ROLLING_WINDOW_N,
+        "EMBEDDING_RING_MAX must be >= ROLLING_WINDOW_N to hold enough embeddings \
+         for template matching"
     );
 
     // ── Cooldown constant sanity (mahbot-770 Fix 2) ───────────────────
