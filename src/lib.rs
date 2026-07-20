@@ -11,6 +11,7 @@
 )]
 
 pub(crate) mod agent;
+pub(crate) mod audio_preprocessor;
 pub mod board;
 pub mod channels;
 pub(crate) mod chat_history;

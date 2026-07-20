@@ -279,6 +279,12 @@ pub struct ConfigData {
     /// JSON-serialized wake word templates for voice assistant.
     /// Stored as a JSON array of [`crate::voice::WakeWordTemplate`] objects.
     pub wake_word_templates: Option<String>,
+    /// Enable noise suppression for voice input (default: `"true"`).
+    /// Uses the WebRTC-based `sonora-ns` denoiser before mel extraction.
+    pub voice_noise_suppression: Option<String>,
+    /// Enable RMS-based automatic gain control for voice input (default: `"true"`).
+    /// Normalises input volume before mel extraction.
+    pub voice_agc: Option<String>,
     /// Per-role model overrides.
     pub per_role_configs: Vec<RoleConfig>,
     /// Per-model provider routing.
@@ -500,6 +506,8 @@ string_config_fields! {
     audio_transcription_use_local [non_empty],
     voice_enabled [non_empty],
     wake_word_templates [non_empty],
+    voice_noise_suppression [non_empty],
+    voice_agc [non_empty],
 }
 
 impl ConfigData {

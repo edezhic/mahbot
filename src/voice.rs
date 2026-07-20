@@ -2288,6 +2288,9 @@ struct PipelineCtx {
     /// the 1.5s silence timeout fires, the ring has been overwritten with
     /// silence (mahbot-775 Fix 3).
     post_speech_tail: Vec<f32>,
+    /// Audio pre-processor for noise suppression and AGC.
+    /// Applied to every incoming audio chunk before VAD / mel extraction.
+    audio_preprocessor: crate::audio_preprocessor::AudioPreprocessor,
 }
 
 impl PipelineCtx {
@@ -2318,6 +2321,21 @@ impl PipelineCtx {
             vad_threshold: VAD_THRESHOLD,
             raw_audio_ring: Vec::new(),
             post_speech_tail: Vec::new(),
+            audio_preprocessor: {
+                use crate::audio_preprocessor::PreprocessorConfig;
+                let ns = CONFIG
+                    .voice_noise_suppression()
+                    .as_deref()
+                    .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
+                let agc = CONFIG
+                    .voice_agc()
+                    .as_deref()
+                    .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
+                crate::audio_preprocessor::AudioPreprocessor::new(PreprocessorConfig {
+                    noise_suppression: ns,
+                    agc,
+                })
+            },
         }
     }
 
@@ -2351,6 +2369,7 @@ impl PipelineCtx {
         self.post_speech_tail.clear();
         self.vad_threshold = VAD_THRESHOLD;
         self.last_wake_word_detection = None;
+        self.audio_preprocessor.clear_buffer();
         voice_state()
             .write()
             .unwrap_poison()
@@ -2421,6 +2440,10 @@ impl PipelineCtx {
         self.is_recording = false;
         self.enrollment_mode = false;
         self.auto_start_pending = false;
+        // Full reset of the audio pre-processor: the mic is being torn down,
+        // so the NS noise profile from this acoustic environment is no longer
+        // representative.  The next start_listening may be in a different room.
+        self.audio_preprocessor.reset();
         drop(self.mic_stream.take());
         self.mic_rx = None;
         set_status(VoiceStatus::Disabled);
@@ -2597,6 +2620,10 @@ pub async fn run_voice_pipeline() {
                     ctx.handle_stop_listening();
                     continue;
                 };
+
+                // Apply noise suppression and/or AGC pre-processing before
+                // the audio reaches VAD / mel extraction / enrollment.
+                let samples = ctx.audio_preprocessor.process(samples);
 
                 if ctx.enrollment_mode {
                     let (sample, total) = {
