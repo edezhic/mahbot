@@ -2049,16 +2049,37 @@ impl SettingsState {
             crate::voice::VoiceStatus::MicDisconnected => {
                 Text::new("Microphone disconnected").into()
             }
-            crate::voice::VoiceStatus::Enrolling { sample, total } => {
+            crate::voice::VoiceStatus::Enrolling {
+                sample,
+                total,
+                duration_ms,
+            } => {
                 let remaining = total.saturating_sub(sample);
                 let msg = if remaining > 0 {
+                    let duration_hint = if duration_ms > 0 {
+                        if duration_ms >= 2000 {
+                            format!(
+                                " — captured {}.{}s ✅",
+                                duration_ms / 1000,
+                                (duration_ms % 1000) / 100
+                            )
+                        } else {
+                            format!(
+                                " — captured {}.{}s ⚠ too short",
+                                duration_ms / 1000,
+                                (duration_ms % 1000) / 100
+                            )
+                        }
+                    } else {
+                        String::new()
+                    };
                     if remaining == 1 {
                         format!(
-                            "Sample {sample}/{total} — say the wake word once, then stay silent. 1 more time."
+                            "Sample {sample}/{total}{duration_hint} — say the wake word once, then stay silent. 1 more time."
                         )
                     } else {
                         format!(
-                            "Sample {sample}/{total} — say the wake word once, then stay silent. {remaining} more times."
+                            "Sample {sample}/{total}{duration_hint} — say the wake word once, then stay silent. {remaining} more times."
                         )
                     }
                 } else {

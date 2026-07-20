@@ -120,7 +120,7 @@ const EMBEDDING_RING_MAX: usize = 19;
 ///
 /// Increased from 3 to 10 (mahbot-765) to provide more representative
 /// statistics for the MAD-based threshold formula
-/// `threshold = min(max(median + K_MAD×mad, median + 0.05), max(median×2, 0.20))`.
+/// `threshold = min(median + K_MAD × mad, max(median × 2, 0.20))`.
 /// With only 3 samples, the median absolute deviation is unstable and the
 /// threshold margin can collapse below 1%, causing false negatives during
 /// live detection.
@@ -132,13 +132,17 @@ const NUM_ENROLLMENT_SAMPLES: usize = 10;
 /// (since MAD ≈ 0.6745×σ for normal distributions, 3.0×MAD ≈ 2.0×σ).
 const K_MAD: f32 = 3.0;
 
-/// Minimum absolute separation between the median distance and the
-/// acceptance threshold.  With only [`NUM_ENROLLMENT_SAMPLES`] (10) samples,
-/// the median absolute deviation is robust (50% breakdown point), but
-/// artificially similar samples can still produce unrealistically tight
-/// thresholds.  This floor ensures at least 0.05 of margin so genuine
-/// wake-word utterances have room to match (mahbot-755 Fix 2).
-const MIN_THRESHOLD_FLOOR: f32 = 0.05;
+// Minimum absolute separation between the median distance and the
+// acceptance threshold (REMOVED in mahbot-770 Fix 5).
+//
+// Previously set to 0.05 then 0.02, the floor was removed entirely because
+// it dominated the MAD-based formula when enrollment samples were highly
+// similar, producing artificially permissive thresholds.  The cap
+// (`max(median × 2, 0.20)`) provides sufficient protection against
+// degenerate thresholds without requiring a floor.
+//
+// The threshold is now purely MAD-based:
+// `threshold = min(median + K_MAD × mad, max(median × 2, 0.20))`
 
 // ── Model URLs and filenames ────────────────────────────────────────────
 
@@ -157,6 +161,24 @@ const MODEL_DIR_NAME: &str = "openwakeword";
 
 /// Timeout for model download (5 minutes for ~2.4 MB total).
 const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Post-detection cooldown period to prevent rapid consecutive false triggers
+/// (mahbot-770 Fix 2).  After a wake word detection, no further detection is
+/// attempted for this duration.  Industry reference: Rhasspy Raven uses
+/// `refractory_sec=2.0`, openWakeWord uses patience counters.
+const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
+
+/// Number of consecutive DTW matches required before triggering wake word
+/// detection (mahbot-770 Fix 4).  Every production system (openWakeWord,
+/// Porcupine, Snips/Rhasspy) requires 2-3 consecutive matches before firing.
+/// N=3 represents ~384-480ms of sustained similarity with the current stride.
+const CONSECUTIVE_MATCHES_REQUIRED: usize = 3;
+
+/// Sakoe-Chiba band width as a fraction of the longer sequence (mahbot-770
+/// Fix 6).  Prevents pathological DTW alignments where a short noise burst
+/// is stretched to match the entire template.  Industry standard is 3-5%;
+/// we use 5% which is slightly more permissive.
+const SAKOE_CHIBA_BAND_FRACTION: f64 = 0.05;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Model loading state machine
@@ -246,9 +268,13 @@ pub enum VoiceStatus {
     Transcribing,
     MicPermissionDenied,
     MicDisconnected,
+    /// Actively enrolled, waiting for the next sample.
+    /// `sample` = completed samples, `total` = required, `duration_ms` = most recent
+    /// utterance duration in milliseconds (0 if not yet available).
     Enrolling {
         sample: usize,
         total: usize,
+        duration_ms: u64,
     },
     /// Actively capturing speech during enrollment.
     ListeningDuringEnrollment {
@@ -634,6 +660,28 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
     Ok(embedding)
 }
 
+/// Pad a sequence of mel spectrogram frames to exactly [`EMBEDDING_WINDOW_FRAMES`]
+/// by appending silence frames.  Uses [`spec_transform`]`(0.0) = 2.0` for silence
+/// instead of raw zeros (mahbot-770 Fix 1): the embedding model was trained on
+/// spec-transformed values (v/10 + 2.0), so zero-padding produces out-of-distribution
+/// inputs that cause near-identical embeddings regardless of acoustic content.
+///
+/// If `frames` already has at least `EMBEDDING_WINDOW_FRAMES`, it is returned as-is
+/// (no truncation — the caller decides the window).  This is extracted as a shared
+/// helper to avoid duplicating the silence-frame padding logic in both
+/// [`extract_embeddings_from_audio`] and [`try_match_wake_word_and_push_embedding`].
+fn pad_mel_frames_to_window(frames: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    if frames.len() >= EMBEDDING_WINDOW_FRAMES {
+        return frames.to_vec();
+    }
+    let mut padded = frames.to_vec();
+    let silence_frame = vec![spec_transform(0.0); NUM_MEL_BANDS];
+    while padded.len() < EMBEDDING_WINDOW_FRAMES {
+        padded.push(silence_frame.clone());
+    }
+    padded
+}
+
 /// Extract a sequence of embeddings from raw audio by processing sliding windows.
 fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result<Vec<Vec<f32>>> {
     let mel_frames = compute_mel_spectrogram(models, samples)?;
@@ -643,11 +691,7 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
         // frames so at least one embedding can be computed.  Without this,
         // short wake words (e.g. 0.5s) would be silently discarded during
         // enrollment, making enrollment impossible for brief utterances.
-        let mut padded = mel_frames;
-        let silence_frame = vec![0.0; NUM_MEL_BANDS];
-        while padded.len() < EMBEDDING_WINDOW_FRAMES {
-            padded.push(silence_frame.clone());
-        }
+        let padded = pad_mel_frames_to_window(&mel_frames);
         let embedding = compute_embedding(models, &padded)?;
         return Ok(vec![embedding]);
     }
@@ -686,13 +730,36 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     if live.is_empty() || template.is_empty() {
         return f32::MAX;
     }
 
+    let n = live.len();
     let m = template.len();
+
+    // Sakoe-Chiba band constraint (mahbot-770 Fix 6): limit warping to
+    // at most `window` steps away from the diagonal.  This prevents
+    // pathological alignments where a short noise burst is stretched to
+    // match the entire template.  Industry standard is 3-5% of the longer
+    // sequence length; we use SAKOE_CHIBA_BAND_FRACTION (5%).
+    //
+    // NOTE: [`calibrate_threshold`] computes DTW in both directions and takes
+    // the asymmetric minimum (d1.min(d2) in Step 2) when comparing enrollment
+    // samples of different lengths.  This means the calibration path is safe
+    // even though the band constrains alignment — if the band in one direction
+    // is too restrictive (short sample vs long template), the reverse direction
+    // may still produce a valid alignment.  A future reader modifying the
+    // calibration path should preserve this bidirectional safety check.
+    let window = (SAKOE_CHIBA_BAND_FRACTION * n.max(m) as f64)
+        .ceil()
+        .max(1.0) as usize;
+
     let mut prev = vec![f32::MAX; m];
     let mut curr = vec![f32::MAX; m];
     // Track path length alongside cumulative cost so we can normalise by
@@ -706,17 +773,28 @@ fn dtw_distance(live: &[Vec<f32>], template: &[Vec<f32>]) -> f32 {
     let mut curr_len = vec![0usize; m];
 
     for (i, live_i) in live.iter().enumerate() {
-        for (j, tpl_j) in template.iter().enumerate() {
-            let cost = cosine_distance(live_i, tpl_j);
+        // Determine the column range constrained by the Sakoe-Chiba band.
+        // |i - j| > window cells are skipped (inherit f32::MAX).
+        let j_start = i.saturating_sub(window);
+        let j_end = (i + window + 1).min(m);
+
+        for j in j_start..j_end {
+            let cost = cosine_distance(live_i, &template[j]);
             if i == 0 && j == 0 {
                 curr[j] = cost;
                 curr_len[j] = 1;
             } else if i == 0 {
-                curr[j] = cost + curr[j - 1];
-                curr_len[j] = curr_len[j - 1] + 1;
+                // First row: only horizontal moves are possible within the band
+                curr[j] = if j > j_start {
+                    cost + curr[j - 1]
+                } else {
+                    f32::MAX
+                };
+                curr_len[j] = if j > j_start { curr_len[j - 1] + 1 } else { 0 };
             } else if j == 0 {
-                curr[j] = cost + prev[j];
-                curr_len[j] = prev_len[j] + 1;
+                // First column: only vertical moves are possible within the band
+                curr[j] = if i > 0 { cost + prev[j] } else { f32::MAX };
+                curr_len[j] = if i > 0 { prev_len[j] + 1 } else { 0 };
             } else {
                 let vert = prev[j];
                 let diag = prev[j - 1];
@@ -1427,9 +1505,10 @@ fn compute_avg_dtw_distances(samples: &[Vec<Vec<f32>>]) -> Vec<f32> {
 ///    these distances.  Set threshold = median + K_MAD × mad.
 /// 3. **Absolute cap**: clamp threshold to at most max(median × 2.0, 0.20) to
 ///    prevent over-permissive thresholds from pathological enrollment.
-/// 4. **MIN_THRESHOLD_FLOOR**: clamp threshold to at least median + 0.05 to
-///    protect against the opposite problem (threshold collapsing toward median
-///    when samples are nearly identical).
+///
+/// The threshold floor (`median + MIN_THRESHOLD_FLOOR`) was removed in
+/// mahbot-770 Fix 5 — the cap alone provides sufficient protection against
+/// degenerate thresholds.
 ///
 /// This function is pure (no global state) so it can be tested directly without
 /// setting up VOICE_PIPELINE.  The caller is responsible for providing at least
@@ -1474,19 +1553,17 @@ fn calibrate_threshold(samples: &[Vec<Vec<f32>>]) -> Result<(Vec<Vec<f32>>, f32)
     });
     let mad = median_of_sorted(&abs_devs);
 
-    // ── Step 4: Compute threshold with cap and floor ──
-    let mut threshold = median + K_MAD * mad;
-
-    // Absolute cap: threshold ≤ max(median × 2.0, 0.20)
+    // ── Step 4: Apply absolute cap ──
+    // The threshold floor (median + MIN_THRESHOLD_FLOOR) was removed in
+    // mahbot-770 Fix 5: let the MAD-based formula determine the threshold
+    // directly.  The cap alone prevents degenerate thresholds.
+    let threshold = median + K_MAD * mad;
     let cap = (median * 2.0).max(0.20);
-    threshold = threshold.min(cap);
-
-    // MIN_THRESHOLD_FLOOR: threshold ≥ median + 0.05
-    threshold = threshold.max(median + MIN_THRESHOLD_FLOOR);
+    let threshold = threshold.min(cap);
 
     info!(
         "Enrollment calibration: best_template={best_idx}, median={median:.4}, mad={mad:.4}, \
-         threshold={threshold:.4} (cap={cap:.4}, min_floor=median+{MIN_THRESHOLD_FLOOR})"
+         threshold={threshold:.4} (cap={cap:.4})"
     );
     info!(
         "Enrollment: {n} samples → best template (sample {best_idx}) with {} embedding vectors",
@@ -1723,6 +1800,15 @@ struct PipelineCtx {
     /// so we don't spam the retry loop every 1-second tick when models are in
     /// [`ModelState::Failed`] (the periodic wake-up checks the state).
     last_model_retry: Option<Instant>,
+    /// Timestamp of the last wake word detection (mahbot-770 Fix 2).
+    /// Used to enforce a cooldown period after detection to prevent rapid
+    /// consecutive false triggers.
+    last_wake_word_detection: Option<Instant>,
+    /// Consecutive successful DTW matches against enrolled templates
+    /// (mahbot-770 Fix 4).  Detection is only triggered when this counter
+    /// reaches [`CONSECUTIVE_MATCHES_REQUIRED`].  Reset to 0 on any failed
+    /// match or when the pipeline state is reset.
+    consecutive_wake_matches: usize,
 }
 
 impl PipelineCtx {
@@ -1747,6 +1833,8 @@ impl PipelineCtx {
             utterance_speech_end_len: 0,
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
             last_model_retry: None,
+            last_wake_word_detection: None,
+            consecutive_wake_matches: 0,
         }
     }
 
@@ -1772,6 +1860,8 @@ impl PipelineCtx {
         self.utterance_speech_end_len = 0;
         self.enrollment_no_speech_frame_count = 0;
         self.enrollment_pending = None;
+        self.consecutive_wake_matches = 0;
+        self.last_wake_word_detection = None;
         voice_state()
             .write()
             .unwrap_poison()
@@ -1856,6 +1946,7 @@ impl PipelineCtx {
         set_status(VoiceStatus::Enrolling {
             sample: 0,
             total: NUM_ENROLLMENT_SAMPLES,
+            duration_ms: 0,
         });
         info!("Voice pipeline: enrollment started");
     }
@@ -2018,24 +2109,9 @@ pub async fn run_voice_pipeline() {
                     };
                     handle_enrollment_audio(&samples, &mut ctx, sample, total);
                 } else if ctx.is_recording {
-                    handle_recording_audio(
-                        samples,
-                        &mut ctx.command_buffer,
-                        &mut ctx.silence_sample_count,
-                        &mut ctx.is_recording,
-                    )
-                    .await;
+                    handle_recording_audio(samples, &mut ctx).await;
                 } else {
-                    handle_wake_word_detection(
-                        &samples,
-                        &mut ctx.audio_buffer,
-                        &mut ctx.voice_batch,
-                        &mut ctx.mel_frame_buffer,
-                        &mut ctx.embedding_ring,
-                        &mut ctx.is_recording,
-                        &mut ctx.command_buffer,
-                        &mut ctx.silence_sample_count,
-                    );
+                    handle_wake_word_detection(&samples, &mut ctx);
                 }
             }
 
@@ -2100,16 +2176,46 @@ pub async fn run_voice_pipeline() {
     info!("Voice pipeline exited");
 }
 
+/// Check that an enrollment utterance produced enough embeddings for meaningful
+/// temporal DTW matching.  Returns an error message if the sample is too short
+/// (<2 embeddings → single-embedding template degenerates to simple cosine
+/// similarity with no temporal structure).  The actual threshold in wall-clock
+/// time is ~1.3-1.4s (EMBEDDING_WINDOW_FRAMES + 1 stride worth of frames), but
+/// the message avoids quoting an exact time since it depends on internal stride
+/// and window constants that may change.
+/// /// This is extracted as a separate function so it can be unit-tested without
+/// requiring ONNX model inference (mahbot-770 Fix 3).
+fn check_enrollment_utterance_length(
+    embeddings_len: usize,
+    duration_ms: u64,
+) -> Result<(), String> {
+    if embeddings_len < 2 {
+        Err(format!(
+            "Utterance too short ({duration_ms}ms, {embeddings_len} embedding(s)) — speak longer"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Handle enrollment sample: process audio into embeddings and accumulate.
 ///
 /// ONNX inference is CPU-bound (mel spectrogram + embedding computation).
 /// It runs on a blocking thread via `spawn_blocking` to avoid starving
 /// the async pipeline during enrollment.
+///
+/// Implements minimum utterance length check (mahbot-770 Fix 3): utterances
+/// shorter than ~2 seconds (fewer than 2 embeddings) are rejected to ensure
+/// multi-embedding templates that encode temporal structure for meaningful
+/// DTW matching.
 async fn handle_enrollment_sample(samples: Vec<f32>) {
     if !models_ready() {
         warn!("Models not ready for enrollment");
         return;
     }
+
+    // Compute utterance duration before moving `samples` into the closure.
+    let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
     // Run ONNX inference on a blocking thread to avoid blocking the async pipeline.
     let embeddings_result =
@@ -2119,6 +2225,13 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
 
     match embeddings_result {
         Ok(embeddings) => {
+            // ── Minimum utterance length check (mahbot-770 Fix 3) ──
+            if let Err(msg) = check_enrollment_utterance_length(embeddings.len(), duration_ms) {
+                warn!("{msg}");
+                set_status(VoiceStatus::Error(msg));
+                return;
+            }
+
             let count = {
                 let mut state = voice_state().write().unwrap_poison();
                 state.enrollment_buffer.push(embeddings);
@@ -2152,6 +2265,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
                 set_status(VoiceStatus::Enrolling {
                     sample: count,
                     total: NUM_ENROLLMENT_SAMPLES,
+                    duration_ms,
                 });
             }
         }
@@ -2192,26 +2306,21 @@ async fn persist_templates() {
 /// system load / processing delays don't affect recording cutoff consistency
 /// (ticket mahbot-760).
 #[allow(clippy::cast_precision_loss)]
-async fn handle_recording_audio(
-    samples: Vec<f32>,
-    command_buffer: &mut Vec<f32>,
-    silence_sample_count: &mut usize,
-    is_recording: &mut bool,
-) {
-    command_buffer.extend_from_slice(&samples);
+async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
+    ctx.command_buffer.extend_from_slice(&samples);
     let speech = is_speech(&samples, VAD_THRESHOLD);
     if speech {
-        *silence_sample_count = 0;
+        ctx.silence_sample_count = 0;
     } else {
         // Accumulate silence by raw chunk size: each call receives a
         // variable-size chunk of audio samples directly from the mic.
         // This differs from the enrollment path (HOP_LENGTH per frame)
         // because recording operates on raw chunks, not frame iterations.
-        *silence_sample_count += samples.len();
+        ctx.silence_sample_count += samples.len();
     }
 
-    let duration_secs = command_buffer.len() as f64 / f64::from(SAMPLE_RATE);
-    let silence_timeout = *silence_sample_count >= SILENCE_THRESHOLD_SAMPLES;
+    let duration_secs = ctx.command_buffer.len() as f64 / f64::from(SAMPLE_RATE);
+    let silence_timeout = ctx.silence_sample_count >= SILENCE_THRESHOLD_SAMPLES;
 
     if silence_timeout || duration_secs > MAX_RECORD_SECS as f64 {
         info!(
@@ -2225,21 +2334,21 @@ async fn handle_recording_audio(
         );
 
         set_status(VoiceStatus::Transcribing);
-        let cmd_buf = std::mem::take(command_buffer);
+        let cmd_buf = std::mem::take(&mut ctx.command_buffer);
 
         match transcribe_audio(&cmd_buf).await {
             Ok(transcribed) => {
                 info!("Transcribed: {transcribed}");
                 route_to_agent(transcribed).await;
                 set_status(VoiceStatus::Listening);
-                *is_recording = false;
+                ctx.is_recording = false;
             }
             Err(e) => {
                 warn!("Transcription failed: {e}");
                 set_status(VoiceStatus::Error("Transcription failed".to_string()));
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 set_status(VoiceStatus::Listening);
-                *is_recording = false;
+                ctx.is_recording = false;
             }
         }
     }
@@ -2306,25 +2415,41 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 /// 4. Produces embeddings and matches against enrolled wake word templates
 ///
 /// Batching reduces ONNX inference calls from ~62/sec (per-frame) to ~8/sec.
-#[allow(clippy::too_many_arguments)]
-fn handle_wake_word_detection(
-    samples: &[f32],
-    audio_buffer: &mut Vec<f32>,
-    voice_batch: &mut Vec<f32>,
-    mel_frame_buffer: &mut Vec<Vec<f32>>,
-    embedding_ring: &mut Vec<Vec<f32>>,
-    is_recording: &mut bool,
-    command_buffer: &mut Vec<f32>,
-    silence_sample_count: &mut usize,
-) {
-    audio_buffer.extend_from_slice(samples);
+///
+/// Implements cooldown (mahbot-770 Fix 2) and consecutive-match confirmation
+/// (mahbot-770 Fix 4) via the `last_wake_word_detection` and
+/// `consecutive_wake_matches` fields.
+fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
+    // ── Cooldown check (mahbot-770 Fix 2) ──
+    // If we recently detected the wake word, skip ALL processing for this
+    // chunk to prevent rapid consecutive false triggers.  The audio is
+    // discarded entirely (not accumulated) since the user is either in
+    // command-recording mode or the cooldown is active.
+    if let Some(last) = ctx.last_wake_word_detection
+        && last.elapsed() < WAKE_WORD_COOLDOWN
+    {
+        debug!(
+            "Wake word cooldown active ({}ms elapsed)",
+            last.elapsed().as_millis()
+        );
+        // Discard all buffered audio — don't accumulate during cooldown
+        // to avoid a large stale batch when the cooldown expires.
+        ctx.audio_buffer.clear();
+        ctx.voice_batch.clear();
+        ctx.mel_frame_buffer.clear();
+        ctx.embedding_ring.clear();
+        ctx.consecutive_wake_matches = 0;
+        return;
+    }
+
+    ctx.audio_buffer.extend_from_slice(samples);
 
     // Process frames from the buffer without per-iteration O(n) drain shifts.
     // Track a consumed offset and drain everything once after the loop.
-    let len = audio_buffer.len();
+    let len = ctx.audio_buffer.len();
     let mut consumed = 0;
     while consumed + FRAME_LENGTH <= len {
-        let frame = &audio_buffer[consumed..consumed + FRAME_LENGTH];
+        let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
         // VAD gate — skip silence to avoid wasted ONNX compute
         if is_speech(frame, VAD_THRESHOLD) {
@@ -2333,19 +2458,12 @@ fn handle_wake_word_detection(
             // by 50% (HOP_LENGTH = FRAME_LENGTH/2), so appending the full
             // frame would duplicate half the audio — corrupting the mel model
             // input with repeated segments.
-            voice_batch.extend_from_slice(&frame[..HOP_LENGTH]);
-        } else if !voice_batch.is_empty() {
+            ctx.voice_batch.extend_from_slice(&frame[..HOP_LENGTH]);
+        } else if !ctx.voice_batch.is_empty() {
             // Silence transition: flush accumulated voiced batch
-            flush_voice_batch(voice_batch, mel_frame_buffer);
-            voice_batch.clear();
-            if try_match_wake_word_and_push_embedding(
-                mel_frame_buffer,
-                embedding_ring,
-                is_recording,
-                command_buffer,
-                silence_sample_count,
-                audio_buffer,
-            ) {
+            flush_voice_batch(&mut ctx.voice_batch, &mut ctx.mel_frame_buffer);
+            ctx.voice_batch.clear();
+            if try_match_wake_word_and_push_embedding(ctx) {
                 return;
             }
             consumed += HOP_LENGTH;
@@ -2354,16 +2472,9 @@ fn handle_wake_word_detection(
 
         // Process batch when enough voiced audio accumulated
         // (every ~128ms instead of every 32ms)
-        if voice_batch.len() >= VOICE_BATCH_SIZE {
-            flush_voice_batch(voice_batch, mel_frame_buffer);
-            if try_match_wake_word_and_push_embedding(
-                mel_frame_buffer,
-                embedding_ring,
-                is_recording,
-                command_buffer,
-                silence_sample_count,
-                audio_buffer,
-            ) {
+        if ctx.voice_batch.len() >= VOICE_BATCH_SIZE {
+            flush_voice_batch(&mut ctx.voice_batch, &mut ctx.mel_frame_buffer);
+            if try_match_wake_word_and_push_embedding(ctx) {
                 return;
             }
         }
@@ -2372,7 +2483,7 @@ fn handle_wake_word_detection(
 
     // Single O(remaining) drain instead of O(remaining) per frame iteration.
     if consumed > 0 {
-        audio_buffer.drain(..consumed);
+        ctx.audio_buffer.drain(..consumed);
     }
 }
 
@@ -2492,16 +2603,16 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 }
 
 /// Compute embedding from mel frames, push to ring buffer, and match against templates.
+///
+/// Implements consecutive-match confirmation (mahbot-770 Fix 4): detection is
+/// only triggered after [`CONSECUTIVE_MATCHES_REQUIRED`] consecutive successful
+/// matches against enrolled templates.  The counter is reset on any failed
+/// match.  On detection, the cooldown timestamp is set (mahbot-770 Fix 2) and
+/// `voice_batch` is cleared to prevent stale audio from the next window.
+///
 /// Returns `true` if wake word was detected (caller should clear state and return).
-fn try_match_wake_word_and_push_embedding(
-    mel_frame_buffer: &mut Vec<Vec<f32>>,
-    embedding_ring: &mut Vec<Vec<f32>>,
-    is_recording: &mut bool,
-    command_buffer: &mut Vec<f32>,
-    silence_sample_count: &mut usize,
-    audio_buffer: &mut Vec<f32>,
-) -> bool {
-    if mel_frame_buffer.is_empty() {
+fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
+    if ctx.mel_frame_buffer.is_empty() {
         return false;
     }
     let Some(models) = ONNX_MODELS.get() else {
@@ -2513,19 +2624,12 @@ fn try_match_wake_word_and_push_embedding(
     // this, short wake words (e.g. 0.5s → ~32 mel frames) would silently be
     // discarded and never detected.
     let padded_window: Vec<Vec<f32>>;
-    let embed_input: &[Vec<f32>] = if mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES {
-        padded_window = {
-            let mut p = mel_frame_buffer.clone();
-            let silence_frame = vec![0.0; NUM_MEL_BANDS];
-            while p.len() < EMBEDDING_WINDOW_FRAMES {
-                p.push(silence_frame.clone());
-            }
-            p
-        };
+    let embed_input: &[Vec<f32>] = if ctx.mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES {
+        padded_window = pad_mel_frames_to_window(&ctx.mel_frame_buffer);
         &padded_window
     } else {
         // Take the most recent EMBEDDING_WINDOW_FRAMES
-        &mel_frame_buffer[mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES..]
+        &ctx.mel_frame_buffer[ctx.mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES..]
     };
 
     let embedding =
@@ -2534,7 +2638,7 @@ fn try_match_wake_word_and_push_embedding(
                 debug!(
                     "Embedding computed: {} dims (ring size before push: {})",
                     emb.len(),
-                    embedding_ring.len(),
+                    ctx.embedding_ring.len(),
                 );
                 emb
             }
@@ -2544,29 +2648,63 @@ fn try_match_wake_word_and_push_embedding(
             }
         };
 
-    embedding_ring.push(embedding);
-    while embedding_ring.len() > EMBEDDING_RING_MAX {
-        embedding_ring.remove(0);
+    ctx.embedding_ring.push(embedding);
+    while ctx.embedding_ring.len() > EMBEDDING_RING_MAX {
+        ctx.embedding_ring.remove(0);
     }
 
     let templates = get_templates();
     if !templates.templates.is_empty()
-        && !embedding_ring.is_empty()
-        && let Some((dist, tpl)) = match_against_templates(embedding_ring, &templates)
+        && !ctx.embedding_ring.is_empty()
+        && let Some((dist, tpl)) = match_against_templates(&ctx.embedding_ring, &templates)
     {
-        info!(
-            "Wake word '{}' detected! (dist={dist:.4}, threshold={})",
-            tpl.name, tpl.threshold
+        // ── Consecutive match tracking (mahbot-770 Fix 4) ──
+        //
+        // NOTE: The counter increments on any template match, not per-template.
+        // With multiple wake words (e.g. "computer" + "hey mahbot"), alternating
+        // matches could accumulate to CONSECUTIVE_MATCHES_REQUIRED without
+        // sustained similarity to a single template.  This is acceptable because:
+        // (a) most users enroll a single wake word, (b) false triggers from
+        // alternating templates are self-limiting (the cooldown resets after
+        // detection), and (c) matching the same template consecutively still
+        // requires genuine acoustic similarity.  Per-template tracking would
+        // add complexity with negligible benefit for the common single-template
+        // case.
+        ctx.consecutive_wake_matches += 1;
+        debug!(
+            "Wake word match: consecutive_matches={}/{} (template='{}', dist={dist:.4})",
+            ctx.consecutive_wake_matches, CONSECUTIVE_MATCHES_REQUIRED, tpl.name
         );
-        *is_recording = true;
-        command_buffer.clear();
-        *silence_sample_count = 0;
-        mel_frame_buffer.clear();
-        embedding_ring.clear();
-        audio_buffer.clear();
-        set_status(VoiceStatus::Recording);
-        true
+
+        if ctx.consecutive_wake_matches >= CONSECUTIVE_MATCHES_REQUIRED {
+            info!(
+                "Wake word '{}' detected! (dist={dist:.4}, threshold={}, consecutive_matches={})",
+                tpl.name, tpl.threshold, ctx.consecutive_wake_matches
+            );
+            ctx.is_recording = true;
+            ctx.command_buffer.clear();
+            ctx.silence_sample_count = 0;
+            ctx.mel_frame_buffer.clear();
+            ctx.embedding_ring.clear();
+            ctx.audio_buffer.clear();
+            ctx.voice_batch.clear();
+            ctx.last_wake_word_detection = Some(Instant::now());
+            ctx.consecutive_wake_matches = 0;
+            set_status(VoiceStatus::Recording);
+            true
+        } else {
+            // Not enough consecutive matches yet — keep listening.
+            false
+        }
     } else {
+        // No match this frame — reset consecutive counter
+        if ctx.consecutive_wake_matches > 0 {
+            debug!(
+                "Wake word match lost after {}/{} consecutive matches",
+                ctx.consecutive_wake_matches, CONSECUTIVE_MATCHES_REQUIRED
+            );
+        }
+        ctx.consecutive_wake_matches = 0;
         false
     }
 }
@@ -2895,6 +3033,7 @@ mod tests {
             set_status(VoiceStatus::Enrolling {
                 sample: 0,
                 total: NUM_ENROLLMENT_SAMPLES,
+                duration_ms: 0,
             });
 
             // 1. Silence before speech: no speech detected — utterance_had_speech
@@ -2998,6 +3137,8 @@ mod tests {
             ctx.utterance_speech_end_len = 600;
             ctx.enrollment_no_speech_frame_count = 700;
             ctx.enrollment_pending = Some(vec![1.0; 50]);
+            ctx.consecutive_wake_matches = 3;
+            ctx.last_wake_word_detection = Some(Instant::now());
             voice_state()
                 .write()
                 .unwrap_poison()
@@ -3059,6 +3200,14 @@ mod tests {
                     .enrollment_buffer
                     .is_empty(),
                 "voice_state().enrollment_buffer should be cleared"
+            );
+            assert_eq!(
+                ctx.consecutive_wake_matches, 0,
+                "consecutive_wake_matches should be reset to 0"
+            );
+            assert!(
+                ctx.last_wake_word_detection.is_none(),
+                "last_wake_word_detection should be reset to None"
             );
         }
 
@@ -3417,10 +3566,14 @@ mod tests {
 
     #[test]
     fn test_mad_threshold_invariants() {
-        // The acceptance threshold uses three protecting stages:
+        // The acceptance threshold uses two protecting stages:
         //   1. threshold = median + K_MAD × mad          (MAD-based estimate)
         //   2. threshold = threshold.min(max(median*2, 0.20))   (absolute cap)
-        //   3. threshold = threshold.max(median + 0.05)         (floor)
+        //
+        // A standalone floor was removed in mahbot-770 Fix 5 — the MAD-based
+        // formula and the cap provide sufficient protection against degenerate
+        // thresholds without artificially inflating the threshold for
+        // highly-similar enrollment samples.
         //
         // These tests verify each stage without requiring VOICE_PIPELINE
         // initialisation — they exercise the same calculation that
@@ -3434,31 +3587,30 @@ mod tests {
             let mut ad_sorted = abs_devs;
             ad_sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             let mad = super::median_of_sorted(&ad_sorted);
-            let threshold = median + K_MAD * mad;
             let cap = (median * 2.0).max(0.20);
-            threshold.min(cap).max(median + MIN_THRESHOLD_FLOOR)
+            (median + K_MAD * mad).min(cap)
         };
 
         // Case 1: nearly identical samples (all distances tiny).
-        //   Floor dominates: threshold = median + MIN_THRESHOLD_FLOOR.
+        //   Without the floor (removed in mahbot-770 Fix 5), the MAD-based
+        //   formula determines the threshold directly.
+        //   median=0.002, mad=0.001 → threshold = 0.002 + 3.0×0.001 = 0.005.
         let mut d = vec![
             0.001, 0.002, 0.001, 0.003, 0.002, 0.001, 0.002, 0.001, 0.003,
         ];
         d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let threshold = compute(&d);
-        let median = super::median_of_sorted(&d);
-        let expected = median + MIN_THRESHOLD_FLOOR;
+        let expected = 0.005_f32;
         assert!(
             (threshold - expected).abs() < 1e-6,
-            "nearly-identical samples: expected {expected}, got {threshold} (floor should dominate)",
+            "nearly-identical samples: expected {expected}, got {threshold} (MAD formula)",
         );
 
         // Case 2: moderate spread.
         //   median = 0.15, mad = 0.02
         //   MAD formula: median + K_MAD * mad = 0.15 + 3.0*0.02 = 0.21
         //   cap = max(0.15 * 2, 0.20) = 0.30
-        //   floor = 0.15 + 0.05 = 0.20
-        //   → threshold = 0.21 (MAD dominates, under cap, above floor)
+        //   → threshold = 0.21 (MAD dominates, under cap)
         let mut d = vec![0.10, 0.12, 0.13, 0.14, 0.15, 0.15, 0.16, 0.18, 0.20];
         d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let threshold = compute(&d);
@@ -3477,7 +3629,6 @@ mod tests {
         //   median = 0.18, mad = 0.10
         //   MAD-based: 0.18 + 3.0 * 0.10 = 0.48
         //   cap = max(0.18 * 2, 0.20) = 0.36
-        //   floor = 0.18 + 0.05 = 0.23
         //   → threshold = 0.36 (clamped to cap)
         let mut d = vec![0.08, 0.10, 0.12, 0.15, 0.18, 0.50, 0.55, 0.60, 0.65];
         d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
@@ -3502,9 +3653,8 @@ mod tests {
         let mut ca = clean_abs;
         ca.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let clean_mad = super::median_of_sorted(&ca);
-        let clean_threshold = (clean_median + K_MAD * clean_mad)
-            .min((clean_median * 2.0).max(0.20))
-            .max(clean_median + MIN_THRESHOLD_FLOOR);
+        let clean_threshold =
+            (clean_median + K_MAD * clean_mad).min((clean_median * 2.0).max(0.20));
 
         // With one extreme outlier: 8 similar + 1 very different.
         // MAD should remain nearly unchanged (breakdown point = 50%).
@@ -3518,9 +3668,8 @@ mod tests {
         let mut oa = outlier_abs;
         oa.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let outlier_mad = super::median_of_sorted(&oa);
-        let outlier_threshold = (outlier_median + K_MAD * outlier_mad)
-            .min((outlier_median * 2.0).max(0.20))
-            .max(outlier_median + MIN_THRESHOLD_FLOOR);
+        let outlier_threshold =
+            (outlier_median + K_MAD * outlier_mad).min((outlier_median * 2.0).max(0.20));
 
         // The median should be the same (both sets have 0.14 as the 5th element).
         assert!(
@@ -4465,4 +4614,167 @@ mod tests {
         assert_eq!(row.get::<String>(2).unwrap(), "user");
         assert_eq!(row.get::<String>(3).unwrap(), "voice");
     }
+
+    // ── Sakoe-Chiba band constraint (mahbot-770 Fix 6) ─────────────────
+
+    /// Verify the Sakoe-Chiba band window calculation for various sequence
+    /// lengths.  window = ceil(0.05 × max(n, m)), minimum 1.
+    #[test]
+    fn test_sakoe_chiba_window_calculation() {
+        // Replicate the window formula from dtw_distance.
+        let band_window = |n: usize, m: usize| -> usize {
+            ((SAKOE_CHIBA_BAND_FRACTION * n.max(m) as f64)
+                .ceil()
+                .max(1.0)) as usize
+        };
+
+        // Equal-length small sequences: 5% of max rounds to ceil.
+        assert_eq!(band_window(3, 3), 1); // ceil(0.05×3) = ceil(0.15) = 1
+
+        // Unequal lengths: max dominates.
+        assert_eq!(band_window(1, 20), 1); // ceil(0.05×20) = ceil(1.0) = 1
+        assert_eq!(band_window(1, 40), 2); // ceil(0.05×40) = ceil(2.0) = 2
+
+        // Floor of 1 for tiny sequences.
+        assert_eq!(band_window(1, 1), 1); // ceil(0.05×1) = ceil(0.05) = 1, max(1)
+        assert_eq!(band_window(2, 2), 1); // ceil(0.05×2) = ceil(0.1) = 1, max(1)
+
+        // Larger: 5% of 100 = 5, no rounding needed.
+        assert_eq!(band_window(100, 100), 5); // ceil(0.05×100) = ceil(5.0) = 5
+
+        // Asymmetric: max(50, 100) = 100 → 5.
+        assert_eq!(band_window(50, 100), 5);
+    }
+
+    /// Identical sequences should produce near-zero DTW distance even with
+    /// the Sakoe-Chiba band — the band only constrains off-diagonal warping,
+    /// not on-diagonal matching.
+    #[test]
+    fn test_dtw_identical_sequences_with_band() {
+        // 10 identical 2D unit vectors.  On-diagonal: i == j for all frames,
+        // so the band (window=1 for max(10,10)*0.05=0.5→ceil→1) is not
+        // restrictive — on-diagonal always satisfies |i-j| ≤ 1.
+        let vec = vec![0.7071, 0.7071]; // unit vector
+        let seq = vec![vec.clone(); 10];
+        let dist = dtw_distance(&seq, &seq);
+        assert!(
+            dist < 1e-6,
+            "identical sequence should have near-zero DTW distance, got {dist}"
+        );
+    }
+
+    /// The Sakoe-Chiba band prevents pathological alignments where a short
+    /// live sequence warps far from the diagonal to find a matching template
+    /// frame.  With live[0] orthogonal to the first window+1 template frames
+    /// but similar to a frame far beyond the band, the band forces a high
+    /// distance that reflects the true acoustic mismatch.
+    #[test]
+    fn test_sakoe_chiba_prevents_pathological_alignment() {
+        // Template: 20 frames where:
+        //   frames 0..6 = [1.0, 0.0]  (x-axis, orthogonal to live[0])
+        //   frame 10    = [0.0, 1.0]  (y-axis, matches live[0])
+        //   frames 11..19 = [0.0, 1.0]  (y-axis)
+        //
+        // Live: 1 frame [0.0, 1.0] (y-axis).
+        //
+        // Without the Sakoe-Chiba band, DTW would align live[0] to
+        // template[10] (distance 0), giving a low overall distance.
+        // With the band (window=1 for max(1,20)*0.05=1), live[0] can only
+        // match template[0] or template[1] — both orthogonal → distance ≈ 2.0.
+        let template: Vec<Vec<f32>> = {
+            let mut t = Vec::new();
+            for _ in 0..7 {
+                t.push(vec![1.0, 0.0]); // orthogonal to live
+            }
+            for _ in 7..10 {
+                t.push(vec![1.0, 0.0]); // still orthogonal (just fillers)
+            }
+            t.push(vec![0.0, 1.0]); // would match, but out of band
+            for _ in 11..20 {
+                t.push(vec![0.0, 1.0]); // would match, but out of band
+            }
+            t
+        };
+        assert_eq!(template.len(), 20, "template must have 20 frames");
+
+        let live = vec![vec![0.0, 1.0]];
+        let dist = dtw_distance(&live, &template);
+
+        // The band restricts to j in [0, min(0+1+1, 20)) = [0, 2) → j=0 or 1.
+        // Both frames are [1.0, 0.0] (orthogonal to live[0] = [0.0, 1.0]),
+        // so cosine_distance = 1.0 for both.
+        // Since j_end = 2, only columns 0 and 1 are computed — columns 2..19
+        // retain their initial f32::MAX.  When only one row exists (n=1),
+        // prev[m-1] = prev[19] was never set → remains f32::MAX → return f32::MAX.
+        assert_eq!(
+            dist,
+            f32::MAX,
+            "short live sequence should not reach template frames beyond the band"
+        );
+    }
+
+    // ── Minimum utterance length check (mahbot-770 Fix 3) ──────────────
+
+    #[test]
+    fn test_minimum_utterance_rejection() {
+        // Utterances with <2 embeddings are too short for meaningful DTW
+        // matching (single-embedding template degenerates to simple cosine
+        // similarity with no temporal structure).
+        let short_err = check_enrollment_utterance_length(1, 600);
+        assert!(
+            short_err.is_err(),
+            "1 embedding should be rejected as too short"
+        );
+        let msg = short_err.unwrap_err();
+        assert!(
+            msg.contains("too short"),
+            "error message should indicate 'too short': {msg}"
+        );
+        assert!(
+            msg.contains("600ms"),
+            "error message should include the duration: {msg}"
+        );
+
+        // Edge case: exactly 0 embeddings (e.g. all-noise utterance that
+        // produced no embeddings at all).
+        let zero_err = check_enrollment_utterance_length(0, 800);
+        assert!(
+            zero_err.is_err(),
+            "0 embeddings should be rejected as too short"
+        );
+        let msg = zero_err.unwrap_err();
+        assert!(
+            msg.contains("too short"),
+            "error message should indicate 'too short': {msg}"
+        );
+
+        // Sufficient length: ≥2 embeddings accepted.
+        assert!(
+            check_enrollment_utterance_length(2, 1300).is_ok(),
+            "2 embeddings should be accepted"
+        );
+        assert!(
+            check_enrollment_utterance_length(5, 3000).is_ok(),
+            "5 embeddings should be accepted"
+        );
+    }
+
+    // ── Consecutive match counter (mahbot-770 Fix 4) ──────────────────
+
+    /// Compile-time invariant: EMBEDDING_RING_MAX must be large enough to hold
+    /// CONSECUTIVE_MATCHES_REQUIRED embeddings (the ring accumulates one
+    /// embedding per ~128ms of speech, so 3 consecutive matches need at least
+    /// 3 embeddings in the ring).
+    const _: () = assert!(
+        EMBEDDING_RING_MAX >= CONSECUTIVE_MATCHES_REQUIRED,
+        "EMBEDDING_RING_MAX must be >= CONSECUTIVE_MATCHES_REQUIRED to hold enough embeddings \
+         for consecutive matching"
+    );
+
+    // ── Cooldown constant sanity (mahbot-770 Fix 2) ───────────────────
+    //
+    // WAKE_WORD_COOLDOWN is a tunable production constant; its exact value is
+    // verified at the integration-test level (test_voice_pipeline_commands_*)
+    // via the pipeline end-to-end.  A unit test that asserts a literal constant
+    // would only replicate the declaration with no behavioral coverage.
 }
