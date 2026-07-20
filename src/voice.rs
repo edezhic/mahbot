@@ -140,16 +140,51 @@ const NUM_ENROLLMENT_SAMPLES: usize = 10;
 const K_MAD: f32 = 3.0;
 
 // Minimum absolute separation between the median distance and the
-// acceptance threshold (REMOVED in mahbot-770 Fix 5).
-//
-// Previously set to 0.05 then 0.02, the floor was removed entirely because
-// it dominated the MAD-based formula when enrollment samples were highly
-// similar, producing artificially permissive thresholds.  The cap
-// (`max(median × 2, 0.20)`) provides sufficient protection against
-// degenerate thresholds without requiring a floor.
-//
-// The threshold is now purely MAD-based:
-// `threshold = min(median + K_MAD × mad, max(median × 2, 0.20))`
+// acceptance threshold (REMOVED in mahbot-770 Fix 5, reintroduced as
+// MAD_THRESHOLD_FLOOR below in mahbot-775).
+
+/// Minimum threshold floor for MAD-based calibration.
+///
+/// Prevents overly restrictive thresholds when enrollment samples are
+/// extremely consistent (MAD ≈ 0.005 → raw threshold ≈ 0.025).  Without
+/// this floor, the user's next-morning voice (slightly different speaking
+/// style adding ~0.04 shift in embedding distance) would fail every frame.
+///
+/// The value 0.10 is chosen to:
+/// - Absorb typical voice variation (morning voice, fatigue, etc.) which
+///   adds ~0.02-0.05 in DTW distance.
+/// - Stay well below the cap (`max(median × 2, 0.20)`) so it only affects
+///   overly tight calibrations, not normal ones.
+/// - Absorb the enrollment↔live-detection embedding asymmetry (~0.02-0.05
+///   due to 18% silence-padding during live detection's final embedding).
+const MAD_THRESHOLD_FLOOR: f32 = 0.10;
+
+/// Minimum gap between sorted average DTW distances to consider the
+/// distribution bimodal.  DTW distances are in the 0.0–2.0 range (cosine
+/// distance), and intra-cluster variation is typically < 0.04 even for
+/// lazy utterances.  A gap > 0.04 reliably separates two distinct
+/// speaking-style clusters.
+const BIMODAL_GAP_THRESHOLD: f32 = 0.04;
+
+/// Maximum size of the raw audio ring buffer (~200ms at 16kHz = 3200
+/// samples).  Used during enrollment to capture ~100ms of pre-VAD-trigger
+/// and post-speech context so the template includes the onset/offset
+/// phonemes that strict enrollment VAD (0.85) excludes.
+const RAW_RING_MAX: usize = SAMPLE_RATE as usize / 5;
+
+/// Context padding duration in milliseconds for VAD asymmetry mitigation
+/// (mahbot-775 Fix 3).  Used to prepend ~100ms of pre-VAD-trigger context
+/// and append ~100ms of post-speech context to enrollment utterances, so
+/// the template includes the onset/offset phonemes that strict enrollment
+/// VAD (0.85) excludes but live detection (VAD=0.5) includes.
+const CONTEXT_PADDING_MS: usize = 100;
+
+/// Context padding in audio samples at 16 kHz, derived from
+/// CONTEXT_PADDING_MS to stay correct if the sample rate is adjusted.
+const CONTEXT_PADDING_SAMPLES: usize = (CONTEXT_PADDING_MS * SAMPLE_RATE as usize) / 1000;
+
+// The threshold formula is now:
+// `threshold = clamp(median + K_MAD × mad, 0.10, max(median × 2, 0.20))`
 
 // ── Model URLs and filenames ────────────────────────────────────────────
 
@@ -1728,6 +1763,69 @@ fn compute_avg_dtw_distances(samples: &[Vec<Vec<f32>>]) -> Vec<f32> {
     avg_distances
 }
 
+/// Detect whether a set of average pairwise DTW distances shows a bimodal
+/// distribution (two distinct clusters) with a significant gap between them.
+///
+/// Returns `Some(split_index)` if bimodal, where indices < `split_index`
+/// belong to the first cluster and >= `split_index` belong to the second.
+/// Returns `None` if the distribution is unimodal.
+///
+/// Uses a simple gap-threshold approach: sort the distances, find the
+/// largest consecutive gap.  If it exceeds `BIMODAL_GAP_THRESHOLD`, the
+/// distribution is considered bimodal.
+fn detect_bimodal_gap(sorted_distances: &[f32]) -> Option<usize> {
+    if sorted_distances.len() < 4 {
+        return None; // too few samples for reliable cluster detection
+    }
+
+    let mut max_gap = 0.0f32;
+    let mut split_at = None;
+    for i in 1..sorted_distances.len() {
+        let gap = sorted_distances[i] - sorted_distances[i - 1];
+        if gap > max_gap {
+            max_gap = gap;
+            split_at = Some(i);
+        }
+    }
+
+    if max_gap > BIMODAL_GAP_THRESHOLD {
+        split_at
+    } else {
+        None
+    }
+}
+
+/// Compute the MAD (Median Absolute Deviation) of all pairwise DTW distances
+/// within a cluster of samples.  Used to determine which cluster is "stricter"
+/// (lower MAD = more careful/prototypical speaking style).
+///
+/// Returns `f32::MAX` for clusters with fewer than 2 samples (cannot compute
+/// pairwise distances).
+fn compute_cluster_mad(samples: &[Vec<Vec<f32>>], indices: &[usize]) -> f32 {
+    if indices.len() < 2 {
+        return f32::MAX;
+    }
+    let mut distances: Vec<f32> = Vec::new();
+    for i in 0..indices.len() {
+        for j in (i + 1)..indices.len() {
+            let d1 = dtw_distance(&samples[indices[i]], &samples[indices[j]]);
+            let d2 = dtw_distance(&samples[indices[j]], &samples[indices[i]]);
+            distances.push(d1.min(d2));
+        }
+    }
+    if distances.is_empty() {
+        return f32::MAX;
+    }
+    distances.sort_unstable_by(|a, b| a.partial_cmp(b).expect("distances must be finite"));
+    let median = median_of_sorted(&distances);
+    let mut abs_devs: Vec<f32> = distances.iter().map(|d| (d - median).abs()).collect();
+    abs_devs.sort_unstable_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("absolute deviations must be finite")
+    });
+    median_of_sorted(&abs_devs)
+}
+
 /// Compute the top-K most representative templates and MAD-based thresholds.
 ///
 /// Returns a vector of up to `MAX_TEMPLATES` (K=3) tuples `(embeddings, threshold)`,
@@ -1742,17 +1840,31 @@ fn compute_avg_dtw_distances(samples: &[Vec<Vec<f32>>]) -> Vec<f32> {
 /// 1. **Rank by representativeness** (GRT strategy): compute the average DTW
 ///    distance from each sample to all other samples.  Sort by ascending average
 ///    distance — the most representative sample comes first.
-/// 2. **Per-template MAD-based threshold**: for each of the top-K samples,
+/// 2. **Bimodal cluster correction** (mahbot-775): if the distribution of
+///    average distances shows a clear bimodal gap (e.g. one cluster of careful
+///    utterances and another of lazy/tired utterances), prefer the cluster with
+///    the stricter (lower) intra-cluster MAD.  This prevents the larger lazy
+///    cluster from dominating the GRT ranking.  Unimodal distributions use the
+///    standard GRT ranking unchanged.
+/// 3. **Per-template MAD-based threshold**: for each of the top-K samples,
 ///    compute DTW distances to every *other* sample.  Compute the median and
 ///    Median Absolute Deviation of those distances.  Set
-///    `threshold = min(median + K_MAD × mad, max(median × 2, 0.20))`.
-/// 3. **Rank preservation**: templates are returned in order of increasing
+///    `threshold = clamp(median + K_MAD × mad, 0.10, max(median × 2, 0.20))`.
+/// 4. **Rank preservation**: templates are returned in order of increasing
 ///    average distance (most representative first), matching the old single-best
 ///    behavior for index 0.
 ///
-/// The threshold cap (`max(median × 2, 0.20)`) prevents over-permissive
-/// thresholds from pathological enrollment (mahbot-770 Fix 5 removed the
-/// original floor, preserving only the cap).
+/// The threshold floor (`MAD_THRESHOLD_FLOOR`, 0.10) was introduced in mahbot-775
+/// to prevent overly restrictive thresholds from near-identical enrollment samples.
+/// The cap (`max(median × 2, 0.20)`) prevents over-permissive thresholds.
+///
+/// A minimum threshold floor (`MAD_THRESHOLD_FLOOR`, 0.10) was reintroduced
+/// in mahbot-775 to prevent overly restrictive thresholds when enrollment
+/// samples are extremely consistent (e.g. quiet-room enrollment with MAD ≈
+/// 0.005).  Without the floor, the raw MAD-based threshold (~0.025) would
+/// reject slightly different voice states like "morning voice" that add
+/// ~0.04 shift in embedding distance.  0.10 is well below the 0.20 cap,
+/// so it only affects overly tight calibrations.
 ///
 /// This function is pure (no global state) so it can be tested directly.
 /// The caller is responsible for providing at least 2 samples.
@@ -1772,13 +1884,63 @@ fn calibrate_threshold(samples: &[Vec<Vec<f32>>]) -> Result<Vec<(Vec<Vec<f32>>, 
     // ── Step 1: Rank by average pairwise DTW distance ──
     let avg_distances = compute_avg_dtw_distances(samples);
 
-    // Sort indices by ascending average distance (most representative first).
-    let mut ranked: Vec<usize> = (0..n).collect();
-    ranked.sort_unstable_by(|&a, &b| {
-        avg_distances[a]
-            .partial_cmp(&avg_distances[b])
-            .expect("average distances must be finite")
-    });
+    // ── Step 1a: Bimodal cluster correction (mahbot-775) ──
+    // Detect if the distribution of average distances is bimodal (two distinct
+    // clusters, e.g. careful utterances vs lazy/tired utterances).  If so,
+    // prefer the cluster with the stricter (lower) intra-cluster MAD so that
+    // a larger lazy cluster doesn't dominate the GRT ranking.
+    let mut sorted_avg: Vec<f32> = avg_distances.clone();
+    sorted_avg.sort_unstable_by(|a, b| a.partial_cmp(b).expect("distances must be finite"));
+    let ranked: Vec<usize> = if let Some(split) = detect_bimodal_gap(&sorted_avg) {
+        // Split samples into two clusters at the gap.
+        let split_threshold = f32::midpoint(sorted_avg[split - 1], sorted_avg[split]);
+        let cluster_a: Vec<usize> = (0..n)
+            .filter(|&i| avg_distances[i] <= split_threshold)
+            .collect();
+        let cluster_b: Vec<usize> = (0..n)
+            .filter(|&i| avg_distances[i] > split_threshold)
+            .collect();
+        // Compute MAD within each cluster (lower MAD = stricter = more careful).
+        let mad_a = compute_cluster_mad(samples, &cluster_a);
+        let mad_b = compute_cluster_mad(samples, &cluster_b);
+        // Prefer the stricter (lower MAD) cluster; if equal MAD, prefer
+        // the larger cluster (more samples → more representative template).
+        let preferred = if mad_a < mad_b {
+            &cluster_a
+        } else if mad_b < mad_a {
+            &cluster_b
+        } else if cluster_a.len() >= cluster_b.len() {
+            &cluster_a
+        } else {
+            &cluster_b
+        };
+
+        info!(
+            "Enrollment bimodal detection: split={split}, cluster_a_size={}, \
+             cluster_b_size={}, mad_a={mad_a:.4}, mad_b={mad_b:.4}, \
+             preferring cluster with MAD={:.4}",
+            cluster_a.len(),
+            cluster_b.len(),
+            mad_a.min(mad_b),
+        );
+        // Rank the preferred cluster by ascending average distance.
+        let mut preferred_ranked = preferred.clone();
+        preferred_ranked.sort_unstable_by(|&a, &b| {
+            avg_distances[a]
+                .partial_cmp(&avg_distances[b])
+                .expect("average distances must be finite")
+        });
+        preferred_ranked
+    } else {
+        // Unimodal distribution: use standard GRT ranking.
+        let mut ranked: Vec<usize> = (0..n).collect();
+        ranked.sort_unstable_by(|&a, &b| {
+            avg_distances[a]
+                .partial_cmp(&avg_distances[b])
+                .expect("average distances must be finite")
+        });
+        ranked
+    };
 
     // Take the top K (or all if < K available).
     let k = ranked.len().min(MAX_TEMPLATES);
@@ -1810,14 +1972,15 @@ fn calibrate_threshold(samples: &[Vec<Vec<f32>>]) -> Result<Vec<(Vec<Vec<f32>>, 
         });
         let mad = median_of_sorted(&abs_devs);
 
-        // ── Step 4: Apply absolute cap ──
+        // ── Step 4: Apply absolute cap and floor ──
         let threshold = median + K_MAD * mad;
         let cap = (median * 2.0).max(0.20);
-        let threshold = threshold.min(cap);
+        let floor = MAD_THRESHOLD_FLOOR;
+        let threshold = threshold.clamp(floor, cap);
 
         info!(
             "Enrollment calibration: candidate={idx}, median={median:.4}, mad={mad:.4}, \
-             threshold={threshold:.4} (cap={cap:.4})"
+             threshold={threshold:.4} (cap={cap:.4}, floor={floor:.4})"
         );
 
         results.push((candidate.clone(), threshold));
@@ -2096,6 +2259,35 @@ struct PipelineCtx {
     /// [`match_threshold`].  Cleared entirely when a frame's score drops
     /// below [`NO_MATCH_RESET_THRESHOLD`] to prevent noise accumulation.
     score_window: Vec<f32>,
+    /// Rolling buffer of raw audio samples captured during enrollment.
+    ///
+    /// Accumulated unconditionally for all raw input audio throughout
+    /// enrollment, with a rolling ~200ms capacity ([`RAW_RING_MAX`]).
+    /// The ring serves two purposes for VAD asymmetry mitigation
+    /// (mahbot-775 Fix 3):
+    ///
+    /// 1. **Pre-speech context**: When sustained speech is first confirmed,
+    ///    ~100ms from this ring is prepended to the utterance to capture
+    ///    the quieter onset phonemes that the strict enrollment VAD (0.85)
+    ///    excludes but live detection (VAD=0.5) includes.
+    ///
+    /// 2. **Post-speech tail**: At the first VAD-negative frame after speech,
+    ///    ~100ms from this ring is snapshotted into [`post_speech_tail`],
+    ///    before the 1.5s silence timeout overwrites the ring with silence.
+    ///
+    /// Both uses require the ring to contain audio from *before* the
+    /// respective event (sustained speech / first silence).  Accumulation
+    /// is unconditional because restricting it to pre-speech would leave
+    /// the ring empty of trailing phonemes for the post-speech tail capture.
+    raw_audio_ring: Vec<f32>,
+    /// Trailing audio captured at the FIRST VAD-negative frame after speech
+    /// during enrollment.  Used to append ~100ms of post-speech context that
+    /// the strict enrollment VAD (0.85) excludes but live detection (VAD=0.5)
+    /// includes.  Captured eagerly at the first silence transition so the raw
+    /// audio ring still contains the trailing speech phonemes — by the time
+    /// the 1.5s silence timeout fires, the ring has been overwritten with
+    /// silence (mahbot-775 Fix 3).
+    post_speech_tail: Vec<f32>,
 }
 
 impl PipelineCtx {
@@ -2124,6 +2316,8 @@ impl PipelineCtx {
             last_wake_word_detection: None,
             score_window: Vec::new(),
             vad_threshold: VAD_THRESHOLD,
+            raw_audio_ring: Vec::new(),
+            post_speech_tail: Vec::new(),
         }
     }
 
@@ -2136,6 +2330,8 @@ impl PipelineCtx {
     /// - `utterance_buf` and enrollment tracking fields
     /// - `enrollment_no_speech_frame_count`
     /// - `enrollment_pending` (stale utterance after cancel)
+    /// - `raw_audio_ring` and `post_speech_tail` (VAD asymmetry padding)
+    /// - `score_window` (sliding detection scores)
     /// - `voice_state().enrollment_buffer` (global enrollment buffer)
     fn clear_pipeline_buffers(&mut self) {
         self.voice_batch.clear();
@@ -2151,6 +2347,8 @@ impl PipelineCtx {
         self.vad_positives_in_a_row = 0;
         self.enrollment_pending = None;
         self.score_window.clear();
+        self.raw_audio_ring.clear();
+        self.post_speech_tail.clear();
         self.vad_threshold = VAD_THRESHOLD;
         self.last_wake_word_detection = None;
         voice_state()
@@ -2829,6 +3027,18 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
 /// - Speech detected: `ListeningDuringEnrollment`
 /// - Speech ended, awaiting silence: `WaitingForSilenceDuringEnrollment`
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
+    // ── Raw audio ring buffer (mahbot-775 Fix 3) ──
+    // Accumulate ALL raw input audio into a rolling ring so we can later
+    // prepend ~100ms of pre-VAD-trigger context and append ~100ms of
+    // post-speech context to the utterance.  This captures the onset/offset
+    // phonemes that the strict enrollment VAD (0.85) excludes but live
+    // detection (VAD=0.5) includes, reducing the systematic mismatch.
+    ctx.raw_audio_ring.extend_from_slice(samples);
+    if ctx.raw_audio_ring.len() > RAW_RING_MAX {
+        let excess = ctx.raw_audio_ring.len() - RAW_RING_MAX;
+        ctx.raw_audio_ring.drain(..excess);
+    }
+
     ctx.audio_buffer.extend_from_slice(samples);
 
     // Process frames with offset tracking instead of per-iteration O(n) drain.
@@ -2853,7 +3063,24 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             if ctx.vad_positives_in_a_row >= ENROLLMENT_VAD_CONSECUTIVE_REQUIRED {
                 // Sustained speech confirmed (mahbot-772): update tracking.
                 let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
-                if !ctx.utterance_had_speech || was_waiting_for_silence {
+
+                // ── Prepend pre-speech context from raw ring (mahbot-775 Fix 3) ──
+                // On the FIRST transition from silence to sustained speech,
+                // prepend ~100ms of audio from the raw input ring to capture
+                // the quieter onset phonemes that VAD=0.85 excluded.
+                let already_had_speech = ctx.utterance_had_speech;
+                if !already_had_speech {
+                    let pad_samples = CONTEXT_PADDING_SAMPLES; // 100ms
+                    let start = ctx.raw_audio_ring.len().saturating_sub(pad_samples);
+                    let padding: Vec<f32> = ctx.raw_audio_ring[start..].to_vec();
+                    if !padding.is_empty() {
+                        let mut padded = padding;
+                        padded.extend_from_slice(&ctx.utterance_buf);
+                        ctx.utterance_buf = padded;
+                    }
+                }
+
+                if !already_had_speech || was_waiting_for_silence {
                     // Transition from silence to speech, or speech resumed after
                     // a pause before the 1.5s timeout — show "Listening…"
                     set_status(VoiceStatus::ListeningDuringEnrollment { sample, total });
@@ -2884,6 +3111,18 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // chunks and accumulates chunks.len() directly — both approaches
                 // correctly measure silence in audio samples at 16 kHz; they just
                 // operate at different granularities (frame-level vs chunk-level).
+
+                // ── Capture trailing speech at first silence (mahbot-775 Fix 3) ──
+                // The raw audio ring still contains the quiet trailing phonemes at
+                // this point (the VAD-negative frames that are just below 0.85).
+                // By the time the 1.5s silence timeout fires, the ring will have
+                // been fully overwritten with silence, so we snapshot the tail now.
+                if ctx.utterance_silence_samples == 0 {
+                    let pad_samples = CONTEXT_PADDING_SAMPLES; // 100ms
+                    let start = ctx.raw_audio_ring.len().saturating_sub(pad_samples);
+                    ctx.post_speech_tail = ctx.raw_audio_ring[start..].to_vec();
+                }
+
                 ctx.utterance_silence_samples += HOP_LENGTH;
                 if ctx.utterance_silence_samples >= SILENCE_THRESHOLD_SAMPLES {
                     // Utterance is complete. With VAD-gated accumulation,
@@ -2891,11 +3130,20 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     // we still truncate to utterance_speech_end_len for safety
                     // in edge cases.
                     ctx.utterance_buf.truncate(ctx.utterance_speech_end_len);
+                    // ── Append post-speech tail (mahbot-775 Fix 3) ──
+                    // The post_speech_tail was captured at the first silence
+                    // transition while the raw ring still held the trailing
+                    // speech phonemes.  Append ~100ms to match the full wake
+                    // word that live detection (VAD=0.5) includes.
+                    if !ctx.post_speech_tail.is_empty() {
+                        ctx.utterance_buf.extend_from_slice(&ctx.post_speech_tail);
+                    }
                     ctx.enrollment_pending = Some(std::mem::take(&mut ctx.utterance_buf));
                     ctx.utterance_speech_end_len = 0;
                     ctx.utterance_had_speech = false;
                     ctx.utterance_silence_samples = 0;
                     ctx.enrollment_no_speech_frame_count = 0;
+                    ctx.post_speech_tail.clear();
                     // Mark ALL samples as consumed so the post-loop drain removes
                     // everything (including the unconsumed tail).  This replaces
                     // the original `clear()` while working correctly even when
@@ -3526,6 +3774,8 @@ mod tests {
             ctx.enrollment_no_speech_frame_count = 700;
             ctx.enrollment_pending = Some(vec![1.0; 50]);
             ctx.score_window = vec![1.5, 2.0, 0.8]; // simulated scores
+            ctx.raw_audio_ring = vec![1.0; 100];
+            ctx.post_speech_tail = vec![1.0; 50];
             ctx.vad_positives_in_a_row = 2;
             ctx.vad_threshold = ENROLLMENT_VAD_THRESHOLD;
             ctx.last_wake_word_detection = Some(Instant::now());
@@ -3598,6 +3848,14 @@ mod tests {
             assert!(
                 ctx.score_window.is_empty(),
                 "score_window should be cleared"
+            );
+            assert!(
+                ctx.raw_audio_ring.is_empty(),
+                "raw_audio_ring should be cleared"
+            );
+            assert!(
+                ctx.post_speech_tail.is_empty(),
+                "post_speech_tail should be cleared"
             );
             assert!(
                 ctx.last_wake_word_detection.is_none(),
@@ -3682,10 +3940,11 @@ mod tests {
                 ctx.utterance_had_speech,
                 "VAD-gated enrollment: third consecutive speech frame must set utterance_had_speech"
             );
-            assert_eq!(
+            assert!(
+                ctx.utterance_buf.len() > HOP_LENGTH * 3,
+                "VAD-gated enrollment: utterance_buf should be > 3× HOP_LENGTH after three speech frames \
+                 (pre-speech context prepended by mahbot-775 VAD asymmetry fix), got {}",
                 ctx.utterance_buf.len(),
-                HOP_LENGTH * 3,
-                "VAD-gated enrollment: utterance_buf should contain 3× HOP_LENGTH after three speech frames"
             );
 
             // Silence after speech should NOT add to utterance_buf, but
@@ -3995,14 +4254,16 @@ mod tests {
 
     #[test]
     fn test_mad_threshold_invariants() {
-        // The acceptance threshold uses two protecting stages:
+        // The acceptance threshold uses three protecting stages:
         //   1. threshold = median + K_MAD × mad          (MAD-based estimate)
         //   2. threshold = threshold.min(max(median*2, 0.20))   (absolute cap)
+        //   3. threshold = threshold.max(MAD_THRESHOLD_FLOOR)    (floor, 0.10)
         //
-        // A standalone floor was removed in mahbot-770 Fix 5 — the MAD-based
-        // formula and the cap provide sufficient protection against degenerate
-        // thresholds without artificially inflating the threshold for
-        // highly-similar enrollment samples.
+        // The floor (reintroduced in mahbot-775) prevents overly restrictive
+        // thresholds from extremely consistent enrollment samples.  Without it,
+        // a careful quiet-room enrollment (MAD ≈ 0.005) produces threshold ≈
+        // 0.025, which rejects slightly different voice states like "morning
+        // voice" that add ~0.04 shift in embedding distance.
         //
         // These tests verify each stage without requiring VOICE_PIPELINE
         // initialisation — they exercise the same calculation that
@@ -4017,29 +4278,31 @@ mod tests {
             ad_sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             let mad = super::median_of_sorted(&ad_sorted);
             let cap = (median * 2.0).max(0.20);
-            (median + K_MAD * mad).min(cap)
+            (median + K_MAD * mad).clamp(super::MAD_THRESHOLD_FLOOR, cap)
         };
 
         // Case 1: nearly identical samples (all distances tiny).
-        //   Without the floor (removed in mahbot-770 Fix 5), the MAD-based
-        //   formula determines the threshold directly.
-        //   median=0.002, mad=0.001 → threshold = 0.002 + 3.0×0.001 = 0.005.
+        //   MAD-based: median=0.002, mad=0.001 → 0.002 + 3.0×0.001 = 0.005
+        //   cap = max(0.002×2, 0.20) = 0.20
+        //   floor = 0.10
+        //   → threshold = 0.005.clamp(0.10, 0.20) = 0.10 (floor applies)
         let mut d = vec![
             0.001, 0.002, 0.001, 0.003, 0.002, 0.001, 0.002, 0.001, 0.003,
         ];
         d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let threshold = compute(&d);
-        let expected = 0.005_f32;
+        let expected = super::MAD_THRESHOLD_FLOOR; // 0.10
         assert!(
             (threshold - expected).abs() < 1e-6,
-            "nearly-identical samples: expected {expected}, got {threshold} (MAD formula)",
+            "nearly-identical samples: expected floor {expected}, got {threshold}",
         );
 
         // Case 2: moderate spread.
         //   median = 0.15, mad = 0.02
-        //   MAD formula: median + K_MAD * mad = 0.15 + 3.0*0.02 = 0.21
-        //   cap = max(0.15 * 2, 0.20) = 0.30
-        //   → threshold = 0.21 (MAD dominates, under cap)
+        //   MAD-based: 0.15 + 3.0×0.02 = 0.21
+        //   cap = max(0.15 × 2, 0.20) = 0.30
+        //   floor = 0.10
+        //   → threshold = 0.21.clamp(0.10, 0.30) = 0.21 (MAD dominates)
         let mut d = vec![0.10, 0.12, 0.13, 0.14, 0.15, 0.15, 0.16, 0.18, 0.20];
         d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let threshold = compute(&d);
@@ -4056,9 +4319,10 @@ mod tests {
 
         // Case 3: extreme spread — absolute cap applies.
         //   median = 0.18, mad = 0.10
-        //   MAD-based: 0.18 + 3.0 * 0.10 = 0.48
-        //   cap = max(0.18 * 2, 0.20) = 0.36
-        //   → threshold = 0.36 (clamped to cap)
+        //   MAD-based: 0.18 + 3.0 × 0.10 = 0.48
+        //   cap = max(0.18 × 2, 0.20) = 0.36
+        //   floor = 0.10
+        //   → threshold = 0.48.clamp(0.10, 0.36) = 0.36 (clamped to cap)
         let mut d = vec![0.08, 0.10, 0.12, 0.15, 0.18, 0.50, 0.55, 0.60, 0.65];
         d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let threshold = compute(&d);
@@ -4123,6 +4387,220 @@ mod tests {
             "threshold changed from {clean_threshold} to {outlier_threshold} \
              (diff={thresh_diff}) — single outlier should not affect threshold",
         );
+    }
+
+    // ── MAD threshold floor (mahbot-775 Fix 1) ──────────────────────────
+
+    /// Test that the MAD_THRESHOLD_FLOOR (0.10) is applied when the raw
+    /// MAD-based threshold would be below 0.10.
+    #[test]
+    fn test_mad_threshold_floor() {
+        // Highly consistent enrollment: MAD ≈ 0.005, raw MAD-based threshold
+        // ≈ 0.025.  Without the floor, this would be the final threshold.
+        // With the floor, it should be clamped to 0.10.
+        let distances = vec![0.010, 0.011, 0.012, 0.013, 0.014, 0.015];
+
+        // Replicate the calibrate_threshold calculation.
+        let mut sorted = distances.clone();
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = super::median_of_sorted(&sorted);
+        let mut abs_devs: Vec<f32> = sorted.iter().map(|d| (d - median).abs()).collect();
+        abs_devs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad = super::median_of_sorted(&abs_devs);
+        let cap = (median * 2.0).max(0.20);
+        let raw = median + K_MAD * mad;
+        let threshold = raw.clamp(super::MAD_THRESHOLD_FLOOR, cap);
+
+        // Verify the floor is above the raw MAD-based value.
+        assert!(
+            raw < super::MAD_THRESHOLD_FLOOR,
+            "raw threshold {raw:.4} should be below floor {:.4} for consistent data",
+            super::MAD_THRESHOLD_FLOOR,
+        );
+        // Verify the final threshold is the floor.
+        assert!(
+            (threshold - super::MAD_THRESHOLD_FLOOR).abs() < 1e-6,
+            "threshold should be floor {:.4}, got {threshold:.4}",
+            super::MAD_THRESHOLD_FLOOR,
+        );
+
+        // Test with synthetic distances that produce a very low raw threshold.
+        // median = 0.01, MAD = 0.0 (all distances identical)
+        // raw = 0.01, cap = max(0.02, 0.20) = 0.20
+        // threshold = 0.01.clamp(0.10, 0.20) = 0.10
+        let identical = vec![0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01];
+        let mut sorted2 = identical.clone();
+        sorted2.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let median2 = super::median_of_sorted(&sorted2);
+        let mut abs_devs2: Vec<f32> = sorted2.iter().map(|d| (d - median2).abs()).collect();
+        abs_devs2.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad2 = super::median_of_sorted(&abs_devs2);
+        let cap2 = (median2 * 2.0).max(0.20);
+        let raw2 = median2 + K_MAD * mad2;
+        let threshold2 = raw2.clamp(super::MAD_THRESHOLD_FLOOR, cap2);
+
+        assert!(
+            raw2 < super::MAD_THRESHOLD_FLOOR,
+            "raw threshold {raw2:.4} should be below floor for identical data",
+        );
+        assert!(
+            (threshold2 - super::MAD_THRESHOLD_FLOOR).abs() < 1e-6,
+            "identical distances should produce floor threshold, got {threshold2:.4}",
+        );
+    }
+
+    // ── GRT selection — bimodal cluster detection (mahbot-775 Fix 2) ──
+
+    /// Test that when enrollment contains a bimodal distribution (careful
+    /// cluster + lazy cluster), the GRT selection prefers the stricter
+    /// (lower MAD) cluster rather than the larger one.
+    #[test]
+    fn test_grt_prefers_careful_cluster() {
+        // Create 10 synthetic enrollment samples with two clusters:
+        //   Careful cluster (3 samples): tight intra-cluster, low distances
+        //     → embeddings near [1, 0] with small variation
+        //   Lazy cluster (7 samples): tight intra-cluster but looser than
+        //     careful; more samples → would dominate naive GRT ranking
+        //     → embeddings near [0.5, 0.866] with moderate variation
+        //
+        // The careful cluster has lower intra-cluster MAD, so the bimodal
+        // correction should select templates from it.
+        use std::f32::consts::FRAC_PI_3;
+
+        let careful_angles = [-0.05_f32, 0.0, 0.05];
+        let lazy_angles = [
+            FRAC_PI_3 - 0.10,
+            FRAC_PI_3 - 0.05,
+            FRAC_PI_3,
+            FRAC_PI_3 + 0.05,
+            FRAC_PI_3 + 0.10,
+            FRAC_PI_3 - 0.08,
+            FRAC_PI_3 + 0.08,
+        ];
+
+        let mut samples: Vec<Vec<Vec<f32>>> = Vec::with_capacity(10);
+        for angle in &careful_angles {
+            samples.push(vec![vec![angle.cos(), angle.sin()]]);
+        }
+        for angle in &lazy_angles {
+            samples.push(vec![vec![angle.cos(), angle.sin()]]);
+        }
+
+        let results = super::calibrate_threshold(&samples)
+            .expect("calibrate_threshold with 10 samples should succeed");
+        assert_eq!(
+            results.len(),
+            3,
+            "should return top 3 templates from 10 samples",
+        );
+
+        // The most representative template (index 0) should come from the
+        // careful cluster (angle ≈ 0, so embedding[0][0] ≈ 1.0, [0][1] ≈ 0.0).
+        let (embeddings, threshold) = &results[0];
+        assert!(
+            threshold.is_finite() && *threshold > 0.0,
+            "threshold should be finite and positive, got {threshold}",
+        );
+
+        // The first embedding dimension should be close to 1.0 (cos(0) ≈ 1.0)
+        // and the second close to 0.0, confirming it's from the careful cluster.
+        let first_emb = &embeddings[0];
+        assert!(
+            first_emb[0] > 0.95,
+            "best template should be from careful cluster (cos ≈ 1.0), got emb[0]={}",
+            first_emb[0],
+        );
+        assert!(
+            first_emb[1].abs() < 0.1,
+            "best template from careful cluster should have sin ≈ 0.0, got emb[1]={}",
+            first_emb[1],
+        );
+
+        // All three returned templates should be from the careful cluster
+        // (since it has only 3 samples, all should be selected).
+        for (i, (emb, _)) in results.iter().enumerate() {
+            let e = &emb[0];
+            assert!(
+                e[0] > 0.95,
+                "template {i} should be from careful cluster, got emb[0]={}",
+                e[0],
+            );
+        }
+    }
+
+    /// Test GRT selection with a near-threshold bimodal gap — angular
+    /// separation just barely exceeding [`BIMODAL_GAP_THRESHOLD`] (0.04).
+    ///
+    /// This exercises the boundary condition where the clusters are close
+    /// enough that their sorted avg_distances barely produce a detectable
+    /// gap, unlike the wide-separation scenario (~60°) tested above.
+    #[test]
+    fn test_grt_prefers_careful_cluster_near_threshold() {
+        // Near-threshold clusters: careful at 0 rad, lazy at 1.2 rad (~68.8°).
+        // Cosine distance between centers ≈ 0.64, giving a gap in sorted
+        // avg_distances of ~0.056 — comfortably above the 0.04 threshold.
+        // Wider separation than 0.5 rad was needed because the 4:6 cluster
+        // ratio produces a gap of 2d/9 (see bimodal gap analysis), requiring
+        // cross-cluster distance d > 0.18 for gap > 0.04.  With d ≈ 0.64,
+        // gap ≈ 0.056 reliably triggers bimodal detection.  This is still
+        // "near-threshold" compared to the original test (~60° separation
+        // gives gap ~0.5).
+        let careful_angles = [-0.02_f32, 0.0, 0.02, 0.015];
+        let lazy_angles = [
+            1.2_f32 - 0.08,
+            1.2_f32 - 0.05,
+            1.2_f32,
+            1.2_f32 + 0.05,
+            1.2_f32 + 0.08,
+            1.2_f32 + 0.04,
+        ];
+
+        let mut samples: Vec<Vec<Vec<f32>>> =
+            Vec::with_capacity(careful_angles.len() + lazy_angles.len());
+        for angle in &careful_angles {
+            samples.push(vec![vec![angle.cos(), angle.sin()]]);
+        }
+        for angle in &lazy_angles {
+            samples.push(vec![vec![angle.cos(), angle.sin()]]);
+        }
+
+        let results = super::calibrate_threshold(&samples)
+            .expect("calibrate_threshold with 10 samples should succeed");
+        assert_eq!(
+            results.len(),
+            3,
+            "should return top 3 templates from 10 samples",
+        );
+
+        // The most representative template should come from the careful
+        // cluster (angle near 0, so cos ≈ 1.0).
+        let (embeddings, threshold) = &results[0];
+        assert!(
+            threshold.is_finite() && *threshold > 0.0,
+            "threshold should be finite and positive, got {threshold}",
+        );
+
+        let first_emb = &embeddings[0];
+        assert!(
+            first_emb[0] > 0.95,
+            "best template should be from careful cluster (cos ≈ 1.0), got emb[0]={}",
+            first_emb[0],
+        );
+        assert!(
+            first_emb[1].abs() < 0.1,
+            "best template from careful cluster should have sin ≈ 0.0, got emb[1]={}",
+            first_emb[1],
+        );
+
+        // All three returned templates should be from the careful cluster.
+        for (i, (emb, _)) in results.iter().enumerate() {
+            let e = &emb[0];
+            assert!(
+                e[0] > 0.95,
+                "template {i} should be from careful cluster, got emb[0]={}",
+                e[0],
+            );
+        }
     }
 
     // ── score_matching_templates — sliding window (mahbot-773) ──
@@ -4633,34 +5111,50 @@ mod tests {
         let speech_only_len = ctx.utterance_speech_end_len;
         assert!(speech_only_len > 0, "should have accumulated speech data");
 
-        // Clear the audio buffer so the next input starts fresh without
-        // leftover speech samples that would contaminate the silence frame.
+        // ── Feed first silence frame to capture trailing speech (mahbot-775 Fix 3) ──
+        // We must NOT pre-set utterance_silence_samples yet — the first VAD-negative
+        // frame after speech is the moment the raw ring still holds the quieter
+        // trailing phonemes.  The post-speech tail is captured here, before the ring
+        // fills with silence during the 1.5s timeout window.
         ctx.audio_buffer.clear();
-
-        // Manually set silence_samples above the threshold so
-        // the SILENCE_DURATION check triggers immediately when a silence
-        // frame is processed (avoids real-time wait).
-        ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES;
-
-        // Reset the VAD detector so the silence frame is classified with a
-        // clean slate (no pre-emphasis transient from the previous speech).
         reset_vad();
-
-        // Feed a silence frame (all zeros → Earshot score ≈ 0.0 < VAD_THRESHOLD).
         let silence_frame = vec![0.0f32; FRAME_LENGTH];
         handle_enrollment_audio(&silence_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
 
-        // After truncation: enrollment_pending should contain the speech-only
-        // audio data, and utterance_buf should be empty.
+        // Verify the trailing speech tail was captured.
+        assert!(
+            !ctx.post_speech_tail.is_empty(),
+            "post_speech_tail should be captured at first silence after speech",
+        );
+
+        // Record the utterance length before the timeout fires.
+        // utterance_buf is unchanged by the first silence frame (only
+        // post_speech_tail was captured), so len_before_timeout == speech_only_len.
+        let len_before_timeout = ctx.utterance_buf.len();
+
+        // Manually set silence_samples just below the threshold so the next
+        // VAD-negative frame (adding HOP_LENGTH) triggers the timeout immediately.
+        ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES.saturating_sub(HOP_LENGTH);
+
+        // Reset the VAD detector for the second silence frame.
+        reset_vad();
+
+        // Feed a second silence frame to trigger the timeout.
+        handle_enrollment_audio(&silence_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+
+        // After truncation: enrollment_pending should contain the speech with
+        // post-speech tail appended, and utterance_buf should be empty.
         assert!(
             ctx.enrollment_pending.is_some(),
             "silence timeout should store utterance in enrollment_pending"
         );
         let pending = ctx.enrollment_pending.as_ref().unwrap();
-        assert_eq!(
+        assert!(
+            pending.len() > len_before_timeout,
+            "enrollment_pending ({}) should be larger than the utterance before timeout ({}) \
+             because post-speech tail was appended (mahbot-775 Fix 3)",
             pending.len(),
-            speech_only_len,
-            "enrollment_pending should contain only speech data (no trailing silence)"
+            len_before_timeout,
         );
         assert!(
             ctx.utterance_buf.is_empty(),
@@ -4762,6 +5256,121 @@ mod tests {
         assert!(
             ctx.audio_buffer.is_empty(),
             "audio_buffer should be fully drained by post-loop drain"
+        );
+    }
+
+    // ── VAD asymmetry padding (mahbot-775 Fix 3) ────────────────────────
+
+    /// Test that enrollment utterance includes pre-speech and post-speech
+    /// context padding from the raw audio ring to reduce the VAD-threshold
+    /// asymmetry between enrollment (VAD=0.85) and live detection (VAD=0.5).
+    #[test]
+    #[serial_test::serial(voice)]
+    fn test_vad_asymmetry_padding() {
+        reset_vad();
+        let _ = VOICE_PIPELINE.set(RwLock::new(VoicePipelineState {
+            enabled: true,
+            status: VoiceStatus::Disabled,
+            templates: Arc::new(WakeWordTemplates::default()),
+            enrollment_buffer: Vec::new(),
+            cmd_tx: None,
+        }));
+
+        let mut ctx = PipelineCtx::new();
+        ctx.is_listening = true;
+        ctx.enrollment_mode = true;
+        ctx.clear_pipeline_buffers();
+
+        // Feed pre-speech silence to fill the raw audio ring.
+        let silence_frame = vec![0.0f32; FRAME_LENGTH];
+        for _ in 0..3 {
+            handle_enrollment_audio(&silence_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+        }
+        // The raw ring should now contain silence audio.
+        assert!(
+            !ctx.raw_audio_ring.is_empty(),
+            "raw_audio_ring should contain pre-speech silence",
+        );
+
+        // Feed speech frames to trigger sustained speech and pre-padding.
+        let speech = speech_frame();
+        // Feed 80ms of speech (5 frames to reach sustained speech + continue).
+        for _ in 0..6 {
+            ctx.audio_buffer.clear();
+            handle_enrollment_audio(&speech, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+        }
+        // utterance_had_speech should now be true.
+        assert!(
+            ctx.utterance_had_speech,
+            "utterance_had_speech should be true"
+        );
+
+        // utterance_buf should be larger than the speech-only content
+        // because pre-speech context was prepended from the raw ring.
+        let speech_content = HOP_LENGTH * 6; // 6 speech frames
+        assert!(
+            ctx.utterance_buf.len() > speech_content,
+            "utterance_buf ({}) should exceed speech-only content ({}) \
+             because pre-speech context was prepended",
+            ctx.utterance_buf.len(),
+            speech_content,
+        );
+
+        // The raw ring should still be non-empty (it accumulates all audio).
+        assert!(
+            !ctx.raw_audio_ring.is_empty(),
+            "raw_audio_ring should continue accumulating after speech",
+        );
+
+        // ── Feed first silence frame to capture trailing speech ─────────
+        // This is the FIRST VAD-negative frame after speech.  The raw audio
+        // ring still contains the trailing phonemes.  Set utterance_silence_samples
+        // to 0 so the first-silence detection fires (mahbot-775 Fix 3).
+        reset_vad();
+        ctx.utterance_silence_samples = 0;
+        ctx.audio_buffer.clear();
+        handle_enrollment_audio(&silence_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+
+        // Verify the trailing speech tail was captured from the raw ring.
+        assert!(
+            !ctx.post_speech_tail.is_empty(),
+            "post_speech_tail should be captured from raw_audio_ring at first silence",
+        );
+
+        // Save the utterance length before the timeout fires.
+        let len_before_timeout = ctx.utterance_buf.len();
+
+        // ── Feed second silence frame to trigger the timeout ─────────────
+        // Pre-set silence_samples just below threshold so one more VAD-negative
+        // frame (adding HOP_LENGTH) fires the timeout.
+        ctx.utterance_silence_samples = SILENCE_THRESHOLD_SAMPLES.saturating_sub(HOP_LENGTH);
+        ctx.audio_buffer.clear();
+        handle_enrollment_audio(&silence_frame, &mut ctx, 0, NUM_ENROLLMENT_SAMPLES);
+
+        // enrollment_pending should contain the padded utterance.
+        let pending = ctx
+            .enrollment_pending
+            .as_ref()
+            .expect("silence timeout should store utterance in enrollment_pending");
+        assert!(
+            pending.len() > len_before_timeout,
+            "enrollment_pending ({}) should be larger than the utterance before timeout ({}) \
+             because post-speech tail was appended (mahbot-775 Fix 3)",
+            pending.len(),
+            len_before_timeout,
+        );
+
+        // post_speech_tail should be cleared after the timeout consumed it.
+        assert!(
+            ctx.post_speech_tail.is_empty(),
+            "post_speech_tail should be cleared after timeout consumed it",
+        );
+
+        // Verify raw_audio_ring is cleared on pipeline reset.
+        ctx.clear_pipeline_buffers();
+        assert!(
+            ctx.raw_audio_ring.is_empty(),
+            "raw_audio_ring should be cleared after pipeline reset",
         );
     }
 
