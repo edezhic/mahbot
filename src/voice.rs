@@ -584,7 +584,15 @@ pub struct UtteranceQuality {
     pub clipping_detected: bool,
     /// Utterance duration in milliseconds.
     pub duration_ms: u64,
-    /// Estimated signal-to-noise ratio in dB, NaN if estimation failed.
+    /// Estimated signal-to-noise ratio in dB.
+    ///
+    /// When a pre-speech noise RMS is available (enrollment path via
+    /// [`compute_utterance_quality`]), this is the actual SNR computed as
+    /// 20*log10(speech_rms / noise_rms) — unbounded, typically 10–50 dB
+    /// in quiet rooms.  When the energy-based fallback ([`estimate_snr_energy`])
+    /// is used (tests or edge cases where no noise measurement exists), the
+    /// value is 0–40 dB or NaN if the utterance is too short for meaningful
+    /// estimation.
     pub snr_db: f32,
     /// Average DTW distance to all other enrollment utterances (lower = more
     /// consistent).  Set to 0.0 when there are fewer than 2 utterances.
@@ -1928,18 +1936,24 @@ fn compute_cluster_mad(samples: &[Vec<Vec<f32>>], indices: &[usize]) -> f32 {
 ///   lower = more consistent = higher quality.
 /// - **Duration** (20%): whether the utterance is in [400ms, 2000ms].
 /// - **Clipping** (15%): penalty if any sample hit i16::MAX.
-/// - **SNR** (15%): estimated signal-to-noise ratio.
+/// - **SNR** (15%): estimated signal-to-noise ratio.  If `noise_rms` is
+///   `Some`, uses the real pre-speech noise floor captured from the raw audio
+///   ring during enrollment; otherwise falls back to an energy-based heuristic.
 ///
 /// # Parameters
 /// - `samples`: raw audio samples of the utterance.
 /// - `embeddings`: extracted embeddings for this utterance.
 /// - `enrollment_buffer`: all previously collected enrollment embeddings
 ///   (used for DTW self-consistency comparison).
+/// - `noise_rms`: pre-speech ambient noise RMS captured at the moment of
+///   first sustained speech detection (mahbot-782).  `None` falls back to
+///   energy-based SNR estimation.
 #[expect(clippy::cast_precision_loss)]
 fn compute_utterance_quality(
     samples: &[f32],
     embeddings: &[Vec<f32>],
     enrollment_buffer: &[Vec<Vec<f32>>],
+    noise_rms: Option<f32>,
 ) -> UtteranceQuality {
     let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
@@ -1949,9 +1963,22 @@ fn compute_utterance_quality(
         .any(|&s| s.abs() >= ENROLLMENT_QUALITY_CLIPPING_THRESHOLD);
 
     // ── SNR estimation ───────────────────────────────────────────────
-    // Simple energy-based VAD: frame the audio, compute RMS per frame,
-    // classify high-RMS frames as speech and low-RMS as noise.
-    let snr_db = estimate_snr_energy(samples);
+    // If we have a real pre-speech noise RMS captured from the raw audio
+    // ring at the moment of first sustained speech, compute actual SNR as
+    // 20*log10(speech_rms / noise_rms).  Otherwise fall back to energy-based
+    // heuristic (estimate_snr_energy) which measures speech dynamic range
+    // rather than true SNR (mahbot-782).
+    let snr_db = if let Some(noise_rms) = noise_rms {
+        let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
+        let speech_rms = (sum_sq / samples.len() as f32).sqrt();
+        if noise_rms > 1e-10 && speech_rms > noise_rms {
+            20.0 * (speech_rms / noise_rms).log10()
+        } else {
+            0.0
+        }
+    } else {
+        estimate_snr_energy(samples)
+    };
 
     // ── DTW self-consistency ─────────────────────────────────────────
     let avg_dtw_distance = if enrollment_buffer.is_empty() {
@@ -2605,6 +2632,12 @@ struct PipelineCtx {
     /// Used to enforce a cooldown period after detection to prevent rapid
     /// consecutive false triggers.
     last_wake_word_detection: Option<Instant>,
+    /// Pre-speech noise RMS captured at the moment of first sustained speech
+    /// detection during enrollment.  Used for real SNR estimation in
+    /// [`compute_utterance_quality`] instead of the fake SNR computed from
+    /// speech dynamic range (mahbot-782).  Reset to `None` after the utterance
+    /// is consumed by [`handle_enrollment_sample`].
+    noise_rms_estimate: Option<f32>,
     /// Rolling window of per-frame soft scores from template matching
     /// (mahbot-773).  Each element is the `total_score` (sum of sigmoid
     /// scores across all K templates) for one embedding frame (~128ms of
@@ -2671,6 +2704,7 @@ impl PipelineCtx {
             last_model_retry: None,
             last_wake_word_detection: None,
             score_window: Vec::new(),
+            noise_rms_estimate: None,
             vad_threshold: VAD_THRESHOLD,
             raw_audio_ring: Vec::new(),
             post_speech_tail: Vec::new(),
@@ -2718,6 +2752,7 @@ impl PipelineCtx {
         self.vad_positives_in_a_row = 0;
         self.enrollment_pending = None;
         self.score_window.clear();
+        self.noise_rms_estimate = None;
         self.raw_audio_ring.clear();
         self.post_speech_tail.clear();
         self.vad_threshold = VAD_THRESHOLD;
@@ -3011,7 +3046,8 @@ pub async fn run_voice_pipeline() {
         // race conditions with the command channel). ONNX inference inside
         // handle_enrollment_sample uses spawn_blocking so it doesn't block.
         if let Some(samples) = ctx.enrollment_pending.take() {
-            handle_enrollment_sample(samples).await;
+            let noise_rms = ctx.noise_rms_estimate.take();
+            handle_enrollment_sample(samples, noise_rms).await;
             // Reset enrollment_mode only on successful completion, not on
             // failure — if finalize_enrollment failed, the user can retry
             // by speaking the wake word again without re-initiating enrollment.
@@ -3097,7 +3133,7 @@ fn check_enrollment_utterance_length(
 ///
 /// Implements minimum utterance length check (mahbot-772): utterances
 /// shorter than 400ms are rejected to reject noise blips and coughs.
-async fn handle_enrollment_sample(samples: Vec<f32>) {
+async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     if !models_ready() {
         warn!("Models not ready for enrollment");
         return;
@@ -3134,6 +3170,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>) {
                     &samples_for_quality,
                     &embeddings,
                     &state.enrollment_buffer,
+                    noise_rms,
                 ));
 
                 state.enrollment_buffer.push(embeddings);
@@ -3496,11 +3533,44 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // Sustained speech confirmed (mahbot-772): update tracking.
                 let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
 
+                // ── Capture noise RMS from pre-speech ring (mahbot-782) ──
+                // On the FIRST transition from silence to sustained speech,
+                // capture the ambient noise RMS from the portion of the raw
+                // audio ring that predates speech onset.  The ring contains
+                // up to ~200ms of audio; speech started at most ~48ms ago
+                // (ENROLLMENT_VAD_CONSECUTIVE_REQUIRED × HOP_LENGTH), so
+                // samples before that boundary are clean ambient noise.
+                // This is used in compute_utterance_quality for real SNR
+                // estimation instead of measuring speech dynamic range.
+                //
+                // NOTE: raw_audio_ring contains post-AGC audio (the
+                // AudioPreprocessor normalises gain before writing to the
+                // ring).  This is intentional — we want to measure the
+                // noise floor at the same gain level as speech so the SNR
+                // computation accurately reflects the signal quality the
+                // VAD and embedding pipeline actually see.  A future
+                // reader should NOT "fix" this by capturing pre-AGC noise;
+                // that would overestimate SNR and let low-quality utterances
+                // pass quality checks.
+                let already_had_speech = ctx.utterance_had_speech;
+                if !already_had_speech && ctx.noise_rms_estimate.is_none() {
+                    let speech_boundary = ENROLLMENT_VAD_CONSECUTIVE_REQUIRED * HOP_LENGTH;
+                    let pre_speech_end = ctx.raw_audio_ring.len().saturating_sub(speech_boundary);
+                    if pre_speech_end > 0 {
+                        let sum_sq: f32 = ctx.raw_audio_ring[..pre_speech_end]
+                            .iter()
+                            .map(|&s| s * s)
+                            .sum();
+                        #[expect(clippy::cast_precision_loss)]
+                        let rms = (sum_sq / pre_speech_end as f32).sqrt();
+                        ctx.noise_rms_estimate = Some(rms);
+                    }
+                }
+
                 // ── Prepend pre-speech context from raw ring (mahbot-775 Fix 3) ──
                 // On the FIRST transition from silence to sustained speech,
                 // prepend ~100ms of audio from the raw input ring to capture
                 // the quieter onset phonemes that VAD=0.85 excluded.
-                let already_had_speech = ctx.utterance_had_speech;
                 if !already_had_speech {
                     let pad_samples = CONTEXT_PADDING_SAMPLES; // 100ms
                     let start = ctx.raw_audio_ring.len().saturating_sub(pad_samples);
@@ -3576,6 +3646,13 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     ctx.utterance_silence_samples = 0;
                     ctx.enrollment_no_speech_frame_count = 0;
                     ctx.post_speech_tail.clear();
+                    // Note: noise_rms_estimate is intentionally NOT reset here.
+                    // It is consumed by the main loop at line 3048 via
+                    // ctx.noise_rms_estimate.take() alongside enrollment_pending.
+                    // reset is handled by clear_pipeline_buffers for
+                    // cancellation/completion safety.  Clearing it here would
+                    // destroy the captured noise RMS before the main loop can
+                    // use it for compute_utterance_quality (mahbot-782).
                     // Mark ALL samples as consumed so the post-loop drain removes
                     // everything (including the unconsumed tail).  This replaces
                     // the original `clear()` while working correctly even when
@@ -6939,7 +7016,7 @@ mod tests {
         let mut samples_clip = vec![0.5f32; 16000]; // ~1 second of audio at 16kHz
         samples_clip[8000] = 1.0; // Hit i16::MAX equivalent
         let embeddings = vec![emb_2d(0.7, 0.7); 5];
-        let quality = compute_utterance_quality(&samples_clip, &embeddings, &[]);
+        let quality = compute_utterance_quality(&samples_clip, &embeddings, &[], None);
         assert!(
             quality.clipping_detected,
             "clipping should be detected when a sample hits 1.0"
@@ -6952,7 +7029,7 @@ mod tests {
 
         // ── Sample without clipping ───────────────────────────────
         let samples_clean = vec![0.5f32; 16000]; // No sample near 1.0
-        let quality_clean = compute_utterance_quality(&samples_clean, &embeddings, &[]);
+        let quality_clean = compute_utterance_quality(&samples_clean, &embeddings, &[], None);
         assert!(
             !quality_clean.clipping_detected,
             "clean sample should not have clipping detected"
@@ -6987,10 +7064,10 @@ mod tests {
         // OTHER consistent utterances — the 5th consistent utterance is the
         // one being scored, excluded from enrollment_buffer).
         let quality_consistent =
-            compute_utterance_quality(&samples, &consistent[0], &consistent[1..]);
+            compute_utterance_quality(&samples, &consistent[0], &consistent[1..], None);
 
         // Compute quality for the outlier (compared against the 5 consistent ones).
-        let quality_outlier = compute_utterance_quality(&samples, &outlier, &consistent);
+        let quality_outlier = compute_utterance_quality(&samples, &outlier, &consistent, None);
 
         // The outlier should have a HIGHER average DTW distance (lower consistency)
         // and thus a LOWER quality score.
@@ -7005,6 +7082,61 @@ mod tests {
             "outlier quality score ({}) should be lower than consistent score ({})",
             quality_outlier.score,
             quality_consistent.score,
+        );
+    }
+
+    #[test]
+    fn test_utterance_quality_snr_with_noise_rms() {
+        // ── Known-clean SNR computation ────────────────────────────
+        // Signal: 0.5 amplitude sine → RMS ≈ 0.354
+        // Noise:  0.05 RMS
+        // Expected SNR = 20 * log10(0.354 / 0.05) ≈ 17.0 dB
+        let sample_count = SAMPLE_RATE as usize; // 1 second at 16 kHz
+        let signal: Vec<f32> = (0..sample_count)
+            .map(|i| {
+                0.5f32 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin()
+            })
+            .collect();
+        // Reference: RMS of 0.5-amplitude sine = 0.5 / sqrt(2) ≈ 0.3536
+        let speech_rms = (signal.iter().map(|&s| s * s).sum::<f32>() / signal.len() as f32).sqrt();
+        assert!(
+            (speech_rms - 0.3536).abs() < 0.001,
+            "speech RMS should be ~0.3536, got {}",
+            speech_rms,
+        );
+
+        let noise_rms = 0.05f32;
+        let expected_snr_db = 20.0 * (speech_rms / noise_rms).log10();
+
+        let embeddings = vec![emb_2d(0.7, 0.7); 5];
+        let quality = compute_utterance_quality(&signal, &embeddings, &[], Some(noise_rms));
+
+        assert!(
+            quality.snr_db.is_finite(),
+            "SNR should be finite when noise_rms < speech_rms, got {}",
+            quality.snr_db,
+        );
+        assert!(
+            (quality.snr_db - expected_snr_db).abs() < 0.1,
+            "SNR should be ~{expected_snr_db:.1} dB, got {} dB",
+            quality.snr_db,
+        );
+
+        // ── Edge case: noise_rms >= speech_rms → 0.0 dB ────────────
+        let quality_loud_noise =
+            compute_utterance_quality(&signal, &embeddings, &[], Some(speech_rms * 2.0));
+        assert_eq!(
+            quality_loud_noise.snr_db, 0.0,
+            "SNR should be 0.0 when noise_rms >= speech_rms, got {}",
+            quality_loud_noise.snr_db,
+        );
+
+        // ── Edge case: near-zero noise_rms → finite high SNR ───────
+        let quality_no_noise = compute_utterance_quality(&signal, &embeddings, &[], Some(1e-9));
+        assert!(
+            quality_no_noise.snr_db.is_finite() && quality_no_noise.snr_db > 0.0,
+            "SNR should be finite and positive with near-zero noise, got {}",
+            quality_no_noise.snr_db,
         );
     }
 
