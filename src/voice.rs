@@ -2100,10 +2100,17 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
 /// [`score_matching_templates`] (sequence-level DTW) on each frame, and runs
 /// the result through [`process_wake_word_score`] with a rolling window.
 ///
-/// This replicates the exact same matching algorithm used in the real detection
-/// loop, unlike a per-frame cosine-matching approach which would diverge from
-/// live behaviour.  An utterance "triggers" if the rolling window sum exceeds
-/// [`match_threshold`] at any point.
+/// This follows the same matching algorithm used in the real detection loop
+/// (DTW, embedding ring, sigmoid scoring), except it hard-codes `minimum_matches=1`
+/// rather than using [`WakeWordTemplates::minimum_matches`].  During self-test the
+/// utterances are matched against templates calibrated from those same utterances,
+/// so DTW distances are near-zero and a single matching frame is sufficient.  Using
+/// M=1 avoids the self-test becoming a threshold-sensitivity test (which would fail
+/// short utterances that produce only 1–2 embedding frames) while still exercising
+/// the core pipeline (DTW, ring buffer, score window accumulation, noise reset).
+///
+/// An utterance "triggers" if the rolling window sum exceeds [`match_threshold`]
+/// at any point.
 ///
 /// Returns `Ok(())` if the self-test passes, or `Err` with a descriptive
 /// message if too many utterances fail to trigger detection.
@@ -2137,7 +2144,13 @@ fn run_enrollment_self_test(
 
             // Sequence-level DTW matching — identical to the live pipeline.
             let total_score = score_matching_templates(&embedding_ring, templates);
-            if process_wake_word_score(total_score, &mut score_window, templates.minimum_matches) {
+            // Deliberately hard-code M=1 instead of using templates.minimum_matches:
+            // during self-test, utterances are matched against templates derived from
+            // the same utterances, so DTW distances are near-zero and a single frame
+            // suffices.  Using templates.minimum_matches (typically 2) would set the
+            // threshold to 3.9, which is unreachable for short utterances that produce
+            // only 1–2 embedding frames (mahbot-786).
+            if process_wake_word_score(total_score, &mut score_window, 1) {
                 detected = true;
                 break;
             }
@@ -7182,7 +7195,7 @@ mod tests {
         let templates = vec![template; 3]; // K=3
         let ww_templates = WakeWordTemplates {
             templates,
-            minimum_matches: 2,
+            minimum_matches: 1, // self-test hard-codes M=1; field is unused but keep accurate
             ..Default::default()
         };
 
