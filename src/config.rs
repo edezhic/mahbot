@@ -117,6 +117,7 @@ pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image-preview";
 const DEFAULT_VIDEO_GEN_MODEL: &str = "google/veo-3.1-lite";
 pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
+pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
 // ── Named config structs ───────────────────────────────────────────
 
@@ -281,6 +282,15 @@ pub struct ConfigData {
     /// aloud via the OS-native audio player when the responding role matches
     /// the user's active GUI role.
     pub tts_enabled: Option<String>,
+    /// Language tag for TTS synthesis (default: `"na"` — language-agnostic).
+    /// Supported codes: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr,
+    /// hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk,
+    /// vi, na.
+    ///
+    /// The default `"na"` works well for any language. Set to `"en"` for
+    /// optimal English pronunciation, or to your language's code for better
+    /// results in that language.
+    pub tts_language: Option<String>,
     /// JSON-serialized wake word templates for voice assistant.
     /// Stored as a JSON array of [`crate::voice::WakeWordTemplate`] objects.
     pub wake_word_templates: Option<String>,
@@ -511,6 +521,7 @@ string_config_fields! {
     audio_transcription_use_local [non_empty],
     voice_enabled [non_empty],
     tts_enabled [non_empty],
+    tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
     voice_noise_suppression [non_empty],
     voice_agc [non_empty],

@@ -1145,9 +1145,16 @@ fn synthesize_chunked(
     Ok(result)
 }
 
-/// Wrap text in English language tag for the Supertonic 3 model.
+/// Wrap text in a language tag for the Supertonic 3 model.
+///
+/// Reads the language tag from `CONFIG.tts_language()` (defaults to `"na"` —
+/// the model's language-agnostic fallback). Users can set `tts_language` in
+/// config to any supported code: en, ko, ja, ar, bg, cs, da, de, el, es, et,
+/// fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr,
+/// uk, vi, na.
 fn wrap_lang_tag(text: &str) -> String {
-    format!("<en>{text}</en>")
+    let lang = CONFIG.tts_language();
+    format!("<{lang}>{text}</{lang}>")
 }
 
 fn split_at_sentence_boundaries(text: &str, max_len: usize) -> Vec<String> {
