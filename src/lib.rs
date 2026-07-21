@@ -46,6 +46,7 @@ pub mod util;
 pub(crate) mod vector;
 pub mod workspace;
 
+pub mod tts;
 pub mod voice;
 pub(crate) mod voice_verifier;
 
@@ -466,6 +467,8 @@ pub enum ChatEvent {
         direction: ChatDirection,
         /// ISO-8601 timestamp.
         timestamp: String,
+        /// The channel this message was delivered on (e.g. "gui", "telegram", "voice").
+        channel: String,
         /// The agent's role (e.g. "manager", "engineer"), if from an agent.
         agent_role: Option<String>,
         /// The workspace this message belongs to.

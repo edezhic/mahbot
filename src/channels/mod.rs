@@ -54,6 +54,7 @@ impl BroadcastPersistEntry {
             &self.user_name,
             &self.content,
             self.direction,
+            &self.channel,
             self.agent_role.clone(),
             &self.workspace,
             self.optimistic_id.clone(),
@@ -83,6 +84,11 @@ impl BroadcastPersistEntry {
 /// ([`send_channel_reply`]) and the per-agent consumer loop
 /// in [`crate::message_router`].
 ///
+/// TTS audio playback is handled separately by [`crate::tts::init_listener()`],
+/// which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and triggers
+/// speech for matching agent messages.  This function does not itself invoke
+/// any TTS logic.
+///
 /// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
 /// and primitive fields — does **not** depend on [`SendMessage`], so it can be used
 /// from the per-agent consumer loop which works from [`crate::users::UserRecord`].
@@ -98,7 +104,7 @@ pub(crate) async fn broadcast_and_persist_agent_response(
         channel: channel.to_string(),
         content: content.to_string(),
         direction: ChatDirection::Agent,
-        agent_role,
+        agent_role, // moved — no clone needed
         workspace: workspace.to_string(),
         optimistic_id: None, // agent messages must not carry one
     }
@@ -144,6 +150,7 @@ pub(crate) fn broadcast_chat_event(
     user_name: &str,
     content: &str,
     direction: ChatDirection,
+    channel: &str,
     agent_role: Option<String>,
     workspace: &str,
     optimistic_id: Option<String>,
@@ -158,6 +165,7 @@ pub(crate) fn broadcast_chat_event(
             content: content.to_string(),
             direction,
             timestamp: timestamp.to_string(),
+            channel: channel.to_string(),
             agent_role,
             workspace: workspace.to_string(),
             optimistic_id,
@@ -184,6 +192,7 @@ pub fn broadcast_incoming_message(
         &msg.user_name,
         content,
         ChatDirection::User,
+        &msg.channel,
         None,
         &msg.workspace,
         msg.optimistic_id.clone(),

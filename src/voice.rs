@@ -2425,6 +2425,7 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
             "",
             transcript,
             ChatDirection::User,
+            "voice",
             None,
             workspace,
             None,

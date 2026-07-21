@@ -1119,6 +1119,7 @@ impl HomeState {
                     content,
                     direction,
                     timestamp: _,
+                    channel: _,
                     agent_role,
                     workspace,
                     optimistic_id,

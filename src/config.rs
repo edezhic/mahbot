@@ -276,6 +276,11 @@ pub struct ConfigData {
     /// Enable voice assistant (wake word detection and voice commands).
     /// Set to `"true"` to enable voice mode.
     pub voice_enabled: Option<String>,
+    /// Enable text-to-speech for agent responses (default: `"false"`).
+    /// Set to `"true"` to enable. When enabled, agent responses are spoken
+    /// aloud via the OS-native audio player when the responding role matches
+    /// the user's active GUI role.
+    pub tts_enabled: Option<String>,
     /// JSON-serialized wake word templates for voice assistant.
     /// Stored as a JSON array of [`crate::voice::WakeWordTemplate`] objects.
     pub wake_word_templates: Option<String>,
@@ -505,6 +510,7 @@ string_config_fields! {
     telegram_bot_token [non_empty],
     audio_transcription_use_local [non_empty],
     voice_enabled [non_empty],
+    tts_enabled [non_empty],
     wake_word_templates [non_empty],
     voice_noise_suppression [non_empty],
     voice_agc [non_empty],

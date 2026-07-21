@@ -119,6 +119,7 @@ async fn bootstrap_mahbot() -> Result<()> {
     mahbot::ticket_buffer::init_global(); // sync — no I/O
     mahbot::message_router::init_global()?;
     mahbot::voice::init_global()?;
+    mahbot::tts::init_global()?;
 
     mahbot::turso::init_all_stores().await?;
 
@@ -126,6 +127,12 @@ async fn bootstrap_mahbot() -> Result<()> {
     // and model settings take effect.
     mahbot::config::reload_from_db().await?;
     mahbot::providers::init_global().await?;
+
+    // Try to load TTS models from cache; if not available, spawn background download.
+    // Only run when TTS is enabled in config to avoid unnecessary ~400 MB download.
+    if mahbot::tts::is_config_enabled() && !mahbot::tts::try_load_cached() {
+        mahbot::tts::spawn_download();
+    }
 
     BOOT_LOG_STORE
         .set(log_store.as_ref().clone())
@@ -334,6 +341,10 @@ fn init_message_pipeline(
     mahbot::CHAT_BROADCAST
         .set(chat_tx)
         .expect("CHAT_BROADCAST already set — should be first init");
+
+    // Spawn the TTS listener which subscribes to CHAT_BROADCAST and triggers
+    // audio playback for matching agent responses.
+    mahbot::tts::init_listener();
 
     // Initialize the channel registry (empty — channels register below).
     let _ = mahbot::CHANNEL_REGISTRY.set(mahbot::ChannelRegistry::default());

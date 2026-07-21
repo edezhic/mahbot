@@ -437,6 +437,17 @@ fn simple_eval_(
                 };
                 values.insert(node.output[0].clone(), output);
             }
+            // https://onnx.ai/onnx/operators/onnx__Softplus.html
+            "Softplus" => {
+                let input = get(&node.input[0])?;
+                // Numerically stable softplus: x > 20 ? x : ln(exp(x) + 1)
+                let mask = input.gt(20.0f64)?;
+                let ones = Tensor::ones(input.dims(), input.dtype(), input.device())?;
+                let exp_add_one = input.exp()?.broadcast_add(&ones)?;
+                let stable = exp_add_one.log()?;
+                let output = mask.where_cond(&input, &stable)?;
+                values.insert(node.output[0].clone(), output);
+            }
             "Transpose" => {
                 let input = get(&node.input[0])?;
                 let output = match get_attr_opt::<[i64]>(node, "perm")? {
@@ -1058,6 +1069,11 @@ fn simple_eval_(
             "Gelu" => {
                 let input = get(&node.input[0])?;
                 let output = input.gelu_erf()?;
+                values.insert(node.output[0].clone(), output);
+            }
+            "Reciprocal" => {
+                let input = get(&node.input[0])?;
+                let output = input.recip()?;
                 values.insert(node.output[0].clone(), output);
             }
             "Relu" => {
@@ -1792,6 +1808,44 @@ fn simple_eval_(
                 }
                 let alpha = get_attr_opt::<f32>(node, "alpha")?.copied().unwrap_or(0.01);
                 let output = candle_nn::ops::leaky_relu(input, alpha.into())?;
+                values.insert(node.output[0].clone(), output);
+            }
+            // https://onnx.ai/onnx/operators/onnx__LayerNormalization.html
+            "LayerNormalization" => {
+                let input = get(&node.input[0])?;
+                let gamma = get(&node.input[1])?;
+                let beta = if node.input.len() > 2 {
+                    Some(get(&node.input[2])?)
+                } else {
+                    None
+                };
+                let axis = get_attr_opt::<i64>(node, "axis")?.copied().unwrap_or(-1);
+                let epsilon = get_attr_opt::<f32>(node, "epsilon")?.copied().unwrap_or(1e-5) as f64;
+
+                let n_dims = input.dims().len();
+                let normal_axis: usize = if axis < 0 {
+                    (n_dims as i64 + axis) as usize
+                } else {
+                    axis as usize
+                };
+
+                // Compute mean and population variance along the normalized axis
+                let mean = input.mean_keepdim(vec![normal_axis])?;
+                let centered = input.broadcast_sub(&mean)?;
+                let pop_var = centered.sqr()?.mean_keepdim(vec![normal_axis])?;
+
+                // Normalize: (x - mean) / sqrt(var + epsilon)
+                let eps_t = Tensor::new(epsilon, input.device())?;
+                let pop_var_plus_eps = pop_var.broadcast_add(&eps_t)?;
+                let denom = pop_var_plus_eps.sqrt()?;
+                let normalized = centered.broadcast_div(&denom)?;
+
+                // Scale and shift: gamma * normalized + beta
+                let output = if let Some(beta) = beta {
+                    normalized.broadcast_mul(&gamma)?.broadcast_add(&beta)?
+                } else {
+                    normalized.broadcast_mul(&gamma)?
+                };
                 values.insert(node.output[0].clone(), output);
             }
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Gemm
@@ -2620,5 +2674,149 @@ fn to_vec0_flexible<T: candle_core::WithDType>(t: &Tensor) -> Result<T> {
         t.flatten_all()?.i(0)?.to_vec0::<T>()
     } else {
         t.to_vec0::<T>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify Reciprocal computes 1/x correctly.
+    #[test]
+    fn test_operator_reciprocal() -> Result<()> {
+        let dev = &Device::Cpu;
+
+        // Basic: 1/2 = 0.5
+        let input = Tensor::new(&[2.0f32, 4.0, 0.5, -1.0], dev)?;
+        let result = input.recip()?;
+        let vals: Vec<f32> = result.to_vec1()?;
+        assert!((vals[0] - 0.5).abs() < 1e-6, "1/2 should be 0.5, got {}", vals[0]);
+        assert!((vals[1] - 0.25).abs() < 1e-6, "1/4 should be 0.25, got {}", vals[1]);
+        assert!((vals[2] - 2.0).abs() < 1e-6, "1/0.5 should be 2.0, got {}", vals[2]);
+        assert!((vals[3] - (-1.0)).abs() < 1e-6, "1/-1 should be -1.0, got {}", vals[3]);
+
+        // Infinity: 1/0 = inf
+        let zero = Tensor::new(&[0.0f32], dev)?;
+        let inf_result = zero.recip()?;
+        let inf_vals: Vec<f32> = inf_result.to_vec1()?;
+        assert!(inf_vals[0].is_infinite(), "1/0 should be inf, got {}", inf_vals[0]);
+
+        Ok(())
+    }
+
+    /// Verify Softplus numerical stability (both branches).
+    #[test]
+    fn test_operator_softplus() -> Result<()> {
+        let dev = &Device::Cpu;
+
+        // Inputs covering both branches of the stable softplus:
+        //   x > 20 branch: return x directly (avoids overflow)
+        //   x <= 20 branch: ln(exp(x) + 1)
+        let input = Tensor::new(&[
+            -100.0f32, // very negative -> ~0
+            -10.0,     // small -> ~0.000045
+            0.0,       // ln(2) = ~0.6931
+            5.0,       // ln(exp(5)+1) = ~5.0067
+            20.0,      // boundary
+            25.0,      // >20 branch: returns 25.0
+            100.0,     // >20 branch: returns 100.0
+        ], dev)?;
+
+        // Stable softplus implementation matching eval.rs
+        let mask = input.gt(20.0f64)?;
+        let ones = Tensor::ones(input.dims(), input.dtype(), input.device())?;
+        let exp_add_one = input.exp()?.broadcast_add(&ones)?;
+        let stable = exp_add_one.log()?;
+        let output = mask.where_cond(&input, &stable)?;
+
+        let vals: Vec<f32> = output.to_vec1()?;
+
+        // Very negative: near 0
+        assert!(vals[0] < 1e-40, "softplus(-100) should be ~0, got {}", vals[0]);
+
+        // x = 0 -> ln(2) ≈ 0.693147
+        assert!((vals[2] - 0.693147).abs() < 1e-5,
+                "softplus(0) should be ~0.693147, got {}", vals[2]);
+
+        // x = 5 -> ln(exp(5)+1) ≈ 5.0067
+        assert!((vals[3] - 5.0067).abs() < 1e-3,
+                "softplus(5) should be ~5.0067, got {}", vals[3]);
+
+        // x = 25 (>20 branch) -> returns 25.0 directly
+        assert!((vals[5] - 25.0).abs() < 1e-5,
+                "softplus(25) should be 25.0 (stable branch), got {}", vals[5]);
+
+        // x = 100 (>20 branch) -> returns 100.0 directly
+        assert!((vals[6] - 100.0).abs() < 1e-5,
+                "softplus(100) should be 100.0 (stable branch), got {}", vals[6]);
+
+        // Verify monotonic property: softplus is strictly increasing
+        for i in 1..vals.len() {
+            assert!(
+                vals[i] >= vals[i - 1] - 1e-6,
+                "softplus should be monotonically increasing, but vals[{i}]={} < vals[{}]={}",
+                vals[i],
+                i - 1,
+                vals[i - 1]
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Verify LayerNormalization computes (x - mean) / sqrt(var + eps) * gamma + beta.
+    #[test]
+    fn test_operator_layer_normalization() -> Result<()> {
+        let dev = &Device::Cpu;
+
+        // Input: 1D tensor [1, 2, 3]
+        let input = Tensor::new(&[1.0f32, 2.0, 3.0], dev)?;
+        let gamma = Tensor::new(&[1.0f32, 1.0, 1.0], dev)?;
+        let beta = Tensor::new(&[0.0f32, 0.0, 0.0], dev)?;
+
+        // Manually compute expected values:
+        // mean = 2.0, var = ((1-2)^2 + (2-2)^2 + (3-2)^2) / 3 = 2/3 ≈ 0.6667
+        // normalized = (x - 2) / sqrt(0.6667 + 1e-5)
+        //   = (-1 / 0.8165), (0 / 0.8165), (1 / 0.8165)
+        //   ≈ -1.2247, 0.0, 1.2247
+
+        // Compute using the same approach as eval.rs LayerNormalization
+        let axis = 0i64;
+        let epsilon: f32 = 1e-5;
+
+        let mean = input.mean_keepdim(vec![axis as usize])?;
+        let centered = input.broadcast_sub(&mean)?;
+        let pop_var = centered.sqr()?.mean_keepdim(vec![axis as usize])?;
+        let eps_t = Tensor::new(epsilon, dev)?;
+        let denom = pop_var.broadcast_add(&eps_t)?.sqrt()?;
+        let normalized = centered.broadcast_div(&denom)?;
+        let output = normalized.broadcast_mul(&gamma)?.broadcast_add(&beta)?;
+
+        let vals: Vec<f32> = output.to_vec1()?;
+
+        // Expected: ~ -1.2247, 0.0, 1.2247
+        assert!((vals[0] - (-1.2247)).abs() < 1e-3,
+                "LayerNorm output[0] should be ~-1.2247, got {}", vals[0]);
+        assert!((vals[1] - 0.0).abs() < 1e-6,
+                "LayerNorm output[1] should be 0.0, got {}", vals[1]);
+        assert!((vals[2] - 1.2247).abs() < 1e-3,
+                "LayerNorm output[2] should be ~1.2247, got {}", vals[2]);
+
+        // Test with non-identity gamma/beta
+        let gamma2 = Tensor::new(&[2.0f32, 2.0, 2.0], dev)?;
+        let beta2 = Tensor::new(&[1.0f32, 1.0, 1.0], dev)?;
+        let output2 = normalized.broadcast_mul(&gamma2)?.broadcast_add(&beta2)?;
+        let vals2: Vec<f32> = output2.to_vec1()?;
+
+        // Expected: ~ 2 * (-1.2247) + 1, 2 * 0.0 + 1, 2 * 1.2247 + 1
+        // = -1.4494, 1.0, 3.4494
+        assert!((vals2[0] - (-1.4494)).abs() < 1e-3,
+                "LayerNorm (gamma=2,beta=1) output[0] should be ~-1.4494, got {}", vals2[0]);
+        assert!((vals2[1] - 1.0).abs() < 1e-6,
+                "LayerNorm (gamma=2,beta=1) output[1] should be 1.0, got {}", vals2[1]);
+        assert!((vals2[2] - 3.4494).abs() < 1e-3,
+                "LayerNorm (gamma=2,beta=1) output[2] should be ~3.4494, got {}", vals2[2]);
+
+        Ok(())
     }
 }
