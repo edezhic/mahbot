@@ -193,6 +193,45 @@ pub fn models_ready() -> bool {
     STATE.load(Ordering::Acquire) == STATE_READY
 }
 
+/// Returns `true` if model download has permanently failed
+/// (retries exhausted or model directory unresolvable).
+#[must_use]
+pub fn download_failed() -> bool {
+    STATE.load(Ordering::Acquire) == STATE_FAILED
+}
+
+/// Retry model download after a previous failure.
+///
+/// Atomically transitions [`STATE`] from [`STATE_FAILED`] → [`STATE_UNINIT`]
+/// and calls [`spawn_download()`]. If the state is not [`STATE_FAILED`],
+/// this is a no-op and returns `false`.
+///
+/// This is the GUI-facing counterpart of [`spawn_download()`] which only
+/// transitions from [`STATE_UNINIT`] — the two functions together handle
+/// the initial download and retry-after-failure paths.
+#[must_use]
+pub fn retry_download() -> bool {
+    if STATE
+        .compare_exchange(
+            STATE_FAILED,
+            STATE_UNINIT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    spawn_download();
+    true
+}
+
+/// Test-only: set TTS state to a known value for deterministic testing.
+#[cfg(test)]
+pub(crate) fn test_set_state(state: u8) {
+    STATE.store(state, Ordering::Release);
+}
+
 /// Speak `text` with the default voice (M1).
 ///
 /// Spawns a background task that synthesizes audio, plays it via the OS-native
@@ -367,6 +406,41 @@ pub fn spawn_download() {
         return;
     }
     tokio::spawn(download_retry_loop());
+}
+
+/// Spawn model download, retrying after a previous failure if needed.
+///
+/// Unlike [`spawn_download()`] which only transitions from [`STATE_UNINIT`],
+/// this also handles [`STATE_FAILED`] by resetting to [`STATE_UNINIT`] first,
+/// making it suitable for the GUI toggle which may be activated after a
+/// permanent download failure.
+pub fn spawn_or_retry_download() {
+    // Fast path: UNINIT → LOADING
+    if STATE
+        .compare_exchange(
+            STATE_UNINIT,
+            STATE_LOADING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        tokio::spawn(download_retry_loop());
+        return;
+    }
+    // Slow path: FAILED → UNINIT, then spawn_download handles UNINIT → LOADING
+    if STATE
+        .compare_exchange(
+            STATE_FAILED,
+            STATE_UNINIT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        spawn_download();
+    }
+    // Otherwise already LOADING or READY — nothing to do.
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────

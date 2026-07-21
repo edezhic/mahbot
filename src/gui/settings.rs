@@ -306,6 +306,16 @@ pub enum SettingsMessage {
     CancelVoiceEnrollment,
     /// Retry loading voice models after a [`VoiceStatus::ModelError`].
     RetryVoiceModels,
+    // ── TTS messages ─────────────────────────────────────
+    /// Toggle TTS on/off (persisted to config DB).
+    TtsToggle(bool),
+    /// Result of async DB persistence after a TTS toggle.
+    /// The `u64` is a generation counter used to detect stale results
+    /// from rapid toggling — if it doesn't match `SettingsState::tts_toggle_gen`,
+    /// the result is ignored as stale.
+    TtsToggleResult(u64, Result<(), String>),
+    /// Retry TTS model download after a permanent failure.
+    TtsRetryModels,
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -354,6 +364,13 @@ pub struct SettingsState {
     /// passed through to `VoiceToggleResult` so stale results from
     /// earlier toggles are detected and ignored.
     voice_toggle_gen: u64,
+
+    // ── TTS state ─────────────────────────────────────────
+    /// Generation counter for TTS toggle operations.
+    /// Incremented before each `TtsToggle`; the expected value is
+    /// passed through to `TtsToggleResult` so stale results from
+    /// earlier toggles are detected and ignored.
+    tts_toggle_gen: u64,
 }
 
 /// Sync the voice assistant pipeline state with `CONFIG.voice_enabled()`.
@@ -388,6 +405,7 @@ impl SettingsState {
             add_user_adding: false,
             model_picker_inputs: [const { String::new() }; ModelPickerTarget::COUNT],
             voice_toggle_gen: 0,
+            tts_toggle_gen: 0,
         }
     }
 
@@ -565,6 +583,79 @@ impl SettingsState {
                         Task::none()
                     }
                 }
+            }
+            SettingsMessage::TtsToggle(enabled) => {
+                // Update in-memory config snapshot so the UI reflects the change.
+                // When disabling, use an empty string so that the [non_empty]
+                // accessor collapses it to None (absent = disabled).
+                let val = if enabled { "true" } else { "" };
+                let _ = self.config.set_string_field("tts_enabled", val);
+                // Update global CONFIG so refresh() doesn't revert.
+                let _ = crate::config::CONFIG.set_string_field("tts_enabled", val);
+
+                // Bump generation so stale TtsToggleResult from a
+                // previous toggle is detected and ignored.
+                self.tts_toggle_gen += 1;
+                let toggle_gen = self.tts_toggle_gen;
+
+                // When toggling ON with uncached models, trigger download.
+                // Uses spawn_or_retry_download to handle both STATE_UNINIT
+                // (initial download) and STATE_FAILED (retry after previous
+                // permanent failure), matching voice's auto-retry behaviour.
+                if enabled && !crate::tts::try_load_cached() {
+                    crate::tts::spawn_or_retry_download();
+                }
+
+                // Persist to DB asynchronously, reporting errors via TtsToggleResult.
+                // When disabled, delete the key so it's truly absent (None on reload).
+                Task::perform(
+                    async move {
+                        let store = crate::config_db::store();
+                        let result = if enabled {
+                            store
+                                .set_kv("tts_enabled", "true")
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            store
+                                .delete_kv("tts_enabled")
+                                .await
+                                .map_err(|e| e.to_string())
+                        };
+                        (toggle_gen, result)
+                    },
+                    |(g, result)| SettingsMessage::TtsToggleResult(g, result),
+                )
+            }
+            SettingsMessage::TtsToggleResult(g, result) => {
+                // Stale result from a previous toggle?  The user toggled
+                // again before the DB write completed — ignore the stale
+                // response to avoid reverting to the wrong state.
+                if g != self.tts_toggle_gen {
+                    return Task::none();
+                }
+                match result {
+                    Ok(()) => Task::none(),
+                    Err(e) => {
+                        self.error = Some(e);
+
+                        // DB write failed — revert the in-memory state so the UI
+                        // stays consistent with the persisted config.
+                        // Without this, the toggle appears Enabled but the change is
+                        // lost on restart because it was never persisted.
+                        let current_enabled = self.config.tts_enabled.as_deref() == Some("true");
+                        let target_state = !current_enabled;
+                        let val = if target_state { "true" } else { "" };
+                        let _ = self.config.set_string_field("tts_enabled", val);
+                        let _ = crate::config::CONFIG.set_string_field("tts_enabled", val);
+
+                        Task::none()
+                    }
+                }
+            }
+            SettingsMessage::TtsRetryModels => {
+                let _ = crate::tts::retry_download();
+                Task::none()
             }
             SettingsMessage::StartVoiceEnrollment => {
                 crate::voice::send_command(crate::voice::VoiceCommand::StartEnrollment);
@@ -759,6 +850,8 @@ impl SettingsState {
             self.transcription_section(),
             Space::new().height(16),
             self.voice_section(),
+            Space::new().height(16),
+            self.tts_section(),
             Space::new().height(16),
             self.generation_section(),
             Space::new().height(16),
@@ -2199,6 +2292,51 @@ impl SettingsState {
         section("Voice Assistant", column)
     }
 
+    // ── TTS section ──────────────────────────────────────────
+
+    fn tts_section(&self) -> Element<'_, SettingsMessage> {
+        use iced::widget::Text;
+
+        let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
+        let ready = crate::tts::models_ready();
+        let failed = crate::tts::download_failed();
+
+        let status_text: Element<'_, SettingsMessage> = if !tts_enabled {
+            Text::new("Disabled").into()
+        } else if ready {
+            Text::new("Ready").into()
+        } else if failed {
+            // Show retry button inline so the user can trigger recovery
+            // without toggling TTS off/on.
+            let retry_btn = iced::widget::button(Text::new("   Retry   ").size(13))
+                .on_press(SettingsMessage::TtsRetryModels)
+                .style(theme::button_danger)
+                .padding(4);
+            iced::widget::row![
+                Text::new("Model download failed").size(14),
+                iced::widget::Space::new().width(8),
+                retry_btn,
+            ]
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            Text::new("Downloading models…").into()
+        };
+
+        let column = Column::new()
+            .push(field_row(
+                "Enable TTS",
+                iced::widget::toggler(tts_enabled)
+                    .on_toggle(SettingsMessage::TtsToggle)
+                    .into(),
+                Some("Text-to-speech for agent responses"),
+            ))
+            .push(iced::widget::Space::new().height(8))
+            .push(field_row("Status", status_text, None));
+
+        section("TTS", column)
+    }
+
     fn routing_section(&self) -> Element<'_, SettingsMessage> {
         // Collect all unique models that should appear in the routing section:
         // 1. Every role's effective model (override from per_role_configs → hardcoded default)
@@ -2772,111 +2910,133 @@ mod tests {
         }
     }
 
-    // ── Voice assistant toggle — generation counter & rollback ───
+    // ── Toggle generation counter & rollback (shared) ──────────────
 
-    #[test]
-    fn voice_toggle_generation_counter_and_rollback() {
-        // The update handler calls sync_voice_state which accesses voice pipeline
-        // globals.  Initialise the pipeline state (no-op if already initialised
-        // by another test — OnceCell::set only succeeds once).
-        let _ = crate::voice::init_global();
-
+    /// Shared helper for toggle generation-counter and rollback tests.
+    /// Parameterised by message constructors and field accessors so the
+    /// same 7-scenario sequence (toggle ON, stale result, DB error revert,
+    /// re-toggle, successful persist, stale-old-gen, toggle OFF + revert)
+    /// is exercised exactly once per toggle without code duplication.
+    fn assert_toggle_gen_counter_and_rollback(
+        toggle_on: impl Fn(bool) -> SettingsMessage,
+        toggle_result: impl Fn(u64, Result<(), String>) -> SettingsMessage,
+        get_enabled: impl Fn(&ConfigData) -> &Option<String>,
+        get_gen: impl Fn(&SettingsState) -> u64,
+        setup: impl Fn(&mut SettingsState),
+    ) {
         let mut state = SettingsState::new();
+        setup(&mut state);
 
         // ── Initial state ──
-        assert_eq!(state.voice_toggle_gen, 0, "initial gen is 0");
+        assert_eq!(get_gen(&state), 0, "initial gen is 0");
         assert_eq!(
-            state.config.voice_enabled.as_deref(),
+            get_enabled(&state.config).as_deref(),
             None,
-            "voice starts disabled"
+            "starts disabled"
         );
         assert!(state.error.is_none(), "no error initially");
 
         // ── Toggle ON ──
-        let _task = state.update(SettingsMessage::VoiceToggle(true));
-        assert_eq!(state.voice_toggle_gen, 1, "gen incremented after toggle ON");
+        let _task = state.update(toggle_on(true));
+        assert_eq!(get_gen(&state), 1, "gen incremented after toggle ON");
         assert_eq!(
-            state.config.voice_enabled.as_deref(),
+            get_enabled(&state.config).as_deref(),
             Some("true"),
-            "voice_enabled set to Some(\"true\") after toggle ON"
+            "enabled set to Some(\"true\") after toggle ON"
         );
 
         // ── Stale result from previous generation must be ignored ──
-        let _task = state.update(SettingsMessage::VoiceToggleResult(
-            0,
-            Err("stale result".into()),
-        ));
+        let _task = state.update(toggle_result(0, Err("stale result".into())));
         assert_eq!(
-            state.config.voice_enabled.as_deref(),
+            get_enabled(&state.config).as_deref(),
             Some("true"),
-            "stale VoiceToggleResult with Err must NOT revert the state"
+            "stale ToggleResult with Err must NOT revert the state"
         );
-        assert_eq!(state.voice_toggle_gen, 1, "gen unchanged by stale result");
+        assert_eq!(get_gen(&state), 1, "gen unchanged by stale result");
 
         // ── Correct generation + DB error → rollback to disabled ──
-        let _task = state.update(SettingsMessage::VoiceToggleResult(
-            1,
-            Err("db write failed".into()),
-        ));
+        let _task = state.update(toggle_result(1, Err("db write failed".into())));
         assert!(
-            state.config.voice_enabled.as_deref() != Some("true"),
-            "errant VoiceToggleResult must revert voice_enabled away from Some(\"true\")"
+            get_enabled(&state.config).as_deref() != Some("true"),
+            "errant ToggleResult must revert enabled away from Some(\"true\")"
         );
         assert_eq!(
             state.error.as_deref(),
             Some("db write failed"),
             "error message set after failed toggle"
         );
-        assert_eq!(state.voice_toggle_gen, 1, "gen unchanged after rollback");
+        assert_eq!(get_gen(&state), 1, "gen unchanged after rollback");
 
         // ── Toggle ON again, succeed this time ──
         state.error = None; // clear previous error
-        let _task = state.update(SettingsMessage::VoiceToggle(true));
+        let _task = state.update(toggle_on(true));
+        assert_eq!(get_gen(&state), 2, "gen incremented on second toggle");
+        let _task = state.update(toggle_result(2, Ok(())));
         assert_eq!(
-            state.voice_toggle_gen, 2,
-            "gen incremented on second toggle"
-        );
-        let _task = state.update(SettingsMessage::VoiceToggleResult(2, Ok(())));
-        assert_eq!(
-            state.config.voice_enabled.as_deref(),
+            get_enabled(&state.config).as_deref(),
             Some("true"),
-            "successful VoiceToggleResult must keep enabled state"
+            "successful ToggleResult must keep enabled state"
         );
         assert!(state.error.is_none(), "no error after successful toggle");
 
         // ── Stale result from old generation must also be ignored ──
-        let _task = state.update(SettingsMessage::VoiceToggleResult(
-            1,
-            Err("stale from old gen".into()),
-        ));
+        let _task = state.update(toggle_result(1, Err("stale from old gen".into())));
         assert_eq!(
-            state.config.voice_enabled.as_deref(),
+            get_enabled(&state.config).as_deref(),
             Some("true"),
-            "stale VoiceToggleResult from gen=1 must NOT revert state when current gen=2"
+            "stale ToggleResult from gen=1 must NOT revert state when current gen=2"
         );
         assert!(state.error.is_none(), "stale result must NOT set error");
 
         // ── Toggle OFF with DB error → rollback back to enabled ──
-        let _task = state.update(SettingsMessage::VoiceToggle(false));
-        assert_eq!(state.voice_toggle_gen, 3, "gen incremented on toggle OFF");
+        let _task = state.update(toggle_on(false));
+        assert_eq!(get_gen(&state), 3, "gen incremented on toggle OFF");
         assert_eq!(
-            state.config.voice_enabled.as_deref(),
+            get_enabled(&state.config).as_deref(),
             Some(""),
-            "voice_enabled set to Some(\"\") after toggle OFF"
+            "enabled set to Some(\"\") after toggle OFF"
         );
-        let _task = state.update(SettingsMessage::VoiceToggleResult(
-            3,
-            Err("db delete failed".into()),
-        ));
+        let _task = state.update(toggle_result(3, Err("db delete failed".into())));
         assert_eq!(
-            state.config.voice_enabled.as_deref(),
+            get_enabled(&state.config).as_deref(),
             Some("true"),
-            "errant VoiceToggleResult(false) must revert back to enabled"
+            "errant ToggleResult(false) must revert back to enabled"
         );
         assert_eq!(
             state.error.as_deref(),
             Some("db delete failed"),
             "error set after failed disable toggle"
+        );
+    }
+
+    #[test]
+    fn voice_toggle_generation_counter_and_rollback() {
+        // The update handler calls sync_voice_state which accesses voice pipeline
+        // globals.  Initialise the pipeline state (no-op if already initialised
+        // by another test — OnceCell::set only succeeds once).
+        assert_toggle_gen_counter_and_rollback(
+            SettingsMessage::VoiceToggle,
+            SettingsMessage::VoiceToggleResult,
+            |c| &c.voice_enabled,
+            |s| s.voice_toggle_gen,
+            |_s| {
+                let _ = crate::voice::init_global();
+            },
+        );
+    }
+
+    #[test]
+    fn tts_toggle_generation_counter_and_rollback() {
+        // Set TTS state to READY so that toggling ON does not trigger
+        // spawn_or_retry_download() (which requires a Tokio runtime).  The
+        // model download logic is tested separately — this test focuses on
+        // the generation-counter and rollback behaviour.
+        assert_toggle_gen_counter_and_rollback(
+            SettingsMessage::TtsToggle,
+            SettingsMessage::TtsToggleResult,
+            |c| &c.tts_enabled,
+            |s| s.tts_toggle_gen,
+            |_s| crate::tts::test_set_state(2), // STATE_READY
         );
     }
 }
