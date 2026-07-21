@@ -161,6 +161,12 @@ const NUM_ENROLLMENT_SAMPLES: usize = 10;
 /// mostly padding/silence and provide negligible discriminative signal.
 const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 
+/// Maximum number of ambient noise chunks to retain for verifier training.
+/// If training repeatedly fails (ONNX not loaded, <2 chunks, or empty
+/// embeddings), this cap prevents unbounded memory growth in the voice
+/// pipeline state (mahbot-800).
+const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
+
 /// MAD multiplier for robust threshold calibration.
 ///
 /// K_MAD = 3.0 is equivalent to ~2σ for normally-distributed data
@@ -2844,19 +2850,21 @@ impl PipelineCtx {
         }
     }
 
-    /// Clear all audio buffers and processing state.
+    /// Clear only detection/recording state while preserving enrollment
+    /// accumulators (`enrollment_buffer`, `negative_audio_chunks`).  Used by
+    /// [`handle_start_listening`] and [`handle_stop_listening`] so that
+    /// toggling voice off/on mid-enrollment does not destroy progress
+    /// (mahbot-800).
     ///
-    /// Must be called at every state transition to prevent stale audio from
-    /// contaminating the new pipeline phase (mahbot-765).  Resets:
-    /// - `voice_batch`, `mel_frame_buffer`, `embedding_ring`
-    /// - `audio_buffer`, `command_buffer`
-    /// - `utterance_buf` and enrollment tracking fields
-    /// - `enrollment_no_speech_frame_count`
-    /// - `enrollment_pending` (stale utterance after cancel)
-    /// - `raw_audio_ring` and `post_speech_tail` (VAD asymmetry padding)
-    /// - `score_window` (sliding detection scores)
-    /// - `voice_state().enrollment_buffer` (global enrollment buffer)
-    fn clear_pipeline_buffers(&mut self) {
+    /// Preserves:
+    /// - `voice_state().enrollment_buffer` (global enrollment utterance buffer)
+    /// - `voice_state().negative_audio_chunks` (global ambient noise chunks)
+    ///
+    /// ⚠ If you add, remove, or reset a field in this function, update the
+    ///    test helpers `fill_detection_buffers` and
+    ///    `assert_detection_buffers_cleared` in
+    ///    `test_voice_pipeline_commands_and_enrollment_guard` to match.
+    fn clear_detection_buffers(&mut self) {
         self.voice_batch.clear();
         self.mel_frame_buffer.clear();
         self.embedding_ring.clear();
@@ -2878,16 +2886,34 @@ impl PipelineCtx {
         self.last_wake_word_detection = None;
         self.audio_preprocessor.clear_buffer();
         self.negative_audio_buf.clear();
-        voice_state()
-            .write()
-            .unwrap_poison()
-            .enrollment_buffer
-            .clear();
-        voice_state()
-            .write()
-            .unwrap_poison()
-            .negative_audio_chunks
-            .clear();
+        // Reset VAD detector state so stale ring buffer + pre-emphasis
+        // filter state from the previous stream does not misclassify
+        // the first few frames (mahbot-771 Fix 3, mahbot-800 C1).
+        reset_vad();
+    }
+
+    /// Clear all audio buffers and processing state.
+    ///
+    /// Resets:
+    /// - `voice_batch`, `mel_frame_buffer`, `embedding_ring`
+    /// - `audio_buffer`, `command_buffer`
+    /// - `utterance_buf` and enrollment tracking fields
+    /// - `enrollment_no_speech_frame_count`
+    ///
+    /// Full pipeline buffer clear — clears detection, recording, AND
+    /// enrollment accumulators.  Intended for post-enrollment cleanup
+    /// (after successful enrollment) and explicit enrollment
+    /// start/cancel.  Do NOT call from [`handle_start_listening`] or
+    /// [`handle_stop_listening`] — use [`clear_detection_buffers`]
+    /// instead to preserve mid-enrollment state (mahbot-800).
+    fn clear_pipeline_buffers(&mut self) {
+        // Clear all detection/recording state (preserves global enrollment accumulators)
+        self.clear_detection_buffers();
+        // Then clear the global enrollment accumulators that clear_detection_buffers preserves.
+        // Single lock acquisition for both clears (mahbot-800).
+        let mut state = voice_state().write().unwrap_poison();
+        state.enrollment_buffer.clear();
+        state.negative_audio_chunks.clear();
     }
 
     fn handle_start_listening(&mut self) {
@@ -2917,12 +2943,7 @@ impl PipelineCtx {
             return;
         }
         if !self.is_listening {
-            self.clear_pipeline_buffers();
-            // Reset VAD detector state when re-creating the mic stream to
-            // prevent stale ring buffer + pre-emphasis filter state from
-            // the previous stream misclassifying the first few frames
-            // (mahbot-771 Fix 3).
-            reset_vad();
+            self.clear_detection_buffers();
             drop(self.mic_stream.take());
             match start_microphone() {
                 Ok((rx, stream)) => {
@@ -2948,7 +2969,10 @@ impl PipelineCtx {
     }
 
     fn handle_stop_listening(&mut self) {
-        self.clear_pipeline_buffers();
+        // Use clear_detection_buffers instead of clear_pipeline_buffers so
+        // that mid-enrollment progress (enrollment_buffer, negative_audio_chunks)
+        // is preserved across a toggle-off/on cycle (mahbot-800).
+        self.clear_detection_buffers();
         self.is_listening = false;
         self.is_recording = false;
         self.enrollment_mode = false;
@@ -2971,16 +2995,29 @@ impl PipelineCtx {
             ));
             return;
         }
-        self.clear_pipeline_buffers();
+
+        // Preserve existing enrollment progress if we're resuming an
+        // interrupted session (e.g., after a toggle-off/on cycle that
+        // preserved enrollment_buffer via clear_detection_buffers).
+        // Only clear everything when starting truly fresh (mahbot-800).
+        let existing_count = voice_state().read().unwrap_poison().enrollment_buffer.len();
+
+        if existing_count == 0 {
+            self.clear_pipeline_buffers();
+        }
+
         self.enrollment_mode = true;
         self.vad_threshold = ENROLLMENT_VAD_THRESHOLD;
         set_status(VoiceStatus::Enrolling {
-            sample: 0,
+            sample: existing_count,
             total: NUM_ENROLLMENT_SAMPLES,
             duration_ms: 0,
             quality: None,
         });
-        info!("Voice pipeline: enrollment started");
+        info!(
+            "Voice pipeline: enrollment started (resuming from sample {}/{NUM_ENROLLMENT_SAMPLES})",
+            existing_count,
+        );
     }
 
     fn handle_cancel_enrollment(&mut self) {
@@ -3349,6 +3386,11 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                                 .collect::<Vec<Vec<f32>>>()
                         };
 
+                        // Track whether real negatives were successfully extracted
+                        // and used for training.  Declared here so it outlives
+                        // the verifier if/else block (mahbot-800).
+                        let mut used_real_negatives = false;
+
                         let verifier = if positive_embeddings.is_empty() {
                             warn!(
                                 "Could not train verifier: no valid positive embeddings \
@@ -3359,11 +3401,14 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         } else {
                             // Collect negative audio chunks and process them
                             // through ONNX to get real negative embeddings.
+                            // Clone instead of split_off(0) so chunks survive
+                            // a synthetic fallback — they remain available for
+                            // the next enrollment retry (mahbot-800).
                             let negative_chunks = voice_state()
-                                .write()
+                                .read()
                                 .unwrap_poison()
                                 .negative_audio_chunks
-                                .split_off(0);
+                                .clone();
                             let n_chunks = negative_chunks.len();
                             // Require >=2 chunks to ensure embedding diversity
                             // and reduce the chance of a single noisy chunk
@@ -3403,6 +3448,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                                 None
                             };
 
+                            used_real_negatives = real_negatives.is_some();
+
                             if let Some(neg_embeddings) = real_negatives {
                                 let n_neg = neg_embeddings.len();
                                 let v = crate::voice_verifier::VoiceVerifier::train(
@@ -3439,6 +3486,18 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                                 v
                             }
                         };
+
+                        // Conditionally clear negative_audio_chunks: only discard
+                        // them when real negatives were actually used for training.
+                        // On synthetic fallback, keep the chunks so they are
+                        // available for a subsequent enrollment retry (mahbot-800).
+                        if used_real_negatives {
+                            voice_state()
+                                .write()
+                                .unwrap_poison()
+                                .negative_audio_chunks
+                                .clear();
+                        }
 
                         let mut existing = get_templates();
                         let existing_mut = Arc::make_mut(&mut existing);
@@ -3818,9 +3877,16 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // negative training example for the verifier.
                 if !already_had_speech {
                     if ctx.negative_audio_buf.len() >= MIN_NEGATIVE_AUDIO_LEN {
-                        voice_state()
-                            .write()
-                            .unwrap_poison()
+                        let mut state = voice_state().write().unwrap_poison();
+                        if state.negative_audio_chunks.len() >= MAX_NEGATIVE_AUDIO_CHUNKS {
+                            warn!(
+                                "negative_audio_chunks at max ({}): discarding oldest chunk \
+                                 to cap memory growth (mahbot-800)",
+                                MAX_NEGATIVE_AUDIO_CHUNKS,
+                            );
+                            state.negative_audio_chunks.remove(0);
+                        }
+                        state
                             .negative_audio_chunks
                             .push(std::mem::take(&mut ctx.negative_audio_buf));
                     } else {
@@ -4094,6 +4160,9 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
         ctx.audio_buffer.clear();
         ctx.voice_batch.clear();
         ctx.score_window.clear();
+        // Clear NS frame-alignment buffer to prevent stale residual audio
+        // from the detection phase contaminating the recording (mahbot-800 C2).
+        ctx.audio_preprocessor.clear_buffer();
         ctx.last_wake_word_detection = Some(Instant::now());
         set_status(VoiceStatus::Recording);
         true
@@ -4593,9 +4662,11 @@ mod tests {
             ctx.enrollment_mode = false;
         }
 
-        // ── clear_pipeline_buffers — full buffer cleanup ──────────────
-        {
-            // Fill all buffers with test data
+        // ── Helpers for buffer clear tests ────────────────────────────
+        // ⚠ These helpers must mirror `clear_detection_buffers` above.
+        //    If that function gains or loses a field reset, update both
+        //    `fill_detection_buffers` and `assert_detection_buffers_cleared`.
+        let fill_detection_buffers = |ctx: &mut PipelineCtx| {
             ctx.voice_batch = vec![1.0; 100];
             ctx.mel_frame_buffer = vec![vec![1.0; 10]; 5];
             ctx.embedding_ring = vec![vec![1.0; 5]; 3];
@@ -4607,26 +4678,26 @@ mod tests {
             ctx.utterance_speech_end_len = 600;
             ctx.enrollment_no_speech_frame_count = 700;
             ctx.enrollment_pending = Some(vec![1.0; 50]);
-            ctx.score_window = vec![1.5, 2.0, 0.8]; // simulated scores
+            ctx.score_window = vec![1.5, 2.0, 0.8];
             ctx.raw_audio_ring = vec![1.0; 100];
             ctx.pre_agc_ring = vec![1.0; 100];
             ctx.post_speech_tail = vec![1.0; 50];
+            ctx.noise_rms_estimate = Some(0.75);
+            ctx.negative_audio_buf = vec![1.0; 5000];
             ctx.vad_positives_in_a_row = 2;
             ctx.vad_threshold = ENROLLMENT_VAD_THRESHOLD;
             ctx.last_wake_word_detection = Some(Instant::now());
-            voice_state()
-                .write()
-                .unwrap_poison()
-                .enrollment_buffer
-                .push(vec![vec![1.0; 10]; 3]);
-            voice_state()
-                .write()
-                .unwrap_poison()
-                .enrollment_buffer
-                .push(vec![vec![1.0; 10]; 3]);
+        };
 
-            ctx.clear_pipeline_buffers();
+        let fill_global_accumulators = || {
+            let mut state = voice_state().write().unwrap_poison();
+            state.enrollment_buffer.push(vec![vec![1.0; 10]; 3]);
+            state.enrollment_buffer.push(vec![vec![1.0; 10]; 3]);
+            state.negative_audio_chunks.push(vec![1.0; 16000]);
+            state.negative_audio_chunks.push(vec![1.0; 16000]);
+        };
 
+        let assert_detection_buffers_cleared = |ctx: &PipelineCtx| {
             assert!(ctx.voice_batch.is_empty(), "voice_batch should be cleared");
             assert!(
                 ctx.mel_frame_buffer.is_empty(),
@@ -4673,16 +4744,12 @@ mod tests {
                 "enrollment_pending should be reset to None"
             );
             assert!(
-                voice_state()
-                    .read()
-                    .unwrap_poison()
-                    .enrollment_buffer
-                    .is_empty(),
-                "voice_state().enrollment_buffer should be cleared"
-            );
-            assert!(
                 ctx.score_window.is_empty(),
                 "score_window should be cleared"
+            );
+            assert!(
+                ctx.noise_rms_estimate.is_none(),
+                "noise_rms_estimate should be reset to None"
             );
             assert!(
                 ctx.raw_audio_ring.is_empty(),
@@ -4703,6 +4770,72 @@ mod tests {
             assert_eq!(
                 ctx.vad_threshold, VAD_THRESHOLD,
                 "vad_threshold should be reset to VAD_THRESHOLD"
+            );
+            assert!(
+                ctx.negative_audio_buf.is_empty(),
+                "negative_audio_buf should be cleared"
+            );
+        };
+
+        // ── clear_pipeline_buffers — full buffer cleanup ──────────────
+        {
+            fill_detection_buffers(&mut ctx);
+            fill_global_accumulators();
+            ctx.clear_pipeline_buffers();
+            assert_detection_buffers_cleared(&ctx);
+            assert!(
+                voice_state()
+                    .read()
+                    .unwrap_poison()
+                    .enrollment_buffer
+                    .is_empty(),
+                "voice_state().enrollment_buffer should be cleared"
+            );
+            assert!(
+                voice_state()
+                    .read()
+                    .unwrap_poison()
+                    .negative_audio_chunks
+                    .is_empty(),
+                "voice_state().negative_audio_chunks should be cleared"
+            );
+        }
+
+        // ── clear_detection_buffers — preserves enrollment state (mahbot-800) ──
+        {
+            fill_detection_buffers(&mut ctx);
+            fill_global_accumulators();
+            ctx.clear_detection_buffers();
+            assert_detection_buffers_cleared(&ctx);
+            assert!(
+                !voice_state()
+                    .read()
+                    .unwrap_poison()
+                    .enrollment_buffer
+                    .is_empty(),
+                "enrollment_buffer must NOT be cleared by clear_detection_buffers"
+            );
+            assert_eq!(
+                voice_state().read().unwrap_poison().enrollment_buffer.len(),
+                2,
+                "enrollment_buffer must retain both entries"
+            );
+            assert!(
+                !voice_state()
+                    .read()
+                    .unwrap_poison()
+                    .negative_audio_chunks
+                    .is_empty(),
+                "negative_audio_chunks must NOT be cleared by clear_detection_buffers"
+            );
+            assert_eq!(
+                voice_state()
+                    .read()
+                    .unwrap_poison()
+                    .negative_audio_chunks
+                    .len(),
+                2,
+                "negative_audio_chunks must retain both entries"
             );
         }
 
