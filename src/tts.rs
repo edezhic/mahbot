@@ -248,6 +248,11 @@ pub fn speak(text: &str) {
     if text.trim().is_empty() || !is_enabled() {
         return;
     }
+    // Cancel any previous playback before starting new synthesis.
+    // The subscription below happens BEFORE the spawn so that this cancel
+    // signal reaches the old task before the new task subscribes.
+    cancel_playback();
+
     // Subscribe to cancellation channel BEFORE spawning the task to avoid a
     // race where cancel_playback() between spawn and subscription is lost.
     let cancel_rx = CANCEL_TX.get().map(broadcast::Sender::subscribe);
