@@ -47,6 +47,7 @@ pub(crate) mod vector;
 pub mod workspace;
 
 pub mod tts;
+pub mod tts_data_gen;
 pub mod voice;
 pub(crate) mod voice_verifier;
 

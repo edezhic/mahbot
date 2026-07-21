@@ -106,6 +106,13 @@ const TTS_JSON_NAME: &str = "tts.json";
 const UNICODE_INDEXER_NAME: &str = "unicode_indexer.json";
 const DEFAULT_VOICE_NAME: &str = "M1.json";
 
+/// All 10 available voice styles from HuggingFace.
+/// F1-F5 are female voices, M1-M5 are male voices.
+const ALL_VOICE_STYLE_NAMES: &[&str] = &[
+    "F1.json", "F2.json", "F3.json", "F4.json", "F5.json", "M1.json", "M2.json", "M3.json",
+    "M4.json", "M5.json",
+];
+
 // ── State machine ─────────────────────────────────────────────────────
 
 const STATE_UNINIT: u8 = 0;
@@ -217,8 +224,6 @@ struct TtsEngine {
     vector_est_model: candle_onnx::onnx::ModelProto,
     vocoder_model: candle_onnx::onnx::ModelProto,
     unicode_indexer: Vec<i32>,
-    style_dp: Tensor,
-    style_ttl: Tensor,
     sample_rate: u32,
     latent_dim: usize,
     chunk_compress_factor: usize,
@@ -226,12 +231,32 @@ struct TtsEngine {
     device: Device,
 }
 
+/// A single style entry from the HuggingFace voice style JSON.
+///
+/// Actual format from HuggingFace repo:
+/// ```json
+/// {
+///   "data": [[[ ... ]]],   // 3D array: [batch, rows, cols]
+///   "dims": [1, 8, 16],    // shape description
+///   "type": "float32"       // data type
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+struct StyleEntry {
+    data: Vec<Vec<Vec<f32>>>,
+    #[allow(dead_code)]
+    dims: Vec<usize>,
+    #[allow(dead_code)]
+    #[serde(rename = "type")]
+    data_type: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct VoiceStyleFile {
     #[serde(rename = "style_dp")]
-    style_dp: Vec<Vec<f32>>,
+    style_dp: StyleEntry,
     #[serde(rename = "style_ttl")]
-    style_ttl: Vec<Vec<f32>>,
+    style_ttl: StyleEntry,
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -436,6 +461,94 @@ pub fn init_listener() {
     });
 }
 
+/// List available voice style names (e.g., "M1.json", "F1.json", etc.).
+///
+/// Returns only the styles that are actually cached on disk. The full set
+/// is downloaded during model initialization.
+#[must_use]
+pub fn list_voice_styles() -> Vec<String> {
+    let Some(dir) = model_dir() else {
+        return Vec::new();
+    };
+    let styles_dir = dir.join(VOICE_STYLES_DIR);
+    let mut available = Vec::new();
+    for &name in ALL_VOICE_STYLE_NAMES {
+        if styles_dir.join(name).exists() {
+            available.push(name.to_string());
+        }
+    }
+    available
+}
+
+/// Synthesize `text` with the given `voice_style` and return raw mono PCM
+/// samples at the specified sample rate (f32 in [-1.0, 1.0]).
+///
+/// This is a **pure synthesis** function — no playback, no rodio, no
+/// cancellation channel. Use it for data generation, offline processing,
+/// or any scenario where you need audio samples rather than immediate
+/// playback.
+///
+/// # Arguments
+///
+/// * `text` — The text to synthesize. Preprocessing (markdown strip, emoji
+///   removal, abbreviation expansion) is applied automatically.
+/// * `voice_style` — One of the style file names (e.g. `"M1.json"`,
+///   `"F1.json"`). Use [`list_voice_styles()`] to discover available styles.
+/// * `seed` — Random seed for the flow-matching noise. Different seeds
+///   produce different prosody/intonation while preserving same text content.
+///   Use `42` for deterministic output matching the default playback behavior
+///   (same as [`speak_async`]).
+/// * `target_sample_rate` — Desired output sample rate in Hz. The Supertonic 3
+///   model natively outputs 24 kHz; passing a different rate triggers
+///   resampling. Common values: `44100` (CD quality), `16000` (voice pipeline),
+///   `24000` (native, no resampling).
+///
+/// # Errors
+///
+/// Returns an error if the TTS engine is not ready, the voice style is not
+/// found or cannot be parsed, or synthesis fails.
+///
+/// # Sample rate
+///
+/// The Supertonic 3 model natively outputs 24 kHz audio. The function
+/// resamples to `target_sample_rate` for compatibility. For training data
+/// generation targeting the voice pipeline (which expects 16 kHz), pass
+/// `target_sample_rate = 16000` to avoid an intermediate 44.1 kHz step.
+///
+/// # Example
+///
+/// ```ignore
+/// // Synthesize at voice pipeline rate (16 kHz)
+/// let pcm = tts::synthesize("hello world", "M1.json", 42, 16000)?;
+/// assert_eq!(pcm.len(), 16000 /* ≈1 second at 16kHz */);
+/// ```
+pub fn synthesize(
+    text: &str,
+    voice_style: &str,
+    seed: u64,
+    target_sample_rate: u32,
+) -> Result<Vec<f32>> {
+    let engine = get_engine_clone().context("TTS engine not ready")?;
+    let dir = model_dir().context("Cannot resolve model directory")?;
+    let (style_dp, style_ttl) = load_voice_style(&dir, voice_style)?;
+    let processed = preprocess_text(text);
+    if processed.is_empty() {
+        anyhow::bail!("Empty text after preprocessing");
+    }
+    let native_rate = engine.sample_rate;
+    let samples = synthesize_internal(&engine, &processed, &style_dp, &style_ttl, seed)?;
+    // Resample from native rate to target rate
+    if native_rate == target_sample_rate {
+        Ok(samples)
+    } else {
+        Ok(crate::util::resample_audio(
+            &samples,
+            native_rate,
+            target_sample_rate,
+        ))
+    }
+}
+
 /// Try to load TTS models from cache at startup.
 /// Returns `true` if loaded, `false` if not (download will happen async).
 pub fn try_load_cached() -> bool {
@@ -447,17 +560,18 @@ pub fn try_load_cached() -> bool {
         return false;
     };
 
-    let all_exist = [
+    let mut paths: Vec<PathBuf> = vec![
         dir.join(ONNX_DIR).join(DP_ONNX_NAME),
         dir.join(ONNX_DIR).join(TEXT_ENC_ONNX_NAME),
         dir.join(ONNX_DIR).join(VECTOR_EST_ONNX_NAME),
         dir.join(ONNX_DIR).join(VOCODER_ONNX_NAME),
         dir.join(ONNX_DIR).join(TTS_JSON_NAME),
         dir.join(ONNX_DIR).join(UNICODE_INDEXER_NAME),
-        dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME),
-    ]
-    .iter()
-    .all(|p| p.exists());
+    ];
+    // Also check that at least the default voice style exists
+    paths.push(dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME));
+
+    let all_exist = paths.iter().all(|p| p.exists());
 
     if !all_exist {
         return false;
@@ -559,13 +673,45 @@ fn load_voice_style(dir: &Path, voice_name: &str) -> Result<(Tensor, Tensor)> {
         .with_context(|| format!("Failed to read voice style: {}", path.display()))?;
     let voice: VoiceStyleFile =
         serde_json::from_str(&content).context("Failed to parse voice style JSON")?;
-    if voice.style_dp.is_empty() || voice.style_ttl.is_empty() {
-        anyhow::bail!("Voice style has empty vectors");
-    }
+
     let device = Device::Cpu;
-    let dp = Tensor::from_slice(&voice.style_dp[0], (1, voice.style_dp[0].len()), &device)?;
-    let ttl = Tensor::from_slice(&voice.style_ttl[0], (1, voice.style_ttl[0].len()), &device)?;
-    Ok((dp, ttl))
+
+    // style_dp: HuggingFace stores as 3D [batch=1, rows=8, cols=16]
+    let dp_data = &voice.style_dp.data;
+    anyhow::ensure!(!dp_data.is_empty(), "Voice style has empty style_dp");
+    anyhow::ensure!(!dp_data[0].is_empty(), "Voice style has empty style_dp[0]");
+    let dp_rows = dp_data[0].len();
+    let dp_cols = dp_data[0][0].len();
+    let dp_flat: Vec<f32> = dp_data[0].iter().flat_map(|v| v.iter()).copied().collect();
+    anyhow::ensure!(
+        dp_flat.len() == dp_rows * dp_cols,
+        "Flat style_dp length {} doesn't match {}×{}",
+        dp_flat.len(),
+        dp_rows,
+        dp_cols,
+    );
+    let style_dp = Tensor::from_slice(&dp_flat, (1, dp_rows, dp_cols), &device)?;
+
+    // style_ttl: HuggingFace stores as 3D [batch=1, rows=50, cols=256]
+    let ttl_data = &voice.style_ttl.data;
+    anyhow::ensure!(!ttl_data.is_empty(), "Voice style has empty style_ttl");
+    anyhow::ensure!(
+        !ttl_data[0].is_empty(),
+        "Voice style has empty style_ttl[0]"
+    );
+    let ttl_rows = ttl_data[0].len();
+    let ttl_cols = ttl_data[0][0].len();
+    let ttl_flat: Vec<f32> = ttl_data[0].iter().flat_map(|v| v.iter()).copied().collect();
+    anyhow::ensure!(
+        ttl_flat.len() == ttl_rows * ttl_cols,
+        "Flat style_ttl length {} doesn't match {}×{}",
+        ttl_flat.len(),
+        ttl_rows,
+        ttl_cols,
+    );
+    let style_ttl = Tensor::from_slice(&ttl_flat, (1, ttl_rows, ttl_cols), &device)?;
+
+    Ok((style_dp, style_ttl))
 }
 
 fn load_engine(dir: &Path) -> Result<TtsEngine> {
@@ -591,8 +737,6 @@ fn load_engine(dir: &Path) -> Result<TtsEngine> {
     let unicode_indexer: Vec<i32> =
         serde_json::from_str(&indexer_content).context("Failed to parse unicode_indexer.json")?;
 
-    let (style_dp, style_ttl) = load_voice_style(dir, DEFAULT_VOICE_NAME)?;
-
     info!(
         "Loaded Supertonic 3 TTS models (version {}, latent {}, {}Hz)",
         config.tts_version, latent_dim, sample_rate,
@@ -604,8 +748,6 @@ fn load_engine(dir: &Path) -> Result<TtsEngine> {
         vector_est_model,
         vocoder_model,
         unicode_indexer,
-        style_dp,
-        style_ttl,
         sample_rate,
         latent_dim,
         chunk_compress_factor,
@@ -697,7 +839,7 @@ async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
 
     let base = format!("{HF_BASE}/{MODEL_REPO}/resolve/{MODEL_REVISION}");
 
-    let files = [
+    let mut files: Vec<TtsFile> = vec![
         TtsFile {
             url: format!("{base}/onnx/{DP_ONNX_NAME}"),
             path: dir.join(ONNX_DIR).join(DP_ONNX_NAME),
@@ -728,12 +870,23 @@ async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
             path: dir.join(ONNX_DIR).join(UNICODE_INDEXER_NAME),
             sha256: UNICODE_INDEXER_SHA256,
         },
-        TtsFile {
-            url: format!("{base}/{VOICE_STYLES_DIR}/{DEFAULT_VOICE_NAME}"),
-            path: dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME),
-            sha256: VOICE_STYLE_SHA256,
-        },
     ];
+
+    // Add all 10 voice style files. Only M1.json has a verified SHA256;
+    // the rest have empty hashes (minimum-size check only) until they
+    // are verified against downloads.
+    for style_name in ALL_VOICE_STYLE_NAMES {
+        let sha = if *style_name == DEFAULT_VOICE_NAME {
+            VOICE_STYLE_SHA256
+        } else {
+            "" // No verified hash yet — minimum-size check only
+        };
+        files.push(TtsFile {
+            url: format!("{base}/{VOICE_STYLES_DIR}/{style_name}"),
+            path: dir.join(VOICE_STYLES_DIR).join(style_name),
+            sha256: sha,
+        });
+    }
 
     // Sequential downloads so per-file progress is meaningful
     for f in &files {
@@ -1172,7 +1325,13 @@ fn extract_output(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn synthesize_internal(engine: &TtsEngine, text: &str) -> Result<Vec<f32>> {
+fn synthesize_internal(
+    engine: &TtsEngine,
+    text: &str,
+    style_dp: &Tensor,
+    style_ttl: &Tensor,
+    seed: u64,
+) -> Result<Vec<f32>> {
     let dev = &engine.device;
 
     // 1. Encode text
@@ -1190,7 +1349,7 @@ fn synthesize_internal(engine: &TtsEngine, text: &str) -> Result<Vec<f32>> {
         &engine.dp_model,
         build_inputs(vec![
             ("text_ids", text_ids.clone()),
-            ("style_dp", engine.style_dp.clone()),
+            ("style_dp", style_dp.clone()),
             ("text_mask", text_mask.clone()),
         ]),
     )
@@ -1208,7 +1367,7 @@ fn synthesize_internal(engine: &TtsEngine, text: &str) -> Result<Vec<f32>> {
         &engine.text_enc_model,
         build_inputs(vec![
             ("text_ids", text_ids),
-            ("style_ttl", engine.style_ttl.clone()),
+            ("style_ttl", style_ttl.clone()),
             ("text_mask", text_mask_flat.clone()),
         ]),
     )
@@ -1222,7 +1381,7 @@ fn synthesize_internal(engine: &TtsEngine, text: &str) -> Result<Vec<f32>> {
     let latent_dim = engine.latent_dim * engine.chunk_compress_factor;
 
     // 5. Sample noise
-    let mut rng = 42u64;
+    let mut rng = seed;
     let noise: Vec<f32> = (0..latent_dim * latent_len)
         .map(|_| {
             rng ^= rng << 13;
@@ -1245,7 +1404,7 @@ fn synthesize_internal(engine: &TtsEngine, text: &str) -> Result<Vec<f32>> {
             build_inputs(vec![
                 ("noisy_latent", xt.clone()),
                 ("text_emb", text_emb.clone()),
-                ("style_ttl", engine.style_ttl.clone()),
+                ("style_ttl", style_ttl.clone()),
                 ("latent_mask", latent_mask.clone()),
                 ("text_mask", text_mask_flat.clone()),
                 ("current_step", step_f),
@@ -1286,7 +1445,10 @@ fn synthesize_internal(engine: &TtsEngine, text: &str) -> Result<Vec<f32>> {
 fn synthesize_chunked(
     engine: &TtsEngine,
     text: &str,
+    style_dp: &Tensor,
+    style_ttl: &Tensor,
     cancel: Option<&AtomicBool>,
+    seed: u64,
 ) -> Result<Vec<f32>> {
     // Check cancellation before starting any work
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
@@ -1294,7 +1456,7 @@ fn synthesize_chunked(
     }
 
     if text.len() <= MAX_CHUNK_LENGTH {
-        return synthesize_internal(engine, &wrap_lang_tag(text));
+        return synthesize_internal(engine, &wrap_lang_tag(text), style_dp, style_ttl, seed);
     }
     let silence_samples = (SILENCE_DURATION * engine.sample_rate as f32) as usize;
     let mut result = Vec::new();
@@ -1305,7 +1467,7 @@ fn synthesize_chunked(
         if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
             anyhow::bail!("Synthesis cancelled");
         }
-        match synthesize_internal(engine, &wrap_lang_tag(&chunk)) {
+        match synthesize_internal(engine, &wrap_lang_tag(&chunk), style_dp, style_ttl, seed) {
             Ok(samples) => {
                 result.extend(samples);
                 result.extend_from_slice(&silence);
@@ -1348,8 +1510,11 @@ fn synthesize_chunked(
 fn synthesize_chunked_streaming(
     engine: &TtsEngine,
     text: &str,
+    style_dp: &Tensor,
+    style_ttl: &Tensor,
     cancel: Option<&AtomicBool>,
     tx: &mpsc::Sender<Vec<f32>>,
+    seed: u64,
 ) -> Result<()> {
     // Check cancellation before starting any work
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
@@ -1357,7 +1522,7 @@ fn synthesize_chunked_streaming(
     }
 
     if text.len() <= MAX_CHUNK_LENGTH {
-        let samples = synthesize_internal(engine, &wrap_lang_tag(text))?;
+        let samples = synthesize_internal(engine, &wrap_lang_tag(text), style_dp, style_ttl, seed)?;
         tx.blocking_send(samples)
             .map_err(|_| anyhow!("Synthesis cancelled (receiver dropped)"))?;
         return Ok(());
@@ -1368,7 +1533,7 @@ fn synthesize_chunked_streaming(
         if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
             anyhow::bail!("Synthesis cancelled");
         }
-        match synthesize_internal(engine, &wrap_lang_tag(&chunk)) {
+        match synthesize_internal(engine, &wrap_lang_tag(&chunk), style_dp, style_ttl, seed) {
             Ok(samples) => {
                 if tx.blocking_send(samples).is_err() {
                     anyhow::bail!("Synthesis cancelled (receiver dropped)");
@@ -1501,6 +1666,18 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
     };
     let sample_rate = engine.sample_rate;
 
+    // Load the default voice style (M1) for playback.
+    let Some(dir) = model_dir() else {
+        return;
+    };
+    let (style_dp, style_ttl) = match load_voice_style(&dir, DEFAULT_VOICE_NAME) {
+        Ok(styles) => styles,
+        Err(e) => {
+            warn!("TTS: failed to load default voice style: {e}");
+            return;
+        }
+    };
+
     // Check audio output availability BEFORE starting the expensive
     // CPU-bound synthesis. On headless systems this avoids wasting
     // ~3-5s of synthesis work per chunk before the channel close is
@@ -1524,7 +1701,15 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
     // CPU-bound synthesis: run on blocking threadpool, streaming each
     // chunk through the channel as it becomes available.
     let synthesize_handle = tokio::task::spawn_blocking(move || {
-        synthesize_chunked_streaming(&engine, &processed, cancel_flag.as_deref(), &tx)
+        synthesize_chunked_streaming(
+            &engine,
+            &processed,
+            &style_dp,
+            &style_ttl,
+            cancel_flag.as_deref(),
+            &tx,
+            42, // default seed for playback
+        )
     });
 
     // Spawn a lightweight logging task that observes the synthesis result.
@@ -2210,13 +2395,51 @@ mod tests {
             .as_ref()
     }
 
+    /// Helper to obtain the default voice style tensors for integration tests.
+    ///
+    /// Returns `None` (and skips the calling test) when:
+    /// - `MAHBOT_SKIP_TTS_TESTS=1` is set
+    /// - The default voice style file is not cached on disk
+    /// - Loading/parsing fails
+    ///
+    /// Caches the loaded tensors via [`OnceLock`] so the JSON parse cost is
+    /// paid only once per test run.
+    fn test_voice_style() -> Option<(&'static Tensor, &'static Tensor)> {
+        // First check if engine is available (which implies model files exist)
+        test_tts_engine()?;
+
+        static TEST_VOICE_STYLE: OnceLock<Option<(Tensor, Tensor)>> = OnceLock::new();
+
+        TEST_VOICE_STYLE
+            .get_or_init(|| {
+                let dir = model_dir()?;
+                let style_path = dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME);
+                if style_path.exists() {
+                    match load_voice_style(&dir, DEFAULT_VOICE_NAME) {
+                        Ok(styles) => return Some(styles),
+                        Err(e) => {
+                            tracing::warn!("Failed to load test voice style: {e}");
+                            return None;
+                        }
+                    }
+                }
+                None
+            })
+            .as_ref()
+            .as_ref()
+            .map(|(dp, ttl)| (dp, ttl))
+    }
+
     #[test]
     fn test_synthesize_short_text_creates_valid_wav() {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
-        let samples = synthesize_internal(engine, "<en>Hello world.</en>")
+        let samples = synthesize_internal(engine, "<en>Hello world.</en>", style_dp, style_ttl, 42)
             .expect("synthesis of short text should succeed");
 
         assert!(!samples.is_empty(), "synthesized audio must not be empty");
@@ -2243,6 +2466,9 @@ mod tests {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
         // Create text longer than MAX_CHUNK_LENGTH (300 chars)
         let long_text =
@@ -2252,8 +2478,8 @@ mod tests {
             "test text must exceed chunk limit"
         );
 
-        let samples =
-            synthesize_chunked(engine, &long_text, None).expect("chunked synthesis should succeed");
+        let samples = synthesize_chunked(engine, &long_text, style_dp, style_ttl, None, 42)
+            .expect("chunked synthesis should succeed");
 
         assert!(
             !samples.is_empty(),
@@ -2276,6 +2502,9 @@ mod tests {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
         // Create text longer than MAX_CHUNK_LENGTH to trigger chunking
         let long_text =
@@ -2290,8 +2519,16 @@ mod tests {
         // Spawn the streaming synthesis on a blocking thread (as in production)
         let text_for_task = long_text.clone();
         tokio::task::spawn_blocking(move || {
-            synthesize_chunked_streaming(engine, &text_for_task, None, &tx)
-                .expect("streaming synthesis should succeed");
+            synthesize_chunked_streaming(
+                engine,
+                &text_for_task,
+                style_dp,
+                style_ttl,
+                None,
+                &tx,
+                42,
+            )
+            .expect("streaming synthesis should succeed");
         })
         .await
         .expect("blocking task should not panic");
@@ -2323,6 +2560,9 @@ mod tests {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
         // Short text below MAX_CHUNK_LENGTH — should take the fast path
         // (single send, no chunk loop).
@@ -2332,8 +2572,16 @@ mod tests {
 
         let text_for_task = short_text.to_string();
         tokio::task::spawn_blocking(move || {
-            synthesize_chunked_streaming(engine, &text_for_task, None, &tx)
-                .expect("streaming synthesis of short text should succeed");
+            synthesize_chunked_streaming(
+                engine,
+                &text_for_task,
+                style_dp,
+                style_ttl,
+                None,
+                &tx,
+                42,
+            )
+            .expect("streaming synthesis of short text should succeed");
         })
         .await
         .expect("blocking task should not panic");
@@ -2354,6 +2602,9 @@ mod tests {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
         // Dropping the receiver before the sender writes causes the
         // blocking_send to fail with a channel-closed error.
@@ -2366,7 +2617,7 @@ mod tests {
 
         let text_for_task = text.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            synthesize_chunked_streaming(engine, &text_for_task, None, &tx)
+            synthesize_chunked_streaming(engine, &text_for_task, style_dp, style_ttl, None, &tx, 42)
         })
         .await
         .expect("blocking task should not panic");
@@ -2387,6 +2638,9 @@ mod tests {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
         // Setting the cancel flag before synthesis starts causes an
         // immediate bail without any model work.
@@ -2395,7 +2649,15 @@ mod tests {
 
         let text_for_task = "This should not be synthesized.".to_string();
         let result = tokio::task::spawn_blocking(move || {
-            synthesize_chunked_streaming(engine, &text_for_task, Some(&cancel_flag), &tx)
+            synthesize_chunked_streaming(
+                engine,
+                &text_for_task,
+                style_dp,
+                style_ttl,
+                Some(&cancel_flag),
+                &tx,
+                42,
+            )
         })
         .await
         .expect("blocking task should not panic");
@@ -2416,6 +2678,9 @@ mod tests {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
         let text = "<en>Hello world, this is a deterministic test.</en>";
 
@@ -2423,8 +2688,10 @@ mod tests {
         // The flow matching process is deterministic for a given input
         // (no random seed involved), so repeated calls on the same
         // hardware should produce bit-identical results.
-        let samples1 = synthesize_internal(engine, text).expect("first synthesis should succeed");
-        let samples2 = synthesize_internal(engine, text).expect("second synthesis should succeed");
+        let samples1 = synthesize_internal(engine, text, style_dp, style_ttl, 42)
+            .expect("first synthesis should succeed");
+        let samples2 = synthesize_internal(engine, text, style_dp, style_ttl, 42)
+            .expect("second synthesis should succeed");
 
         assert_eq!(
             samples1.len(),
@@ -2451,8 +2718,11 @@ mod tests {
         let Some(engine) = test_tts_engine() else {
             return; // Skip if no model available
         };
+        let Some((style_dp, style_ttl)) = test_voice_style() else {
+            return;
+        };
 
-        let result = synthesize_internal(engine, "");
+        let result = synthesize_internal(engine, "", style_dp, style_ttl, 42);
         assert!(result.is_err(), "empty text synthesis should fail");
 
         // Verify the error message mentions empty input

@@ -1384,63 +1384,6 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
         || msg.to_lowercase().contains("access denied")
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
-        return samples.to_vec();
-    }
-    let ratio = f64::from(to_rate) / f64::from(from_rate);
-    let output_len = (samples.len() as f64 * ratio).ceil() as usize;
-
-    // Anti-aliasing filter: when downsampling (from_rate > to_rate),
-    // apply a simple binomial low-pass filter to attenuate frequencies
-    // above the new Nyquist before decimation.  Without this filter,
-    // linear interpolation introduces aliasing — high-frequency content
-    // above to_rate/2 folds back into the audible range as noise,
-    // degrading mel spectrogram feature quality.
-    //
-    // The 3-tap binomial [0.25, 0.5, 0.25] gives reasonable stopband
-    // attenuation (~6 dB at 0.25 normalised) for speech audio.  For
-    // 48 kHz → 16 kHz this attenuates content above ~8 kHz.
-    let filtered: Vec<f32> = if from_rate > to_rate && samples.len() >= 3 {
-        let mut out = Vec::with_capacity(samples.len());
-        // First sample (asymmetric boundary)
-        out.push(samples[0] * 0.75 + samples[1] * 0.25);
-        for i in 1..samples.len() - 1 {
-            out.push(samples[i - 1] * 0.25 + samples[i] * 0.5 + samples[i + 1] * 0.25);
-        }
-        // Last sample (asymmetric boundary)
-        out.push(samples[samples.len() - 2] * 0.25 + samples[samples.len() - 1] * 0.75);
-        out
-    } else {
-        samples.to_vec()
-    };
-
-    let mut output = Vec::with_capacity(output_len);
-
-    for i in 0..output_len {
-        let src_pos = i as f64 / ratio;
-        let src_idx = src_pos as usize;
-        let frac = src_pos - src_idx as f64;
-        if src_idx + 1 < filtered.len() {
-            output.push(
-                (f64::from(filtered[src_idx]) * (1.0 - frac)
-                    + f64::from(filtered[src_idx + 1]) * frac) as f32,
-            );
-        } else if src_idx < filtered.len() {
-            output.push(filtered[src_idx]);
-        } else {
-            output.push(0.0);
-        }
-    }
-
-    output
-}
-
 /// Convert multi-channel audio to mono by averaging channels.
 /// Kept for test use; production uses the fused [`convert_and_send_audio_to_pipeline`].
 #[cfg(test)]
@@ -1754,7 +1697,7 @@ fn convert_and_send_audio_to_pipeline<T, F>(
         let resampled = if sample_rate == SAMPLE_RATE {
             mono
         } else {
-            resample_audio(&mono, sample_rate, SAMPLE_RATE)
+            crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
         };
         let _ = tx.send(resampled);
         return;
@@ -1777,7 +1720,7 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     let resampled = if sample_rate == SAMPLE_RATE {
         mono
     } else {
-        resample_audio(&mono, sample_rate, SAMPLE_RATE)
+        crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
     };
     let _ = tx.send(resampled);
 }
@@ -4443,7 +4386,7 @@ mod tests {
     #[test]
     fn test_resample_audio_same_rate() {
         let input: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
-        let output = super::resample_audio(&input, 16000, 16000);
+        let output = crate::util::resample_audio(&input, 16000, 16000);
         assert_eq!(output.len(), input.len());
         for (a, b) in input.iter().zip(output.iter()) {
             assert!(
@@ -4456,7 +4399,7 @@ mod tests {
     #[test]
     fn test_resample_audio_downsample() {
         let input: Vec<f32> = (0..100).map(|i| (i as f32 * PI / 50.0).sin()).collect();
-        let output = super::resample_audio(&input, 16000, 8000);
+        let output = crate::util::resample_audio(&input, 16000, 8000);
         assert!(output.len() < input.len(), "downsampled should be shorter");
         assert!(output.len() > 0, "downsampled should not be empty");
     }
@@ -4464,7 +4407,7 @@ mod tests {
     #[test]
     fn test_resample_audio_upsample() {
         let input: Vec<f32> = (0..50).map(|i| (i as f32 * PI / 25.0).sin()).collect();
-        let output = super::resample_audio(&input, 8000, 16000);
+        let output = crate::util::resample_audio(&input, 8000, 16000);
         assert!(
             output.len() >= input.len() * 2 - 2,
             "upsampled should be ~2x longer, got {} vs {}*2",
@@ -4475,7 +4418,7 @@ mod tests {
 
     #[test]
     fn test_resample_audio_empty() {
-        let output = super::resample_audio(&[], 16000, 8000);
+        let output = crate::util::resample_audio(&[], 16000, 8000);
         assert!(output.is_empty());
     }
 
