@@ -138,6 +138,26 @@ const EMBED_MODEL_SHA256: &str = "70d164290c1d095d1d4ee149bc5e00543250a7316b59f3
 /// to ~8/sec while maintaining real-time responsiveness.
 const VOICE_BATCH_SIZE: usize = 2048;
 
+/// Maximum audio samples to accumulate in [`PipelineCtx::audio_buffer`] during
+/// wake word cooldown ([`WAKE_WORD_COOLDOWN`]).  Set to 2 frames (1024 samples
+/// = ~64ms) to prevent unbounded growth during a prolonged cooldown while
+/// providing enough context for a smooth pipeline restart.
+///
+/// ## Frame-processing arithmetic
+///
+/// When the cooldown expires, the next mic chunk (512 samples) is appended to
+/// the accumulated buffer for a total of 1024 + 512 = 1536 samples.  The frame
+/// loop in [`handle_wake_word_detection`] processes
+/// `floor((1536 - FRAME_LENGTH) / HOP_LENGTH) + 1 = 5` iterations per call.
+/// Each iteration contributes `HOP_LENGTH` (256) samples to `voice_batch` if
+/// VAD-positive, filling ~62% of [`VOICE_BATCH_SIZE`] (1280/2048) in one shot.
+///
+/// With 1 frame (512) accumulated: 3 iterations, ~38% of batch threshold.
+/// With no accumulation: 1 iteration, ~13% — the pipeline starves.
+/// Higher caps (3+ frames) offer only 2 more iterations per frame at the cost
+/// of ~64ms more cooldown audio kept (diminishing returns).
+const COOLDOWN_ACCUMULATION_CAP: usize = FRAME_LENGTH * 2;
+
 /// Maximum number of recent embeddings to keep in the ring buffer.
 /// With stride=8 (~89.5% overlap), each new embedding covers ~1.2s of audio
 /// and arrives every ~128ms, keeping ~19 embeddings = ~2.4 seconds of context.
@@ -2916,6 +2936,46 @@ impl PipelineCtx {
         state.negative_audio_chunks.clear();
     }
 
+    /// Transition from wake-word-detection to recording mode (mahbot-802).
+    ///
+    /// Performs the detection→recording handoff in the correct sequence:
+    /// 1. Sets `is_recording = true` to route subsequent audio to recording
+    /// 2. Clears `command_buffer` to start a fresh recording
+    /// 3. Forwards the entire `audio_buffer` (processed wake-word tail +
+    ///    unprocessed command-start) into `command_buffer` so ASR receives
+    ///    the transition audio — ASR tolerates the extra wake-word overlap
+    /// 4. Resets silence tracking for the recording phase
+    /// 5. Clears intermediate detection buffers (mel, embedding, voice_batch,
+    ///    score_window) to prevent stale data from contaminating the recording
+    /// 6. Clears the noise-suppression frame-alignment buffer (mahbot-800 C2)
+    /// 7. Records the detection timestamp for cooldown tracking
+    /// 8. Does NOT reset VAD state or `vad_threshold` — the noise floor estimate
+    ///    from the detection phase is deliberately carried through to recording
+    ///    mode so Earshot does not need to re-establish the floor from scratch,
+    ///    which would cause transient misclassification of the first few
+    ///    recording frames (mahbot-802).
+    ///
+    /// Must be paired with `set_status(VoiceStatus::Recording)` by the caller
+    /// because the status update is a side effect on global voice state, not
+    /// on `PipelineCtx`.
+    fn transition_to_recording(&mut self) {
+        self.is_recording = true;
+        self.command_buffer.clear();
+        // Forward the entire audio_buffer (processed wake-word tail + unprocessed
+        // command start) into command_buffer so ASR receives the transition audio.
+        // ASR tolerates the extra wake-word overlap at the start (mahbot-802).
+        // extend_from_slice copies, so audio_buffer must be cleared separately.
+        self.command_buffer.extend_from_slice(&self.audio_buffer);
+        self.silence_sample_count = 0;
+        self.mel_frame_buffer.clear();
+        self.embedding_ring.clear();
+        self.audio_buffer.clear();
+        self.voice_batch.clear();
+        self.score_window.clear();
+        self.audio_preprocessor.clear_buffer();
+        self.last_wake_word_detection = Some(Instant::now());
+    }
+
     fn handle_start_listening(&mut self) {
         // Defense-in-depth: reject if voice has been disabled between the
         // time the command was sent and the time it's processed. This
@@ -3725,9 +3785,11 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // ── Cooldown check (mahbot-770 Fix 2) ──
     // If we recently detected the wake word, skip ALL processing for this
-    // chunk to prevent rapid consecutive false triggers.  The audio is
-    // discarded entirely (not accumulated) since the user is either in
-    // command-recording mode or the cooldown is active.
+    // chunk to prevent rapid consecutive false triggers.  During cooldown
+    // audio accumulates into audio_buffer with a cap (mahbot-802) so that
+    // when the cooldown expires the pipeline has data to process immediately;
+    // intermediate detection buffers are cleared to prevent stale data from
+    // the previous utterance causing false triggers (mahbot-770 Fix 2).
     if let Some(last) = ctx.last_wake_word_detection
         && last.elapsed() < WAKE_WORD_COOLDOWN
     {
@@ -3735,9 +3797,37 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
             "Wake word cooldown active ({}ms elapsed)",
             last.elapsed().as_millis()
         );
-        // Discard all buffered audio — don't accumulate during cooldown
-        // to avoid a large stale batch when the cooldown expires.
-        ctx.audio_buffer.clear();
+        // Accumulate audio during cooldown so the pipeline has data
+        // when cooldown expires — don't discard it entirely (mahbot-802).
+        // See [`COOLDOWN_ACCUMULATION_CAP`] for the frame-processing
+        // arithmetic that justifies the cap value (2 frames = 1024 samples).
+        //
+        // We accumulate into audio_buffer (not command_buffer) because during
+        // cooldown is_recording is false, so audio is routed to
+        // handle_wake_word_detection, not to handle_recording_audio.
+        // command_buffer is only populated after detection transitions to
+        // recording mode (mahbot-802 deviation from ticket §2).
+        //
+        // Invariant: audio_buffer is empty or within COOLDOWN_ACCUMULATION_CAP at
+        // cooldown entry.  Caller sequencing (transition_to_recording() clears it at
+        // the detection→recording handoff) ensures this invariant holds — this
+        // assertion guards against future refactors that bypass that path.
+        debug_assert!(
+            ctx.audio_buffer.len() <= COOLDOWN_ACCUMULATION_CAP,
+            "audio_buffer (len={}) exceeds COOLDOWN_ACCUMULATION_CAP ({}) at cooldown entry; \
+             transition_to_recording() should have cleared it at detection→recording handoff",
+            ctx.audio_buffer.len(),
+            COOLDOWN_ACCUMULATION_CAP
+        );
+        let remaining = COOLDOWN_ACCUMULATION_CAP.saturating_sub(ctx.audio_buffer.len());
+        let n = samples.len().min(remaining);
+        ctx.audio_buffer.extend_from_slice(&samples[..n]);
+        // Clear intermediate detection buffers to prevent stale data
+        // from the previous utterance causing false detections.
+        // VAD is intentionally NOT reset here: the accumulated audio_buffer
+        // naturally refills Earshot's internal ring buffer when processing
+        // resumes after cooldown expiry.  A manual reset_vad() would lose
+        // the noise floor estimate (mahbot-802).
         ctx.voice_batch.clear();
         ctx.mel_frame_buffer.clear();
         ctx.embedding_ring.clear();
@@ -4151,19 +4241,10 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
             }
         }
 
-        // Wake word detected — clear pipeline state and start recording.
-        ctx.is_recording = true;
-        ctx.command_buffer.clear();
-        ctx.silence_sample_count = 0;
-        ctx.mel_frame_buffer.clear();
-        ctx.embedding_ring.clear();
-        ctx.audio_buffer.clear();
-        ctx.voice_batch.clear();
-        ctx.score_window.clear();
-        // Clear NS frame-alignment buffer to prevent stale residual audio
-        // from the detection phase contaminating the recording (mahbot-800 C2).
-        ctx.audio_preprocessor.clear_buffer();
-        ctx.last_wake_word_detection = Some(Instant::now());
+        // Wake word detected — transition to recording mode.
+        // See [`PipelineCtx::transition_to_recording`] for the exact
+        // handoff sequence (mahbot-802).
+        ctx.transition_to_recording();
         set_status(VoiceStatus::Recording);
         true
     } else {
@@ -7306,6 +7387,67 @@ mod tests {
         );
     }
 
+    // ── transition_to_recording handoff (Fix 1, mahbot-802) ────────
+    //
+    // Verifies that the detection→recording handoff correctly captures
+    // audio_buffer content into command_buffer before clearing, so the
+    // transition audio between wake word and user command is not lost.
+
+    #[test]
+    fn test_transition_to_recording() {
+        let mut ctx = PipelineCtx::new();
+        // Pre-populate audio_buffer with transition audio
+        ctx.audio_buffer = vec![42.0f32; 512];
+        // Pre-populate other buffers to verify they are cleared
+        ctx.mel_frame_buffer = vec![vec![1.0f32; NUM_MEL_BANDS]];
+        ctx.embedding_ring = vec![vec![2.0f32; EMBEDDING_DIM]];
+        ctx.voice_batch = vec![3.0f32; 256];
+        ctx.score_window = vec![0.5f32; 3];
+
+        ctx.transition_to_recording();
+
+        // is_recording set to true
+        assert!(
+            ctx.is_recording,
+            "transition_to_recording should set is_recording = true",
+        );
+        // command_buffer contains the forwarded audio (the behavioral contract)
+        assert_eq!(
+            ctx.command_buffer.len(),
+            512,
+            "command_buffer should contain the forwarded audio from audio_buffer",
+        );
+        assert_eq!(
+            &ctx.command_buffer[..],
+            &[42.0f32; 512],
+            "command_buffer content should match original audio_buffer",
+        );
+        // Detection buffers cleared
+        assert!(
+            ctx.mel_frame_buffer.is_empty(),
+            "mel_frame_buffer should be cleared",
+        );
+        assert!(
+            ctx.embedding_ring.is_empty(),
+            "embedding_ring should be cleared",
+        );
+        assert!(ctx.voice_batch.is_empty(), "voice_batch should be cleared",);
+        assert!(
+            ctx.score_window.is_empty(),
+            "score_window should be cleared",
+        );
+        // silence_sample_count reset
+        assert_eq!(
+            ctx.silence_sample_count, 0,
+            "silence_sample_count should be reset",
+        );
+        // last_wake_word_detection set
+        assert!(
+            ctx.last_wake_word_detection.is_some(),
+            "last_wake_word_detection should be set",
+        );
+    }
+
     // ── handle_wake_word_detection cooldown ──────────────────────────
 
     #[test]
@@ -7313,25 +7455,34 @@ mod tests {
     fn test_handle_wake_word_detection_cooldown() {
         let mut ctx = PipelineCtx::new();
 
-        // ── Cooldown ACTIVE: all buffers cleared, no processing ──
+        // ── Cooldown ACTIVE: intermediate buffers cleared, audio_buffer accumulated ──
         ctx.last_wake_word_detection = Some(Instant::now());
         let last_detection_saved = ctx.last_wake_word_detection;
 
-        // Pre-populate buffers to verify they get cleared by the cooldown path
+        // Pre-populate buffers to verify cooldown path behavior
         ctx.audio_buffer = vec![1.0f32; 512];
         ctx.voice_batch = vec![2.0f32; 256];
         ctx.mel_frame_buffer = vec![vec![3.0f32; NUM_MEL_BANDS]];
         ctx.embedding_ring = vec![vec![4.0f32; EMBEDDING_DIM]];
         ctx.score_window = vec![0.5f32; 3];
 
-        // Feed audio — cooldown should discard it and clear everything
+        // Feed audio during cooldown — audio_buffer accumulates (capped at COOLDOWN_ACCUMULATION_CAP)
+        // while intermediate detection buffers are cleared (mahbot-802).
         let samples = vec![5.0f32; FRAME_LENGTH];
         handle_wake_word_detection(&samples, &mut ctx);
 
-        assert!(
-            ctx.audio_buffer.is_empty(),
-            "audio_buffer should be cleared during cooldown",
+        // audio_buffer accumulates during cooldown: initial 512 + 512 new = 1024 (cap reached)
+        assert_eq!(
+            ctx.audio_buffer.len(),
+            COOLDOWN_ACCUMULATION_CAP,
+            "audio_buffer should accumulate up to cap during cooldown (got {}, expected {})",
+            ctx.audio_buffer.len(),
+            COOLDOWN_ACCUMULATION_CAP,
         );
+        // First 512 samples are the pre-populated ones, next 512 are the fed samples
+        assert_eq!(&ctx.audio_buffer[..512], &[1.0f32; 512]);
+        assert_eq!(&ctx.audio_buffer[512..], &[5.0f32; 512]);
+
         assert!(
             ctx.voice_batch.is_empty(),
             "voice_batch should be cleared during cooldown",
@@ -7352,22 +7503,68 @@ mod tests {
             ctx.last_wake_word_detection, last_detection_saved,
             "last_wake_word_detection should remain unchanged after cooldown early-return",
         );
+    }
 
-        // ── Cooldown EXPIRED: processing proceeds normally ──
+    // ── Cooldown accumulation → post-cooldown processing handoff (mahbot-802) ──
+    //
+    // Verifies that audio accumulated during cooldown is consumed by the frame
+    // loop when cooldown expires, rather than being discarded.  This is the core
+    // fix for the ~48ms audio loss at the wake-word-to-command transition.
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn test_cooldown_accumulation_handoff_to_frame_processing() {
+        let mut ctx = PipelineCtx::new();
+
+        // Phase 1: Cooldown active — accumulate audio into audio_buffer
+        ctx.last_wake_word_detection = Some(Instant::now());
+        let detection_snapshot = ctx.last_wake_word_detection;
+        reset_vad();
+        let speech = speech_frame();
+        ctx.audio_buffer = speech.clone(); // 512 samples (one frame)
+        ctx.voice_batch.clear();
+
+        // Feed another frame during cooldown — accumulates (capped at 1024)
+        handle_wake_word_detection(&speech, &mut ctx);
+        assert_eq!(
+            ctx.audio_buffer.len(),
+            COOLDOWN_ACCUMULATION_CAP,
+            "audio_buffer should accumulate to cap during cooldown",
+        );
+        assert!(
+            ctx.voice_batch.is_empty(),
+            "voice_batch should remain empty — processing is skipped during cooldown",
+        );
+        assert_eq!(
+            ctx.last_wake_word_detection, detection_snapshot,
+            "cooldown timestamp should be unchanged after early return",
+        );
+
+        // Phase 2: Cooldown expired — accumulated audio + new frame processed
         ctx.last_wake_word_detection =
             Some(Instant::now() - WAKE_WORD_COOLDOWN - Duration::from_secs(1));
         reset_vad();
 
-        let speech = speech_frame();
+        // Feed a speech frame — the accumulated 1024 + 512 new = 1536 total,
+        // which yields floor((1536-512)/256)+1 = 5 frame iterations.
         handle_wake_word_detection(&speech, &mut ctx);
 
-        // With cooldown expired and speech frame: voice_batch should
-        // accumulate audio (one frame adds HOP_LENGTH = 256 samples).
+        // With 5 speech-classified iterations, each contributes HOP_LENGTH (256)
+        // samples to voice_batch, totalling 5 × 256 = 1280.
         assert_eq!(
             ctx.voice_batch.len(),
-            HOP_LENGTH,
-            "voice_batch should accumulate {} samples after cooldown expired",
-            HOP_LENGTH,
+            5 * HOP_LENGTH,
+            "voice_batch should accumulate {} samples from 5 frame iterations \
+             (1024 accumulated during cooldown + 512 new from this call)",
+            5 * HOP_LENGTH,
+        );
+        // After 5 iterations, consumed = 5 × HOP_LENGTH = 1280 samples drained.
+        // Remaining: 1536 - 1280 = 256 samples.
+        assert_eq!(
+            ctx.audio_buffer.len(),
+            256,
+            "audio_buffer should have 256 residual after 5 frame iterations \
+             draining 1280 from 1536 total",
         );
     }
 
