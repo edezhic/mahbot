@@ -42,18 +42,20 @@ use crate::util::UnwrapPoison;
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
 use candle_onnx::simple_eval;
+use futures_util::StreamExt;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -114,6 +116,38 @@ static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 static GLOBAL_TTS: OnceLock<RwLock<Option<Arc<TtsEngine>>>> = OnceLock::new();
 static CANCEL_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
 static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+// ── Download progress events (GUI subscription) ───────────────────────
+
+/// Events emitted during TTS model download for GUI progress reporting.
+#[derive(Debug, Clone)]
+pub enum TtsDownloadEvent {
+    /// A file download has started.
+    FileStarted { name: String, total_bytes: u64 },
+    /// Download progress for a file.
+    FileProgress {
+        name: String,
+        bytes_downloaded: u64,
+        total_bytes: u64,
+    },
+    /// A file download has completed successfully.
+    FileCompleted { name: String },
+    /// All files have been downloaded and verified.
+    Complete,
+    /// Download failed with an error.
+    Failed { error: String },
+}
+
+/// Broadcast channel for TTS download progress events (GUI subscription).
+pub static DOWNLOAD_EVENTS: OnceLock<broadcast::Sender<TtsDownloadEvent>> = OnceLock::new();
+
+/// Subscribe to TTS download progress events for the GUI subscription.
+pub fn subscribe_download_events() -> broadcast::Receiver<TtsDownloadEvent> {
+    DOWNLOAD_EVENTS
+        .get()
+        .expect("DOWNLOAD_EVENTS initialized before subscribe")
+        .subscribe()
+}
 
 /// Wrapper around rodio's audio output that is `Send` on all platforms.
 ///
@@ -319,6 +353,12 @@ pub fn init_global() -> Result<()> {
     CANCEL_FLAG
         .set(Arc::new(AtomicBool::new(false)))
         .map_err(|_| anyhow!("CANCEL_FLAG already initialized"))?;
+
+    // Initialize download progress broadcast channel
+    let (dl_tx, _dl_rx) = broadcast::channel(64);
+    DOWNLOAD_EVENTS
+        .set(dl_tx)
+        .map_err(|_| anyhow!("DOWNLOAD_EVENTS already initialized"))?;
 
     // Initialize rodio audio output (best-effort: may fail on headless systems)
     match OutputStream::try_default() {
@@ -575,6 +615,13 @@ fn load_engine(dir: &Path) -> Result<TtsEngine> {
 
 // ── Download retry loop ──────────────────────────────────────────────
 
+/// Emit a download event through the global broadcast channel.
+fn emit_download_event(event: TtsDownloadEvent) {
+    if let Some(tx) = DOWNLOAD_EVENTS.get() {
+        let _ = tx.send(event);
+    }
+}
+
 struct TtsGuard;
 
 impl Drop for TtsGuard {
@@ -607,7 +654,9 @@ async fn download_retry_loop() {
         }
         retry_count += 1;
         if retry_count > MAX_DOWNLOAD_RETRIES {
-            warn!("TTS download failed after {MAX_DOWNLOAD_RETRIES} retries");
+            let msg = format!("TTS download failed after {MAX_DOWNLOAD_RETRIES} retries");
+            warn!("{msg}");
+            emit_download_event(TtsDownloadEvent::Failed { error: msg });
             STATE.store(STATE_FAILED, Ordering::Release);
             return;
         }
@@ -616,6 +665,7 @@ async fn download_retry_loop() {
             Ok(Ok(())) => match load_engine(&dir) {
                 Ok(e) => {
                     set_engine_ready(e);
+                    emit_download_event(TtsDownloadEvent::Complete);
                     info!("TTS models loaded successfully");
                     return;
                 }
@@ -684,13 +734,22 @@ async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
         },
     ];
 
-    // Parallel downloads for I/O-bound model files
-    let download_futures: Vec<_> = files
-        .into_iter()
-        .map(|f| async move { ensure_file(&f).await })
-        .collect();
+    // Sequential downloads so per-file progress is meaningful
+    for f in &files {
+        if let Err(e) = ensure_file(f).await {
+            let file_name = f
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            emit_download_event(TtsDownloadEvent::Failed {
+                error: format!("Failed to download {file_name}: {e}"),
+            });
+            return Err(e);
+        }
+    }
 
-    futures_util::future::try_join_all(download_futures).await?;
     Ok(())
 }
 
@@ -730,7 +789,7 @@ async fn ensure_file(f: &TtsFile) -> Result<()> {
     download_file(&f.url, &f.path, f.sha256).await
 }
 
-/// Download a single file with atomic write and SHA256 verification.
+/// Download a single file with atomic write, SHA256 verification, and progress events.
 #[allow(clippy::cast_precision_loss)]
 async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()> {
     let client = reqwest::Client::builder()
@@ -744,29 +803,84 @@ async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()
         .send()
         .await
         .context("Failed to start download")?;
-    let bytes = response.bytes().await.context("Failed to download file")?;
 
-    if bytes.len() < 100 {
-        anyhow::bail!("Downloaded file too small: {} bytes", bytes.len());
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status} from {url}");
     }
 
+    let total_size = response.content_length().unwrap_or(0);
+    let file_name = dest
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Emit FileStarted with the file name and total size (if known)
+    emit_download_event(TtsDownloadEvent::FileStarted {
+        name: file_name.clone(),
+        total_bytes: total_size,
+    });
+
+    // Stream download to a temporary file, computing SHA256 on the fly
     let tmp = dest.with_extension("tmp");
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.flush()?;
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .context("Failed to create temp file")?;
+
+    let compute_hash = !expected_hash.is_empty();
+    let mut hasher = compute_hash.then(Sha256::new);
+    let mut downloaded: u64 = 0;
+    let mut last_reported_bytes: u64 = 0;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Download stream error")?;
+        let len = chunk.len() as u64;
+        downloaded += len;
+        if let Some(ref mut h) = hasher {
+            h.update(&chunk);
+        }
+        file.write_all(&chunk)
+            .await
+            .context("Failed to write download chunk")?;
+
+        // Throttle: emit progress at ~1% granularity to avoid broadcast pressure
+        if total_size > 0 {
+            let threshold = (total_size / 100).max(1);
+            if downloaded - last_reported_bytes >= threshold || downloaded >= total_size {
+                last_reported_bytes = downloaded;
+                emit_download_event(TtsDownloadEvent::FileProgress {
+                    name: file_name.clone(),
+                    bytes_downloaded: downloaded,
+                    total_bytes: total_size,
+                });
+            }
+        }
+    }
+
+    file.flush().await?;
+    drop(file);
+
+    if downloaded < 100 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        anyhow::bail!("Downloaded file too small: {downloaded} bytes");
     }
 
     // Verify hash BEFORE renaming to final path
-    if !expected_hash.is_empty()
-        && let Err(e) = verify_sha256(&tmp, expected_hash)
-    {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e)
-            .with_context(|| format!("SHA256 verification failed for {}", dest.display()));
+    if let Some(h) = hasher {
+        let actual_hash = format!("{:x}", h.finalize());
+        if actual_hash != expected_hash {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            anyhow::bail!(
+                "SHA256 verification failed for {}: expected {expected_hash}, got {actual_hash}",
+                dest.display()
+            );
+        }
     }
 
-    std::fs::rename(&tmp, dest)?;
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .with_context(|| format!("Failed to rename temp file to {}", dest.display()))?;
 
     let hash_str = if expected_hash.is_empty() {
         String::new()
@@ -776,10 +890,12 @@ async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()
 
     info!(
         "Downloaded {}{} ({:.1} MB)",
-        dest.file_name().unwrap_or_default().to_string_lossy(),
+        file_name,
         hash_str,
-        bytes.len() as f64 / 1_048_576.0
+        downloaded as f64 / 1_048_576.0
     );
+
+    emit_download_event(TtsDownloadEvent::FileCompleted { name: file_name });
     Ok(())
 }
 

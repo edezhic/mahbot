@@ -279,6 +279,8 @@ pub enum Message {
     CloseDiffModal,
     /// Set the selected user's role for the role switcher indicator.
     SetSelectedRole(Option<Role>),
+    /// TTS model download progress event.
+    TtsDownloadEvent(crate::tts::TtsDownloadEvent),
 }
 
 // ── Message introspection helpers ────────────────────────────────
@@ -470,6 +472,11 @@ pub struct Dashboard {
     // ── Git state ───────────────────────────────────────────────
     /// All git-related state (branch info, sync, branch modal).
     git_state: git::GitState,
+
+    // ── TTS download progress ───────────────────────────────────
+    /// Current TTS download progress: (file_name, progress 0.0–1.0).
+    /// `None` when no download is active.
+    tts_download_progress: Option<(String, f32)>,
 }
 
 impl Dashboard {
@@ -502,6 +509,7 @@ impl Dashboard {
             settings_state: settings::SettingsState::new(),
             show_diff_modal: false,
             git_state: git::GitState::new(),
+            tts_download_progress: None,
         }
     }
 
@@ -1096,6 +1104,41 @@ impl Dashboard {
                 self.selected_user_role = role;
                 Task::none()
             }
+            Message::TtsDownloadEvent(event) => self.handle_tts_download_event(event),
+        }
+    }
+
+    /// Handle a TTS download progress event.
+    #[allow(clippy::cast_precision_loss)]
+    fn handle_tts_download_event(&mut self, event: crate::tts::TtsDownloadEvent) -> Task<Message> {
+        match event {
+            crate::tts::TtsDownloadEvent::FileStarted { name, .. } => {
+                self.tts_download_progress = Some((name, 0.0));
+                Task::none()
+            }
+            crate::tts::TtsDownloadEvent::FileProgress {
+                name,
+                bytes_downloaded,
+                total_bytes,
+            } => {
+                let progress = if total_bytes > 0 {
+                    (bytes_downloaded as f32 / total_bytes as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                self.tts_download_progress = Some((name, progress));
+                Task::none()
+            }
+            crate::tts::TtsDownloadEvent::FileCompleted { name } => {
+                // Mark the file as fully done; next FileStarted will show the next file.
+                self.tts_download_progress = Some((name, 1.0));
+                Task::none()
+            }
+            crate::tts::TtsDownloadEvent::Complete
+            | crate::tts::TtsDownloadEvent::Failed { .. } => {
+                self.tts_download_progress = None;
+                Task::none()
+            }
         }
     }
 
@@ -1660,6 +1703,8 @@ impl Dashboard {
             self.editor_state.subscription().map(Message::Editor),
             self.home_state.subscription().map(Message::Home),
             iced::Subscription::run(shutdown_subscription),
+            // TTS download progress subscription (always active while ready).
+            iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
             // Only active when the modal is open to avoid intercepting
             // global keyboard shortcuts unnecessarily.
@@ -1680,6 +1725,30 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
         crate::shutdown::shutdown_token().cancelled().await;
         let _ = output.try_send(Message::Shutdown);
     })
+}
+
+/// Subscription that emits [`crate::tts::TtsDownloadEvent`]s from the global
+/// TTS download broadcast channel, forwarded as [`Message::TtsDownloadEvent`].
+fn tts_download_subscription() -> impl futures_util::Stream<Item = crate::tts::TtsDownloadEvent> {
+    use iced::futures::channel::mpsc;
+    iced::stream::channel(
+        1,
+        |mut output: mpsc::Sender<crate::tts::TtsDownloadEvent>| async move {
+            let mut rx = crate::tts::subscribe_download_events();
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        // Best-effort delivery: drop events if GUI channel is full
+                        let _ = output.try_send(event);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Progress events were dropped — next event is current state
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        },
+    )
 }
 
 // ── Navigation sidebar ──────────────────────────────────────────
@@ -2135,6 +2204,25 @@ impl Dashboard {
             .into()
     }
 
+    /// Render the TTS download progress indicator in the centre of the footer bar.
+    /// Shows the current file name and percentage (e.g. "duration_predictor.onnx 83%").
+    fn render_tts_download_progress(&self) -> Element<'_, Message> {
+        let Some((file_name, progress)) = &self.tts_download_progress else {
+            return Space::new().width(0).into();
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pct = (progress * 100.0).round() as u32;
+        let label = format!("TTS: {file_name} {pct}%");
+        container(text(label).size(12).color(theme::TEXT_MUTED))
+            .padding(iced::Padding {
+                left: 12.0,
+                right: 12.0,
+                top: 0.0,
+                bottom: 0.0,
+            })
+            .into()
+    }
+
     /// 42px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
         let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(3);
@@ -2153,9 +2241,12 @@ impl Dashboard {
             .spacing(6)
             .align_y(Alignment::Center);
 
+        // TTS download progress indicator (center of footer bar)
+        let center = self.render_tts_download_progress();
+
         let right = Self::render_active_agents();
 
-        let footer_row = row![left, Space::new().width(Length::Fill), right]
+        let footer_row = row![left, center, Space::new().width(Length::Fill), right]
             .align_y(Alignment::Center)
             .padding(iced::Padding {
                 top: 3.0,
