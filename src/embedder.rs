@@ -1078,54 +1078,65 @@ mod tests {
     /// `$HOME/.mahbot/models`. This ensures model-dependent tests work regardless
     /// of whether the graceful degradation test (which uses a temp dir) ran first.
     /// Returns `None` and skips test if the model files aren't available.
-    fn test_embedder() -> Option<Embedder> {
-        // Skip if env var is set
-        if std::env::var("MAHBOT_SKIP_EMBEDDER_TESTS").is_ok() {
-            return None;
-        }
+    fn test_embedder() -> Option<&'static Embedder> {
+        use std::sync::OnceLock;
 
-        // Collect all candidate models directories (deduplicated).
-        let mut candidates = Vec::new();
+        // Share a single model load across all tests via OnceLock.
+        // The first test to call this pays the ~60-second load;
+        // subsequent tests reuse the already-loaded embedder.
+        static TEST_EMBEDDER: OnceLock<Option<Embedder>> = OnceLock::new();
 
-        // 1. CONFIG storage root (may be a temp dir from graceful degradation test).
-        if let Some(root) = crate::config::CONFIG.try_storage_root() {
-            candidates.push(root.join("models"));
-        }
+        TEST_EMBEDDER
+            .get_or_init(|| {
+                // Skip if env var is set
+                if std::env::var("MAHBOT_SKIP_EMBEDDER_TESTS").is_ok() {
+                    return None;
+                }
 
-        // 2. Real home directory cache (always present in dev/CI environments).
-        if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
-            let real = std::path::PathBuf::from(&home)
-                .join(".mahbot")
-                .join("models");
-            if !candidates.contains(&real) {
-                candidates.push(real);
-            }
-        }
+                // Collect all candidate models directories (deduplicated).
+                let mut candidates = Vec::new();
 
-        // Try each candidate until we find model files.
-        for models_dir in &candidates {
-            let model_path = models_dir.join(MODEL_FILENAME);
-            let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
+                // 1. CONFIG storage root (may be a temp dir from graceful degradation test).
+                if let Some(root) = crate::config::CONFIG.try_storage_root() {
+                    candidates.push(root.join("models"));
+                }
 
-            if model_path.exists() && tokenizer_path.exists() {
-                match Embedder::load(&model_path, &tokenizer_path) {
-                    Ok(emb) => return Some(emb),
-                    Err(e) => {
-                        eprintln!("WARNING: Failed to load test embedder: {e}");
-                        return None;
+                // 2. Real home directory cache (always present in dev/CI environments).
+                if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+                    let real = std::path::PathBuf::from(&home)
+                        .join(".mahbot")
+                        .join("models");
+                    if !candidates.contains(&real) {
+                        candidates.push(real);
                     }
                 }
-            }
-        }
 
-        // No model files found in any candidate directory.
-        let last_candidate = candidates.last().map(|p| p.display().to_string());
-        eprintln!(
-            "WARNING: Model files not found. Looked in: {}. \
-             Set MAHBOT_SKIP_EMBEDDER_TESTS=1 to suppress this warning.",
-            last_candidate.as_deref().unwrap_or("<none>")
-        );
-        None
+                // Try each candidate until we find model files.
+                for models_dir in &candidates {
+                    let model_path = models_dir.join(MODEL_FILENAME);
+                    let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
+
+                    if model_path.exists() && tokenizer_path.exists() {
+                        match Embedder::load(&model_path, &tokenizer_path) {
+                            Ok(emb) => return Some(emb),
+                            Err(e) => {
+                                eprintln!("WARNING: Failed to load test embedder: {e}");
+                                return None;
+                            }
+                        }
+                    }
+                }
+
+                // No model files found in any candidate directory.
+                let last_candidate = candidates.last().map(|p| p.display().to_string());
+                eprintln!(
+                    "WARNING: Model files not found. Looked in: {}. \
+                 Set MAHBOT_SKIP_EMBEDDER_TESTS=1 to suppress this warning.",
+                    last_candidate.as_deref().unwrap_or("<none>")
+                );
+                None
+            })
+            .as_ref()
     }
 
     /// Reset global embedder state for hermetic testing.
