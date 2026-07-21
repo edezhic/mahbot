@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -71,9 +71,10 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
 const DEFAULT_TOTAL_STEPS: usize = 8;
 const SPEED_FACTOR: f32 = 1.05;
-const SYNTHESIS_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CHUNK_LENGTH: usize = 300;
 const SILENCE_DURATION: f32 = 0.3;
+// Timeout per-chunk receive: guards against hung synthesis (ONNX deadlock).
+const SYNTHESIS_CHUNK_TIMEOUT: Duration = Duration::from_mins(5);
 
 // ── SHA256 integrity hashes ──────────────────────────────────────────
 //
@@ -1273,6 +1274,10 @@ fn synthesize_internal(engine: &TtsEngine, text: &str) -> Result<Vec<f32>> {
 
 /// Synthesize with chunking for long texts.
 /// Language tags are applied per-chunk (model requires `<en>...</en>` wrapping).
+///
+/// Collects all chunk samples into a single `Vec<f32>` (legacy non-streaming API).
+/// Use [`synthesize_chunked_streaming`] for streaming playback.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1300,12 +1305,81 @@ fn synthesize_chunked(
         if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
             anyhow::bail!("Synthesis cancelled");
         }
-        if let Ok(samples) = synthesize_internal(engine, &wrap_lang_tag(&chunk)) {
-            result.extend(samples);
-            result.extend_from_slice(&silence);
+        match synthesize_internal(engine, &wrap_lang_tag(&chunk)) {
+            Ok(samples) => {
+                result.extend(samples);
+                result.extend_from_slice(&silence);
+            }
+            Err(e) => {
+                warn!("TTS: chunk synthesis failed, skipping chunk: {e}");
+            }
         }
     }
     Ok(result)
+}
+
+/// Synthesize with chunking for long texts, streaming each chunk through
+/// a bounded channel as it becomes available.
+///
+/// Language tags are applied per-chunk (model requires `<en>...</en>` wrapping).
+/// Each chunk's PCM samples are sent via the provided sender. The function
+/// returns `Ok(())` when all chunks have been sent, or an error on cancellation
+/// or if the receiver was dropped.
+///
+/// # Error propagation (intentional asymmetry)
+///
+/// There are two code paths with different error-handling strategies:
+///
+/// **Short-text path** (`text.len() <= MAX_CHUNK_LENGTH`):
+/// Propagates synthesis errors via `?` because there is only one chunk — a
+/// failure means no audio at all, so an error is the correct response.
+///
+/// **Long-text path** (multiple chunks):
+/// Logs individual chunk failures via `warn!` and continues to the next chunk.
+/// This is intentional: a single problematic sentence should not abort the
+/// entire response. The user hears partial audio (all succeeding chunks)
+/// rather than silence from an aborted synthesis. Only fatal errors
+/// (cancellation, receiver drop) are propagated.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn synthesize_chunked_streaming(
+    engine: &TtsEngine,
+    text: &str,
+    cancel: Option<&AtomicBool>,
+    tx: &mpsc::Sender<Vec<f32>>,
+) -> Result<()> {
+    // Check cancellation before starting any work
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        anyhow::bail!("Synthesis cancelled");
+    }
+
+    if text.len() <= MAX_CHUNK_LENGTH {
+        let samples = synthesize_internal(engine, &wrap_lang_tag(text))?;
+        tx.blocking_send(samples)
+            .map_err(|_| anyhow!("Synthesis cancelled (receiver dropped)"))?;
+        return Ok(());
+    }
+
+    for chunk in split_at_sentence_boundaries(text, MAX_CHUNK_LENGTH) {
+        // Check cancellation between chunks
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            anyhow::bail!("Synthesis cancelled");
+        }
+        match synthesize_internal(engine, &wrap_lang_tag(&chunk)) {
+            Ok(samples) => {
+                if tx.blocking_send(samples).is_err() {
+                    anyhow::bail!("Synthesis cancelled (receiver dropped)");
+                }
+            }
+            Err(e) => {
+                warn!("TTS: chunk synthesis failed, skipping chunk: {e}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Wrap text in a language tag for the Supertonic 3 model.
@@ -1427,6 +1501,19 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
     };
     let sample_rate = engine.sample_rate;
 
+    // Check audio output availability BEFORE starting the expensive
+    // CPU-bound synthesis. On headless systems this avoids wasting
+    // ~3-5s of synthesis work per chunk before the channel close is
+    // detected.
+    let Some(audio_output) = AUDIO_OUTPUT.get() else {
+        return;
+    };
+
+    // Create bounded channel for streaming chunks.
+    // Capacity 4 provides natural backpressure — if synthesis outpaces
+    // playback, the synthesizer blocks on send after 4 queued chunks.
+    let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
+
     // Reset cancellation flag for this synthesis, then clone the Arc
     // so it can be passed into the spawn_blocking closure.
     let cancel_flag = CANCEL_FLAG.get().map(|f| {
@@ -1434,104 +1521,126 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
         Arc::clone(f)
     });
 
-    // CPU-bound synthesis: run on blocking threadpool with timeout.
-    let synthesized = match tokio::time::timeout(
-        SYNTHESIS_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            synthesize_chunked(&engine, &processed, cancel_flag.as_deref())
-        }),
-    )
-    .await
-    {
-        Ok(Ok(Ok(samples))) => Ok(samples),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(join_err)) => {
-            warn!("TTS synthesis task panicked: {join_err}");
-            return;
-        }
-        Err(_) => {
-            warn!("TTS synthesis timed out after {SYNTHESIS_TIMEOUT:?}");
-            return;
-        }
-    };
+    // CPU-bound synthesis: run on blocking threadpool, streaming each
+    // chunk through the channel as it becomes available.
+    let synthesize_handle = tokio::task::spawn_blocking(move || {
+        synthesize_chunked_streaming(&engine, &processed, cancel_flag.as_deref(), &tx)
+    });
 
-    let samples = match synthesized {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("TTS synthesis failed: {e}");
-            return;
+    // Spawn a lightweight logging task that observes the synthesis result.
+    // This restores error observability lost when we stopped awaiting the
+    // blocking task directly — synthesis errors and panics are now logged.
+    tokio::spawn(async move {
+        match synthesize_handle.await {
+            Ok(Ok(())) => {} // Success — normal completion
+            Ok(Err(e)) => warn!("TTS synthesis failed: {e}"),
+            Err(e) => warn!("TTS synthesis task panicked: {e}"),
         }
-    };
+    });
 
-    if samples.is_empty() {
-        return;
+    // Receive chunks and play them as they arrive.
+    let mut current_sink: Option<Sink> = None;
+
+    // Stream chunks with a per-chunk timeout to guard against hung
+    // synthesis. On timeout the loop breaks, which drops the receiver
+    // and causes the blocking sender to unblock with a channel error.
+    loop {
+        let chunk_samples = match tokio::time::timeout(SYNTHESIS_CHUNK_TIMEOUT, rx.recv()).await {
+            Ok(Some(samples)) => samples,
+            Ok(None) => {
+                // Channel closed cleanly — synthesis finished.
+                break;
+            }
+            Err(_) => {
+                warn!("TTS: timed out waiting for synthesis chunk (possible hang)");
+                break;
+            }
+        };
+
+        // Check cancellation before playing this chunk
+        if let Some(ref mut rx) = cancel_rx
+            && rx.try_recv().is_ok()
+        {
+            info!("TTS playback cancelled mid-stream");
+            if let Some(ref sink) = current_sink {
+                sink.stop();
+                // Wait briefly for the audio thread to finish flushing
+                // so we don't leave a truncated burst in the output buffer.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            break;
+        }
+
+        // Wait for previous chunk to finish playing, then add inter-chunk
+        // silence between consecutive chunks.
+        if let Some(ref sink) = current_sink {
+            let completed = wait_for_sink(sink, cancel_rx.as_mut()).await;
+            if !completed {
+                // Cancelled while waiting — sink.stop() was already called
+                // inside wait_for_sink. Flush output buffer and stop.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                break;
+            }
+            // Natural pause between speech chunks
+            tokio::time::sleep(Duration::from_secs_f32(SILENCE_DURATION)).await;
+        }
+
+        // Render WAV bytes for this chunk (in-memory, no file I/O).
+        let wav_bytes = match render_wav(&chunk_samples, sample_rate) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("TTS: failed to render WAV chunk: {e}");
+                continue;
+            }
+        };
+
+        // Decode the WAV bytes as an in-memory source
+        let cursor = Cursor::new(wav_bytes);
+        let source = match rodio::Decoder::new(cursor) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("TTS: failed to decode WAV chunk: {e}");
+                continue;
+            }
+        };
+
+        // Create a fresh sink for this chunk and begin playback immediately.
+        // Each chunk gets its own sink so we can cancel per-chunk playback.
+        let sink = match Sink::try_new(&audio_output.handle) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("TTS: failed to create audio sink for chunk: {e}");
+                continue;
+            }
+        };
+
+        sink.append(source);
+        current_sink = Some(sink);
     }
 
-    // Check cancellation before WAV rendering
-    if let Some(ref mut rx) = cancel_rx
-        && rx.try_recv().is_ok()
-    {
-        info!("TTS synthesis cancelled before playback");
-        return;
+    // Wait for the last chunk to finish playing
+    if let Some(ref sink) = current_sink {
+        let _ = wait_for_sink(sink, cancel_rx.as_mut()).await;
     }
+}
 
-    // Render WAV bytes in memory (no file I/O needed).
-    let wav_bytes = match render_wav(&samples, sample_rate) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!("TTS: failed to render WAV: {e}");
-            return;
-        }
-    };
-
-    // Get or initialize the rodio audio output handle.
-    // If AUDIO_OUTPUT wasn't initialized (e.g. headless system), playback
-    // is silently disabled — the model still synthesizes, we just don't play.
-    let Some(audio_output) = AUDIO_OUTPUT.get() else {
-        return;
-    };
-
-    // Create a Sink for playback. This lets us control volume and stop
-    // playback on cancellation.
-    let sink = match Sink::try_new(&audio_output.handle) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("TTS: failed to create audio sink: {e}");
-            return;
-        }
-    };
-
-    // Decode the WAV bytes as an in-memory source and queue for playback.
-    let cursor = Cursor::new(wav_bytes);
-    let source = match rodio::Decoder::new(cursor) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("TTS: failed to decode WAV: {e}");
-            return;
-        }
-    };
-    sink.append(source);
-
-    // Play audio with cancellation support — poll sink state in a loop
-    // so we can respond to cancellation signals without blocking.
-    //
-    // rodio's `Sink::sleep_until_end()` blocks the calling thread, so we
-    // use a polling loop instead for async-friendly cancellation.
-    if let Some(ref mut rx) = cancel_rx {
+/// Wait for a rodio sink to finish playback, polling for completion
+/// with optional cancellation support.
+///
+/// Returns `true` if playback completed normally, `false` if cancelled.
+async fn wait_for_sink(sink: &Sink, cancel_rx: Option<&mut broadcast::Receiver<()>>) -> bool {
+    if let Some(rx) = cancel_rx {
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             if sink.empty() {
-                break;
+                return true;
             }
 
             if rx.try_recv().is_ok() {
                 info!("TTS playback cancelled");
                 sink.stop();
-                // Wait briefly for the audio thread to finish flushing
-                // so we don't leave a truncated burst in the output buffer.
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                break;
+                return false;
             }
         }
     } else {
@@ -1539,6 +1648,7 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
         while !sink.empty() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        true
     }
 }
 
@@ -2159,6 +2269,146 @@ mod tests {
         for &s in &samples {
             assert!((-1.0..=1.0).contains(&s), "sample {s} out of valid range");
         }
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_chunked_streaming_receives_chunks() {
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        // Create text longer than MAX_CHUNK_LENGTH to trigger chunking
+        let long_text =
+            "Hello world. This is a test of the streaming synthesis pipeline. ".repeat(20);
+        assert!(
+            long_text.len() > MAX_CHUNK_LENGTH,
+            "test text must exceed chunk limit"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
+
+        // Spawn the streaming synthesis on a blocking thread (as in production)
+        let text_for_task = long_text.clone();
+        tokio::task::spawn_blocking(move || {
+            synthesize_chunked_streaming(engine, &text_for_task, None, &tx)
+                .expect("streaming synthesis should succeed");
+        })
+        .await
+        .expect("blocking task should not panic");
+
+        // Collect all chunks from the channel
+        let mut chunk_count = 0;
+        let mut total_samples = 0usize;
+        while let Some(samples) = rx.recv().await {
+            assert!(!samples.is_empty(), "each chunk must produce samples");
+            for &s in &samples {
+                assert!((-1.0..=1.0).contains(&s), "sample {s} out of valid range");
+            }
+            total_samples += samples.len();
+            chunk_count += 1;
+        }
+
+        assert!(
+            chunk_count > 1,
+            "long text should produce multiple chunks (got {chunk_count})"
+        );
+        assert!(
+            total_samples > 1000,
+            "long text should produce many samples (got {total_samples})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_chunked_streaming_short_fast_path() {
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        // Short text below MAX_CHUNK_LENGTH — should take the fast path
+        // (single send, no chunk loop).
+        let short_text = "Hello world.";
+
+        let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
+
+        let text_for_task = short_text.to_string();
+        tokio::task::spawn_blocking(move || {
+            synthesize_chunked_streaming(engine, &text_for_task, None, &tx)
+                .expect("streaming synthesis of short text should succeed");
+        })
+        .await
+        .expect("blocking task should not panic");
+
+        // Should receive exactly one chunk, then channel closes
+        let first = rx.recv().await;
+        assert!(first.is_some(), "short text must send one chunk");
+        let samples = first.unwrap();
+        assert!(!samples.is_empty(), "chunk must not be empty");
+        assert!(
+            rx.recv().await.is_none(),
+            "short text must send exactly one chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_chunked_streaming_cancelled_on_receiver_drop() {
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        // Dropping the receiver before the sender writes causes the
+        // blocking_send to fail with a channel-closed error.
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(4);
+        let text = "Hello world. This tests receiver drop cancellation.";
+
+        // Drop the receiver immediately — the sender will detect the
+        // closed channel on its first blocking_send.
+        drop(rx);
+
+        let text_for_task = text.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            synthesize_chunked_streaming(engine, &text_for_task, None, &tx)
+        })
+        .await
+        .expect("blocking task should not panic");
+
+        assert!(
+            result.is_err(),
+            "streaming synthesis should error when receiver is dropped"
+        );
+        let err = format!("{:#}", result.err().unwrap());
+        assert!(
+            err.contains("receiver dropped"),
+            "error should mention receiver drop, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synthesize_chunked_streaming_cancelled_by_flag() {
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        // Setting the cancel flag before synthesis starts causes an
+        // immediate bail without any model work.
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::channel::<Vec<f32>>(4);
+
+        let text_for_task = "This should not be synthesized.".to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            synthesize_chunked_streaming(engine, &text_for_task, Some(&cancel_flag), &tx)
+        })
+        .await
+        .expect("blocking task should not panic");
+
+        assert!(
+            result.is_err(),
+            "streaming synthesis should error on cancellation"
+        );
+        let err = format!("{:#}", result.err().unwrap());
+        assert!(
+            err.contains("cancelled") || err.contains("Cancelled"),
+            "error should mention cancellation, got: {err}"
+        );
     }
 
     #[test]
