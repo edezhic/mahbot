@@ -161,8 +161,6 @@ const K_MAD: f32 = 3.0;
 ///   adds ~0.02-0.05 in DTW distance.
 /// - Stay well below the cap (`max(median × 2, 0.20)`) so it only affects
 ///   overly tight calibrations, not normal ones.
-/// - Absorb the enrollment↔live-detection embedding asymmetry (~0.02-0.05
-///   due to 18% silence-padding during live detection's final embedding).
 const MAD_THRESHOLD_FLOOR: f32 = 0.10;
 
 /// Threshold for detecting clipping: samples at or above this absolute
@@ -963,24 +961,76 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
 }
 
 /// Pad a sequence of mel spectrogram frames to exactly [`EMBEDDING_WINDOW_FRAMES`]
-/// by appending silence frames.  Uses [`spec_transform`]`(0.0) = 2.0` for silence
-/// instead of raw zeros (mahbot-770 Fix 1): the embedding model was trained on
-/// spec-transformed values (v/10 + 2.0), so zero-padding produces out-of-distribution
-/// inputs that cause near-identical embeddings regardless of acoustic content.
+/// by appending a **tapered fade-out** toward silence instead of constant-value
+/// silence frames.
 ///
-/// If `frames` already has at least `EMBEDDING_WINDOW_FRAMES`, it is returned as-is
-/// (no truncation — the caller decides the window).  This is extracted as a shared
-/// helper to avoid duplicating the silence-frame padding logic in both
+/// # Problem (mahbot-798)
+///
+/// The previous implementation appended identical `spec_transform(0.0) = 2.0`
+/// frames for all padding.  This produced an embedding tail that was **identical
+/// regardless of acoustic content** for any audio shorter than 76 frames:
+///
+/// 1. **False triggers:** short audio + silence produced an embedding highly
+///    similar to the enrolled template (which also had a silence-padded tail),
+///    artificially lowering DTW distance.
+/// 2. **Out-of-distribution input:** the embedding model was trained on real
+///    mel spectrograms, not constant-valued blocks.  A block of identical 2.0
+///    frames is not representative of speech or silence in natural audio.
+///
+/// # Fix
+///
+/// Instead of appending identical silence frames, **linearly taper** from the
+/// last real mel frame toward the silence value (`spec_transform(0.0) = 2.0`)
+/// over the `frames_needed` padding frames.  This creates a smooth transition
+/// that:
+///
+/// - Preserves **continuity** from the real audio (no abrupt value jump).
+/// - Avoids the **identical-tail** contamination (each padding frame differs
+///   slightly, so the tail encodes ≈0 acoustic energy rather than a constant).
+/// - Remains **in-distribution** for the embedding model (natural decay of
+///   acoustic energy toward the noise floor).
+///
+/// If `frames` is empty (no audio at all), constant silence frames are used
+/// as a fallback — there is no last frame to taper from.
+///
+/// If `frames` already has at least `EMBEDDING_WINDOW_FRAMES`, it is returned
+/// as-is (no truncation — the caller decides the window).  This is extracted
+/// as a shared helper to avoid duplicating the padding logic in both
 /// [`extract_embeddings_from_audio`] and [`try_match_wake_word_and_push_embedding`].
+#[allow(clippy::cast_precision_loss)]
 fn pad_mel_frames_to_window(frames: &[Vec<f32>]) -> Vec<Vec<f32>> {
     if frames.len() >= EMBEDDING_WINDOW_FRAMES {
         return frames.to_vec();
     }
-    let mut padded = frames.to_vec();
-    let silence_frame = vec![spec_transform(0.0); NUM_MEL_BANDS];
-    while padded.len() < EMBEDDING_WINDOW_FRAMES {
-        padded.push(silence_frame.clone());
+
+    let frames_needed = EMBEDDING_WINDOW_FRAMES - frames.len();
+    let silence_val = spec_transform(0.0);
+
+    if frames.is_empty() {
+        // No frames to taper from — fall back to constant silence padding.
+        let silence_frame = vec![silence_val; NUM_MEL_BANDS];
+        return vec![silence_frame; EMBEDDING_WINDOW_FRAMES];
     }
+
+    // Tapered fade-out: linearly interpolate from the last real frame's values
+    // toward the silence value over `frames_needed` padding frames.  Alpha goes
+    // from ~0 (first padding frame ≈ last real frame) to ~1 (last padding frame
+    // ≈ silence), providing a smooth transition.
+    let last_frame = frames.last().expect("non-empty — checked above");
+    let inv_count = 1.0 / (frames_needed + 1) as f32;
+
+    let mut padded = frames.to_vec();
+    padded.reserve(frames_needed);
+
+    for i in 0..frames_needed {
+        let alpha = (i + 1) as f32 * inv_count; // (i+1)/(frames_needed+1), range (0, 1)
+        let frame: Vec<f32> = last_frame
+            .iter()
+            .map(|&v| v * (1.0 - alpha) + silence_val * alpha)
+            .collect();
+        padded.push(frame);
+    }
+
     padded
 }
 
@@ -989,9 +1039,9 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
     let mel_frames = compute_mel_spectrogram(models, samples)?;
 
     if mel_frames.len() < EMBEDDING_WINDOW_FRAMES {
-        // Audio too short for a full 76-frame window — pad with silence
-        // frames so at least one embedding can be computed.  Without this,
-        // short wake words (e.g. 0.5s) would be silently discarded during
+        // Audio too short for a full 76-frame window — pad with tapered
+        // fade-out frames so at least one embedding can be computed.  Without
+        // this, short wake words (e.g. 0.5s) would be silently discarded during
         // enrollment, making enrollment impossible for brief utterances.
         let padded = pad_mel_frames_to_window(&mel_frames);
         let embedding = compute_embedding(models, &padded)?;
@@ -3885,9 +3935,9 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
     };
 
     // If the mel buffer is shorter than the required embedding window (76 frames),
-    // pad it with silence frames so an embedding can always be computed.  Without
-    // this, short wake words (e.g. 0.5s → ~32 mel frames) would silently be
-    // discarded and never detected.
+    // pad it with tapered fade-out frames so an embedding can always be computed.
+    // Without this, short wake words (e.g. 0.5s → ~32 mel frames) would silently
+    // be discarded and never detected.
     let padded_window: Vec<Vec<f32>>;
     let embed_input: &[Vec<f32>] = if ctx.mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES {
         padded_window = pad_mel_frames_to_window(&ctx.mel_frame_buffer);
@@ -6962,7 +7012,16 @@ mod tests {
 
     #[test]
     fn test_pad_mel_frames_to_window() {
-        // 1. Empty sequence → get EMBEDDING_WINDOW_FRAMES silence frames
+        let silence_val = super::spec_transform(0.0);
+        // Tolerance: 1e-5 is well above accumulated FP round-off from
+        // different computation paths between the implementation
+        // (X * inv_count where inv_count = 1/(N+1)) and the test
+        // (X / (N+1) with naive lerp).  Across 46 fade frames even the
+        // worst-case accumulation stays below 1e-6; 1e-5 gives headroom
+        // for platform differences in FMA contraction.
+        let eps = 1e-5;
+
+        // 1. Empty sequence → get EMBEDDING_WINDOW_FRAMES silence frames (fallback)
         let empty: Vec<Vec<f32>> = Vec::new();
         let padded = super::pad_mel_frames_to_window(&empty);
         assert_eq!(
@@ -6970,8 +7029,7 @@ mod tests {
             EMBEDDING_WINDOW_FRAMES,
             "empty sequence should be padded to {EMBEDDING_WINDOW_FRAMES} frames",
         );
-        let silence_val = super::spec_transform(0.0);
-        let eps = 1e-6; // relaxed tolerance for silence-padding values (~2.0)
+        // All frames are constant silence (fallback for empty buffer).
         for (i, frame) in padded.iter().enumerate() {
             assert_eq!(
                 frame.len(),
@@ -6987,8 +7045,7 @@ mod tests {
             }
         }
 
-        // 2. Partial sequence (30 frames) → get EMBEDDING_WINDOW_FRAMES
-        //    frames total, with silence padding at end
+        // 2. Partial sequence (30 frames) → tapered fade-out at end
         let mut partial = Vec::with_capacity(30);
         for i in 0..30 {
             partial.push(vec![i as f32; NUM_MEL_BANDS]);
@@ -7008,13 +7065,17 @@ mod tests {
                 frame[0],
             );
         }
-        // Remaining frames are silence padding
-        for frame in padded[30..].iter() {
+        // Remaining frames are tapered fade-out from last value (29.0) toward silence
+        let last_val = 29.0f32;
+        let frames_needed = EMBEDDING_WINDOW_FRAMES - 30;
+        for (j, frame) in padded[30..].iter().enumerate() {
             assert_eq!(frame.len(), NUM_MEL_BANDS);
+            let alpha = (j + 1) as f32 / (frames_needed + 1) as f32;
+            let expected_val = last_val * (1.0 - alpha) + silence_val * alpha;
             for &val in frame.iter() {
                 assert!(
-                    (val - silence_val).abs() < eps,
-                    "silence padding frame: expected {silence_val}, got {val}",
+                    (val - expected_val).abs() < eps,
+                    "fade frame {j}: expected {expected_val}, got {val} (alpha={alpha})",
                 );
             }
         }
