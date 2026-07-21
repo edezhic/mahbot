@@ -492,7 +492,7 @@ impl SettingsState {
                 let config = self.config.clone();
                 // NOTE: wake_word_templates is intentionally NOT preserved
                 // here — save_and_reload skips it, leaving the voice pipeline
-                // (persist_templates) as the sole owner of that key.
+                // (persist_model_state) as the sole owner of that key.
                 // This avoids the dual-writer race entirely.
                 Task::perform(
                     async move {
@@ -2112,8 +2112,8 @@ impl SettingsState {
 
         let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
         let status = crate::voice::get_status();
-        let templates = crate::voice::get_templates();
-        let has_templates = !templates.templates.is_empty();
+        let templates = crate::voice::get_classifier_weights();
+        let has_templates = templates.is_some();
 
         let status_text: Element<'_, SettingsMessage> = match status.clone() {
             crate::voice::VoiceStatus::Disabled => Text::new("Disabled").into(),

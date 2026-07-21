@@ -50,6 +50,7 @@ pub mod tts;
 pub mod tts_data_gen;
 pub mod voice;
 pub(crate) mod voice_verifier;
+pub(crate) mod wake_word_classifier;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

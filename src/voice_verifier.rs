@@ -1,8 +1,8 @@
 //! Logistic regression verifier for wake word false-trigger suppression.
 //!
-//! Implements a lightweight second-stage classifier that runs AFTER DTW
-//! matching fires, as an additional AND gate. The verifier uses L2-regularized
-//! logistic regression with optional StandardScaler normalization.
+//! Implements a lightweight second-stage classifier that runs AFTER the
+//! Conv1D MLP classifier fires, as an additional AND gate. The verifier uses
+//! L2-regularized logistic regression with optional StandardScaler normalization.
 //!
 //! When not trained, the verifier acts as a no-op (all frames pass).
 //!
@@ -560,7 +560,7 @@ mod tests {
 
     /// Generate a synthetic 96-dim "non-wake-word" embedding with values
     /// distributed near 0 (simulating real non-wake-word speech or ambient
-    /// audio that survives DTW matching).  Unlike the old opposite-direction
+    /// audio that survives Conv1D MLP matching).  Unlike the old opposite-direction
     /// negatives (N(-0.5, 0.3)), these sit in the same general region as
     /// wake word embeddings but lack the consistent structure that the
     /// verifier must learn to discriminate (mahbot-797).

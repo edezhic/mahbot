@@ -291,8 +291,8 @@ pub struct ConfigData {
     /// optimal English pronunciation, or to your language's code for better
     /// results in that language.
     pub tts_language: Option<String>,
-    /// JSON-serialized wake word templates for voice assistant.
-    /// Stored as a JSON array of [`crate::voice::WakeWordTemplate`] objects.
+    /// JSON-serialized wake word classifier weights + verifier for voice assistant.
+    /// Stored as a JSON object with `classifier` and `verifier` fields.
     pub wake_word_templates: Option<String>,
     /// Enable noise suppression for voice input (default: `"true"`).
     /// Uses the WebRTC-based `sonora-ns` denoiser before mel extraction.
@@ -882,7 +882,7 @@ pub async fn reload_from_db() -> Result<()> {
 // transaction.
 //
 // `wake_word_templates` is intentionally **skipped** — it is owned exclusively
-// by the voice pipeline (`persist_templates()` in `voice.rs`) and must never
+// by the voice pipeline (`persist_model_state()` in `voice.rs`) and must never
 // be overwritten or deleted by a GUI save from any settings tab.
 pub(crate) async fn write_string_config_fields_to_db(
     tx: &turso::TxGuard<'_>,
@@ -938,7 +938,7 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     //
     // NOTE: `wake_word_templates` is intentionally SKIPPED by the helper
     // below — it is managed exclusively by the voice pipeline via
-    // `persist_templates()` which writes directly to the config_kv table and
+    // `persist_model_state()` which writes directly to the config_kv table and
     // updates CONFIG independently.  Including it in the save loop would
     // create a dual-writer race where a save from any settings tab could
     // silently overwrite or delete freshly-enrolled templates.
@@ -1557,9 +1557,8 @@ mod tests {
     fn save_and_reload_preserves_wake_word_templates_in_config() {
         let reload = ConfigReload::const_new();
 
-        // Simulate: templates were enrolled (persist_templates updated CONFIG).
-        let template_json =
-            r#"{"templates":[{"name":"hey","embeddings":[[0.1]],"threshold":0.5}]}"#;
+        // Simulate: templates were enrolled (persist_model_state updated CONFIG).
+        let template_json = r#"{"classifier":null,"verifier":{"is_trained":false,"weights":[],"threshold":0.0,"scaler_mean":null,"scaler_std":null}}"#;
         let mut enrolled = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(enrolled.set_string_field("wake_word_templates", template_json));
         reload.swap(enrolled);

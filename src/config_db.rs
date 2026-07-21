@@ -609,7 +609,7 @@ mod tests {
     /// `save_and_reload` must NOT overwrite or delete the `wake_word_templates`
     /// [`write_string_config_fields_to_db`] intentionally skips the
     /// `wake_word_templates` key because that key is owned exclusively by the voice pipeline
-    /// (`persist_templates`).  This test delegates to the shared helper
+    /// (`persist_model_state`).  This test delegates to the shared helper
     /// [`crate::config::write_string_config_fields_to_db`] — the same helper
     /// that `save_and_reload` uses — so any change to the skip logic is
     /// automatically reflected here.
