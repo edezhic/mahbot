@@ -22,12 +22,16 @@
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-/// Default decision threshold for the verifier.
+/// Default decision threshold for the verifier (standard logistic regression
+/// decision boundary).
 ///
-/// Lowered from 0.5 to 0.3 (mahbot-788) to reduce false negatives. The DTW
-/// matching already provides the primary false-trigger protection, so the
-/// verifier threshold can be more permissive.
-const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.3;
+/// Restored to 0.5 (mahbot-797) after mahbot-788 lowered it to 0.3, which
+/// caused the verifier to become a permanently-open gate (accepting any speech,
+/// not just the enrolled wake word).  The root cause was training on synthetic
+/// Gaussian negatives — once the verifier is trained on real (non-synthetic)
+/// negative examples, the standard 0.5 boundary correctly separates wake word
+/// frames from other speech/ambient audio.
+const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.5;
 
 /// L2 regularization strength (lambda).
 ///
@@ -554,6 +558,33 @@ mod tests {
 
     // ── Required tests (from ticket mahbot-777) ─────────────────────
 
+    /// Generate a synthetic 96-dim "non-wake-word" embedding with values
+    /// distributed near 0 (simulating real non-wake-word speech or ambient
+    /// audio that survives DTW matching).  Unlike the old opposite-direction
+    /// negatives (N(-0.5, 0.3)), these sit in the same general region as
+    /// wake word embeddings but lack the consistent structure that the
+    /// verifier must learn to discriminate (mahbot-797).
+    fn make_non_wake_speech_embedding(rng: &mut impl Rng) -> Vec<f32> {
+        (0..EMBEDDING_DIM)
+            .map(|_| {
+                // Broad cluster centered at 0 with higher variance: N(0, 0.6).
+                // This simulates the diversity of non-wake-word speech —
+                // some dimensions may overlap with the wake word cluster,
+                // making discrimination harder than the old opposite-direction
+                // negatives.
+                loop {
+                    let u1: f32 = rng.random();
+                    let u2: f32 = rng.random();
+                    if u1 > 0.0 && u2 > 0.0 {
+                        let r = (-2.0 * u1.ln()).sqrt();
+                        let theta = 2.0 * std::f32::consts::PI * u2;
+                        break 0.0 + 0.6 * r * theta.cos();
+                    }
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn test_verifier_accepts_positive() {
         // Train on known positive and negative synthetic embeddings.
@@ -595,6 +626,87 @@ mod tests {
         assert!(
             score < 0.5,
             "Verifier should reject negative embedding (score < 0.5), got score={score:.4}",
+        );
+    }
+
+    // ── Mahbot-797: real-negative tests ─────────────────────────────
+
+    #[test]
+    fn test_verifier_rejects_non_wake_speech() {
+        // Train on positive embeddings (N(0.5, 0.3)) and realistic
+        // non-wake-word embeddings (N(0, 0.6)) — these overlap with the
+        // positive cluster, requiring the verifier to learn a more nuanced
+        // boundary than the old opposite-direction test.
+        let mut rng = StdRng::seed_from_u64(42);
+        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..30)
+            .map(|_| make_non_wake_speech_embedding(&mut rng))
+            .collect();
+
+        let verifier = VoiceVerifier::train(
+            &positives, &negatives, 0.5,  // standard logistic regression boundary
+            1.0,  // L2 regularization (default)
+            0.01, // learning rate (default)
+            2000, // max iterations (default)
+        );
+
+        assert!(verifier.is_trained(), "Verifier must be trained");
+
+        // Verify a held-out positive is accepted.
+        let held_out = make_positive_embedding(&mut rng);
+        let score = verifier.predict(&held_out);
+        assert!(
+            score >= 0.5,
+            "Verifier should accept positive embedding (score >= 0.5), got score={score:.4}",
+        );
+
+        // Verify a held-out non-wake-word speech embedding is rejected.
+        let held_out = make_non_wake_speech_embedding(&mut rng);
+        let score = verifier.predict(&held_out);
+        assert!(
+            score < 0.5,
+            "Verifier should reject non-wake-word speech embedding (score < 0.5), \
+             got score={score:.4}",
+        );
+    }
+
+    #[test]
+    fn test_train_with_synthetic_negatives_rejects_non_wake_word_speech() {
+        // Tests the actual production fallback path (mahbot-797):
+        // when fewer than 2 real negative chunks are available, the verifier
+        // is trained via train_with_synthetic_negatives which generates
+        // synthetic Gaussian N(0,1) negatives internally. This verifies that
+        // the resulting decision boundary correctly rejects non-wake-word
+        // speech embeddings (unlike the old pre-fix verifier which would
+        // accept any speech because it was trained only on N(0,1) noise).
+        let mut rng = StdRng::seed_from_u64(99);
+        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+
+        let verifier = VoiceVerifier::train_with_synthetic_negatives(&positives, 0.5);
+
+        assert!(verifier.is_trained(), "Verifier must be trained");
+
+        // Verify a held-out positive is accepted.
+        let held_out = make_positive_embedding(&mut rng);
+        let score = verifier.predict(&held_out);
+        assert!(
+            score >= 0.5,
+            "Verifier should accept positive embedding (score >= 0.5), got score={score:.4}",
+        );
+
+        // Verify a held-out non-wake-word speech embedding is rejected.
+        // The key insight: even though the verifier was trained on
+        // synthetic N(0,1) negatives (not real non-wake-word speech), the
+        // N(0.5, 0.3) positives are sufficiently separated from N(0, 0.6)
+        // speech to maintain a useful decision boundary at 0.5 for this
+        // test. In production, the fallback is only triggered when <2 real
+        // chunks are available, which is rare during normal enrollment.
+        let held_out = make_non_wake_speech_embedding(&mut rng);
+        let score = verifier.predict(&held_out);
+        assert!(
+            score < 0.5,
+            "Verifier should reject non-wake-word speech embedding (score < 0.5), \
+             got score={score:.4}",
         );
     }
 

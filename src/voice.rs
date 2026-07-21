@@ -131,6 +131,14 @@ const EMBEDDING_RING_MAX: usize = 19;
 /// live detection.
 const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
+/// Minimum length (in audio samples at 16kHz) for a collected ambient audio
+/// chunk to be used as a negative verifier training example (mahbot-797).
+///
+/// Set to 0.5s of audio, which produces ~31 mel frames (padded to 76 for the
+/// embedding model).  Chunks shorter than this are discarded — they would be
+/// mostly padding/silence and provide negligible discriminative signal.
+const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
+
 /// MAD multiplier for robust threshold calibration.
 ///
 /// K_MAD = 3.0 is equivalent to ~2σ for normally-distributed data
@@ -648,6 +656,11 @@ struct VoicePipelineState {
     status: VoiceStatus,
     templates: Arc<WakeWordTemplates>,
     enrollment_buffer: Vec<Vec<Vec<f32>>>,
+    /// Raw audio chunks collected during non-wake-word periods of enrollment
+    /// (pre-enrollment ambient noise and inter-utterance silence).  These are
+    /// processed through the ONNX embedding model at verifier training time to
+    /// produce real (non-synthetic) negative examples for the verifier (mahbot-797).
+    negative_audio_chunks: Vec<Vec<f32>>,
     cmd_tx: Option<mpsc::UnboundedSender<VoiceCommand>>,
 }
 
@@ -682,6 +695,7 @@ pub fn init_global() -> Result<()> {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
             cmd_tx: None,
         }))
         .map_err(|_| anyhow!("VoicePipeline already initialized"))?;
@@ -2702,6 +2716,11 @@ struct PipelineCtx {
     /// Audio pre-processor for noise suppression and AGC.
     /// Applied to every incoming audio chunk before VAD / mel extraction.
     audio_preprocessor: crate::audio_preprocessor::AudioPreprocessor,
+    /// Accumulates non-VAD audio frames during enrollment for use as negative
+    /// training examples (mahbot-797).  Collected between utterances (pre-enrollment
+    /// ambient noise, inter-utterance silence/background) and saved as chunks
+    /// when sustained speech begins.
+    negative_audio_buf: Vec<f32>,
 }
 
 impl PipelineCtx {
@@ -2749,6 +2768,7 @@ impl PipelineCtx {
                     agc,
                 })
             },
+            negative_audio_buf: Vec::new(),
         }
     }
 
@@ -2785,10 +2805,16 @@ impl PipelineCtx {
         self.vad_threshold = VAD_THRESHOLD;
         self.last_wake_word_detection = None;
         self.audio_preprocessor.clear_buffer();
+        self.negative_audio_buf.clear();
         voice_state()
             .write()
             .unwrap_poison()
             .enrollment_buffer
+            .clear();
+        voice_state()
+            .write()
+            .unwrap_poison()
+            .negative_audio_chunks
             .clear();
     }
 
@@ -3176,6 +3202,7 @@ fn check_enrollment_utterance_length(
 ///
 /// Implements minimum utterance length check (mahbot-772): utterances
 /// shorter than 400ms are rejected to reject noise blips and coughs.
+#[allow(clippy::too_many_lines)]
 async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     if !models_ready() {
         warn!("Models not ready for enrollment");
@@ -3230,15 +3257,17 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                             new_templates.len(),
                         );
 
-                        // ── Train verifier (mahbot-777, mahbot-788) ────
-                        // Use all per-frame embeddings from the enrollment
-                        // buffer as positive training examples (mahbot-788
-                        // Fix 3) — each utterance contributes 6-10 frames
-                        // instead of a single mean-pooled vector, giving
-                        // 60-100 examples with zero UX cost.  The verifier
-                        // threshold is lowered to 0.3 (Fix 4) to reduce
-                        // false negatives while DTW provides primary
-                        // false-trigger protection.
+                        // ── Train verifier (mahbot-777, mahbot-797) ──────
+                        // Uses real (non-synthetic) negative embeddings
+                        // collected from pre-enrollment ambient noise and
+                        // inter-utterance audio during enrollment. Falls back
+                        // to synthetic Gaussian negatives only when fewer than
+                        // 2 real chunks were captured (mahbot-797).
+                        //
+                        // Positive examples are all per-frame embeddings from
+                        // the enrollment buffer (mahbot-788 Fix 3) — each
+                        // utterance contributes 6-10 frames instead of a
+                        // single mean-pooled vector, giving 60-100 examples.
                         let positive_embeddings = {
                             let state = voice_state().read().unwrap_poison();
                             state
@@ -3256,17 +3285,87 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                             );
                             crate::voice_verifier::VoiceVerifier::untrained()
                         } else {
-                            let v = crate::voice_verifier::VoiceVerifier::
-                                    train_with_synthetic_negatives(
-                                        &positive_embeddings,
-                                        0.3,
-                                    );
-                            info!(
-                                "Verifier trained from {} per-frame positive embedding(s) \
-                                     + synthetic negatives",
-                                positive_embeddings.len(),
-                            );
-                            v
+                            // Collect negative audio chunks and process them
+                            // through ONNX to get real negative embeddings.
+                            let negative_chunks = voice_state()
+                                .write()
+                                .unwrap_poison()
+                                .negative_audio_chunks
+                                .split_off(0);
+                            let n_chunks = negative_chunks.len();
+                            // Require >=2 chunks to ensure embedding diversity
+                            // and reduce the chance of a single noisy chunk
+                            // (e.g. VAD misclassification, transient mic pop)
+                            // dominating the negative class. With 2+ separate
+                            // ambient/inter-utterance periods (each >=0.5s),
+                            // we get a more representative sample of the
+                            // deployment environment's non-wake-word audio.
+                            let real_negatives = if n_chunks >= 2 && ONNX_MODELS.get().is_some() {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let models =
+                                        ONNX_MODELS.get().expect("ONNX_MODELS checked above");
+                                    let mut all_neg = Vec::new();
+                                    for chunk in &negative_chunks {
+                                        match extract_embeddings_from_audio(models, chunk) {
+                                            Ok(embs) => all_neg.extend(embs),
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to extract negative embedding \
+                                                     from ambient audio chunk ({} samples): \
+                                                     {e}",
+                                                    chunk.len(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    all_neg
+                                })
+                                .await
+                                .unwrap_or_default();
+                                if result.is_empty() {
+                                    None
+                                } else {
+                                    Some(result)
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(neg_embeddings) = real_negatives {
+                                let n_neg = neg_embeddings.len();
+                                let v = crate::voice_verifier::VoiceVerifier::train(
+                                    &positive_embeddings,
+                                    &neg_embeddings,
+                                    0.5,  // standard logistic regression boundary
+                                    1.0,  // L2 regularization (lambda)
+                                    0.01, // learning rate
+                                    2000, // max iterations
+                                );
+                                info!(
+                                    "Verifier trained from {} positive + {n_neg} real \
+                                     negative embedding(s) ({})",
+                                    positive_embeddings.len(),
+                                    if n_neg < n_chunks {
+                                        format!("{n_chunks} chunks → {n_neg} embeds")
+                                    } else {
+                                        format!("{n_chunks} chunks")
+                                    },
+                                );
+                                v
+                            } else {
+                                let v = crate::voice_verifier::VoiceVerifier::
+                                        train_with_synthetic_negatives(
+                                            &positive_embeddings,
+                                            0.5,
+                                        );
+                                info!(
+                                    "Verifier trained from {} per-frame positive \
+                                     embedding(s) + synthetic negatives (no real \
+                                     negatives available)",
+                                    positive_embeddings.len(),
+                                );
+                                v
+                            }
                         };
 
                         let mut existing = get_templates();
@@ -3528,6 +3627,15 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
 /// `SILENCE_DURATION`), stores the utterance in `enrollment_pending` for
 /// inline processing (avoids race conditions with the command channel).
 ///
+/// **Verifier negative collection** (mahbot-797): Non-VAD frames captured
+/// before the first detected speech (pre-enrollment ambient noise) and during
+/// inter-utterance silence (audio between wake word utterances) are accumulated
+/// into `ctx.negative_audio_buf`. On the first transition to sustained speech,
+/// this buffer is saved as a chunk in `voice_state().negative_audio_chunks`.
+/// These real (non-synthetic) negative examples are later used to train the
+/// wake word verifier at enrollment finalization, replacing the old synthetic
+/// Gaussian noise that caused false triggers (mahbot-797 Fix 4).
+///
 /// **VAD symmetry** (mahbot-765): Only VAD-positive frames are accumulated
 /// into the utterance buffer, mirroring the detection pipeline
 /// ([`handle_wake_word_detection`]). This eliminates the asymmetry where
@@ -3542,6 +3650,7 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
 /// - No speech yet: caller's `Enrolling` text persists (or no-speech warning)
 /// - Speech detected: `ListeningDuringEnrollment`
 /// - Speech ended, awaiting silence: `WaitingForSilenceDuringEnrollment`
+#[allow(clippy::too_many_lines)]
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
     // ── Raw audio ring buffer (mahbot-775 Fix 3) ──
     // Accumulate ALL raw input audio into a rolling ring so we can later
@@ -3591,6 +3700,22 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // quiet environments (mahbot-782 used raw_audio_ring which
                 // contains post-AGC audio, causing this false-positive).
                 let already_had_speech = ctx.utterance_had_speech;
+                // ── Save collected ambient audio for verifier negatives (mahbot-797) ──
+                // On the FIRST transition from silence to sustained speech,
+                // save the accumulated non-wake-word audio (pre-enrollment
+                // ambient noise or inter-utterance silence) as a potential
+                // negative training example for the verifier.
+                if !already_had_speech {
+                    if ctx.negative_audio_buf.len() >= MIN_NEGATIVE_AUDIO_LEN {
+                        voice_state()
+                            .write()
+                            .unwrap_poison()
+                            .negative_audio_chunks
+                            .push(std::mem::take(&mut ctx.negative_audio_buf));
+                    } else {
+                        ctx.negative_audio_buf.clear();
+                    }
+                }
                 if !already_had_speech && ctx.noise_rms_estimate.is_none() {
                     let speech_boundary = ENROLLMENT_VAD_CONSECUTIVE_REQUIRED * HOP_LENGTH;
                     let pre_speech_end = ctx.pre_agc_ring.len().saturating_sub(speech_boundary);
@@ -3705,6 +3830,13 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
                 }
             } else if !ctx.utterance_had_speech {
+                // Accumulate non-VAD audio for verifier negatives (mahbot-797):
+                // pre-enrollment ambient noise, inter-utterance silence, or
+                // any non-wake-word audio between utterances.  Each frame
+                // contributes HOP_LENGTH new samples.
+                ctx.negative_audio_buf
+                    .extend_from_slice(&frame[..HOP_LENGTH]);
+
                 // Pre-speech silence: increment no-speech counter.  When the
                 // count reaches ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES (~5 seconds
                 // of non-VAD audio), show a warning so the user knows to speak
@@ -3816,9 +3948,11 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
         // trailing silence) should not veto detection when previous
         // frames are strong.
         //
-        // Fix 2 (mahbot-788): Do NOT clear the score window on
-        // rejection — the next frame should get a fresh chance without
-        // losing accumulated detection evidence.
+        // Fix 2 (mahbot-797): Clear the score window on verifier rejection.
+        // Without this, a single borderline pass lets accumulated scores
+        // drift high enough that any speech eventually triggers detection.
+        // The next frame must start from zero — DTW matching will rebuild
+        // if the frame is truly a wake word.
         if templates.verifier.is_trained() {
             let start = ctx.embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
             let score = ctx.embedding_ring[start..]
@@ -3832,9 +3966,10 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
                     templates.verifier.threshold,
                     ctx.embedding_ring.len() - start,
                 );
-                // Fix 2: score_window is NOT cleared here — the next
-                // frame gets a fresh chance at detection without losing
-                // accumulated DTW evidence.
+                // Clear the score window so the next frame starts from zero.
+                // Without this the accumulated DTW evidence eventually lets
+                // any speech through (mahbot-797).
+                ctx.score_window.clear();
                 return false;
             }
         }
@@ -4134,6 +4269,8 @@ mod tests {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+
             cmd_tx: None,
         }));
 
@@ -5660,6 +5797,8 @@ mod tests {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+
             cmd_tx: None,
         }));
 
@@ -5793,6 +5932,8 @@ mod tests {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+
             cmd_tx: None,
         }));
 
@@ -5869,6 +6010,8 @@ mod tests {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+
             cmd_tx: None,
         }));
 
@@ -6057,6 +6200,8 @@ mod tests {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+
             cmd_tx: None,
         }));
         // Force-enable so handle_start_listening passes the is_enabled() guard.
@@ -6100,6 +6245,8 @@ mod tests {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+
             cmd_tx: None,
         }));
 
@@ -6182,6 +6329,8 @@ mod tests {
             status: VoiceStatus::Disabled,
             templates: Arc::new(WakeWordTemplates::default()),
             enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+
             cmd_tx: None,
         }));
 
@@ -7270,6 +7419,8 @@ mod tests {
                 status: VoiceStatus::Disabled,
                 templates: Arc::new(WakeWordTemplates::default()),
                 enrollment_buffer: Vec::new(),
+                negative_audio_chunks: Vec::new(),
+
                 cmd_tx: None,
             })
         });
