@@ -1105,16 +1105,24 @@ fn has_ending_punctuation(text: &str) -> bool {
 
 // ── Character encoding ───────────────────────────────────────────────
 
+/// Encode a text string into token IDs using the engine's unicode indexer.
 fn encode_text(engine: &TtsEngine, text: &str) -> (Vec<i64>, usize) {
-    let unk_id = engine.unicode_indexer.first().copied().unwrap_or(0);
+    encode_text_with_indexer(&engine.unicode_indexer, text)
+}
+
+/// Core encoding logic that works with any unicode indexer slice.
+///
+/// This is extracted for testability — see `test_encode_text_with_indexer`.
+fn encode_text_with_indexer(unicode_indexer: &[i32], text: &str) -> (Vec<i64>, usize) {
+    let unk_id = unicode_indexer.first().copied().unwrap_or(0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let max_idx = engine.unicode_indexer.len() as i32 - 1;
+    let max_idx = unicode_indexer.len() as i32 - 1;
     let ids: Vec<i64> = text
         .chars()
         .map(|c| {
             let code = c as usize;
-            if code < engine.unicode_indexer.len() {
-                let tid = engine.unicode_indexer[code];
+            if code < unicode_indexer.len() {
+                let tid = unicode_indexer[code];
                 if tid >= 0 && tid <= max_idx {
                     return i64::from(tid);
                 }
@@ -1716,6 +1724,494 @@ mod tests {
             "empty SHA256 expected hash should skip verification"
         );
         std::fs::remove_file(&tmp).ok();
+    }
+
+    // ── Tier 1: Preprocessing helpers (always-run unit tests) ─────────
+
+    #[test]
+    fn test_normalize_symbols() {
+        let r = normalize_symbols("Hello—world–test\u{2011}");
+        assert_eq!(r, "Hello-world-test-", "em/en dashes become hyphen");
+
+        let r2 = normalize_symbols(
+            "a\u{00AF}b[c]d|e/f#g\u{2192}h\u{2190}i\u{2665}j\u{2606}k\u{2661}l\u{00A9}m\\n",
+        );
+        assert_eq!(
+            r2, "a b c d e f g h i j k l m n",
+            "symbols like overline, brackets, pipe, slash, hash, arrows, hearts, copyright, backslash become space"
+        );
+
+        let r3 = normalize_symbols("\u{201C}hello\u{201D}");
+        assert_eq!(
+            r3, "\"hello\"",
+            "curly double quotes become straight double quote"
+        );
+
+        let r4 = normalize_symbols("\u{2018}hello\u{2019}\u{00B4}`");
+        assert_eq!(
+            r4, "'hello'''",
+            "curly single quotes, acute, backtick become straight single quote"
+        );
+
+        // Characters that should pass through unchanged
+        let r5 = normalize_symbols("abc123.!?");
+        assert_eq!(
+            r5, "abc123.!?",
+            "normal alphanumeric and basic punctuation pass through"
+        );
+    }
+
+    #[test]
+    fn test_expand_abbreviations() {
+        assert_eq!(expand_abbreviations("@user"), " at user");
+        // Note: "e.g.," → "for example, " (trailing space) because the original
+        // text has a space after the comma — this is fine as clean_whitespace
+        // later normalises it.
+        assert_eq!(expand_abbreviations("e.g., hello"), "for example,  hello");
+        assert_eq!(expand_abbreviations("i.e., world"), "that is,  world");
+        assert_eq!(
+            expand_abbreviations("multiple e.g., and i.e., here"),
+            "multiple for example,  and that is,  here"
+        );
+        // Text without abbreviations passes through unchanged
+        assert_eq!(expand_abbreviations("hello world"), "hello world");
+        // Case-sensitive: only lowercase exact match
+        assert_eq!(expand_abbreviations("E.G.,"), "E.G.,");
+    }
+
+    #[test]
+    fn test_fix_punctuation_spacing() {
+        assert_eq!(fix_punctuation_spacing("hello ,world"), "hello,world");
+        assert_eq!(fix_punctuation_spacing("hello .world"), "hello.world");
+        assert_eq!(fix_punctuation_spacing("hello !world"), "hello!world");
+        assert_eq!(fix_punctuation_spacing("hello ?world"), "hello?world");
+        assert_eq!(fix_punctuation_spacing("hello ;world"), "hello;world");
+        assert_eq!(fix_punctuation_spacing("hello :world"), "hello:world");
+        assert_eq!(fix_punctuation_spacing("hello 'world"), "hello'world");
+        assert_eq!(
+            fix_punctuation_spacing("hello , . ; : ! ? 'world"),
+            "hello,.;:!?'world"
+        );
+        // Text without spacing issues passes through unchanged
+        assert_eq!(fix_punctuation_spacing("Hello, world!"), "Hello, world!");
+    }
+
+    #[test]
+    fn test_remove_duplicate_quotes() {
+        assert_eq!(
+            remove_duplicate_quotes(r#""hello""#),
+            r#""hello""#,
+            "single pair unchanged"
+        );
+        assert_eq!(
+            remove_duplicate_quotes(r#""""hello"""""#),
+            r#""hello""#,
+            "double quotes deduplicated"
+        );
+        assert_eq!(
+            remove_duplicate_quotes("''hello''"),
+            "'hello'",
+            "single quotes deduplicated"
+        );
+        assert_eq!(
+            remove_duplicate_quotes("``hello``"),
+            "`hello`",
+            "backticks deduplicated"
+        );
+        assert_eq!(
+            remove_duplicate_quotes(r#""'mixed"#),
+            r#""'mixed"#,
+            "different quote chars are not collapsed"
+        );
+        assert_eq!(
+            remove_duplicate_quotes("no quotes"),
+            "no quotes",
+            "text without quotes unchanged"
+        );
+    }
+
+    #[test]
+    fn test_clean_whitespace() {
+        assert_eq!(
+            clean_whitespace("hello   world"),
+            "hello world",
+            "multiple spaces collapsed"
+        );
+        assert_eq!(
+            clean_whitespace("  hello  world  "),
+            "hello world",
+            "leading/trailing whitespace trimmed"
+        );
+        assert_eq!(
+            clean_whitespace("hello\tworld"),
+            "hello world",
+            "tabs become space"
+        );
+        assert_eq!(
+            clean_whitespace("hello\n\nworld"),
+            "hello world",
+            "newlines collapsed to space"
+        );
+        assert_eq!(clean_whitespace("  "), "", "whitespace-only becomes empty");
+        assert_eq!(
+            clean_whitespace("hello world"),
+            "hello world",
+            "normal text unchanged"
+        );
+    }
+
+    #[test]
+    fn test_remove_emojis() {
+        // A selection of emojis from different ranges
+        let emoji_text = "Hello 😊😢🔥👍🏆🎉💯";
+        assert_eq!(
+            remove_emojis(emoji_text),
+            "Hello ",
+            "emoji characters removed"
+        );
+
+        // Emoticons range: U+1F600..=U+1F64F
+        assert_eq!(remove_emojis("😀😁😂🤣😃😄😅😆"), "", "emoticons removed");
+
+        // Symbols and pictographs range: U+1F300..=U+1F5FF
+        assert_eq!(remove_emojis("🌀🌂🌁"), "", "misc symbols removed");
+
+        // Transport range: U+1F680..=U+1F6FF
+        assert_eq!(remove_emojis("🚀🚁🚂"), "", "transport symbols removed");
+
+        // Various other emoji ranges
+        assert_eq!(
+            remove_emojis("🛀🛁🛂🛃🛄🛅"),
+            "",
+            "transport supplement removed"
+        );
+        assert_eq!(
+            remove_emojis("🤐🤑🤒🤓🤔🤕🤖"),
+            "",
+            "supplemental symbols removed"
+        );
+        assert_eq!(remove_emojis("🥰🥱🥴🥳🥺"), "", "extended symbols removed");
+        assert_eq!(remove_emojis("🦾🦿🧠🧡"), "", "symbols ext A removed");
+        // Note: ZWJ sequences like 🧑‍🦰 contain U+200D (zero-width joiner) which is
+        // not in the emoji ranges, so it passes through.
+        assert_eq!(
+            remove_emojis("🧑‍🦰"),
+            "\u{200d}",
+            "ZWJ character survives emoji removal"
+        );
+
+        // Misc symbols: U+2600..=U+26FF
+        // Note: ☀️ contains U+FE0F (variation selector-16) which is not in the
+        // emoji ranges, so it passes through. We test with bare U+2600 instead.
+        assert_eq!(
+            remove_emojis("\u{2600}\u{2601}\u{2602}\u{2603}"),
+            "",
+            "misc symbols removed"
+        );
+
+        // Dingbats: U+2700..=U+27BF
+        assert_eq!(remove_emojis("✀✁✂✃✄✅"), "", "dingbats removed");
+
+        // Non-emoji text passes through
+        assert_eq!(
+            remove_emojis("Hello, world!"),
+            "Hello, world!",
+            "plain text unchanged"
+        );
+    }
+
+    /// Panic-safe guard that restores the TTS language config on drop.
+    struct TtsLangGuard {
+        saved: String,
+    }
+
+    impl Drop for TtsLangGuard {
+        fn drop(&mut self) {
+            CONFIG.set_string_field("tts_language", &self.saved);
+        }
+    }
+
+    #[test]
+    fn test_wrap_lang_tag() {
+        let _guard = TtsLangGuard {
+            saved: CONFIG.tts_language(),
+        };
+
+        // Force language to "en" for deterministic test
+        let _ = CONFIG.set_string_field("tts_language", "en");
+        let r = wrap_lang_tag("Hello world");
+        assert_eq!(r, "<en>Hello world</en>", "text wrapped in language tag");
+
+        // Test with language-agnostic tag
+        let _ = CONFIG.set_string_field("tts_language", "na");
+        let r2 = wrap_lang_tag("Test");
+        assert_eq!(r2, "<na>Test</na>");
+        // _guard restores original language on drop (including on panic)
+    }
+
+    // ── Tier 2: encode_text with synthetic indexer ────────────────────
+
+    #[test]
+    fn test_encode_text_with_indexer() {
+        // Synthetic unicode indexer: maps ASCII chars 0-127 to sequential IDs.
+        // indexer[i] = i for i in 0..128, with UNK positioned at index 0.
+        // This means:
+        //   - 'H' (72)  → ID 72
+        //   - 'w' (119) → ID 119
+        //   - '😊' (U+1F60A = 128522) → out of range → UNK (ID 0)
+        //
+        // We specifically set space (32) to -1 so it falls through to UNK,
+        // simulating a real indexer where space is not a valid token.
+        let mut indexer = vec![-1i32; 128];
+        for i in 0..128 {
+            indexer[i] = i as i32;
+        }
+        // ID 0 is the UNK token
+        indexer[0] = 0;
+        // Space (code 32) → UNK (not a valid token in the model)
+        indexer[32] = -1;
+
+        let (ids, len) = encode_text_with_indexer(&indexer, "H w");
+        assert_eq!(len, 3, "three characters encoded");
+        assert_eq!(ids, vec![72, 0, 119], "space should map to UNK (ID 0)");
+
+        // Test with empty indexer (edge case)
+        let (ids2, len2) = encode_text_with_indexer(&[], "hello");
+        assert_eq!(len2, 5, "five chars encoded with empty indexer");
+        assert_eq!(ids2, vec![0; 5], "all map to UNK (default 0)");
+
+        // Test with single-entry indexer (no UNK differentiation)
+        let (ids3, len3) = encode_text_with_indexer(&vec![42], "abc");
+        assert_eq!(len3, 3);
+        assert_eq!(ids3, vec![42; 3], "all chars map to UNK (first entry = 42)");
+
+        // Test with negative UNK sentinel
+        let (ids4, len4) = encode_text_with_indexer(&vec![-1], "x");
+        assert_eq!(len4, 1);
+        assert_eq!(ids4, vec![-1i64], "UNK sentinel preserved");
+    }
+
+    /// Model-free test for the empty-token-sequence guard.
+    ///
+    /// The guard in [`synthesize_internal`] checks `if seq_len == 0` after
+    /// calling [`encode_text`]. This test validates the precondition directly
+    /// using [`encode_text_with_indexer`] with a synthetic indexer, so it
+    /// runs in any environment regardless of whether TTS model files are
+    /// cached.
+    #[test]
+    fn test_encode_text_empty_input_produces_zero_len() {
+        // Empty string → zero-length output (triggers the seq_len == 0 guard)
+        let (ids, len) = encode_text_with_indexer(&vec![0i32; 128], "");
+        assert_eq!(
+            len, 0,
+            "empty input must produce zero-length token sequence"
+        );
+        assert!(ids.is_empty(), "token IDs must be empty for empty input");
+
+        // Non-empty string still produces tokens (guard not triggered)
+        let (_, len2) = encode_text_with_indexer(&vec![0i32; 128], "a");
+        assert_eq!(len2, 1, "single-char input should produce one token");
+
+        // Whitespace-only strings are NOT empty — they produce tokens.
+        // The guard only triggers for truly empty character sequences.
+        let (_, len3) = encode_text_with_indexer(&vec![0i32; 128], " ");
+        assert_eq!(len3, 1, "whitespace input produces a token");
+    }
+
+    // ── Tier 3: Integration tests with real models ────────────────────
+    //
+    // These tests require the Supertonic 3 model files to be cached in
+    // `~/.mahbot/models/supertonic3/`. They are skipped if the files are
+    // not found (matching the embedder test pattern).
+
+    /// Helper to obtain a loaded [`TtsEngine`] for integration tests.
+    ///
+    /// Returns `None` (and skips the calling test) when:
+    /// - `MAHBOT_SKIP_TTS_TESTS=1` is set
+    /// - Model files are not cached on disk
+    ///
+    /// Caches the loaded engine via [`OnceLock`] so the ~2s load cost is
+    /// paid only once per test run.
+    fn test_tts_engine() -> Option<&'static TtsEngine> {
+        use std::sync::OnceLock;
+
+        // Share a single model load across all tests via OnceLock.
+        static TEST_TTS_ENGINE: OnceLock<Option<TtsEngine>> = OnceLock::new();
+
+        TEST_TTS_ENGINE
+            .get_or_init(|| {
+                // Skip if env var is set
+                if std::env::var("MAHBOT_SKIP_TTS_TESTS").is_ok() {
+                    return None;
+                }
+
+                // Collect all candidate models directories (deduplicated).
+                let mut candidates = Vec::new();
+
+                // 1. CONFIG storage root (may be a temp dir from graceful degradation test).
+                if let Some(root) = crate::config::CONFIG.try_storage_root() {
+                    candidates.push(root.join("models").join(MODEL_DIR_NAME));
+                }
+
+                // 2. Real home directory cache (always present in dev/CI environments).
+                if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+                    let real = std::path::PathBuf::from(&home)
+                        .join(".mahbot")
+                        .join("models")
+                        .join(MODEL_DIR_NAME);
+                    if !candidates.contains(&real) {
+                        candidates.push(real);
+                    }
+                }
+
+                // Try each candidate until we find model files.
+                for dir in &candidates {
+                    let onnx_dir = dir.join(ONNX_DIR);
+                    // Check essential files: one ONNX model, config, indexer, and voice style
+                    let essential_files = [
+                        onnx_dir.join(DP_ONNX_NAME),
+                        onnx_dir.join(TEXT_ENC_ONNX_NAME),
+                        onnx_dir.join(VECTOR_EST_ONNX_NAME),
+                        onnx_dir.join(VOCODER_ONNX_NAME),
+                        onnx_dir.join(TTS_JSON_NAME),
+                        onnx_dir.join(UNICODE_INDEXER_NAME),
+                        dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME),
+                    ];
+                    if essential_files.iter().all(|p| p.exists()) {
+                        match load_engine(dir) {
+                            Ok(engine) => return Some(engine),
+                            Err(e) => {
+                                eprintln!("WARNING: Failed to load test TTS engine: {e}");
+                                return None;
+                            }
+                        }
+                    }
+                }
+
+                // No model files found in any candidate directory.
+                let last_candidate = candidates.last().map(|p| p.display().to_string());
+                eprintln!(
+                    "WARNING: Supertonic 3 model files not found. Looked in: {}. \
+                     Set MAHBOT_SKIP_TTS_TESTS=1 to suppress this warning.",
+                    last_candidate.as_deref().unwrap_or("<none>")
+                );
+                None
+            })
+            .as_ref()
+    }
+
+    #[test]
+    fn test_synthesize_short_text_creates_valid_wav() {
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        let samples = synthesize_internal(engine, "<en>Hello world.</en>")
+            .expect("synthesis of short text should succeed");
+
+        assert!(!samples.is_empty(), "synthesized audio must not be empty");
+        assert!(
+            samples.len() > 1000,
+            "short text should produce at least 1000 samples (got {})",
+            samples.len()
+        );
+
+        // Verify samples are in valid f32 range [-1.0, 1.0]
+        for &s in &samples {
+            assert!((-1.0..=1.0).contains(&s), "sample {s} out of valid range");
+        }
+
+        // Verify the WAV rendering works with the synthesized samples
+        let wav_bytes =
+            render_wav(&samples, engine.sample_rate).expect("render_wav should succeed");
+        assert!(wav_bytes.starts_with(b"RIFF"), "WAV should start with RIFF");
+        assert!(wav_bytes.len() > 44, "WAV should have header + data");
+    }
+
+    #[test]
+    fn test_synthesize_chunked_long_text() {
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        // Create text longer than MAX_CHUNK_LENGTH (300 chars)
+        let long_text =
+            "Hello world. This is a test of the chunked synthesis pipeline. ".repeat(20);
+        assert!(
+            long_text.len() > MAX_CHUNK_LENGTH,
+            "test text must exceed chunk limit"
+        );
+
+        let samples =
+            synthesize_chunked(engine, &long_text, None).expect("chunked synthesis should succeed");
+
+        assert!(
+            !samples.is_empty(),
+            "chunked synthesis must produce samples"
+        );
+        assert!(
+            samples.len() > 1000,
+            "chunked text should produce at least 1000 samples (got {})",
+            samples.len()
+        );
+
+        // Verify samples are in valid f32 range [-1.0, 1.0]
+        for &s in &samples {
+            assert!((-1.0..=1.0).contains(&s), "sample {s} out of valid range");
+        }
+    }
+
+    #[test]
+    fn test_synthesis_deterministic_with_seed_42() {
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        let text = "<en>Hello world, this is a deterministic test.</en>";
+
+        // Synthesize the same text twice and verify identical output.
+        // The flow matching process is deterministic for a given input
+        // (no random seed involved), so repeated calls on the same
+        // hardware should produce bit-identical results.
+        let samples1 = synthesize_internal(engine, text).expect("first synthesis should succeed");
+        let samples2 = synthesize_internal(engine, text).expect("second synthesis should succeed");
+
+        assert_eq!(
+            samples1.len(),
+            samples2.len(),
+            "both syntheses should produce the same number of samples"
+        );
+
+        // Compare bit-exactness of the first 1000 samples using direct
+        // f32 equality (which checks bit patterns).
+        let check_len = samples1.len().min(1000);
+        for i in 0..check_len {
+            assert_eq!(
+                samples1[i], samples2[i],
+                "sample {i} differs: {:.10} vs {:.10}",
+                samples1[i], samples2[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_text_fails_fast() {
+        // synthesize_internal with empty text should bail cleanly at the
+        // Rust-level guard (seq_len == 0) before reaching any ONNX model code.
+        let Some(engine) = test_tts_engine() else {
+            return; // Skip if no model available
+        };
+
+        let result = synthesize_internal(engine, "");
+        assert!(result.is_err(), "empty text synthesis should fail");
+
+        // Verify the error message mentions empty input
+        let err = result.err().unwrap();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("Empty token sequence"),
+            "error should mention 'Empty token sequence', got: {err_msg}"
+        );
     }
 
     // ── init_listener ────────────────────────────────────────────────
