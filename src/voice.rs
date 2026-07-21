@@ -8004,3 +8004,17 @@ mod tests {
         assert_eq!(minimum_matches, 2, "minimum_matches should be 2 for K=3",);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Voice pipeline test harness (feature-gated)
+// ═══════════════════════════════════════════════════════════════════════════
+///
+/// This module is ONLY compiled when `voice-tests` feature is active AND we're
+/// in test mode (`#[cfg(all(test, feature = "voice-tests"))]`).  It provides
+/// synthetic audio generation, offline pipeline execution, and FAR/FRR/latency
+/// metric collection for wake word detection quality assessment.
+///
+/// The module is a child of `voice` and accesses private items via
+/// `use super::*`.
+#[cfg(all(test, feature = "voice-tests"))]
+mod voice_test_harness;

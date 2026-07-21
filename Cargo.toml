@@ -14,6 +14,10 @@ rust-version = "1.96"
 resolver = "2"
 exclude = [".DS_Store"]
 
+[features]
+default = []
+voice-tests = []
+
 [[bin]]
 name = "mahbot"
 path = "src/main.rs"
