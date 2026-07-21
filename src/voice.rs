@@ -64,6 +64,28 @@ const HOP_LENGTH: usize = 256;
 /// Number of mel bands in the spectrogram.
 const NUM_MEL_BANDS: usize = 32;
 
+/// Internal hop length of the ONNX mel spectrogram model (160 samples = 10ms
+/// at 16 kHz).  This is the stride between consecutive mel frames computed
+/// by the `melspectrogram.onnx` model, independent of the application-level
+/// [`HOP_LENGTH`] which controls VAD frame iteration.
+///
+/// This constant is used to align voice batch overlap boundaries with the
+/// model's internal stride so that mel frames across consecutive batches
+/// have consistent temporal positions (mahbot-799).  See [`flush_voice_batch`]
+/// for details.
+const MEL_STRIDE: usize = 160;
+
+/// Overlap samples retained in `voice_batch` after a mel spectrogram flush.
+///
+/// Set to 2 × [`MEL_STRIDE`] (320 samples = 20ms at 16kHz) so that the
+/// retained overlap is a multiple of the mel model's internal stride
+/// (160 samples), ensuring mel frame positions are aligned across
+/// consecutive batch boundaries.
+///
+/// Using 2× provides two full-context crossing frames at the batch boundary.
+/// See [`flush_voice_batch`] for the detailed rationale (mahbot-799).
+const VOICE_BATCH_OVERLAP: usize = MEL_STRIDE * 2;
+
 /// Embedding window: 76 consecutive mel frames (~760ms with the ONNX mel
 /// model's 10ms internal stride, not 16ms — see HOP_LENGTH note above).
 const EMBEDDING_WINDOW_FRAMES: usize = 76;
@@ -3537,6 +3559,29 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     }
 }
 
+/// Retain only the last [`VOICE_BATCH_OVERLAP`] samples in `voice_batch`
+/// as overlap context for the next mel spectrogram batch.
+///
+/// This function is extracted from [`flush_voice_batch`] so the overlap
+/// trimming logic can be tested in isolation (the ONNX inference inside
+/// `flush_voice_batch` requires model files and cannot run in unit tests).
+/// See [`test_mel_stride_overlap_alignment`] for the behavioral test.
+///
+/// # Caution
+/// [`flush_voice_batch`] **must** call this function after each successful
+/// mel flush.  The test suite validates `trim_voice_batch` in isolation but
+/// cannot verify the call site — ONNX models are unavailable in unit tests,
+/// so `flush_voice_batch` returns early before reaching the trim call.
+/// Removing this call without a replacement would create a regression gap
+/// (see [`test_mel_stride_overlap_alignment`] which documents this gap).
+fn trim_voice_batch(voice_batch: &mut Vec<f32>) {
+    let keep = VOICE_BATCH_OVERLAP;
+    if voice_batch.len() > keep {
+        let drain_to = voice_batch.len() - keep;
+        voice_batch.drain(..drain_to);
+    }
+}
+
 /// Process accumulated voiced audio through the mel spectrogram ONNX model.
 /// Batches multiple frames into a single ONNX call for efficiency.
 ///
@@ -3544,6 +3589,15 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 /// `block_in_place` so the tokio runtime can run other tasks on this thread
 /// during inference, consistent with the enrollment path which uses
 /// `spawn_blocking` for the same purpose.
+///
+/// # Overlap management
+/// After a successful ONNX call, [`trim_voice_batch`] trims `voice_batch` to
+/// retain only the last [`VOICE_BATCH_OVERLAP`] samples as overlap context
+/// for the next batch.  This ensures mel frame positions are aligned across
+/// batch boundaries (mahbot-799).  Removing this call would create a
+/// regression gap — the test suite cannot verify the call site because ONNX
+/// models are unavailable in unit tests (see [`trim_voice_batch`]'s
+/// `# Caution` note).
 fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<f32>>) {
     if voice_batch.len() < FRAME_LENGTH {
         return; // not enough for a single frame
@@ -3552,8 +3606,8 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
         return;
     };
 
-    let batch = voice_batch.clone();
-    let frames = crate::util::with_block_in_place(|| compute_mel_spectrogram(models, &batch));
+    let frames =
+        crate::util::with_block_in_place(|| compute_mel_spectrogram(models, &*voice_batch));
     match frames {
         Ok(frames) => {
             debug!(
@@ -3568,17 +3622,24 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
             while mel_frame_buffer.len() > EMBEDDING_WINDOW_FRAMES {
                 mel_frame_buffer.remove(0);
             }
-            // Keep only the last (FRAME_LENGTH - HOP_LENGTH) samples for overlap
-            // context, ensuring temporal continuity across batch boundaries.  The
-            // remaining samples provide the context needed for the first mel frame
-            // of the next batch to have the correct 256-sample hop from the last
-            // frame of this batch (rather than being computed from a new disjoint
-            // window, which would create a 512-sample gap).
-            let keep = FRAME_LENGTH.saturating_sub(HOP_LENGTH);
-            if voice_batch.len() > keep {
-                let drain_to = voice_batch.len() - keep;
-                voice_batch.drain(..drain_to);
-            }
+            // Keep only the last VOICE_BATCH_OVERLAP (MEL_STRIDE × 2 = 320)
+            // samples as overlap context across batch boundaries.  The ONNX
+            // mel spectrogram model uses an internal stride of 160 samples
+            // (MEL_STRIDE), so the overlap must be a multiple of 160 to align
+            // mel frame positions at the batch boundary.
+            //
+            // Using 2 × MEL_STRIDE (320 samples = 20ms) provides two full mel
+            // frames of overlap context:
+            //   - Frame 0 of the new batch covers [P-320 .. P+192] — starts at
+            //     a valid stride position
+            //   - Frame 1 covers [P-160 .. P+352] — also valid
+            // Both match exactly what continuous processing would compute.
+            //
+            // The previous value (FRAME_LENGTH - HOP_LENGTH = 256 samples) was
+            // NOT a multiple of 160, causing ~6ms of temporal offset drift at
+            // each batch boundary that accumulated ~45ms across 76 frames
+            // (mahbot-799).
+            trim_voice_batch(voice_batch);
         }
         Err(e) => {
             warn!("Mel spectrogram failed: {e}");
@@ -7249,6 +7310,87 @@ mod tests {
     // verified at the integration-test level (test_voice_pipeline_commands_*)
     // via the pipeline end-to-end.  A unit test that asserts a literal constant
     // would only replicate the declaration with no behavioral coverage.
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Mel stride alignment (mahbot-799)
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// The voice batch overlap constant [`VOICE_BATCH_OVERLAP`] must be a
+    /// multiple of the ONNX mel model's internal stride so that mel frame
+    /// positions are aligned across consecutive batch boundaries.
+    ///
+    /// This test verifies both the constant's algebraic invariants and the
+    /// runtime behaviour of [`trim_voice_batch`] (the function that applies
+    /// the overlap in [`flush_voice_batch`]).  Trimming is tested separately
+    /// because the full ONNX inference requires model files and cannot run
+    /// in unit tests.
+    #[test]
+    fn test_mel_stride_overlap_alignment() {
+        // ── Constant invariants ──────────────────────────────────────
+        // VOICE_BATCH_OVERLAP = MEL_STRIDE × 2 = 320 samples, which is a
+        // clean multiple of the model's 160-sample stride.
+        assert_eq!(
+            VOICE_BATCH_OVERLAP % MEL_STRIDE,
+            0,
+            "VOICE_BATCH_OVERLAP ({VOICE_BATCH_OVERLAP}) must be a multiple of MEL_STRIDE ({MEL_STRIDE})",
+        );
+        assert!(
+            VOICE_BATCH_OVERLAP < FRAME_LENGTH,
+            "VOICE_BATCH_OVERLAP ({VOICE_BATCH_OVERLAP}) must be < FRAME_LENGTH ({FRAME_LENGTH})",
+        );
+        // VOICE_BATCH_OVERLAP must also be less than VOICE_BATCH_SIZE so that
+        // at least one new frame fits after the overlap when the batch-size
+        // flush triggers.
+        assert!(
+            VOICE_BATCH_OVERLAP < VOICE_BATCH_SIZE,
+            "VOICE_BATCH_OVERLAP ({VOICE_BATCH_OVERLAP}) must be < VOICE_BATCH_SIZE ({VOICE_BATCH_SIZE})",
+        );
+
+        // ── Behavioural test: trim_voice_batch retains exactly the
+        //    expected number of samples ────────────────────────────────
+        // A large buffer should be trimmed to VOICE_BATCH_OVERLAP.
+        let mut batch = vec![1.0f32; VOICE_BATCH_SIZE];
+        trim_voice_batch(&mut batch);
+        assert_eq!(
+            batch.len(),
+            VOICE_BATCH_OVERLAP,
+            "trim_voice_batch on a buffer of {} samples should retain {VOICE_BATCH_OVERLAP}",
+            VOICE_BATCH_SIZE,
+        );
+
+        // A buffer already at or above the overlap threshold should be
+        // trimmed to exactly the overlap.
+        let mut at_threshold = vec![2.0f32; VOICE_BATCH_OVERLAP + 1];
+        trim_voice_batch(&mut at_threshold);
+        assert_eq!(
+            at_threshold.len(),
+            VOICE_BATCH_OVERLAP,
+            "trim_voice_batch on a buffer of {} samples should retain {VOICE_BATCH_OVERLAP}",
+            VOICE_BATCH_OVERLAP + 1,
+        );
+
+        // A buffer smaller than the overlap should be left unchanged.
+        let mut small = vec![3.0f32; VOICE_BATCH_OVERLAP - 1];
+        trim_voice_batch(&mut small);
+        assert_eq!(
+            small.len(),
+            VOICE_BATCH_OVERLAP - 1,
+            "trim_voice_batch should not truncate when len ({}) <= overlap ({VOICE_BATCH_OVERLAP})",
+            VOICE_BATCH_OVERLAP - 1,
+        );
+
+        // The *last* VOICE_BATCH_OVERLAP samples should be preserved, not
+        // the first.  Fill with zeros then place a marker at the expected
+        // preserved position.
+        let marker_index = VOICE_BATCH_SIZE - VOICE_BATCH_OVERLAP; // first preserved sample
+        let mut boundary = vec![0.0f32; VOICE_BATCH_SIZE];
+        boundary[marker_index] = 42.0; // marker at the boundary
+        trim_voice_batch(&mut boundary);
+        assert_eq!(
+            boundary[0], 42.0,
+            "the first sample after trimming should be the one that was at index {marker_index} (the oldest preserved sample)",
+        );
+    }
 
     // ═════════════════════════════════════════════════════════════════════
     // Enrollment quality scoring and self-test (mahbot-778)
