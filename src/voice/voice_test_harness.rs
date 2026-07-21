@@ -608,7 +608,6 @@ impl OfflinePipelineRunner {
 
         let utterance = wake_word_utterance(5);
 
-        // We need 10 utterances for NUM_ENROLLMENT_SAMPLES=10.
         let required_utterances = NUM_ENROLLMENT_SAMPLES;
 
         for utt_idx in 0..required_utterances {
@@ -711,7 +710,8 @@ impl OfflinePipelineRunner {
 
         // Reset VAD threshold from enrollment mode (0.85) back to
         // production detection threshold (0.5).  The production pipeline
-        // does this at voice.rs:3086 after enrollment completes; the test
+        // does this at voice.rs:2905/3299 via clear_pipeline_buffers →
+        // clear_detection_buffers after enrollment completes; the test
         // harness must match that behaviour so the first utterance of the
         // clean-wake-word scenario uses the same threshold as production.
         self.ctx.vad_threshold = VAD_THRESHOLD;
