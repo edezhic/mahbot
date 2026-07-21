@@ -3230,17 +3230,21 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                             new_templates.len(),
                         );
 
-                        // ── Train verifier (mahbot-777) ──────────────
-                        // Extract mean-pooled positive embeddings from
-                        // the enrollment buffer, then train the logistic
-                        // regression verifier with synthetic negatives.
+                        // ── Train verifier (mahbot-777, mahbot-788) ────
+                        // Use all per-frame embeddings from the enrollment
+                        // buffer as positive training examples (mahbot-788
+                        // Fix 3) — each utterance contributes 6-10 frames
+                        // instead of a single mean-pooled vector, giving
+                        // 60-100 examples with zero UX cost.  The verifier
+                        // threshold is lowered to 0.3 (Fix 4) to reduce
+                        // false negatives while DTW provides primary
+                        // false-trigger protection.
                         let positive_embeddings = {
                             let state = voice_state().read().unwrap_poison();
                             state
                                 .enrollment_buffer
                                 .iter()
-                                .map(|sample| crate::voice_verifier::mean_pool_embeddings(sample))
-                                .filter(|e| !e.is_empty())
+                                .flat_map(|sample| sample.iter().cloned())
                                 .collect::<Vec<Vec<f32>>>()
                         };
 
@@ -3255,10 +3259,10 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                             let v = crate::voice_verifier::VoiceVerifier::
                                     train_with_synthetic_negatives(
                                         &positive_embeddings,
-                                        0.5,
+                                        0.3,
                                     );
                             info!(
-                                "Verifier trained from {} enrollment utterance(s) \
+                                "Verifier trained from {} per-frame positive embedding(s) \
                                      + synthetic negatives",
                                 positive_embeddings.len(),
                             );
@@ -3799,27 +3803,38 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
         &mut ctx.score_window,
         templates.minimum_matches,
     ) {
-        // ── Verifier gate (mahbot-777) ────────────────────────────
+        // ── Verifier gate (mahbot-777, mahbot-788) ────────────
         // After the rolling window check passes, run the second-stage
-        // logistic regression verifier on the current embedding to catch
-        // false positives that survived DTW matching.  Near-zero CPU
-        // overhead (~1 μs per frame) since it only runs on candidate
-        // frames that already passed the rolling window.
+        // logistic regression verifier to catch false positives that
+        // survived DTW matching.  Near-zero CPU overhead (~1 μs per
+        // frame) since it only runs on candidate frames that already
+        // passed the rolling window.
+        //
+        // Fix 1 (mahbot-788): Check all recent ROLLING_WINDOW_N
+        // embeddings and take the maximum score, instead of checking
+        // only the last frame.  A weak trailing frame (end of phoneme,
+        // trailing silence) should not veto detection when previous
+        // frames are strong.
+        //
+        // Fix 2 (mahbot-788): Do NOT clear the score window on
+        // rejection — the next frame should get a fresh chance without
+        // losing accumulated detection evidence.
         if templates.verifier.is_trained() {
-            let score = ctx
-                .embedding_ring
-                .last()
-                .map_or(0.0, |emb| templates.verifier.predict(emb));
+            let start = ctx.embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
+            let score = ctx.embedding_ring[start..]
+                .iter()
+                .map(|emb| templates.verifier.predict(emb))
+                .fold(0.0f32, f32::max);
             if score < templates.verifier.threshold {
                 debug!(
-                    "Wake word suppressed by verifier: score={score:.4} < threshold={}",
+                    "Wake word suppressed by verifier: max_score={score:.4} < threshold={} \
+                     (checked {} recent embeddings)",
                     templates.verifier.threshold,
+                    ctx.embedding_ring.len() - start,
                 );
-                // Clear the score window to prevent immediate re-triggering
-                // on the very next frame.  The verifier has rejected this
-                // frame, so the accumulated scores should not count toward
-                // a future detection.
-                ctx.score_window.clear();
+                // Fix 2: score_window is NOT cleared here — the next
+                // frame gets a fresh chance at detection without losing
+                // accumulated DTW evidence.
                 return false;
             }
         }

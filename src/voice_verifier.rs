@@ -23,7 +23,11 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 /// Default decision threshold for the verifier.
-const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.5;
+///
+/// Lowered from 0.5 to 0.3 (mahbot-788) to reduce false negatives. The DTW
+/// matching already provides the primary false-trigger protection, so the
+/// verifier threshold can be more permissive.
+const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.3;
 
 /// L2 regularization strength (lambda).
 ///
@@ -470,7 +474,12 @@ pub(crate) fn generate_synthetic_negatives(count: usize, dim: usize) -> Vec<Vec<
 /// embeddings from one enrollment utterance into a single positive example.
 ///
 /// Returns an empty `Vec` when `embeddings` is empty.
+///
+/// Note: As of mahbot-788 Fix 3, the verifier training uses per-frame
+/// embeddings directly instead of mean-pooled vectors. This function is
+/// preserved as a utility for potential future use.
 #[must_use]
+#[allow(dead_code)]
 pub fn mean_pool_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
     if embeddings.is_empty() {
         return Vec::new();
