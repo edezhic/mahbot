@@ -207,12 +207,7 @@ impl WakeWordClassifier {
             *v /= norm;
         }
         // Convert from samples-first to channels-first layout for Conv1D.
-        let mut cf = vec![0.0; EMBEDDING_DIM * WINDOW_SIZE];
-        for (t, emb) in x.chunks(EMBEDDING_DIM).enumerate() {
-            for (c, &v) in emb.iter().enumerate() {
-                cf[c * WINDOW_SIZE + t] = v;
-            }
-        }
+        let cf = to_channels_first(&x, EMBEDDING_DIM, WINDOW_SIZE);
         forward_pass(&cf, &self.weights)
     }
 }
@@ -827,12 +822,6 @@ fn backward(x: &[f32], target: f32, w: &ClassifierWeights, g: &mut GradientBuffe
 mod tests {
     use super::*;
 
-    fn make_emb(seed: f32) -> Vec<f32> {
-        (0..EMBEDDING_DIM)
-            .map(|i| (seed + i as f32 * 0.01).sin())
-            .collect()
-    }
-
     #[test]
     fn test_sigmoid_pos() {
         let s = sigmoid(5.0);
@@ -930,21 +919,23 @@ mod tests {
 
     #[test]
     fn test_train_classifier_convergence() {
-        // Generate two separable clusters in 288-dim space.
+        // Generate two separable clusters in embedding space.
         // Positive cluster centered at +0.3, negative at -0.3, with noise.
+        // Each embedding is EMBEDDING_DIM-length; build_windows groups
+        // WINDOW_SIZE embeddings into each training window — matching the
+        // production data pipeline in voice.rs.
         let mut rng = rand::rng();
-        let mut make_vec = |center: f32, noise: f32| -> Vec<f32> {
-            (0..INPUT_DIM)
+        let mut make_emb = |center: f32, noise: f32| -> Vec<f32> {
+            (0..EMBEDDING_DIM)
                 .map(|_| center + (rng.random::<f32>() - 0.5) * noise)
                 .collect()
         };
 
-        // 100 positive windows around +0.3, 100 negative windows around -0.3.
-        let pos: Vec<Vec<f32>> = (0..100).map(|_| make_vec(0.3, 0.4)).collect();
-        let neg: Vec<Vec<f32>> = (0..100).map(|_| make_vec(-0.3, 0.4)).collect();
-        let mut all: Vec<Vec<f32>> = Vec::new();
-        all.extend(pos.iter().cloned());
-        all.extend(neg.iter().cloned());
+        // 100 windows each = 300 embeddings (WINDOW_SIZE per window).
+        let n_wins = 100;
+        let n_embs = n_wins * WINDOW_SIZE;
+        let pos: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(0.3, 0.4)).collect();
+        let neg: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(-0.3, 0.4)).collect();
 
         let cfg = TrainingConfig {
             max_epochs: 50,
@@ -953,8 +944,9 @@ mod tests {
         let w = train_classifier(&pos, &neg, &cfg).unwrap();
 
         let classifier = WakeWordClassifier::new(w);
-        // Re-package into 3-embedding Vec for forward() (which normalizes internally).
-        for (i, win) in all.iter().enumerate() {
+        // Evaluate on the windows produced by build_windows — same path
+        // that train_classifier uses internally.
+        for win in build_windows(&pos) {
             let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
                 .map(|t| {
                     let start = t * EMBEDDING_DIM;
@@ -962,18 +954,23 @@ mod tests {
                 })
                 .collect();
             let score = classifier.forward(&embs);
-            if i < 100 {
-                assert!(
-                    score > 0.8,
-                    "Positive case {i} should score >0.8, got {score}"
-                );
-            } else {
-                assert!(
-                    score < 0.2,
-                    "Negative case {} should score <0.2, got {score}",
-                    i - 100
-                );
-            }
+            assert!(
+                score > 0.8,
+                "Positive window should score >0.8, got {score}"
+            );
+        }
+        for win in build_windows(&neg) {
+            let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+                .map(|t| {
+                    let start = t * EMBEDDING_DIM;
+                    win[start..start + EMBEDDING_DIM].to_vec()
+                })
+                .collect();
+            let score = classifier.forward(&embs);
+            assert!(
+                score < 0.2,
+                "Negative window should score <0.2, got {score}"
+            );
         }
     }
 }
