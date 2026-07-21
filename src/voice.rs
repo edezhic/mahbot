@@ -47,6 +47,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+// ── E2E integration test (voice-tests feature) ──────────────────────────
+#[cfg(all(test, feature = "voice-tests"))]
+#[path = "voice_pipeline_e2e_test.rs"]
+pub(crate) mod voice_pipeline_e2e_test;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════
@@ -337,6 +342,86 @@ fn process_wake_word_score(total_score: f32, score_window: &mut Vec<f32>) -> boo
             false
         }
     }
+}
+
+/// Process a single embedding through the wake word detection pipeline.
+///
+/// This is the **core detection loop** shared between the live pipeline
+/// ([`try_match_wake_word_and_push_embedding`]), enrollment self-test
+/// ([`run_enrollment_self_test`]), and integration tests.
+///
+/// It manages the ring buffer, runs the Conv1D MLP classifier forward pass,
+/// applies rolling window scoring via [`process_wake_word_score`], and checks
+/// the second-stage logistic regression verifier gate.  All three callers
+/// exercise exactly the same code path, so changes to detection logic (ring
+/// buffer sizing, MLP window, rolling sum threshold, verifier gating) are
+/// automatically validated by the E2E test.
+///
+/// # Returns
+/// - `true` — the embedding triggered wake word detection (all gates passed).
+/// - `false` — continue feeding more embeddings (the ring buffer and score
+///   window are updated for the next call).
+///
+/// # Parameters
+/// - `embedding` — one 96-dim embedding vector to process.
+/// - `embedding_ring` — persistent ring buffer (shared across frames in the
+///   live pipeline; fresh per utterance in tests).
+/// - `classifier` — trained Conv1D MLP classifier (`None` skips classification).
+/// - `verifier` — trained logistic regression verifier (`None` skips the
+///   second-stage gate, matching enrollment self-test behaviour).
+/// - `score_window` — persistent rolling window of recent MLP confidence scores.
+pub(crate) fn score_single_embedding(
+    embedding: &[f32],
+    embedding_ring: &mut Vec<Vec<f32>>,
+    classifier: Option<&WakeWordClassifier>,
+    verifier: Option<&VoiceVerifier>,
+    score_window: &mut Vec<f32>,
+) -> bool {
+    // ── Ring buffer ───────────────────────────────────────────────────
+    embedding_ring.push(embedding.to_vec());
+    while embedding_ring.len() > EMBEDDING_RING_MAX {
+        embedding_ring.remove(0);
+    }
+
+    // ── MLP classifier forward pass (replaces DTW template matching) ──
+    // Needs 3 consecutive embeddings.  Before 3 are buffered, score is 0.
+    let total_score = if let Some(classifier) = classifier {
+        if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
+            let start = embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
+            let window = &embedding_ring[start..];
+            classifier.forward(window)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    // ── Soft scoring + rolling window (mahbot-773) ────────────────────
+    if process_wake_word_score(total_score, score_window) {
+        // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
+        // After the rolling window check passes, run the second-stage
+        // logistic regression verifier to catch false positives that
+        // survived the MLP classifier.
+        if let Some(verifier) = verifier
+            && verifier.is_trained()
+        {
+            let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
+            let max_score = embedding_ring[start..]
+                .iter()
+                .map(|emb| verifier.predict(emb))
+                .fold(0.0f32, f32::max);
+            if max_score < verifier.threshold {
+                // Clear the score window so the next frame starts from zero.
+                // Without this the accumulated classifier scores eventually
+                // let any speech through (mahbot-797).
+                score_window.clear();
+                return false;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
@@ -1772,27 +1857,21 @@ fn run_enrollment_self_test(
 
     for utterance in enrollment_buffer {
         // Fresh simulation for each utterance: no cross-utterance state.
+        // Uses `score_single_embedding` (mahbot-811) which encapsulates the
+        // same ring-buffer + MLP classifier + rolling window logic as the
+        // live detection pipeline and the E2E integration test.
         let mut embedding_ring: Vec<Vec<f32>> = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
         let mut detected = false;
 
         for embedding in utterance {
-            // Same ring-buffer logic as the live detection loop.
-            embedding_ring.push(embedding.clone());
-            while embedding_ring.len() > EMBEDDING_RING_MAX {
-                embedding_ring.remove(0);
-            }
-
-            // MLP classifier forward pass — needs 3 consecutive embeddings.
-            let total_score = if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
-                let start = embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
-                let window = &embedding_ring[start..];
-                classifier.forward(window)
-            } else {
-                0.0
-            };
-
-            if process_wake_word_score(total_score, &mut score_window) {
+            if score_single_embedding(
+                embedding,
+                &mut embedding_ring,
+                Some(classifier),
+                None, // no verifier gate during enrollment self-test
+                &mut score_window,
+            ) {
                 detected = true;
                 break;
             }
@@ -3512,87 +3591,26 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
             }
         };
 
-    ctx.embedding_ring.push(embedding);
-    while ctx.embedding_ring.len() > EMBEDDING_RING_MAX {
-        ctx.embedding_ring.remove(0);
-    }
-
-    // ── MLP classifier forward pass (replaces DTW template matching) ──
-    // Needs 3 consecutive embeddings.  Before 3 are buffered, score is 0.
-    let total_score = {
-        let state = voice_state().read().unwrap_poison();
-        if let Some(ref classifier) = state.classifier {
-            if ctx.embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
-                let start = ctx.embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
-                let window = &ctx.embedding_ring[start..];
-                let score = classifier.forward(window);
-                debug!(
-                    "MLP classifier: score={score:.4} (ring_size={})",
-                    ctx.embedding_ring.len(),
-                );
-                score
-            } else {
-                debug!(
-                    "MLP classifier: only {} embeddings (< {}) — score=0",
-                    ctx.embedding_ring.len(),
-                    wake_word_classifier::WINDOW_SIZE,
-                );
-                0.0
-            }
-        } else {
-            0.0
-        }
-    };
-
-    // ── Soft scoring + rolling window (mahbot-773, preserved) ──
-    //
-    // Delegates to `process_wake_word_score()` which encapsulates the
-    // no-match reset, score accumulation, window trimming, and threshold
-    // check.
-    if process_wake_word_score(total_score, &mut ctx.score_window) {
-        // ── Verifier gate (mahbot-777, mahbot-788) ────────────
-        // After the rolling window check passes, run the second-stage
-        // logistic regression verifier to catch false positives that
-        // survived the MLP classifier.  Near-zero CPU overhead (~1 μs per
-        // frame) since it only runs on candidate frames that already
-        // passed the rolling window.
-        //
-        // Fix 1 (mahbot-788): Check all recent ROLLING_WINDOW_N
-        // embeddings and take the maximum score, instead of checking
-        // only the last frame.  A weak trailing frame (end of phoneme,
-        // trailing silence) should not veto detection when previous
-        // frames are strong.
-        //
-        // Fix 2 (mahbot-797): Clear the score window on verifier rejection.
-        // Without this, a single borderline pass lets accumulated scores
-        // drift high enough that any speech eventually triggers detection.
-        // The next frame must start from zero — the MLP classifier will
-        // rebuild if the frame is truly a wake word.
-        let verifier = get_verifier();
-        if verifier.is_trained() {
-            let start = ctx.embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
-            let score = ctx.embedding_ring[start..]
-                .iter()
-                .map(|emb| verifier.predict(emb))
-                .fold(0.0f32, f32::max);
-            if score < verifier.threshold {
-                debug!(
-                    "Wake word suppressed by verifier: max_score={score:.4} < threshold={} \
-                     (checked {} recent embeddings)",
-                    verifier.threshold,
-                    ctx.embedding_ring.len() - start,
-                );
-                // Clear the score window so the next frame starts from zero.
-                // Without this the accumulated classifier scores eventually lets
-                // any speech through (mahbot-797).
-                ctx.score_window.clear();
-                return false;
-            }
-        }
-
+    // ── Shared detection scoring (mahbot-811) ────────────────────────
+    // Uses `score_single_embedding` which encapsulates the ring buffer,
+    // MLP classifier forward pass, rolling window scoring, and verifier
+    // gate — the same logic exercised by `run_enrollment_self_test` and
+    // the E2E integration test.  Any change to detection heuristics is
+    // automatically validated by the integration test.
+    let state = voice_state().read().unwrap_poison();
+    let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
+    let verifier = get_verifier();
+    if score_single_embedding(
+        &embedding,
+        &mut ctx.embedding_ring,
+        classifier,
+        Some(&verifier),
+        &mut ctx.score_window,
+    ) {
         // Wake word detected — transition to recording mode.
         // See [`PipelineCtx::transition_to_recording`] for the exact
         // handoff sequence (mahbot-802).
+        drop(state); // release read lock before side effects
         ctx.transition_to_recording();
         set_status(VoiceStatus::Recording);
         true
