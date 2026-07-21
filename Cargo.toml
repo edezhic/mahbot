@@ -62,6 +62,8 @@ anyhow = "1.0"
 # Self-replace for cross-platform binary swap during self-update
 self-replace = "1.5"
 
+rodio = { version = "0.19", default-features = false, features = ["wav"] }
+
 # Utils
 base64 = "0.22"
 jsonrepair-rs = "0.2"

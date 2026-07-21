@@ -42,11 +42,12 @@ use crate::util::UnwrapPoison;
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
 use candle_onnx::simple_eval;
+use rodio::{OutputStream, OutputStreamHandle, Sink};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -113,6 +114,35 @@ static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 static GLOBAL_TTS: OnceLock<RwLock<Option<Arc<TtsEngine>>>> = OnceLock::new();
 static CANCEL_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
 static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Wrapper around rodio's audio output that is `Send` on all platforms.
+///
+/// `rodio::OutputStream` is `!Send` on macOS because of a phantom
+/// `NotSendSyncAcrossAllPlatforms` marker, but the underlying CoreAudio
+/// handles are actually thread-safe. This uses `unsafe impl Send` to
+/// assert thread-safety, following the same pattern as `SendMicStream`
+/// in `voice.rs`.
+struct AudioOutputWrapper {
+    _stream: OutputStream,
+    handle: OutputStreamHandle,
+}
+
+// SAFETY: `OutputStream` is conservatively `!Send` on macOS due to a
+// `PhantomData<*mut ()>` marker. The underlying CoreAudio device handles
+// are thread-safe for our usage: we create the stream once at startup and
+// only use the `OutputStreamHandle` (which is `Send`) to create sinks from
+// async tasks. The `OutputStream` itself is never moved after initialization.
+// This is a well-known pattern in the cpal/rodio ecosystem.
+unsafe impl Send for AudioOutputWrapper {}
+
+// SAFETY: `OutputStream` is conservatively `!Sync` on macOS due to the same
+// phantom marker as `!Send`. The underlying CoreAudio device handles are
+// thread-safe for our usage — we only read the `OutputStreamHandle` (which
+// is `Sync`) from multiple threads, and the `OutputStream` itself is never
+// accessed after initialization. This extends the `Send` justification above.
+unsafe impl Sync for AudioOutputWrapper {}
+
+static AUDIO_OUTPUT: OnceLock<AudioOutputWrapper> = OnceLock::new();
 
 /// Test-only counter of `speak()` calls. Incremented at the very start of
 /// `speak()`, before the `is_enabled()` guard. Used by `test_init_listener_*`
@@ -234,9 +264,9 @@ pub(crate) fn test_set_state(state: u8) {
 
 /// Speak `text` with the default voice (M1).
 ///
-/// Spawns a background task that synthesizes audio, plays it via the OS-native
-/// audio player (afplay on macOS), then deletes the temp file.
-/// Silently ignored if TTS is disabled, models aren't ready, or text is empty.
+/// Spawns a background task that synthesizes audio, plays it via rodio
+/// (cross-platform audio playback), then returns. Silently ignored if TTS is
+/// disabled, models aren't ready, audio output is unavailable, or text is empty.
 ///
 /// **Note:** This does NOT trigger model initialization. Models must be loaded
 /// beforehand by [`init_global()`] + [`try_load_cached()`] / [`spawn_download()`].
@@ -290,11 +320,20 @@ pub fn init_global() -> Result<()> {
         .set(Arc::new(AtomicBool::new(false)))
         .map_err(|_| anyhow!("CANCEL_FLAG already initialized"))?;
 
-    // Clean up stale temp directories from previous process instances
-    // that may have left orphaned WAV files (macOS does not auto-clean /tmp).
-    // Run unconditionally even though config hasn't been loaded from DB yet
-    // — this is a cheap directory listing with negligible cost.
-    cleanup_stale_temp_dirs();
+    // Initialize rodio audio output (best-effort: may fail on headless systems)
+    match OutputStream::try_default() {
+        Ok((stream, handle)) => {
+            AUDIO_OUTPUT
+                .set(AudioOutputWrapper {
+                    _stream: stream,
+                    handle,
+                })
+                .map_err(|_| anyhow!("AUDIO_OUTPUT already initialized"))?;
+        }
+        Err(e) => {
+            warn!("TTS: failed to initialize audio output — playback will be disabled: {e}");
+        }
+    }
 
     Ok(())
 }
@@ -1200,7 +1239,12 @@ fn split_at_sentence_boundaries(text: &str, max_len: usize) -> Vec<String> {
 
 // ── WAV generation ───────────────────────────────────────────────────
 
-fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
+/// Render PCM float samples to an in-memory WAV file (16-bit mono PCM).
+///
+/// Returns the complete WAV file bytes, including RIFF header and sample data.
+/// This replaces the old `write_wav` which wrote to a temp file — rodio can
+/// play directly from a `Cursor<Vec<u8>>`, eliminating ephemeral file I/O.
+fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     let channels: u16 = 1;
     let bps: u16 = 16;
     let byte_rate = sample_rate * u32::from(channels) * u32::from(bps / 8);
@@ -1209,7 +1253,6 @@ fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
         .context("WAV data size exceeds u32 range")?;
     let file_size = 36 + data_size;
 
-    // Buffer all header and sample data, then write once
     let mut buf = Vec::with_capacity(44 + data_size as usize);
     buf.extend_from_slice(b"RIFF");
     buf.extend_from_slice(&file_size.to_le_bytes());
@@ -1233,60 +1276,10 @@ fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
         buf.extend_from_slice(&sample_i16.to_le_bytes());
     }
 
-    let mut f = File::create(path)?;
-    f.write_all(&buf)?;
-    f.flush()?;
-    Ok(())
+    Ok(buf)
 }
 
 // ── Async speak ──────────────────────────────────────────────────────
-
-/// Temp directory for ephemeral TTS WAV files.
-///
-/// Uses a per-process directory name (containing the PID) so that each
-/// process instance has its own isolated temp space.  Stale directories
-/// from crashed processes are cleaned up at [`init_global`] time.
-fn session_temp_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("mahbot_tts_{}", std::process::id()))
-}
-
-/// Remove stale TTS temp directories from previous process instances.
-///
-/// Scans the OS temp directory for `mahbot_tts_<PID>` subdirectories
-/// whose PID does not match the current process.  This prevents
-/// unbounded accumulation of orphaned WAV files from crashes
-/// (macOS `/tmp` is not cleared on reboot).
-fn cleanup_stale_temp_dirs() {
-    let current_pid = std::process::id();
-    let prefix = "mahbot_tts_";
-    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(String::from) else {
-                continue;
-            };
-            if let Some(pid_str) = name.strip_prefix(prefix)
-                && let Ok(pid) = pid_str.parse::<u32>()
-                && pid != current_pid
-            {
-                let path = entry.path();
-                if let Err(e) = std::fs::remove_dir_all(&path) {
-                    warn!(
-                        "TTS: failed to remove stale temp dir {}: {e}",
-                        path.display()
-                    );
-                } else {
-                    info!("TTS: cleaned up stale temp dir: {}", path.display());
-                }
-            }
-        }
-    }
-}
 
 #[allow(clippy::too_many_lines)]
 async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
@@ -1350,135 +1343,79 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
         return;
     }
 
-    // Check cancellation before WAV writing
+    // Check cancellation before WAV rendering
     if let Some(ref mut rx) = cancel_rx
         && rx.try_recv().is_ok()
     {
-        info!("TTS synthesis cancelled before WAV write");
+        info!("TTS synthesis cancelled before playback");
         return;
     }
 
-    let tmp_dir = session_temp_dir();
-    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-        warn!("TTS: failed to create temp directory: {e}");
-        return;
-    }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let wav_path = tmp_dir.join(format!("tts_{ts}.wav"));
-
-    // Write WAV file (sync I/O, small file — fine on blocking threadpool)
-    let wav_write = tokio::task::spawn_blocking({
-        let wav_path = wav_path.clone();
-        move || write_wav(&wav_path, &samples, sample_rate)
-    })
-    .await;
-
-    match wav_write {
-        Ok(Ok(())) => {} // success
-        Ok(Err(e)) => {
-            warn!("TTS: failed to write WAV: {e}");
-            // Remove the partial WAV file (disk full, permissions, etc.)
-            if let Err(rm_err) = tokio::fs::remove_file(&wav_path).await {
-                warn!("TTS: failed to remove partial WAV after write error: {rm_err}");
-            }
-            return;
-        }
-        Err(join_err) => {
-            warn!("TTS: WAV write task panicked: {join_err}");
-            // Best-effort cleanup: file may not exist if the panic occurred
-            // before File::create, but remove_file on a nonexistent path is
-            // harmless (returns Ok). Only real I/O errors are relevant here.
-            if let Err(rm_err) = tokio::fs::remove_file(&wav_path).await
-                && rm_err.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!("TTS: failed to clean up WAV after write panic: {rm_err}");
-            }
-            return;
-        }
-    }
-
-    // Spawn audio player and get a Child handle for cancellation support
-    let mut child = match spawn_audio_player(&wav_path) {
-        Ok(c) => c,
+    // Render WAV bytes in memory (no file I/O needed).
+    let wav_bytes = match render_wav(&samples, sample_rate) {
+        Ok(bytes) => bytes,
         Err(e) => {
-            warn!("TTS: failed to start audio player: {e}");
-            // Remove orphaned WAV file (playback never started)
-            if let Err(rm_err) = tokio::fs::remove_file(&wav_path).await {
-                warn!("TTS: failed to remove orphaned WAV after player error: {rm_err}");
-            }
+            warn!("TTS: failed to render WAV: {e}");
             return;
         }
     };
 
-    // Play audio with cancellation support (kills child on cancel)
+    // Get or initialize the rodio audio output handle.
+    // If AUDIO_OUTPUT wasn't initialized (e.g. headless system), playback
+    // is silently disabled — the model still synthesizes, we just don't play.
+    let Some(audio_output) = AUDIO_OUTPUT.get() else {
+        return;
+    };
+
+    // Create a Sink for playback. This lets us control volume and stop
+    // playback on cancellation.
+    let sink = match Sink::try_new(&audio_output.handle) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("TTS: failed to create audio sink: {e}");
+            return;
+        }
+    };
+
+    // Decode the WAV bytes as an in-memory source and queue for playback.
+    let cursor = Cursor::new(wav_bytes);
+    let source = match rodio::Decoder::new(cursor) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("TTS: failed to decode WAV: {e}");
+            return;
+        }
+    };
+    sink.append(source);
+
+    // Play audio with cancellation support — poll sink state in a loop
+    // so we can respond to cancellation signals without blocking.
+    //
+    // rodio's `Sink::sleep_until_end()` blocks the calling thread, so we
+    // use a polling loop instead for async-friendly cancellation.
     if let Some(ref mut rx) = cancel_rx {
-        tokio::select! {
-            biased;
-            _ = rx.recv() => {
-                info!("TTS playback cancelled");
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            if sink.empty() {
+                break;
             }
-            status = child.wait() => {
-                if let Ok(status) = status
-                    && !status.success()
-                {
-                    warn!("TTS: audio player exited with {status}");
-                }
+
+            if rx.try_recv().is_ok() {
+                info!("TTS playback cancelled");
+                sink.stop();
+                // Wait briefly for the audio thread to finish flushing
+                // so we don't leave a truncated burst in the output buffer.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                break;
             }
         }
     } else {
-        let status = child.wait().await;
-        if let Ok(status) = status
-            && !status.success()
-        {
-            warn!("TTS: audio player exited with {status}");
+        // No cancellation receiver — just wait until playback finishes.
+        while !sink.empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-
-    // Cleanup temp file — log error instead of silently dropping
-    if let Err(e) = tokio::fs::remove_file(&wav_path).await {
-        warn!("TTS: failed to remove temp WAV file: {e}");
-    }
-}
-
-/// Spawn the OS-native audio player and return a [`Child`] handle.
-///
-/// The caller is responsible for calling [`Child::wait()`] to reap the process,
-/// and may call [`Child::kill()`] to interrupt playback early.
-fn spawn_audio_player(path: &Path) -> Result<tokio::process::Child> {
-    let path_s = path.to_string_lossy().to_string();
-
-    // Platform-aware audio player selection (detected once, cached via LazyLock)
-    #[cfg(target_os = "macos")]
-    let player = "afplay";
-    #[cfg(target_os = "linux")]
-    let player = {
-        static LINUX_PLAYER: LazyLock<&str> = LazyLock::new(|| {
-            if std::process::Command::new("paplay")
-                .arg("--version")
-                .output()
-                .is_ok()
-            {
-                "paplay"
-            } else {
-                "aplay"
-            }
-        });
-        *LINUX_PLAYER
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let player = "afplay"; // fallback
-
-    let child = tokio::process::Command::new(player)
-        .arg(&path_s)
-        .spawn()
-        .with_context(|| format!("Failed to launch audio player '{player}'"))?;
-
-    Ok(child)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -1604,48 +1541,53 @@ mod tests {
     }
 
     #[test]
-    fn test_write_wav() {
-        let tmp = std::env::temp_dir().join("test_tts.wav");
+    fn test_render_wav() {
         let sample_rate = 44100u32;
         let samples = vec![0.0f32, 0.5, -0.5, 1.0, -1.0, 0.0];
-        assert!(write_wav(&tmp, &samples, sample_rate).is_ok());
-        assert!(tmp.exists());
 
-        // Read back and verify RIFF header correctness
-        let data = std::fs::read(&tmp).unwrap();
+        let wav_bytes = render_wav(&samples, sample_rate).expect("render_wav should succeed");
+
+        // Should be a valid WAV of 44 header + 12 data bytes
+        assert_eq!(wav_bytes.len(), 56, "WAV should be 56 bytes total");
+
+        // Verify RIFF header correctness
         assert!(
-            data.starts_with(b"RIFF"),
+            wav_bytes.starts_with(b"RIFF"),
             "WAV should start with RIFF marker"
         );
         assert!(
-            data[8..12].starts_with(b"WAVE"),
+            wav_bytes[8..12].starts_with(b"WAVE"),
             "WAV should contain WAVE format"
         );
         assert!(
-            data[12..16].starts_with(b"fmt "),
+            wav_bytes[12..16].starts_with(b"fmt "),
             "WAV should contain fmt chunk"
         );
 
         // Read sample rate from header (offset 24, 4 bytes LE)
-        let header_sr = u32::from_le_bytes(data[24..28].try_into().unwrap());
+        let header_sr = u32::from_le_bytes(wav_bytes[24..28].try_into().unwrap());
         assert_eq!(header_sr, sample_rate, "WAV header sample rate mismatch");
 
         // Read bits per sample (offset 34, 2 bytes LE)
-        let bps = u16::from_le_bytes(data[34..36].try_into().unwrap());
+        let bps = u16::from_le_bytes(wav_bytes[34..36].try_into().unwrap());
         assert_eq!(bps, 16, "WAV should be 16-bit PCM");
 
         // Read number of channels (offset 22, 2 bytes LE)
-        let channels = u16::from_le_bytes(data[22..24].try_into().unwrap());
+        let channels = u16::from_le_bytes(wav_bytes[22..24].try_into().unwrap());
         assert_eq!(channels, 1, "WAV should be mono");
 
         // Verify data chunk: expected size = 6 samples × 2 bytes = 12
-        let data_size = u32::from_le_bytes(data[40..44].try_into().unwrap());
+        let data_size = u32::from_le_bytes(wav_bytes[40..44].try_into().unwrap());
         assert_eq!(
             data_size, 12,
             "WAV data size should be 12 bytes for 6 16-bit samples"
         );
 
-        std::fs::remove_file(&tmp).ok();
+        // Verify the last sample (samples[5] = 0.0 → i16 = 0) appears
+        // at the end of the data section.
+        let data_start = 44;
+        let last_sample_bytes = &wav_bytes[data_start + 10..data_start + 12];
+        assert_eq!(last_sample_bytes, &[0x00, 0x00], "last sample should be 0");
     }
 
     #[test]
