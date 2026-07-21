@@ -2634,10 +2634,13 @@ struct PipelineCtx {
     /// consecutive false triggers.
     last_wake_word_detection: Option<Instant>,
     /// Pre-speech noise RMS captured at the moment of first sustained speech
-    /// detection during enrollment.  Used for real SNR estimation in
-    /// [`compute_utterance_quality`] instead of the fake SNR computed from
-    /// speech dynamic range (mahbot-782).  Reset to `None` after the utterance
-    /// is consumed by [`handle_enrollment_sample`].
+    /// detection during enrollment.  Computed from the pre-AGC audio ring
+    /// ([`pre_agc_ring`]) so AGC's asymmetric gain (4× on silence, ~1-2× on
+    /// speech) does not artificially lower the SNR estimate (mahbot-785).
+    /// Used for real SNR estimation in [`compute_utterance_quality`] instead
+    /// of the fake SNR computed from speech dynamic range (mahbot-782).
+    /// Reset to `None` after the utterance is consumed by
+    /// [`handle_enrollment_sample`].
     noise_rms_estimate: Option<f32>,
     /// Rolling window of per-frame soft scores from template matching
     /// (mahbot-773).  Each element is the `total_score` (sum of sigmoid
@@ -2667,6 +2670,14 @@ struct PipelineCtx {
     /// is unconditional because restricting it to pre-speech would leave
     /// the ring empty of trailing phonemes for the post-speech tail capture.
     raw_audio_ring: Vec<f32>,
+    /// Rolling buffer of raw audio samples captured BEFORE AGC processing.
+    ///
+    /// Same rolling capacity as [`raw_audio_ring`] (~200ms, [`RAW_RING_MAX`]
+    /// samples).  Used exclusively for noise RMS estimation at first sustained
+    /// speech detection — AGC amplifies silence (up to 4×) more than speech
+    /// (~1-2×), so noise RMS from post-AGC audio produces an artificially low
+    /// SNR estimate (mahbot-785).
+    pre_agc_ring: Vec<f32>,
     /// Trailing audio captured at the FIRST VAD-negative frame after speech
     /// during enrollment.  Used to append ~100ms of post-speech context that
     /// the strict enrollment VAD (0.85) excludes but live detection (VAD=0.5)
@@ -2708,6 +2719,7 @@ impl PipelineCtx {
             noise_rms_estimate: None,
             vad_threshold: VAD_THRESHOLD,
             raw_audio_ring: Vec::new(),
+            pre_agc_ring: Vec::new(),
             post_speech_tail: Vec::new(),
             audio_preprocessor: {
                 use crate::audio_preprocessor::PreprocessorConfig;
@@ -2755,6 +2767,7 @@ impl PipelineCtx {
         self.score_window.clear();
         self.noise_rms_estimate = None;
         self.raw_audio_ring.clear();
+        self.pre_agc_ring.clear();
         self.post_speech_tail.clear();
         self.vad_threshold = VAD_THRESHOLD;
         self.last_wake_word_detection = None;
@@ -3010,6 +3023,22 @@ pub async fn run_voice_pipeline() {
                     ctx.handle_stop_listening();
                     continue;
                 };
+
+                // ── Pre-AGC ring buffer (mahbot-785) ──
+                // Capture raw audio before AGC processing for noise RMS
+                // estimation.  AGC amplifies silence (up to 4×) more than
+                // speech (~1-2×), so noise RMS computed from post-AGC audio
+                // would artificially lower the SNR estimate.  Only accumulate
+                // during enrollment where noise RMS is needed — the ring would
+                // be stale/irrelevant during live detection since it's reset
+                // when enrollment completes.
+                if ctx.enrollment_mode {
+                    ctx.pre_agc_ring.extend_from_slice(&samples);
+                    if ctx.pre_agc_ring.len() > RAW_RING_MAX {
+                        let excess = ctx.pre_agc_ring.len() - RAW_RING_MAX;
+                        ctx.pre_agc_ring.drain(..excess);
+                    }
+                }
 
                 // Apply noise suppression and/or AGC pre-processing before
                 // the audio reaches VAD / mel extraction / enrollment.
@@ -3534,31 +3563,22 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // Sustained speech confirmed (mahbot-772): update tracking.
                 let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
 
-                // ── Capture noise RMS from pre-speech ring (mahbot-782) ──
+                // ── Capture noise RMS from pre-AGC ring (mahbot-785) ──
                 // On the FIRST transition from silence to sustained speech,
-                // capture the ambient noise RMS from the portion of the raw
-                // audio ring that predates speech onset.  The ring contains
-                // up to ~200ms of audio; speech started at most ~48ms ago
-                // (ENROLLMENT_VAD_CONSECUTIVE_REQUIRED × HOP_LENGTH), so
-                // samples before that boundary are clean ambient noise.
-                // This is used in compute_utterance_quality for real SNR
-                // estimation instead of measuring speech dynamic range.
-                //
-                // NOTE: raw_audio_ring contains post-AGC audio (the
-                // AudioPreprocessor normalises gain before writing to the
-                // ring).  This is intentional — we want to measure the
-                // noise floor at the same gain level as speech so the SNR
-                // computation accurately reflects the signal quality the
-                // VAD and embedding pipeline actually see.  A future
-                // reader should NOT "fix" this by capturing pre-AGC noise;
-                // that would overestimate SNR and let low-quality utterances
-                // pass quality checks.
+                // capture the ambient noise RMS from the pre-AGC audio ring.
+                // The pre_agc_ring stores raw mic audio before AGC gain is
+                // applied — this matters because AGC amplifies silence (up to
+                // 4×) disproportionately to speech (~1-2×), so post-AGC noise
+                // RMS would produce an SNR estimate 6-12 dB lower than the
+                // true room SNR, triggering a false low-SNR warning even in
+                // quiet environments (mahbot-782 used raw_audio_ring which
+                // contains post-AGC audio, causing this false-positive).
                 let already_had_speech = ctx.utterance_had_speech;
                 if !already_had_speech && ctx.noise_rms_estimate.is_none() {
                     let speech_boundary = ENROLLMENT_VAD_CONSECUTIVE_REQUIRED * HOP_LENGTH;
-                    let pre_speech_end = ctx.raw_audio_ring.len().saturating_sub(speech_boundary);
+                    let pre_speech_end = ctx.pre_agc_ring.len().saturating_sub(speech_boundary);
                     if pre_speech_end > 0 {
-                        let sum_sq: f32 = ctx.raw_audio_ring[..pre_speech_end]
+                        let sum_sq: f32 = ctx.pre_agc_ring[..pre_speech_end]
                             .iter()
                             .map(|&s| s * s)
                             .sum();
@@ -4313,6 +4333,7 @@ mod tests {
             ctx.enrollment_pending = Some(vec![1.0; 50]);
             ctx.score_window = vec![1.5, 2.0, 0.8]; // simulated scores
             ctx.raw_audio_ring = vec![1.0; 100];
+            ctx.pre_agc_ring = vec![1.0; 100];
             ctx.post_speech_tail = vec![1.0; 50];
             ctx.vad_positives_in_a_row = 2;
             ctx.vad_threshold = ENROLLMENT_VAD_THRESHOLD;
@@ -4390,6 +4411,10 @@ mod tests {
             assert!(
                 ctx.raw_audio_ring.is_empty(),
                 "raw_audio_ring should be cleared"
+            );
+            assert!(
+                ctx.pre_agc_ring.is_empty(),
+                "pre_agc_ring should be cleared"
             );
             assert!(
                 ctx.post_speech_tail.is_empty(),
