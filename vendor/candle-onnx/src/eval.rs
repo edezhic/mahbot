@@ -251,8 +251,99 @@ fn simple_eval_(
     graph: &onnx::GraphProto,
     values: &mut HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>> {
+    // Helper: ensure two tensors have the same dtype by upcasting the smaller
+    // type to match the larger one. ONNX allows implicit type promotion in
+    // binary ops; candle-core's broadcast_* ops require matching dtypes.
+    // Try to coerce two tensors to a common dtype for arithmetic ops.
+    //
+    // Promotes within type families (float→float, int→int), and also
+    // promotes integers to floats when mixed with float types. This is
+    // safe for arithmetic ops (Add, Sub, Mul, Div) because the results
+    // flow through further float ops, not through index-based ops.
+    fn promote_types(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
+        if a.dtype() == b.dtype() {
+            return Ok((a.clone(), b.clone()));
+        }
+        let a_f = a.dtype().is_float();
+        let b_f = b.dtype().is_float();
+        // Mixed float+int: promote int to the float type
+        if a_f != b_f {
+            if a_f {
+                return Ok((a.clone(), b.to_dtype(a.dtype())?));
+            } else {
+                return Ok((a.to_dtype(b.dtype())?, b.clone()));
+            }
+        }
+        // Both floats or both ints: promote to the wider type
+        let target = if a_f {
+            // Both floats: prefer F32 over F64 for inference
+            match (a.dtype(), b.dtype()) {
+                (DType::F32, _) | (_, DType::F32) => DType::F32,
+                (DType::F64, _) | (_, DType::F64) => DType::F64,
+                (DType::F16, _) | (_, DType::F16) => DType::F16,
+                (DType::BF16, _) | (_, DType::BF16) => DType::BF16,
+                _ => return Ok((a.clone(), b.clone())),
+            }
+        } else {
+            // Both ints
+            match (a.dtype(), b.dtype()) {
+                (DType::I64, _) | (_, DType::I64) => DType::I64,
+                (DType::I32, _) | (_, DType::I32) => DType::I32,
+                (DType::U32, _) | (_, DType::U32) => DType::U32,
+                (DType::U8, _) | (_, DType::U8) => DType::U8,
+                _ => return Ok((a.clone(), b.clone())),
+            }
+        };
+        Ok((a.to_dtype(target)?, b.to_dtype(target)?))
+    }
+
+    // Wrapper around `broadcast_add` with automatic type promotion.
+    fn safe_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let (a, b) = promote_types(a, b)?;
+        a.broadcast_add(&b)
+    }
+
+    // Wrapper around `broadcast_sub` with automatic type promotion.
+    fn safe_sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let (a, b) = promote_types(a, b)?;
+        a.broadcast_sub(&b)
+    }
+
+    // Wrapper around `broadcast_mul` with automatic type promotion.
+    fn safe_mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let (a, b) = promote_types(a, b)?;
+        a.broadcast_mul(&b)
+    }
+
+    // Wrapper around `broadcast_div` with automatic type promotion.
+    fn safe_div(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let (a, b) = promote_types(a, b)?;
+        a.broadcast_div(&b)
+    }
+
+    // Wrapper around `broadcast_matmul` with automatic type promotion.
+    fn safe_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let (a, b) = promote_types(a, b)?;
+        a.broadcast_matmul(&b)
+    }
+
+    // Wrapper around `where_cond` with automatic type promotion for the
+    // two value branches.  The condition tensor is not promoted.
+    fn safe_where(cond: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        let (a, b) = promote_types(a, b)?;
+        cond.where_cond(&a, &b)
+    }
+
     for t in graph.initializer.iter() {
         let tensor = get_tensor(t, t.name.as_str())?;
+        // Normalize float initializers to F32 to avoid dtype cascading issues
+        // throughout the graph.  Many ONNX models store constants as F64, but
+        // downstream ops expect F32 — matching typical inference engines.
+        let tensor = if tensor.dtype().is_float() && tensor.dtype() != DType::F32 {
+            tensor.to_dtype(DType::F32)?
+        } else {
+            tensor
+        };
         values.insert(t.name.to_string(), tensor);
     }
     for input in graph.input.iter() {
@@ -312,11 +403,17 @@ fn simple_eval_(
             }
         };
         if dt != tensor.dtype() {
-            bail!(
-                "unexpected dtype for {}, got {:?}, expected {dt:?}",
-                input.name,
-                tensor.dtype()
-            )
+            // Skip dtype validation for graph inputs that have been overridden
+            // by initializers (their dtypes may differ from the graph type
+            // declaration after initializer normalization).
+            let is_initializer = graph.initializer.iter().any(|init| init.name == input.name);
+            if !is_initializer {
+                bail!(
+                    "unexpected dtype for {}, got {:?}, expected {dt:?}",
+                    input.name,
+                    tensor.dtype()
+                )
+            }
         }
     }
     // The nodes are topologically sorted so we can just process them in order.
@@ -337,25 +434,25 @@ fn simple_eval_(
             "Add" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_add(input1)?;
+                let output = safe_add(input0, input1)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Sub" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_sub(input1)?;
+                let output = safe_sub(input0, input1)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Mul" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_mul(input1)?;
+                let output = safe_mul(input0, input1)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Div" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_div(input1)?;
+                let output = safe_div(input0, input1)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Pow" => {
@@ -363,8 +460,14 @@ fn simple_eval_(
                 let input1 = get(&node.input[1])?;
                 // HACK: current implementation of broadcast_pow cannot handle negative base,
                 // so we use powf where we can, which *does* correctly handle negative base.
+                // powf only supports float types, so cast to F32 if needed.
                 if let Ok(exp) = to_scalar_flexible::<f64>(&input1.to_dtype(DType::F64)?) {
-                    let output = input0.powf(exp)?;
+                    let base = if input0.dtype().is_float() {
+                        input0.clone()
+                    } else {
+                        input0.to_dtype(DType::F32)?
+                    };
+                    let output = base.powf(exp)?;
                     values.insert(node.output[0].clone(), output);
                 } else {
                     let output = input0.broadcast_pow(input1)?;
@@ -390,7 +493,7 @@ fn simple_eval_(
             "MatMul" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
-                let output = input0.broadcast_matmul(input1)?;
+                let output = safe_matmul(input0, input1)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Reshape" => {
@@ -443,9 +546,9 @@ fn simple_eval_(
                 // Numerically stable softplus: x > 20 ? x : ln(exp(x) + 1)
                 let mask = input.gt(20.0f64)?;
                 let ones = Tensor::ones(input.dims(), input.dtype(), input.device())?;
-                let exp_add_one = input.exp()?.broadcast_add(&ones)?;
+                let exp_add_one = safe_add(&input.exp()?, &ones)?;
                 let stable = exp_add_one.log()?;
-                let output = mask.where_cond(&input, &stable)?;
+                let output = safe_where(&mask, &input, &stable)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Transpose" => {
@@ -554,12 +657,14 @@ fn simple_eval_(
                     .map(|(idx, v)| if idx == 1 { *v } else { 1 })
                     .collect();
                 let target_shape = target_shape.as_slice();
-                let xs = xs
-                    .broadcast_sub(&running_mean.reshape(target_shape)?)?
-                    .broadcast_div(&(running_var.reshape(target_shape)? + eps as f64)?.sqrt()?)?;
+                let mean = running_mean.reshape(target_shape)?;
+                let xs = safe_sub(&xs, &mean)?;
+                let var = (running_var.reshape(target_shape)? + eps as f64)?.sqrt()?;
+                let xs = safe_div(&xs, &var)?;
                 let weight = weight.reshape(target_shape)?;
                 let bias = bias.reshape(target_shape)?;
-                let xs = xs.broadcast_mul(&weight)?.broadcast_add(&bias)?;
+                let xs = safe_mul(&xs, &weight)?;
+                let xs = safe_add(&xs, &bias)?;
                 values.insert(node.output[0].clone(), xs);
             }
             "Squeeze" => {
@@ -600,8 +705,8 @@ fn simple_eval_(
                     .map(|&x| x as usize)
                     .collect();
 
-                let xs = Tensor::ones(shape_vec, value.dtype(), input.device())?
-                    .broadcast_mul(&value)?;
+                let ones = Tensor::ones(shape_vec, value.dtype(), input.device())?;
+                let xs = safe_mul(&ones, &value)?;
                 values.insert(node.output[0].clone(), xs);
             }
             "Unsqueeze" => {
@@ -660,9 +765,8 @@ fn simple_eval_(
                     let max = Tensor::new(xs.dims()[axis] as i64, indices.device())?
                         .to_dtype(indices.dtype())?;
                     let mask = indices.lt(&zeros)?;
-                    mask.to_dtype(indices.dtype())?
-                        .broadcast_mul(&max)?
-                        .add(indices)?
+                    let mask_f = mask.to_dtype(indices.dtype())?;
+                    safe_mul(&mask_f, &max)?.add(indices)?
                 };
 
                 // In Pytorch or Numpy this can be done by indexing the xs tensor using the indices
@@ -725,9 +829,8 @@ fn simple_eval_(
                     let max = Tensor::new(data.dims()[axis] as i64, indices.device())?
                         .to_dtype(indices.dtype())?;
                     let mask = indices.lt(&zeros)?;
-                    mask.to_dtype(indices.dtype())?
-                        .broadcast_mul(&max)?
-                        .add(indices)?
+                    let mask_f = mask.to_dtype(indices.dtype())?;
+                    safe_mul(&mask_f, &max)?.add(indices)?
                 };
 
                 values.insert(node.output[0].clone(), data.gather(indices, axis)?);
@@ -869,7 +972,7 @@ fn simple_eval_(
                 let cond = cond.broadcast_as(shape.clone())?;
                 let a = a.broadcast_as(shape.clone())?;
                 let b = b.broadcast_as(shape)?;
-                let output = cond.where_cond(&a, &b)?;
+                let output = safe_where(&cond, &a, &b)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Conv" => {
@@ -886,6 +989,8 @@ fn simple_eval_(
                 };
                 let xs = get(&node.input[0])?;
                 let ws = get(&node.input[1])?;
+                // Ensure input and weight have the same dtype for conv ops
+                let (xs, ws) = promote_types(&xs, &ws)?;
                 let ys = match ws.rank() {
                     3 => {
                         let (pads, xs) = match pads {
@@ -916,7 +1021,7 @@ fn simple_eval_(
                                 bail!("more dilations than expected in conv1d {s:?} {}", node.name)
                             }
                         };
-                        xs.conv1d(ws, pads, strides, dilations, groups as usize)?
+                        xs.conv1d(&ws, pads, strides, dilations, groups as usize)?
                     }
                     4 => {
                         let (pads, xs) = match pads {
@@ -969,7 +1074,7 @@ fn simple_eval_(
                                 bail!("more dilations than expected in conv2d {s:?} {}", node.name)
                             }
                         };
-                        xs.conv2d(ws, pads, strides, dilations, groups as usize)?
+                        xs.conv2d(&ws, pads, strides, dilations, groups as usize)?
                     }
                     rank => bail!(
                         "unsupported rank for weight matrix {rank} in conv {}",
@@ -980,7 +1085,7 @@ fn simple_eval_(
                     let bs = get(&node.input[2])?;
                     let mut bs_shape = vec![1; ys.rank()];
                     bs_shape[1] = bs.elem_count();
-                    ys.broadcast_add(&bs.reshape(bs_shape)?)?
+                    safe_add(&ys, &bs.reshape(bs_shape)?)?
                 } else {
                     ys
                 };
@@ -1015,6 +1120,30 @@ fn simple_eval_(
                     })
                     .collect();
                 let axis = inputs[0].normalize_axis(axis)?;
+                // Promote all inputs to a common dtype before concatenating.
+                // Use the most-represented dtype among inputs (majority rule)
+                // to minimize precision loss while avoiding cascading dtype
+                // errors from a single odd-one-out input (e.g. an I64 index
+                // tensor among many F32 value tensors). Ties are harmless
+                // since all tied dtypes produce valid concatenations.
+                let mut dtype_counts = std::collections::HashMap::new();
+                for t in &inputs {
+                    *dtype_counts.entry(t.dtype()).or_insert(0) += 1;
+                }
+                let target_dtype = dtype_counts.into_iter()
+                    .max_by_key(|&(_, count)| count)
+                    .map(|(dt, _)| dt)
+                    .expect("at least one input exists — guaranteed by the empty check above");
+                let inputs: Vec<Value> = inputs.into_iter().map(|t| {
+                    if t.dtype() == target_dtype {
+                        Ok(t)
+                    } else {
+                        t.to_dtype(target_dtype).map_err(|e| candle_core::Error::Msg(format!(
+                            "Concat dtype promotion failed for node '{}': {e}",
+                            node.name,
+                        )))
+                    }
+                }).collect::<Result<Vec<_>>>()?;
                 let output = Tensor::cat(&inputs, axis).map_err(|e| {
                     let shapes: Vec<_> = inputs.iter().map(|t| format!("{:?}", t.dims())).collect();
                     candle_core::Error::Msg(format!(
@@ -1086,7 +1215,10 @@ fn simple_eval_(
                 let input = get(&node.input[0])?;
                 let slope = get(&node.input[1])?;
 
-                let output = PReLU::new(slope.clone(), false).forward(input)?;
+                // ONNX PReLU allows a single scalar slope applied to all channels.
+                // Set is_scalar=true when the weight has only 1 element.
+                let is_scalar = slope.elem_count() == 1;
+                let output = PReLU::new(slope.clone(), is_scalar).forward(input)?;
                 values.insert(node.output[0].clone(), output);
             }
             "Ceil" => {
@@ -1200,9 +1332,26 @@ fn simple_eval_(
                 let mode = get_attr_opt(node, "mode")?.unwrap_or("constant");
                 let data = get(&node.input[0])?;
                 let pads = get(&node.input[1])?;
-                if node.input.len() > 2 {
+                // ONNX opset 18+ allows an optional 3rd input: constant_value.
+                // The 3rd input may be an empty string when not provided.
+                // TODO: The constant_value is currently discarded — padding always
+                // uses zeros via `pad_with_zeros`. If a model specifies non-zero
+                // constant padding (e.g. constant_value=1.0), results will be
+                // silently wrong.
+                let _constant_value = if node.input.len() >= 3
+                    && !node.input[2].is_empty()
+                {
+                    if mode == "constant" {
+                        Some(get(&node.input[2])?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if node.input.len() > 3 {
                     bail!(
-                        "unsupported number of inputs {} for Pad node {:?}, expected 2",
+                        "unsupported number of inputs {} for Pad node {:?}, expected 2 or 3",
                         node.input.len(),
                         node.name
                     );
@@ -1241,6 +1390,46 @@ fn simple_eval_(
                             out = out.index_select(&idx, i)?;
                         }
 
+                        values.insert(node.output[0].clone(), out);
+                    }
+                    "edge" => {
+                        let mut out = data.clone();
+                        for (i, (&pre, &post)) in
+                            pads_pre.iter().zip(pads_post.iter()).enumerate()
+                        {
+                            if pre < 0 || post < 0 {
+                                bail!(
+                                    "Pad edge mode does not support negative padding in {:?}",
+                                    node.name
+                                );
+                            }
+                            let pre = pre as usize;
+                            let post = post as usize;
+                            if pre == 0 && post == 0 {
+                                continue;
+                            }
+                            out = out.pad_with_same(i, pre, post)?;
+                        }
+                        values.insert(node.output[0].clone(), out);
+                    }
+                    "constant" => {
+                        let mut out = data.clone();
+                        for (i, (&pre, &post)) in
+                            pads_pre.iter().zip(pads_post.iter()).enumerate()
+                        {
+                            if pre < 0 || post < 0 {
+                                bail!(
+                                    "Pad constant mode does not support negative padding in {:?}",
+                                    node.name
+                                );
+                            }
+                            let pre = pre as usize;
+                            let post = post as usize;
+                            if pre == 0 && post == 0 {
+                                continue;
+                            }
+                            out = out.pad_with_zeros(i, pre, post)?;
+                        }
                         values.insert(node.output[0].clone(), out);
                     }
                     _ => bail!(
@@ -1831,20 +2020,20 @@ fn simple_eval_(
 
                 // Compute mean and population variance along the normalized axis
                 let mean = input.mean_keepdim(vec![normal_axis])?;
-                let centered = input.broadcast_sub(&mean)?;
+                let centered = safe_sub(&input, &mean)?;
                 let pop_var = centered.sqr()?.mean_keepdim(vec![normal_axis])?;
 
                 // Normalize: (x - mean) / sqrt(var + epsilon)
                 let eps_t = Tensor::new(epsilon, input.device())?;
-                let pop_var_plus_eps = pop_var.broadcast_add(&eps_t)?;
+                let pop_var_plus_eps = safe_add(&pop_var, &eps_t)?;
                 let denom = pop_var_plus_eps.sqrt()?;
-                let normalized = centered.broadcast_div(&denom)?;
+                let normalized = safe_div(&centered, &denom)?;
 
                 // Scale and shift: gamma * normalized + beta
                 let output = if let Some(beta) = beta {
-                    normalized.broadcast_mul(&gamma)?.broadcast_add(&beta)?
+                    safe_add(&safe_mul(&normalized, &gamma)?, &beta)?
                 } else {
-                    normalized.broadcast_mul(&gamma)?
+                    safe_mul(&normalized, &gamma)?
                 };
                 values.insert(node.output[0].clone(), output);
             }
@@ -1866,10 +2055,9 @@ fn simple_eval_(
                 let a = if trans_a == 0 { a.clone() } else { a.t()? };
                 let b = if trans_b == 0 { b.clone() } else { b.t()? };
 
-                let output = a
-                    .broadcast_mul(&alpha)?
-                    .broadcast_matmul(&b)?
-                    .broadcast_add(&c.broadcast_mul(&beta)?)?;
+                let a_mul = safe_mul(&a, &alpha)?;
+                let c_mul = safe_mul(&c, &beta)?;
+                let output = safe_add(&safe_matmul(&a_mul, &b)?, &c_mul)?;
                 values.insert(node.output[0].clone(), output);
             }
             "LSTM" => {

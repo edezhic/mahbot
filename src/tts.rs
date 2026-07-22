@@ -1343,7 +1343,6 @@ fn synthesize_internal(
     // 2. Duration predictor inputs
     let text_ids = Tensor::from_slice(&token_ids, (1, seq_len), dev)?;
     let text_mask = Tensor::from_slice(&vec![1.0f32; seq_len], (1, 1, seq_len), dev)?;
-    let text_mask_flat = Tensor::from_slice(&vec![1.0f32; seq_len], (1, seq_len), dev)?;
 
     let dp_out = simple_eval(
         &engine.dp_model,
@@ -1368,7 +1367,7 @@ fn synthesize_internal(
         build_inputs(vec![
             ("text_ids", text_ids),
             ("style_ttl", style_ttl.clone()),
-            ("text_mask", text_mask_flat.clone()),
+            ("text_mask", text_mask.clone()),
         ]),
     )
     .context("Text encoder failed")?;
@@ -1396,9 +1395,9 @@ fn synthesize_internal(
     let latent_mask = Tensor::from_slice(&vec![1.0f32; latent_len], (1, 1, latent_len), dev)?;
 
     // 6. Flow matching
-    let total_steps = Tensor::new(DEFAULT_TOTAL_STEPS as f32, dev)?;
+    let total_steps = Tensor::new(DEFAULT_TOTAL_STEPS as f32, dev)?.reshape((1,))?;
     for step in 0..DEFAULT_TOTAL_STEPS {
-        let step_f = Tensor::new(step as f32, dev)?;
+        let step_f = Tensor::new(step as f32, dev)?.reshape((1,))?;
         let ve_out = simple_eval(
             &engine.vector_est_model,
             build_inputs(vec![
@@ -1406,7 +1405,7 @@ fn synthesize_internal(
                 ("text_emb", text_emb.clone()),
                 ("style_ttl", style_ttl.clone()),
                 ("latent_mask", latent_mask.clone()),
-                ("text_mask", text_mask_flat.clone()),
+                ("text_mask", text_mask.clone()),
                 ("current_step", step_f),
                 ("total_step", total_steps.clone()),
             ]),

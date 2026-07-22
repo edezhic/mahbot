@@ -415,21 +415,35 @@ fn test_detection_samples(
 #[ignore]
 #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn e2e_voice_pipeline() {
-    // ── 0. Prerequisites ───────────────────────────────────────────────
+    // ── 0. Initialize global state ─────────────────────────────────────
     info!("═══ Voice Pipeline E2E Test ═══");
 
-    // Ensure TTS engine is loaded
-    if let Err(msg) = ensure_tts_ready() {
-        panic!("{msg}\nRun the application first to download TTS models.");
+    // Set CONFIG storage root so model paths resolve.
+    // This mirrors what `config::load_or_init()` does in startup.
+    if crate::config::CONFIG.try_storage_root().is_none() {
+        let mahbot_dir = crate::config::default_config_dir()
+            .expect("Cannot resolve home directory for ~/.mahbot");
+        let _ = crate::config::CONFIG.try_set_storage_root(mahbot_dir.clone());
+        info!("CONFIG storage root set to: {}", mahbot_dir.display());
     }
 
-    // Ensure voice ONNX models are loaded
-    if let Err(msg) = ensure_voice_models_loaded() {
-        panic!("{msg}\nRun the application first to download voice models.");
-    }
+    // Initialize TTS module (needed before try_load_cached can store the engine).
+    crate::tts::init_global().unwrap_or_else(|e| warn!("tts::init_global() already called: {e}"));
 
     // Ensure voice pipeline state is initialized
     super::init_global().unwrap_or_else(|e| warn!("voice::init_global() already called: {e}"));
+
+    // ── 1. Prerequisites ───────────────────────────────────────────────
+
+    // Ensure TTS engine is loaded from cache
+    if let Err(msg) = ensure_tts_ready() {
+        panic!("{msg}\nRun the application first to download TTS models (~400 MB).");
+    }
+
+    // Ensure voice ONNX models are loaded from cache
+    if let Err(msg) = ensure_voice_models_loaded() {
+        panic!("{msg}\nRun the application first to download voice models.");
+    }
 
     // Discover available TTS voice styles
     let available_styles = tts::list_voice_styles();
@@ -498,9 +512,24 @@ fn e2e_voice_pipeline() {
     // ── 4. Train the MLP classifier ────────────────────────────────────
     info!("─── Phase 4: Training MLP classifier ───");
 
-    // Generate synthetic negatives for classifier training
     let dim = all_positive_embeddings[0].len();
-    let negative_embeddings = generate_synthetic_negatives(SYNTHETIC_NEGATIVE_COUNT, dim);
+
+    // Generate real negative training data from unrelated phrases via TTS.
+    // This mirrors the production pipeline where the verifier is trained on
+    // real ambient audio negatives rather than synthetic-only (Mahbot-822).
+    info!("Generating negative training audio from unrelated phrases...");
+    let neg_train_variants: Vec<(Vec<f32>, String)> =
+        generate_phrase_variants(UNRELATED_PHRASES, &available_styles, 400, "neg_train");
+    let (mut real_neg_embeddings, _, _) = process_enrollment(&neg_train_variants);
+    info!(
+        "Extracted {} real negative embeddings from {} phrases",
+        real_neg_embeddings.len(),
+        neg_train_variants.len()
+    );
+
+    // Supplement with synthetic Gaussian negatives for generalization
+    real_neg_embeddings.extend(generate_synthetic_negatives(SYNTHETIC_NEGATIVE_COUNT, dim));
+    let negative_embeddings = real_neg_embeddings;
 
     let config = TrainingConfig::default();
     let weights = wake_word_classifier::train_classifier(
@@ -526,13 +555,11 @@ fn e2e_voice_pipeline() {
     // ── 5. Train the VoiceVerifier ─────────────────────────────────────
     info!("─── Phase 5: Training VoiceVerifier ───");
 
-    // Use synthetic negatives for verifier training too
-    let verifier_negatives = generate_synthetic_negatives(SYNTHETIC_NEGATIVE_COUNT, dim);
-
+    // Use the same mixed (real + synthetic) negatives for verifier training.
     let verifier = VoiceVerifier::train(
         &all_positive_embeddings,
-        &verifier_negatives,
-        0.5,  // default threshold
+        &negative_embeddings,
+        0.5,  // standard logistic regression boundary
         1.0,  // L2 lambda
         0.01, // learning rate
         2000, // max iterations
@@ -542,7 +569,7 @@ fn e2e_voice_pipeline() {
         info!(
             "VoiceVerifier trained successfully with {} positive + {} negative",
             all_positive_embeddings.len(),
-            verifier_negatives.len()
+            negative_embeddings.len()
         );
     } else {
         warn!("VoiceVerifier is untrained (insufficient data)");
