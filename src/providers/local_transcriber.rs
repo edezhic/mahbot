@@ -88,13 +88,16 @@ const MODEL_SHA256: &str = "79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b
 const VOCAB_SHA256: &str = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910";
 const MERGES_SHA256: &str = "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5";
 
-/// Inference timeout: 10 minutes.
+/// Default inference timeout for the enrichment path (10 minutes).
 ///
 /// Qwen3-ASR-0.6B inference on short audio clips (< 30s) completes in
 /// seconds.  Longer recordings (e.g. voice memos, meetings) may take
 /// several minutes.  This timeout prevents a hung inference from
 /// permanently occupying a tokio blocking thread.
-const INFERENCE_TIMEOUT: Duration = Duration::from_mins(10);
+///
+/// The voice pipeline uses a shorter 30-second timeout (see
+/// [`crate::voice::transcribe_audio`]).
+pub(crate) const INFERENCE_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Download timeout for the 1.88 GB model file (30 minutes).
 /// The smaller files (vocab.json, merges.txt) complete far sooner under this
@@ -203,10 +206,20 @@ impl QwenLocalTranscriber {
 /// background download completes mid-transcription, the new transcriber can be
 /// swapped in without waiting for inference to finish.
 ///
-/// This is the preferred entry point for async callers (e.g. the enrichment
-/// pipeline). Returns an error if the local model is unavailable; the caller
-/// should return a `[Audio: filename attached]` placeholder on failure.
-pub async fn transcribe_file_async(path: &Path) -> Result<String> {
+/// # Timeout
+///
+/// `inference_timeout` controls the maximum wall-clock time for the ONNX
+/// inference step (audio decoding is excluded from the timeout).  The voice
+/// pipeline (max 30 s recordings) should pass a short timeout like 30 s,
+/// while the enrichment path for arbitrarily long audio passes a longer
+/// timeout (e.g. 10 minutes).
+///
+/// A shutdown guard races against the inference so that a stalled model
+/// cannot block pipeline exit.
+///
+/// Returns an error if the local model is unavailable; the caller should
+/// return a `[Audio: filename attached]` placeholder on failure.
+pub async fn transcribe_file_async(path: &Path, inference_timeout: Duration) -> Result<String> {
     let owned = path.to_owned();
 
     // Step 1: Decode audio on a blocking thread.
@@ -234,21 +247,28 @@ pub async fn transcribe_file_async(path: &Path) -> Result<String> {
 
     // Step 3: Run inference with a timeout — the outer lock was released
     // after the clone.  The timeout prevents a hung inference from
-    // permanently occupying a tokio blocking thread.
+    // permanently occupying a tokio blocking thread.  A shutdown guard
+    // ensures the inference cannot block pipeline exit.
     let ctx_arc2 = ctx_arc;
-    let text = tokio::time::timeout(INFERENCE_TIMEOUT, async move {
-        tokio::task::spawn_blocking(move || {
-            let mut ctx = ctx_arc2.lock().unwrap_poison();
-            qwen_asr::transcribe::transcribe_audio(&mut ctx, &samples)
-                .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR inference returned no output"))
-        })
-        .await
-        .context("Inference task panicked")?
-    })
-    .await
-    .context("Qwen3-ASR inference timed out")??;
+    let shutdown_token = crate::shutdown::shutdown_token();
+    let text = tokio::select! {
+        result = tokio::time::timeout(inference_timeout, async move {
+            tokio::task::spawn_blocking(move || {
+                let mut ctx = ctx_arc2.lock().unwrap_poison();
+                qwen_asr::transcribe::transcribe_audio(&mut ctx, &samples)
+                    .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR inference returned no output"))
+            })
+            .await
+            .context("Inference task panicked")?
+        }) => {
+            result.context("Qwen3-ASR inference timed out")?
+        }
+        () = shutdown_token.cancelled() => {
+            anyhow::bail!("Shutdown during audio transcription");
+        }
+    };
 
-    Ok(text)
+    text
 }
 
 // ── Audio decoding ────────────────────────────────────────────────────

@@ -55,7 +55,14 @@ async fn transcribe_audio_marker(path: &str) -> (String, bool) {
         != Some("false");
 
     if use_local {
-        match crate::providers::local_transcriber::transcribe_file_async(&path_buf).await {
+        match crate::providers::local_transcriber::transcribe_file_async(
+            &path_buf,
+            // 10-minute timeout for enrichment path — attached audio can be
+            // arbitrarily long (voice memos, meeting recordings, etc.).
+            crate::providers::local_transcriber::INFERENCE_TIMEOUT,
+        )
+        .await
+        {
             Ok(text) => {
                 tracing::debug!(%path, "Local audio transcription succeeded");
                 return (

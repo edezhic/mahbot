@@ -1656,7 +1656,11 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     let tmp_path = tmp_dir.join(format!("cmd_{}.wav", crate::generate_id()));
     tokio::fs::write(&tmp_path, &wav_bytes).await?;
 
-    let result = crate::providers::local_transcriber::transcribe_file_async(&tmp_path).await;
+    let result = crate::providers::local_transcriber::transcribe_file_async(
+        &tmp_path,
+        Duration::from_secs(30),
+    )
+    .await;
 
     // Remove the specific temp file.
     if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
@@ -1978,6 +1982,25 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
     }
 }
 
+/// Resolve the workspace for a voice operation, falling back to the user's
+/// configured personal workspace if no active workspace is set.
+///
+/// This mirrors the resolution pattern used by [`route_to_agent`] and the
+/// error-broadcast path in [`handle_recording_audio`] (mahbot-812).
+async fn resolve_workspace_for_voice(user_name: &str) -> String {
+    let ws = active_workspace_name();
+    if ws.is_empty() {
+        if let Ok(Some(ws)) = crate::users::get_workspace(user_name).await {
+            ws.name
+        } else {
+            let path = crate::users::personal_workspace_path(user_name);
+            crate::users::personal_workspace_struct(user_name, &path).name
+        }
+    } else {
+        ws
+    }
+}
+
 /// Route a transcribed voice command to the appropriate agent.
 ///
 /// Resolves the active user's role and computes the deterministic agent ID,
@@ -1989,18 +2012,7 @@ async fn route_to_agent(text: String) {
     let user_name = active_user_name();
     if !user_name.is_empty() {
         let role = crate::users::resolve_active_role(&user_name).await;
-        let active_ws = active_workspace_name();
-        let ws_name = if active_ws.is_empty() {
-            // Fallback to user's configured workspace
-            if let Ok(Some(ws)) = crate::users::get_workspace(&user_name).await {
-                ws.name
-            } else {
-                let path = crate::users::personal_workspace_path(&user_name);
-                crate::users::personal_workspace_struct(&user_name, &path).name
-            }
-        } else {
-            active_ws
-        };
+        let ws_name = resolve_workspace_for_voice(&user_name).await;
 
         info!("Voice command -> {role} (user: {user_name}, workspace: {ws_name}): {text}",);
 
@@ -2233,6 +2245,15 @@ struct PipelineCtx {
     /// ambient noise, inter-utterance silence/background) and saved as chunks
     /// when sustained speech begins.
     negative_audio_buf: Vec<f32>,
+    /// Timestamp until which the pipeline stays in [`VoiceStatus::Error`]
+    /// before returning to [`VoiceStatus::Listening`] (mahbot-812).
+    /// Set on transcription failure as a non-blocking replacement for the
+    /// old 2-second sleep.
+    refractory_until: Option<Instant>,
+    /// Timestamp of the most recent error chat message, for rate-limiting
+    /// repeated transcription failure notifications (mahbot-812).
+    /// At most one error message per 10-second window.
+    last_error_message_time: Option<Instant>,
 }
 
 impl PipelineCtx {
@@ -2281,6 +2302,8 @@ impl PipelineCtx {
                 })
             },
             negative_audio_buf: Vec::new(),
+            refractory_until: None,
+            last_error_message_time: None,
         }
     }
 
@@ -2317,6 +2340,12 @@ impl PipelineCtx {
         self.last_wake_word_detection = None;
         self.audio_preprocessor.clear_buffer();
         self.negative_audio_buf.clear();
+        // NOTE: `refractory_until` and `last_error_message_time` are NOT
+        // cleared here — they are session-level UX state (rate-limiting
+        // debounce and the Error→Listening refractory timer), not
+        // per-detection-cycle audio buffers.  Clearing them would reset
+        // the rate-limit counter mid-session and abort an in-progress
+        // refractory period, both of which are incorrect.
         // Reset VAD detector state so stale ring buffer + pre-emphasis
         // filter state from the previous stream does not misclassify
         // the first few frames (mahbot-771 Fix 3, mahbot-800 C1).
@@ -2385,6 +2414,41 @@ impl PipelineCtx {
         self.score_window.clear();
         self.audio_preprocessor.clear_buffer();
         self.last_wake_word_detection = Some(Instant::now());
+    }
+
+    /// Check whether the refractory period has elapsed and transition back
+    /// to [`VoiceStatus::Listening`] if so (mahbot-812).
+    ///
+    /// Called once per main-loop iteration.  When the pipeline is in
+    /// [`VoiceStatus::Error`] after a transcription failure, the refractory
+    /// period (3 seconds) prevents immediate re-triggering.  Once the timer
+    /// expires this method transitions back to Listening unless the pipeline
+    /// is currently recording (which would mean a concurrent error path
+    /// already initiated a new recording).
+    fn check_refractory_period(&mut self) {
+        if let Some(refractory_until) = self.refractory_until
+            && Instant::now() >= refractory_until
+        {
+            self.refractory_until = None;
+            // Only transition if we're in an Error state and not currently
+            // recording — a concurrent error path could have cleared this.
+            if !self.is_recording && matches!(get_status(), VoiceStatus::Error(_)) {
+                set_status(VoiceStatus::Listening);
+            }
+        }
+    }
+
+    /// Check whether the 10-second rate-limit has elapsed since the last
+    /// transcription-error chat message (mahbot-812).
+    ///
+    /// Returns `true` if no prior error occurred, or if at least 10 seconds
+    /// have passed since the last one.  The caller broadcasts the error
+    /// message on `true` and sets [`last_error_message_time`] to the current
+    /// instant.
+    fn should_send_error_message(&self) -> bool {
+        let now = Instant::now();
+        self.last_error_message_time
+            .is_none_or(|t| now.duration_since(t).as_secs() >= 10)
     }
 
     fn handle_start_listening(&mut self) {
@@ -2748,6 +2812,11 @@ pub async fn run_voice_pipeline() {
             }
         }
 
+        // Transition from Error to Listening after the refractory period
+        // has elapsed (mahbot-812).  This replaces the old 2-second blocking
+        // sleep with a non-blocking check in the main loop.
+        ctx.check_refractory_period();
+
         // Auto-start when models become ready (async download case).
         ctx.check_auto_start();
     }
@@ -3080,18 +3149,53 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
                     info!("Transcribed: {transcribed}");
                     route_to_agent(transcribed).await;
                 }
+
+                // Cleanup: return to listening immediately on success.
+                // This runs for both the empty-transcription and the
+                // routed-success paths.
+                ctx.silence_sample_count = 0;
+                ctx.is_recording = false;
+                set_status(VoiceStatus::Listening);
             }
             Err(e) => {
                 warn!("Transcription failed: {e}");
                 set_status(VoiceStatus::Error("Transcription failed".to_string()));
-                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                // Broadcast an error chat message (rate-limited: at most one
+                // per 10 seconds) so the user sees a persistent indicator
+                // instead of a flash that disappears after 2s (mahbot-812).
+                if ctx.should_send_error_message() {
+                    let user_name = active_user_name();
+                    if !user_name.is_empty() {
+                        ctx.last_error_message_time = Some(Instant::now());
+
+                        // Resolve workspace with fallback via the shared helper
+                        // (matching the route_to_agent pattern).
+                        let workspace = resolve_workspace_for_voice(&user_name).await;
+
+                        crate::channels::broadcast_and_persist_agent_response(
+                            &user_name,
+                            "voice",
+                            "*Voice: transcription failed — try again*",
+                            Some("voice".to_string()),
+                            &workspace,
+                        )
+                        .await;
+                    }
+                }
+
+                // Enforce a 3-second refractory period before returning to
+                // Listening (replaces the old 2-second blocking sleep with a
+                // non-blocking alternative, mahbot-812).
+                ctx.refractory_until = Some(Instant::now() + Duration::from_secs(3));
+
+                // Cleanup the recording state.
+                ctx.silence_sample_count = 0;
+                ctx.is_recording = false;
+                // Do NOT set status to Listening here — the refractory delay
+                // is handled in the main loop's post-select section.
             }
         }
-
-        // Common cleanup for all three paths above.
-        ctx.silence_sample_count = 0;
-        ctx.is_recording = false;
-        set_status(VoiceStatus::Listening);
     }
 }
 
@@ -3625,5 +3729,162 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // ── Refractory period state-machine tests ────────────────────────────
+    // These test the Error→Listening transition logic via the canonical
+    // [`PipelineCtx::check_refractory_period`] method.
+    // Uses serial_test to isolate global voice-state mutations.
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn refractory_transitions_from_error_to_listening() {
+        let _ = init_global();
+
+        let mut ctx = PipelineCtx::new();
+        ctx.is_recording = false;
+        ctx.refractory_until = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("1s in the past should not underflow"),
+        );
+
+        set_status(VoiceStatus::Error("test error".to_string()));
+
+        ctx.check_refractory_period();
+
+        assert!(matches!(get_status(), VoiceStatus::Listening));
+        assert!(ctx.refractory_until.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn refractory_does_not_transition_if_not_error() {
+        let _ = init_global();
+
+        let mut ctx = PipelineCtx::new();
+        ctx.is_recording = false;
+        ctx.refractory_until = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("1s in the past should not underflow"),
+        );
+
+        set_status(VoiceStatus::Disabled);
+
+        ctx.check_refractory_period();
+
+        // Status unchanged — not Error, so no transition.
+        assert!(matches!(get_status(), VoiceStatus::Disabled));
+        // Timer still cleared (the timer itself is session-level, not
+        // status-dependent — always cleared when elapsed).
+        assert!(ctx.refractory_until.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn refractory_does_not_transition_while_recording() {
+        let _ = init_global();
+
+        let mut ctx = PipelineCtx::new();
+        ctx.is_recording = true; // still recording
+        ctx.refractory_until = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("1s in the past should not underflow"),
+        );
+
+        set_status(VoiceStatus::Error("test error".to_string()));
+
+        ctx.check_refractory_period();
+
+        // Still Error because is_recording is true.
+        assert!(matches!(get_status(), VoiceStatus::Error(..)));
+        assert!(ctx.refractory_until.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn refractory_future_timer_does_not_transition() {
+        let _ = init_global();
+
+        let mut ctx = PipelineCtx::new();
+        ctx.is_recording = false;
+        ctx.refractory_until = Some(
+            Instant::now()
+                .checked_add(Duration::from_secs(60))
+                .expect("60s in the future should not overflow"),
+        );
+
+        set_status(VoiceStatus::Error("test error".to_string()));
+
+        ctx.check_refractory_period();
+
+        // Timer hasn't elapsed yet — still Error and timer preserved.
+        assert!(matches!(get_status(), VoiceStatus::Error(..)));
+        assert!(ctx.refractory_until.is_some());
+    }
+
+    // ── Rate-limiting debounce tests ─────────────────────────────────────
+    // These test the 10-second error-message rate limit via the canonical
+    // [`PipelineCtx::should_send_error_message`] method.  No serial marker
+    // needed — these only read from [`PipelineCtx`] fields without touching
+    // global voice state.
+
+    #[test]
+    fn rate_limit_no_prior_error_allows_message() {
+        let ctx = PipelineCtx::new();
+        // last_error_message_time is None → should always send.
+        assert!(ctx.should_send_error_message());
+    }
+
+    #[test]
+    fn rate_limit_recent_error_suppresses_message() {
+        let mut ctx = PipelineCtx::new();
+        ctx.last_error_message_time = Some(Instant::now());
+        // Just sent one → should suppress (< 10s elapsed).
+        assert!(!ctx.should_send_error_message());
+    }
+
+    #[test]
+    fn rate_limit_old_error_allows_message() {
+        let mut ctx = PipelineCtx::new();
+        ctx.last_error_message_time = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(15))
+                .expect("15s in the past should not underflow"),
+        );
+        // 15s > 10s threshold → should send.
+        assert!(ctx.should_send_error_message());
+    }
+
+    #[test]
+    fn rate_limit_exact_threshold_allows_message() {
+        let mut ctx = PipelineCtx::new();
+        ctx.last_error_message_time = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .expect("10s in the past should not underflow"),
+        );
+        // ≥ 10s is the threshold — exactly at the boundary should send.
+        assert!(ctx.should_send_error_message());
+    }
+
+    #[test]
+    fn rate_limit_just_below_threshold_suppresses_message() {
+        let mut ctx = PipelineCtx::new();
+        ctx.last_error_message_time = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(9))
+                .expect("9s in the past should not underflow"),
+        );
+        // 9s < 10s threshold → should suppress.
+        assert!(!ctx.should_send_error_message());
     }
 }

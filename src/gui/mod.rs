@@ -43,6 +43,7 @@ use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
 
 use crate::Role;
+use crate::voice::VoiceStatus;
 
 use self::context_menu::ContextMenu;
 
@@ -2223,6 +2224,31 @@ impl Dashboard {
             .into()
     }
 
+    /// Render a compact voice status indicator in the footer bar (mahbot-812).
+    ///
+    /// Shows one of four states: "🔊 Listening", "🔊 Recording…",
+    /// "🔊 Transcribing…", or "🔊 Error: transcription failed".
+    /// All other [`VoiceStatus`] variants (disabled, enrolling, etc.) are
+    /// only relevant on the Settings page and do not render anything here.
+    fn render_voice_status() -> Element<'static, Message> {
+        let label = match crate::voice::get_status() {
+            VoiceStatus::Listening => "🔊 Listening",
+            VoiceStatus::Recording => "🔊 Recording…",
+            VoiceStatus::Transcribing => "🔊 Transcribing…",
+            VoiceStatus::Error(_) => "🔊 Error: transcription failed",
+            // Disabled, loading, enrolling, etc. — not shown in the footer.
+            _ => return Space::new().width(0).into(),
+        };
+        container(text(label).size(12).color(theme::TEXT_MUTED))
+            .padding(iced::Padding {
+                left: 12.0,
+                right: 12.0,
+                top: 0.0,
+                bottom: 0.0,
+            })
+            .into()
+    }
+
     /// 42px footer bar — nav items (left) and active agents (right).
     fn footer_view(&self) -> Element<'_, Message> {
         let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(3);
@@ -2241,8 +2267,13 @@ impl Dashboard {
             .spacing(6)
             .align_y(Alignment::Center);
 
-        // TTS download progress indicator (center of footer bar)
-        let center = self.render_tts_download_progress();
+        // TTS download progress and voice status indicator (center of footer bar)
+        let center = row![
+            self.render_tts_download_progress(),
+            Self::render_voice_status(),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
 
         let right = Self::render_active_agents();
 
