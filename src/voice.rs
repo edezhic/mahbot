@@ -37,7 +37,7 @@ use crate::wake_word_classifier::{self, ClassifierWeights, TrainingConfig, WakeW
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -60,13 +60,13 @@ pub(crate) mod voice_pipeline_e2e_test;
 pub const SAMPLE_RATE: u32 = 16_000;
 
 /// Frame size for mel spectrogram (512 samples = 32ms at 16kHz).
-const FRAME_LENGTH: usize = 512;
+pub(crate) const FRAME_LENGTH: usize = 512;
 
 /// Hop length between frames (256 samples at 16 kHz).  This constant controls
 /// VAD frame iteration stride and silence tracking in the application code.
 /// The ONNX mel spectrogram model uses its own internal stride (160 samples =
 /// 10ms) — HOP_LENGTH does NOT affect mel frame spacing (mahbot-772).
-const HOP_LENGTH: usize = 256;
+pub(crate) const HOP_LENGTH: usize = 256;
 
 /// Number of mel bands in the spectrogram.
 const NUM_MEL_BANDS: usize = 32;
@@ -106,7 +106,7 @@ pub(crate) const SILENCE_DURATION: Duration = Duration::from_millis(1500);
 /// Silence threshold in audio samples at 16 kHz.
 /// Derived from SILENCE_DURATION × SAMPLE_RATE to prevent silent drift
 /// if either constant changes.
-const SILENCE_THRESHOLD_SAMPLES: usize =
+pub(crate) const SILENCE_THRESHOLD_SAMPLES: usize =
     (SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
 
 /// Silence threshold (200ms) before showing "Keep silent to confirm…" UI hint.
@@ -255,7 +255,7 @@ const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
 /// samples).  Used during enrollment to capture ~100ms of pre-VAD-trigger
 /// and post-speech context so the template includes the onset/offset
 /// phonemes that strict enrollment VAD (0.85) excludes.
-const RAW_RING_MAX: usize = SAMPLE_RATE as usize / 5;
+pub(crate) const RAW_RING_MAX: usize = SAMPLE_RATE as usize / 5;
 
 /// Context padding duration in milliseconds for VAD asymmetry mitigation
 /// (mahbot-775 Fix 3).  Used to prepend ~100ms of pre-VAD-trigger context
@@ -266,7 +266,8 @@ const CONTEXT_PADDING_MS: usize = 100;
 
 /// Context padding in audio samples at 16 kHz, derived from
 /// CONTEXT_PADDING_MS to stay correct if the sample rate is adjusted.
-const CONTEXT_PADDING_SAMPLES: usize = (CONTEXT_PADDING_MS * SAMPLE_RATE as usize) / 1000;
+pub(crate) const CONTEXT_PADDING_SAMPLES: usize =
+    (CONTEXT_PADDING_MS * SAMPLE_RATE as usize) / 1000;
 
 // ── Model URLs and filenames ────────────────────────────────────────────
 
@@ -469,12 +470,12 @@ pub(crate) fn score_single_embedding(
 /// pass during enrollment to prevent ambient noise (traffic, wind) from
 /// contaminating the template (mahbot-772).  The detection VAD threshold
 /// stays at 0.5 for responsiveness.
-const ENROLLMENT_VAD_THRESHOLD: f32 = 0.85;
+pub(crate) const ENROLLMENT_VAD_THRESHOLD: f32 = 0.85;
 
 /// Minimum consecutive VAD-positive frames before setting utterance_had_speech
 /// during enrollment (~48ms at 16ms/frame).  Prevents a single noise spike
 /// from starting utterance accumulation (mahbot-772).
-const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 3;
+pub(crate) const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 3;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Neural VAD (Earshot) — replaces RMS-based `is_speech`
@@ -1159,7 +1160,7 @@ fn is_speech(samples: &[f32]) -> bool {
 /// Processes ALL 256-sample chunks through the detector to keep its internal
 /// state (ring buffer + pre-emphasis filter) synchronized with the audio
 /// stream, even when speech is detected early in the frame (mahbot-771 Fix 2).
-fn is_speech_with_detector(
+pub(crate) fn is_speech_with_detector(
     samples: &[f32],
     detector: &mut earshot::Detector,
     threshold: f32,
@@ -1966,6 +1967,202 @@ pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
     "Say the wake word clearly"
 }
 
+/// Configuration parameters for [`segment_utterances_by_vad`].
+///
+/// Bundles the six module-level constants that are identical across all call
+/// sites into a single struct.  This reduces the function signature from 8 to
+/// 3 parameters and makes the call sites more resilient to parameter-order
+/// changes.
+pub(crate) struct VadSegmentationConfig {
+    /// Frame size in samples (typically [`FRAME_LENGTH`] = 512).
+    frame_length: usize,
+    /// Frame stride in samples (typically [`HOP_LENGTH`] = 256).
+    hop_length: usize,
+    /// Min consecutive VAD-positive frames to confirm sustained speech
+    /// (typically [`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 3).
+    consecutive_required: usize,
+    /// Silence duration in samples before utterance ends
+    /// (typically [`SILENCE_THRESHOLD_SAMPLES`] = 24 000 ≈ 1.5 s).
+    silence_threshold_samples: usize,
+    /// Samples of pre/post speech context to include
+    /// (typically [`CONTEXT_PADDING_SAMPLES`] = 1 600 ≈ 100 ms).
+    context_padding_samples: usize,
+    /// Max samples in the internal raw-audio ring buffer
+    /// (typically [`RAW_RING_MAX`] = 3 200 ≈ 200 ms).
+    raw_ring_max: usize,
+}
+
+/// Module-level default config for [`segment_utterances_by_vad`] using the
+/// standard voice-pipeline constants.
+pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
+    frame_length: FRAME_LENGTH,
+    hop_length: HOP_LENGTH,
+    consecutive_required: ENROLLMENT_VAD_CONSECUTIVE_REQUIRED,
+    silence_threshold_samples: SILENCE_THRESHOLD_SAMPLES,
+    context_padding_samples: CONTEXT_PADDING_SAMPLES,
+    raw_ring_max: RAW_RING_MAX,
+};
+
+/// Core VAD-gated utterance segmentation.
+///
+/// Processes raw audio with per-frame VAD decisions and segments it into
+/// utterances using the same boundary-detection algorithm as the enrollment
+/// pipeline's streaming handler ([`handle_enrollment_audio`]).  The caller
+/// provides VAD decisions so this function is pure with respect to VAD state
+/// management — it does not touch the global [`VAD_DETECTOR`].
+///
+/// # Algorithm (matches [`handle_enrollment_audio`])
+///
+/// 1. For each frame (stride = `config.hop_length`), check the VAD decision.
+/// 2. VAD-positive frames accumulate into the current utterance.
+/// 3. `config.consecutive_required` consecutive VAD-positive frames confirm
+///    **sustained speech**.  On this transition the function prepends
+///    pre-speech context (~100 ms) from the raw-audio ring buffer to capture
+///    onset phonemes excluded by a strict VAD threshold.
+/// 4. After speech, `config.silence_threshold_samples` of consecutive
+///    VAD-negative audio ends the utterance.  Post-speech context (~100 ms)
+///    is appended from the raw-audio ring (captured at the first silence
+///    frame).
+/// 5. The complete utterance is emitted and internal state resets for the
+///    next utterance.
+///
+/// # Parameters
+///
+/// - `raw_audio`: Complete raw mono audio buffer (16 kHz f32 samples).
+/// - `vad_decisions`: One boolean per frame (stride = `config.hop_length`).
+///   Each decision is whether the frame at that position contains speech.
+///   The caller is responsible for computing these (e.g. via
+///   [`is_speech_with_detector`] on each frame).
+/// - `config`: Segmentation parameters (see [`VadSegmentationConfig`]).
+///   Use [`DEFAULT_VAD_SEGMENTATION_CONFIG`] for the standard pipeline.
+///
+/// # Returns
+///
+/// A list of utterance segments (raw audio samples, **not** VAD-subsampled),
+/// in order of detection.  Each segment includes pre- and post-speech context
+/// padding.  Empty if no utterances were detected.
+///
+/// # Panics
+///
+/// Panics if `vad_decisions` is empty or if the frame/hop parameters would
+/// index past the end of `raw_audio`.
+#[must_use]
+pub(crate) fn segment_utterances_by_vad(
+    raw_audio: &[f32],
+    vad_decisions: &[bool],
+    config: &VadSegmentationConfig,
+) -> Vec<Vec<f32>> {
+    let frame_length = config.frame_length;
+    let hop_length = config.hop_length;
+    let consecutive_required = config.consecutive_required;
+    let silence_threshold_samples = config.silence_threshold_samples;
+    let context_padding_samples = config.context_padding_samples;
+    let raw_ring_max = config.raw_ring_max;
+
+    // --- Validate parameters ---
+    assert!(
+        !vad_decisions.is_empty(),
+        "segment_utterances_by_vad: vad_decisions must not be empty",
+    );
+    assert!(
+        raw_audio.len() >= frame_length,
+        "segment_utterances_by_vad: raw_audio too short \
+         ({} < {frame_length})",
+        raw_audio.len(),
+    );
+
+    let mut utterances: Vec<Vec<f32>> = Vec::new();
+    let mut utterance_buf: Vec<f32> = Vec::new();
+    let mut utterance_had_speech = false;
+    let mut utterance_silence_samples: usize = 0;
+    let mut utterance_speech_end_len: usize = 0;
+    let mut vad_positives_in_a_row: usize = 0;
+    let mut raw_audio_ring: Vec<f32> = Vec::with_capacity(raw_ring_max);
+    let mut post_speech_tail: Vec<f32> = Vec::new();
+
+    // Iterate frames at hop_length stride.
+    // Each frame corresponds to one VAD decision.
+    for (frame_idx, &is_speech) in vad_decisions.iter().enumerate() {
+        let frame_start = frame_idx * hop_length;
+
+        // Update raw-audio ring with the current frame's full-res samples.
+        let frame_end = (frame_start + frame_length).min(raw_audio.len());
+        if frame_end > frame_start {
+            raw_audio_ring.extend_from_slice(&raw_audio[frame_start..frame_end]);
+            if raw_audio_ring.len() > raw_ring_max {
+                let excess = raw_audio_ring.len() - raw_ring_max;
+                raw_audio_ring.drain(..excess);
+            }
+        }
+
+        if is_speech {
+            // VAD-positive: accumulate hop_length samples into utterance.
+            let hop_end = (frame_start + hop_length).min(raw_audio.len());
+            if hop_end > frame_start {
+                utterance_buf.extend_from_slice(&raw_audio[frame_start..hop_end]);
+            }
+
+            vad_positives_in_a_row += 1;
+
+            if vad_positives_in_a_row >= consecutive_required {
+                // Sustained speech confirmed.
+
+                if !utterance_had_speech {
+                    // Prepend pre-speech context from raw-audio ring
+                    // (first transition only).
+                    let start = raw_audio_ring.len().saturating_sub(context_padding_samples);
+                    let padding: Vec<f32> = raw_audio_ring[start..].to_vec();
+                    if !padding.is_empty() {
+                        let mut padded = padding;
+                        padded.extend_from_slice(&utterance_buf);
+                        utterance_buf = padded;
+                    }
+                }
+
+                utterance_had_speech = true;
+                utterance_speech_end_len = utterance_buf.len();
+                utterance_silence_samples = 0;
+            } else if utterance_had_speech {
+                // Single VAD-positive frame after sustained speech:
+                // extend utterance end and reset silence.
+                utterance_speech_end_len = utterance_buf.len();
+                utterance_silence_samples = 0;
+            }
+        } else {
+            // VAD-negative: reset consecutive counter.
+            vad_positives_in_a_row = 0;
+
+            if utterance_had_speech {
+                // Capture trailing speech at first silence.
+                if utterance_silence_samples == 0 {
+                    let start = raw_audio_ring.len().saturating_sub(context_padding_samples);
+                    post_speech_tail = raw_audio_ring[start..].to_vec();
+                }
+
+                utterance_silence_samples += hop_length;
+
+                if utterance_silence_samples >= silence_threshold_samples {
+                    // Utterance is complete.
+                    utterance_buf.truncate(utterance_speech_end_len);
+                    if !post_speech_tail.is_empty() {
+                        utterance_buf.extend_from_slice(&post_speech_tail);
+                    }
+                    if !utterance_buf.is_empty() {
+                        utterances.push(std::mem::take(&mut utterance_buf));
+                    }
+                    utterance_speech_end_len = 0;
+                    utterance_had_speech = false;
+                    utterance_silence_samples = 0;
+                    post_speech_tail.clear();
+                    vad_positives_in_a_row = 0;
+                }
+            }
+        }
+    }
+
+    utterances
+}
+
 /// Train the Conv1D wake word classifier from the enrollment buffer.
 ///
 /// Returns the trained [`ClassifierWeights`] on success, after running the
@@ -2191,7 +2388,19 @@ struct PipelineCtx {
     /// cutoff consistency (ticket mahbot-760).
     silence_sample_count: usize,
     enrollment_mode: bool,
-    utterance_buf: Vec<f32>,
+    /// Accumulated VAD decisions across all frames processed this enrollment
+    /// session.  Paired with [`frame_raw_audio`] for the extracted
+    /// [`segment_utterances_by_vad`] function.
+    frame_vad: Vec<bool>,
+    /// Accumulated raw audio samples (full-resolution, NOT sub-sampled) for
+    /// all frames processed this enrollment session.  Used by the extracted
+    /// [`segment_utterances_by_vad`] function alongside [`frame_vad`].
+    frame_raw_audio: Vec<f32>,
+    /// Number of utterances already emitted by the extracted
+    /// [`segment_utterances_by_vad`] function.  Reset across enrollment
+    /// sessions (Cancel/Full) but preserved within a single session so the
+    /// function is called on the full accumulated buffer each time.
+    emitted_utterances: usize,
     utterance_had_speech: bool,
     /// Silence duration in samples for enrollment utterance detection
     /// (sample-based to avoid wall-clock drift under load).
@@ -2213,13 +2422,16 @@ struct PipelineCtx {
     mel_frame_buffer: Vec<Vec<f32>>,
     embedding_ring: Vec<Vec<f32>>,
     voice_batch: Vec<f32>,
-    enrollment_pending: Option<Vec<f32>>,
-    /// Length of [`utterance_buf`] at the last detected speech frame boundary.
-    /// Used to trim trailing silence from enrollment utterances so only the
-    /// active speech portion contributes to the template, preventing the
-    /// silence-content mismatch between enrollment and live detection
-    /// (Root Cause 1 in mahbot-755).
-    utterance_speech_end_len: usize,
+    /// Queue of completed enrollment utterances awaiting processing by the main
+    /// pipeline loop.  Each element is a Vec<f32> of raw audio samples for one
+    /// utterance.  The extracted [`segment_utterances_by_vad`] function detects
+    /// utterance boundaries and queues completed utterances here.  The main loop
+    /// pops them one at a time via [`pop_front`](VecDeque::pop_front) and
+    /// processes them through [`handle_enrollment_sample`].  Using a queue
+    /// (rather than a single `Option`) ensures that if multiple utterances
+    /// complete within a single mic frame, all are preserved — no utterance is
+    /// silently dropped (mahbot-823).
+    enrollment_pending: VecDeque<Vec<f32>>,
     auto_start_pending: bool,
     /// Timestamp of the last automatic model retry attempt.  Used to debounce
     /// so we don't spam the retry loop every 1-second tick when models are in
@@ -2245,43 +2457,13 @@ struct PipelineCtx {
     /// when a frame's score drops below [`NO_MATCH_RESET_THRESHOLD`] to
     /// prevent noise accumulation.
     score_window: Vec<f32>,
-    /// Rolling buffer of raw audio samples captured during enrollment.
-    ///
-    /// Accumulated unconditionally for all raw input audio throughout
-    /// enrollment, with a rolling ~200ms capacity ([`RAW_RING_MAX`]).
-    /// The ring serves two purposes for VAD asymmetry mitigation
-    /// (mahbot-775 Fix 3):
-    ///
-    /// 1. **Pre-speech context**: When sustained speech is first confirmed,
-    ///    ~100ms from this ring is prepended to the utterance to capture
-    ///    the quieter onset phonemes that the strict enrollment VAD (0.85)
-    ///    excludes but live detection (VAD=0.5) includes.
-    ///
-    /// 2. **Post-speech tail**: At the first VAD-negative frame after speech,
-    ///    ~100ms from this ring is snapshotted into [`post_speech_tail`],
-    ///    before the 1.5s silence timeout overwrites the ring with silence.
-    ///
-    /// Both uses require the ring to contain audio from *before* the
-    /// respective event (sustained speech / first silence).  Accumulation
-    /// is unconditional because restricting it to pre-speech would leave
-    /// the ring empty of trailing phonemes for the post-speech tail capture.
-    raw_audio_ring: Vec<f32>,
     /// Rolling buffer of raw audio samples captured BEFORE AGC processing.
     ///
-    /// Same rolling capacity as [`raw_audio_ring`] (~200ms, [`RAW_RING_MAX`]
-    /// samples).  Used exclusively for noise RMS estimation at first sustained
+    /// ~200ms capacity ([`RAW_RING_MAX`] samples).  Used exclusively for noise RMS estimation at first sustained
     /// speech detection — AGC amplifies silence (up to 4×) more than speech
     /// (~1-2×), so noise RMS from post-AGC audio produces an artificially low
     /// SNR estimate (mahbot-785).
     pre_agc_ring: Vec<f32>,
-    /// Trailing audio captured at the FIRST VAD-negative frame after speech
-    /// during enrollment.  Used to append ~100ms of post-speech context that
-    /// the strict enrollment VAD (0.85) excludes but live detection (VAD=0.5)
-    /// includes.  Captured eagerly at the first silence transition so the raw
-    /// audio ring still contains the trailing speech phonemes — by the time
-    /// the 1.5s silence timeout fires, the ring has been overwritten with
-    /// silence (mahbot-775 Fix 3).
-    post_speech_tail: Vec<f32>,
     /// Audio pre-processor for noise suppression and AGC.
     /// Applied to every incoming audio chunk before VAD / mel extraction.
     audio_preprocessor: crate::audio_preprocessor::AudioPreprocessor,
@@ -2327,7 +2509,9 @@ impl PipelineCtx {
             command_buffer: Vec::new(),
             silence_sample_count: 0,
             enrollment_mode: false,
-            utterance_buf: Vec::new(),
+            frame_vad: Vec::new(),
+            frame_raw_audio: Vec::new(),
+            emitted_utterances: 0,
             utterance_had_speech: false,
             utterance_silence_samples: 0,
             enrollment_no_speech_frame_count: 0,
@@ -2336,17 +2520,14 @@ impl PipelineCtx {
             mel_frame_buffer: Vec::new(),
             embedding_ring: Vec::new(),
             voice_batch: Vec::new(),
-            enrollment_pending: None,
-            utterance_speech_end_len: 0,
+            enrollment_pending: VecDeque::new(),
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
             last_model_retry: None,
             last_wake_word_detection: None,
             score_window: Vec::new(),
             noise_rms_estimate: None,
             vad_threshold: VAD_THRESHOLD,
-            raw_audio_ring: Vec::new(),
             pre_agc_ring: Vec::new(),
-            post_speech_tail: Vec::new(),
             audio_preprocessor: {
                 use crate::audio_preprocessor::PreprocessorConfig;
                 let ns = CONFIG
@@ -2372,9 +2553,9 @@ impl PipelineCtx {
     ///
     /// | Field | Full | Soft | Cancel |
     /// |---|---|---|---|
-    /// | `voice_batch`, `mel_frame_buffer`, `embedding_ring`, `audio_buffer`, `command_buffer`, `score_window`, `raw_audio_ring`, `pre_agc_ring`, `post_speech_tail`, `negative_audio_buf` | cleared | cleared | cleared |
+    /// | `voice_batch`, `mel_frame_buffer`, `embedding_ring`, `audio_buffer`, `command_buffer`, `score_window`, `pre_agc_ring`, `negative_audio_buf`, `frame_vad`, `frame_raw_audio` | cleared | cleared | cleared |
     /// | `silence_sample_count` | = 0 | = 0 | = 0 |
-    /// | `utterance_buf`, `utterance_had_speech`, `utterance_silence_samples`, `utterance_speech_end_len`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
+    /// | `utterance_had_speech`, `utterance_silence_samples`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `emitted_utterances`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
     /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
     /// | `last_wake_word_detection` | `None` | preserved | `None` |
     /// | `auto_start_pending` | `false` | preserved | preserved |
@@ -2392,20 +2573,19 @@ impl PipelineCtx {
         self.command_buffer.clear();
         self.silence_sample_count = 0;
         self.score_window.clear();
-        self.raw_audio_ring.clear();
         self.pre_agc_ring.clear();
-        self.post_speech_tail.clear();
         self.negative_audio_buf.clear();
 
         // ── Enrollment detection/accumulator state (cleared by all levels) ──
-        self.utterance_buf.clear();
         self.utterance_had_speech = false;
         self.utterance_silence_samples = 0;
-        self.utterance_speech_end_len = 0;
         self.enrollment_no_speech_frame_count = 0;
         self.vad_positives_in_a_row = 0;
-        self.enrollment_pending = None;
+        self.enrollment_pending.clear();
         self.noise_rms_estimate = None;
+        self.frame_vad.clear();
+        self.frame_raw_audio.clear();
+        self.emitted_utterances = 0;
 
         match level {
             ResetLevel::Full => {
@@ -2470,7 +2650,7 @@ impl PipelineCtx {
         // at the start (mahbot-802).
         let audio = std::mem::take(&mut self.audio_buffer);
         // Soft reset: clears detection buffers (mel, embedding, voice_batch,
-        // score_window, raw_audio_ring, pre_agc_ring, post_speech_tail,
+        // score_window, pre_agc_ring,
         // negative_audio_buf, audio_preprocessor frame buffer) while
         // preserving VAD state, noise-suppressor noise profile, and
         // vad_threshold (mahbot-802).  command_buffer and silence_sample_count
@@ -2841,10 +3021,13 @@ pub async fn run_voice_pipeline() {
             ctx.try_retry_models();
         }
 
-        // Process any pending enrollment utterance (accumulated inline to avoid
-        // race conditions with the command channel). ONNX inference inside
-        // handle_enrollment_sample uses spawn_blocking so it doesn't block.
-        if let Some(samples) = ctx.enrollment_pending.take() {
+        // Process any pending enrollment utterances (accumulated inline to avoid
+        // race conditions with the command channel).  Using a VecDeque so all
+        // completed utterances are preserved even if multiple complete within a
+        // single mic frame — each is popped one per tick (mahbot-823).
+        // ONNX inference inside handle_enrollment_sample uses spawn_blocking
+        // so it doesn't block.
+        if let Some(samples) = ctx.enrollment_pending.pop_front() {
             let noise_rms = ctx.noise_rms_estimate.take();
             handle_enrollment_sample(samples, noise_rms).await;
             // Reset enrollment_mode only on successful completion, not on
@@ -3227,8 +3410,8 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 
                 // Cleanup: return to listening immediately on success.
                 // Soft reset clears detection/recording buffers (mel, embedding,
-                // voice_batch, score_window, command_buffer, raw_audio_ring,
-                // pre_agc_ring, post_speech_tail, negative_audio_buf) while
+                // voice_batch, score_window, command_buffer,
+                // pre_agc_ring, negative_audio_buf) while
                 // preserving VAD state, NS noise profile, vad_threshold, and the
                 // wake-word cooldown timestamp to prevent immediate re-triggering
                 // (mahbot-805).
@@ -3486,10 +3669,16 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
 
 /// Handle audio during enrollment mode.
 ///
-/// Accumulates audio frames into utterances with VAD-based boundary detection.
-/// When a complete utterance is detected (speech followed by silence exceeding
-/// `SILENCE_DURATION`), stores the utterance in `enrollment_pending` for
-/// inline processing (avoids race conditions with the command channel).
+/// Accumulates VAD decisions and raw audio into `ctx.frame_vad` /
+/// `ctx.frame_raw_audio`, then after the frame loop calls the extracted
+/// [`segment_utterances_by_vad`] function which performs utterance-boundary
+/// detection.  Newly completed utterances are queued in `enrollment_pending`
+/// (a `VecDeque`) for the main loop to process one per tick (avoids race
+/// conditions with the command channel).  Using a queue ensures no utterance
+/// is dropped if multiple complete within a single mic frame (mahbot-823).  The frame loop maintains lightweight inline state only for
+/// side-effect gating (noise RMS capture, negative audio collection, UI
+/// status) — utterance construction itself is delegated to the extracted
+/// function (mahbot-823).
 ///
 /// **Verifier negative collection** (mahbot-797): Non-VAD frames captured
 /// before the first detected speech (pre-enrollment ambient noise) and during
@@ -3501,7 +3690,7 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
 /// Gaussian noise that caused false triggers (mahbot-797 Fix 4).
 ///
 /// **VAD symmetry** (mahbot-765): Only VAD-positive frames are accumulated
-/// into the utterance buffer, mirroring the detection pipeline
+/// by the extracted function into utterances, mirroring the detection pipeline
 /// ([`handle_wake_word_detection`]). This eliminates the asymmetry where
 /// enrollment built templates on audio that the detector never processes.
 /// Utterance end is detected after [`SILENCE_THRESHOLD_SAMPLES`] consecutive
@@ -3516,19 +3705,14 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
 /// - Speech ended, awaiting silence: `WaitingForSilenceDuringEnrollment`
 #[allow(clippy::too_many_lines)]
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
-    // ── Raw audio ring buffer (mahbot-775 Fix 3) ──
-    // Accumulate ALL raw input audio into a rolling ring so we can later
-    // prepend ~100ms of pre-VAD-trigger context and append ~100ms of
-    // post-speech context to the utterance.  This captures the onset/offset
-    // phonemes that the strict enrollment VAD (0.85) excludes but live
-    // detection (VAD=0.5) includes, reducing the systematic mismatch.
-    ctx.raw_audio_ring.extend_from_slice(samples);
-    if ctx.raw_audio_ring.len() > RAW_RING_MAX {
-        let excess = ctx.raw_audio_ring.len() - RAW_RING_MAX;
-        ctx.raw_audio_ring.drain(..excess);
-    }
-
     ctx.audio_buffer.extend_from_slice(samples);
+
+    // ── Accumulate full-res audio for extracted VAD gating function ──
+    // Store the ORIGINAL mic samples (not sub-sampled, not framed) so
+    // [`segment_utterances_by_vad`] has full 16 kHz resolution for its
+    // internal raw-audio ring (correct context padding) and can access
+    // frames at hop_length stride to align with `ctx.frame_vad`.
+    ctx.frame_raw_audio.extend_from_slice(samples);
 
     // Process frames with offset tracking instead of per-iteration O(n) drain.
     let len = ctx.audio_buffer.len();
@@ -3536,21 +3720,23 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
     while consumed + FRAME_LENGTH <= len {
         let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
-        if is_speech_with_threshold(frame, ctx.vad_threshold) {
-            // VAD-positive: accumulate only the new samples (HOP_LENGTH per
-            // frame) into the utterance buffer. Adding the full FRAME_LENGTH
-            // frame would duplicate overlapping audio since consecutive frames
-            // overlap by 50%. The utterance buffer is later passed to
-            // extract_embeddings_from_audio which expects continuous raw audio,
-            // not overlapping frames.
-            ctx.utterance_buf.extend_from_slice(&frame[..HOP_LENGTH]);
+        // ── Accumulate VAD decision for extracted function ──
+        let is_speech = is_speech_with_threshold(frame, ctx.vad_threshold);
+        ctx.frame_vad.push(is_speech);
 
+        if is_speech {
             ctx.vad_positives_in_a_row += 1;
             // Reset the no-speech warning counter on any VAD-positive frame.
             ctx.enrollment_no_speech_frame_count = 0;
 
             if ctx.vad_positives_in_a_row >= ENROLLMENT_VAD_CONSECUTIVE_REQUIRED {
-                // Sustained speech confirmed (mahbot-772): update tracking.
+                // Sustained speech confirmed: perform inline side-effect gating.
+                // The extracted [`segment_utterances_by_vad`] function handles
+                // utterance-boundary detection and construction (mahbot-823);
+                // the inline code below only gates real-time side effects that
+                // must happen during the frame loop: noise RMS capture (mahbot-785),
+                // negative audio collection (mahbot-797), and UI status updates.
+
                 let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
 
                 // ── Capture noise RMS from pre-AGC ring (mahbot-785) ──
@@ -3601,34 +3787,17 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     }
                 }
 
-                // ── Prepend pre-speech context from raw ring (mahbot-775 Fix 3) ──
-                // On the FIRST transition from silence to sustained speech,
-                // prepend ~100ms of audio from the raw input ring to capture
-                // the quieter onset phonemes that VAD=0.85 excluded.
-                if !already_had_speech {
-                    let pad_samples = CONTEXT_PADDING_SAMPLES; // 100ms
-                    let start = ctx.raw_audio_ring.len().saturating_sub(pad_samples);
-                    let padding: Vec<f32> = ctx.raw_audio_ring[start..].to_vec();
-                    if !padding.is_empty() {
-                        let mut padded = padding;
-                        padded.extend_from_slice(&ctx.utterance_buf);
-                        ctx.utterance_buf = padded;
-                    }
-                }
-
                 if !already_had_speech || was_waiting_for_silence {
                     // Transition from silence to speech, or speech resumed after
                     // a pause before the 1.5s timeout — show "Listening…"
                     set_status(VoiceStatus::ListeningDuringEnrollment { sample, total });
                 }
                 ctx.utterance_had_speech = true;
-                ctx.utterance_speech_end_len = ctx.utterance_buf.len();
                 ctx.utterance_silence_samples = 0;
             } else if ctx.utterance_had_speech {
-                // Previously confirmed speech: a single VAD-positive frame is
-                // enough to extend the utterance end and reset silence (handles
-                // brief VAD gaps during continuous speech, e.g. unvoiced stops).
-                ctx.utterance_speech_end_len = ctx.utterance_buf.len();
+                // A single VAD-positive frame (below the consecutive threshold)
+                // after sustained speech: just reset silence.  Handles brief
+                // VAD gaps during continuous speech (e.g. unvoiced stops).
                 ctx.utterance_silence_samples = 0;
             }
         } else {
@@ -3648,56 +3817,31 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // correctly measure silence in audio samples at 16 kHz; they just
                 // operate at different granularities (frame-level vs chunk-level).
 
-                // ── Capture trailing speech at first silence (mahbot-775 Fix 3) ──
-                // The raw audio ring still contains the quiet trailing phonemes at
-                // this point (the VAD-negative frames that are just below 0.85).
-                // By the time the 1.5s silence timeout fires, the ring will have
-                // been fully overwritten with silence, so we snapshot the tail now.
-                if ctx.utterance_silence_samples == 0 {
-                    let pad_samples = CONTEXT_PADDING_SAMPLES; // 100ms
-                    let start = ctx.raw_audio_ring.len().saturating_sub(pad_samples);
-                    ctx.post_speech_tail = ctx.raw_audio_ring[start..].to_vec();
-                }
-
                 ctx.utterance_silence_samples += HOP_LENGTH;
+
+                // Inline silence threshold reset: partially duplicates the
+                // extracted function's boundary logic but is needed so that
+                // post-utterance silence within the same chunk accumulates
+                // into negative_audio_buf rather than being discarded
+                // (mahbot-797, mahbot-823).
+                // Snapshot before reset so the UI status gate uses the
+                // pre-reset value — after utterance completion the silence
+                // samples are 0, which would spuriously trigger the "waiting
+                // for silence" status for one frame (mahbot-823).
+                let silence_ui_check = ctx.utterance_silence_samples;
+
                 if ctx.utterance_silence_samples >= SILENCE_THRESHOLD_SAMPLES {
-                    // Utterance is complete. With VAD-gated accumulation,
-                    // utterance_buf already only contains speech frames, but
-                    // we still truncate to utterance_speech_end_len for safety
-                    // in edge cases.
-                    ctx.utterance_buf.truncate(ctx.utterance_speech_end_len);
-                    // ── Append post-speech tail (mahbot-775 Fix 3) ──
-                    // The post_speech_tail was captured at the first silence
-                    // transition while the raw ring still held the trailing
-                    // speech phonemes.  Append ~100ms to match the full wake
-                    // word that live detection (VAD=0.5) includes.
-                    if !ctx.post_speech_tail.is_empty() {
-                        ctx.utterance_buf.extend_from_slice(&ctx.post_speech_tail);
-                    }
-                    ctx.enrollment_pending = Some(std::mem::take(&mut ctx.utterance_buf));
-                    ctx.utterance_speech_end_len = 0;
                     ctx.utterance_had_speech = false;
                     ctx.utterance_silence_samples = 0;
                     ctx.enrollment_no_speech_frame_count = 0;
-                    ctx.post_speech_tail.clear();
-                    // Note: noise_rms_estimate is intentionally NOT reset here.
-                    // It is consumed by the main loop at line 3048 via
-                    // ctx.noise_rms_estimate.take() alongside enrollment_pending.
-                    // reset is handled by reset_pipeline_state(Cancel) for
-                    // cancellation/completion safety.  Clearing it here would
-                    // destroy the captured noise RMS before the main loop can
-                    // use it for compute_utterance_quality (mahbot-782).
-                    // Mark ALL samples as consumed so the post-loop drain removes
-                    // everything (including the unconsumed tail).  This replaces
-                    // the original `clear()` while working correctly even when
-                    // `consumed > 0` — the original `clear()` + post-loop
-                    // `drain(..consumed)` would panic on an empty buffer.
-                    consumed = len;
-                    break;
+                    ctx.vad_positives_in_a_row = 0;
                 }
+
                 // Set status during the first 200ms of silence to show
-                // "Keep silent to confirm…".
-                if ctx.utterance_silence_samples < SILENCE_UI_GATE_SAMPLES {
+                // "Keep silent to confirm…".  Uses the snapshot captured
+                // before the threshold reset so that utterance completion
+                // does not spuriously re-trigger this status.
+                if silence_ui_check < SILENCE_UI_GATE_SAMPLES {
                     set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
                 }
             } else if !ctx.utterance_had_speech {
@@ -3733,6 +3877,48 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
     // Single O(remaining) drain instead of O(remaining) per frame iteration.
     if consumed > 0 {
         ctx.audio_buffer.drain(..consumed);
+    }
+
+    // ── Extracted VAD gating: detect completed utterances ─────────────
+    // Call the same pure function that the E2E integration test exercises.
+    // Uses the full accumulated audio and VAD decisions to detect utterance
+    // boundaries with the same algorithm as the inline logic above.
+    // `emitted_utterances` tracks how many utterances have already been
+    // processed across calls — newly completed utterances are those with
+    // index >= emitted_utterances.
+    if !ctx.frame_vad.is_empty() {
+        let utterances = segment_utterances_by_vad(
+            &ctx.frame_raw_audio,
+            &ctx.frame_vad,
+            &DEFAULT_VAD_SEGMENTATION_CONFIG,
+        );
+
+        // Handle any newly completed utterances
+        while utterances.len() > ctx.emitted_utterances {
+            let new_idx = ctx.emitted_utterances;
+            ctx.emitted_utterances += 1;
+
+            // Queue the utterance in enrollment_pending (VecDeque) for the
+            // main loop to process.  Using a queue ensures all utterances are
+            // preserved even if multiple complete within a single mic frame.
+            // The index starts at the previous emitted_utterances count, which
+            // is the oldest unprocessed utterance; utterances are processed
+            // in detection order.
+            let utterance = utterances[new_idx].clone();
+            ctx.enrollment_pending.push_back(utterance);
+
+            // Reset inline tracking state for the next utterance.
+            // Fields used for side-effect gating in the frame loop are reset
+            // so the next utterance starts with a clean slate.
+            ctx.utterance_had_speech = false;
+            ctx.utterance_silence_samples = 0;
+            ctx.vad_positives_in_a_row = 0;
+            ctx.enrollment_no_speech_frame_count = 0;
+            // Note: noise_rms_estimate is intentionally NOT reset here.
+            // It is consumed by the main loop alongside enrollment_pending.
+            // Reset is handled by reset_pipeline_state(Cancel) for
+            // cancellation/completion safety (mahbot-782).
+        }
     }
 }
 
@@ -3818,6 +4004,105 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    // ── VAD-gated utterance segmentation tests ────────────────────────────
+    // These test the pure [`segment_utterances_by_vad`] function with synthetic
+    // audio and manually-computed VAD decisions.  No global voice state needed.
+
+    /// Test config with a shorter silence threshold (10 frames ≈ 2560 samples
+    /// instead of the default 94 frames ≈ 24000 samples) so tests don't need
+    /// prohibitively long audio buffers.
+    const TEST_VAD_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
+        frame_length: FRAME_LENGTH,
+        hop_length: HOP_LENGTH,
+        consecutive_required: ENROLLMENT_VAD_CONSECUTIVE_REQUIRED,
+        silence_threshold_samples: HOP_LENGTH * 10, // 2560 samples ≈ 10 frames
+        context_padding_samples: CONTEXT_PADDING_SAMPLES,
+        raw_ring_max: RAW_RING_MAX,
+    };
+
+    /// Build a raw audio buffer long enough for `n_frames` frames at
+    /// [`HOP_LENGTH`] stride with [`FRAME_LENGTH`] window size.
+    fn audio_for_frames(n_frames: usize) -> Vec<f32> {
+        let last_end = (n_frames.saturating_sub(1)) * HOP_LENGTH + FRAME_LENGTH;
+        vec![0.0f32; last_end]
+    }
+
+    #[test]
+    fn segment_no_speech_returns_empty() {
+        // No VAD-positive frames at all → no utterances.
+        let n_frames = 10;
+        let audio = audio_for_frames(n_frames);
+        let vad = vec![false; n_frames];
+        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
+        assert!(utterances.is_empty(), "no speech → no utterances");
+    }
+
+    #[test]
+    fn segment_single_utterance_detected() {
+        // 4 speech frames (≥3 consecutive → sustained) + 10 silence frames (≥10 → threshold).
+        let audio = audio_for_frames(14);
+        let mut vad = vec![true; 4];
+        vad.extend(vec![false; 10]);
+        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
+        assert_eq!(
+            utterances.len(),
+            1,
+            "sustained speech + silence → 1 utterance"
+        );
+        assert!(
+            utterances[0].len() >= CONTEXT_PADDING_SAMPLES,
+            "utterance should include pre-speech context padding"
+        );
+    }
+
+    #[test]
+    fn segment_multiple_utterances_separated_by_silence() {
+        // 4 speech, 10 silence, 3 speech, 10 silence → 2 utterances.
+        let n_frames = 4 + 10 + 3 + 10;
+        let audio = audio_for_frames(n_frames);
+        let mut vad = vec![true; 4];
+        vad.extend(vec![false; 10]);
+        vad.extend(vec![true; 3]);
+        vad.extend(vec![false; 10]);
+        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
+        assert_eq!(utterances.len(), 2, "two speech segments → two utterances");
+        for (i, utt) in utterances.iter().enumerate() {
+            assert!(
+                utt.len() >= CONTEXT_PADDING_SAMPLES,
+                "utterance {i} should include context padding"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_short_burst_not_sustained() {
+        // 2 speech frames (fewer than consecutive_required = 3) → no sustained speech.
+        let n_frames = 10;
+        let audio = audio_for_frames(n_frames);
+        let mut vad = vec![true; 2];
+        vad.extend(vec![false; 8]);
+        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
+        assert!(
+            utterances.is_empty(),
+            "short burst below consecutive_required → no utterance",
+        );
+    }
+
+    #[test]
+    fn segment_utterance_at_end_without_silence_not_emitted() {
+        // 8 silence frames, then 4 speech frames at end — no trailing silence
+        // to cross the threshold, so no utterance is emitted.
+        let n_frames = 12;
+        let audio = audio_for_frames(n_frames);
+        let mut vad = vec![false; 8];
+        vad.extend(vec![true; 4]);
+        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
+        assert!(
+            utterances.is_empty(),
+            "speech at end without trailing silence → no utterance",
+        );
+    }
 
     // ── Refractory period state-machine tests ────────────────────────────
     // These test the Error→Listening transition logic via the canonical
@@ -3992,17 +4277,16 @@ mod tests {
         ctx.command_buffer = vec![0.5; 100];
         ctx.silence_sample_count = 1000;
         ctx.score_window = vec![0.5; 5];
-        ctx.raw_audio_ring = vec![0.5; 100];
         ctx.pre_agc_ring = vec![0.5; 100];
-        ctx.post_speech_tail = vec![0.5; 50];
         ctx.negative_audio_buf = vec![0.5; 50];
-        ctx.utterance_buf = vec![0.5; 100];
+        ctx.frame_vad = vec![true; 3];
+        ctx.frame_raw_audio = vec![0.5; 200];
+        ctx.emitted_utterances = 2;
         ctx.utterance_had_speech = true;
         ctx.utterance_silence_samples = 500;
-        ctx.utterance_speech_end_len = 80;
         ctx.enrollment_no_speech_frame_count = 3;
         ctx.vad_positives_in_a_row = 5;
-        ctx.enrollment_pending = Some(vec![0.5; 50]);
+        ctx.enrollment_pending.push_back(vec![0.5; 50]);
         ctx.noise_rms_estimate = Some(0.1);
         ctx.vad_threshold = 0.75;
         ctx.last_wake_word_detection = Some(Instant::now() - Duration::from_secs(5));
@@ -4022,19 +4306,20 @@ mod tests {
         assert!(ctx.command_buffer.is_empty());
         assert_eq!(ctx.silence_sample_count, 0);
         assert!(ctx.score_window.is_empty());
-        assert!(ctx.raw_audio_ring.is_empty());
         assert!(ctx.pre_agc_ring.is_empty());
-        assert!(ctx.post_speech_tail.is_empty());
         assert!(ctx.negative_audio_buf.is_empty());
 
+        // Enrollment VAD accumulation state.
+        assert!(ctx.frame_vad.is_empty());
+        assert!(ctx.frame_raw_audio.is_empty());
+        assert_eq!(ctx.emitted_utterances, 0);
+
         // Enrollment detection/accumulator state.
-        assert!(ctx.utterance_buf.is_empty());
         assert!(!ctx.utterance_had_speech);
         assert_eq!(ctx.utterance_silence_samples, 0);
-        assert_eq!(ctx.utterance_speech_end_len, 0);
         assert_eq!(ctx.enrollment_no_speech_frame_count, 0);
         assert_eq!(ctx.vad_positives_in_a_row, 0);
-        assert!(ctx.enrollment_pending.is_none());
+        assert!(ctx.enrollment_pending.is_empty());
         assert!(ctx.noise_rms_estimate.is_none());
     }
 

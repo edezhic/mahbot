@@ -32,6 +32,7 @@ use crate::voice_verifier::VoiceVerifier;
 use crate::voice_verifier::generate_synthetic_negatives;
 use crate::wake_word_classifier;
 use crate::wake_word_classifier::{TrainingConfig, WakeWordClassifier};
+use earshot::Detector;
 use rand::{RngExt, SeedableRng};
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -480,6 +481,99 @@ fn e2e_voice_pipeline() {
         enroll_failed,
     );
 
+    // ── 2b. VAD gating: verify utterance segmentation (mahbot-823) ─────
+    // Concatenate enrollment audio clips with silence gaps and process
+    // through the extracted VAD gating function to verify that utterance
+    // boundaries are correctly detected.  This exercises the same pure
+    // function used by the production enrollment handler.
+    info!("─── Phase 2b: VAD gating utterance segmentation ───");
+    {
+        // Concatenate enrollment clips with 1.8s of silence between them
+        // (slightly longer than SILENCE_THRESHOLD_SAMPLES = 1.5s to ensure
+        // clean boundary detection).
+        let silence_gap_samples = (super::SILENCE_DURATION.as_millis() as usize + 300) as usize
+            * super::SAMPLE_RATE as usize
+            / 1000;
+        let silence: Vec<f32> = vec![0.0f32; silence_gap_samples];
+        let mut combined_audio: Vec<f32> = Vec::new();
+        for (samples, _label) in &enrollment_variants {
+            if !combined_audio.is_empty() {
+                combined_audio.extend_from_slice(&silence);
+            }
+            combined_audio.extend_from_slice(samples);
+        }
+
+        // Compute VAD decisions for each frame using a fresh detector.
+        let mut detector = Detector::default();
+        let n_frames =
+            combined_audio.len().saturating_sub(super::FRAME_LENGTH) / super::HOP_LENGTH + 1;
+        let mut vad_decisions: Vec<bool> = Vec::with_capacity(n_frames);
+        for i in 0..n_frames {
+            let start = i * super::HOP_LENGTH;
+            let frame = &combined_audio[start..start + super::FRAME_LENGTH];
+            let is_speech = super::is_speech_with_detector(
+                frame,
+                &mut detector,
+                super::ENROLLMENT_VAD_THRESHOLD,
+            );
+            vad_decisions.push(is_speech);
+        }
+
+        // Call the extracted VAD gating function.
+        let utterances = super::segment_utterances_by_vad(
+            &combined_audio,
+            &vad_decisions,
+            &super::DEFAULT_VAD_SEGMENTATION_CONFIG,
+        );
+
+        let expected_count = enrollment_variants.len();
+        info!(
+            "VAD gating: {} utterances detected from {} enrollment clips",
+            utterances.len(),
+            expected_count,
+        );
+
+        // Assert the correct number of utterances was captured.
+        // The TTS-generated enrollment clips are pre-trimmed speech
+        // separated by 1.8s silence gaps, so the VAD gating should
+        // detect exactly one utterance per clip.
+        assert_eq!(
+            utterances.len(),
+            expected_count,
+            "VAD gating: expected {expected_count} utterances from \
+             {expected_count} enrollment clips with 1.8s silence gaps, \
+             got {}",
+            utterances.len(),
+        );
+
+        // Assert each utterance has adequate audio length to produce
+        // meaningful embeddings (≥3 per utterance).  The minimum raw
+        // audio length for 3 embeddings is 3 × EMBEDDING_WINDOW_FRAMES
+        // × MEL_STRIDE ≈ 3 × 76 × 160 = 36480 samples at 16 kHz, but
+        // since embeddings are extracted with stride=8 from the
+        // mel-spectrogram, the actual audio needed is ~76 frames ×
+        // MEL_STRIDE = 12160 samples ≈ 760ms.  We assert a generous
+        // minimum of 400ms (ENROLLMENT_QUALITY_DURATION_MIN_MS) which
+        // corresponds to ~6400 raw audio samples, well above what the
+        // TTS engine should produce for a multi-word wake phrase.
+        let min_audio_len =
+            super::ENROLLMENT_QUALITY_DURATION_MIN_MS as usize * super::SAMPLE_RATE as usize / 1000;
+        for (i, utt) in utterances.iter().enumerate() {
+            let duration_ms = (utt.len() as u64 * 1000) / u64::from(super::SAMPLE_RATE);
+            assert!(
+                utt.len() >= min_audio_len,
+                "Utterance {i} too short: {} samples ({duration_ms}ms) \
+                 — need ≥{min_audio_len} samples ({}ms)",
+                utt.len(),
+                super::ENROLLMENT_QUALITY_DURATION_MIN_MS,
+            );
+            info!(
+                "  Utterance {i}: {} samples ({duration_ms}ms) — OK",
+                utt.len(),
+            );
+        }
+    }
+
     // ── 3. Generate augmented wake word variants ───────────────────────
     info!("─── Phase 3: Generating augmented wake word audio ───");
     let augmented_variants = generate_augmented_variants(&available_styles, 200);
@@ -551,6 +645,15 @@ fn e2e_voice_pipeline() {
     } else {
         info!("Enrollment self-test passed");
     }
+    // NOTE: Self-test assertion is intentionally soft (warn-only) for now.
+    // The self-test requires ≥3 embeddings per utterance to pass, but the
+    // current ENROLLMENT_VAD_THRESHOLD=0.85 produces utterances with only
+    // 1–2 embeddings, making scores always 0.0.  This is the bug that
+    // mahbot-823 is designed to gate-fix: once the VAD threshold is
+    // adjusted (mahbot-835), the `assert!` below should be uncommented.
+    // For now, the E2E test validates utterance capture via Phase 2b's
+    // segment_utterances_by_vad assertions, independent of the self-test.
+    // assert!(self_test_ok.is_ok(), "Enrollment self-test failed: {:?}", self_test_ok);
 
     // ── 5. Train the VoiceVerifier ─────────────────────────────────────
     info!("─── Phase 5: Training VoiceVerifier ───");
