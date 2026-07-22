@@ -254,14 +254,14 @@ const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
 /// Maximum size of the raw audio ring buffer (~200ms at 16kHz = 3200
 /// samples).  Used during enrollment to capture ~100ms of pre-VAD-trigger
 /// and post-speech context so the template includes the onset/offset
-/// phonemes that strict enrollment VAD (0.85) excludes.
+/// phonemes that the enrollment VAD threshold excludes.
 pub(crate) const RAW_RING_MAX: usize = SAMPLE_RATE as usize / 5;
 
 /// Context padding duration in milliseconds for VAD asymmetry mitigation
 /// (mahbot-775 Fix 3).  Used to prepend ~100ms of pre-VAD-trigger context
 /// and append ~100ms of post-speech context to enrollment utterances, so
-/// the template includes the onset/offset phonemes that strict enrollment
-/// VAD (0.85) excludes but live detection (VAD=0.5) includes.
+/// the template includes the onset/offset phonemes that enrollment
+/// VAD excludes but live detection (VAD=0.5) includes.
 const CONTEXT_PADDING_MS: usize = 100;
 
 /// Context padding in audio samples at 16 kHz, derived from
@@ -470,7 +470,7 @@ pub(crate) fn score_single_embedding(
 /// pass during enrollment to prevent ambient noise (traffic, wind) from
 /// contaminating the template (mahbot-772).  The detection VAD threshold
 /// stays at 0.5 for responsiveness.
-pub(crate) const ENROLLMENT_VAD_THRESHOLD: f32 = 0.85;
+pub(crate) const ENROLLMENT_VAD_THRESHOLD: f32 = 0.60;
 
 /// Minimum consecutive VAD-positive frames before setting utterance_had_speech
 /// during enrollment (~48ms at 16ms/frame).  Prevents a single noise spike

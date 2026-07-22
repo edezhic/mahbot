@@ -689,20 +689,23 @@ mod tests {
     fn test_add_white_noise() {
         // Flat signal at 0.5 — noise should produce measurable deviation
         let samples = vec![0.5f32; 1000];
-        let noisy = add_noise(&samples, 20.0, NoiseType::White);
+        let noisy = add_noise(&samples, 10.0, NoiseType::White);
         assert_eq!(noisy.len(), samples.len());
         // All samples should still be in range
         for &s in &noisy {
             assert!((-1.0..=1.0).contains(&s));
         }
         // Signal should have changed (noise injection is deterministic in distribution)
-        let rms_before = compute_rms(&samples);
-        let rms_after = compute_rms(&noisy);
-        // At 20 dB SNR, signal RMS = 0.5, noise RMS ≈ 0.5/10 = 0.05,
-        // so output RMS should differ from input
+        // At 10 dB SNR, signal RMS = 0.5, noise RMS ≈ 0.5/3.16 ≈ 0.158.
+        // Measure noise-only RMS by subtracting the flat signal first,
+        // avoiding the signal-noise cross-term that causes flakiness with
+        // combined RMS (the noise sample mean can cancel the energy).
+        let noise_part: Vec<f32> = noisy.iter().map(|&s| s - 0.5).collect();
+        let noise_rms = compute_rms(&noise_part);
+        let expected_noise_rms = 0.5 * 10.0_f32.powf(-10.0 / 20.0);
         assert!(
-            (rms_after - rms_before).abs() > 0.001,
-            "Noise should change RMS: before={rms_before}, after={rms_after}"
+            (noise_rms - expected_noise_rms).abs() < 0.02,
+            "White noise RMS should be ~{expected_noise_rms} at 10 dB SNR, got {noise_rms}"
         );
         // At least some samples should differ from the flat 0.5
         let changed = noisy.iter().filter(|&&s| (s - 0.5).abs() > 0.01).count();
@@ -722,12 +725,16 @@ mod tests {
             assert!((-1.0..=1.0).contains(&s));
         }
         // Signal should have changed (noise injection is deterministic in distribution)
-        let rms_before = compute_rms(&samples);
-        let rms_after = compute_rms(&noisy);
-        // At 10 dB SNR with flat 0.25 signal, noise should measurably change RMS
+        // At 10 dB SNR, signal RMS = 0.25, noise RMS ≈ 0.25/3.16 ≈ 0.079.
+        // Measure noise-only RMS by subtracting the flat signal first,
+        // avoiding the signal-noise cross-term that causes flakiness with
+        // combined RMS (the noise sample mean can cancel the energy).
+        let noise_part: Vec<f32> = noisy.iter().map(|&s| s - 0.25).collect();
+        let noise_rms = compute_rms(&noise_part);
+        let expected_noise_rms = 0.25 * 10.0_f32.powf(-10.0 / 20.0);
         assert!(
-            (rms_after - rms_before).abs() > 0.001,
-            "Pink noise should change RMS: before={rms_before}, after={rms_after}"
+            (noise_rms - expected_noise_rms).abs() < 0.02,
+            "Pink noise RMS should be ~{expected_noise_rms} at 10 dB SNR, got {noise_rms}"
         );
         // At least some samples should differ from the flat 0.25
         let changed = noisy.iter().filter(|&&s| (s - 0.25).abs() > 0.01).count();
