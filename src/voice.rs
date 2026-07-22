@@ -2307,7 +2307,7 @@ struct PipelineCtx {
 ///
 /// | Level | When to use | Behavioral summary |
 /// |---|---|---|
-/// | [`Full`](ResetLevel::Full) | New mic stream or acoustic environment change | Clears ALL buffers + calls `reset_vad()` + `audio_preprocessor.reset()` (new NoiseSuppressor) + resets `is_recording`, `auto_start_pending`, `vad_threshold`, `last_wake_word_detection` + clears global enrollment accumulators |
+/// | [`Full`](ResetLevel::Full) | New mic stream or acoustic environment change | Clears ALL buffers + calls `reset_vad()` + `audio_preprocessor.reset()` (new NoiseSuppressor) + resets `is_recording`, `auto_start_pending`, `vad_threshold`, `last_wake_word_detection`. Preserves global enrollment accumulators (survive mic stop/start). |
 /// | [`Soft`](ResetLevel::Soft) | Same mic stream transition (enrollment↔detection, detection↔recording) | Clears audio accumulators + enrollment fields + `audio_preprocessor.clear_buffer()` (preserves NS noise profile) + preserves VAD state, `vad_threshold`, `last_wake_word_detection`, `auto_start_pending`, `is_recording`, and global enrollment accumulators |
 /// | [`Cancel`](ResetLevel::Cancel) | Explicit enrollment cancellation or completion | Same buffer clearing as Soft + resets `vad_threshold` to [`VAD_THRESHOLD`] + clears `last_wake_word_detection` + clears global enrollment accumulators (`enrollment_buffer`, `negative_audio_chunks`) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2381,7 +2381,7 @@ impl PipelineCtx {
     /// | `is_recording` | `false` | preserved | preserved |
     /// | `audio_preprocessor` | `.reset()` | `.clear_buffer()` | `.clear_buffer()` |
     /// | VAD (`reset_vad()`) | called | NOT called | NOT called |
-    /// | Global `enrollment_buffer`, `negative_audio_chunks` | cleared | preserved | cleared |
+    /// | Global `enrollment_buffer`, `negative_audio_chunks` | preserved | preserved | cleared |
     /// | `refractory_until`, `last_error_message_time`, `last_model_retry`, `mic_rx`, `mic_stream`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
     fn reset_pipeline_state(&mut self, level: ResetLevel) {
         // ── Audio accumulators (cleared by all levels) ──
@@ -2416,10 +2416,11 @@ impl PipelineCtx {
                 self.audio_preprocessor.reset();
                 reset_vad();
 
-                // Full clear also nukes the global enrollment accumulators.
-                let mut state = voice_state().write().unwrap_poison();
-                state.enrollment_buffer.clear();
-                state.negative_audio_chunks.clear();
+                // Full does NOT clear global enrollment accumulators — those
+                // survive mic stop/start cycles so mid-enrollment progress is
+                // preserved across toggle-off/on (mahbot-800, mahbot-819).
+                // Only ResetLevel::Cancel (explicit cancel or start-fresh)
+                // clears the global enrollment buffer and negative audio chunks.
             }
             ResetLevel::Soft => {
                 // Preserve VAD state, NS noise profile (clear_buffer, not reset),
@@ -2572,10 +2573,9 @@ impl PipelineCtx {
         // profile and VAD state are no longer representative of the next
         // acoustic environment.  Full level uses audio_preprocessor.reset()
         // (new NoiseSuppressor) and reset_vad() (mahbot-800, mahbot-805).
-        // Note: this clears global enrollment accumulators too, so any
-        // mid-enrollment progress from a prior session is lost on toggle-off
-        // — Full assumes a new mic stream, which invalidates the enrollment
-        // embedding model for the new acoustic environment (mahbot-805).
+        // Global enrollment accumulators are preserved across mic stop/start
+        // so mid-enrollment progress survives toggle-off/on (mahbot-800,
+        // mahbot-819).
         self.reset_pipeline_state(ResetLevel::Full);
         self.is_listening = false;
         self.enrollment_mode = false;
@@ -4061,10 +4061,12 @@ mod tests {
         assert!(!ctx.auto_start_pending);
         assert!(!ctx.is_recording);
 
-        // Global enrollment accumulators cleared.
+        // Global enrollment accumulators PRESERVED by Full — they survive
+        // mic stop/start cycles so mid-enrollment progress is not lost on
+        // toggle-off/on (mahbot-800, mahbot-819).
         let state = voice_state().read().unwrap_poison();
-        assert!(state.enrollment_buffer.is_empty());
-        assert!(state.negative_audio_chunks.is_empty());
+        assert_eq!(state.enrollment_buffer.len(), 1);
+        assert_eq!(state.negative_audio_chunks.len(), 1);
     }
 
     #[test]
@@ -4155,46 +4157,25 @@ mod tests {
 
     #[test]
     #[serial_test::serial(voice)]
-    fn reset_soft_preserves_refractory_and_rate_limit_timers() {
+    fn reset_levels_preserve_session_ux_state() {
         let _ = init_global();
-        let mut ctx = PipelineCtx::new();
-        ctx.refractory_until = Some(Instant::now());
-        ctx.last_error_message_time = Some(Instant::now());
+        // Session-level UX state (refractory_until, last_error_message_time)
+        // must survive all reset levels — no level touches them.
+        for level in [ResetLevel::Soft, ResetLevel::Full, ResetLevel::Cancel] {
+            let mut ctx = PipelineCtx::new();
+            ctx.refractory_until = Some(Instant::now());
+            ctx.last_error_message_time = Some(Instant::now());
 
-        ctx.reset_pipeline_state(ResetLevel::Soft);
+            ctx.reset_pipeline_state(level);
 
-        // Session-level UX state must survive soft transitions.
-        assert!(ctx.refractory_until.is_some());
-        assert!(ctx.last_error_message_time.is_some());
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn reset_full_preserves_refractory_and_rate_limit_timers() {
-        let _ = init_global();
-        let mut ctx = PipelineCtx::new();
-        ctx.refractory_until = Some(Instant::now());
-        ctx.last_error_message_time = Some(Instant::now());
-
-        ctx.reset_pipeline_state(ResetLevel::Full);
-
-        // Even Full should not touch these session-level timers.
-        assert!(ctx.refractory_until.is_some());
-        assert!(ctx.last_error_message_time.is_some());
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn reset_cancel_preserves_refractory_and_rate_limit_timers() {
-        let _ = init_global();
-        let mut ctx = PipelineCtx::new();
-        ctx.refractory_until = Some(Instant::now());
-        ctx.last_error_message_time = Some(Instant::now());
-
-        ctx.reset_pipeline_state(ResetLevel::Cancel);
-
-        // Session-level UX state must survive cancel transitions too.
-        assert!(ctx.refractory_until.is_some());
-        assert!(ctx.last_error_message_time.is_some());
+            assert!(
+                ctx.refractory_until.is_some(),
+                "refractory_until lost at {level:?}"
+            );
+            assert!(
+                ctx.last_error_message_time.is_some(),
+                "last_error_message_time lost at {level:?}"
+            );
+        }
     }
 }
