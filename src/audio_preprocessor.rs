@@ -213,8 +213,8 @@ impl AudioPreprocessor {
     /// - **Quiet audio** (input RMS << TARGET_RMS) converges in ~114 chunks
     ///   (~3.6s) via release α=0.02.
     ///
-    /// Pipeline state transitions at `clear_pipeline_buffers()` call sites
-    /// (~11 locations) typically settle within 320ms because the new phase
+    /// Pipeline state transitions via `PipelineCtx::reset_pipeline_state()`
+    /// (Soft/Cancel → clear_buffer, Full → reset) typically settle within 320ms because the new phase
     /// (listening, recording, enrollment) receives speech-level audio whose
     /// RMS is near TARGET_RMS.  The slow release case (~3.6s) only matters
     /// in the rare scenario where the new phase produces consistently quiet

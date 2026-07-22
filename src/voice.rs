@@ -2301,6 +2301,22 @@ struct PipelineCtx {
     last_error_message_time: Option<Instant>,
 }
 
+/// Reset granularity for [`PipelineCtx::reset_pipeline_state`].
+///
+/// Each level maps to a category of pipeline transitions:
+///
+/// | Level | When to use | Behavioral summary |
+/// |---|---|---|
+/// | [`Full`](ResetLevel::Full) | New mic stream or acoustic environment change | Clears ALL buffers + calls `reset_vad()` + `audio_preprocessor.reset()` (new NoiseSuppressor) + resets `is_recording`, `auto_start_pending`, `vad_threshold`, `last_wake_word_detection` + clears global enrollment accumulators |
+/// | [`Soft`](ResetLevel::Soft) | Same mic stream transition (enrollment↔detection, detection↔recording) | Clears audio accumulators + enrollment fields + `audio_preprocessor.clear_buffer()` (preserves NS noise profile) + preserves VAD state, `vad_threshold`, `last_wake_word_detection`, `auto_start_pending`, `is_recording`, and global enrollment accumulators |
+/// | [`Cancel`](ResetLevel::Cancel) | Explicit enrollment cancellation or completion | Same buffer clearing as Soft + resets `vad_threshold` to [`VAD_THRESHOLD`] + clears `last_wake_word_detection` + clears global enrollment accumulators (`enrollment_buffer`, `negative_audio_chunks`) |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetLevel {
+    Full,
+    Soft,
+    Cancel,
+}
+
 impl PipelineCtx {
     fn new() -> Self {
         Self {
@@ -2352,23 +2368,36 @@ impl PipelineCtx {
         }
     }
 
-    /// Clear only detection/recording state while preserving enrollment
-    /// accumulators (`enrollment_buffer`, `negative_audio_chunks`).  Used by
-    /// [`handle_start_listening`] and [`handle_stop_listening`] so that
-    /// toggling voice off/on mid-enrollment does not destroy progress
-    /// (mahbot-800).
+    /// Parameterised pipeline state reset.
     ///
-    /// Preserves:
-    /// - `voice_state().enrollment_buffer` (global enrollment utterance buffer)
-    /// - `voice_state().negative_audio_chunks` (global ambient noise chunks)
-    ///
-    fn clear_detection_buffers(&mut self) {
+    /// | Field | Full | Soft | Cancel |
+    /// |---|---|---|---|
+    /// | `voice_batch`, `mel_frame_buffer`, `embedding_ring`, `audio_buffer`, `command_buffer`, `score_window`, `raw_audio_ring`, `pre_agc_ring`, `post_speech_tail`, `negative_audio_buf` | cleared | cleared | cleared |
+    /// | `silence_sample_count` | = 0 | = 0 | = 0 |
+    /// | `utterance_buf`, `utterance_had_speech`, `utterance_silence_samples`, `utterance_speech_end_len`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
+    /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
+    /// | `last_wake_word_detection` | `None` | preserved | `None` |
+    /// | `auto_start_pending` | `false` | preserved | preserved |
+    /// | `is_recording` | `false` | preserved | preserved |
+    /// | `audio_preprocessor` | `.reset()` | `.clear_buffer()` | `.clear_buffer()` |
+    /// | VAD (`reset_vad()`) | called | NOT called | NOT called |
+    /// | Global `enrollment_buffer`, `negative_audio_chunks` | cleared | preserved | cleared |
+    /// | `refractory_until`, `last_error_message_time`, `last_model_retry`, `mic_rx`, `mic_stream`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
+    fn reset_pipeline_state(&mut self, level: ResetLevel) {
+        // ── Audio accumulators (cleared by all levels) ──
         self.voice_batch.clear();
         self.mel_frame_buffer.clear();
         self.embedding_ring.clear();
         self.audio_buffer.clear();
         self.command_buffer.clear();
         self.silence_sample_count = 0;
+        self.score_window.clear();
+        self.raw_audio_ring.clear();
+        self.pre_agc_ring.clear();
+        self.post_speech_tail.clear();
+        self.negative_audio_buf.clear();
+
+        // ── Enrollment detection/accumulator state (cleared by all levels) ──
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
         self.utterance_silence_samples = 0;
@@ -2376,49 +2405,39 @@ impl PipelineCtx {
         self.enrollment_no_speech_frame_count = 0;
         self.vad_positives_in_a_row = 0;
         self.enrollment_pending = None;
-        self.score_window.clear();
         self.noise_rms_estimate = None;
-        self.raw_audio_ring.clear();
-        self.pre_agc_ring.clear();
-        self.post_speech_tail.clear();
-        self.vad_threshold = VAD_THRESHOLD;
-        self.last_wake_word_detection = None;
-        self.audio_preprocessor.clear_buffer();
-        self.negative_audio_buf.clear();
-        // NOTE: `refractory_until` and `last_error_message_time` are NOT
-        // cleared here — they are session-level UX state (rate-limiting
-        // debounce and the Error→Listening refractory timer), not
-        // per-detection-cycle audio buffers.  Clearing them would reset
-        // the rate-limit counter mid-session and abort an in-progress
-        // refractory period, both of which are incorrect.
-        // Reset VAD detector state so stale ring buffer + pre-emphasis
-        // filter state from the previous stream does not misclassify
-        // the first few frames (mahbot-771 Fix 3, mahbot-800 C1).
-        reset_vad();
-    }
 
-    /// Clear all audio buffers and processing state.
-    ///
-    /// Resets:
-    /// - `voice_batch`, `mel_frame_buffer`, `embedding_ring`
-    /// - `audio_buffer`, `command_buffer`
-    /// - `utterance_buf` and enrollment tracking fields
-    /// - `enrollment_no_speech_frame_count`
-    ///
-    /// Full pipeline buffer clear — clears detection, recording, AND
-    /// enrollment accumulators.  Intended for post-enrollment cleanup
-    /// (after successful enrollment) and explicit enrollment
-    /// start/cancel.  Do NOT call from [`handle_start_listening`] or
-    /// [`handle_stop_listening`] — use [`clear_detection_buffers`]
-    /// instead to preserve mid-enrollment state (mahbot-800).
-    fn clear_pipeline_buffers(&mut self) {
-        // Clear all detection/recording state (preserves global enrollment accumulators)
-        self.clear_detection_buffers();
-        // Then clear the global enrollment accumulators that clear_detection_buffers preserves.
-        // Single lock acquisition for both clears (mahbot-800).
-        let mut state = voice_state().write().unwrap_poison();
-        state.enrollment_buffer.clear();
-        state.negative_audio_chunks.clear();
+        match level {
+            ResetLevel::Full => {
+                self.vad_threshold = VAD_THRESHOLD;
+                self.last_wake_word_detection = None;
+                self.auto_start_pending = false;
+                self.is_recording = false;
+                self.audio_preprocessor.reset();
+                reset_vad();
+
+                // Full clear also nukes the global enrollment accumulators.
+                let mut state = voice_state().write().unwrap_poison();
+                state.enrollment_buffer.clear();
+                state.negative_audio_chunks.clear();
+            }
+            ResetLevel::Soft => {
+                // Preserve VAD state, NS noise profile (clear_buffer, not reset),
+                // vad_threshold, last_wake_word_detection cooldown,
+                // auto_start_pending, is_recording, and global enrollment accumulators.
+                self.audio_preprocessor.clear_buffer();
+            }
+            ResetLevel::Cancel => {
+                self.vad_threshold = VAD_THRESHOLD;
+                self.last_wake_word_detection = None;
+                self.audio_preprocessor.clear_buffer();
+
+                // Cancel also clears global enrollment accumulators.
+                let mut state = voice_state().write().unwrap_poison();
+                state.enrollment_buffer.clear();
+                state.negative_audio_chunks.clear();
+            }
+        }
     }
 
     /// Transition from wake-word-detection to recording mode (mahbot-802).
@@ -2445,19 +2464,19 @@ impl PipelineCtx {
     /// on `PipelineCtx`.
     fn transition_to_recording(&mut self) {
         self.is_recording = true;
-        self.command_buffer.clear();
-        // Forward the entire audio_buffer (processed wake-word tail + unprocessed
-        // command start) into command_buffer so ASR receives the transition audio.
-        // ASR tolerates the extra wake-word overlap at the start (mahbot-802).
-        // extend_from_slice copies, so audio_buffer must be cleared separately.
-        self.command_buffer.extend_from_slice(&self.audio_buffer);
-        self.silence_sample_count = 0;
-        self.mel_frame_buffer.clear();
-        self.embedding_ring.clear();
-        self.audio_buffer.clear();
-        self.voice_batch.clear();
-        self.score_window.clear();
-        self.audio_preprocessor.clear_buffer();
+        // Save the wake-word tail + unprocessed command-start before the Soft
+        // reset clears audio_buffer.  ASR tolerates the extra wake-word overlap
+        // at the start (mahbot-802).
+        let audio = std::mem::take(&mut self.audio_buffer);
+        // Soft reset: clears detection buffers (mel, embedding, voice_batch,
+        // score_window, raw_audio_ring, pre_agc_ring, post_speech_tail,
+        // negative_audio_buf, audio_preprocessor frame buffer) while
+        // preserving VAD state, noise-suppressor noise profile, and
+        // vad_threshold (mahbot-802).  command_buffer and silence_sample_count
+        // are cleared by the reset — we re-populate command_buffer from the
+        // saved audio.
+        self.reset_pipeline_state(ResetLevel::Soft);
+        self.command_buffer.extend_from_slice(&audio);
         self.last_wake_word_detection = Some(Instant::now());
     }
 
@@ -2523,7 +2542,7 @@ impl PipelineCtx {
             return;
         }
         if !self.is_listening {
-            self.clear_detection_buffers();
+            self.reset_pipeline_state(ResetLevel::Full);
             drop(self.mic_stream.take());
             match start_microphone() {
                 Ok((rx, stream)) => {
@@ -2549,18 +2568,17 @@ impl PipelineCtx {
     }
 
     fn handle_stop_listening(&mut self) {
-        // Use clear_detection_buffers instead of clear_pipeline_buffers so
-        // that mid-enrollment progress (enrollment_buffer, negative_audio_chunks)
-        // is preserved across a toggle-off/on cycle (mahbot-800).
-        self.clear_detection_buffers();
+        // Full reset: the mic stream is being torn down, so the old noise
+        // profile and VAD state are no longer representative of the next
+        // acoustic environment.  Full level uses audio_preprocessor.reset()
+        // (new NoiseSuppressor) and reset_vad() (mahbot-800, mahbot-805).
+        // Note: this clears global enrollment accumulators too, so any
+        // mid-enrollment progress from a prior session is lost on toggle-off
+        // — Full assumes a new mic stream, which invalidates the enrollment
+        // embedding model for the new acoustic environment (mahbot-805).
+        self.reset_pipeline_state(ResetLevel::Full);
         self.is_listening = false;
-        self.is_recording = false;
         self.enrollment_mode = false;
-        self.auto_start_pending = false;
-        // Full reset of the audio pre-processor: the mic is being torn down,
-        // so the NS noise profile from this acoustic environment is no longer
-        // representative.  The next start_listening may be in a different room.
-        self.audio_preprocessor.reset();
         drop(self.mic_stream.take());
         self.mic_rx = None;
         set_status(VoiceStatus::Disabled);
@@ -2576,14 +2594,20 @@ impl PipelineCtx {
             return;
         }
 
-        // Preserve existing enrollment progress if we're resuming an
-        // interrupted session (e.g., after a toggle-off/on cycle that
-        // preserved enrollment_buffer via clear_detection_buffers).
-        // Only clear everything when starting truly fresh (mahbot-800).
+        // Resume existing enrollment progress if available (e.g., the user
+        // clicked Enroll while already enrolled or mid-enrollment — the
+        // global enrollment_buffer from the interrupted session is intact).
+        // When starting fresh (existing_count == 0), use Cancel-level reset
+        // to clear stale buffers while preserving VAD/NS continuity (same
+        // mic stream, same acoustic environment) — mahbot-805.
         let existing_count = voice_state().read().unwrap_poison().enrollment_buffer.len();
 
         if existing_count == 0 {
-            self.clear_pipeline_buffers();
+            // Cancel-level reset: clears all audio buffers, enrollment
+            // accumulators, and global enrollment state, but preserves
+            // VAD/NS continuity (same mic stream, same acoustic environment).
+            // vad_threshold will be set to ENROLLMENT_VAD_THRESHOLD below.
+            self.reset_pipeline_state(ResetLevel::Cancel);
         }
 
         self.enrollment_mode = true;
@@ -2601,9 +2625,9 @@ impl PipelineCtx {
     }
 
     fn handle_cancel_enrollment(&mut self) {
-        self.clear_pipeline_buffers();
+        self.reset_pipeline_state(ResetLevel::Cancel);
         self.enrollment_mode = false;
-        self.vad_threshold = VAD_THRESHOLD;
+        // vad_threshold already restored to VAD_THRESHOLD by Cancel level.
         set_status(if self.is_listening {
             VoiceStatus::Listening
         } else {
@@ -2833,7 +2857,13 @@ pub async fn run_voice_pipeline() {
                 // Clear all audio buffers BEFORE resetting enrollment_mode
                 // to prevent stale audio from leaking into detection mode
                 // during the ~1.5s status delay (mahbot-765 Race condition fix).
-                ctx.clear_pipeline_buffers();
+                // Cancel level: clears audio buffers, enrollment accumulators,
+                // restores vad_threshold to VAD_THRESHOLD, but preserves VAD/NS
+                // continuity (same mic stream, same acoustic environment).
+                // Does NOT call reset_vad() — the earshot noise floor estimate
+                // from the enrollment phase is deliberately carried through to
+                // detection mode (mahbot-805).
+                ctx.reset_pipeline_state(ResetLevel::Cancel);
                 ctx.enrollment_mode = false;
                 // Schedule transition to Listening after showing "Enrolled"
                 // for 1.5 seconds, so the user gets visual confirmation that
@@ -3196,9 +3226,13 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
                 }
 
                 // Cleanup: return to listening immediately on success.
-                // This runs for both the empty-transcription and the
-                // routed-success paths.
-                ctx.silence_sample_count = 0;
+                // Soft reset clears detection/recording buffers (mel, embedding,
+                // voice_batch, score_window, command_buffer, raw_audio_ring,
+                // pre_agc_ring, post_speech_tail, negative_audio_buf) while
+                // preserving VAD state, NS noise profile, vad_threshold, and the
+                // wake-word cooldown timestamp to prevent immediate re-triggering
+                // (mahbot-805).
+                ctx.reset_pipeline_state(ResetLevel::Soft);
                 ctx.is_recording = false;
                 set_status(VoiceStatus::Listening);
             }
@@ -3235,7 +3269,10 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
                 ctx.refractory_until = Some(Instant::now() + Duration::from_secs(3));
 
                 // Cleanup the recording state.
-                ctx.silence_sample_count = 0;
+                // Soft reset clears recording/detection buffers while preserving
+                // VAD/NS continuity so the noise floor estimate survives the
+                // refractory period (mahbot-805).
+                ctx.reset_pipeline_state(ResetLevel::Soft);
                 ctx.is_recording = false;
                 // Do NOT set status to Listening here — the refractory delay
                 // is handled in the main loop's post-select section.
@@ -3646,7 +3683,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     // Note: noise_rms_estimate is intentionally NOT reset here.
                     // It is consumed by the main loop at line 3048 via
                     // ctx.noise_rms_estimate.take() alongside enrollment_pending.
-                    // reset is handled by clear_pipeline_buffers for
+                    // reset is handled by reset_pipeline_state(Cancel) for
                     // cancellation/completion safety.  Clearing it here would
                     // destroy the captured noise RMS before the main loop can
                     // use it for compute_utterance_quality (mahbot-782).
@@ -3931,5 +3968,233 @@ mod tests {
         );
         // 9s < 10s threshold → should suppress.
         assert!(!ctx.should_send_error_message());
+    }
+
+    // ── reset_pipeline_state level tests (mahbot-805) ─────────────────────
+    // These test the three ResetLevel variants against a PipelineCtx with
+    // non-default field values.  Tests that touch global voice state (Full,
+    // Cancel) use #[serial_test::serial(voice)].
+    //
+    // The audio_preprocessor is tested indirectly: Full calls .reset() (new
+    // NoiseSuppressor), Soft and Cancel call .clear_buffer() (preserves NS
+    // adaptive noise profile).  These distinctions are not observable through
+    // PipelineCtx's public API — they rely on the internal NoiseSuppressor
+    // instance being recreated (reset) or kept (clear_buffer).
+
+    /// Helper: build a PipelineCtx with non-default values in all mutable
+    /// fields that reset_pipeline_state may touch.
+    fn ctx_with_populated_buffers() -> PipelineCtx {
+        let mut ctx = PipelineCtx::new();
+        ctx.voice_batch = vec![0.5; 100];
+        ctx.mel_frame_buffer = vec![vec![0.5; 32]; 10];
+        ctx.embedding_ring = vec![vec![0.5; 96]; 3];
+        ctx.audio_buffer = vec![0.5; 100];
+        ctx.command_buffer = vec![0.5; 100];
+        ctx.silence_sample_count = 1000;
+        ctx.score_window = vec![0.5; 5];
+        ctx.raw_audio_ring = vec![0.5; 100];
+        ctx.pre_agc_ring = vec![0.5; 100];
+        ctx.post_speech_tail = vec![0.5; 50];
+        ctx.negative_audio_buf = vec![0.5; 50];
+        ctx.utterance_buf = vec![0.5; 100];
+        ctx.utterance_had_speech = true;
+        ctx.utterance_silence_samples = 500;
+        ctx.utterance_speech_end_len = 80;
+        ctx.enrollment_no_speech_frame_count = 3;
+        ctx.vad_positives_in_a_row = 5;
+        ctx.enrollment_pending = Some(vec![0.5; 50]);
+        ctx.noise_rms_estimate = Some(0.1);
+        ctx.vad_threshold = 0.75;
+        ctx.last_wake_word_detection = Some(Instant::now() - Duration::from_secs(5));
+        ctx.auto_start_pending = true;
+        ctx.is_recording = true;
+        ctx
+    }
+
+    /// Assert that all audio accumulators and enrollment-state fields are
+    /// cleared — the common post-reset invariant shared by all level variants.
+    fn assert_buffers_cleared(ctx: &PipelineCtx) {
+        // Audio accumulators.
+        assert!(ctx.voice_batch.is_empty());
+        assert!(ctx.mel_frame_buffer.is_empty());
+        assert!(ctx.embedding_ring.is_empty());
+        assert!(ctx.audio_buffer.is_empty());
+        assert!(ctx.command_buffer.is_empty());
+        assert_eq!(ctx.silence_sample_count, 0);
+        assert!(ctx.score_window.is_empty());
+        assert!(ctx.raw_audio_ring.is_empty());
+        assert!(ctx.pre_agc_ring.is_empty());
+        assert!(ctx.post_speech_tail.is_empty());
+        assert!(ctx.negative_audio_buf.is_empty());
+
+        // Enrollment detection/accumulator state.
+        assert!(ctx.utterance_buf.is_empty());
+        assert!(!ctx.utterance_had_speech);
+        assert_eq!(ctx.utterance_silence_samples, 0);
+        assert_eq!(ctx.utterance_speech_end_len, 0);
+        assert_eq!(ctx.enrollment_no_speech_frame_count, 0);
+        assert_eq!(ctx.vad_positives_in_a_row, 0);
+        assert!(ctx.enrollment_pending.is_none());
+        assert!(ctx.noise_rms_estimate.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn reset_full_clears_all_buffers_and_state() {
+        let _ = init_global();
+        let mut ctx = ctx_with_populated_buffers();
+
+        // Pre-populate global enrollment state.
+        {
+            let mut state = voice_state().write().unwrap_poison();
+            state.enrollment_buffer.push(vec![vec![0.5; 96]]);
+            state.negative_audio_chunks.push(vec![0.5; 100]);
+        }
+
+        ctx.reset_pipeline_state(ResetLevel::Full);
+
+        assert_buffers_cleared(&ctx);
+
+        // Full-specific: state flags reset.
+        assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
+        assert!(ctx.last_wake_word_detection.is_none());
+        assert!(!ctx.auto_start_pending);
+        assert!(!ctx.is_recording);
+
+        // Global enrollment accumulators cleared.
+        let state = voice_state().read().unwrap_poison();
+        assert!(state.enrollment_buffer.is_empty());
+        assert!(state.negative_audio_chunks.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn reset_full_preserves_handler_managed_flags() {
+        let _ = init_global();
+        let mut ctx = ctx_with_populated_buffers();
+
+        // Full should NOT touch these — they are owned by handler functions.
+        ctx.is_listening = true;
+        ctx.enrollment_mode = true;
+
+        ctx.reset_pipeline_state(ResetLevel::Full);
+
+        assert!(ctx.is_listening);
+        assert!(ctx.enrollment_mode);
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn reset_soft_preserves_vad_threshold_cooldown_and_flags() {
+        let _ = init_global();
+        let mut ctx = ctx_with_populated_buffers();
+
+        // Pre-populate global enrollment state so we can verify it's preserved.
+        let saved_buffer = vec![vec![vec![0.5; 96]]]; // one utterance with one frame
+        let saved_chunks = vec![vec![0.5; 100]];
+        {
+            let mut state = voice_state().write().unwrap_poison();
+            state.enrollment_buffer = saved_buffer.clone();
+            state.negative_audio_chunks = saved_chunks.clone();
+        }
+
+        let saved_threshold = ctx.vad_threshold; // 0.75
+        let saved_cooldown = ctx.last_wake_word_detection;
+        let saved_auto_start = ctx.auto_start_pending;
+        let saved_recording = ctx.is_recording;
+
+        ctx.reset_pipeline_state(ResetLevel::Soft);
+
+        assert_buffers_cleared(&ctx);
+
+        // Soft preserves these.
+        assert_eq!(ctx.vad_threshold, saved_threshold);
+        assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
+        assert_eq!(ctx.auto_start_pending, saved_auto_start);
+        assert_eq!(ctx.is_recording, saved_recording);
+
+        // Global enrollment accumulators preserved.
+        let state = voice_state().read().unwrap_poison();
+        assert_eq!(state.enrollment_buffer, saved_buffer);
+        assert_eq!(state.negative_audio_chunks, saved_chunks);
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn reset_cancel_clears_enrollment_and_vad_threshold() {
+        let _ = init_global();
+        let mut ctx = ctx_with_populated_buffers();
+
+        // Pre-populate global enrollment state so we can verify it's cleared.
+        {
+            let mut state = voice_state().write().unwrap_poison();
+            state.enrollment_buffer.push(vec![vec![0.5; 96]]);
+            state.negative_audio_chunks.push(vec![0.5; 100]);
+        }
+
+        let saved_auto_start = ctx.auto_start_pending;
+        let saved_recording = ctx.is_recording;
+
+        ctx.reset_pipeline_state(ResetLevel::Cancel);
+
+        assert_buffers_cleared(&ctx);
+
+        // Cancel clears vad_threshold and last_wake_word_detection.
+        assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
+        assert!(ctx.last_wake_word_detection.is_none());
+
+        // Cancel preserves handler-managed flags (unlike Full).
+        assert_eq!(ctx.auto_start_pending, saved_auto_start);
+        assert_eq!(ctx.is_recording, saved_recording);
+
+        // Global enrollment accumulators cleared (unlike Soft).
+        let state = voice_state().read().unwrap_poison();
+        assert!(state.enrollment_buffer.is_empty());
+        assert!(state.negative_audio_chunks.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn reset_soft_preserves_refractory_and_rate_limit_timers() {
+        let _ = init_global();
+        let mut ctx = PipelineCtx::new();
+        ctx.refractory_until = Some(Instant::now());
+        ctx.last_error_message_time = Some(Instant::now());
+
+        ctx.reset_pipeline_state(ResetLevel::Soft);
+
+        // Session-level UX state must survive soft transitions.
+        assert!(ctx.refractory_until.is_some());
+        assert!(ctx.last_error_message_time.is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn reset_full_preserves_refractory_and_rate_limit_timers() {
+        let _ = init_global();
+        let mut ctx = PipelineCtx::new();
+        ctx.refractory_until = Some(Instant::now());
+        ctx.last_error_message_time = Some(Instant::now());
+
+        ctx.reset_pipeline_state(ResetLevel::Full);
+
+        // Even Full should not touch these session-level timers.
+        assert!(ctx.refractory_until.is_some());
+        assert!(ctx.last_error_message_time.is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn reset_cancel_preserves_refractory_and_rate_limit_timers() {
+        let _ = init_global();
+        let mut ctx = PipelineCtx::new();
+        ctx.refractory_until = Some(Instant::now());
+        ctx.last_error_message_time = Some(Instant::now());
+
+        ctx.reset_pipeline_state(ResetLevel::Cancel);
+
+        // Session-level UX state must survive cancel transitions too.
+        assert!(ctx.refractory_until.is_some());
+        assert!(ctx.last_error_message_time.is_some());
     }
 }
