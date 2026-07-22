@@ -313,6 +313,17 @@ const _: () = assert!(
      for the Conv1D MLP classifier"
 );
 
+/// Compile-time invariant: EMBEDDING_RING_MAX must be at least
+/// wake_word_classifier::WINDOW_SIZE so the tiling fallback (used when the
+/// ring has fewer than WINDOW_SIZE entries) has at least one embedding to
+/// tile from.  This prevents a repeat-last `len()-1` underflow if WINDOW_SIZE
+/// is ever changed independently of ROLLING_WINDOW_N.
+const _: () = assert!(
+    EMBEDDING_RING_MAX >= wake_word_classifier::WINDOW_SIZE,
+    "EMBEDDING_RING_MAX must be >= wake_word_classifier::WINDOW_SIZE to ensure \
+     the ring is non-empty when the tiling fallback is reached"
+);
+
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
 /// (mahbot-773).  At 0.65, the average per-frame soft score must exceed ~65%
 /// for detection to fire.
@@ -392,12 +403,14 @@ fn process_wake_word_score(total_score: f32, score_window: &mut Vec<f32>) -> boo
 /// ([`try_match_wake_word_and_push_embedding`]), enrollment self-test
 /// ([`run_enrollment_self_test`]), and integration tests.
 ///
-/// It manages the ring buffer, runs the Conv1D MLP classifier forward pass,
+/// It manages the ring buffer, runs the Conv1D MLP classifier forward pass
+/// (tiling available embeddings to fill the 3-embedding window when the ring
+/// has fewer than 3 entries — see [`score_single_embedding`] implementation),
 /// applies rolling window scoring via [`process_wake_word_score`], and checks
 /// the second-stage logistic regression verifier gate.  All three callers
 /// exercise exactly the same code path, so changes to detection logic (ring
-/// buffer sizing, MLP window, rolling sum threshold, verifier gating) are
-/// automatically validated by the E2E test.
+/// buffer sizing, MLP window, tiling behaviour, rolling sum threshold, verifier
+/// gating) are automatically validated by the E2E test.
 ///
 /// # Returns
 /// - `true` — the embedding triggered wake word detection (all gates passed).
@@ -426,14 +439,33 @@ pub(crate) fn score_single_embedding(
     }
 
     // ── MLP classifier forward pass (replaces DTW template matching) ──
-    // Needs 3 consecutive embeddings.  Before 3 are buffered, score is 0.
+    // Needs 3 consecutive embeddings for the Conv1D window.  When fewer than
+    // 3 embeddings are available, tile the available embeddings to fill the
+    // window before scoring.  AdaptiveAvgPool collapses the time dimension,
+    // so tiling provides an unbiased estimate of the class-conditional score
+    // in expectation over a stationary embedding distribution.  The rolling
+    // window and verifier provide additional false-positive mitigation for
+    // the tiled fallback path.
+    // Tiling strategy: repeat-last — fill positions up to the ring length
+    // normally, then duplicate the last embedding for any remaining positions.
     let total_score = if let Some(classifier) = classifier {
         if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
             let start = embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
             let window = &embedding_ring[start..];
             classifier.forward(window)
         } else {
-            0.0
+            // Ring is non-empty (embedding was pushed above), with 1 or
+            // 2 entries.  Repeat-last tiling: [a] → [a,a,a]; [a,b] → [a,b,b].
+            debug_assert!(
+                !embedding_ring.is_empty(),
+                "embedding_ring should be non-empty after push"
+            );
+            let last = embedding_ring.len() - 1;
+            let mut window = Vec::with_capacity(wake_word_classifier::WINDOW_SIZE);
+            for i in 0..wake_word_classifier::WINDOW_SIZE {
+                window.push(embedding_ring[i.min(last)].clone());
+            }
+            classifier.forward(&window)
         }
     } else {
         0.0
@@ -4254,6 +4286,165 @@ mod tests {
         );
         // 9s < 10s threshold → should suppress.
         assert!(!ctx.should_send_error_message());
+    }
+
+    // ── score_single_embedding tiling fallback tests (mahbot-825) ──────────
+    // Tests that when the embedding ring has fewer than WINDOW_SIZE (3) entries,
+    // the available embeddings are tiled to fill the window instead of returning
+    // a hard-coded 0.0.  These exercise the pure detection logic without ONNX
+    // models — just the Conv1D classifier with known weights.
+
+    /// Build a WakeWordClassifier with all-zero weights so it always outputs
+    /// sigmoid(0.0) = 0.5, regardless of input.  This lets us verify that the
+    /// tiling fallback actually runs the classifier forward pass (producing a
+    /// non-zero, known score) rather than short-circuiting to 0.0.
+    fn classifier_always_half() -> WakeWordClassifier {
+        let mut w = ClassifierWeights::default();
+        // Zero all trainable weights and biases so the forward pass produces
+        // sigmoid(0.0) = 0.5 for any input.  Batch norm parameters from
+        // default() are already identity (gamma=1, beta=0, mean=0, var=1).
+        w.conv1_weight.fill(0.0);
+        w.conv1_bias.fill(0.0);
+        w.conv2_weight.fill(0.0);
+        w.conv2_bias.fill(0.0);
+        w.fc_weight.fill(0.0);
+        w.fc_bias.fill(0.0);
+        WakeWordClassifier::new(w)
+    }
+
+    #[test]
+    fn score_single_1_embedding_tiles_to_nonzero() {
+        // When the ring has only 1 embedding after push, the tiling fallback
+        // should produce a non-zero score (replaces the old hard-coded 0.0).
+        let classifier = classifier_always_half();
+        let embedding = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+
+        let detected = score_single_embedding(
+            &embedding,
+            &mut ring,
+            Some(&classifier),
+            None,
+            &mut score_window,
+        );
+
+        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.3) → window appended.
+        // Rolling sum 0.5 < match_threshold (1.95) → detection does NOT fire.
+        assert!(
+            !detected,
+            "single embedding should not trigger detection (rolling sum < threshold)",
+        );
+        assert!(
+            !score_window.is_empty(),
+            "tiling should produce a score ≥0.3, giving a non-empty score window",
+        );
+
+        let score = score_window[0];
+        assert!(
+            (score - 0.5).abs() < 0.01,
+            "Expected score ~0.5 from always-half classifier, got {score}",
+        );
+        assert_eq!(ring.len(), 1, "ring should hold exactly 1 embedding");
+    }
+
+    #[test]
+    fn score_single_2_embeddings_tiles_to_nonzero() {
+        // With 2 embeddings in the ring, the tiling fallback should also
+        // produce a non-zero score (repeat-last: [a, b, b]).
+        let classifier = classifier_always_half();
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+
+        // First embedding: ring = [a], tiled to [a, a, a] → score ~0.5.
+        let _detected =
+            score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
+        assert!(
+            !score_window.is_empty(),
+            "first embedding should produce a score"
+        );
+        assert_eq!(
+            ring.len(),
+            1,
+            "ring should have 1 embedding after first push"
+        );
+
+        // Second embedding: ring = [a, b], tiled to [a, b, b] → score ~0.5.
+        score_window.clear();
+        let detected =
+            score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
+        assert!(
+            !detected,
+            "two embeddings should not trigger detection (rolling sum < 1.95)",
+        );
+        assert!(
+            !score_window.is_empty(),
+            "second embedding tiling should produce a score ≥0.3",
+        );
+        assert_eq!(ring.len(), 2, "ring should have 2 embeddings");
+    }
+
+    #[test]
+    fn score_single_3_embeddings_uses_natural_window() {
+        // With 3+ embeddings, the natural sliding window is used (no tiling).
+        let classifier = classifier_always_half();
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+
+        for _ in 0..3 {
+            let _ =
+                score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
+        }
+
+        assert!(
+            !score_window.is_empty(),
+            "three embeddings should produce a score",
+        );
+        assert!(ring.len() >= 3, "ring should have ≥3 embeddings");
+    }
+
+    #[test]
+    fn score_single_tiled_matches_natural_for_stationary_input() {
+        // For stationary input (all embeddings identical), the tiled window
+        // [a, a, a] should produce the same score as the natural window [a, a, a]
+        // after 3 pushes.  The Conv1D classifier is deterministic, and
+        // AdaptiveAvgPool collapses the time dimension, so the scores match.
+        let classifier = classifier_always_half();
+        let embedding = vec![0.5; EMBEDDING_DIM];
+
+        // Method 1: tiled fallback with 1 embedding → [a, a, a]
+        let mut ring_tiled = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut sw_tiled = Vec::new();
+        let _ = score_single_embedding(
+            &embedding,
+            &mut ring_tiled,
+            Some(&classifier),
+            None,
+            &mut sw_tiled,
+        );
+        let tiled_score = sw_tiled.last().copied().unwrap_or(0.0);
+
+        // Method 2: natural 3-embedding window after 3 pushes
+        let mut ring_nat = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut sw_nat = Vec::new();
+        for _ in 0..3 {
+            let _ = score_single_embedding(
+                &embedding,
+                &mut ring_nat,
+                Some(&classifier),
+                None,
+                &mut sw_nat,
+            );
+        }
+        let natural_score = sw_nat.last().copied().unwrap_or(0.0);
+
+        assert!(
+            (tiled_score - natural_score).abs() < 0.01,
+            "Tiled score {tiled_score} should match natural score {natural_score} \
+             for stationary input",
+        );
     }
 
     // ── reset_pipeline_state level tests (mahbot-805) ─────────────────────
