@@ -276,18 +276,15 @@ fn generate_phrase_variants(
 ///
 /// Returns:
 /// * `positive_embeddings` — flat list of all frame-level 96-dim embedding
-///   vectors across all utterances (for MLP classifier training).
+///   vectors across all utterances (for MLP classifier and verifier training).
 /// * `enrollment_buffer` — per-utterance structure: each element is the
 ///   sequence of frame-level embeddings for one utterance (for self-test).
-/// * `per_utterance_mean` — one mean-pooled 96-dim vector per utterance
-///   (for verifier training).
 /// * `failed_count` — how many variants failed embedding extraction.
 fn process_enrollment(
     variants: &[(Vec<f32>, String)],
-) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>, Vec<Vec<f32>>, usize) {
+) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>, usize) {
     let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
     let mut enrollment_buffer: Vec<Vec<Vec<f32>>> = Vec::new();
-    let mut mean_embeddings: Vec<Vec<f32>> = Vec::new();
     let mut failed = 0usize;
 
     for (samples, label) in variants {
@@ -304,9 +301,6 @@ fn process_enrollment(
                 }
                 // Keep per-utterance structure for self-test
                 enrollment_buffer.push(embeddings.clone());
-                // Mean-pool per-utterance for verifier training
-                let mean = mean_pool(&embeddings);
-                mean_embeddings.push(mean);
                 info!(
                     "Processed enrollment variant '{label}': {} embeddings",
                     embeddings.len()
@@ -319,29 +313,10 @@ fn process_enrollment(
         }
     }
 
-    (all_embeddings, enrollment_buffer, mean_embeddings, failed)
+    (all_embeddings, enrollment_buffer, failed)
 }
 
-/// Mean-pool a sequence of 96-dim embeddings into a single vector.
-fn mean_pool(embeddings: &[Vec<f32>]) -> Vec<f32> {
-    if embeddings.is_empty() {
-        return Vec::new();
-    }
-    let dim = embeddings[0].len();
-    let mut pooled = vec![0.0f32; dim];
-    for emb in embeddings {
-        for (i, &v) in emb.iter().enumerate() {
-            pooled[i] += v;
-        }
-    }
-    let n = embeddings.len() as f32;
-    for v in &mut pooled {
-        *v /= n;
-    }
-    pooled
-}
-
-// ── Detection simulation ──────────────────────────────────────────────────
+// ── Detection simulation ───────────────────────────
 
 /// Simulate the live detection pipeline for a single audio clip's embeddings.
 ///
@@ -478,7 +453,7 @@ fn e2e_voice_pipeline() {
 
     // ── 2. Process enrollment → embeddings ────────────────────────────
     info!("─── Phase 2: Processing enrollment embeddings ───");
-    let (positive_embeddings, enrollment_buffer, mean_embeddings, enroll_failed) =
+    let (positive_embeddings, enrollment_buffer, enroll_failed) =
         process_enrollment(&enrollment_variants);
     assert!(
         !positive_embeddings.is_empty(),
@@ -497,7 +472,7 @@ fn e2e_voice_pipeline() {
     info!("Generated {} augmented variants", augmented_variants.len());
 
     // Process augmented variants through embedding pipeline
-    let (aug_embeddings, aug_enrollment_buffer, aug_mean_embeddings, aug_failed) =
+    let (aug_embeddings, aug_enrollment_buffer, aug_failed) =
         process_enrollment(&augmented_variants);
     info!(
         "Extracted {} augmented embeddings from {} variants ({} failed)",
@@ -513,8 +488,6 @@ fn e2e_voice_pipeline() {
     // utterances — the name reflects its content for the self-test.
     let mut all_utterance_buffers = enrollment_buffer; // move
     all_utterance_buffers.extend(aug_enrollment_buffer);
-    let mut all_mean_embeddings = mean_embeddings; // move
-    all_mean_embeddings.extend(aug_mean_embeddings);
 
     info!(
         "Combined training set: {} positive embeddings from {} utterances",
@@ -557,7 +530,7 @@ fn e2e_voice_pipeline() {
     let verifier_negatives = generate_synthetic_negatives(SYNTHETIC_NEGATIVE_COUNT, dim);
 
     let verifier = VoiceVerifier::train(
-        &all_mean_embeddings,
+        &all_positive_embeddings,
         &verifier_negatives,
         0.5,  // default threshold
         1.0,  // L2 lambda
@@ -568,7 +541,7 @@ fn e2e_voice_pipeline() {
     if verifier.is_trained() {
         info!(
             "VoiceVerifier trained successfully with {} positive + {} negative",
-            all_mean_embeddings.len(),
+            all_positive_embeddings.len(),
             verifier_negatives.len()
         );
     } else {
