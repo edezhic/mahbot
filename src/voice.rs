@@ -114,6 +114,47 @@ const SILENCE_THRESHOLD_SAMPLES: usize =
 /// even under scheduling jitter.
 const SILENCE_UI_GATE_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 
+/// Capacity of the microphone audio channel feeding the voice pipeline.
+///
+/// 32 chunks × 512 samples / 16000 Hz ≈ 1 second of audio.  When the pipeline
+/// is blocked (e.g. ONNX inference in [`handle_wake_word_detection`]),
+/// [`try_send`](tokio::sync::mpsc::Sender::try_send) silently drops chunks
+/// at this threshold, preventing unbounded memory growth.
+///
+/// # Drop policy
+///
+/// This is **drop-newest**: the most recent audio chunk is discarded when the
+/// channel is full.  During a pipeline stall the buffered audio is slightly
+/// delayed (~1 s) but temporally contiguous, so downstream processing (VAD,
+/// mel extraction, wake-word classifier) operates on consistent stream
+/// segments.  The wake word may be missed if it arrives entirely within the
+/// dropped window, but the user will simply repeat it.
+///
+/// # VAD state
+///
+/// The [`earshot::Detector`] maintains an internal ring buffer and pre-emphasis
+/// filter that stay synchronised with the audio stream *as processed* by the
+/// pipeline.  Dropped chunks create a temporal gap at the stream level, but
+/// the detector processes whatever it receives next — spurious VAD frames are
+/// short-lived (1–2 frames) and the detector self-corrects on subsequent audio.
+///
+/// # Future work
+///
+/// The underlying latency cause is that ONNX inference (mel spectrogram,
+/// embedding) runs on the async runtime via
+/// [`tokio::task::block_in_place`](https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html)
+/// inside [`handle_wake_word_detection`].  Moving these to
+/// [`tokio::task::spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
+/// (as enrollment already does) would reduce pipeline stalls and minimise
+/// the frequency of dropped chunks.  The bounded channel is a tractable
+/// first step that caps memory growth without restructuring the hot path.
+///
+/// # See also
+///
+/// * [`start_microphone`] — channel creation
+/// * ticket mahbot-804 — unbounded queue growth root cause
+const MIC_CHANNEL_CAPACITY: usize = 32;
+
 /// Duration of non-VAD audio before showing "speak louder" warning during
 /// enrollment (~5s).  Derived from SAMPLE_RATE and HOP_LENGTH so the threshold
 /// stays correct if frame/hop sizes are adjusted (mahbot-765).
@@ -1492,7 +1533,7 @@ fn retry_model_loading() -> bool {
 /// When `T = f32` and `convert` is the identity closure `|&s| s`, this
 /// function handles the F32 path identically to the integer format paths.
 fn convert_and_send_audio_to_pipeline<T, F>(
-    tx: &mpsc::UnboundedSender<Vec<f32>>,
+    tx: &mpsc::Sender<Vec<f32>>,
     data: &[T],
     channels: u16,
     sample_rate: u32,
@@ -1508,7 +1549,9 @@ fn convert_and_send_audio_to_pipeline<T, F>(
         } else {
             crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
         };
-        let _ = tx.send(resampled);
+        if let Err(e) = tx.try_send(resampled) {
+            debug!("Mic audio chunk dropped (1ch fast-path): {e}");
+        }
         return;
     }
 
@@ -1531,11 +1574,13 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     } else {
         crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
     };
-    let _ = tx.send(resampled);
+    if let Err(e) = tx.try_send(resampled) {
+        debug!("Mic audio chunk dropped: {e}");
+    }
 }
 
-fn start_microphone() -> Result<(mpsc::UnboundedReceiver<Vec<f32>>, cpal::Stream)> {
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<f32>>();
+fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
+    let (tx, rx) = mpsc::channel::<Vec<f32>>(MIC_CHANNEL_CAPACITY);
 
     let host = cpal::default_host();
     let device = host
@@ -2136,7 +2181,7 @@ unsafe impl Send for SendMicStream {}
 /// Runtime state for the voice pipeline main loop.
 #[allow(clippy::struct_excessive_bools)]
 struct PipelineCtx {
-    mic_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>>,
+    mic_rx: Option<mpsc::Receiver<Vec<f32>>>,
     mic_stream: SendMicStream,
     is_listening: bool,
     is_recording: bool,
