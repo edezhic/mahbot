@@ -2294,16 +2294,13 @@ impl PipelineCtx {
     /// - `voice_state().enrollment_buffer` (global enrollment utterance buffer)
     /// - `voice_state().negative_audio_chunks` (global ambient noise chunks)
     ///
-    /// ⚠ If you add, remove, or reset a field in this function, update the
-    ///    test helpers `fill_detection_buffers` and
-    ///    `assert_detection_buffers_cleared` in
-    ///    `test_voice_pipeline_commands_and_enrollment_guard` to match.
     fn clear_detection_buffers(&mut self) {
         self.voice_batch.clear();
         self.mel_frame_buffer.clear();
         self.embedding_ring.clear();
         self.audio_buffer.clear();
         self.command_buffer.clear();
+        self.silence_sample_count = 0;
         self.utterance_buf.clear();
         self.utterance_had_speech = false;
         self.utterance_silence_samples = 0;
@@ -3040,7 +3037,7 @@ async fn persist_model_state() {
 #[allow(clippy::cast_precision_loss)]
 async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     ctx.command_buffer.extend_from_slice(&samples);
-    let speech = is_speech(&samples);
+    let speech = is_speech_with_threshold(&samples, ctx.vad_threshold);
     if speech {
         ctx.silence_sample_count = 0;
     } else {
@@ -3070,19 +3067,31 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 
         match transcribe_audio(&cmd_buf).await {
             Ok(transcribed) => {
-                info!("Transcribed: {transcribed}");
-                route_to_agent(transcribed).await;
-                set_status(VoiceStatus::Listening);
-                ctx.is_recording = false;
+                // Guard: skip routing if ASR produced an empty or
+                // whitespace-only transcription (qwen-asr can return
+                // Ok("") when the model outputs zero text tokens).
+                if transcribed.trim().is_empty() {
+                    warn!(
+                        "Empty transcription — dropping ({} samples, {:.1}s)",
+                        cmd_buf.len(),
+                        duration_secs,
+                    );
+                } else {
+                    info!("Transcribed: {transcribed}");
+                    route_to_agent(transcribed).await;
+                }
             }
             Err(e) => {
                 warn!("Transcription failed: {e}");
                 set_status(VoiceStatus::Error("Transcription failed".to_string()));
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                set_status(VoiceStatus::Listening);
-                ctx.is_recording = false;
             }
         }
+
+        // Common cleanup for all three paths above.
+        ctx.silence_sample_count = 0;
+        ctx.is_recording = false;
+        set_status(VoiceStatus::Listening);
     }
 }
 
