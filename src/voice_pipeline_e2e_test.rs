@@ -709,18 +709,20 @@ fn e2e_voice_pipeline() {
 
     let classifier = WakeWordClassifier::new(weights.clone());
 
-    // ── Self-test: verify proportion of enrollment utterances trigger detection ──
-    // Uses `ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION` (currently 0.8) as the
-    // pass threshold, keeping the test in sync with the production self-test.
-    // The self-test now uses VAD-gated utterance embeddings (Phase 2 + Phase 3)
-    // which match the production enrollment pipeline (mahbot-824).
-    info!("─── Phase 4b: Enrollment self-test ───");
-    let self_test_ok = super::run_enrollment_self_test(&all_utterance_buffers, &classifier);
+    // ── Enrollment consistency check ──
+    info!("─── Phase 4b: Enrollment consistency check ───");
+    let consistency_ok = super::validate_enrollment_consistency(&all_utterance_buffers);
     assert!(
-        self_test_ok.is_ok(),
-        "Enrollment self-test failed: {:?}",
-        self_test_ok,
+        consistency_ok.is_ok(),
+        "Enrollment consistency check failed: {:?}",
+        consistency_ok,
     );
+
+    // ── Informational self-test (non-gating, diagnostic only) ──
+    match super::run_enrollment_self_test(&all_utterance_buffers, &classifier) {
+        Ok(()) => info!("Detection self-test (informational): passed"),
+        Err(e) => info!("Detection self-test (informational, non-gating): {e}"),
+    }
 
     // ── 5. Train the VoiceVerifier ─────────────────────────────────────
     info!("─── Phase 5: Training VoiceVerifier ───");

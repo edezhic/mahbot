@@ -108,6 +108,28 @@ impl ClassifierWeights {
         anyhow::ensure!(self.bn2_running_var.len() == CONV2_OUT);
         anyhow::ensure!(self.fc_weight.len() == CONV2_OUT * FC_OUT);
         anyhow::ensure!(self.fc_bias.len() == FC_OUT);
+        // Check for NaN/Infinity — guards against silent training failures
+        // (NaN gradients, degenerate input normalization) that shape checks
+        // alone don't catch.
+        anyhow::ensure!(
+            self.conv1_weight
+                .iter()
+                .chain(self.conv1_bias.iter())
+                .chain(self.bn1_gamma.iter())
+                .chain(self.bn1_beta.iter())
+                .chain(self.bn1_running_mean.iter())
+                .chain(self.bn1_running_var.iter())
+                .chain(self.conv2_weight.iter())
+                .chain(self.conv2_bias.iter())
+                .chain(self.bn2_gamma.iter())
+                .chain(self.bn2_beta.iter())
+                .chain(self.bn2_running_mean.iter())
+                .chain(self.bn2_running_var.iter())
+                .chain(self.fc_weight.iter())
+                .chain(self.fc_bias.iter())
+                .all(|v| v.is_finite()),
+            "Classifier weights contain NaN or Infinity"
+        );
         Ok(())
     }
     pub fn param_count(&self) -> usize {

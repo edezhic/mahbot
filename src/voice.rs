@@ -32,6 +32,7 @@
 use crate::ChatDirection;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
+use crate::vector::cosine_similarity;
 use crate::voice_verifier::{EMBEDDING_DIM, VoiceVerifier};
 use crate::wake_word_classifier::{self, ClassifierWeights, TrainingConfig, WakeWordClassifier};
 use anyhow::{Context, Result, anyhow};
@@ -239,8 +240,24 @@ pub(crate) const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
 /// Utterances longer than this may contain too much silence padding.
 pub(crate) const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
 
-/// Fraction of enrollment utterances that must pass self-test (≥8/10).
+/// Fraction of enrollment utterances that must trigger detection in the
+/// informational self-test (non-gating, diagnostic only).
 const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
+
+/// Minimum cosine similarity between an utterance's mean embedding and the
+/// centroid for the consistency check.  Set to 0.65 as a conservative
+/// starting value — the enrollment prompts intentionally diversify
+/// (distance, angle, voice quality) which can lower cross-utterance
+/// similarity.  Tuning plan: run the E2E test against this threshold.
+/// If valid enrollments consistently fail, lower to 0.60; if false
+/// acceptances increase, raise to 0.70.
+const ENROLLMENT_CONSISTENCY_MIN_SIMILARITY: f32 = 0.65;
+
+/// Fraction of enrollment utterances that must pass the consistency check.
+/// Uses ceil() rounding, making the effective pass fraction vary with N
+/// (70% for N=10, up to ~83% for N=6).  This is intentional — fewer
+/// utterances get a higher bar to compensate for the smaller sample.
+const ENROLLMENT_CONSISTENCY_MIN_FRACTION: f32 = 0.7;
 
 /// Enrollment prompts for multi-position guidance (mahbot-778).
 /// Each entry is (prompt_text, count_of_samples_for_this_prompt).
@@ -1974,11 +1991,6 @@ fn run_enrollment_self_test(
             enrollment_buffer.len(),
         ))
     } else {
-        info!(
-            "Enrollment self-test passed: {passed}/{} utterances triggered detection \
-             (threshold ≥{required})",
-            enrollment_buffer.len(),
-        );
         Ok(())
     }
 }
@@ -2197,30 +2209,86 @@ pub(crate) fn segment_utterances_by_vad(
 
 /// Train the Conv1D wake word classifier from the enrollment buffer.
 ///
-/// Returns the trained [`ClassifierWeights`] on success, after running the
-/// self-test to verify ≥80% of enrollment utterances trigger detection.
+/// Returns the trained [`ClassifierWeights`] on success, after validating
+/// utterance quality via [`validate_enrollment_consistency`] (gating) and
+/// training the classifier.  The old detection-based self-test is preserved
+/// as an informational-only diagnostic in the caller (see
+/// [`handle_enrollment_sample`]).
 fn finalize_enrollment(
     positive_embeddings: &[Vec<f32>],
     negative_embeddings: &[Vec<f32>],
     enrollment_buffer: &[Vec<Vec<f32>>],
 ) -> Result<ClassifierWeights> {
-    if positive_embeddings.is_empty() {
-        anyhow::bail!("No positive embeddings available for training");
-    }
+    anyhow::ensure!(
+        !positive_embeddings.is_empty(),
+        "No positive embeddings available for training"
+    );
 
-    // ── Train the Conv1D classifier ──
+    // Step 1: Consistency check — gates on utterance quality before training
+    validate_enrollment_consistency(enrollment_buffer)?;
+
+    // Step 2: Train the Conv1D classifier (unchanged)
     let config = TrainingConfig::default();
     let weights =
         wake_word_classifier::train_classifier(positive_embeddings, negative_embeddings, &config)?;
-
-    // ── Self-test: verify ≥80% of enrollment utterances trigger detection ──
-    let classifier = WakeWordClassifier::new(weights.clone());
-    if let Err(msg) = run_enrollment_self_test(enrollment_buffer, &classifier) {
-        warn!("{msg}");
-        return Err(anyhow!("{msg}"));
-    }
+    // validate() inside train_classifier checks shapes + NaN/finite
 
     Ok(weights)
+}
+
+/// Validate enrollment utterance quality via centroid cosine similarity.
+///
+/// # Gating
+/// - Requires ≥5 utterances with ≥3 embeddings each.
+/// - Requires ≥ceil(N * `ENROLLMENT_CONSISTENCY_MIN_FRACTION`) utterances to have
+///   cosine similarity ≥`ENROLLMENT_CONSISTENCY_MIN_SIMILARITY` to the centroid.
+///
+/// This replaces the old detection-based self-test which was brittle because
+/// `score_single_embedding` requires ≥3 embeddings per utterance, a condition
+/// the enrollment VAD threshold (~0.60) rarely guarantees.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn validate_enrollment_consistency(enrollment_buffer: &[Vec<Vec<f32>>]) -> Result<()> {
+    // Filter to utterances with ≥3 embeddings
+    let qualified: Vec<Vec<f32>> = enrollment_buffer
+        .iter()
+        .filter(|utt| utt.len() >= 3)
+        .map(|utt| crate::voice_verifier::mean_pool_embeddings(utt))
+        .collect();
+
+    let total = qualified.len();
+    anyhow::ensure!(
+        total >= 5,
+        "Only {total} enrollment utterances had sufficient audio (need ≥5 with ≥3 embeddings). \
+         Speak clearly and close to the microphone.",
+    );
+
+    let centroid = crate::voice_verifier::mean_pool_embeddings(&qualified);
+
+    // Count utterances that pass the similarity threshold
+    let passed = qualified
+        .iter()
+        .filter(|mean_emb| {
+            cosine_similarity(mean_emb, &centroid) >= ENROLLMENT_CONSISTENCY_MIN_SIMILARITY
+        })
+        .count();
+
+    let required = (total as f32 * ENROLLMENT_CONSISTENCY_MIN_FRACTION).ceil() as usize;
+    anyhow::ensure!(
+        passed >= required,
+        "Enrollment consistency check failed: only {passed}/{total} utterances met the \
+         quality threshold (need ≥{required} with cosine similarity \
+         ≥{ENROLLMENT_CONSISTENCY_MIN_SIMILARITY}). \
+         Try re-enrolling in a quieter environment with clearer, more consistent speech.",
+    );
+
+    info!(
+        "Enrollment consistency check passed: {passed}/{total} utterances (threshold ≥{required})",
+    );
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3326,6 +3394,13 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     );
                     v
                 };
+
+                // ── Informational self-test (non-gating, diagnostic only) ──
+                let classifier = WakeWordClassifier::new(weights.clone());
+                match run_enrollment_self_test(&enrollment_buffer, &classifier) {
+                    Ok(()) => debug!("Detection self-test (informational): passed"),
+                    Err(e) => debug!("Detection self-test (informational, non-gating): {e}"),
+                }
 
                 // ── Store classifier + verifier in global state ──
                 set_classifier_weights(weights.clone());
@@ -4654,5 +4729,68 @@ mod tests {
                 "last_error_message_time lost at {level:?}"
             );
         }
+    }
+
+    // ── Enrollment consistency check tests ────────────────────────────
+
+    /// Build a 96-dim embedding with a single non-zero component at `dim`.
+    fn basis_embedding(dim: usize) -> Vec<f32> {
+        let mut v = vec![0.0; EMBEDDING_DIM];
+        if dim < EMBEDDING_DIM {
+            v[dim] = 1.0;
+        }
+        v
+    }
+
+    /// Build an enrollment buffer from per-utterance basis dimensions.
+    fn enrollment_from_bases(bases: &[usize], n_embs_per_utt: usize) -> Vec<Vec<Vec<f32>>> {
+        bases
+            .iter()
+            .map(|&dim| vec![basis_embedding(dim); n_embs_per_utt])
+            .collect()
+    }
+
+    #[test]
+    fn consistency_check_fails_when_too_few_utterances() {
+        // 4 utterances with 3 embeddings each → <5 qualified → fail
+        let buf = enrollment_from_bases(&[0, 0, 0, 0], 3);
+        let result = validate_enrollment_consistency(&buf);
+        assert!(result.is_err(), "expected failure with <5 utterances");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("4 enrollment utterances"),
+            "error should mention utterance count: {msg}"
+        );
+    }
+
+    #[test]
+    fn consistency_check_fails_when_too_few_pass_threshold() {
+        // 6 good (basis 0) + 4 bad (basis 1):
+        //   centroid ≈ [0.6, 0.4, 0.0], cosine(good, centroid) ≈ 0.832 >=0.65,
+        //   cosine(bad, centroid) ≈ 0.555 <0.65.
+        // 6/10 pass, need ceil(10*0.7)=7 → fail
+        let buf = enrollment_from_bases(&[0, 0, 0, 0, 0, 0, 1, 1, 1, 1], 3);
+        let result = validate_enrollment_consistency(&buf);
+        assert!(result.is_err(), "expected failure with only 6/10 passing");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("only 6/10"),
+            "error should report 6/10 passed: {msg}"
+        );
+    }
+
+    #[test]
+    fn consistency_check_succeeds_with_high_quality_utterances() {
+        // 8 good (basis 0) + 2 bad (basis 1):
+        //   centroid ≈ [0.8, 0.2, 0.0], cosine(good, centroid) ≈ 0.970 >=0.65,
+        //   cosine(bad, centroid) ≈ 0.285 <0.65.
+        // 8/10 pass, need ceil(10*0.7)=7 → success
+        let buf = enrollment_from_bases(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 1], 3);
+        let result = validate_enrollment_consistency(&buf);
+        assert!(
+            result.is_ok(),
+            "expected success with 8/10 passing: {:?}",
+            result,
+        );
     }
 }

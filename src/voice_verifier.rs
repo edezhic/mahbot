@@ -481,9 +481,10 @@ pub(crate) fn generate_synthetic_negatives(count: usize, dim: usize) -> Vec<Vec<
 ///
 /// Note: As of mahbot-788 Fix 3, the verifier training uses per-frame
 /// embeddings directly instead of mean-pooled vectors. This function is
-/// preserved as a utility for potential future use.
+/// now used by [`validate_enrollment_consistency`](crate::voice::validate_enrollment_consistency)
+/// to compute per-utterance means for centroid cosine-similarity analysis.
+/// It remains available for any other use that needs utterance-level pooling.
 #[must_use]
-#[allow(dead_code)]
 pub fn mean_pool_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
     if embeddings.is_empty() {
         return Vec::new();
