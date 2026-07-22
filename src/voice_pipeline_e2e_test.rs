@@ -317,6 +317,31 @@ fn process_enrollment(
     (all_embeddings, enrollment_buffer, failed)
 }
 
+/// Compute VAD frame decisions and segment audio into utterances at the
+/// enrollment VAD threshold.  Shared by the VAD-gated enrollment pipeline
+/// and the VAD segmentation validation test to eliminate duplication.
+fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
+    let n_frames = audio.len().saturating_sub(super::FRAME_LENGTH) / super::HOP_LENGTH + 1;
+    let mut detector = Detector::default();
+    let mut vad_decisions: Vec<bool> = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        let start = i * super::HOP_LENGTH;
+        let end = (start + super::FRAME_LENGTH).min(audio.len());
+        let frame = &audio[start..end];
+        vad_decisions.push(super::is_speech_with_detector(
+            frame,
+            &mut detector,
+            super::ENROLLMENT_VAD_THRESHOLD,
+        ));
+    }
+    let utterances = super::segment_utterances_by_vad(
+        audio,
+        &vad_decisions,
+        &super::DEFAULT_VAD_SEGMENTATION_CONFIG,
+    );
+    (vad_decisions, utterances)
+}
+
 /// Process enrollment variants through VAD gating + embedding extraction,
 /// simulating the production enrollment pipeline.
 ///
@@ -324,41 +349,20 @@ fn process_enrollment(
 /// utterances via [`segment_utterances_by_vad`], then extracts embeddings
 /// via [`process_enrollment_sample`] from each VAD-gated utterance.
 ///
-/// Returns the same triple as [`process_enrollment`]: flat embeddings list
-/// (for classifier training), per-utterance embedding buffers (for self-test),
-/// and failed variant count.
+/// Returns the same pair as [`process_enrollment`] (minus the failed count):
+/// flat embeddings list (for classifier training) and per-utterance embedding
+/// buffers (for self-test).
 fn process_vad_gated_enrollment(
     variants: &[(Vec<f32>, String)],
-) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>, usize) {
+) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>) {
     let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
     let mut enrollment_buffer: Vec<Vec<Vec<f32>>> = Vec::new();
-    let mut failed = 0usize;
 
     for (samples, label) in variants {
-        // Compute VAD decisions for the full variant at enrollment threshold.
-        let mut detector = Detector::default();
-        let n_frames = samples.len().saturating_sub(super::FRAME_LENGTH) / super::HOP_LENGTH + 1;
-        let mut vad_decisions: Vec<bool> = Vec::with_capacity(n_frames);
-        for i in 0..n_frames {
-            let start = i * super::HOP_LENGTH;
-            let frame = &samples[start..start + super::FRAME_LENGTH];
-            vad_decisions.push(super::is_speech_with_detector(
-                frame,
-                &mut detector,
-                super::ENROLLMENT_VAD_THRESHOLD,
-            ));
-        }
-
-        // Segment by VAD with production config.
-        let utterances = super::segment_utterances_by_vad(
-            samples,
-            &vad_decisions,
-            &super::DEFAULT_VAD_SEGMENTATION_CONFIG,
-        );
+        let (_vad_decisions, utterances) = compute_vad_segments(samples);
 
         if utterances.is_empty() {
             warn!("VAD gating detected no speech in variant '{label}'");
-            failed += 1;
             continue;
         }
 
@@ -381,17 +385,14 @@ fn process_vad_gated_enrollment(
                 }
                 Err(e) => {
                     warn!("VAD-gated embedding failed for '{label}': {e}");
-                    failed += 1;
-                    // Break after first failure per variant to prevent
-                    // double-counting when a variant has multiple utterances
-                    // and more than one fails.
+                    // Skip remaining utterances for this variant.
                     break;
                 }
             }
         }
     }
 
-    (all_embeddings, enrollment_buffer, failed)
+    (all_embeddings, enrollment_buffer)
 }
 
 // ── Detection simulation ───────────────────────────
@@ -550,7 +551,7 @@ fn e2e_voice_pipeline() {
     // used for classifier training (Phase 4) and self-test (Phase 4b),
     // matching the production data path exactly.
     info!("─── Phase 2: VAD-gated enrollment embeddings ───");
-    let (vad_positive_embeddings, vad_enrollment_buffer, _) =
+    let (vad_positive_embeddings, vad_enrollment_buffer) =
         process_vad_gated_enrollment(&enrollment_variants);
     assert!(
         !vad_enrollment_buffer.is_empty(),
@@ -602,28 +603,8 @@ fn e2e_voice_pipeline() {
             combined_audio.extend_from_slice(samples);
         }
 
-        // Compute VAD decisions for each frame using a fresh detector.
-        let mut detector = Detector::default();
-        let n_frames =
-            combined_audio.len().saturating_sub(super::FRAME_LENGTH) / super::HOP_LENGTH + 1;
-        let mut vad_decisions: Vec<bool> = Vec::with_capacity(n_frames);
-        for i in 0..n_frames {
-            let start = i * super::HOP_LENGTH;
-            let frame = &combined_audio[start..start + super::FRAME_LENGTH];
-            let is_speech = super::is_speech_with_detector(
-                frame,
-                &mut detector,
-                super::ENROLLMENT_VAD_THRESHOLD,
-            );
-            vad_decisions.push(is_speech);
-        }
-
-        // Call the extracted VAD gating function.
-        let utterances = super::segment_utterances_by_vad(
-            &combined_audio,
-            &vad_decisions,
-            &super::DEFAULT_VAD_SEGMENTATION_CONFIG,
-        );
+        // Use the shared helper to compute VAD segments.
+        let (_vad_decisions, utterances) = compute_vad_segments(&combined_audio);
 
         let expected_count = enrollment_variants.len();
         info!(
@@ -647,13 +628,9 @@ fn e2e_voice_pipeline() {
 
         // Assert each utterance has adequate audio length for embedding.
         // The 400ms floor (ENROLLMENT_QUALITY_DURATION_MIN_MS) ensures VAD
-        // gating captured real speech rather than noise blips.  A separate
-        // ≥3-embedding assertion in Phase 2 validates production adequacy.
-        // For reference: 3 embeddings at stride=8 requires ~92 mel frames
-        // ≈ 920ms of audio (76-frame window + 2 strides × 8 frames/stride
-        // × 10ms/frame), but with context padding (~200ms) and the lower
-        // enrollment VAD threshold (0.60), typical ~1s wake words produce
-        // 3–4 embeddings per utterance.
+        // gating captured real speech rather than noise blips.  Phase 2's
+        // ≥3-embedding assertion validates production adequacy separately;
+        // see Phase 2 comment for stride/embedding math.
         let min_audio_len =
             super::ENROLLMENT_QUALITY_DURATION_MIN_MS as usize * super::SAMPLE_RATE as usize / 1000;
         for (i, utt) in utterances.iter().enumerate() {
@@ -679,13 +656,12 @@ fn e2e_voice_pipeline() {
 
     // Process augmented variants through VAD-gated pipeline to match
     // the production data path (mahbot-824).
-    let (vad_augmented_embeddings, vad_augmented_enrollment_buffer, vad_aug_failed) =
+    let (vad_augmented_embeddings, vad_augmented_enrollment_buffer) =
         process_vad_gated_enrollment(&augmented_variants);
     info!(
-        "Extracted {} VAD-gated augmented embeddings from {} variants ({} failed)",
+        "Extracted {} VAD-gated augmented embeddings from {} variants",
         vad_augmented_embeddings.len(),
         augmented_variants.len(),
-        vad_aug_failed,
     );
 
     // Merge VAD-gated enrollment + augmentation embeddings for training

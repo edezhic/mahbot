@@ -2416,7 +2416,8 @@ struct PipelineCtx {
     /// VAD threshold for the current mode.  Set to [`VAD_THRESHOLD`] for
     /// detection/recording and [`ENROLLMENT_VAD_THRESHOLD`] for enrollment
     /// (mahbot-772).  Stored in the context so tests can use [`VAD_THRESHOLD`]
-    /// without needing the synthetic test signal to score above 0.85.
+    /// without needing the synthetic test signal to score above the
+    /// enrollment VAD threshold.
     vad_threshold: f32,
     audio_buffer: Vec<f32>,
     mel_frame_buffer: Vec<Vec<f32>>,
