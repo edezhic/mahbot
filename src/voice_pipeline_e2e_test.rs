@@ -81,7 +81,11 @@ const NOISE_LEN: usize = 16_000;
 /// Number of synthetic negative embeddings to generate for classifier training.
 /// This is supplemented with real negative examples from unrelated phrases
 /// (see Phase 4) to provide a diverse negative training set.
-const SYNTHETIC_NEGATIVE_COUNT: usize = 50;
+///
+/// Equal to [`crate::voice_verifier::SYNTHETIC_NEGATIVES_COUNT`] for consistency —
+/// both produce the same number of synthetic negatives so the test configuration
+/// is representative of production's fallback path.
+const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 
 /// TTS target sample rate (voice pipeline rate).
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -635,32 +639,71 @@ fn e2e_voice_pipeline() {
     // verifier is trained on real ambient audio negatives — the confusable
     // near-misses teach the classifier/verifier to discriminate beyond
     // synthetic Gaussian noise.  Confusable detection uses a different TTS
-    // seed (300) than confusable training (500), measuring generalization to
-    // novel acoustic renderings.  Unrelated detection and training both use
-    // seed 400 — this tests rejection of known-phrase acoustics without the
-    // generalization confound.
+    // seed (300) than confusable training (500/510/520), measuring generalization to
+    // novel acoustic renderings.  Unrelated detection uses seed 400; unrelated training
+    // uses seeds 400/410/420 for diverse acoustic renderings (mahbot-829).
+    //
+    // Generate confusable negatives with multiple seeds (500, 510, 520) to
+    // provide diverse acoustic renderings of each confusable phrase, improving
+    // the classifier's ability to reject near-miss phrases that sound similar
+    // to the wake word (mahbot-829).
     info!("─── Phase 3: Generating negative training data ───");
     info!("Generating negative training audio from unrelated + confusable phrases...");
-    let neg_unrelated: Vec<(Vec<f32>, String)> =
+    let neg_unrelated_1: Vec<(Vec<f32>, String)> =
         generate_phrase_variants(UNRELATED_PHRASES, &available_styles, 400, "neg_train");
-    let neg_confusable: Vec<(Vec<f32>, String)> =
+    let neg_unrelated_2: Vec<(Vec<f32>, String)> =
+        generate_phrase_variants(UNRELATED_PHRASES, &available_styles, 410, "neg_train");
+    let neg_unrelated_3: Vec<(Vec<f32>, String)> =
+        generate_phrase_variants(UNRELATED_PHRASES, &available_styles, 420, "neg_train");
+    let neg_confusable_1: Vec<(Vec<f32>, String)> =
         generate_phrase_variants(CONFUSABLE_PHRASES, &available_styles, 500, "neg_conf_train");
-    let (mut negative_embeddings, _, _) = process_enrollment(&neg_unrelated);
-    let (conf_neg_embeddings, _, _) = process_enrollment(&neg_confusable);
-    negative_embeddings.extend(conf_neg_embeddings);
+    let neg_confusable_2: Vec<(Vec<f32>, String)> =
+        generate_phrase_variants(CONFUSABLE_PHRASES, &available_styles, 510, "neg_conf_train");
+    let neg_confusable_3: Vec<(Vec<f32>, String)> =
+        generate_phrase_variants(CONFUSABLE_PHRASES, &available_styles, 520, "neg_conf_train");
+    let mut negative_embeddings: Vec<Vec<f32>> = Vec::new();
+    for neg_set in [
+        &neg_unrelated_1,
+        &neg_unrelated_2,
+        &neg_unrelated_3,
+        &neg_confusable_1,
+        &neg_confusable_2,
+        &neg_confusable_3,
+    ] {
+        let (embs, _, _) = process_enrollment(neg_set);
+        negative_embeddings.extend(embs);
+    }
     info!(
-        "Extracted {} real negative embeddings from {} unrelated + {} confusable phrases",
+        "Extracted {} real negative embeddings from {} unrelated (3 seeds) + {} confusable phrases \
+         (across 3 seed variations)",
         negative_embeddings.len(),
-        neg_unrelated.len(),
-        neg_confusable.len(),
+        neg_unrelated_1.len() + neg_unrelated_2.len() + neg_unrelated_3.len(),
+        neg_confusable_1.len() + neg_confusable_2.len() + neg_confusable_3.len(),
     );
 
     // Supplement with synthetic Gaussian negatives for generalization
-    negative_embeddings.extend(generate_synthetic_negatives(SYNTHETIC_NEGATIVE_COUNT, dim));
-    info!(
-        "Total negative training set: {} embeddings ({dim}-dim)",
-        negative_embeddings.len(),
-    );
+    // (used by BOTH classifier and verifier).
+    negative_embeddings.extend(generate_synthetic_negatives(SYNTHETIC_NEGATIVES_COUNT, dim));
+
+    // Build a SEPARATE negative set for the verifier that EXCLUDES confusable
+    // phrases.  The logistic regression verifier is too simple to separate
+    // confusable near-misses from genuine wake words — including confusables
+    // in verifier training would cause the verifier to reject wake-word-like
+    // embeddings (including the first enrollment variant).  The MLP classifier
+    // (trained above with all negatives) handles confusable rejection at the
+    // rolling-window level; the verifier only needs to reject random/unrelated
+    // speech that the classifier might pass.
+    //
+    // Unrelated phrases use 3 TTS seeds (400, 410, 420) so the verifier sees
+    // diverse acoustic renderings and learns a more generalizable boundary,
+    // directly addressing the case where same-seed renderings still trigger
+    // detection (mahbot-829).
+    let mut verifier_negatives: Vec<Vec<f32>> = Vec::new();
+    for unrelated in [&neg_unrelated_1, &neg_unrelated_2, &neg_unrelated_3] {
+        let (embs, _, _) = process_enrollment(unrelated);
+        verifier_negatives.extend(embs);
+    }
+    verifier_negatives.extend(generate_synthetic_negatives(SYNTHETIC_NEGATIVES_COUNT, dim));
 
     // ── 4. finalize_enrollment (consistency check + classifier training) ──
     // Calls the same production function used by the enrollment pipeline
@@ -689,11 +732,17 @@ fn e2e_voice_pipeline() {
     // ── 5. Train the VoiceVerifier ─────────────────────────────────────
     info!("─── Phase 5: Training VoiceVerifier ───");
 
-    // Use the same mixed (real + synthetic) negatives for verifier training.
+    // Use ONLY unrelated + synthetic negatives for verifier training
+    // (excludes confusable phrases — the logistic regression cannot separate
+    // confusable near-misses from wake words).  At 0.60 the verifier blocks
+    // confusable embeddings that pass the rolling window while passing all
+    // wake word variants.
     let verifier = VoiceVerifier::train(
         &all_positive_embeddings,
-        &negative_embeddings,
-        0.5,  // standard logistic regression boundary
+        &verifier_negatives,
+        0.60, // mahbot-829: clean verifier at 0.60 blocks confusables that
+        // pass the rolling window.  No confusable negatives in training
+        // ensures the first variant's embeddings are not rejected.
         1.0,  // L2 lambda
         0.01, // learning rate
         2000, // max iterations
@@ -701,9 +750,10 @@ fn e2e_voice_pipeline() {
 
     if verifier.is_trained() {
         info!(
-            "VoiceVerifier trained successfully with {} positive + {} negative",
+            "VoiceVerifier trained successfully with {} positive + {} negative \
+             (unrelated + synthetic, no confusable phrases)",
             all_positive_embeddings.len(),
-            negative_embeddings.len()
+            verifier_negatives.len()
         );
     } else {
         warn!("VoiceVerifier is untrained (insufficient data)");

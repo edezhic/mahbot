@@ -311,9 +311,11 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// Minimum per-frame soft score below which the rolling window is reset
-/// entirely (mahbot-773).  Prevents slow accumulation from noise frames
-/// while allowing smooth degradation for borderline matches.
-const NO_MATCH_RESET_THRESHOLD: f32 = 0.3;
+/// entirely (mahbot-773, mahbot-829).  Set to 0.40 to prevent gradual
+/// confusable accumulation.  Wake word frames typically score well above
+/// 0.40 (often averaging ≥0.77 per frame), so this does not affect
+/// genuine detection.
+const NO_MATCH_RESET_THRESHOLD: f32 = 0.40;
 
 /// Number of recent per-frame scores to keep in the rolling sum window
 /// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
@@ -342,14 +344,15 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773).  At 0.65, the average per-frame soft score must exceed ~65%
-/// for detection to fire.
-const MATCH_THRESHOLD_FACTOR: f32 = 0.65;
+/// (mahbot-773, mahbot-829).  At 0.80 (threshold 2.40), the average per-frame
+/// soft score must exceed ~80% for detection to fire.  Combined with a clean
+/// verifier at 0.60, this reduces confusable false accepts toward ≤2 while
+/// maintaining ≥75% wake word detection.
+const MATCH_THRESHOLD_FACTOR: f32 = 0.80;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
-/// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR` (which simplifies
-/// to `1 × 3 × 0.65 = 1.95` since the MLP classifier produces a single score
-/// per window, not multi-template consensus).
+/// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
+/// (= `3 × 0.80 = 2.40`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
@@ -2243,6 +2246,15 @@ pub(crate) fn finalize_enrollment(
 /// - Requires ≥ceil(N * `ENROLLMENT_CONSISTENCY_MIN_FRACTION`) utterances to have
 ///   cosine similarity ≥`ENROLLMENT_CONSISTENCY_MIN_SIMILARITY` to the centroid.
 ///
+/// # Self-correlation bias
+/// The centroid is computed from ALL qualified utterances, including the
+/// utterance being compared.  This means each utterance's own embedding
+/// contributes to the centroid, slightly inflating similarity scores
+/// (self-correlation).  The thresholds (`ENROLLMENT_CONSISTENCY_MIN_SIMILARITY`
+/// = 0.65, `ENROLLMENT_CONSISTENCY_MIN_FRACTION` = 0.7) were calibrated with
+/// this bias present — they work correctly in practice but should be re-checked
+/// if centroid computation ever switches to leave-one-out or a fixed reference.
+///
 /// This replaces the old detection-based self-test which was brittle because
 /// `score_single_embedding` requires ≥3 embeddings per utterance, a condition
 /// the enrollment VAD threshold (~0.60) rarely guarantees.
@@ -3365,7 +3377,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     let v = crate::voice_verifier::VoiceVerifier::train(
                         &positive_embeddings,
                         &negative_embeddings,
-                        0.5,  // standard logistic regression boundary
+                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
+                        // Clean training (ambient audio negatives, no confusable phrases)
+                        // ensures wake word variants pass while confusables are blocked.
                         1.0,  // L2 regularization (lambda)
                         0.01, // learning rate
                         2000, // max iterations
@@ -3384,7 +3398,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 } else {
                     let v = crate::voice_verifier::VoiceVerifier::train_with_synthetic_negatives(
                         &positive_embeddings,
-                        0.5,
+                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
+                              // Clean training (ambient audio negatives, no confusable phrases)
+                              // ensures wake word variants pass while confusables are blocked.
                     );
                     info!(
                         "Verifier trained from {} per-frame positive \
@@ -4404,15 +4420,15 @@ mod tests {
             &mut score_window,
         );
 
-        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.3) → window appended.
-        // Rolling sum 0.5 < match_threshold (1.95) → detection does NOT fire.
+        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.40) → window appended.
+        // Rolling sum 0.5 < match_threshold (2.40) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
         );
         assert!(
             !score_window.is_empty(),
-            "tiling should produce a score ≥0.3, giving a non-empty score window",
+            "tiling should produce a score ≥0.4, giving a non-empty score window",
         );
 
         let score = score_window[0];
@@ -4451,11 +4467,11 @@ mod tests {
             score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 1.95)",
+            "two embeddings should not trigger detection (rolling sum < 2.40)",
         );
         assert!(
             !score_window.is_empty(),
-            "second embedding tiling should produce a score ≥0.3",
+            "second embedding tiling should produce a score ≥0.4",
         );
         assert_eq!(ring.len(), 2, "ring should have 2 embeddings");
     }

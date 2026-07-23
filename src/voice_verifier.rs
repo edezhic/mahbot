@@ -25,13 +25,15 @@ use tracing::warn;
 /// Default decision threshold for the verifier (standard logistic regression
 /// decision boundary).
 ///
-/// Restored to 0.5 (mahbot-797) after mahbot-788 lowered it to 0.3, which
-/// caused the verifier to become a permanently-open gate (accepting any speech,
-/// not just the enrolled wake word).  The root cause was training on synthetic
-/// Gaussian negatives — once the verifier is trained on real (non-synthetic)
-/// negative examples, the standard 0.5 boundary correctly separates wake word
-/// frames from other speech/ambient audio.
-const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.5;
+/// Set to 0.6 (mahbot-829) for stricter confusable-phrase rejection while
+/// maintaining ≥75% wake word detection rate.  Previously at 0.5 (mahbot-797)
+/// after mahbot-788 lowered it to 0.3, which caused the verifier to become a
+/// permanently-open gate (accepting any speech, not just the enrolled wake
+/// word).  The root cause was training on synthetic Gaussian negatives — once
+/// the verifier is trained on real (non-synthetic) negative examples, the 0.6
+/// boundary correctly separates wake word frames from other speech/ambient
+/// audio while rejecting confusable near-miss phrases.
+const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.6;
 
 /// L2 regularization strength (lambda).
 ///
@@ -54,7 +56,7 @@ pub(crate) const EMBEDDING_DIM: usize = 96;
 
 /// Number of synthetic negative examples to generate for bootstrapping
 /// when no real calibration data is available.
-const SYNTHETIC_NEGATIVES_COUNT: usize = 30;
+const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VoiceVerifier
@@ -197,7 +199,7 @@ impl VoiceVerifier {
     ///   utterances (label = 1). Each element is a single 96-dim vector.
     /// * `negative_embeddings` — Embeddings from non-wake-word audio
     ///   (label = 0). Each element is a single 96-dim vector.
-    /// * `threshold` — Decision threshold (typically 0.5).
+    /// * `threshold` — Decision threshold (currently 0.6 in production).
     /// * `l2_lambda` — L2 regularisation strength.
     /// * `learning_rate` — Gradient descent learning rate.
     /// * `max_iter` — Maximum gradient descent iterations.
@@ -594,7 +596,7 @@ mod tests {
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
 
         let verifier = VoiceVerifier::train(
-            &positives, &negatives, 0.5,   // threshold
+            &positives, &negatives, 0.6,   // threshold (mahbot-829: raised from 0.5)
             0.001, // weak L2 (clean synthetic data)
             0.1,   // learning rate
             500,   // max iter
@@ -617,7 +619,7 @@ mod tests {
         let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
 
-        let verifier = VoiceVerifier::train(&positives, &negatives, 0.5, 0.001, 0.1, 500);
+        let verifier = VoiceVerifier::train(&positives, &negatives, 0.6, 0.001, 0.1, 500);
 
         assert!(verifier.is_trained());
 
@@ -645,7 +647,9 @@ mod tests {
             .collect();
 
         let verifier = VoiceVerifier::train(
-            &positives, &negatives, 0.5,  // standard logistic regression boundary
+            &positives, &negatives,
+            0.6, // mahbot-829: raised from 0.5 for stricter confusable
+            // rejection while maintaining wake word detection.
             1.0,  // L2 regularization (default)
             0.01, // learning rate (default)
             2000, // max iterations (default)
@@ -681,11 +685,12 @@ mod tests {
         // speech embeddings (unlike the old pre-fix verifier which would
         // accept any speech because it was trained only on N(0,1) noise).
         let mut rng = StdRng::seed_from_u64(99);
-        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
 
-        let verifier = VoiceVerifier::train_with_synthetic_negatives(&positives, 0.5);
+        let verifier = VoiceVerifier::train_with_synthetic_negatives(&positives, 0.6);
 
         assert!(verifier.is_trained(), "Verifier must be trained");
+        assert_eq!(verifier.threshold, 0.6, "threshold must match production");
 
         // Verify a held-out positive is accepted.
         let held_out = make_positive_embedding(&mut rng);
@@ -732,7 +737,7 @@ mod tests {
         let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
 
-        let verifier = VoiceVerifier::train(&positives, &negatives, 0.5, 0.001, 0.1, 500);
+        let verifier = VoiceVerifier::train(&positives, &negatives, 0.6, 0.001, 0.1, 500);
 
         // Serialize to JSON.
         let json = serde_json::to_string(&verifier).expect("serialize");
@@ -831,7 +836,7 @@ mod tests {
             bias: 0.0,
             scaler_mean: vec![0.1; 32], // wrong dimension (32 ≠ 96)
             scaler_std: vec![0.2; 32],
-            threshold: 0.5,
+            threshold: 0.6,
         };
         assert!(
             !verifier.is_trained(),
@@ -845,7 +850,7 @@ mod tests {
             bias: 0.0,
             scaler_mean: Vec::new(),
             scaler_std: vec![0.2; 32], // non-empty but mismatched
-            threshold: 0.5,
+            threshold: 0.6,
         };
         assert!(
             !verifier2.is_trained(),
@@ -868,9 +873,10 @@ mod tests {
     #[test]
     fn test_train_with_synthetic_negatives_basic() {
         let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
-        let verifier = VoiceVerifier::train_with_synthetic_negatives(&positives, 0.5);
+        let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
+        let verifier = VoiceVerifier::train_with_synthetic_negatives(&positives, 0.6);
         assert!(verifier.is_trained());
+        assert_eq!(verifier.threshold, 0.6, "threshold must match production");
         assert_eq!(verifier.weights.len(), EMBEDDING_DIM);
         assert!(!verifier.scaler_mean.is_empty());
         assert!(!verifier.scaler_std.is_empty());
@@ -897,7 +903,7 @@ mod tests {
     #[test]
     fn test_verifier_empty_training_returns_untrained() {
         // No positive examples → should return untrained.
-        let verifier = VoiceVerifier::train(&[], &[vec![0.0; 96]], 0.5, 0.001, 0.1, 100);
+        let verifier = VoiceVerifier::train(&[], &[vec![0.0; 96]], 0.6, 0.001, 0.1, 100);
         assert!(!verifier.is_trained());
     }
 }

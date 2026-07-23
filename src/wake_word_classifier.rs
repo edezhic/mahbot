@@ -93,6 +93,29 @@ impl Default for ClassifierWeights {
 }
 
 impl ClassifierWeights {
+    /// Return references to all weight Vec fields for unified validation/counting.
+    /// Adding a new Vec field to `ClassifierWeights` requires adding it here
+    /// — a compile error if omitted from the array literal (Rust checks array
+    /// element count at compile time for fixed-size arrays).
+    fn all_weight_slices(&self) -> [&[f32]; 14] {
+        [
+            &self.conv1_weight,
+            &self.conv1_bias,
+            &self.bn1_gamma,
+            &self.bn1_beta,
+            &self.bn1_running_mean,
+            &self.bn1_running_var,
+            &self.conv2_weight,
+            &self.conv2_bias,
+            &self.bn2_gamma,
+            &self.bn2_beta,
+            &self.bn2_running_mean,
+            &self.bn2_running_var,
+            &self.fc_weight,
+            &self.fc_bias,
+        ]
+    }
+
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.conv1_weight.len() == CONV1_OUT * EMBEDDING_DIM * KERNEL_SIZE);
         anyhow::ensure!(self.conv1_bias.len() == CONV1_OUT);
@@ -112,41 +135,16 @@ impl ClassifierWeights {
         // (NaN gradients, degenerate input normalization) that shape checks
         // alone don't catch.
         anyhow::ensure!(
-            self.conv1_weight
+            self.all_weight_slices()
                 .iter()
-                .chain(self.conv1_bias.iter())
-                .chain(self.bn1_gamma.iter())
-                .chain(self.bn1_beta.iter())
-                .chain(self.bn1_running_mean.iter())
-                .chain(self.bn1_running_var.iter())
-                .chain(self.conv2_weight.iter())
-                .chain(self.conv2_bias.iter())
-                .chain(self.bn2_gamma.iter())
-                .chain(self.bn2_beta.iter())
-                .chain(self.bn2_running_mean.iter())
-                .chain(self.bn2_running_var.iter())
-                .chain(self.fc_weight.iter())
-                .chain(self.fc_bias.iter())
+                .flat_map(|s| s.iter())
                 .all(|v| v.is_finite()),
             "Classifier weights contain NaN or Infinity"
         );
         Ok(())
     }
     pub fn param_count(&self) -> usize {
-        self.conv1_weight.len()
-            + self.conv1_bias.len()
-            + self.bn1_gamma.len()
-            + self.bn1_beta.len()
-            + self.bn1_running_mean.len()
-            + self.bn1_running_var.len()
-            + self.conv2_weight.len()
-            + self.conv2_bias.len()
-            + self.bn2_gamma.len()
-            + self.bn2_beta.len()
-            + self.bn2_running_mean.len()
-            + self.bn2_running_var.len()
-            + self.fc_weight.len()
-            + self.fc_bias.len()
+        self.all_weight_slices().iter().map(|s| s.len()).sum()
     }
 }
 
