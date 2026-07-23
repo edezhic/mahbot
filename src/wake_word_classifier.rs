@@ -18,7 +18,9 @@
 
 use anyhow::Result;
 use rand::RngExt;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -306,6 +308,7 @@ fn sigmoid(x: f32) -> f32 {
 
 // ── Training ────────────────────────────────────────────────────────────
 
+
 #[derive(Debug, Clone)]
 pub struct TrainingConfig {
     pub learning_rate: f32,
@@ -314,6 +317,10 @@ pub struct TrainingConfig {
     pub max_epochs: usize,
     pub early_stop_patience: usize,
     pub validation_split: f32,
+    /// Optional RNG seed for deterministic training.  When `None`, uses
+    /// `rand::rng()` (non-deterministic).  When `Some(seed)`, uses
+    /// `StdRng::seed_from_u64(seed)` for weight init and data shuffling.
+    pub rng_seed: Option<u64>,
 }
 impl Default for TrainingConfig {
     fn default() -> Self {
@@ -324,6 +331,7 @@ impl Default for TrainingConfig {
             max_epochs: MAX_EPOCHS,
             early_stop_patience: EARLY_STOP_PATIENCE,
             validation_split: VALIDATION_SPLIT,
+            rng_seed: None,
         }
     }
 }
@@ -414,7 +422,11 @@ pub fn train_classifier(
     let n_val = n_val.max(1).min(n - 1);
     let n_tr = n - n_val;
 
-    let mut rng = rand::rng();
+    let mut rng: Box<dyn rand::Rng> = if let Some(seed) = cfg.rng_seed {
+        Box::new(rand::rngs::StdRng::seed_from_u64(seed))
+    } else {
+        Box::new(rand::rng())
+    };
     let mut idx: Vec<usize> = (0..n).collect();
     idx.shuffle(&mut rng);
 

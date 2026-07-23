@@ -2216,8 +2216,14 @@ pub(crate) fn finalize_enrollment(
     // Step 1: Consistency check — gates on utterance quality before training
     validate_enrollment_consistency(enrollment_buffer)?;
 
-    // Step 2: Train the Conv1D classifier (unchanged)
-    let config = TrainingConfig::default();
+    // Step 2: Train the Conv1D classifier with a fixed seed for
+    // deterministic convergence (mahbot-832).  The training is unstable
+    // with 31K params on ~500 examples; a fixed seed ensures the same
+    // initialization and data shuffle produces consistent convergence.
+    let config = wake_word_classifier::TrainingConfig {
+        rng_seed: Some(42),
+        ..Default::default()
+    };
     let weights =
         wake_word_classifier::train_classifier(positive_embeddings, negative_embeddings, &config)?;
     // validate() inside train_classifier checks shapes + NaN/finite
