@@ -3364,9 +3364,10 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     let v = crate::voice_verifier::VoiceVerifier::train(
                         &positive_embeddings,
                         &negative_embeddings,
-                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
-                        // Clean training (ambient audio negatives, no confusable phrases)
-                        // ensures wake word variants pass while confusables are blocked.
+                        0.50, // mahbot-832: lowered from 0.60. The MLP rolling window
+                        // (threshold 2.10) provides the primary confusable gate; the
+                        // verifier at 0.50 blocks unrelated speech without false-rejecting
+                        // enrolled wake word variants.
                         1.0,  // L2 regularization (lambda)
                         0.01, // learning rate
                         2000, // max iterations
@@ -3385,9 +3386,10 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 } else {
                     let v = crate::voice_verifier::VoiceVerifier::train_with_synthetic_negatives(
                         &positive_embeddings,
-                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
-                              // Clean training (ambient audio negatives, no confusable phrases)
-                              // ensures wake word variants pass while confusables are blocked.
+                        0.50, // mahbot-832: lowered from 0.60. The MLP rolling window
+                              // (threshold 2.10) provides the primary confusable gate; the
+                              // verifier at 0.50 blocks unrelated speech without false-rejecting
+                              // enrolled wake word variants.
                     );
                     info!(
                         "Verifier trained from {} per-frame positive \
