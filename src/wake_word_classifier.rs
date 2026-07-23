@@ -18,9 +18,8 @@
 
 use anyhow::Result;
 use rand::RngExt;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -307,7 +306,6 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 // ── Training ────────────────────────────────────────────────────────────
-
 
 #[derive(Debug, Clone)]
 pub struct TrainingConfig {

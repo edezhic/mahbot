@@ -66,6 +66,9 @@ const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
 
 /// Default maximum shell command execution time before kill.
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
+/// Absolute maximum allowed shell command timeout (1 hour).
+/// Prevents agents from setting absurdly long timeouts.
+const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
 /// Cap bytes collected from each pipe during command execution (including timeouts).
 ///
 /// # Truncation safety
@@ -347,6 +350,7 @@ fn append_output_tail(msg: &mut String, label: &str, data: &[u8]) {
 fn format_timeout_error(
     command: &str,
     elapsed: Duration,
+    timeout_limit: Duration,
     pid: Option<u32>,
     stdout: &[u8],
     stderr: &[u8],
@@ -355,8 +359,9 @@ fn format_timeout_error(
         "Shell command timed out.\n\
          command: {command}\n\
          elapsed: {:.1}s\n\
-         timeout_limit: {DEFAULT_SHELL_TIMEOUT_SECS}s",
-        elapsed.as_secs_f64()
+         timeout_limit: {:.0}s",
+        elapsed.as_secs_f64(),
+        timeout_limit.as_secs_f64(),
     );
     if let Some(p) = pid {
         let _ = write!(msg, "\npid: {p}");
@@ -408,9 +413,13 @@ impl ShellTool {
         // `cd workspace/subdir && cargo build` actually navigates the shell.
         let mut cmd = build_shell_command(command_str, ws.as_path());
 
-        let result =
-            run_command_with_timeout(&mut cmd, Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS))
-                .await;
+        // Allow agent to override the default timeout via `timeout_secs`.
+        // Capped at MAX_SHELL_TIMEOUT_SECS to prevent absurdly long runs.
+        let timeout_secs = super::get_opt_u64(&args, "timeout_secs")
+            .map_or(DEFAULT_SHELL_TIMEOUT_SECS, |s| s.min(MAX_SHELL_TIMEOUT_SECS));
+        let timeout = Duration::from_secs(timeout_secs);
+
+        let result = run_command_with_timeout(&mut cmd, timeout).await;
 
         match result {
             ShellRunResult::Completed {
@@ -459,7 +468,8 @@ impl ShellTool {
                     stderr_bytes = stderr.len(),
                     "Shell command timed out"
                 );
-                let msg = format_timeout_error(command_str, elapsed, pid, &stdout, &stderr);
+                let msg =
+                    format_timeout_error(command_str, elapsed, timeout, pid, &stdout, &stderr);
                 anyhow::bail!("{msg}");
             }
             ShellRunResult::SpawnFailed(e) => anyhow::bail!(
@@ -666,6 +676,12 @@ Use this tool only for inspection: reading files, listing directories, running c
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Optional custom timeout in seconds (default: 300, max: 3600). Use this for long-running commands that need more than the default 5-minute timeout.",
+                    "minimum": 1,
+                    "maximum": 3600
                 },
             }),
             &["command"],
@@ -2396,7 +2412,14 @@ mod tests {
         else {
             panic!("expected timeout");
         };
-        let msg = format_timeout_error("echo test", elapsed, pid, &stdout, &stderr);
+        let msg = format_timeout_error(
+            "echo test",
+            elapsed,
+            Duration::from_secs(1),
+            pid,
+            &stdout,
+            &stderr,
+        );
         assert!(msg.contains("elapsed:"), "msg: {msg}");
         assert!(msg.contains("timeout_limit:"), "msg: {msg}");
         assert!(msg.contains("before-timeout"), "msg: {msg}");
@@ -2404,7 +2427,14 @@ mod tests {
         // Verify ANSI escape sequences are stripped from timeout error messages
         let ansi_stdout = b"\x1B[31mred error\x1B[0m";
         let ansi_stderr = b"\x1B[1mBOLD STUFF\x1B[22m";
-        let ansi_msg = format_timeout_error("test", elapsed, Some(42), ansi_stdout, ansi_stderr);
+        let ansi_msg = format_timeout_error(
+            "test",
+            elapsed,
+            Duration::from_secs(300),
+            Some(42),
+            ansi_stdout,
+            ansi_stderr,
+        );
         assert!(
             ansi_msg.contains("red error"),
             "ANSI text content should survive stripping: {ansi_msg}"

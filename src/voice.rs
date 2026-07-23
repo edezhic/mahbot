@@ -34,7 +34,7 @@ use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use crate::vector::cosine_similarity;
 use crate::voice_verifier::{EMBEDDING_DIM, VoiceVerifier};
-use crate::wake_word_classifier::{self, ClassifierWeights, TrainingConfig, WakeWordClassifier};
+use crate::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
