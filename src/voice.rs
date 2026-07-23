@@ -311,11 +311,11 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// Minimum per-frame soft score below which the rolling window is reset
-/// entirely (mahbot-773, mahbot-829).  Set to 0.40 to prevent gradual
-/// confusable accumulation.  Wake word frames typically score well above
-/// 0.40 (often averaging ≥0.77 per frame), so this does not affect
-/// genuine detection.
-const NO_MATCH_RESET_THRESHOLD: f32 = 0.40;
+/// entirely (mahbot-773, mahbot-829).  Set to 0.35 to allow borderline
+/// positive scores to accumulate while still clearing the window on noise.
+/// The verifier at 0.60 provides the primary false-accept gate — the reset
+/// threshold only needs to prevent indefinite noise accumulation.
+const NO_MATCH_RESET_THRESHOLD: f32 = 0.35;
 
 /// Number of recent per-frame scores to keep in the rolling sum window
 /// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
@@ -344,15 +344,15 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829).  At 0.80 (threshold 2.40), the average per-frame
-/// soft score must exceed ~80% for detection to fire.  Combined with a clean
+/// (mahbot-773, mahbot-829).  At 0.75 (threshold 2.25), the average per-frame
+/// soft score must exceed ~75% for detection to fire.  Combined with a clean
 /// verifier at 0.60, this reduces confusable false accepts toward ≤2 while
 /// maintaining ≥75% wake word detection.
-const MATCH_THRESHOLD_FACTOR: f32 = 0.80;
+const MATCH_THRESHOLD_FACTOR: f32 = 0.75;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.80 = 2.40`).
+/// (= `3 × 0.75 = 2.25`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
@@ -4420,15 +4420,15 @@ mod tests {
             &mut score_window,
         );
 
-        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.40) → window appended.
-        // Rolling sum 0.5 < match_threshold (2.40) → detection does NOT fire.
+        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.35) → window appended.
+        // Rolling sum 0.5 < match_threshold (2.25) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
         );
         assert!(
             !score_window.is_empty(),
-            "tiling should produce a score ≥0.4, giving a non-empty score window",
+            "tiling should produce a score ≥0.35, giving a non-empty score window",
         );
 
         let score = score_window[0];
@@ -4467,11 +4467,11 @@ mod tests {
             score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 2.40)",
+            "two embeddings should not trigger detection (rolling sum < 2.25)",
         );
         assert!(
             !score_window.is_empty(),
-            "second embedding tiling should produce a score ≥0.4",
+            "second embedding tiling should produce a score ≥0.35",
         );
         assert_eq!(ring.len(), 2, "ring should have 2 embeddings");
     }
