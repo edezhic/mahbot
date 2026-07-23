@@ -311,11 +311,11 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// Minimum per-frame soft score below which the rolling window is reset
-/// entirely (mahbot-773, mahbot-829).  Set to 0.40 to clear the window on
-/// low-confidence frames while allowing borderline verifier scores to
-/// accumulate.  Wake word frames score well above 0.40 (typically ≥0.60),
-/// so this does not affect genuine detection.
-const NO_MATCH_RESET_THRESHOLD: f32 = 0.40;
+/// entirely (mahbot-773, mahbot-829).  Set to 0.30 to clear the window on
+/// very low-confidence frames while allowing borderline scores to accumulate.
+/// The verifier at 0.50 provides the per-frame decision boundary — the reset
+/// threshold only needs to prevent indefinite noise accumulation.
+const NO_MATCH_RESET_THRESHOLD: f32 = 0.30;
 
 /// Number of recent per-frame scores to keep in the rolling sum window
 /// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
@@ -344,15 +344,15 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829).  At 0.70 (threshold 2.10), the average per-frame
-/// soft score must exceed ~70% for detection to fire.  The verifier at 0.60
-/// provides a second-stage AND gate that blocks confusable near-misses while
-/// passing enrolled wake word frames.
-const MATCH_THRESHOLD_FACTOR: f32 = 0.70;
+/// (mahbot-773, mahbot-829).  With the verifier as the per-frame scorer,
+/// the threshold represents the average verifier confidence needed across 3
+/// consecutive frames.  At 0.50 (threshold 1.50), 3 frames averaging ≥0.50
+/// trigger detection — a soft consistency check over ~384ms of speech.
+const MATCH_THRESHOLD_FACTOR: f32 = 0.50;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.70 = 2.10`).
+/// (= `3 × 0.50 = 1.50`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
@@ -458,12 +458,19 @@ pub(crate) fn score_single_embedding(
         embedding_ring.remove(0);
     }
 
-    // ── MLP classifier forward pass ───────────────────────────────────
-    // Scores a window of 3 consecutive embeddings via Conv1D + sigmoid.
-    // Falls back to repeat-last tiling when fewer than 3 embeddings are
-    // available — AdaptiveAvgPool collapses the time dimension, so tiling
-    // provides an unbiased estimate for a stationary distribution.
-    let total_score = if let Some(c) = classifier {
+    // ── Per-frame score ──────────────────────────────────────────────
+    // Use the verifier (logistic regression, 97 params, converges reliably
+    // on ~400 examples) as the primary per-frame signal.  When the verifier
+    // is not trained, fall back to the Conv1D MLP classifier (31K params,
+    // unreliable convergence on ~500 examples).
+    //
+    // The rolling window provides temporal smoothing — 3 consecutive frames
+    // averaging ≥ threshold trigger detection.
+    let total_score = if let Some(v) = verifier
+        && v.is_trained()
+    {
+        v.predict(embedding)
+    } else if let Some(c) = classifier {
         if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
             let start = embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
             c.forward(&embedding_ring[start..])
@@ -480,29 +487,10 @@ pub(crate) fn score_single_embedding(
     };
 
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
-    if process_wake_word_score(total_score, score_window) {
-        // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
-        // Second-stage AND check: the max verifier score over the last
-        // ROLLING_WINDOW_N embeddings must be ≥ the verifier threshold
-        // (currently 0.60).  This rejects confusable near-misses that
-        // scored high enough to pass the rolling window but don't match
-        // the enrolled wake word embedding signature.
-        if let Some(v) = verifier
-            && v.is_trained()
-        {
-            let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
-            let max_score = embedding_ring[start..]
-                .iter()
-                .map(|emb| v.predict(emb))
-                .fold(0.0f32, f32::max);
-            if max_score < v.threshold {
-                score_window.clear();
-                return false;
-            }
-        }
-        return true;
-    }
-    false
+    // Accumulates the per-frame score.  When the rolling sum exceeds
+    // threshold, detection fires.  Frames below NO_MATCH_RESET_THRESHOLD
+    // clear the window to prevent indefinite noise accumulation.
+    process_wake_word_score(total_score, score_window)
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
@@ -4409,15 +4397,15 @@ mod tests {
             &mut score_window,
         );
 
-        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.40) → window appended.
-        // Rolling sum 0.5 < match_threshold (2.10) → detection does NOT fire.
+        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.30) → window appended.
+        // Rolling sum 0.5 < match_threshold (1.50) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
         );
         assert!(
             !score_window.is_empty(),
-            "tiling should produce a score ≥0.4, giving a non-empty score window",
+            "tiling should produce a score ≥0.3, giving a non-empty score window",
         );
 
         let score = score_window[0];
@@ -4456,7 +4444,7 @@ mod tests {
             score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 2.10)",
+            "two embeddings should not trigger detection (rolling sum < 1.50)",
         );
         assert!(
             !score_window.is_empty(),
