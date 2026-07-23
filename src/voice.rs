@@ -494,7 +494,7 @@ pub(crate) fn score_single_embedding(
                 .iter()
                 .map(|emb| v.predict(emb))
                 .fold(0.0f32, f32::max);
-            if max_score < 0.10 {
+            if max_score < 0.20 {
                 score_window.clear();
                 return false;
             }
