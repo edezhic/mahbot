@@ -66,9 +66,13 @@ pub struct ClassifierWeights {
 
 impl Default for ClassifierWeights {
     fn default() -> Self {
-        let scale_c1 = (6.0 / (EMBEDDING_DIM + CONV1_OUT) as f32).sqrt();
-        let scale_c2 = (6.0 / (CONV1_OUT + CONV2_OUT) as f32).sqrt();
-        let scale_fc = (6.0 / (CONV2_OUT + FC_OUT) as f32).sqrt();
+        // Gain factor to compensate for signal attenuation through two ReLU
+        // layers (each halves variance) and adaptive average pooling (divides
+        // variance by WINDOW_SIZE=3).  Total gain = sqrt(2 × WINDOW_SIZE).
+        let gain = (2.0 * WINDOW_SIZE as f32).sqrt();
+        let scale_c1 = gain * (6.0 / (EMBEDDING_DIM + CONV1_OUT) as f32).sqrt();
+        let scale_c2 = gain * (6.0 / (CONV1_OUT + CONV2_OUT) as f32).sqrt();
+        let scale_fc = gain * (6.0 / (CONV2_OUT + FC_OUT) as f32).sqrt();
         let mut rng = rand::rng();
         let mut uniform =
             |s: f32, n: usize| -> Vec<f32> { (0..n).map(|_| rng.random_range(-s..s)).collect() };
