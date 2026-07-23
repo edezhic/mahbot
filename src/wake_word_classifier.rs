@@ -28,13 +28,13 @@ use crate::voice_verifier::EMBEDDING_DIM;
 
 pub const WINDOW_SIZE: usize = 3;
 pub const INPUT_DIM: usize = WINDOW_SIZE * EMBEDDING_DIM; // 288
-const CONV1_OUT: usize = 64;
-const CONV2_OUT: usize = 64;
+const CONV1_OUT: usize = 32;
+const CONV2_OUT: usize = 16;
 const KERNEL_SIZE: usize = 3;
 const PADDING: usize = 1;
 const FC_OUT: usize = 1;
 const L2_LAMBDA: f32 = 0.0001;
-const LEARNING_RATE: f32 = 0.01;
+const LEARNING_RATE: f32 = 0.001;
 const ADAM_BETA1: f32 = 0.9;
 const ADAM_BETA2: f32 = 0.999;
 const ADAM_EPS: f32 = 1e-8;
