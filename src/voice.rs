@@ -344,14 +344,14 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829).  At 0.55 (threshold 1.65), 3 consecutive frames
-/// must average ≥0.55 for detection to fire — a moderate bar that balances
+/// (mahbot-773, mahbot-829).  At 0.57 (threshold 1.71), 3 consecutive frames
+/// must average ≥0.57 for detection to fire — moderately strict, balancing
 /// detection rate (≥75%) against false accepts (≤2).
-const MATCH_THRESHOLD_FACTOR: f32 = 0.55;
+const MATCH_THRESHOLD_FACTOR: f32 = 0.57;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.55 = 1.65`).
+/// (= `3 × 0.57 = 1.71`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
@@ -493,7 +493,7 @@ pub(crate) fn score_single_embedding(
                 .iter()
                 .map(|emb| v.predict(emb))
                 .fold(0.0f32, f32::max);
-            if max_score < 0.30 {
+            if max_score < 0.28 {
                 score_window.clear();
                 return false;
             }
