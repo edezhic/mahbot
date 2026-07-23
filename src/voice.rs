@@ -2214,7 +2214,7 @@ pub(crate) fn segment_utterances_by_vad(
 /// training the classifier.  The old detection-based self-test is preserved
 /// as an informational-only diagnostic in the caller (see
 /// [`handle_enrollment_sample`]).
-fn finalize_enrollment(
+pub(crate) fn finalize_enrollment(
     positive_embeddings: &[Vec<f32>],
     negative_embeddings: &[Vec<f32>],
     enrollment_buffer: &[Vec<Vec<f32>>],
@@ -2477,7 +2477,7 @@ unsafe impl Send for SendMicStream {}
 
 /// Runtime state for the voice pipeline main loop.
 #[allow(clippy::struct_excessive_bools)]
-struct PipelineCtx {
+pub(crate) struct PipelineCtx {
     mic_rx: Option<mpsc::Receiver<Vec<f32>>>,
     mic_stream: SendMicStream,
     is_listening: bool,
@@ -2541,7 +2541,7 @@ struct PipelineCtx {
     /// Timestamp of the last wake word detection (mahbot-770 Fix 2).
     /// Used to enforce a cooldown period after detection to prevent rapid
     /// consecutive false triggers.
-    last_wake_word_detection: Option<Instant>,
+    pub(crate) last_wake_word_detection: Option<Instant>,
     /// Pre-speech noise RMS captured at the moment of first sustained speech
     /// detection during enrollment.  Computed from the pre-AGC audio ring
     /// ([`pre_agc_ring`]) so AGC's asymmetric gain (4× on silence, ~1-2× on
@@ -2601,7 +2601,7 @@ enum ResetLevel {
 }
 
 impl PipelineCtx {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             mic_rx: None,
             mic_stream: SendMicStream::default(),
@@ -3677,7 +3677,7 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 /// Implements cooldown (mahbot-770 Fix 2) and soft-scoring + rolling window
 /// detection (mahbot-773) via the `last_wake_word_detection` and
 /// `score_window` fields.
-fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
+pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // ── Cooldown check (mahbot-770 Fix 2) ──
     // If we recently detected the wake word, skip ALL processing for this
     // chunk to prevent rapid consecutive false triggers.  During cooldown

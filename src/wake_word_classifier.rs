@@ -208,6 +208,12 @@ fn forward_pass(x: &[f32], w: &ClassifierWeights) -> f32 {
 }
 
 impl WakeWordClassifier {
+    /// Get a reference to the underlying classifier weights.
+    #[expect(dead_code)]
+    pub fn weights_ref(&self) -> &ClassifierWeights {
+        &self.weights
+    }
+
     pub fn new(weights: ClassifierWeights) -> Self {
         Self { weights }
     }

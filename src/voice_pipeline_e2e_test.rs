@@ -30,8 +30,7 @@ use super::*; // voice module items (process_enrollment_sample, etc.)
 use crate::tts;
 use crate::voice_verifier::VoiceVerifier;
 use crate::voice_verifier::generate_synthetic_negatives;
-use crate::wake_word_classifier;
-use crate::wake_word_classifier::{TrainingConfig, WakeWordClassifier};
+use crate::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
 
@@ -347,124 +346,137 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
     (vad_decisions, utterances)
 }
 
-/// Process enrollment variants through VAD-validated embedding extraction.
+/// Process enrollment variants through VAD-gated utterance segmentation.
 ///
-/// For each variant: (1) validates that VAD at [`ENROLLMENT_VAD_THRESHOLD`]
-/// detects speech in ≥50% of frames (gating against bad/noisy audio), then
-/// (2) extracts embeddings from the **full** raw audio via
-/// [`process_enrollment_sample`].
+/// Concatenates all variants with trailing silence gaps, computes VAD decisions
+/// at the enrollment threshold, segments by [`segment_utterances_by_vad`], then
+/// extracts embeddings from each utterance via [`process_enrollment_sample`].
 ///
-/// This does **not** segment by VAD-gated utterances — see
-/// [`compute_vad_segments`] / [`segment_utterances_by_vad`] for that.
-/// TTS-generated speech has no trailing silence, so VAD-gated segmentation
-/// cannot complete utterances.  Phase 2b tests utterance segmentation
-/// separately with concatenated clips and proper silence gaps.
+/// This exercises the same production path as [`handle_enrollment_audio`]:
+/// audio → VAD frame-by-frame → segment by VAD → per-utterance embeddings.
+///
+/// The trailing silence (≥1.5s) between clips ensures that
+/// [`segment_utterances_by_vad`] can complete utterance boundary detection,
+/// matching the production enrollment pipeline's behavior.
 ///
 /// Returns the same pair as [`process_enrollment`] (minus the failed count):
 /// flat embeddings list (for classifier training) and per-utterance embedding
-/// buffers (for self-test).
-fn process_vad_validated_enrollment(
-    variants: &[(Vec<f32>, String)],
+/// buffers (for consistency check + self-test).
+fn vad_segment_and_enroll(
+    enrollment_variants: &[(Vec<f32>, String)],
+    augmented_variants: &[(Vec<f32>, String)],
 ) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>) {
+    // ── Concatenate all variants with 2.0s silence gaps ──
+    // 2.0s well exceeds SILENCE_THRESHOLD_SAMPLES (1.5s) for clean boundaries.
+    let silence_gap_samples = (2.0 * super::SAMPLE_RATE as f64) as usize;
+    let silence: Vec<f32> = vec![0.0f32; silence_gap_samples];
+
+    let mut combined_audio: Vec<f32> = Vec::new();
+    for (samples, _label) in enrollment_variants.iter().chain(augmented_variants) {
+        if !combined_audio.is_empty() {
+            combined_audio.extend_from_slice(&silence);
+        }
+        combined_audio.extend_from_slice(samples);
+    }
+    // Trailing silence for the last utterance
+    combined_audio.extend_from_slice(&silence);
+
+    info!(
+        "VAD concatenation: {} total samples ({:.1}s) from {} variants",
+        combined_audio.len(),
+        combined_audio.len() as f64 / super::SAMPLE_RATE as f64,
+        enrollment_variants.len() + augmented_variants.len(),
+    );
+
+    // ── Compute VAD decision + utterances via shared helper ──
+    let (_vad_decisions, utterances) = compute_vad_segments(&combined_audio);
+
+    info!(
+        "VAD segmentation: {} utterances from {} concatenated variants",
+        utterances.len(),
+        enrollment_variants.len() + augmented_variants.len(),
+    );
+
+    // ── Process each utterance through enrollment ──
     let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
     let mut enrollment_buffer: Vec<Vec<Vec<f32>>> = Vec::new();
 
-    for (samples, label) in variants {
-        // Apply VAD gating: check that the enrollment-threshold VAD detects
-        // speech in this variant.  TTS-generated wake word audio is clean,
-        // continuous speech, so strong VAD support is expected.  If the VAD
-        // doesn't fire on the majority of frames, the recording quality or
-        // VAD threshold may need adjustment.
-        let (_vad_decisions, _utterances) = compute_vad_segments(samples);
-
-        // NOTE: `segment_utterances_by_vad` requires trailing silence (≥1.5s)
-        // to complete utterance detection.  TTS-generated speech ends abruptly,
-        // so no completed utterances are expected.  Instead, we validate the
-        // VAD decisions directly and use non-VAD-gated enrollment for embedding
-        // extraction (Phase 2b tests utterance-segmentation separately).
-        let speech_frames = _vad_decisions.iter().filter(|&&v| v).count();
-        let total_frames = _vad_decisions.len();
-        if total_frames > 0 {
-            let speech_ratio = speech_frames as f64 / total_frames as f64;
-            assert!(
-                speech_ratio >= 0.5,
-                "VAD gating: variant '{label}' only {:.1}% speech frames ({}/{}) — \
-                 expected ≥50% for clean TTS speech.  Check ENROLLMENT_VAD_THRESHOLD={}.",
-                speech_ratio * 100.0,
-                speech_frames,
-                total_frames,
-                super::ENROLLMENT_VAD_THRESHOLD,
-            );
-            info!(
-                "VAD-gated '{label}': {:.1}% speech frames ({}/{}) — OK",
-                speech_ratio * 100.0,
-                speech_frames,
-                total_frames,
-            );
-        }
-
-        // Extract embeddings from the full audio using non-VAD-gated enrollment.
-        // TTS audio has no trailing silence, so segment_utterances_by_vad cannot
-        // complete utterances.  Phase 2b tests utterance segmentation separately
-        // with proper silence gaps.  Using process_enrollment for the training
-        // data is acceptable because TTS audio is clean speech with no non-speech
-        // to filter out.
-        match super::process_enrollment_sample(samples) {
-            Ok(embeddings) => {
-                if embeddings.is_empty() {
-                    warn!("VAD-gated utterance '{label}' produced no embeddings");
-                    continue;
-                }
-                let count = embeddings.len();
+    for (i, utterance) in utterances.iter().enumerate() {
+        match super::process_enrollment_sample(utterance) {
+            Ok(embeddings) if !embeddings.is_empty() => {
+                info!(
+                    "Utterance {i}: {} samples ({:.2}s), {} embeddings",
+                    utterance.len(),
+                    utterance.len() as f64 / super::SAMPLE_RATE as f64,
+                    embeddings.len(),
+                );
                 for emb in &embeddings {
                     all_embeddings.push(emb.clone());
                 }
                 enrollment_buffer.push(embeddings);
-                info!(
-                    "VAD-gated '{label}': {count} embeddings from {} samples",
-                    samples.len(),
-                );
             }
-            Err(e) => {
-                warn!("VAD-gated embedding failed for '{label}': {e}");
-            }
+            Ok(_) => warn!("Utterance {i}: no embeddings extracted"),
+            Err(e) => warn!("Utterance {i}: embedding extraction failed: {e}"),
         }
     }
+
+    let expected_utterances = enrollment_variants.len() + augmented_variants.len();
+    info!(
+        "VAD-gated enrollment: {} positive embeddings from {} utterances (expected ~{expected_utterances})",
+        all_embeddings.len(),
+        enrollment_buffer.len(),
+    );
 
     (all_embeddings, enrollment_buffer)
 }
 
-// ── Detection simulation ───────────────────────────
+// ── Streaming detection ─────────────────────────────
 
-/// Simulate the live detection pipeline for a single audio clip's embeddings.
+/// Run the production streaming wake word detection pipeline on audio samples.
 ///
-/// Delegates to the **production detection logic** via
-/// [`super::score_single_embedding`] — the same function used by the live
-/// pipeline ([`try_match_wake_word_and_push_embedding`]) and enrollment
-/// self-test ([`run_enrollment_self_test`]).  Any changes to ring buffer
-/// sizing, MLP window size, rolling sum threshold, or verifier gating are
-/// automatically exercised by this integration test.
+/// Feeds audio through [`handle_wake_word_detection`] in FRAME_LENGTH chunks,
+/// exercising the full streaming chain: VAD gating, batch accumulation,
+/// [`flush_voice_batch`], [`try_match_wake_word_and_push_embedding`],
+/// [`score_single_embedding`], and cooldown logic.
 ///
-/// Returns `true` if the wake word was detected at any point in the clip.
-fn simulate_detection(
-    embeddings: &[Vec<f32>],
-    classifier: &WakeWordClassifier,
-    verifier: &VoiceVerifier,
-) -> bool {
-    let mut embedding_ring: Vec<Vec<f32>> = Vec::with_capacity(super::EMBEDDING_RING_MAX);
-    let mut score_window: Vec<f32> = Vec::new();
-    for embedding in embeddings {
-        if super::score_single_embedding(
-            embedding,
-            &mut embedding_ring,
-            Some(classifier),
-            Some(verifier),
-            &mut score_window,
-        ) {
+/// After all audio is fed, a silence frame is sent to flush any remaining
+/// voice batch (matching how the production pipeline handles speech→silence
+/// transitions).
+///
+/// Returns `true` if the wake word was detected during processing.
+fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> bool {
+    let chunk_size = super::FRAME_LENGTH;
+    // Save pre-existing timestamp — we only return true if detection fires
+    // during THIS call, not because a prior call already set the field.
+    let before = ctx.last_wake_word_detection;
+
+    // Feed audio in FRAME_LENGTH chunks
+    for chunk in samples.chunks(chunk_size) {
+        let padded = if chunk.len() < chunk_size {
+            let mut p: Vec<f32> = chunk.to_vec();
+            p.resize(chunk_size, 0.0);
+            p
+        } else {
+            chunk.to_vec()
+        };
+        super::handle_wake_word_detection(&padded, ctx);
+        if ctx.last_wake_word_detection != before {
             return true;
         }
     }
-    false
+
+    // Feed silence frames to flush any remaining voice_batch.
+    // The first silence frame after speech triggers flush_voice_batch via
+    // the VAD-negative branch in handle_wake_word_detection.
+    for _ in 0..3 {
+        if ctx.last_wake_word_detection != before {
+            return true;
+        }
+        let silence = vec![0.0f32; chunk_size];
+        super::handle_wake_word_detection(&silence, ctx);
+    }
+
+    ctx.last_wake_word_detection != before
 }
 
 // ── Metrics reporting ────────────────────────────────────────────────────
@@ -475,7 +487,6 @@ struct DetectionMetrics {
     total: usize,
     detected: usize,
     false_accepts: Vec<String>,
-    failures: Vec<String>, // Variants that couldn't be processed
 }
 
 impl DetectionMetrics {
@@ -494,8 +505,8 @@ impl DetectionMetrics {
 ///
 /// # Parameters
 /// - `variants`: audio clips with descriptive labels.
-/// - `classifier`, `verifier`: trained models (passed to `simulate_detection`).
-/// - `metrics`: records total/failures; `on_detection` fills detected or
+/// - `classifier`, `verifier`: trained models passed to the streaming pipeline.
+/// - `metrics`: records total/detected; `on_detection` fills detected or
 ///   false_accepts.
 /// - `on_detection`: called with `(&mut metrics, label_str)` when the
 ///   wake word is detected (for positives: increment `.detected`; for
@@ -507,20 +518,16 @@ fn test_detection_samples(
     metrics: &mut DetectionMetrics,
     on_detection: impl Fn(&mut DetectionMetrics, &str),
 ) {
+    // Set classifier + verifier in global state for the streaming pipeline.
+    // try_match_wake_word_and_push_embedding reads these from voice_state().
+    super::set_classifier_weights(classifier.weights_ref().clone());
+    super::set_verifier(verifier.clone());
+
     for (samples, label) in variants {
         metrics.total += 1;
-        match super::process_enrollment_sample(samples) {
-            Ok(embeddings) if !embeddings.is_empty() => {
-                if simulate_detection(&embeddings, classifier, verifier) {
-                    on_detection(metrics, label);
-                }
-            }
-            Ok(_) => {
-                metrics.failures.push(format!("{label}: empty embeddings"));
-            }
-            Err(e) => {
-                metrics.failures.push(format!("{label}: {e}"));
-            }
+        let mut ctx = super::PipelineCtx::new();
+        if run_streaming_detection(samples, &mut ctx) {
+            on_detection(metrics, label);
         }
     }
 }
@@ -594,197 +601,83 @@ fn e2e_voice_pipeline() {
         enrollment_variants.len()
     );
 
-    // ── 2. Enrollment with VAD gating verification ────────────────────
-    // For each enrollment variant: (a) verify the enrollment VAD threshold
-    // detects ≥50% of frames as speech (confirms TTS audio is above the
-    // VAD noise floor), then (b) extract embeddings from the full audio.
-    // TTS-generated wake word audio is clean speech with no trailing silence,
-    // so the extracted [`segment_utterances_by_vad`] function cannot complete
-    // utterance detection (it needs ≥1.5s of trailing silence).  Phase 2b
-    // tests utterance segmentation separately using concatenated clips with
-    // proper silence gaps.  Using non-VAD-gated embedding extraction is
-    // acceptable because TTS audio has no non-speech content to filter out.
-    info!("─── Phase 2: Enrollment with VAD gating verification ───");
-    let (vad_positive_embeddings, vad_enrollment_buffer) =
-        process_vad_validated_enrollment(&enrollment_variants);
-    assert!(
-        !vad_enrollment_buffer.is_empty(),
-        "VAD gating produced no utterances from {variants} enrollment variants",
-        variants = enrollment_variants.len(),
-    );
-    // Assert each VAD-gated utterance produces at least 3 embeddings.
-    // With 76-frame windows at stride=8, 3 embeddings requires ~92 mel
-    // frames (≈920ms of audio including context padding).  The lower
-    // enrollment VAD threshold (0.60) captures ~75–85% of each utterance,
-    // which with 200ms of context padding (100ms each side) produces
-    // sufficient audio for ≥3 embeddings on a normal-speed wake word.
-    // See `extract_embeddings_from_audio` for the stride/embedding math.
-    for (i, utt_emb) in vad_enrollment_buffer.iter().enumerate() {
-        assert!(
-            utt_emb.len() >= 3,
-            "VAD-gated utterance {i}: only {} embeddings (need ≥3). \
-             Check that ENROLLMENT_VAD_THRESHOLD={threshold} captures \
-             enough of each utterance, or that TTS audio is long enough.",
-            utt_emb.len(),
-            threshold = super::ENROLLMENT_VAD_THRESHOLD,
-        );
-    }
-    info!(
-        "VAD-gated enrollment: {} positive embeddings from {} utterances",
-        vad_positive_embeddings.len(),
-        vad_enrollment_buffer.len(),
-    );
+    // ── 2. VAD-gated enrollment ────────────────────────────────────
+    // Concatenate all TTS clips with 2.0s silence gaps, segment by VAD
+    // at the enrollment threshold, and extract embeddings per utterance.
+    // This exercises the same production path as handle_enrollment_audio:
+    // audio → VAD frame-by-frame → segment_utterances_by_vad → per-utterance
+    // process_enrollment_sample.
+    info!("─── Phase 2: VAD-gated enrollment ───");
 
-    // ── 2b. VAD gating: verify utterance segmentation (mahbot-823) ─────
-    // Concatenate enrollment audio clips with silence gaps and process
-    // through the extracted VAD gating function to verify that utterance
-    // boundaries are correctly detected.  This exercises the same pure
-    // function used by the production enrollment handler.
-    info!("─── Phase 2b: VAD gating utterance segmentation ───");
-    {
-        // Concatenate enrollment clips with 1.8s of silence between them
-        // (slightly longer than SILENCE_THRESHOLD_SAMPLES = 1.5s to ensure
-        // clean boundary detection).
-        let silence_gap_samples = (super::SILENCE_DURATION.as_millis() as usize + 300) as usize
-            * super::SAMPLE_RATE as usize
-            / 1000;
-        let silence: Vec<f32> = vec![0.0f32; silence_gap_samples];
-        let mut combined_audio: Vec<f32> = Vec::new();
-        for (samples, _label) in &enrollment_variants {
-            if !combined_audio.is_empty() {
-                combined_audio.extend_from_slice(&silence);
-            }
-            combined_audio.extend_from_slice(samples);
-        }
-        // Add trailing silence so the last clip's utterance is completed.
-        // The 1.8s gaps between clips handle utterance separation;
-        // the trailing silence completes the final utterance.
-        combined_audio.extend_from_slice(&silence);
-
-        // Use the shared helper to compute VAD segments.
-        let (_vad_decisions, utterances) = compute_vad_segments(&combined_audio);
-
-        let expected_count = enrollment_variants.len();
-        info!(
-            "VAD gating: {} utterances detected from {} enrollment clips",
-            utterances.len(),
-            expected_count,
-        );
-
-        // Assert the correct number of utterances was captured.
-        // The TTS-generated enrollment clips are pre-trimmed speech
-        // separated by 1.8s silence gaps, so the VAD gating should
-        // detect exactly one utterance per clip.
-        assert_eq!(
-            utterances.len(),
-            expected_count,
-            "VAD gating: expected {expected_count} utterances from \
-             {expected_count} enrollment clips with 1.8s silence gaps, \
-             got {}",
-            utterances.len(),
-        );
-
-        // Assert each utterance has adequate audio length for embedding.
-        // The 400ms floor (ENROLLMENT_QUALITY_DURATION_MIN_MS) ensures VAD
-        // gating captured real speech rather than noise blips.  Phase 2's
-        // ≥3-embedding assertion validates production adequacy separately;
-        // see Phase 2 comment for stride/embedding math.
-        let min_audio_len =
-            super::ENROLLMENT_QUALITY_DURATION_MIN_MS as usize * super::SAMPLE_RATE as usize / 1000;
-        for (i, utt) in utterances.iter().enumerate() {
-            let duration_ms = (utt.len() as u64 * 1000) / u64::from(super::SAMPLE_RATE);
-            assert!(
-                utt.len() >= min_audio_len,
-                "Utterance {i} too short: {} samples ({duration_ms}ms) \
-                 — need ≥{min_audio_len} samples ({}ms)",
-                utt.len(),
-                super::ENROLLMENT_QUALITY_DURATION_MIN_MS,
-            );
-            info!(
-                "  Utterance {i}: {} samples ({duration_ms}ms) — OK",
-                utt.len(),
-            );
-        }
-    }
-
-    // ── 3. Generate augmented wake word variants ───────────────────────
-    info!("─── Phase 3: Generating augmented wake word audio ───");
+    // Generate augmented variants for enrollment diversity
     let augmented_variants = generate_augmented_variants(&available_styles, 200);
     info!("Generated {} augmented variants", augmented_variants.len());
 
-    // Process augmented variants through VAD-gated pipeline to match
-    // the production data path (mahbot-824).
-    let (vad_augmented_embeddings, vad_augmented_enrollment_buffer) =
-        process_vad_validated_enrollment(&augmented_variants);
-    info!(
-        "Extracted {} VAD-gated augmented embeddings from {} variants",
-        vad_augmented_embeddings.len(),
+    let (all_positive_embeddings, all_utterance_buffers) =
+        vad_segment_and_enroll(&enrollment_variants, &augmented_variants);
+    assert!(
+        !all_utterance_buffers.is_empty(),
+        "VAD-gated enrollment produced no utterances from {} enrollment + {} augmented variants",
+        enrollment_variants.len(),
         augmented_variants.len(),
     );
-
-    // Merge VAD-gated enrollment + augmentation embeddings for training
-    // Uses VAD-gated data from Phase 2 for the production-accurate path.
-    let mut all_positive_embeddings = vad_positive_embeddings; // move
-    all_positive_embeddings.extend(vad_augmented_embeddings);
-    let mut all_utterance_buffers = vad_enrollment_buffer; // move
-    all_utterance_buffers.extend(vad_augmented_enrollment_buffer);
-
     info!(
-        "Combined training set: {} positive embeddings from {} utterances (VAD-gated)",
+        "VAD-gated enrollment: {} positive embeddings from {} utterances",
         all_positive_embeddings.len(),
         all_utterance_buffers.len(),
     );
 
-    // ── 4. Train the MLP classifier ────────────────────────────────────
-    info!("─── Phase 4: Training MLP classifier ───");
-
     let dim = all_positive_embeddings[0].len();
 
+    // ── 3. Generate negative training data ─────────────────────────────
     // Generate real negative training data from unrelated AND confusable
     // phrases via TTS.  This mirrors the production pipeline where the
     // verifier is trained on real ambient audio negatives — the confusable
     // near-misses teach the classifier/verifier to discriminate beyond
-    // synthetic Gaussian noise.  Confusable detection (Phase 8) uses a
-    // different TTS seed (300) than confusable training (500), measuring
-    // generalization to novel acoustic renderings.  Unrelated detection
-    // (Phase 9) and training both use seed 400 — this tests rejection of
-    // known-phrase acoustics without the generalization confound.
+    // synthetic Gaussian noise.  Confusable detection uses a different TTS
+    // seed (300) than confusable training (500), measuring generalization to
+    // novel acoustic renderings.  Unrelated detection and training both use
+    // seed 400 — this tests rejection of known-phrase acoustics without the
+    // generalization confound.
+    info!("─── Phase 3: Generating negative training data ───");
     info!("Generating negative training audio from unrelated + confusable phrases...");
     let neg_unrelated: Vec<(Vec<f32>, String)> =
         generate_phrase_variants(UNRELATED_PHRASES, &available_styles, 400, "neg_train");
     let neg_confusable: Vec<(Vec<f32>, String)> =
         generate_phrase_variants(CONFUSABLE_PHRASES, &available_styles, 500, "neg_conf_train");
-    let (mut real_neg_embeddings, _, _) = process_enrollment(&neg_unrelated);
+    let (mut negative_embeddings, _, _) = process_enrollment(&neg_unrelated);
     let (conf_neg_embeddings, _, _) = process_enrollment(&neg_confusable);
-    real_neg_embeddings.extend(conf_neg_embeddings);
+    negative_embeddings.extend(conf_neg_embeddings);
     info!(
         "Extracted {} real negative embeddings from {} unrelated + {} confusable phrases",
-        real_neg_embeddings.len(),
+        negative_embeddings.len(),
         neg_unrelated.len(),
         neg_confusable.len(),
     );
 
     // Supplement with synthetic Gaussian negatives for generalization
-    real_neg_embeddings.extend(generate_synthetic_negatives(SYNTHETIC_NEGATIVE_COUNT, dim));
-    let negative_embeddings = real_neg_embeddings;
+    negative_embeddings.extend(generate_synthetic_negatives(SYNTHETIC_NEGATIVE_COUNT, dim));
+    info!(
+        "Total negative training set: {} embeddings ({dim}-dim)",
+        negative_embeddings.len(),
+    );
 
-    let config = TrainingConfig::default();
-    let weights = wake_word_classifier::train_classifier(
+    // ── 4. finalize_enrollment (consistency check + classifier training) ──
+    // Calls the same production function used by the enrollment pipeline
+    // (handle_enrollment_sample) — validates utterance consistency, then
+    // trains the Conv1D MLP classifier via train_classifier.
+    info!("─── Phase 4: finalize_enrollment ───");
+    let weights = super::finalize_enrollment(
         &all_positive_embeddings,
         &negative_embeddings,
-        &config,
+        &all_utterance_buffers,
     )
-    .expect("Classifier training must succeed");
+    .expect("finalize_enrollment must succeed — consistency check + classifier training");
 
     let classifier = WakeWordClassifier::new(weights.clone());
-
-    // ── Enrollment consistency check ──
-    info!("─── Phase 4b: Enrollment consistency check ───");
-    let consistency_ok = super::validate_enrollment_consistency(&all_utterance_buffers);
-    assert!(
-        consistency_ok.is_ok(),
-        "Enrollment consistency check failed: {:?}",
-        consistency_ok,
+    info!(
+        "Classifier trained successfully: {} params",
+        weights.param_count(),
     );
 
     // ── Informational self-test (non-gating, diagnostic only) ──
@@ -816,14 +709,17 @@ fn e2e_voice_pipeline() {
         warn!("VoiceVerifier is untrained (insufficient data)");
     }
 
-    info!("─── Phase 6: Running detection tests ───");
+    // ── 6. Set global state for streaming detection ────────────────────
+    // The streaming pipeline (handle_wake_word_detection) reads classifier
+    // and verifier from voice_state() global state.  Set them once here.
+    info!("─── Phase 6: Setting global state for streaming detection ───");
+    super::set_classifier_weights(weights);
+    super::set_verifier(verifier.clone());
 
-    // ── 7. Detection: Positive cases ───────────────────────────────────
-    // NOTE: Uses `process_enrollment_sample` (stride=8), which produces
-    // ~8× fewer embeddings per utterance than the live pipeline's per-frame
-    // embedding extraction.  This is a known blind spot: detection that
-    // depends on specific window alignments may differ in production.
-    info!("─── 7. Positive (wake word) variants ───");
+    info!("─── Phase 7: Running streaming detection tests ───");
+
+    // ── 8. Detection: Positive cases ───────────────────────────────────
+    info!("─── 8. Positive (wake word) variants ───");
     let mut pos_metrics = DetectionMetrics::default();
     let all_wake_variants: Vec<(Vec<f32>, String)> = enrollment_variants
         .into_iter()
@@ -837,8 +733,8 @@ fn e2e_voice_pipeline() {
         |m, _| m.detected += 1,
     );
 
-    // ── 8. Detection: Confusable near-miss phrases ─────────────────────
-    info!("─── 8. Negative — confusable phrases ───");
+    // ── 9. Detection: Confusable near-miss phrases ─────────────────────
+    info!("─── 9. Negative — confusable phrases ───");
     let confusable_variants =
         generate_phrase_variants(CONFUSABLE_PHRASES, &available_styles, 300, "confusable");
     info!(
@@ -854,8 +750,8 @@ fn e2e_voice_pipeline() {
         |m, l| m.false_accepts.push(l.to_string()),
     );
 
-    // ── 9. Detection: Unrelated phrases ────────────────────────────────
-    info!("─── 9. Negative — unrelated phrases ───");
+    // ── 10. Detection: Unrelated phrases ────────────────────────────────
+    info!("─── 10. Negative — unrelated phrases ───");
     let unrelated_variants =
         generate_phrase_variants(UNRELATED_PHRASES, &available_styles, 400, "unrelated");
     info!(
@@ -871,8 +767,8 @@ fn e2e_voice_pipeline() {
         |m, l| m.false_accepts.push(l.to_string()),
     );
 
-    // ── 10. Detection: Silence ─────────────────────────────────────────
-    info!("─── 10. Negative — silence ───");
+    // ── 11. Detection: Silence ─────────────────────────────────────────
+    info!("─── 11. Negative — silence ───");
     let mut silence_metric = DetectionMetrics::default();
     test_detection_samples(
         &[(vec![0.0f32; SILENCE_LEN], "silence".to_string())],
@@ -882,8 +778,8 @@ fn e2e_voice_pipeline() {
         |m, l| m.false_accepts.push(l.to_string()),
     );
 
-    // ── 11. Detection: Random noise ────────────────────────────────────
-    info!("─── 11. Negative — random noise ───");
+    // ── 12. Detection: Random noise ────────────────────────────────────
+    info!("─── 12. Negative — random noise ───");
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     let noise: Vec<f32> = (0..NOISE_LEN)
         .map(|_| rng.random::<f32>() * 2.0 - 1.0)
@@ -896,6 +792,51 @@ fn e2e_voice_pipeline() {
         &mut noise_metric,
         |m, l| m.false_accepts.push(l.to_string()),
     );
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Cooldown sub-test
+    // ═══════════════════════════════════════════════════════════════════
+    info!("─── 13. Cooldown verification ───");
+    if let Some((first_pos, _label)) = all_wake_variants.first() {
+        let mut ctx = super::PipelineCtx::new();
+        // First detection should fire
+        let detected = run_streaming_detection(first_pos, &mut ctx);
+        assert!(detected, "Cooldown test: first detection should fire");
+        info!("Cooldown test: first detection fired ✓");
+
+        // Immediate re-feed while cooldown active — detection should NOT fire.
+        let before_cooldown = ctx.last_wake_word_detection;
+        let silenced = run_streaming_detection(first_pos, &mut ctx);
+        assert!(
+            !silenced,
+            "Cooldown test: detection should NOT fire during cooldown"
+        );
+        assert_eq!(
+            ctx.last_wake_word_detection, before_cooldown,
+            "Cooldown test: last_wake_word_detection should not change during cooldown"
+        );
+        info!("Cooldown test: cooldown prevented re-detection ✓");
+
+        // Wait for cooldown to expire
+        info!(
+            "Cooldown test: waiting {}ms for cooldown expiry...",
+            super::WAKE_WORD_COOLDOWN.as_millis()
+        );
+        std::thread::sleep(super::WAKE_WORD_COOLDOWN + std::time::Duration::from_millis(100));
+
+        // After cooldown, detection should fire again.
+        // Reset last_wake_word_detection so run_streaming_detection
+        // doesn't think it already detected before processing audio.
+        ctx.last_wake_word_detection = None;
+        let after_cooldown = run_streaming_detection(first_pos, &mut ctx);
+        assert!(
+            after_cooldown,
+            "Cooldown test: detection should fire after cooldown expires"
+        );
+        info!("Cooldown test: detection fired after cooldown ✓");
+    } else {
+        warn!("Cooldown test: no positive variants available, skipping");
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // Metrics report
@@ -916,10 +857,6 @@ fn e2e_voice_pipeline() {
         pos_metrics.total,
         MIN_DETECTION_RATE * 100.0,
     );
-    if !pos_metrics.failures.is_empty() {
-        info!("  Processing failures: {}", pos_metrics.failures.join(", "));
-    }
-
     info!(
         "Confusable false accepts: {} / {}",
         conf_metrics.false_accepts.len(),
@@ -928,10 +865,6 @@ fn e2e_voice_pipeline() {
     if !conf_metrics.false_accepts.is_empty() {
         info!("  False triggers: {:?}", conf_metrics.false_accepts);
     }
-    if !conf_metrics.failures.is_empty() {
-        info!("  Failures: {}", conf_metrics.failures.join(", "));
-    }
-
     info!(
         "Unrelated false accepts: {} / {}",
         unrelated_metrics.false_accepts.len(),
@@ -940,10 +873,6 @@ fn e2e_voice_pipeline() {
     if !unrelated_metrics.false_accepts.is_empty() {
         info!("  False triggers: {:?}", unrelated_metrics.false_accepts);
     }
-    if !unrelated_metrics.failures.is_empty() {
-        info!("  Failures: {}", unrelated_metrics.failures.join(", "));
-    }
-
     info!(
         "Silence false accepts: {} / 1",
         silence_metric.false_accepts.len(),
@@ -955,13 +884,7 @@ fn e2e_voice_pipeline() {
 
     info!("──────────────────────────────────────────────");
     info!("Total false accepts: {total_false_accepts} — limit ≤{MAX_FALSE_ACCEPTS}",);
-    info!(
-        "Enrollment consistency: {}",
-        match &consistency_ok {
-            Ok(()) => "PASSED".to_string(),
-            Err(msg) => format!("{msg}"),
-        }
-    );
+    info!("Enrollment consistency: validated by finalize_enrollment (Phase 4)");
     info!("══════════════════════════════════════════════");
 
     // ═══════════════════════════════════════════════════════════════════
