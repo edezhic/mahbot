@@ -347,11 +347,11 @@ const _: () = assert!(
 /// (mahbot-773, mahbot-829).  At 0.57 (threshold 1.71), 3 consecutive frames
 /// must average ≥0.57 for detection to fire — moderately strict, balancing
 /// detection rate (≥75%) against false accepts (≤2).
-const MATCH_THRESHOLD_FACTOR: f32 = 0.57;
+const MATCH_THRESHOLD_FACTOR: f32 = 0.60;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.57 = 1.71`).
+/// (= `3 × 0.60 = 1.80`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
