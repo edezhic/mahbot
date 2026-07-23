@@ -458,19 +458,12 @@ pub(crate) fn score_single_embedding(
         embedding_ring.remove(0);
     }
 
-    // ── Per-frame score ──────────────────────────────────────────────
-    // Use the verifier (logistic regression, 97 params, converges reliably
-    // on ~400 examples) as the primary per-frame signal.  When the verifier
-    // is not trained, fall back to the Conv1D MLP classifier (31K params,
-    // unreliable convergence on ~500 examples).
-    //
-    // The rolling window provides temporal smoothing — 3 consecutive frames
-    // averaging ≥ threshold trigger detection.
-    let total_score = if let Some(v) = verifier
-        && v.is_trained()
-    {
-        v.predict(embedding)
-    } else if let Some(c) = classifier {
+    // ── MLP classifier forward pass ───────────────────────────────────
+    // Scores a window of 3 consecutive embeddings via Conv1D + sigmoid.
+    // Falls back to repeat-last tiling when fewer than 3 embeddings are
+    // available.  The MLP is the primary scorer; the verifier below acts
+    // as a light second-stage gate.
+    let total_score = if let Some(c) = classifier {
         if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
             let start = embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
             c.forward(&embedding_ring[start..])
@@ -487,10 +480,28 @@ pub(crate) fn score_single_embedding(
     };
 
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
-    // Accumulates the per-frame score.  When the rolling sum exceeds
-    // threshold, detection fires.  Frames below NO_MATCH_RESET_THRESHOLD
-    // clear the window to prevent indefinite noise accumulation.
-    process_wake_word_score(total_score, score_window)
+    if process_wake_word_score(total_score, score_window) {
+        // ── Verifier gate (mahbot-777) ────────────────────────────────
+        // Lightweight second-stage gate: the max verifier score over the
+        // last ROLLING_WINDOW_N embeddings must be ≥ 0.10.  This only
+        // blocks frames with extremely low confidence (e.g., silence or
+        // pure noise) while passing all wake word and confusable frames.
+        if let Some(v) = verifier
+            && v.is_trained()
+        {
+            let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
+            let max_score = embedding_ring[start..]
+                .iter()
+                .map(|emb| v.predict(emb))
+                .fold(0.0f32, f32::max);
+            if max_score < 0.10 {
+                score_window.clear();
+                return false;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
