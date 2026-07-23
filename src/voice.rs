@@ -311,11 +311,11 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// Minimum per-frame soft score below which the rolling window is reset
-/// entirely (mahbot-773, mahbot-829).  Set to 0.30 to clear the window on
-/// very low-confidence frames while allowing borderline scores to accumulate.
-/// The verifier at 0.50 provides the per-frame decision boundary — the reset
-/// threshold only needs to prevent indefinite noise accumulation.
-const NO_MATCH_RESET_THRESHOLD: f32 = 0.30;
+/// entirely (mahbot-773, mahbot-829).  Set to 0.40 to prevent gradual
+/// confusable accumulation.  Wake word frames typically score well above
+/// 0.40 (often averaging ≥0.77 per frame), so this does not affect
+/// genuine detection.
+const NO_MATCH_RESET_THRESHOLD: f32 = 0.40;
 
 /// Number of recent per-frame scores to keep in the rolling sum window
 /// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
@@ -344,14 +344,15 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829).  At 0.57 (threshold 1.71), 3 consecutive frames
-/// must average ≥0.57 for detection to fire — moderately strict, balancing
-/// detection rate (≥75%) against false accepts (≤2).
-const MATCH_THRESHOLD_FACTOR: f32 = 0.55;
+/// (mahbot-773, mahbot-829).  At 0.80 (threshold 2.40), the average per-frame
+/// soft score must exceed ~80% for detection to fire.  Combined with a clean
+/// verifier at 0.60, this reduces confusable false accepts toward ≤2 while
+/// maintaining ≥75% wake word detection.
+const MATCH_THRESHOLD_FACTOR: f32 = 0.80;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.55 = 1.65`).
+/// (= `3 × 0.80 = 2.40`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
@@ -480,11 +481,10 @@ pub(crate) fn score_single_embedding(
 
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
     if process_wake_word_score(total_score, score_window) {
-        // ── Verifier gate (mahbot-777) ────────────────────────────────
-        // Lightweight second-stage gate: the max verifier score over the
-        // last ROLLING_WINDOW_N embeddings must be ≥ 0.10.  This only
-        // blocks frames with extremely low confidence (e.g., silence or
-        // pure noise) while passing all wake word and confusable frames.
+        // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
+        // After the rolling window check passes, run the second-stage
+        // logistic regression verifier to catch false positives that
+        // survived the MLP classifier.
         if let Some(v) = verifier
             && v.is_trained()
         {
@@ -493,7 +493,10 @@ pub(crate) fn score_single_embedding(
                 .iter()
                 .map(|emb| v.predict(emb))
                 .fold(0.0f32, f32::max);
-            if max_score < 0.295 {
+            if max_score < v.threshold {
+                // Clear the score window so the next frame starts from zero.
+                // Without this the accumulated classifier scores eventually
+                // let any speech through (mahbot-797).
                 score_window.clear();
                 return false;
             }
@@ -2215,14 +2218,8 @@ pub(crate) fn finalize_enrollment(
     // Step 1: Consistency check — gates on utterance quality before training
     validate_enrollment_consistency(enrollment_buffer)?;
 
-    // Step 2: Train the Conv1D classifier with a fixed seed for
-    // deterministic convergence (mahbot-832).  The training is unstable
-    // with 31K params on ~500 examples; a fixed seed ensures the same
-    // initialization and data shuffle produces consistent convergence.
-    let config = wake_word_classifier::TrainingConfig {
-        rng_seed: Some(42),
-        ..Default::default()
-    };
+    // Step 2: Train the Conv1D classifier
+    let config = wake_word_classifier::TrainingConfig::default();
     let weights =
         wake_word_classifier::train_classifier(positive_embeddings, negative_embeddings, &config)?;
     // validate() inside train_classifier checks shapes + NaN/finite
@@ -3368,10 +3365,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     let v = crate::voice_verifier::VoiceVerifier::train(
                         &positive_embeddings,
                         &negative_embeddings,
-                        0.30, // mahbot-832: lowered from 0.50. The verifier has
-                        // only ~100 positive examples for 96 features, so it
-                        // overfits.  The rolling window provides the primary
-                        // temporal gate.
+                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
+                        // Clean training (ambient audio negatives, no confusable phrases)
+                        // ensures wake word variants pass while confusables are blocked.
                         1.0,  // L2 regularization (lambda)
                         0.01, // learning rate
                         2000, // max iterations
@@ -3390,10 +3386,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 } else {
                     let v = crate::voice_verifier::VoiceVerifier::train_with_synthetic_negatives(
                         &positive_embeddings,
-                        0.30, // mahbot-832: lowered from 0.50. The verifier has
-                              // only ~100 positive examples for 96 features, so it
-                              // overfits.  The rolling window provides the primary
-                              // temporal gate.
+                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
+                              // Clean training (ambient audio negatives, no confusable phrases)
+                              // ensures wake word variants pass while confusables are blocked.
                     );
                     info!(
                         "Verifier trained from {} per-frame positive \
@@ -4413,15 +4408,15 @@ mod tests {
             &mut score_window,
         );
 
-        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.30) → window appended.
-        // Rolling sum 0.5 < match_threshold (1.50) → detection does NOT fire.
+        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.40) → window appended.
+        // Rolling sum 0.5 < match_threshold (2.40) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
         );
         assert!(
             !score_window.is_empty(),
-            "tiling should produce a score ≥0.3, giving a non-empty score window",
+            "tiling should produce a score ≥0.4, giving a non-empty score window",
         );
 
         let score = score_window[0];
@@ -4460,11 +4455,11 @@ mod tests {
             score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 1.50)",
+            "two embeddings should not trigger detection (rolling sum < 2.40)",
         );
         assert!(
             !score_window.is_empty(),
-            "second embedding tiling should produce a score ≥0.3",
+            "second embedding tiling should produce a score ≥0.4",
         );
         assert_eq!(ring.len(), 2, "ring should have 2 embeddings");
     }

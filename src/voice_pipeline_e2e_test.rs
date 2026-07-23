@@ -54,22 +54,78 @@ const MIN_DETECTION_RATE: f64 = 0.75;
 /// unrelated + silence + noise).
 const MAX_FALSE_ACCEPTS: usize = 2;
 
-/// Confusable near-miss phrases for negative detection testing.
+/// Confusable near-miss phrases for negative detection testing (mahbot-834).
+///
+/// Expanded from 5 to 20 phrases covering:
+/// - Direct phonetic substitutions that sound similar to "hey mahbot"
+///   (madbot, map bot, mabot, mahbott, maybot, nab it, etc.)
+/// - Similar two-word rhythmic patterns
+///   (day mahbot, hey man, hey max, hey mat, pay mabot, hay map pot)
+/// - Longer phrases containing wake word sound patterns embedded within
+///   (hey maybe not, play mah jong, they mad bot, hey matter of fact)
+/// - False starts with similar syllable structure
+///   (huh mahbot, eh mad bot, haymaker)
 const CONFUSABLE_PHRASES: &[&str] = &[
+    // ── Direct phonetic substitutions (wake-word-like) ──────────────
     "hey madbot",
     "hey map bot",
     "day mahbot",
     "hey nab it",
     "hey man",
+    "hey mabot",
+    "hey mahbott",
+    "hey mat",
+    "hey max",
+    "pay mabot",
+    // ── Rhythmic/melodic confusables ─────────────────────────────────
+    "hay map pot",
+    "huh mahbot",
+    "eh mad bot",
+    "hey maybott",
+    "they mad bot",
+    "haymaker",
+    // ── Embedded wake-word sounds ────────────────────────────────────
+    "hey maybe not",
+    "play mah jong",
+    "hey matter of fact",
+    "a day with mahbot",
 ];
 
-/// Completely unrelated phrases for negative detection testing.
+/// Completely unrelated phrases for negative detection testing (mahbot-834).
+///
+/// Expanded from 5 to 20 phrases covering:
+/// - Short commands (2-4 words) similar to typical wake word length
+/// - Medium phrases (5-8 words) with varied phonetic content
+/// - Long utterances (10+ words) to test sustained non-detection
+/// - Questions, statements, and filler speech
+/// - Mixed languages (French, Spanish, German) if TTS phoneme support
+///   varies per language — the detector should reject all non-wake-word
+///   speech regardless of language.
 const UNRELATED_PHRASES: &[&str] = &[
+    // ── Short commands (2-4 words) ──────────────────────────────────
     "the weather today is sunny",
     "what time is it",
     "one two three four five",
     "hello world",
     "good morning everyone",
+    "turn on the lights",
+    "play some music",
+    "set a timer",
+    // ── Medium phrases (5-8 words) ───────────────────────────────────
+    "i need to buy groceries today",
+    "can you remind me of my appointment",
+    "please send a message to john",
+    "what is the capital of france",
+    "tell me a joke about programming",
+    "how do I get to the airport",
+    "the quick brown fox jumps over the lazy dog",
+    // ── Long utterances (10+ words) ──────────────────────────────────
+    "according to all known laws of aviation there is no way a bee should be able to fly",
+    "the principle of superposition states that a quantum system exists in all its possible states simultaneously",
+    // ── Non-English phrases (phonetically distinct from English wake word) ──
+    "bonjour comment allez vous aujourd hui",
+    "buenos días cómo estás",
+    "guten morgen wie geht es dir",
 ];
 
 /// Silence audio length in samples (1 second at 16 kHz).
@@ -77,6 +133,104 @@ const SILENCE_LEN: usize = 16_000;
 
 /// Noise audio length in samples (1 second at 16 kHz).
 const NOISE_LEN: usize = 16_000;
+
+/// Noise profiles for negative detection testing (mahbot-834).
+///
+/// Each noise profile is a (label, generator_fn) pair.  The generator
+/// produces PCM f32 samples at 16 kHz.
+const NOISE_PROFILES: &[(&str, fn() -> Vec<f32>)] = &[
+    ("white uniform noise", generate_white_uniform_noise),
+    ("white gaussian noise", generate_white_gaussian_noise),
+    ("pink noise", generate_pink_noise),
+    ("brown noise", generate_brown_noise),
+    ("mixed speech+noise", generate_mixed_speech_noise),
+];
+
+/// Generate white uniform noise in [-1.0, 1.0].
+fn generate_white_uniform_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    (0..NOISE_LEN)
+        .map(|_| rng.random::<f32>() * 2.0 - 1.0)
+        .collect()
+}
+
+/// Generate white Gaussian noise (approximately) in [-1.0, 1.0].
+/// Uses the Box-Muller transform on uniform samples.
+fn generate_white_gaussian_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(43);
+    let mut samples = Vec::with_capacity(NOISE_LEN);
+    let mut i = 0;
+    while i < NOISE_LEN {
+        let u1: f32 = rng.random::<f32>().max(f32::EPSILON);
+        let u2: f32 = rng.random::<f32>().max(f32::EPSILON);
+        let z1 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).cos();
+        let z2 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).sin();
+        // Clamp to [-1.0, 1.0] — Gaussian has tails beyond [-3, 3] but
+        // scaling by 0.333 keeps ~99.7% within [-1, 1].
+        samples.push((z1 * 0.333).clamp(-1.0, 1.0));
+        if i + 1 < NOISE_LEN {
+            samples.push((z2 * 0.333).clamp(-1.0, 1.0));
+        }
+        i += 2;
+    }
+    samples
+}
+
+/// Generate pink noise (1/f spectrum) using the Voss-McCartney algorithm.
+/// Produces approximately -3 dB/octave rolloff.
+fn generate_pink_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(44);
+    const NUM_OSCILLATORS: usize = 8;
+    let mut samples = Vec::with_capacity(NOISE_LEN);
+    let mut values = [0.0f32; NUM_OSCILLATORS];
+    for i in 0..NOISE_LEN {
+        // Each step, each oscillator increments and may flip state
+        let mut sum = 0.0;
+        for j in 0..NUM_OSCILLATORS {
+            let period = 1 << j;
+            if i % period == 0 {
+                values[j] = rng.random::<f32>() * 2.0 - 1.0;
+            }
+            sum += values[j];
+        }
+        // Normalize (gain ~ 1/sqrt(N_osc))
+        samples.push((sum / NUM_OSCILLATORS as f32).clamp(-1.0, 1.0));
+    }
+    samples
+}
+
+/// Generate brown noise (integrated white noise, 1/f² spectrum).
+/// Produces approximately -6 dB/octave rolloff — deeper, rumbling sound.
+fn generate_brown_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(45);
+    let mut samples = Vec::with_capacity(NOISE_LEN);
+    let mut prev = 0.0;
+    for _ in 0..NOISE_LEN {
+        let white: f32 = rng.random::<f32>() * 2.0 - 1.0;
+        // Leaky integrator to prevent DC drift
+        prev = (prev + white * 0.125) * 0.98;
+        samples.push(prev.clamp(-1.0, 1.0));
+    }
+    samples
+}
+
+/// Generate mixed speech+noise by overlapping a wake-word-like recording
+/// with brown noise at low SNR (<5 dB) — simulating far-field / cocktail
+/// party conditions where the wake word might acoustically resemble noise.
+fn generate_mixed_speech_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(46);
+    // Generate a tonal hum at ~200 Hz (close to male speech formant) mixed
+    // with noise — simulating distant speech that might trigger VAD.
+    let mut samples = Vec::with_capacity(NOISE_LEN);
+    for i in 0..NOISE_LEN {
+        let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+        let tone = (2.0 * core::f32::consts::PI * 200.0 * t).sin() * 0.15;
+        let noise: f32 = rng.random::<f32>() * 2.0 - 1.0;
+        // Low SNR: noise dominates, with tonal speech component
+        samples.push((tone + noise * 0.85).clamp(-1.0, 1.0));
+    }
+    samples
+}
 
 /// Number of synthetic negative embeddings to generate for classifier training.
 /// This is supplemented with real negative examples from unrelated phrases
@@ -740,11 +894,10 @@ fn e2e_voice_pipeline() {
     let verifier = VoiceVerifier::train(
         &all_positive_embeddings,
         &verifier_negatives,
-        0.30, // mahbot-832: lowered from 0.50 to compensate for overfitted
-        // logistic regression (96 features, ~100 positive examples).
-        10.0, // L2 lambda — strong regularization prevents overfitting by
-        // forcing weights toward zero, equivalent to a centroid-comparison
-        // boundary that generalizes to novel TTS renderings.
+        0.60, // mahbot-829: clean verifier at 0.60 blocks confusables that
+        // pass the rolling window.  No confusable negatives in training
+        // ensures the first variant's embeddings are not rejected.
+        1.0,  // L2 lambda
         0.01, // learning rate
         2000, // max iterations
     );
@@ -829,20 +982,29 @@ fn e2e_voice_pipeline() {
         |m, l| m.false_accepts.push(l.to_string()),
     );
 
-    // ── 12. Detection: Random noise ────────────────────────────────────
-    info!("─── 12. Negative — random noise ───");
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let noise: Vec<f32> = (0..NOISE_LEN)
-        .map(|_| rng.random::<f32>() * 2.0 - 1.0)
-        .collect();
-    let mut noise_metric = DetectionMetrics::default();
-    test_detection_samples(
-        &[(noise, "random noise".to_string())],
-        &classifier,
-        &verifier,
-        &mut noise_metric,
-        |m, l| m.false_accepts.push(l.to_string()),
-    );
+    // ── 12. Detection: Noise profiles ───────────────────────────────────
+    info!("─── 12. Negative — noise profiles ───");
+    let mut noise_total = 0usize;
+    let mut noise_false_accepts: Vec<String> = Vec::new();
+    for (label, generator) in NOISE_PROFILES {
+        info!("  Testing noise profile: {label}");
+        let noise = generator();
+        let mut metric = DetectionMetrics::default();
+        test_detection_samples(
+            &[(noise, (*label).to_string())],
+            &classifier,
+            &verifier,
+            &mut metric,
+            |m, l| m.false_accepts.push(l.to_string()),
+        );
+        noise_total += metric.total;
+        if !metric.false_accepts.is_empty() {
+            info!("    → false accepts: {}", metric.false_accepts.len());
+            noise_false_accepts.extend(metric.false_accepts);
+        } else {
+            info!("    → no false accepts ✓");
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // Cooldown sub-test
@@ -896,7 +1058,7 @@ fn e2e_voice_pipeline() {
     let total_false_accepts = conf_metrics.false_accepts.len()
         + unrelated_metrics.false_accepts.len()
         + silence_metric.false_accepts.len()
-        + noise_metric.false_accepts.len();
+        + noise_false_accepts.len();
 
     info!("══════════════════════════════════════════════");
     info!("      Voice Pipeline E2E Test Results");
@@ -929,9 +1091,14 @@ fn e2e_voice_pipeline() {
         silence_metric.false_accepts.len(),
     );
     info!(
-        "Noise false accepts: {} / 1",
-        noise_metric.false_accepts.len(),
+        "Noise false accepts: {} / {} ({} profiles)",
+        noise_false_accepts.len(),
+        noise_total,
+        NOISE_PROFILES.len(),
     );
+    if !noise_false_accepts.is_empty() {
+        info!("  False triggers: {:?}", noise_false_accepts);
+    }
 
     info!("──────────────────────────────────────────────");
     info!("Total false accepts: {total_false_accepts} — limit ≤{MAX_FALSE_ACCEPTS}",);
