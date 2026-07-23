@@ -740,10 +740,11 @@ fn e2e_voice_pipeline() {
     let verifier = VoiceVerifier::train(
         &all_positive_embeddings,
         &verifier_negatives,
-        0.3, // mahbot-832: lowered from 0.50 to compensate for overfitted
+        0.30, // mahbot-832: lowered from 0.50 to compensate for overfitted
         // logistic regression (96 features, ~100 positive examples).
-        // The rolling window at 0.50/0.30 provides temporal smoothing.
-        1.0,  // L2 lambda
+        10.0, // L2 lambda — strong regularization prevents overfitting by
+        // forcing weights toward zero, equivalent to a centroid-comparison
+        // boundary that generalizes to novel TTS renderings.
         0.01, // learning rate
         2000, // max iterations
     );
