@@ -740,11 +740,9 @@ fn e2e_voice_pipeline() {
     let verifier = VoiceVerifier::train(
         &all_positive_embeddings,
         &verifier_negatives,
-        0.50, // mahbot-832: lower from 0.60 to avoid rejecting wake word frames
-        // whose verifier scores cluster near 0.50-0.55.  The MLP rolling
-        // window (threshold 2.10) provides the primary gate; the verifier at
-        // 0.50 still blocks unrelated speech without false-rejecting enrolled
-        // wake word variants.
+        0.3, // mahbot-832: lowered from 0.50 to compensate for overfitted
+        // logistic regression (96 features, ~100 positive examples).
+        // The rolling window at 0.50/0.30 provides temporal smoothing.
         1.0,  // L2 lambda
         0.01, // learning rate
         2000, // max iterations
