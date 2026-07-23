@@ -344,16 +344,15 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829).  With the verifier score as the per-frame signal,
-/// the threshold represents the average verifier confidence needed across 3
-/// consecutive frames.  At 0.60 (threshold 1.80), each frame needs to be at
-/// or above the verifier's default 0.60 decision boundary for detection to
-/// fire — the rolling window serves as a temporal consistency check.
-const MATCH_THRESHOLD_FACTOR: f32 = 0.60;
+/// (mahbot-773, mahbot-829).  At 0.70 (threshold 2.10), the average per-frame
+/// soft score must exceed ~70% for detection to fire.  The verifier at 0.60
+/// provides a second-stage AND gate that blocks confusable near-misses while
+/// passing enrolled wake word frames.
+const MATCH_THRESHOLD_FACTOR: f32 = 0.70;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.60 = 1.80`).
+/// (= `3 × 0.70 = 2.10`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
@@ -459,20 +458,12 @@ pub(crate) fn score_single_embedding(
         embedding_ring.remove(0);
     }
 
-    // ── Per-frame score ──────────────────────────────────────────────
-    // Use the verifier score as the primary per-frame signal when the
-    // verifier is trained.  The verifier is a well-calibrated logistic
-    // regression trained on individual wake-word vs non-wake-word embeddings.
-    // The rolling window provides temporal smoothing over 3 frames.
-    //
-    // When the verifier is unavailable, fall back to the MLP Conv1D
-    // classifier which scores windows of 3 consecutive embeddings.
-    let total_score = if let Some(v) = verifier
-        && v.is_trained()
-    {
-        v.predict(embedding)
-    } else if let Some(c) = classifier {
-        // MLP fallback — tile ring buffer to fill the 3-embedding window.
+    // ── MLP classifier forward pass ───────────────────────────────────
+    // Scores a window of 3 consecutive embeddings via Conv1D + sigmoid.
+    // Falls back to repeat-last tiling when fewer than 3 embeddings are
+    // available — AdaptiveAvgPool collapses the time dimension, so tiling
+    // provides an unbiased estimate for a stationary distribution.
+    let total_score = if let Some(c) = classifier {
         if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
             let start = embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
             c.forward(&embedding_ring[start..])
@@ -489,10 +480,29 @@ pub(crate) fn score_single_embedding(
     };
 
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
-    // Accumulates the per-frame score.  When the rolling sum exceeds
-    // threshold, detection fires.  Frames below NO_MATCH_RESET_THRESHOLD
-    // clear the window to prevent indefinite noise accumulation.
-    process_wake_word_score(total_score, score_window)
+    if process_wake_word_score(total_score, score_window) {
+        // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
+        // Second-stage AND check: the max verifier score over the last
+        // ROLLING_WINDOW_N embeddings must be ≥ the verifier threshold
+        // (currently 0.60).  This rejects confusable near-misses that
+        // scored high enough to pass the rolling window but don't match
+        // the enrolled wake word embedding signature.
+        if let Some(v) = verifier
+            && v.is_trained()
+        {
+            let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
+            let max_score = embedding_ring[start..]
+                .iter()
+                .map(|emb| v.predict(emb))
+                .fold(0.0f32, f32::max);
+            if max_score < v.threshold {
+                score_window.clear();
+                return false;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
@@ -4398,7 +4408,7 @@ mod tests {
         );
 
         // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.40) → window appended.
-        // Rolling sum 0.5 < match_threshold (1.80) → detection does NOT fire.
+        // Rolling sum 0.5 < match_threshold (2.10) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
@@ -4444,7 +4454,7 @@ mod tests {
             score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 1.80)",
+            "two embeddings should not trigger detection (rolling sum < 2.10)",
         );
         assert!(
             !score_window.is_empty(),
