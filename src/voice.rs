@@ -344,15 +344,14 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829).  With the verifier as the per-frame scorer,
-/// the threshold represents the average verifier confidence needed across 3
-/// consecutive frames.  At 0.50 (threshold 1.50), 3 frames averaging ≥0.50
-/// trigger detection — a soft consistency check over ~384ms of speech.
-const MATCH_THRESHOLD_FACTOR: f32 = 0.50;
+/// (mahbot-773, mahbot-829).  At 0.55 (threshold 1.65), 3 consecutive frames
+/// must average ≥0.55 for detection to fire — a moderate bar that balances
+/// detection rate (≥75%) against false accepts (≤2).
+const MATCH_THRESHOLD_FACTOR: f32 = 0.55;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.50 = 1.50`).
+/// (= `3 × 0.55 = 1.65`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
