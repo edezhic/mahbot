@@ -910,7 +910,15 @@ struct VoicePipelineState {
     classifier: Option<WakeWordClassifier>,
     /// Second-stage logistic regression verifier.
     verifier: VoiceVerifier,
+    /// Per-utterance embeddings extracted via the full-utterance mel pipeline
+    /// (used for Conv1D classifier training).
     enrollment_buffer: Vec<Vec<Vec<f32>>>,
+    /// Per-utterance embeddings extracted via the streaming detection pipeline
+    /// (used for VoiceVerifier training, mahbot-855).  Mirrors
+    /// [`enrollment_buffer`] structure: one entry per utterance, each entry
+    /// containing all embeddings extracted from that utterance through the
+    /// streaming pipeline.
+    streaming_enrollment_buffer: Vec<Vec<Vec<f32>>>,
     /// Raw audio chunks collected during non-wake-word periods of enrollment
     /// (pre-enrollment ambient noise and inter-utterance silence).  These are
     /// processed through the ONNX embedding model at verifier training time to
@@ -953,6 +961,7 @@ pub fn init_global() -> Result<()> {
             classifier: None,
             verifier: VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
+            streaming_enrollment_buffer: Vec::new(),
             negative_audio_chunks: Vec::new(),
             cmd_tx: None,
         }))
@@ -1362,6 +1371,183 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
     }
 
     Ok(embeddings)
+}
+
+/// Process raw utterance audio through the streaming detection pipeline and
+/// collect all embeddings that would be produced during live inference.
+///
+/// Uses [`process_streaming_frames`] for the VAD-gating / batch-accumulation
+/// loop (shared with the live detection pipeline), then extracts embeddings
+/// from each mel frame flush via [`push_streaming_embedding`].
+///
+/// Unlike [`extract_embeddings_from_audio`] which processes the full audio
+/// through a single mel spectrogram call and slides a window with stride 8 over
+/// dense mel frames, this function simulates the streaming pipeline where audio
+/// arrives in 512-sample chunks, mel spectrograms are computed per-batch with
+/// batch-boundary artifacts, and only the most recent 76 mel frames produce one
+/// embedding per ~128ms of speech. This ensures verifier training distribution
+/// matches the inference distribution (mahbot-855).
+///
+/// Uses a fresh [`earshot::Detector`] so the global live pipeline's VAD state
+/// is not corrupted.
+fn extract_streaming_embeddings_from_audio(
+    models: &OnnxModels,
+    samples: &[f32],
+) -> Result<Vec<Vec<f32>>> {
+    if samples.is_empty() {
+        anyhow::bail!("No audio samples provided");
+    }
+
+    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+    let mut voice_batch: Vec<f32> = Vec::new();
+    let mut mel_frame_buffer: Vec<Vec<f32>> = Vec::new();
+    let mut detector = earshot::Detector::default();
+
+    process_streaming_frames(
+        samples,
+        &mut voice_batch,
+        &mut mel_frame_buffer,
+        &mut detector,
+        |mel_buf| {
+            push_streaming_embedding(models, mel_buf, &mut embeddings);
+        },
+    );
+
+    // If we still have mel frames but no embeddings yet (e.g. very short
+    // utterance that never triggered a batch flush), try one final embedding.
+    if embeddings.is_empty() && !mel_frame_buffer.is_empty() {
+        push_streaming_embedding(models, &mel_frame_buffer, &mut embeddings);
+    }
+
+    if embeddings.is_empty() {
+        anyhow::bail!("No embeddings could be extracted from audio through streaming pipeline");
+    }
+
+    Ok(embeddings)
+}
+
+/// Shared VAD-gating / batch-accumulation frame loop from the streaming
+/// detection pipeline.
+///
+/// Processes audio frames through VAD gating, accumulates voiced samples into
+/// `voice_batch`, flushes to `mel_frame_buffer` at [`VOICE_BATCH_SIZE`] or on
+/// VAD-negative transitions, and calls `on_embedding_ready` with the current
+/// mel frame buffer after each flush — giving the callback an opportunity to
+/// compute one or more embeddings (mahbot-855).
+///
+/// This is the reference implementation of the batch-accumulation logic shared
+/// by both offline streaming embedding extraction (for verifier training) and
+/// the live detection pipeline ([`handle_wake_word_detection`]).
+///
+/// # Callback
+///
+/// `on_embedding_ready` receives `&[Vec<f32>]` — the current mel frame buffer
+/// after a flush.  Typically the callback extracts the most recent
+/// [`EMBEDDING_WINDOW_FRAMES`] frames and computes an embedding via
+/// [`push_streaming_embedding`] or
+/// [`try_match_wake_word_and_push_embedding`].
+///
+/// # Parameters
+///
+/// - `detector`: VAD detector instance.  Offline extraction passes a fresh
+///   [`earshot::Detector::default()`] to avoid corrupting the live pipeline's
+///   VAD state; the live detection path passes the global [`VAD_DETECTOR`]
+///   mutex.
+///
+/// # Synchronisation with the live detection path
+///
+/// If you change the batch accumulation behaviour here (overlap, sizing, VAD
+/// gating, flush triggers), you MUST also update the equivalent frame loop in
+/// [`handle_wake_word_detection`] so that verifier training and inference stay
+/// aligned — otherwise the training/inference distribution mismatch that caused
+/// mahbot-855 will silently reappear.
+///
+/// The live detection path has additional concerns not captured here (cooldown,
+/// audio buffer accumulation across calls, early return on wake word detection,
+/// [`ctx.audio_buffer`] drain), but the core VAD-gating and batch-flush logic
+/// must remain identical.
+fn process_streaming_frames(
+    samples: &[f32],
+    voice_batch: &mut Vec<f32>,
+    mel_frame_buffer: &mut Vec<Vec<f32>>,
+    detector: &mut earshot::Detector,
+    mut on_embedding_ready: impl FnMut(&[Vec<f32>]),
+) {
+    let mut consumed = 0;
+    let len = samples.len();
+    while consumed + FRAME_LENGTH <= len {
+        let frame = &samples[consumed..consumed + FRAME_LENGTH];
+
+        // VAD gate — skip silence to avoid wasted ONNX compute.
+        if is_speech_with_detector(frame, detector, VAD_THRESHOLD) {
+            // Add only the NEW samples (HOP_LENGTH per frame) to avoid
+            // duplicating overlapping audio.  Each frame overlaps the previous
+            // by 50% (HOP_LENGTH = FRAME_LENGTH/2), so appending the full
+            // frame would duplicate half the audio — corrupting the mel model
+            // input with repeated segments.
+            voice_batch.extend_from_slice(&frame[..HOP_LENGTH]);
+        } else if !voice_batch.is_empty() {
+            // Silence transition: flush accumulated voiced batch
+            flush_voice_batch(voice_batch, mel_frame_buffer);
+            voice_batch.clear();
+            on_embedding_ready(mel_frame_buffer);
+            consumed += HOP_LENGTH;
+            continue;
+        }
+
+        // Process batch when enough voiced audio accumulated
+        // (every ~128ms instead of every 32ms)
+        if voice_batch.len() >= VOICE_BATCH_SIZE {
+            flush_voice_batch(voice_batch, mel_frame_buffer);
+            on_embedding_ready(mel_frame_buffer);
+        }
+        consumed += HOP_LENGTH;
+    }
+
+    // Flush any remaining voice batch after the frame loop (end-of-utterance
+    // where no trailing silence is present).
+    if !voice_batch.is_empty() {
+        flush_voice_batch(voice_batch, mel_frame_buffer);
+        voice_batch.clear();
+        on_embedding_ready(mel_frame_buffer);
+    }
+}
+
+/// Helper: compute an embedding from the current mel frame buffer (padded if
+/// necessary) and push it into the embeddings collection.
+///
+/// Mirrors the mel-frame → embedding logic in
+/// [`try_match_wake_word_and_push_embedding`], and uses
+/// [`crate::util::with_block_in_place`] for the blocking ONNX call so that
+/// callers on the multi-threaded tokio runtime do not starve other tasks.
+fn push_streaming_embedding(
+    models: &OnnxModels,
+    mel_frame_buffer: &[Vec<f32>],
+    embeddings: &mut Vec<Vec<f32>>,
+) {
+    if mel_frame_buffer.is_empty() {
+        return;
+    }
+
+    // If the mel buffer is shorter than the required embedding window
+    // (76 frames), pad it with tapered fade-out frames so an embedding
+    // can always be computed — matching the streaming pipeline.
+    let padded_window: Vec<Vec<f32>>;
+    let embed_input: &[Vec<f32>] = if mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES {
+        padded_window = pad_mel_frames_to_window(mel_frame_buffer);
+        &padded_window
+    } else {
+        // Take the most recent EMBEDDING_WINDOW_FRAMES
+        &mel_frame_buffer[mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES..]
+    };
+
+    match crate::util::with_block_in_place(|| compute_embedding(models, embed_input)) {
+        Ok(emb) => {
+            debug!("Streaming embedding computed: {} dims", emb.len());
+            embeddings.push(emb);
+        }
+        Err(e) => warn!("Streaming embedding compute failed: {e}"),
+    }
 }
 
 fn is_speech(samples: &[f32]) -> bool {
@@ -1966,6 +2152,20 @@ pub fn process_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
         .get()
         .ok_or_else(|| anyhow!("Voice models not loaded"))?;
     extract_embeddings_from_audio(models, samples)
+}
+
+/// Process raw utterance audio through the streaming detection pipeline and
+/// return all embeddings that would be produced during live inference.
+///
+/// Wraps [`extract_streaming_embeddings_from_audio`] with a global model lookup,
+/// analogous to [`process_enrollment_sample`].  Used to generate verifier
+/// training data that matches the inference-time embedding distribution
+/// (mahbot-855).
+pub fn process_streaming_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
+    let models = ONNX_MODELS
+        .get()
+        .ok_or_else(|| anyhow!("Voice models not loaded"))?;
+    extract_streaming_embeddings_from_audio(models, samples)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3180,6 +3380,7 @@ impl PipelineCtx {
                 // Cancel also clears global enrollment accumulators.
                 let mut state = voice_state().write().unwrap_poison();
                 state.enrollment_buffer.clear();
+                state.streaming_enrollment_buffer.clear();
                 state.negative_audio_chunks.clear();
             }
         }
@@ -3690,6 +3891,16 @@ fn check_enrollment_utterance_length(
 
 /// Handle enrollment sample: process audio into embeddings and accumulate.
 ///
+/// Extracts TWO types of embeddings from each utterance:
+/// 1. **Old-style** (via [`process_enrollment_sample`]): full-utterance mel
+///    spectrogram with stride-8 sliding window — used for Conv1D classifier
+///    training (stored in `enrollment_buffer`).
+/// 2. **Streaming-style** (via [`process_streaming_enrollment_sample`]):
+///    VAD-gated batch processing matching the live detection pipeline — used
+///    for VoiceVerifier training (stored in `streaming_enrollment_buffer`).
+///    This ensures the verifier's training distribution matches the inference
+///    distribution (mahbot-855).
+///
 /// ONNX inference is CPU-bound (mel spectrogram + embedding computation).
 /// It runs on a blocking thread via `spawn_blocking` to avoid starving
 /// the async pipeline during enrollment.
@@ -3706,15 +3917,25 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // Compute utterance duration before moving `samples` into the closure.
     let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
-    // Clone samples for quality computation (they will be moved into
-    // spawn_blocking for ONNX inference).
+    // Clone samples for quality computation and streaming embedding extraction
+    // (the primary copy is moved into spawn_blocking for old-style extraction).
     let samples_for_quality = samples.clone();
+    let samples_for_streaming = samples.clone();
 
     // Run ONNX inference on a blocking thread to avoid blocking the async pipeline.
-    let embeddings_result =
-        tokio::task::spawn_blocking(move || process_enrollment_sample(&samples))
-            .await
-            .unwrap_or_else(|e| Err(anyhow!("Blocking task failed: {e}")));
+    // Extract BOTH old-style and streaming embeddings from the same raw audio.
+    let (embeddings_result, streaming_result) = tokio::task::spawn_blocking(move || {
+        let old = process_enrollment_sample(&samples);
+        let streaming = process_streaming_enrollment_sample(&samples_for_streaming);
+        (old, streaming)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        (
+            Err(anyhow!("Blocking task failed: {e}")),
+            Err(anyhow!("Blocking task failed: {e}")),
+        )
+    });
 
     match embeddings_result {
         Ok(embeddings) => {
@@ -3725,6 +3946,20 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 return;
             }
 
+            // ── Handle streaming embeddings ──
+            let streaming_embeddings = match streaming_result {
+                Ok(se) => se,
+                Err(e) => {
+                    warn!("Streaming embedding extraction failed for this utterance: {e}");
+                    // Do NOT fall back to old-style embeddings — they would
+                    // reproduce the training/inference distribution mismatch
+                    // that causes 46.2% detection (mahbot-855 root cause).
+                    // An empty entry keeps the buffer aligned and is skipped
+                    // during verifier training via flat_map.
+                    Vec::new()
+                }
+            };
+
             let (count, quality) = {
                 let mut state = voice_state().write().unwrap_poison();
 
@@ -3733,13 +3968,14 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 let quality = Some(compute_utterance_quality(&samples_for_quality, noise_rms));
 
                 state.enrollment_buffer.push(embeddings);
+                state.streaming_enrollment_buffer.push(streaming_embeddings);
                 let count = state.enrollment_buffer.len();
                 // state dropped here — no lock held across await
                 (count, quality)
             };
 
             if count >= NUM_ENROLLMENT_SAMPLES {
-                // ── Collect positive and negative embeddings ──
+                // ── Collect positive embeddings (old-style for classifier) ──
                 let enrollment_buffer = {
                     let state = voice_state().read().unwrap_poison();
                     state.enrollment_buffer.clone()
@@ -3750,41 +3986,63 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     .flat_map(|sample| sample.iter().cloned())
                     .collect();
 
-                // Extract negative embeddings from ambient audio chunks
-                let (negative_embeddings, n_chunks) = {
+                // ── Collect streaming positive embeddings (for verifier) ──
+                let streaming_enrollment_buffer = {
+                    let state = voice_state().read().unwrap_poison();
+                    state.streaming_enrollment_buffer.clone()
+                };
+
+                let positive_streaming_embeddings: Vec<Vec<f32>> = streaming_enrollment_buffer
+                    .iter()
+                    .flat_map(|sample| sample.iter().cloned())
+                    .collect();
+
+                // ── Clone negative audio chunks once for both extraction paths ──
+                let (negative_audio_chunks, _n_chunks, used_real_negatives) = {
                     let state = voice_state().read().unwrap_poison();
                     let chunks = state.negative_audio_chunks.clone();
                     let n = chunks.len();
-                    (chunks, n)
+                    let should_use = n >= 2 && ONNX_MODELS.get().is_some();
+                    (chunks, n, should_use)
                 };
-                let (negative_embeddings, used_real_negatives) = {
-                    if n_chunks >= 2 && ONNX_MODELS.get().is_some() {
-                        let result = tokio::task::spawn_blocking(move || {
+
+                // ── Extract negatives in a single blocking task ──
+                // Processes each ambient audio chunk through BOTH the streaming
+                // pipeline (for verifier) and the old-style pipeline (for classifier)
+                // in one spawn_blocking call, avoiding duplicated clone + scheduling
+                // overhead (mahbot-855 review feedback).
+                let (streaming_negative_embeddings, negative_embeddings_for_classifier) =
+                    if used_real_negatives {
+                        let chunks = negative_audio_chunks.clone();
+                        tokio::task::spawn_blocking(move || {
                             let models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
-                            let mut all_neg = Vec::new();
-                            for chunk in &negative_embeddings {
+                            let mut streaming_neg = Vec::new();
+                            let mut old_neg = Vec::new();
+                            for chunk in &chunks {
+                                match extract_streaming_embeddings_from_audio(models, chunk) {
+                                    Ok(embs) => streaming_neg.extend(embs),
+                                    Err(e) => warn!(
+                                        "Failed to extract streaming negative embedding \
+                                     from ambient audio chunk ({} samples): {e}",
+                                        chunk.len(),
+                                    ),
+                                }
                                 match extract_embeddings_from_audio(models, chunk) {
-                                    Ok(embs) => all_neg.extend(embs),
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to extract negative embedding \
-                                             from ambient audio chunk ({} samples): \
-                                             {e}",
-                                            chunk.len(),
-                                        );
-                                    }
+                                    Ok(embs) => old_neg.extend(embs),
+                                    Err(e) => warn!(
+                                        "Failed to extract old-style negative embedding \
+                                     from ambient audio chunk ({} samples): {e}",
+                                        chunk.len(),
+                                    ),
                                 }
                             }
-                            all_neg
+                            (streaming_neg, old_neg)
                         })
                         .await
-                        .unwrap_or_default();
-                        let used = !result.is_empty();
-                        (result, used)
+                        .unwrap_or_default()
                     } else {
-                        (Vec::new(), false)
-                    }
-                };
+                        (Vec::new(), Vec::new())
+                    };
 
                 // Conditionally clear negative_audio_chunks
                 if used_real_negatives {
@@ -3794,11 +4052,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         .negative_audio_chunks
                         .clear();
                 }
-
-                // ── Train the Conv1D classifier (blocking, pure Rust manual backprop) ──
                 let classifier_result = {
                     let pos = positive_embeddings.clone();
-                    let neg = negative_embeddings.clone();
+                    let neg = negative_embeddings_for_classifier.clone();
                     let buf = enrollment_buffer.clone();
                     tokio::task::spawn_blocking(move || finalize_enrollment(&pos, &neg, &buf))
                         .await
@@ -3831,52 +4087,61 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     }
                 };
 
-                // ── Train verifier (mahbot-777, mahbot-797) ──────
-                let verifier = if positive_embeddings.is_empty() {
-                    warn!(
-                        "Could not train verifier: no valid positive embeddings \
-                         from {} enrollment samples",
-                        positive_embeddings.len(),
-                    );
+                // ── Train verifier in spawn_blocking (CPU-bound logistic ──────
+                // regression with up to 5000 iterations — must not block the
+                // async runtime during enrollment finalization, mahbot-855).
+                //
+                // The verifier uses STREAMING-style embeddings (from
+                // streaming_enrollment_buffer) so the training distribution
+                // matches the inference distribution (mahbot-855).  Both
+                // positives and negatives are processed through the streaming
+                // pipeline.
+                let pos_for_verifier = positive_streaming_embeddings.clone();
+                let neg_for_verifier = streaming_negative_embeddings.clone();
+                let verifier = tokio::task::spawn_blocking(move || {
+                    use crate::voice_verifier::{
+                        DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE, MAX_ITER,
+                        VoiceVerifier,
+                    };
+
+                    if pos_for_verifier.is_empty() {
+                        warn!("Could not train verifier: no valid streaming positive embeddings");
+                        VoiceVerifier::untrained()
+                    } else if !neg_for_verifier.is_empty() {
+                        let n_neg = neg_for_verifier.len();
+                        let v = VoiceVerifier::train(
+                            &pos_for_verifier,
+                            &neg_for_verifier,
+                            DEFAULT_VERIFIER_THRESHOLD,
+                            L2_LAMBDA,     // 0.01
+                            LEARNING_RATE, // 0.01
+                            MAX_ITER,      // 5000
+                        );
+                        info!(
+                            "Verifier trained from {} streaming positive + {n_neg} real \
+                             streaming negative embedding(s) (streaming pipeline, mahbot-855)",
+                            pos_for_verifier.len(),
+                        );
+                        v
+                    } else {
+                        let v = VoiceVerifier::train_with_synthetic_negatives(
+                            &pos_for_verifier,
+                            DEFAULT_VERIFIER_THRESHOLD,
+                        );
+                        info!(
+                            "Verifier trained from {} streaming positive \
+                             embedding(s) + synthetic negatives (no real \
+                             negatives available, mahbot-855)",
+                            pos_for_verifier.len(),
+                        );
+                        v
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Verifier training task panicked: {e}");
                     crate::voice_verifier::VoiceVerifier::untrained()
-                } else if !negative_embeddings.is_empty() {
-                    let n_neg = negative_embeddings.len();
-                    let v = crate::voice_verifier::VoiceVerifier::train(
-                        &positive_embeddings,
-                        &negative_embeddings,
-                        crate::voice_verifier::DEFAULT_VERIFIER_THRESHOLD,
-                        // Clean training (ambient audio negatives, no confusable phrases)
-                        // ensures wake word variants pass while confusables are blocked.
-                        crate::voice_verifier::L2_LAMBDA, // mahbot-854: 0.01
-                        crate::voice_verifier::LEARNING_RATE, // mahbot-854: 0.01
-                        crate::voice_verifier::MAX_ITER,  // mahbot-854: 5000
-                    );
-                    info!(
-                        "Verifier trained from {} positive + {n_neg} real \
-                         negative embedding(s) ({})",
-                        positive_embeddings.len(),
-                        if n_neg < n_chunks {
-                            format!("{n_chunks} chunks → {n_neg} embeds")
-                        } else {
-                            format!("{n_chunks} chunks")
-                        },
-                    );
-                    v
-                } else {
-                    let v = crate::voice_verifier::VoiceVerifier::train_with_synthetic_negatives(
-                        &positive_embeddings,
-                        crate::voice_verifier::DEFAULT_VERIFIER_THRESHOLD,
-                        // Clean training (ambient audio negatives, no confusable phrases)
-                        // ensures wake word variants pass while confusables are blocked.
-                    );
-                    info!(
-                        "Verifier trained from {} per-frame positive \
-                         embedding(s) + synthetic negatives (no real \
-                         negatives available)",
-                        positive_embeddings.len(),
-                    );
-                    v
-                };
+                });
 
                 // ── Informational self-test (non-gating, diagnostic only) ──
                 let classifier =
@@ -4279,6 +4544,25 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 
     ctx.audio_buffer.extend_from_slice(samples);
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // VAD-gating / batch-accumulation frame loop
+    //
+    // This is the PRODUCTION version of the frame-processing loop.  The
+    // VERIFIER TRAINING version lives in [`process_streaming_frames`] (the
+    // shared reference implementation).  If you change batch accumulation
+    // behaviour here — overlap, sizing, VAD gating, flush triggers — you MUST
+    // also update [`process_streaming_frames`] so that verifier training and
+    // inference stay aligned.  Failure to do so will silently reappear the
+    // training/inference distribution mismatch that caused mahbot-855.
+    //
+    // Differences from the shared reference:
+    //   - Operates on `ctx.audio_buffer` (accumulates across calls) with
+    //     O(n) drain after the loop, not a fresh `samples` buffer
+    //   - `try_match_wake_word_and_push_embedding` can return `true` to stop
+    //     early (wake word detected)
+    //   - Cooldown logic handles recent-detection suppression
+    //   - Uses the global VAD detector via `is_speech()`
+    // ═══════════════════════════════════════════════════════════════════════
     // Process frames from the buffer without per-iteration O(n) drain shifts.
     // Track a consumed offset and drain everything once after the loop.
     let len = ctx.audio_buffer.len();

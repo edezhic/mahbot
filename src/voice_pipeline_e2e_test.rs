@@ -645,15 +645,22 @@ fn ensure_tts_ready() -> Result<(), String> {
 ///   sequence of frame-level embeddings for one utterance (for self-test).
 /// * `failed_count` — how many variants failed embedding extraction.
 #[allow(clippy::type_complexity)]
-fn process_enrollment(
+/// Process audio variants through a given embedding extraction function.
+///
+/// Shared helper that eliminates the duplicated per-variant loop
+/// (mahbot-855 review).  Callers supply the extraction function — either
+/// [`super::process_enrollment_sample`] for old-style (classifier) or
+/// [`super::process_streaming_enrollment_sample`] for streaming (verifier).
+fn process_variants_with(
     variants: &[(Vec<f32>, String)],
+    extract_fn: impl Fn(&[f32]) -> Result<Vec<Vec<f32>>>,
 ) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>, usize) {
     let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
     let mut enrollment_buffer: Vec<Vec<Vec<f32>>> = Vec::new();
     let mut failed = 0usize;
 
     for (samples, label) in variants {
-        match super::process_enrollment_sample(samples) {
+        match extract_fn(samples) {
             Ok(embeddings) => {
                 if embeddings.is_empty() {
                     warn!("No embeddings extracted from '{label}'");
@@ -722,13 +729,17 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
 /// [`segment_utterances_by_vad`] can complete utterance boundary detection,
 /// matching the production enrollment pipeline's behavior.
 ///
-/// Returns the same pair as [`process_enrollment`] (minus the failed count):
-/// flat embeddings list (for classifier training) and per-utterance embedding
-/// buffers (for consistency check + self-test).
+/// Returns a 4-tuple of old-style embeddings & buffers followed by streaming
+/// embeddings & buffers (for classifier and verifier training respectively).
 fn vad_segment_and_enroll(
     enrollment_variants: &[(Vec<f32>, String)],
     augmented_variants: &[(Vec<f32>, String)],
-) -> (Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>) {
+) -> (
+    Vec<Vec<f32>>,
+    Vec<Vec<Vec<f32>>>,
+    Vec<Vec<f32>>,
+    Vec<Vec<Vec<f32>>>,
+) {
     // ── Concatenate all variants with 2.0s silence gaps ──
     // 2.0s well exceeds SILENCE_THRESHOLD_SAMPLES (1.5s) for clean boundaries.
     let silence_gap_samples = (2.0 * f64::from(super::SAMPLE_RATE)) as usize;
@@ -763,6 +774,8 @@ fn vad_segment_and_enroll(
     // ── Process each utterance through enrollment ──
     let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
     let mut enrollment_buffer: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut all_streaming_embeddings: Vec<Vec<f32>> = Vec::new();
+    let mut streaming_enrollment_buffer: Vec<Vec<Vec<f32>>> = Vec::new();
 
     for (i, utterance) in utterances.iter().enumerate() {
         match super::process_enrollment_sample(utterance) {
@@ -781,16 +794,39 @@ fn vad_segment_and_enroll(
             Ok(_) => warn!("Utterance {i}: no embeddings extracted"),
             Err(e) => warn!("Utterance {i}: embedding extraction failed: {e}"),
         }
+
+        // Also extract streaming embeddings from the same utterance for
+        // verifier training (mahbot-855).
+        match super::process_streaming_enrollment_sample(utterance) {
+            Ok(streaming_embs) if !streaming_embs.is_empty() => {
+                info!(
+                    "Utterance {i}: {} streaming embeddings (mahbot-855)",
+                    streaming_embs.len(),
+                );
+                for emb in &streaming_embs {
+                    all_streaming_embeddings.push(emb.clone());
+                }
+                streaming_enrollment_buffer.push(streaming_embs);
+            }
+            Ok(_) => warn!("Utterance {i}: no streaming embeddings extracted"),
+            Err(e) => warn!("Utterance {i}: streaming embedding extraction failed: {e}"),
+        }
     }
 
     let expected_utterances = enrollment_variants.len() + augmented_variants.len();
     info!(
-        "VAD-gated enrollment: {} positive embeddings from {} utterances (expected ~{expected_utterances})",
+        "VAD-gated enrollment: {} old-style + {} streaming embeddings from {} utterances (expected ~{expected_utterances})",
         all_embeddings.len(),
+        all_streaming_embeddings.len(),
         enrollment_buffer.len(),
     );
 
-    (all_embeddings, enrollment_buffer)
+    (
+        all_embeddings,
+        enrollment_buffer,
+        all_streaming_embeddings,
+        streaming_enrollment_buffer,
+    )
 }
 
 // ── Streaming detection ─────────────────────────────
@@ -1372,8 +1408,12 @@ pub(crate) fn run_internal() {
     let augmented_variants = generate_augmented_variants(&available_styles, 200);
     info!("Generated {} augmented variants", augmented_variants.len());
 
-    let (all_positive_embeddings, all_utterance_buffers) =
-        vad_segment_and_enroll(&enrollment_variants, &augmented_variants);
+    let (
+        all_positive_embeddings,
+        all_utterance_buffers,
+        all_streaming_embeddings,
+        _streaming_utterance_buffers,
+    ) = vad_segment_and_enroll(&enrollment_variants, &augmented_variants);
     assert!(
         !all_utterance_buffers.is_empty(),
         "VAD-gated enrollment produced no utterances from {} enrollment + {} augmented variants",
@@ -1381,8 +1421,9 @@ pub(crate) fn run_internal() {
         augmented_variants.len(),
     );
     info!(
-        "VAD-gated enrollment: {} positive embeddings from {} utterances",
+        "VAD-gated enrollment: {} old-style + {} streaming embeddings from {} utterances",
         all_positive_embeddings.len(),
+        all_streaming_embeddings.len(),
         all_utterance_buffers.len(),
     );
 
@@ -1463,7 +1504,7 @@ pub(crate) fn run_internal() {
         &neg_confusable_2,
         &neg_confusable_3,
     ] {
-        let (embs, _, _) = process_enrollment(neg_set);
+        let (embs, _, _) = process_variants_with(neg_set, |s| super::process_enrollment_sample(s));
         negative_embeddings.extend(embs);
     }
     info!(
@@ -1485,14 +1526,17 @@ pub(crate) fn run_internal() {
     ));
 
     // Build a SEPARATE negative set for the verifier that EXCLUDES confusable
+    // and uses STREAMING pipeline embeddings to match inference distribution
+    // (mahbot-855).
     let mut verifier_negatives: Vec<Vec<f32>> = Vec::new();
     for unrelated in [&neg_unrelated_1, &neg_unrelated_2, &neg_unrelated_3] {
-        let (embs, _, _) = process_enrollment(unrelated);
+        let (embs, _, _) =
+            process_variants_with(unrelated, |s| super::process_streaming_enrollment_sample(s));
         verifier_negatives.extend(embs);
     }
     verifier_negatives.extend(generate_synthetic_negatives_from_positives(
         SYNTHETIC_NEGATIVES_COUNT,
-        &all_positive_embeddings,
+        &all_streaming_embeddings,
         1.5,
     ));
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
@@ -1577,10 +1621,10 @@ pub(crate) fn run_internal() {
     }
     phase_times[P_CLASSIFIER_TRAINING] = phase_end_ms!();
 
-    // ── Phase 5: Train the VoiceVerifier ─────────────────────────────────
+    // ── Phase 5: Train the VoiceVerifier (mahbot-855) ─────────────────────
     phase_start!("Phase 5: Training VoiceVerifier");
     let verifier = VoiceVerifier::train(
-        &all_positive_embeddings,
+        &all_streaming_embeddings,
         &verifier_negatives,
         VoiceVerifier::default_threshold(),
         L2_LAMBDA,     // mahbot-854: 0.01
@@ -1590,9 +1634,9 @@ pub(crate) fn run_internal() {
 
     if verifier.is_trained() {
         info!(
-            "VoiceVerifier trained successfully with {} positive + {} negative \
-             (unrelated + synthetic, no confusable phrases)",
-            all_positive_embeddings.len(),
+            "VoiceVerifier trained successfully with {} streaming positive + {} negative \
+             (streaming pipeline, unrelated + synthetic, no confusable phrases, mahbot-855)",
+            all_streaming_embeddings.len(),
             verifier_negatives.len()
         );
     } else {
