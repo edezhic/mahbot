@@ -3,6 +3,12 @@
 //! Architecture: Conv1D(96→64, k=3) + BN + ReLU → Conv1D(64→64, k=3) + BN + ReLU
 //! → AdaptiveAvgPool1d → Linear(64→1) + Sigmoid.
 //!
+//! Batch-normalisation uses frozen identity statistics (mean=0, var=1)
+//! acting as a learned per-channel affine transform — identical at train
+//! and inference time.  This was found to be correct for a network where
+//! per-sample normalization over only WINDOW_SIZE=3 spatial positions
+//! destroys the magnitude differences learned by Conv1D layers (mahbot-849).
+//!
 //! Inference uses pure Rust. Training uses manual backprop + Adam.
 
 #![allow(
@@ -133,23 +139,11 @@ const MAX_EPOCHS: usize = 100;
 const EARLY_STOP_PATIENCE: usize = 15;
 const VALIDATION_SPLIT: f32 = 0.2;
 
-/// Dropout probability applied after each ReLU during training (mahbot-846).
-/// The model has ~31K trainable parameters trained on ~99 positive examples
-/// with only weak L2 weight decay (λ=0.0001).  Dropout provides stronger
-/// regularization to prevent overfitting on small enrollment data.
-const DROPOUT_RATE: f32 = 0.3;
-
 /// Maximum gradient norm for clipping (mahbot-846).  With small datasets,
 /// a single unlucky mini-batch can produce large gradients that derail
 /// the optimization trajectory.  Gradient clipping caps the L2 norm of
 /// the flattened gradient vector to this value before the Adam update.
 const GRADIENT_CLIP_NORM: f32 = 1.0;
-
-/// Momentum for updating batch-norm running statistics (mahbot-846).
-/// During training, each forward pass computes batch mean/variance over
-/// the spatial dimension and updates running stats via exponential moving
-/// average: running = momentum * running + (1 - momentum) * batch.
-const BN_MOMENTUM: f32 = 0.9;
 
 /// Standard deviation of Gaussian noise applied to embedding windows during
 /// training for data augmentation (mahbot-847).  Noise is added to the
@@ -354,76 +348,7 @@ pub struct WakeWordClassifier {
     cached_weights: Vec<f32>,
 }
 
-// ── Training context ────────────────────────────────────────────────────
-
-/// Per-sample training context passed between forward and backward passes
-/// during classifier training (mahbot-846).
-///
-/// Stores batch-normalization statistics (computed from the spatial
-/// dimension in the forward pass and consumed by the backward pass) and
-/// dropout masks.  A new context is created for each training sample with
-/// the ensemble member's architecture configuration (mahbot-848).
-struct TrainingCtx {
-    bn1_mean: Vec<f32>,
-    bn1_var: Vec<f32>,
-    bn2_mean: Vec<f32>,
-    bn2_var: Vec<f32>,
-    dropout_mask1: Vec<f32>,
-    dropout_mask2: Vec<f32>,
-    rng: rand::rngs::StdRng,
-}
-
-impl TrainingCtx {
-    fn new(arch: &ArchConfig, seed: u64) -> Self {
-        let c1 = arch.conv1_out;
-        let c2 = arch.conv2_out;
-        Self {
-            bn1_mean: vec![0.0; c1],
-            bn1_var: vec![0.0; c1],
-            bn2_mean: vec![0.0; c2],
-            bn2_var: vec![0.0; c2],
-            dropout_mask1: vec![0.0; c1 * WINDOW_SIZE],
-            dropout_mask2: vec![0.0; c2 * WINDOW_SIZE],
-            rng: rand::rngs::StdRng::seed_from_u64(seed),
-        }
-    }
-}
-
-/// Compute per-channel mean and variance over the spatial dimension for a
-/// Conv1D output of shape `[c, l]` in channels-first layout.
-fn compute_batch_stats(x: &[f32], c: usize, l: usize, mean: &mut [f32], var: &mut [f32]) {
-    for ci in 0..c {
-        let mut m = 0.0;
-        for li in 0..l {
-            m += x[ci * l + li];
-        }
-        m /= l as f32;
-        mean[ci] = m;
-        let mut v = 0.0;
-        for li in 0..l {
-            let d = x[ci * l + li] - m;
-            v += d * d;
-        }
-        v /= l as f32;
-        var[ci] = v;
-    }
-}
-
-/// Apply dropout with inverted scaling (mahbot-846).  Sets dropped elements
-/// to zero and scales kept elements by 1/(1-rate).  The mask stores the
-/// scale (either 0.0 or 1/(1-rate)) for use in the backward pass.
-fn apply_dropout(x: &mut [f32], rate: f32, mask: &mut [f32], rng: &mut impl rand::Rng) {
-    let scale = 1.0 / (1.0 - rate);
-    for (v, m) in x.iter_mut().zip(mask.iter_mut()) {
-        if rng.random::<f32>() < rate {
-            *v = 0.0;
-            *m = 0.0;
-        } else {
-            *v *= scale;
-            *m = scale;
-        }
-    }
-}
+// ── Data augmentation ──────────────────────────────────────────────────
 
 /// Apply data augmentation to an L2-normalized embedding window (mahbot-847).
 /// Adds Gaussian noise with the given standard deviation and re-normalizes
@@ -448,12 +373,16 @@ fn apply_augmentation(x: &[f32], std: f32, rng: &mut impl rand::Rng) -> Vec<f32>
     out
 }
 
-// ── Training forward pass ─────────────────────────────────────────────
+// ── Unified forward pass ─────────────────────────────────────────────
 
-/// Inference-only forward pass (no mutation of weights).  Uses running
-/// batch-norm statistics and no dropout — identical to the original
-/// `forward_pass` behaviour.
-fn forward_pass_infer(x: &[f32], w: &ClassifierWeights) -> f32 {
+/// Unified forward pass using frozen BN running statistics (mean=0, var=1).
+///
+/// This is the only forward path — there is no separate training pass
+/// because batch-norm uses frozen identity statistics that act as a
+/// learned per-channel affine transform, identical at train and inference
+/// time.  No dropout is applied (the network has only 3 temporal positions,
+/// making dropout destructively aggressive).
+fn forward_pass(x: &[f32], w: &ClassifierWeights) -> f32 {
     let ks = w.arch.kernel_size;
     let c1 = w.arch.conv1_out;
     let c2 = w.arch.conv2_out;
@@ -489,74 +418,6 @@ fn forward_pass_infer(x: &[f32], w: &ClassifierWeights) -> f32 {
         w.bn_eps,
     );
     relu(&mut h);
-    let pooled = adaptive_avg_pool(&h, c2, WINDOW_SIZE);
-    sigmoid(dot(&pooled, &w.fc_weight) + w.fc_bias[0])
-}
-
-/// Training forward pass with batch normalisation, running stats
-/// collection, and dropout (mahbot-846).
-///
-/// - Batch norm uses per-sample batch statistics (mean/variance over the
-///   spatial dimension) instead of fixed running statistics.
-/// - Per-sample mean/variance are recorded in `ctx` and accumulated by the
-///   caller for a single batch-level running stats update (avoids compounding
-///   the momentum decay across samples within a batch).
-/// - Dropout (rate [`DROPOUT_RATE`]) is applied after each ReLU.
-/// - The context records batch stats and dropout masks for the backward pass.
-///
-/// # Backward note
-/// The backward pass uses a simplified gradient that treats the BN statistics
-/// as constants (no backprop through the mean/variance computation).  This
-/// approximation is common in resource-constrained settings and converges
-/// reliably in practice, but differs from the full BN backward that includes
-/// the mean/variance correction terms.
-fn forward_pass_train(x: &[f32], w: &ClassifierWeights, ctx: &mut TrainingCtx) -> f32 {
-    let ks = w.arch.kernel_size;
-    let c1 = w.arch.conv1_out;
-    let c2 = w.arch.conv2_out;
-    let mut h = conv1d(
-        x,
-        EMBEDDING_DIM,
-        WINDOW_SIZE,
-        c1,
-        ks,
-        &w.conv1_weight,
-        &w.conv1_bias,
-    );
-
-    // ── BN1 with batch stats ──
-    compute_batch_stats(&h, c1, WINDOW_SIZE, &mut ctx.bn1_mean, &mut ctx.bn1_var);
-    batch_norm(
-        &mut h,
-        c1,
-        WINDOW_SIZE,
-        &w.bn1_gamma,
-        &w.bn1_beta,
-        &ctx.bn1_mean,
-        &ctx.bn1_var,
-        w.bn_eps,
-    );
-    relu(&mut h);
-    apply_dropout(&mut h, DROPOUT_RATE, &mut ctx.dropout_mask1, &mut ctx.rng);
-
-    // ── Conv2 ──
-    let mut h = conv1d(&h, c1, WINDOW_SIZE, c2, ks, &w.conv2_weight, &w.conv2_bias);
-
-    // ── BN2 with batch stats ──
-    compute_batch_stats(&h, c2, WINDOW_SIZE, &mut ctx.bn2_mean, &mut ctx.bn2_var);
-    batch_norm(
-        &mut h,
-        c2,
-        WINDOW_SIZE,
-        &w.bn2_gamma,
-        &w.bn2_beta,
-        &ctx.bn2_mean,
-        &ctx.bn2_var,
-        w.bn_eps,
-    );
-    relu(&mut h);
-    apply_dropout(&mut h, DROPOUT_RATE, &mut ctx.dropout_mask2, &mut ctx.rng);
-
     let pooled = adaptive_avg_pool(&h, c2, WINDOW_SIZE);
     sigmoid(dot(&pooled, &w.fc_weight) + w.fc_bias[0])
 }
@@ -688,7 +549,7 @@ impl WakeWordClassifier {
         debug_assert_eq!(self.cached_weights.len(), self.members.len());
         let mut total = 0.0;
         for (i, w) in self.members.iter().enumerate() {
-            total += self.cached_weights[i] * forward_pass_infer(&cf, w);
+            total += self.cached_weights[i] * forward_pass(&cf, w);
         }
         total
     }
@@ -1062,71 +923,32 @@ pub fn train_classifier(
         for chunk in tr_idx.chunks(bs) {
             let mut g = GradientBuffer::new(&weights);
             let mut batch_loss = 0.0;
-            // BN running statistics accumulators (updated once per batch
-            // instead of per-sample, which would otherwise compound the
-            // momentum decay ~32× per batch, making the effective retention
-            // 0.9³² ≈ 0.034 after a single batch).
-            let mut bn1_mean_acc = vec![0.0; cfg.arch.conv1_out];
-            let mut bn1_var_acc = vec![0.0; cfg.arch.conv1_out];
-            let mut bn2_mean_acc = vec![0.0; cfg.arch.conv2_out];
-            let mut bn2_var_acc = vec![0.0; cfg.arch.conv2_out];
-
             for (sample_idx, &i) in chunk.iter().enumerate() {
-                let dropout_seed = cfg.rng_seed.unwrap_or_else(|| rand::rng().random::<u64>())
+                // Per-sample RNG for deterministic data augmentation.
+                let aug_seed = cfg.rng_seed.unwrap_or_else(|| rand::rng().random::<u64>())
                     ^ (epoch as u64).wrapping_mul(1_000_000)
                     ^ sample_idx as u64;
-                let mut ctx = TrainingCtx::new(&cfg.arch, dropout_seed);
+                let mut aug_rng = rand::rngs::StdRng::seed_from_u64(aug_seed);
 
                 // Data augmentation (mahbot-847): add Gaussian noise and
-                // re-normalize.  Uses the same per-sample RNG as dropout
-                // for deterministic reproducibility.
+                // re-normalize.  Uses seeded RNG for deterministic reproducibility.
                 let x_cf = if cfg.data_augmentation_std > 0.0 {
                     let augmented =
-                        apply_augmentation(&tr_x[i], cfg.data_augmentation_std, &mut ctx.rng);
+                        apply_augmentation(&tr_x[i], cfg.data_augmentation_std, &mut aug_rng);
                     to_channels_first(&augmented, cin, lin)
                 } else {
                     to_channels_first(&tr_x[i], cin, lin)
                 };
                 let target = tr_y[i];
                 let sw = tr_w[i];
-                let pred = forward_pass_train(&x_cf, &weights, &mut ctx);
+                // Unified forward pass uses frozen BN running stats (mean=0, var=1)
+                // acting as a learned affine transform — identical to inference.
+                let pred = forward_pass(&x_cf, &weights);
                 let eps = 1e-7;
                 let loss =
                     -sw * (target * (pred + eps).ln() + (1.0 - target) * (1.0 - pred + eps).ln());
                 batch_loss += loss;
-                backward(&x_cf, target, &weights, &mut g, Some(&ctx));
-
-                // Accumulate per-sample BN stats for batch update.
-                for (acc, &v) in bn1_mean_acc.iter_mut().zip(ctx.bn1_mean.iter()) {
-                    *acc += v;
-                }
-                for (acc, &v) in bn1_var_acc.iter_mut().zip(ctx.bn1_var.iter()) {
-                    *acc += v;
-                }
-                for (acc, &v) in bn2_mean_acc.iter_mut().zip(ctx.bn2_mean.iter()) {
-                    *acc += v;
-                }
-                for (acc, &v) in bn2_var_acc.iter_mut().zip(ctx.bn2_var.iter()) {
-                    *acc += v;
-                }
-            }
-            // Update BN running stats once per batch using accumulated stats.
-            let n_batch = chunk.len() as f32;
-            for ci in 0..cfg.arch.conv1_out {
-                let batch_mean = bn1_mean_acc[ci] / n_batch;
-                let batch_var = bn1_var_acc[ci] / n_batch;
-                weights.bn1_running_mean[ci] =
-                    BN_MOMENTUM * weights.bn1_running_mean[ci] + (1.0 - BN_MOMENTUM) * batch_mean;
-                weights.bn1_running_var[ci] =
-                    BN_MOMENTUM * weights.bn1_running_var[ci] + (1.0 - BN_MOMENTUM) * batch_var;
-            }
-            for ci in 0..cfg.arch.conv2_out {
-                let batch_mean = bn2_mean_acc[ci] / n_batch;
-                let batch_var = bn2_var_acc[ci] / n_batch;
-                weights.bn2_running_mean[ci] =
-                    BN_MOMENTUM * weights.bn2_running_mean[ci] + (1.0 - BN_MOMENTUM) * batch_mean;
-                weights.bn2_running_var[ci] =
-                    BN_MOMENTUM * weights.bn2_running_var[ci] + (1.0 - BN_MOMENTUM) * batch_var;
+                backward(&x_cf, target, &weights, &mut g);
             }
             // Average gradients
             let nf = chunk.len() as f32;
@@ -1183,7 +1005,7 @@ pub fn train_classifier(
             let mut vl = 0.0;
             for i in 0..va_x.len() {
                 let x_cf = to_channels_first(&va_x[i], cin, lin);
-                let pred = forward_pass_infer(&x_cf, &weights);
+                let pred = forward_pass(&x_cf, &weights);
                 let eps = 1e-7;
                 let l = -va_w[i]
                     * (va_y[i] * (pred + eps).ln() + (1.0 - va_y[i]) * (1.0 - pred + eps).ln());
@@ -1238,7 +1060,7 @@ pub fn train_classifier(
         norm.iter()
             .map(|w| {
                 let x_cf = to_channels_first(w, cin, lin);
-                forward_pass_infer(&x_cf, &weights)
+                forward_pass(&x_cf, &weights)
             })
             .collect()
     };
@@ -1385,23 +1207,15 @@ impl AdamStateGroup {
     }
 }
 
-/// Manual backward pass. Accumulates gradients into `g`.
+/// Manual backward pass using frozen BN running statistics (mean=0, var=1).
+/// Accumulates gradients into `g`.
 ///
-/// When `ctx` is `Some` (training mode, mahbot-846):
-/// - Batch-normalisation gradients use the per-sample batch statistics
-///   recorded by `forward_pass_train` instead of running statistics.
-/// - Dropout masks from the forward pass are applied to the ReLU gradients.
-///
-/// When `ctx` is `None` (legacy/inference backward):
-/// - Uses running statistics (identical to original `backward`).
+/// No per-sample batch statistics are used — BN running stats are always
+/// the frozen identity (mean=0, var=1) that act as a learned per-channel
+/// affine transform.  No dropout is applied (the network has only 3 temporal
+/// positions, making dropout destructively aggressive).
 #[allow(clippy::cast_precision_loss)]
-fn backward(
-    x: &[f32],
-    target: f32,
-    w: &ClassifierWeights,
-    g: &mut GradientBuffer,
-    ctx: Option<&TrainingCtx>,
-) {
+fn backward(x: &[f32], target: f32, w: &ClassifierWeights, g: &mut GradientBuffer) {
     let cin = EMBEDDING_DIM;
     let lin = WINDOW_SIZE;
     let c1 = w.arch.conv1_out;
@@ -1410,16 +1224,15 @@ fn backward(
     let padding = kernel_size / 2;
     let eps = w.bn_eps;
 
-    // Determine which BN statistics to use.
-    let (bn1_mean, bn1_var, bn2_mean, bn2_var) = match ctx {
-        Some(ctx) => (&*ctx.bn1_mean, &*ctx.bn1_var, &*ctx.bn2_mean, &*ctx.bn2_var),
-        None => (
-            &*w.bn1_running_mean,
-            &*w.bn1_running_var,
-            &*w.bn2_running_mean,
-            &*w.bn2_running_var,
-        ),
-    };
+    // Batch-norm always uses frozen running statistics (mean=0, var=1)
+    // that act as a learned per-channel affine transform — identical at
+    // train and inference time.
+    let (bn1_mean, bn1_var, bn2_mean, bn2_var) = (
+        &*w.bn1_running_mean,
+        &*w.bn1_running_var,
+        &*w.bn2_running_mean,
+        &*w.bn2_running_var,
+    );
 
     // Forward intermediates
     let mut conv1_pre = vec![0.0; c1 * lin];
@@ -1459,16 +1272,6 @@ fn backward(
         relu1m[i] = if bn1_out[i] > 0.0 { 1.0 } else { 0.0 };
     }
 
-    // Apply dropout mask1 (training) or identity (inference)
-    if let Some(ctx) = ctx {
-        for i in 0..(c1 * lin) {
-            relu1[i] *= ctx.dropout_mask1[i];
-            // Mask gradient through ReLU: the dropout mask is 0.0 for
-            // dropped units, so the gradient will also be zeroed.
-            relu1m[i] *= ctx.dropout_mask1[i];
-        }
-    }
-
     let mut conv2_pre = vec![0.0; c2 * lin];
     for co in 0..c2 {
         for li in 0..lin {
@@ -1504,14 +1307,6 @@ fn backward(
     for i in 0..(c2 * lin) {
         relu2[i] = bn2_out[i].max(0.0);
         relu2m[i] = if bn2_out[i] > 0.0 { 1.0 } else { 0.0 };
-    }
-
-    // Apply dropout mask2 (training) or identity (inference)
-    if let Some(ctx) = ctx {
-        for i in 0..(c2 * lin) {
-            relu2[i] *= ctx.dropout_mask2[i];
-            relu2m[i] *= ctx.dropout_mask2[i];
-        }
     }
 
     let mut pooled = vec![0.0; c2];
