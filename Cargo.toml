@@ -17,6 +17,7 @@ exclude = [".DS_Store"]
 [features]
 default = []
 voice-tests = []
+voice-debug = []
 
 [[bin]]
 name = "mahbot"

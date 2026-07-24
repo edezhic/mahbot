@@ -486,6 +486,18 @@ fn process_wake_word_score(
     }
 }
 
+/// Check whether voice debug logging is enabled (requires the `voice-debug`
+/// feature AND the `MAHBOT_VOICE_DEBUG=1` environment variable).  When the
+/// feature is not compiled in, this function is dead-code eliminated and
+/// produces zero overhead.
+#[cfg(feature = "voice-debug")]
+fn voice_debug_enabled() -> bool {
+    std::env::var("MAHBOT_VOICE_DEBUG")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// Process a single embedding through the wake word detection pipeline.
 ///
 /// This is the **core detection loop** shared between the live pipeline
@@ -569,6 +581,27 @@ pub(crate) fn score_single_embedding(
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
     let (detected, rolling_sum) =
         process_wake_word_score(total_score, score_window, adaptive_override);
+
+    // ── Voice debug logging (mahbot-850) ─────────────────────────────
+    // When the `voice-debug` feature is enabled and `MAHBOT_VOICE_DEBUG=1`
+    // is set, log every per-frame total_score along with whether it passed
+    // the reset threshold and the resulting rolling sum.  This provides
+    // observability into detection behaviour without requiring recompilation
+    // when the feature is already enabled.  The feature gate ensures zero
+    // overhead when not compiled in.
+    #[cfg(feature = "voice-debug")]
+    if voice_debug_enabled() {
+        let passed_threshold = total_score >= NO_MATCH_RESET_THRESHOLD;
+        let below_note = if passed_threshold {
+            ""
+        } else {
+            " (below NO_MATCH_RESET_THRESHOLD — window reset)"
+        };
+        info!(
+            "VOICE_DEBUG: total_score={total_score:.4}{below_note} rolling_sum={rolling_sum:.4} ring_len={}",
+            embedding_ring.len(),
+        );
+    }
 
     if detected {
         // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
