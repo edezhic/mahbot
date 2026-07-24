@@ -1211,13 +1211,25 @@ pub(crate) fn is_speech_with_detector(
 
     let mut any_speech = false;
 
+    // Clamp audio samples to [-1, 1] before feeding to the VAD detector.
+    // TTS-generated audio and microphone capture can produce samples slightly
+    // outside this range due to floating-point overflow, which triggers
+    // earshot's debug_assert! in debug/test builds (mahbot-835).
+    let clamp_frame = |frame: &[f32]| -> [f32; 256] {
+        let mut clamped = [0.0f32; 256];
+        for (i, &s) in frame.iter().enumerate() {
+            clamped[i] = s.clamp(-1.0, 1.0);
+        }
+        clamped
+    };
+
     // Process each complete 256-sample frame (Earshot requires exactly 256
     // samples per call at 16 kHz).  A typical call receives 512-sample frame
     // (FRAME_LENGTH) from the wake-word / enrollment paths, which naturally
     // splits into two 256-sample chunks.  Always process both chunks to keep
     // the detector's sliding window in sync with the actual audio stream.
     for chunk in samples.chunks_exact(256) {
-        if detector.predict_f32(chunk) >= threshold {
+        if detector.predict_f32(&clamp_frame(chunk)) >= threshold {
             any_speech = true;
         }
     }
@@ -1230,6 +1242,10 @@ pub(crate) fn is_speech_with_detector(
     if remainder > 0 {
         let mut padded = [0.0f32; 256];
         padded[..remainder].copy_from_slice(&samples[samples.len() - remainder..]);
+        // Clamp the partial frame too (the copy_from_slice copies raw samples).
+        for s in padded[..remainder].iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
+        }
         if detector.predict_f32(&padded) >= threshold {
             any_speech = true;
         }
