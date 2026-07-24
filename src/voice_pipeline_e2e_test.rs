@@ -1645,14 +1645,13 @@ pub(crate) fn run_internal() {
         // in perpetual 5-frame bootstrap and measuring all metrics against the
         // static threshold.
         //
-        // ⚠ Methodological note (reviewer_3): The benchmark tests ALL positive
-        // variants first (phases 8), feeding high classifier scores into the
-        // adaptive statistics, THEN tests negatives (phases 9-12).  This
-        // inflates the adaptive threshold for negative testing, potentially
-        // overestimating false-accept resilience.  The noise-overlap phase (14)
-        // uses a separate freshly-warmed state and avoids this bias.  Future
-        // benchmark improvements could interleave positive/negative testing or
-        // run negative phases before positives.
+        // Note (mahbot-852): The adaptive threshold no longer feeds high
+        // classifier scores into its statistics — only background frames
+        // (below NO_MATCH_RESET_THRESHOLD) update the running statistics.
+        // Positive variants therefore no longer inflate the adaptive
+        // threshold, eliminating the bias described in reviewer_3's
+        // methodological note.  The noise-overlap phase (14) uses a
+        // separate freshly-warmed state for independent measurement.
         let mut shared_adaptive = super::AdaptiveThresholdState::warmed();
 
         // ── Phase 8: Detection — Positive cases ───────────────────────────
