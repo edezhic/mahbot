@@ -842,6 +842,10 @@ struct VoicePipelineState {
     /// In ensemble mode (mahbot-839) this contains all `NUM_ENSEMBLE_MEMBERS`
     /// weight sets; in legacy mode it contains a single entry.
     classifier_weights: Option<Vec<ClassifierWeights>>,
+    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
+    /// Used by [`set_classifier_weights`] to create a weighted ensemble.
+    /// Empty vec means uniform averaging (backward compat).
+    classifier_val_losses: Vec<f32>,
     /// Cached classifier for inference (avoids per-frame clone of weights).
     /// Recreated when [`classifier_weights`] changes.
     classifier: Option<WakeWordClassifier>,
@@ -886,6 +890,7 @@ pub fn init_global() -> Result<()> {
             enabled: false,
             status: VoiceStatus::Disabled,
             classifier_weights: None,
+            classifier_val_losses: vec![],
             classifier: None,
             verifier: VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
@@ -932,7 +937,27 @@ pub fn set_classifier_weights(weights: Vec<ClassifierWeights>) {
     let mut state = voice_state().write().unwrap_poison();
     debug_assert!(!weights.is_empty(), "Classifier weights must not be empty");
     state.classifier_weights = Some(weights.clone());
+    // Reset val_losses to prevent stale losses from a prior weighted session
+    // silently contaminating a caller who only has weights (mahbot-847).
+    state.classifier_val_losses.clear();
     state.classifier = Some(WakeWordClassifier::new_ensemble(weights));
+}
+
+/// Atomically set both classifier weights and validation losses in a single
+/// lock acquisition (mahbot-847).  Avoids the two-step pattern where a
+/// concurrent inference frame could observe uniform averaging before the
+/// weighted-averaging constructor replaces the classifier.
+pub fn set_classifier_weighted(weights: Vec<ClassifierWeights>, val_losses: Vec<f32>) {
+    let n = weights.len();
+    let classifier = WakeWordClassifier::new_ensemble_weighted(weights.clone(), val_losses.clone());
+    let mut state = voice_state().write().unwrap_poison();
+    state.classifier_weights = Some(weights);
+    state.classifier_val_losses = if val_losses.len() == n {
+        val_losses
+    } else {
+        vec![]
+    };
+    state.classifier = Some(classifier);
 }
 
 #[must_use]
@@ -2333,6 +2358,10 @@ pub(crate) fn finalize_enrollment(
     // Step 2: Train the ensemble of Conv1D classifiers (mahbot-839).
     // Train NUM_ENSEMBLE_MEMBERS independent models with different seeds
     // for deterministic, diverse weight initializations and shuffles.
+    // Each model validates on a different k-fold partition (mahbot-847),
+    // ensuring every training example is used for training in 4 models
+    // and validation in 1.  Data augmentation (Gaussian noise) is applied
+    // on-the-fly to each training window to reduce overfitting.
     // The models are trained in parallel via std::thread::scope since they
     // have no shared state and training is CPU-bound.
     let base_config = wake_word_classifier::TrainingConfig::default();
@@ -2342,6 +2371,9 @@ pub(crate) fn finalize_enrollment(
                 .map(|seed| {
                     let config = wake_word_classifier::TrainingConfig {
                         rng_seed: Some(seed as u64),
+                        k_fold_total: wake_word_classifier::NUM_ENSEMBLE_MEMBERS,
+                        k_fold_index: seed,
+                        data_augmentation_std: wake_word_classifier::DATA_AUGMENTATION_STD,
                         ..base_config.clone()
                     };
                     s.spawn(move || {
@@ -2359,6 +2391,7 @@ pub(crate) fn finalize_enrollment(
         });
 
     let mut all_weights = Vec::with_capacity(wake_word_classifier::NUM_ENSEMBLE_MEMBERS);
+    let mut all_val_losses = Vec::with_capacity(wake_word_classifier::NUM_ENSEMBLE_MEMBERS);
     // Track stats from seed-0 model for reporting (informational only)
     let mut epochs_trained = 0;
     let mut best_val_loss = f32::INFINITY;
@@ -2373,6 +2406,7 @@ pub(crate) fn finalize_enrollment(
         let r = result?;
         // Each result already validated its weights internally
         all_weights.extend(r.weights);
+        all_val_losses.push(r.best_val_loss);
         if i == 0 {
             epochs_trained = r.epochs_trained;
             best_val_loss = r.best_val_loss;
@@ -2389,6 +2423,7 @@ pub(crate) fn finalize_enrollment(
         weights: all_weights,
         epochs_trained,
         best_val_loss,
+        val_losses: all_val_losses,
         pos_scores_mean,
         pos_scores_min,
         pos_scores_max,
@@ -3317,7 +3352,11 @@ pub async fn run_voice_pipeline() {
                 .is_some_and(|members| members.iter().all(|w| w.validate().is_ok()));
             if all_valid {
                 if let Some(ref members) = model.classifier {
-                    set_classifier_weights(members.clone());
+                    if let Some(ref vl) = model.val_losses {
+                        set_classifier_weighted(members.clone(), vl.clone());
+                    } else {
+                        set_classifier_weights(members.clone());
+                    }
                 }
                 if let Some(ref v) = model.verifier {
                     set_verifier(v.clone());
@@ -3668,7 +3707,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         .unwrap_or_else(|e| Err(anyhow!("Classifier training task panicked: {e}")))
                 };
 
-                let weights = match classifier_result {
+                let (weights, val_losses) = match classifier_result {
                     Ok(result) => {
                         // First model's weights for reporting (all are identical architecture)
                         let first_params = result
@@ -3684,7 +3723,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                             result.epochs_trained,
                             result.best_val_loss,
                         );
-                        result.weights
+                        let vl = result.val_losses.clone();
+                        (result.weights, vl)
                     }
                     Err(e) => {
                         warn!("Enrollment finalization failed: {e}");
@@ -3741,14 +3781,15 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 };
 
                 // ── Informational self-test (non-gating, diagnostic only) ──
-                let classifier = WakeWordClassifier::new_ensemble(weights.clone());
+                let classifier =
+                    WakeWordClassifier::new_ensemble_weighted(weights.clone(), val_losses.clone());
                 match run_enrollment_self_test(&enrollment_buffer, &classifier) {
                     Ok(()) => debug!("Detection self-test (informational): passed"),
                     Err(e) => debug!("Detection self-test (informational, non-gating): {e}"),
                 }
 
                 // ── Store classifier + verifier in global state ──
-                set_classifier_weights(weights.clone());
+                set_classifier_weighted(weights.clone(), val_losses);
                 set_verifier(verifier);
 
                 // ── Persist to config DB ──
@@ -3773,13 +3814,18 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 }
 
 /// Serialisable form of the wake word model (classifier + verifier).
-/// `verifier` is optional for backward compatibility with legacy persistence.
+/// `verifier` and `val_losses` are optional for backward compatibility.
 #[derive(serde::Serialize)]
 struct PersistedModel {
     /// Ensemble of classifier weight sets (NEW format, mahbot-839).
     /// When loaded, if this is a single-element vec it's treated as a
     /// single-model classifier for backward compatibility.
     classifier: Option<Vec<ClassifierWeights>>,
+    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
+    /// Optional for backward compatibility — when missing, falls back to
+    /// uniform averaging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    val_losses: Option<Vec<f32>>,
     verifier: Option<VoiceVerifier>,
 }
 
@@ -3795,6 +3841,8 @@ impl<'de> serde::Deserialize<'de> for PersistedModel {
         struct PersistedModelHelper {
             #[serde(default)]
             classifier: Option<serde_json::Value>,
+            #[serde(default)]
+            val_losses: Option<Vec<f32>>,
             #[serde(default)]
             verifier: Option<VoiceVerifier>,
         }
@@ -3819,6 +3867,7 @@ impl<'de> serde::Deserialize<'de> for PersistedModel {
 
         Ok(PersistedModel {
             classifier,
+            val_losses: helper.val_losses,
             verifier: helper.verifier,
         })
     }
@@ -3828,8 +3877,17 @@ impl<'de> serde::Deserialize<'de> for PersistedModel {
 async fn persist_model_state() {
     let weights = get_classifier_weights();
     let verifier = get_verifier();
+    let val_losses = {
+        let state = voice_state().read().unwrap_poison();
+        if state.classifier_val_losses.is_empty() {
+            None
+        } else {
+            Some(state.classifier_val_losses.clone())
+        }
+    };
     let model = PersistedModel {
         classifier: weights,
+        val_losses,
         verifier: Some(verifier),
     };
     if let Ok(json) = serde_json::to_string(&model) {

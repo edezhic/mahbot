@@ -81,6 +81,13 @@ const GRADIENT_CLIP_NORM: f32 = 1.0;
 /// average: running = momentum * running + (1 - momentum) * batch.
 const BN_MOMENTUM: f32 = 0.9;
 
+/// Standard deviation of Gaussian noise applied to embedding windows during
+/// training for data augmentation (mahbot-847).  Noise is added to the
+/// L2-normalized 288-dim window, then the result is re-normalized.
+/// Calibrated to produce meaningful variation (cosine similarity ~0.76
+/// after augmentation) without destroying the wake word signal.
+pub const DATA_AUGMENTATION_STD: f32 = 0.05;
+
 // ── Weights ─────────────────────────────────────────────────────────────
 
 /// Default running mean for BN1 (used when deserializing legacy enrollment
@@ -249,6 +256,13 @@ pub struct WakeWordClassifier {
     /// entry; in ensemble mode (mahbot-839) it contains `NUM_ENSEMBLE_MEMBERS`
     /// entries and `forward()` averages their post-sigmoid scores.
     members: Vec<ClassifierWeights>,
+    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
+    /// When empty (backward compat / legacy single-model path), falls back
+    /// to uniform averaging.
+    member_val_losses: Vec<f32>,
+    /// Pre-computed softmax weights cached at construction time (mahbot-847).
+    /// Avoids recomputing on every inference frame.
+    cached_weights: Vec<f32>,
 }
 
 // ── Training context ────────────────────────────────────────────────────
@@ -317,6 +331,29 @@ fn apply_dropout(x: &mut [f32], rate: f32, mask: &mut [f32], rng: &mut impl rand
             *m = scale;
         }
     }
+}
+
+/// Apply data augmentation to an L2-normalized embedding window (mahbot-847).
+/// Adds Gaussian noise with the given standard deviation and re-normalizes
+/// the perturbed vector back to unit length.  Uses the provided RNG for
+/// deterministic noise generation.
+fn apply_augmentation(x: &[f32], std: f32, rng: &mut impl rand::Rng) -> Vec<f32> {
+    let mut out = x.to_vec();
+    // Box-Muller transform for Gaussian noise
+    for v in &mut out {
+        let u1 = rng.random::<f32>();
+        let u2 = rng.random::<f32>();
+        // Guard against log(0) — clamp u1 away from 0.
+        let u1_safe = (1.0 - u1).max(f32::EPSILON);
+        let z = (-2.0 * u1_safe.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+        *v += std * z;
+    }
+    // Re-normalize to unit length
+    let norm = out.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+    for v in &mut out {
+        *v /= norm;
+    }
+    out
 }
 
 // ── Training forward pass ─────────────────────────────────────────────
@@ -451,18 +488,27 @@ fn forward_pass_train(x: &[f32], w: &ClassifierWeights, ctx: &mut TrainingCtx) -
 }
 
 impl WakeWordClassifier {
-    /// Get references to the underlying classifier weight sets.
-    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-    pub fn weights_ref(&self) -> &[ClassifierWeights] {
-        &self.members
-    }
-
     /// Create a single-member classifier (legacy / backward compat path).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(weights: ClassifierWeights) -> Self {
         Self {
             members: vec![weights],
+            member_val_losses: vec![],
+            cached_weights: vec![1.0],
         }
+    }
+
+    /// Return a reference to the ensemble member weights.
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
+    pub fn weights_ref(&self) -> &[ClassifierWeights] {
+        &self.members
+    }
+
+    /// Return a reference to the per-member validation losses (empty if
+    /// unavailable, e.g. backward compat / uniform-averaging mode).
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
+    pub fn val_losses_ref(&self) -> &[f32] {
+        &self.member_val_losses
     }
 
     /// Create a multi-member ensemble classifier.
@@ -474,14 +520,73 @@ impl WakeWordClassifier {
             !members.is_empty(),
             "Ensemble must have at least one member"
         );
-        Self { members }
+        let n = members.len();
+        Self {
+            members,
+            member_val_losses: vec![],
+            cached_weights: vec![1.0 / n as f32; n],
+        }
     }
 
-    /// Run the forward pass through all ensemble members and return the mean
-    /// post-sigmoid score.
+    /// Create a multi-member ensemble classifier with per-member validation
+    /// losses for softmax-weighted averaging (mahbot-847).
+    ///
+    /// When `val_losses` has the wrong length or is empty, falls back to
+    /// uniform averaging (backward compatibility).
+    ///
+    /// # Panics
+    /// Panics if `members` is empty — an ensemble must have at least one model.
+    pub fn new_ensemble_weighted(members: Vec<ClassifierWeights>, val_losses: Vec<f32>) -> Self {
+        assert!(
+            !members.is_empty(),
+            "Ensemble must have at least one member"
+        );
+        let n = members.len();
+        let (member_val_losses, cached_weights) = if val_losses.len() == n {
+            let weights = Self::compute_softmax_weights(&val_losses, n);
+            (val_losses, weights)
+        } else {
+            (vec![], vec![1.0 / n as f32; n])
+        };
+        Self {
+            members,
+            member_val_losses,
+            cached_weights,
+        }
+    }
+
+    /// Compute softmax weights from member validation losses.
+    /// Uses `exp(-(loss - min_loss))` for numerical stability, ensuring the
+    /// best model (lowest loss) always gets the highest weight.
+    /// Falls back to uniform weights when validation losses are unavailable.
+    fn compute_softmax_weights(val_losses: &[f32], n: usize) -> Vec<f32> {
+        // Caller (new_ensemble_weighted) ensures len matches and n > 0.
+        debug_assert!(val_losses.len() == n && n > 0);
+        // Guard against NaN in validation losses — if any entry is NaN the
+        // softmax computation produces all-NaN weights, corrupting inference.
+        if val_losses.iter().any(|v| v.is_nan()) {
+            return vec![1.0 / n as f32; n];
+        }
+        let min_loss = val_losses.iter().copied().fold(f32::INFINITY, f32::min);
+        let mut exps = Vec::with_capacity(n);
+        let mut sum = 0.0;
+        for &loss in val_losses {
+            let e = (-(loss - min_loss)).exp();
+            exps.push(e);
+            sum += e;
+        }
+        // sum is always > 0 for finite inputs, but guard defensively.
+        debug_assert!(sum > 0.0, "Sum of exponentials must be positive");
+        exps.iter().map(|e| e / sum).collect()
+    }
+
+    /// Run the forward pass through all ensemble members and return the
+    /// softmax-weighted average post-sigmoid score (mahbot-847).
     ///
     /// For a single-model classifier this is equivalent to the original
     /// single-member forward pass.
+    /// For an unweighted ensemble (no val_losses available), falls back to
+    /// uniform averaging.
     pub fn forward(&self, embeddings: &[Vec<f32>]) -> f32 {
         debug_assert_eq!(embeddings.len(), WINDOW_SIZE);
         // Flatten 3 embeddings into a 288-dim window, then L2-normalize
@@ -501,14 +606,17 @@ impl WakeWordClassifier {
         // Convert from samples-first to channels-first layout for Conv1D.
         let cf = to_channels_first(&x, EMBEDDING_DIM, WINDOW_SIZE);
 
-        // Average post-sigmoid scores across all ensemble members.
-        // Ensembling per-frame scores (not per-model rolling windows) means
-        // zero changes to `process_wake_word_score` or the verifier.
+        // Softmax-weighted average of post-sigmoid scores across all
+        // ensemble members (mahbot-847).  Models with lower validation
+        // loss contribute more to the final detection score.
+        // Weights are pre-computed at construction time to avoid recomputation
+        // on every inference frame.
+        debug_assert_eq!(self.cached_weights.len(), self.members.len());
         let mut total = 0.0;
-        for w in &self.members {
-            total += forward_pass_infer(&cf, w);
+        for (i, w) in self.members.iter().enumerate() {
+            total += self.cached_weights[i] * forward_pass_infer(&cf, w);
         }
-        total / self.members.len() as f32
+        total
     }
 }
 
@@ -589,6 +697,10 @@ pub struct ClassifierTrainingResult {
     pub epochs_trained: usize,
     /// Best validation loss achieved during training.
     pub best_val_loss: f32,
+    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
+    /// One entry per member in `weights`.  When empty, the caller should fall
+    /// back to uniform averaging.
+    pub val_losses: Vec<f32>,
     /// Mean positive class score after training.
     #[allow(dead_code)]
     pub pos_scores_mean: f32,
@@ -623,6 +735,19 @@ pub struct TrainingConfig {
     /// `rand::rng()` (non-deterministic).  When `Some(seed)`, uses
     /// `StdRng::seed_from_u64(seed)` for weight init and data shuffling.
     pub rng_seed: Option<u64>,
+    /// Number of folds for stratified k-fold cross-validation (mahbot-847).
+    /// When 0 (default), uses the random [`validation_split`] ratio instead.
+    /// When > 0, each call with a different [`k_fold_index`] gets a different
+    /// fold as validation set while preserving class ratios in each fold.
+    pub k_fold_total: usize,
+    /// Which fold (0-based) to use as the validation set.
+    /// Only meaningful when [`k_fold_total`] > 0.
+    pub k_fold_index: usize,
+    /// Standard deviation of Gaussian noise for on-the-fly data augmentation
+    /// applied to L2-normalized training windows (mahbot-847).
+    /// When 0.0 (default), no augmentation is applied.
+    /// Typical values: 0.01–0.05.
+    pub data_augmentation_std: f32,
 }
 impl Default for TrainingConfig {
     fn default() -> Self {
@@ -634,6 +759,9 @@ impl Default for TrainingConfig {
             early_stop_patience: EARLY_STOP_PATIENCE,
             validation_split: VALIDATION_SPLIT,
             rng_seed: None,
+            k_fold_total: 0,
+            k_fold_index: 0,
+            data_augmentation_std: 0.0,
         }
     }
 }
@@ -718,28 +846,108 @@ pub fn train_classifier(
         }
     }
 
-    // Train/val split
-    let n = all_x.len();
-    let n_val = ((n as f32) * cfg.validation_split).ceil() as usize;
-    let n_val = n_val.max(1).min(n - 1);
-    let n_tr = n - n_val;
+    // Train/val split — stratified k-fold (mahbot-847) or random 80/20 fallback.
+    let (tr_x, tr_y, tr_w, va_x, va_y, va_w, n_tr, _n_val, mut rng) = if cfg.k_fold_total > 0 {
+        // Stratified k-fold: each class is partitioned separately to
+        // preserve class ratios in every fold.
+        let k = cfg.k_fold_total;
+        let fold = cfg.k_fold_index.min(k - 1);
+        let pos_count = pos_w.len();
+        let neg_count = neg_w.len();
 
-    let mut rng: Box<dyn rand::Rng> = if let Some(seed) = cfg.rng_seed {
-        Box::new(rand::rngs::StdRng::seed_from_u64(seed))
+        let mut rng_r: Box<dyn rand::Rng> = if let Some(seed) = cfg.rng_seed {
+            Box::new(rand::rngs::StdRng::seed_from_u64(seed))
+        } else {
+            Box::new(rand::rng())
+        };
+
+        // Shuffle class-specific indices
+        let mut pos_idx: Vec<usize> = (0..pos_count).collect();
+        pos_idx.shuffle(&mut rng_r);
+        let mut neg_idx: Vec<usize> = (0..neg_count).collect();
+        neg_idx.shuffle(&mut rng_r);
+
+        let fold_for = |shuffled_pos: usize, class_size: usize, total_k: usize| -> usize {
+            if class_size == 0 {
+                return 0;
+            }
+            (shuffled_pos * total_k) / class_size
+        };
+
+        let mut tr_x = Vec::new();
+        let mut tr_y = Vec::new();
+        let mut tr_w = Vec::new();
+        let mut va_x = Vec::new();
+        let mut va_y = Vec::new();
+        let mut va_w = Vec::new();
+
+        // Positives: use shuffled index (_global_i) so each fold gets a
+        // random subset rather than contiguous blocks.
+        for (local_i, &global_i) in pos_idx.iter().enumerate() {
+            let f = fold_for(local_i, pos_count, k);
+            if f == fold {
+                va_x.push(all_x[global_i].clone());
+                va_y.push(all_y[global_i]);
+                va_w.push(all_w[global_i]);
+            } else {
+                tr_x.push(all_x[global_i].clone());
+                tr_y.push(all_y[global_i]);
+                tr_w.push(all_w[global_i]);
+            }
+        }
+
+        // Negatives: use shuffled index from neg_idx.
+        for (local_i, &neg_gi) in neg_idx.iter().enumerate() {
+            let global_i = pos_count + neg_gi;
+            let f = fold_for(local_i, neg_count, k);
+            if f == fold {
+                va_x.push(all_x[global_i].clone());
+                va_y.push(all_y[global_i]);
+                va_w.push(all_w[global_i]);
+            } else {
+                tr_x.push(all_x[global_i].clone());
+                tr_y.push(all_y[global_i]);
+                tr_w.push(all_w[global_i]);
+            }
+        }
+
+        let n_tr = tr_x.len();
+        let n_val = va_x.len();
+        info!(
+            "Training (k-fold fold={fold}/{k}): {n_tr} train + {n_val} val \
+                 ({pos_count} pos + {neg_count} neg windows)"
+        );
+        (tr_x, tr_y, tr_w, va_x, va_y, va_w, n_tr, n_val, rng_r)
     } else {
-        Box::new(rand::rng())
+        // Original random 80/20 split
+        let n = all_x.len();
+        let n_val_calc = ((n as f32) * cfg.validation_split).ceil() as usize;
+        let n_val_calc = n_val_calc.max(1).min(n - 1);
+        let n_tr_calc = n - n_val_calc;
+
+        let mut rng_r: Box<dyn rand::Rng> = if let Some(seed) = cfg.rng_seed {
+            Box::new(rand::rngs::StdRng::seed_from_u64(seed))
+        } else {
+            Box::new(rand::rng())
+        };
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.shuffle(&mut rng_r);
+
+        let tr_x = gather(&all_x, &idx[n_val_calc..]);
+        let tr_y = gather(&all_y, &idx[n_val_calc..]);
+        let tr_w = gather(&all_w, &idx[n_val_calc..]);
+        let va_x = gather(&all_x, &idx[..n_val_calc]);
+        let va_y = gather(&all_y, &idx[..n_val_calc]);
+        let va_w = gather(&all_w, &idx[..n_val_calc]);
+
+        info!(
+            "Training (random split): {n_tr_calc} train + {n_val_calc} val \
+                 ({np} pos + {nn} neg total)"
+        );
+        (
+            tr_x, tr_y, tr_w, va_x, va_y, va_w, n_tr_calc, n_val_calc, rng_r,
+        )
     };
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.shuffle(&mut rng);
-
-    let tr_x = gather(&all_x, &idx[n_val..]);
-    let tr_y = gather(&all_y, &idx[n_val..]);
-    let tr_w = gather(&all_w, &idx[n_val..]);
-    let va_x = gather(&all_x, &idx[..n_val]);
-    let va_y = gather(&all_y, &idx[..n_val]);
-    let va_w = gather(&all_w, &idx[..n_val]);
-
-    info!("Training: {n_tr} train + {n_val} val ({np} pos + {nn} neg total)");
 
     let cin = EMBEDDING_DIM;
     let lin = WINDOW_SIZE;
@@ -779,7 +987,17 @@ pub fn train_classifier(
                     ^ (epoch as u64).wrapping_mul(1_000_000)
                     ^ sample_idx as u64;
                 let mut ctx = TrainingCtx::new(dropout_seed);
-                let x_cf = to_channels_first(&tr_x[i], cin, lin);
+
+                // Data augmentation (mahbot-847): add Gaussian noise and
+                // re-normalize.  Uses the same per-sample RNG as dropout
+                // for deterministic reproducibility.
+                let x_cf = if cfg.data_augmentation_std > 0.0 {
+                    let augmented =
+                        apply_augmentation(&tr_x[i], cfg.data_augmentation_std, &mut ctx.rng);
+                    to_channels_first(&augmented, cin, lin)
+                } else {
+                    to_channels_first(&tr_x[i], cin, lin)
+                };
                 let target = tr_y[i];
                 let sw = tr_w[i];
                 let pred = forward_pass_train(&x_cf, &weights, &mut ctx);
@@ -949,6 +1167,7 @@ pub fn train_classifier(
         weights: vec![weights],
         epochs_trained,
         best_val_loss: best_loss,
+        val_losses: vec![best_loss],
         pos_scores_mean,
         pos_scores_min,
         pos_scores_max,
@@ -1501,6 +1720,213 @@ mod tests {
             assert!(
                 score < 0.2,
                 "Negative window should score <0.2, got {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_augmentation_preserves_unit_norm() {
+        // Build a random unit-normalized vector.
+        let mut rng = rand::rng();
+        let mut x = vec![0.0; EMBEDDING_DIM];
+        for v in &mut x {
+            *v = rng.random::<f32>() - 0.5;
+        }
+        let n = x.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+        for v in &mut x {
+            *v /= n;
+        }
+        let orig_norm = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((orig_norm - 1.0).abs() < 1e-6);
+
+        let augmented = apply_augmentation(&x, 0.05, &mut rng);
+        let aug_norm = augmented.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (aug_norm - 1.0).abs() < 1e-4,
+            "Augmented vector must remain unit-normalized, got norm={aug_norm}",
+        );
+    }
+
+    #[test]
+    fn test_apply_augmentation_produces_variation() {
+        // Two augmentations of the same vector should differ from the
+        // original and from each other.
+        let mut rng = rand::rng();
+        let x = vec![1.0 / (EMBEDDING_DIM as f32).sqrt(); EMBEDDING_DIM];
+        let a1 = apply_augmentation(&x, 0.05, &mut rng);
+        let a2 = apply_augmentation(&x, 0.05, &mut rng);
+        // Cosine similarity with original should be < 1.0
+        let dot1: f32 = x.iter().zip(a1.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            dot1 < 0.99,
+            "Augmented vector should differ from original (cos sim={dot1})",
+        );
+        // Two augmentations should differ from each other
+        let dot12: f32 = a1.iter().zip(a2.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            dot12 < 0.99,
+            "Two augmented vectors should differ (cos sim={dot12})",
+        );
+    }
+
+    #[test]
+    fn test_compute_softmax_weights_basic() {
+        let losses = vec![1.0, 2.0, 3.0];
+        let weights = WakeWordClassifier::compute_softmax_weights(&losses, 3);
+        assert_eq!(weights.len(), 3);
+        // Best model (lowest loss) gets highest weight
+        assert!(
+            weights[0] > weights[1] && weights[1] > weights[2],
+            "Weights should be strictly decreasing with increasing loss: {weights:?}",
+        );
+        // Weights sum to 1.0
+        let wsum: f32 = weights.iter().sum();
+        assert!(
+            (wsum - 1.0).abs() < 1e-6,
+            "Weights should sum to 1.0, got {wsum}",
+        );
+    }
+
+    #[test]
+    fn test_ensemble_weighted_length_mismatch() {
+        // When val_losses length doesn't match member count,
+        // new_ensemble_weighted falls back to uniform averaging.
+        let mut rng = rand::rng();
+        let mut make_weights = || -> ClassifierWeights {
+            let mut w = ClassifierWeights::default();
+            w.fc_bias[0] = rng.random::<f32>() * 2.0 - 1.0;
+            w
+        };
+        let members = vec![make_weights(), make_weights(), make_weights()];
+        let losses = vec![1.0, 2.0]; // 2 losses for 3 members
+        let classifier = WakeWordClassifier::new_ensemble_weighted(members, losses);
+        // Cached weights should be uniform (1/3).
+        assert_eq!(classifier.cached_weights.len(), 3);
+        let expected = 1.0 / 3.0;
+        for &w in &classifier.cached_weights {
+            assert!(
+                (w - expected).abs() < 1e-6,
+                "Uniform fallback expected {expected}, got {w}",
+            );
+        }
+        assert!(
+            classifier.member_val_losses.is_empty(),
+            "Should store no val_losses on length mismatch",
+        );
+    }
+
+    #[test]
+    fn test_compute_softmax_weights_nan_guard() {
+        // NaN in val_losses should produce uniform fallback.
+        let losses = vec![1.0, f32::NAN, 3.0];
+        let weights = WakeWordClassifier::compute_softmax_weights(&losses, 3);
+        assert_eq!(weights.len(), 3);
+        let expected = 1.0 / 3.0;
+        for &w in &weights {
+            assert!(
+                (w - expected).abs() < 1e-6,
+                "NaN guard should fall back to uniform, got {w}",
+            );
+        }
+        // All weights must be finite (not NaN).
+        assert!(
+            weights.iter().all(|w| w.is_finite()),
+            "All weights must be finite: {weights:?}",
+        );
+    }
+
+    #[test]
+    fn test_ensemble_weighted_vs_uniform() {
+        // A 3-member ensemble where members produce different scores.
+        // Weighted averaging should give different result from uniform.
+        let mut rng = rand::rng();
+        let make_weights = |bias: f32| -> ClassifierWeights {
+            let mut w = ClassifierWeights::default();
+            // Set fc_bias to produce different post-sigmoid scores.
+            w.fc_bias[0] = bias;
+            w
+        };
+        let members = vec![make_weights(0.5), make_weights(0.0), make_weights(-0.5)];
+        let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE).map(|_| vec![0.3; EMBEDDING_DIM]).collect();
+
+        let uniform = WakeWordClassifier::new_ensemble(members.clone());
+        let unweighted = uniform.forward(&embs);
+
+        let weighted = WakeWordClassifier::new_ensemble_weighted(members, vec![1.0, 2.0, 3.0]);
+        let weighted_score = weighted.forward(&embs);
+
+        assert!(
+            (weighted_score - unweighted).abs() > 0.001,
+            "Weighted and uniform scores should differ: weighted={weighted_score} uniform={unweighted}",
+        );
+    }
+
+    #[test]
+    fn test_kfold_training_produces_valid_classifier() {
+        // Generate synthetic positive and negative data, then verify that
+        // k-fold training produces a valid classifier with correct fold sizes.
+        let mut rng = rand::rng();
+        let n_pos = 20;
+        let n_neg = 40;
+        let k_fold = 5;
+        let fold_idx = 0;
+        let pos: Vec<Vec<f32>> = (0..n_pos)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..EMBEDDING_DIM)
+                    .map(|_| rng.random::<f32>() * 0.2 + 0.4)
+                    .collect();
+                let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+                for x in &mut v {
+                    *x /= n;
+                }
+                v
+            })
+            .collect();
+        let neg: Vec<Vec<f32>> = (0..n_neg)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..EMBEDDING_DIM)
+                    .map(|_| rng.random::<f32>() * 0.2 - 0.4)
+                    .collect();
+                let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+                for x in &mut v {
+                    *x /= n;
+                }
+                v
+            })
+            .collect();
+
+        // TrainingConfig with k-fold = 5, fold index 0.
+        // Fold index 0 uses 1/5 of each class for validation:
+        // positive → 4 val (20/5), 16 train  (ratio ~0.20)
+        // negative → 8 val (40/5), 32 train  (ratio ~0.20)
+        // Each fold gets floor(N/k) = N/5 samples per class.
+        let cfg = TrainingConfig {
+            k_fold_total: k_fold,
+            k_fold_index: fold_idx,
+            ..Default::default()
+        };
+        let result = train_classifier(&pos, &neg, &cfg).unwrap();
+        // Single member since we only pass one full training run.
+        assert_eq!(result.weights.len(), 1);
+        assert_eq!(
+            result.val_losses.len(),
+            1,
+            "Should produce one val_loss per member",
+        );
+
+        // Verify the model converges despite having fewer training examples
+        // (only 4/5 of the data).
+        let classifier = WakeWordClassifier::new_ensemble(result.weights);
+        for win in build_windows(&pos) {
+            let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+                .map(|t| {
+                    let start = t * EMBEDDING_DIM;
+                    win[start..start + EMBEDDING_DIM].to_vec()
+                })
+                .collect();
+            assert!(
+                classifier.forward(&embs) > 0.5,
+                "k-fold trained classifier should score positive windows >0.5",
             );
         }
     }
