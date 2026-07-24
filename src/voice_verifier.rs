@@ -19,6 +19,7 @@
 //! - **Negative examples**: Synthetic Gaussian noise (bootstrapping) or
 //!   hard-negative embeddings collected from near-miss frames during detection.
 
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -286,16 +287,19 @@ impl VoiceVerifier {
     }
 
     /// Convenience: train a verifier using the given positive embeddings and
-    /// automatically generated synthetic negative examples (Gaussian noise).
+    /// automatically generated synthetic negative examples (distribution-
+    /// matched via [`generate_synthetic_negatives_from_positives`] instead of
+    /// pure N(0,1) Gaussian noise).
     #[must_use]
     pub fn train_with_synthetic_negatives(
         positive_embeddings: &[Vec<f32>],
         threshold: f32,
     ) -> Self {
-        let dim = positive_embeddings
-            .first()
-            .map_or(EMBEDDING_DIM, std::vec::Vec::len);
-        let negatives = generate_synthetic_negatives(SYNTHETIC_NEGATIVES_COUNT, dim);
+        let negatives = generate_synthetic_negatives_from_positives(
+            SYNTHETIC_NEGATIVES_COUNT,
+            positive_embeddings,
+            1.5, // noise_scale — matched to benchmark default
+        );
         Self::train(
             positive_embeddings,
             &negatives,
@@ -445,6 +449,7 @@ fn train_logistic_regression(
 /// bootstrapping signal for the verifier when real calibration negatives are
 /// not yet available.
 #[must_use]
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn generate_synthetic_negatives(count: usize, dim: usize) -> Vec<Vec<f32>> {
     (0..count)
         .map(|_| {
@@ -465,6 +470,91 @@ pub(crate) fn generate_synthetic_negatives(count: usize, dim: usize) -> Vec<Vec<
                     }
                 })
                 .collect()
+        })
+        .collect()
+}
+
+/// Generate synthetic negative embeddings based on the statistics of the
+/// positive embeddings (mahbot-846).  Unlike [`generate_synthetic_negatives`]
+/// which produces pure N(0,1) noise in a completely different region of
+/// embedding space than real speech, this function produces negatives that
+/// overlap with the real embedding distribution.
+///
+/// Each synthetic negative is sampled as:
+///   `mean + noise_scale * sigma * N(0, 1)`
+/// per dimension, then L2-normalised to the unit sphere.  This puts the
+/// synthetic negatives in the same region of embedding space as the real
+/// positives, providing useful training signal for the wake word vs.
+/// confusable boundary.
+///
+/// `noise_scale` controls how far the negatives are pushed from the positive
+/// centroid (default 1.5 — large enough to create a separation margin while
+/// maintaining distribution overlap).
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+pub(crate) fn generate_synthetic_negatives_from_positives(
+    count: usize,
+    positives: &[Vec<f32>],
+    noise_scale: f32,
+) -> Vec<Vec<f32>> {
+    if positives.is_empty() || count == 0 {
+        return vec![];
+    }
+    let dim = positives[0].len();
+
+    // Compute per-dimension mean and std of positive embeddings.
+    let mut mean = vec![0.0; dim];
+    for emb in positives {
+        for (m, &v) in mean.iter_mut().zip(emb.iter()) {
+            *m += v;
+        }
+    }
+    for m in &mut mean {
+        *m /= positives.len() as f32;
+    }
+
+    let mut std = vec![0.0; dim];
+    for emb in positives {
+        for ((s, &v), &m) in std.iter_mut().zip(emb.iter()).zip(mean.iter()) {
+            *s += (v - m) * (v - m);
+        }
+    }
+    let n = positives.len() as f32;
+    for s in &mut std {
+        *s = (*s / n).sqrt().max(1e-6);
+    }
+
+    (0..count)
+        .map(|_| {
+            // Pick a random positive as the base (adds diversity).
+            let base = &positives[rand::rng().random_range(0..positives.len())];
+            let mut emb: Vec<f32> = base
+                .iter()
+                .zip(std.iter())
+                .map(|(&b, &s)| {
+                    // Box-Muller N(0,1)
+                    let z = loop {
+                        let u1: f32 = rand::random();
+                        let u2: f32 = rand::random();
+                        if u1 > 0.0 && u2 > 0.0 {
+                            let r = (-2.0 * u1.ln()).sqrt();
+                            let theta = 2.0 * std::f32::consts::PI * u2;
+                            break r * theta.cos();
+                        }
+                    };
+                    // Perturb the base embedding: move away by noise_scale * sigma
+                    // This puts the synthetic negative in the same region as real
+                    // speech but shifted toward the distribution tails.
+                    b + noise_scale * s * z
+                })
+                .collect();
+
+            // L2-normalize to unit sphere (matching real embeddings).
+            let norm = emb.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+            for v in &mut emb {
+                *v /= norm;
+            }
+            emb
         })
         .collect()
 }
@@ -806,6 +896,92 @@ mod tests {
     fn test_generate_synthetic_negatives_zero_count() {
         let negs = generate_synthetic_negatives(0, 96);
         assert!(negs.is_empty());
+    }
+
+    #[test]
+    fn test_generate_synthetic_negatives_from_positives_basic() {
+        let positives: Vec<Vec<f32>> = vec![vec![0.5; 96], vec![0.6; 96], vec![0.4; 96]];
+        let negs = generate_synthetic_negatives_from_positives(10, &positives, 1.5);
+        assert_eq!(negs.len(), 10);
+        assert_eq!(negs[0].len(), 96);
+        // All values should be finite.
+        for emb in &negs {
+            for &v in emb {
+                assert!(v.is_finite(), "Negative has non-finite value {v}");
+            }
+        }
+        // Negatives should be L2-normalised (unit norm).
+        for emb in &negs {
+            let norm: f32 = emb.iter().map(|x| x * x).sum();
+            assert!(
+                (norm - 1.0).abs() < 1e-5,
+                "Negative embedding is not unit-norm: norm={norm}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_synthetic_negatives_from_positives_zero_count() {
+        let positives: Vec<Vec<f32>> = vec![vec![0.5; 96]];
+        let negs = generate_synthetic_negatives_from_positives(0, &positives, 1.5);
+        assert!(negs.is_empty());
+    }
+
+    #[test]
+    fn test_generate_synthetic_negatives_from_positives_empty_positives() {
+        let positives: Vec<Vec<f32>> = vec![];
+        let negs = generate_synthetic_negatives_from_positives(10, &positives, 1.5);
+        assert!(negs.is_empty());
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    #[test]
+    fn test_generate_synthetic_negatives_from_positives_per_dim_std() {
+        // Two dimensions with very different spreads: dim 0 has tight
+        // cluster (low std), dim 1 has wide spread (high std).  The
+        // synthetic negatives must reflect this — dim 1 should show
+        // proportionally larger perturbations than dim 0.
+        let positives: Vec<Vec<f32>> = (0..50)
+            .map(|i| {
+                let d0 = 0.5; // constant — no variance
+                let d1 = 0.5 + (i as f32 - 25.0) / 25.0 * 2.0; // ~N(0.5, 1.0)
+                vec![d0, d1]
+            })
+            .collect();
+        let negs = generate_synthetic_negatives_from_positives(200, &positives, 1.0);
+        assert_eq!(negs.len(), 200);
+
+        // Compute per-dimension std of the generated negatives.
+        let mut neg_mean = vec![0.0; 2];
+        let mut neg_std = vec![0.0; 2];
+        for emb in &negs {
+            for (m, &v) in neg_mean.iter_mut().zip(emb.iter()) {
+                *m += v;
+            }
+        }
+        for m in &mut neg_mean {
+            *m /= negs.len() as f32;
+        }
+        for emb in &negs {
+            for ((s, &v), &m) in neg_std.iter_mut().zip(emb.iter()).zip(neg_mean.iter()) {
+                *s += (v - m) * (v - m);
+            }
+        }
+        let n = negs.len() as f32;
+        for s in &mut neg_std {
+            *s = (*s / n).sqrt();
+        }
+
+        // Dim 1 should have significantly larger std than dim 0 (which
+        // started from near-constant positives so should remain tight).
+        // Note: L2 normalization couples dimensions, so dim 0 picks up
+        // some spread from dim 1 — a factor of 2× is still meaningful.
+        assert!(
+            neg_std[1] > neg_std[0] * 2.0,
+            "High-variance dimension should show larger spread: dim0_std={}, dim1_std={}",
+            neg_std[0],
+            neg_std[1],
+        );
     }
 
     #[test]
