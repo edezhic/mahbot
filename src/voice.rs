@@ -2390,16 +2390,11 @@ pub(crate) fn finalize_enrollment(
 
     // Step 2: Train the ensemble of Conv1D classifiers (mahbot-839).
     // Train NUM_ENSEMBLE_MEMBERS independent models with different seeds
-    // for deterministic, diverse weight initializations and shuffles.
-    // Each model validates on a different k-fold partition (mahbot-847),
-    // ensuring every training example is used for training in 4 models
-    // and validation in 1.  Data augmentation (Gaussian noise) is applied
-    // on-the-fly to each training window to reduce overfitting.
-    // The models are trained in parallel via std::thread::scope since they
-    // have no shared state and training is CPU-bound.
-    // Each model also uses a different architecture (mahbot-848) so ensemble
-    // members learn genuinely different feature representations for better
-    // diversity on ambiguous inputs.
+    // and architectures (mahbot-848) for deterministic, diverse weight
+    // initializations, shuffles, and feature representations.
+    // Each model trains on a random 80/20 validation split (k-fold and data
+    // augmentation removed in mahbot-851 — they prevented learning on the
+    // tiny ~99-window enrollment dataset).
     let base_config = wake_word_classifier::TrainingConfig::default();
     let ensemble_results: Vec<Result<wake_word_classifier::ClassifierTrainingResult>> =
         std::thread::scope(|s| {
@@ -2408,9 +2403,6 @@ pub(crate) fn finalize_enrollment(
                     let arch = wake_word_classifier::ENSEMBLE_ARCHS[seed];
                     let config = wake_word_classifier::TrainingConfig {
                         rng_seed: Some(seed as u64),
-                        k_fold_total: wake_word_classifier::NUM_ENSEMBLE_MEMBERS,
-                        k_fold_index: seed,
-                        data_augmentation_std: wake_word_classifier::DATA_AUGMENTATION_STD,
                         arch,
                         ..base_config.clone()
                     };
