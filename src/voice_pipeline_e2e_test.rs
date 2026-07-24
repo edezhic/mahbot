@@ -1581,7 +1581,7 @@ pub(crate) fn run_internal() {
     let verifier = VoiceVerifier::train(
         &all_positive_embeddings,
         &verifier_negatives,
-        0.60,
+        VoiceVerifier::default_threshold(),
         1.0,
         0.01,
         2000,

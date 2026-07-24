@@ -383,8 +383,9 @@ const _: () = assert!(
 /// the average per-frame soft score must exceed ~55% for detection to fire.
 /// Lowered from 0.75 in mahbot-852 to increase detection rate while maintaining
 /// zero false accepts — the negative distribution mean is 0.02 vs threshold 1.65,
-/// providing a large safety margin.  Combined with the verifier at 0.60, this
-/// maintains low false accepts while achieving ≥85% wake word detection.
+/// providing a large safety margin.  Combined with the verifier at 0.40
+/// (mahbot-853), this maintains low false accepts while achieving ≥85%
+/// wake word detection.
 const MATCH_THRESHOLD_FACTOR: f32 = 0.55;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
@@ -628,6 +629,20 @@ pub(crate) fn score_single_embedding(
                 .map(|emb| v.predict(emb))
                 .fold(0.0f32, f32::max);
             if max_score < v.threshold {
+                // ── Voice debug logging (mahbot-853) ────────────────────
+                // When the `voice-debug` feature is enabled and
+                // `MAHBOT_VOICE_DEBUG=1` is set, log the verifier's score
+                // and threshold when it blocks a detection.  This provides
+                // observability into verifier behaviour without requiring
+                // recompilation when the feature is already enabled.
+                #[cfg(feature = "voice-debug")]
+                if voice_debug_enabled() {
+                    info!(
+                        "VOICE_DEBUG: verifier blocked — max_score={max_score:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
+                        v.threshold,
+                    );
+                }
+
                 // Clear the score window so the next frame starts from zero.
                 // Without this the accumulated classifier scores eventually
                 // let any speech through (mahbot-797).
@@ -3829,7 +3844,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     let v = crate::voice_verifier::VoiceVerifier::train(
                         &positive_embeddings,
                         &negative_embeddings,
-                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
+                        crate::voice_verifier::DEFAULT_VERIFIER_THRESHOLD,
                         // Clean training (ambient audio negatives, no confusable phrases)
                         // ensures wake word variants pass while confusables are blocked.
                         1.0,  // L2 regularization (lambda)
@@ -3850,9 +3865,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 } else {
                     let v = crate::voice_verifier::VoiceVerifier::train_with_synthetic_negatives(
                         &positive_embeddings,
-                        0.60, // mahbot-829: raised from 0.50 for better confusable rejection.
-                              // Clean training (ambient audio negatives, no confusable phrases)
-                              // ensures wake word variants pass while confusables are blocked.
+                        crate::voice_verifier::DEFAULT_VERIFIER_THRESHOLD,
+                        // Clean training (ambient audio negatives, no confusable phrases)
+                        // ensures wake word variants pass while confusables are blocked.
                     );
                     info!(
                         "Verifier trained from {} per-frame positive \
