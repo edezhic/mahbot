@@ -36,13 +36,17 @@ const PADDING: usize = 1;
 const FC_OUT: usize = 1;
 /// L2 regularization strength (lambda).
 ///
-/// Set to 0.0005 (mahbot-835) as a compromise between 829 baseline (0.001)
-/// and 832's 0.0001.  The expanded negative training dataset (20 confusable +
-/// 20 unrelated phrases × 3 seeds = ~2093 embeddings) requires less
-/// regularization than the original 5-phrase dataset (~200 embeddings) to
-/// avoid underfitting — at 0.001 the validation loss was 1.21 (worse than
-/// random), producing zero wake word detections.
-const L2_LAMBDA: f32 = 0.0005;
+/// Set to 0.0001 (mahbot-835), matching the value that produced successful
+/// detection in mahbot-832.  The 829 baseline of 0.001 is too strong for the
+/// expanded negative dataset (20 confusable + 20 unrelated phrases × 3 seeds
+/// = ~2093 embeddings versus ~200 at 829), causing the Conv1D classifier to
+/// underfit with validation loss >1.0 and zero wake word detections.
+/// At 0.0005 (first attempt) the val loss dropped from 1.21 to 1.05 but the
+/// classifier still produced sub-0.80 per-frame scores, failing the rolling
+/// window gate.  At 0.0001 the model can better separate wake word frames
+/// from the 10× larger negative set while MATCH_THRESHOLD_FACTOR=0.80
+/// prevents false accepts.
+const L2_LAMBDA: f32 = 0.0001;
 const LEARNING_RATE: f32 = 0.001;
 const ADAM_BETA1: f32 = 0.9;
 const ADAM_BETA2: f32 = 0.999;
