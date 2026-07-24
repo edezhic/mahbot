@@ -34,11 +34,81 @@ pub const WINDOW_SIZE: usize = 3;
 /// and their post-sigmoid scores are averaged at inference time.
 pub const NUM_ENSEMBLE_MEMBERS: usize = 5;
 pub const INPUT_DIM: usize = WINDOW_SIZE * EMBEDDING_DIM; // 288
-const CONV1_OUT: usize = 64;
-const CONV2_OUT: usize = 64;
-const KERNEL_SIZE: usize = 3;
-const PADDING: usize = 1;
+/// Default baseline architecture values used for serialization defaults.
+const DEFAULT_CONV1_OUT: usize = 64;
+const DEFAULT_CONV2_OUT: usize = 64;
+const DEFAULT_KERNEL_SIZE: usize = 3;
 const FC_OUT: usize = 1;
+
+/// Architecture configuration for a Conv1D ensemble member (mahbot-848).
+///
+/// Defines the Conv1D channel counts and kernel size that determine each
+/// member's feature extraction capacity and temporal receptive field.
+/// Different architectures across ensemble members produce diverse feature
+/// representations that improve ensemble robustness on ambiguous inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ArchConfig {
+    pub conv1_out: usize,
+    pub conv2_out: usize,
+    pub kernel_size: usize,
+}
+
+impl ArchConfig {
+    /// Compute `padding` as `kernel_size / 2` for "same" convolution where
+    /// the output spatial length equals the input length (odd kernel sizes
+    /// only — 3, 5, …).
+    #[must_use]
+    pub const fn padding(&self) -> usize {
+        self.kernel_size / 2
+    }
+}
+
+impl Default for ArchConfig {
+    fn default() -> Self {
+        Self {
+            conv1_out: DEFAULT_CONV1_OUT,
+            conv2_out: DEFAULT_CONV2_OUT,
+            kernel_size: DEFAULT_KERNEL_SIZE,
+        }
+    }
+}
+
+/// The five architecture variants used for ensemble feature diversity
+/// (mahbot-848).  Each member learns genuinely different feature representations:
+///
+/// 1. Low capacity  (32/32/k3) — acts as a regularized baseline
+/// 2. Baseline     (64/64/k3) — current default architecture
+/// 3. Wide kernel  (64/64/k5) — wider temporal receptive field
+/// 4. High channels (96/96/k3) — richer feature extraction
+/// 5. High capacity (128/128/k3) — fine-grained temporal patterns
+pub const ENSEMBLE_ARCHS: [ArchConfig; NUM_ENSEMBLE_MEMBERS] = [
+    ArchConfig {
+        conv1_out: 32,
+        conv2_out: 32,
+        kernel_size: 3,
+    },
+    ArchConfig {
+        conv1_out: 64,
+        conv2_out: 64,
+        kernel_size: 3,
+    },
+    ArchConfig {
+        conv1_out: 64,
+        conv2_out: 64,
+        kernel_size: 5,
+    },
+    ArchConfig {
+        conv1_out: 96,
+        conv2_out: 96,
+        kernel_size: 3,
+    },
+    ArchConfig {
+        conv1_out: 128,
+        conv2_out: 128,
+        kernel_size: 3,
+    },
+];
+
 /// L2 regularization strength (lambda).
 ///
 /// Set to 0.0001 (mahbot-835).  The 829 baseline of 0.001 caused the
@@ -93,84 +163,100 @@ pub const DATA_AUGMENTATION_STD: f32 = 0.05;
 /// Default running mean for BN1 (used when deserializing legacy enrollment
 /// data that predates the BN training stats, preserving backward compatibility).
 fn default_bn1_running_mean() -> Vec<f32> {
-    vec![0.0; CONV1_OUT]
+    vec![0.0; DEFAULT_CONV1_OUT]
 }
 
 /// Default running variance for BN1 (see [`default_bn1_running_mean`]).
 fn default_bn1_running_var() -> Vec<f32> {
-    vec![1.0; CONV1_OUT]
+    vec![1.0; DEFAULT_CONV1_OUT]
 }
 
 /// Default running mean for BN2 (see [`default_bn1_running_mean`]).
 fn default_bn2_running_mean() -> Vec<f32> {
-    vec![0.0; CONV2_OUT]
+    vec![0.0; DEFAULT_CONV2_OUT]
 }
 
 /// Default running variance for BN2 (see [`default_bn1_running_mean`]).
 fn default_bn2_running_var() -> Vec<f32> {
-    vec![1.0; CONV2_OUT]
+    vec![1.0; DEFAULT_CONV2_OUT]
+}
+
+fn default_arch() -> ArchConfig {
+    ArchConfig::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifierWeights {
-    pub conv1_weight: Vec<f32>, // [64, 96, 3]
-    pub conv1_bias: Vec<f32>,   // [64]
+    pub conv1_weight: Vec<f32>, // [conv1_out, EMBEDDING_DIM, kernel_size]
+    pub conv1_bias: Vec<f32>,   // [conv1_out]
     pub bn1_gamma: Vec<f32>,
     pub bn1_beta: Vec<f32>,
     #[serde(default = "default_bn1_running_mean")]
     pub bn1_running_mean: Vec<f32>,
     #[serde(default = "default_bn1_running_var")]
     pub bn1_running_var: Vec<f32>,
-    pub conv2_weight: Vec<f32>, // [64, 64, 3]
-    pub conv2_bias: Vec<f32>,   // [64]
+    pub conv2_weight: Vec<f32>, // [conv2_out, conv1_out, kernel_size]
+    pub conv2_bias: Vec<f32>,   // [conv2_out]
     pub bn2_gamma: Vec<f32>,
     pub bn2_beta: Vec<f32>,
     #[serde(default = "default_bn2_running_mean")]
     pub bn2_running_mean: Vec<f32>,
     #[serde(default = "default_bn2_running_var")]
     pub bn2_running_var: Vec<f32>,
-    pub fc_weight: Vec<f32>, // [1, 64]
+    pub fc_weight: Vec<f32>, // [1, conv2_out]
     pub fc_bias: Vec<f32>,   // [1]
     pub bn_eps: f32,
+    /// Architecture configuration for this ensemble member (mahbot-848).
+    /// Defines conv1_out, conv2_out, and kernel_size that were used during
+    /// training.  Uses `#[serde(default)]` so legacy enrollment data (which
+    /// predates this field) deserializes with the baseline architecture,
+    /// preserving backward compatibility.
+    #[serde(default = "default_arch")]
+    pub arch: ArchConfig,
 }
 
 impl Default for ClassifierWeights {
     fn default() -> Self {
-        Self::from_rng(&mut rand::rng())
+        Self::from_rng(&mut rand::rng(), &ArchConfig::default())
     }
 }
 
 impl ClassifierWeights {
-    /// Initialize classifier weights using a seeded RNG for deterministic training.
+    /// Initialize classifier weights using a seeded RNG for deterministic training
+    /// and the given architecture configuration (mahbot-848).
     /// Used by [`train_classifier`] when a seed is configured, replacing the
     /// non-deterministic `Default` path.
-    pub fn from_rng(rng: &mut (impl rand::Rng + ?Sized)) -> Self {
+    pub fn from_rng(rng: &mut (impl rand::Rng + ?Sized), arch: &ArchConfig) -> Self {
+        let ks = arch.kernel_size;
+        let c1 = arch.conv1_out;
+        let c2 = arch.conv2_out;
         // Xavier/Glorot uniform initialization corrected for Conv1D
         // (mahbot-846): fan_in and fan_out must include kernel_size.
         // Formula: scale = sqrt(6 / (fan_in + fan_out))
         //   fan_in = in_channels * kernel_size
         //   fan_out = out_channels * kernel_size
-        let scale_c1 = (6.0 / ((EMBEDDING_DIM + CONV1_OUT) * KERNEL_SIZE) as f32).sqrt();
-        let scale_c2 = (6.0 / ((CONV1_OUT + CONV2_OUT) * KERNEL_SIZE) as f32).sqrt();
-        let scale_fc = (6.0 / (CONV2_OUT + FC_OUT) as f32).sqrt();
+        let scale_c1 = (6.0 / ((EMBEDDING_DIM + c1) * ks) as f32).sqrt();
+        let scale_c2 = (6.0 / ((c1 + c2) * ks) as f32).sqrt();
+        let scale_fc = (6.0 / (c2 + FC_OUT) as f32).sqrt();
         let mut uniform =
             |s: f32, n: usize| -> Vec<f32> { (0..n).map(|_| rng.random_range(-s..s)).collect() };
         Self {
-            conv1_weight: uniform(scale_c1, CONV1_OUT * EMBEDDING_DIM * KERNEL_SIZE),
-            conv1_bias: vec![0.0; CONV1_OUT],
-            bn1_gamma: vec![1.0; CONV1_OUT],
-            bn1_beta: vec![0.0; CONV1_OUT],
-            bn1_running_mean: vec![0.0; CONV1_OUT],
-            bn1_running_var: vec![1.0; CONV1_OUT],
-            conv2_weight: uniform(scale_c2, CONV2_OUT * CONV1_OUT * KERNEL_SIZE),
-            conv2_bias: vec![0.0; CONV2_OUT],
-            bn2_gamma: vec![1.0; CONV2_OUT],
-            bn2_beta: vec![0.0; CONV2_OUT],
-            bn2_running_mean: vec![0.0; CONV2_OUT],
-            bn2_running_var: vec![1.0; CONV2_OUT],
-            fc_weight: uniform(scale_fc, CONV2_OUT * FC_OUT),
+            conv1_weight: uniform(scale_c1, c1 * EMBEDDING_DIM * ks),
+            conv1_bias: vec![0.0; c1],
+            bn1_gamma: vec![1.0; c1],
+            bn1_beta: vec![0.0; c1],
+            bn1_running_mean: vec![0.0; c1],
+            bn1_running_var: vec![1.0; c1],
+            conv2_weight: uniform(scale_c2, c2 * c1 * ks),
+            conv2_bias: vec![0.0; c2],
+            bn2_gamma: vec![1.0; c2],
+            bn2_beta: vec![0.0; c2],
+            bn2_running_mean: vec![0.0; c2],
+            bn2_running_var: vec![1.0; c2],
+            fc_weight: uniform(scale_fc, c2 * FC_OUT),
             fc_bias: vec![0.0; FC_OUT],
             bn_eps: 1e-5,
+            arch: *arch,
         }
     }
 
@@ -218,19 +304,22 @@ impl ClassifierWeights {
     }
 
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.conv1_weight.len() == CONV1_OUT * EMBEDDING_DIM * KERNEL_SIZE);
-        anyhow::ensure!(self.conv1_bias.len() == CONV1_OUT);
-        anyhow::ensure!(self.bn1_gamma.len() == CONV1_OUT);
-        anyhow::ensure!(self.bn1_beta.len() == CONV1_OUT);
-        anyhow::ensure!(self.bn1_running_mean.len() == CONV1_OUT);
-        anyhow::ensure!(self.bn1_running_var.len() == CONV1_OUT);
-        anyhow::ensure!(self.conv2_weight.len() == CONV2_OUT * CONV1_OUT * KERNEL_SIZE);
-        anyhow::ensure!(self.conv2_bias.len() == CONV2_OUT);
-        anyhow::ensure!(self.bn2_gamma.len() == CONV2_OUT);
-        anyhow::ensure!(self.bn2_beta.len() == CONV2_OUT);
-        anyhow::ensure!(self.bn2_running_mean.len() == CONV2_OUT);
-        anyhow::ensure!(self.bn2_running_var.len() == CONV2_OUT);
-        anyhow::ensure!(self.fc_weight.len() == CONV2_OUT * FC_OUT);
+        let ks = self.arch.kernel_size;
+        let c1 = self.arch.conv1_out;
+        let c2 = self.arch.conv2_out;
+        anyhow::ensure!(self.conv1_weight.len() == c1 * EMBEDDING_DIM * ks);
+        anyhow::ensure!(self.conv1_bias.len() == c1);
+        anyhow::ensure!(self.bn1_gamma.len() == c1);
+        anyhow::ensure!(self.bn1_beta.len() == c1);
+        anyhow::ensure!(self.bn1_running_mean.len() == c1);
+        anyhow::ensure!(self.bn1_running_var.len() == c1);
+        anyhow::ensure!(self.conv2_weight.len() == c2 * c1 * ks);
+        anyhow::ensure!(self.conv2_bias.len() == c2);
+        anyhow::ensure!(self.bn2_gamma.len() == c2);
+        anyhow::ensure!(self.bn2_beta.len() == c2);
+        anyhow::ensure!(self.bn2_running_mean.len() == c2);
+        anyhow::ensure!(self.bn2_running_var.len() == c2);
+        anyhow::ensure!(self.fc_weight.len() == c2 * FC_OUT);
         anyhow::ensure!(self.fc_bias.len() == FC_OUT);
         // Check for NaN/Infinity — guards against silent training failures
         // (NaN gradients, degenerate input normalization) that shape checks
@@ -272,7 +361,8 @@ pub struct WakeWordClassifier {
 ///
 /// Stores batch-normalization statistics (computed from the spatial
 /// dimension in the forward pass and consumed by the backward pass) and
-/// dropout masks.  A new context is created for each training sample.
+/// dropout masks.  A new context is created for each training sample with
+/// the ensemble member's architecture configuration (mahbot-848).
 struct TrainingCtx {
     bn1_mean: Vec<f32>,
     bn1_var: Vec<f32>,
@@ -284,14 +374,16 @@ struct TrainingCtx {
 }
 
 impl TrainingCtx {
-    fn new(seed: u64) -> Self {
+    fn new(arch: &ArchConfig, seed: u64) -> Self {
+        let c1 = arch.conv1_out;
+        let c2 = arch.conv2_out;
         Self {
-            bn1_mean: vec![0.0; CONV1_OUT],
-            bn1_var: vec![0.0; CONV1_OUT],
-            bn2_mean: vec![0.0; CONV2_OUT],
-            bn2_var: vec![0.0; CONV2_OUT],
-            dropout_mask1: vec![0.0; CONV1_OUT * WINDOW_SIZE],
-            dropout_mask2: vec![0.0; CONV2_OUT * WINDOW_SIZE],
+            bn1_mean: vec![0.0; c1],
+            bn1_var: vec![0.0; c1],
+            bn2_mean: vec![0.0; c2],
+            bn2_var: vec![0.0; c2],
+            dropout_mask1: vec![0.0; c1 * WINDOW_SIZE],
+            dropout_mask2: vec![0.0; c2 * WINDOW_SIZE],
             rng: rand::rngs::StdRng::seed_from_u64(seed),
         }
     }
@@ -362,17 +454,21 @@ fn apply_augmentation(x: &[f32], std: f32, rng: &mut impl rand::Rng) -> Vec<f32>
 /// batch-norm statistics and no dropout — identical to the original
 /// `forward_pass` behaviour.
 fn forward_pass_infer(x: &[f32], w: &ClassifierWeights) -> f32 {
+    let ks = w.arch.kernel_size;
+    let c1 = w.arch.conv1_out;
+    let c2 = w.arch.conv2_out;
     let mut h = conv1d(
         x,
         EMBEDDING_DIM,
         WINDOW_SIZE,
-        CONV1_OUT,
+        c1,
+        ks,
         &w.conv1_weight,
         &w.conv1_bias,
     );
     batch_norm(
         &mut h,
-        CONV1_OUT,
+        c1,
         WINDOW_SIZE,
         &w.bn1_gamma,
         &w.bn1_beta,
@@ -381,17 +477,10 @@ fn forward_pass_infer(x: &[f32], w: &ClassifierWeights) -> f32 {
         w.bn_eps,
     );
     relu(&mut h);
-    let mut h = conv1d(
-        &h,
-        CONV1_OUT,
-        WINDOW_SIZE,
-        CONV2_OUT,
-        &w.conv2_weight,
-        &w.conv2_bias,
-    );
+    let mut h = conv1d(&h, c1, WINDOW_SIZE, c2, ks, &w.conv2_weight, &w.conv2_bias);
     batch_norm(
         &mut h,
-        CONV2_OUT,
+        c2,
         WINDOW_SIZE,
         &w.bn2_gamma,
         &w.bn2_beta,
@@ -400,7 +489,7 @@ fn forward_pass_infer(x: &[f32], w: &ClassifierWeights) -> f32 {
         w.bn_eps,
     );
     relu(&mut h);
-    let pooled = adaptive_avg_pool(&h, CONV2_OUT, WINDOW_SIZE);
+    let pooled = adaptive_avg_pool(&h, c2, WINDOW_SIZE);
     sigmoid(dot(&pooled, &w.fc_weight) + w.fc_bias[0])
 }
 
@@ -422,26 +511,24 @@ fn forward_pass_infer(x: &[f32], w: &ClassifierWeights) -> f32 {
 /// reliably in practice, but differs from the full BN backward that includes
 /// the mean/variance correction terms.
 fn forward_pass_train(x: &[f32], w: &ClassifierWeights, ctx: &mut TrainingCtx) -> f32 {
+    let ks = w.arch.kernel_size;
+    let c1 = w.arch.conv1_out;
+    let c2 = w.arch.conv2_out;
     let mut h = conv1d(
         x,
         EMBEDDING_DIM,
         WINDOW_SIZE,
-        CONV1_OUT,
+        c1,
+        ks,
         &w.conv1_weight,
         &w.conv1_bias,
     );
 
     // ── BN1 with batch stats ──
-    compute_batch_stats(
-        &h,
-        CONV1_OUT,
-        WINDOW_SIZE,
-        &mut ctx.bn1_mean,
-        &mut ctx.bn1_var,
-    );
+    compute_batch_stats(&h, c1, WINDOW_SIZE, &mut ctx.bn1_mean, &mut ctx.bn1_var);
     batch_norm(
         &mut h,
-        CONV1_OUT,
+        c1,
         WINDOW_SIZE,
         &w.bn1_gamma,
         &w.bn1_beta,
@@ -453,26 +540,13 @@ fn forward_pass_train(x: &[f32], w: &ClassifierWeights, ctx: &mut TrainingCtx) -
     apply_dropout(&mut h, DROPOUT_RATE, &mut ctx.dropout_mask1, &mut ctx.rng);
 
     // ── Conv2 ──
-    let mut h = conv1d(
-        &h,
-        CONV1_OUT,
-        WINDOW_SIZE,
-        CONV2_OUT,
-        &w.conv2_weight,
-        &w.conv2_bias,
-    );
+    let mut h = conv1d(&h, c1, WINDOW_SIZE, c2, ks, &w.conv2_weight, &w.conv2_bias);
 
     // ── BN2 with batch stats ──
-    compute_batch_stats(
-        &h,
-        CONV2_OUT,
-        WINDOW_SIZE,
-        &mut ctx.bn2_mean,
-        &mut ctx.bn2_var,
-    );
+    compute_batch_stats(&h, c2, WINDOW_SIZE, &mut ctx.bn2_mean, &mut ctx.bn2_var);
     batch_norm(
         &mut h,
-        CONV2_OUT,
+        c2,
         WINDOW_SIZE,
         &w.bn2_gamma,
         &w.bn2_beta,
@@ -483,7 +557,7 @@ fn forward_pass_train(x: &[f32], w: &ClassifierWeights, ctx: &mut TrainingCtx) -
     relu(&mut h);
     apply_dropout(&mut h, DROPOUT_RATE, &mut ctx.dropout_mask2, &mut ctx.rng);
 
-    let pooled = adaptive_avg_pool(&h, CONV2_OUT, WINDOW_SIZE);
+    let pooled = adaptive_avg_pool(&h, c2, WINDOW_SIZE);
     sigmoid(dot(&pooled, &w.fc_weight) + w.fc_bias[0])
 }
 
@@ -622,16 +696,25 @@ impl WakeWordClassifier {
 
 // ── Forward primitives ──────────────────────────────────────────────────
 
-fn conv1d(inp: &[f32], cin: usize, l: usize, cout: usize, w: &[f32], b: &[f32]) -> Vec<f32> {
+fn conv1d(
+    inp: &[f32],
+    cin: usize,
+    l: usize,
+    cout: usize,
+    kernel_size: usize,
+    w: &[f32],
+    b: &[f32],
+) -> Vec<f32> {
+    let padding = kernel_size / 2;
     let mut out = vec![0.0; cout * l];
     for co in 0..cout {
         for li in 0..l {
             let mut s = b[co];
             for ci in 0..cin {
-                for k in 0..KERNEL_SIZE {
-                    let ii = li as isize + k as isize - PADDING as isize;
+                for k in 0..kernel_size {
+                    let ii = li as isize + k as isize - padding as isize;
                     if ii >= 0 && ii < l as isize {
-                        s += inp[ci * l + ii as usize] * w[(co * cin + ci) * KERNEL_SIZE + k];
+                        s += inp[ci * l + ii as usize] * w[(co * cin + ci) * kernel_size + k];
                     }
                 }
             }
@@ -748,6 +831,11 @@ pub struct TrainingConfig {
     /// When 0.0 (default), no augmentation is applied.
     /// Typical values: 0.01–0.05.
     pub data_augmentation_std: f32,
+    /// Architecture configuration for this ensemble member (mahbot-848).
+    /// Defines conv1_out, conv2_out, and kernel_size for the Conv1D layers.
+    /// When `ArchConfig::default()` (baseline, 64/64/k3), behaviour matches
+    /// the pre-848 single-architecture training.
+    pub arch: ArchConfig,
 }
 impl Default for TrainingConfig {
     fn default() -> Self {
@@ -762,6 +850,7 @@ impl Default for TrainingConfig {
             k_fold_total: 0,
             k_fold_index: 0,
             data_augmentation_std: 0.0,
+            arch: ArchConfig::default(),
         }
     }
 }
@@ -951,7 +1040,7 @@ pub fn train_classifier(
 
     let cin = EMBEDDING_DIM;
     let lin = WINDOW_SIZE;
-    let mut weights = ClassifierWeights::from_rng(&mut *rng);
+    let mut weights = ClassifierWeights::from_rng(&mut *rng, &cfg.arch);
     let bs = cfg.batch_size.min(n_tr).max(1);
     let mut best_loss = f32::INFINITY;
     let mut patience = 0;
@@ -977,16 +1066,16 @@ pub fn train_classifier(
             // instead of per-sample, which would otherwise compound the
             // momentum decay ~32× per batch, making the effective retention
             // 0.9³² ≈ 0.034 after a single batch).
-            let mut bn1_mean_acc = vec![0.0; CONV1_OUT];
-            let mut bn1_var_acc = vec![0.0; CONV1_OUT];
-            let mut bn2_mean_acc = vec![0.0; CONV2_OUT];
-            let mut bn2_var_acc = vec![0.0; CONV2_OUT];
+            let mut bn1_mean_acc = vec![0.0; cfg.arch.conv1_out];
+            let mut bn1_var_acc = vec![0.0; cfg.arch.conv1_out];
+            let mut bn2_mean_acc = vec![0.0; cfg.arch.conv2_out];
+            let mut bn2_var_acc = vec![0.0; cfg.arch.conv2_out];
 
             for (sample_idx, &i) in chunk.iter().enumerate() {
                 let dropout_seed = cfg.rng_seed.unwrap_or_else(|| rand::rng().random::<u64>())
                     ^ (epoch as u64).wrapping_mul(1_000_000)
                     ^ sample_idx as u64;
-                let mut ctx = TrainingCtx::new(dropout_seed);
+                let mut ctx = TrainingCtx::new(&cfg.arch, dropout_seed);
 
                 // Data augmentation (mahbot-847): add Gaussian noise and
                 // re-normalize.  Uses the same per-sample RNG as dropout
@@ -1023,7 +1112,7 @@ pub fn train_classifier(
             }
             // Update BN running stats once per batch using accumulated stats.
             let n_batch = chunk.len() as f32;
-            for ci in 0..CONV1_OUT {
+            for ci in 0..cfg.arch.conv1_out {
                 let batch_mean = bn1_mean_acc[ci] / n_batch;
                 let batch_var = bn1_var_acc[ci] / n_batch;
                 weights.bn1_running_mean[ci] =
@@ -1031,7 +1120,7 @@ pub fn train_classifier(
                 weights.bn1_running_var[ci] =
                     BN_MOMENTUM * weights.bn1_running_var[ci] + (1.0 - BN_MOMENTUM) * batch_var;
             }
-            for ci in 0..CONV2_OUT {
+            for ci in 0..cfg.arch.conv2_out {
                 let batch_mean = bn2_mean_acc[ci] / n_batch;
                 let batch_var = bn2_var_acc[ci] / n_batch;
                 weights.bn2_running_mean[ci] =
@@ -1315,8 +1404,10 @@ fn backward(
 ) {
     let cin = EMBEDDING_DIM;
     let lin = WINDOW_SIZE;
-    let c1 = CONV1_OUT;
-    let c2 = CONV2_OUT;
+    let c1 = w.arch.conv1_out;
+    let c2 = w.arch.conv2_out;
+    let kernel_size = w.arch.kernel_size;
+    let padding = kernel_size / 2;
     let eps = w.bn_eps;
 
     // Determine which BN statistics to use.
@@ -1336,11 +1427,11 @@ fn backward(
         for li in 0..lin {
             let mut s = w.conv1_bias[co];
             for ci in 0..cin {
-                for k in 0..KERNEL_SIZE {
-                    let ii = li as isize + k as isize - PADDING as isize;
+                for k in 0..kernel_size {
+                    let ii = li as isize + k as isize - padding as isize;
                     if ii >= 0 && ii < lin as isize {
                         s += x[ci * lin + ii as usize]
-                            * w.conv1_weight[(co * cin + ci) * KERNEL_SIZE + k];
+                            * w.conv1_weight[(co * cin + ci) * kernel_size + k];
                     }
                 }
             }
@@ -1383,11 +1474,11 @@ fn backward(
         for li in 0..lin {
             let mut s = w.conv2_bias[co];
             for ci in 0..c1 {
-                for k in 0..KERNEL_SIZE {
-                    let ii = li as isize + k as isize - PADDING as isize;
+                for k in 0..kernel_size {
+                    let ii = li as isize + k as isize - padding as isize;
                     if ii >= 0 && ii < lin as isize {
                         s += relu1[ci * lin + ii as usize]
-                            * w.conv2_weight[(co * c1 + ci) * KERNEL_SIZE + k];
+                            * w.conv2_weight[(co * c1 + ci) * kernel_size + k];
                     }
                 }
             }
@@ -1483,10 +1574,10 @@ fn backward(
         for li in 0..lin {
             let go = d_conv2[co * lin + li];
             for ci in 0..c1 {
-                for k in 0..KERNEL_SIZE {
-                    let ii = li as isize + k as isize - PADDING as isize;
+                for k in 0..kernel_size {
+                    let ii = li as isize + k as isize - padding as isize;
                     if ii >= 0 && ii < lin as isize {
-                        let widx = (co * c1 + ci) * KERNEL_SIZE + k;
+                        let widx = (co * c1 + ci) * kernel_size + k;
                         g.conv2_w[widx] += go * relu1[ci * lin + ii as usize];
                         d_relu1[ci * lin + ii as usize] += go * w.conv2_weight[widx];
                     }
@@ -1523,10 +1614,10 @@ fn backward(
         for li in 0..lin {
             let go = d_conv1[co * lin + li];
             for ci in 0..cin {
-                for k in 0..KERNEL_SIZE {
-                    let ii = li as isize + k as isize - PADDING as isize;
+                for k in 0..kernel_size {
+                    let ii = li as isize + k as isize - padding as isize;
                     if ii >= 0 && ii < lin as isize {
-                        let widx = (co * cin + ci) * KERNEL_SIZE + k;
+                        let widx = (co * cin + ci) * kernel_size + k;
                         g.conv1_w[widx] += go * x[ci * lin + ii as usize];
                     }
                 }
@@ -1558,22 +1649,24 @@ mod tests {
     #[test]
     fn test_forward_constant() {
         let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE).map(|_| vec![0.5; EMBEDDING_DIM]).collect();
+        let arch = ArchConfig::default();
         let w = ClassifierWeights {
-            conv1_weight: vec![0.0; CONV1_OUT * EMBEDDING_DIM * KERNEL_SIZE],
-            conv1_bias: vec![0.0; CONV1_OUT],
-            bn1_gamma: vec![1.0; CONV1_OUT],
-            bn1_beta: vec![0.0; CONV1_OUT],
-            bn1_running_mean: vec![0.0; CONV1_OUT],
-            bn1_running_var: vec![1.0; CONV1_OUT],
-            conv2_weight: vec![0.0; CONV2_OUT * CONV1_OUT * KERNEL_SIZE],
-            conv2_bias: vec![0.0; CONV2_OUT],
-            bn2_gamma: vec![1.0; CONV2_OUT],
-            bn2_beta: vec![0.0; CONV2_OUT],
-            bn2_running_mean: vec![0.0; CONV2_OUT],
-            bn2_running_var: vec![1.0; CONV2_OUT],
-            fc_weight: vec![0.0; CONV2_OUT * FC_OUT],
+            conv1_weight: vec![0.0; arch.conv1_out * EMBEDDING_DIM * arch.kernel_size],
+            conv1_bias: vec![0.0; arch.conv1_out],
+            bn1_gamma: vec![1.0; arch.conv1_out],
+            bn1_beta: vec![0.0; arch.conv1_out],
+            bn1_running_mean: vec![0.0; arch.conv1_out],
+            bn1_running_var: vec![1.0; arch.conv1_out],
+            conv2_weight: vec![0.0; arch.conv2_out * arch.conv1_out * arch.kernel_size],
+            conv2_bias: vec![0.0; arch.conv2_out],
+            bn2_gamma: vec![1.0; arch.conv2_out],
+            bn2_beta: vec![0.0; arch.conv2_out],
+            bn2_running_mean: vec![0.0; arch.conv2_out],
+            bn2_running_var: vec![1.0; arch.conv2_out],
+            fc_weight: vec![0.0; arch.conv2_out * FC_OUT],
             fc_bias: vec![0.0; FC_OUT],
             bn_eps: 1e-5,
+            arch,
         };
         let c = WakeWordClassifier::new(w);
         let score = c.forward(&embs);
@@ -1604,33 +1697,39 @@ mod tests {
 
     #[test]
     fn test_weights_serde_legacy() {
-        // Legacy JSON without BN running stats fields — these must be absent
-        // so that #[serde(default)] kicks in, verifying backward compatibility
-        // with enrollment data serialized before mahbot-846 added the four
-        // BN running-stat fields.
+        // Legacy JSON without BN running stats fields and without the arch
+        // field — these must be absent so that #[serde(default)] kicks in,
+        // verifying backward compatibility with enrollment data serialized
+        // before mahbot-846 added the four BN running-stat fields and
+        // mahbot-848 added the per-member architecture configuration.
+        let c1_def = DEFAULT_CONV1_OUT;
+        let c2_def = DEFAULT_CONV2_OUT;
+        let ks_def = DEFAULT_KERNEL_SIZE;
         let legacy = serde_json::json!({
-            "conv1_weight": vec![0.0; CONV1_OUT * EMBEDDING_DIM * KERNEL_SIZE],
-            "conv1_bias": vec![0.0; CONV1_OUT],
-            "bn1_gamma": vec![1.0; CONV1_OUT],
-            "bn1_beta": vec![0.0; CONV1_OUT],
-            "conv2_weight": vec![0.0; CONV2_OUT * CONV1_OUT * KERNEL_SIZE],
-            "conv2_bias": vec![0.0; CONV2_OUT],
-            "bn2_gamma": vec![1.0; CONV2_OUT],
-            "bn2_beta": vec![0.0; CONV2_OUT],
-            "fc_weight": vec![0.0; CONV2_OUT * FC_OUT],
+            "conv1_weight": vec![0.0; c1_def * EMBEDDING_DIM * ks_def],
+            "conv1_bias": vec![0.0; c1_def],
+            "bn1_gamma": vec![1.0; c1_def],
+            "bn1_beta": vec![0.0; c1_def],
+            "conv2_weight": vec![0.0; c2_def * c1_def * ks_def],
+            "conv2_bias": vec![0.0; c2_def],
+            "bn2_gamma": vec![1.0; c2_def],
+            "bn2_beta": vec![0.0; c2_def],
+            "fc_weight": vec![0.0; c2_def * FC_OUT],
             "fc_bias": vec![0.0; FC_OUT],
             "bn_eps": 1e-5_f32,
         });
         let w: ClassifierWeights = serde_json::from_value(legacy).unwrap();
         // Verify BN running stats were defaulted to correct shapes and values.
-        assert_eq!(w.bn1_running_mean.len(), CONV1_OUT);
-        assert_eq!(w.bn1_running_var.len(), CONV1_OUT);
-        assert_eq!(w.bn2_running_mean.len(), CONV2_OUT);
-        assert_eq!(w.bn2_running_var.len(), CONV2_OUT);
+        assert_eq!(w.bn1_running_mean.len(), c1_def);
+        assert_eq!(w.bn1_running_var.len(), c1_def);
+        assert_eq!(w.bn2_running_mean.len(), c2_def);
+        assert_eq!(w.bn2_running_var.len(), c2_def);
         assert!(w.bn1_running_mean.iter().all(|&v| v == 0.0));
         assert!(w.bn1_running_var.iter().all(|&v| (v - 1.0).abs() < 1e-6));
         assert!(w.bn2_running_mean.iter().all(|&v| v == 0.0));
         assert!(w.bn2_running_var.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        // Verify arch was defaulted to baseline (backward compat).
+        assert_eq!(w.arch, ArchConfig::default());
         // Also verify the rest round-trips correctly.
         assert!(w.validate().is_ok());
     }

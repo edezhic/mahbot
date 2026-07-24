@@ -2364,16 +2364,21 @@ pub(crate) fn finalize_enrollment(
     // on-the-fly to each training window to reduce overfitting.
     // The models are trained in parallel via std::thread::scope since they
     // have no shared state and training is CPU-bound.
+    // Each model also uses a different architecture (mahbot-848) so ensemble
+    // members learn genuinely different feature representations for better
+    // diversity on ambiguous inputs.
     let base_config = wake_word_classifier::TrainingConfig::default();
     let ensemble_results: Vec<Result<wake_word_classifier::ClassifierTrainingResult>> =
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..wake_word_classifier::NUM_ENSEMBLE_MEMBERS)
                 .map(|seed| {
+                    let arch = wake_word_classifier::ENSEMBLE_ARCHS[seed];
                     let config = wake_word_classifier::TrainingConfig {
                         rng_seed: Some(seed as u64),
                         k_fold_total: wake_word_classifier::NUM_ENSEMBLE_MEMBERS,
                         k_fold_index: seed,
                         data_augmentation_std: wake_word_classifier::DATA_AUGMENTATION_STD,
+                        arch,
                         ..base_config.clone()
                     };
                     s.spawn(move || {
