@@ -95,7 +95,7 @@ strum = { version = "0.27", features = ["derive"] }
 # Embeddings
 tokenizers = "0.22"
 candle-core = "0.10.2"
-candle-nn = "0.10.2"
+candle-nn = { version = "0.10.2", features = ["accelerate"] }
 candle-onnx = "0.10.2"
 
 # Neural voice activity detection (replaces RMS-based VAD)
@@ -148,6 +148,11 @@ http = "1.4"
 tempfile = "3"
 serial_test = "3"
 
+[[bench]]
+name = "voice_pipeline_e2e"
+harness = false
+required-features = ["voice-tests"]
+
 [profile.dev]
 incremental = true
 opt-level = 0
@@ -175,6 +180,14 @@ panic = "unwind"
 inherits = "dev"
 debug = 0
 codegen-units = 256
+
+[profile.bench]
+inherits = "release"
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 0
+incremental = false
 
 [patch.crates-io]
 candle-onnx = { path = "vendor/candle-onnx" }

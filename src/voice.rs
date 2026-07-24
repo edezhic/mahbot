@@ -49,9 +49,18 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 // ── E2E integration test (voice-tests feature) ──────────────────────────
-#[cfg(all(test, feature = "voice-tests"))]
+#[cfg(feature = "voice-tests")]
 #[path = "voice_pipeline_e2e_test.rs"]
 pub(crate) mod voice_pipeline_e2e_test;
+
+/// Public entry point for the voice pipeline benchmark.
+///
+/// Called by `benches/voice_pipeline_e2e.rs`.  Only compiled when the
+/// `voice-tests` feature is enabled.
+#[cfg(feature = "voice-tests")]
+pub fn run_voice_pipeline_benchmark() {
+    voice_pipeline_e2e_test::run_internal();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -1246,7 +1255,7 @@ pub(crate) fn is_speech_with_detector(
         let mut padded = [0.0f32; 256];
         padded[..remainder].copy_from_slice(&samples[samples.len() - remainder..]);
         // Clamp the partial frame too (the copy_from_slice copies raw samples).
-        for s in padded[..remainder].iter_mut() {
+        for s in &mut padded[..remainder] {
             *s = s.clamp(-1.0, 1.0);
         }
         if detector.predict_f32(&padded) >= threshold {
@@ -2228,7 +2237,7 @@ pub(crate) fn finalize_enrollment(
     positive_embeddings: &[Vec<f32>],
     negative_embeddings: &[Vec<f32>],
     enrollment_buffer: &[Vec<Vec<f32>>],
-) -> Result<ClassifierWeights> {
+) -> Result<wake_word_classifier::ClassifierTrainingResult> {
     anyhow::ensure!(
         !positive_embeddings.is_empty(),
         "No positive embeddings available for training"
@@ -2239,11 +2248,11 @@ pub(crate) fn finalize_enrollment(
 
     // Step 2: Train the Conv1D classifier
     let config = wake_word_classifier::TrainingConfig::default();
-    let weights =
+    let result =
         wake_word_classifier::train_classifier(positive_embeddings, negative_embeddings, &config)?;
     // validate() inside train_classifier checks shapes + NaN/finite
 
-    Ok(weights)
+    Ok(result)
 }
 
 /// Validate enrollment utterance quality via centroid cosine similarity.
@@ -3356,13 +3365,16 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 };
 
                 let weights = match classifier_result {
-                    Ok(w) => {
+                    Ok(result) => {
                         info!(
-                            "Enrollment complete: wake word '{}' (classifier trained: {} params)",
+                            "Enrollment complete: wake word '{}' (classifier trained: {} params, \
+                             {} epochs, best val loss={:.4})",
                             WAKE_WORD_NAME,
-                            w.param_count(),
+                            result.weights.param_count(),
+                            result.epochs_trained,
+                            result.best_val_loss,
                         );
-                        w
+                        result.weights
                     }
                     Err(e) => {
                         warn!("Enrollment finalization failed: {e}");

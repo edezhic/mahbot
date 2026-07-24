@@ -21,7 +21,7 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::voice_verifier::EMBEDDING_DIM;
 
@@ -107,7 +107,7 @@ impl ClassifierWeights {
     /// Adding a new Vec field to `ClassifierWeights` requires adding it here
     /// — a compile error if omitted from the array literal (Rust checks array
     /// element count at compile time for fixed-size arrays).
-    fn all_weight_slices(&self) -> [&[f32]; 14] {
+    pub(crate) fn all_weight_slices(&self) -> [&[f32]; 14] {
         [
             &self.conv1_weight,
             &self.conv1_bias,
@@ -217,7 +217,7 @@ fn forward_pass(x: &[f32], w: &ClassifierWeights) -> f32 {
 
 impl WakeWordClassifier {
     /// Get a reference to the underlying classifier weights.
-    #[expect(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub fn weights_ref(&self) -> &ClassifierWeights {
         &self.weights
     }
@@ -314,6 +314,36 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Result of training a wake word classifier, returned by [`train_classifier`].
+#[derive(Debug, Clone)]
+pub struct ClassifierTrainingResult {
+    /// The trained classifier weights.
+    pub weights: ClassifierWeights,
+    /// Actual number of epochs trained (may be less than
+    /// `TrainingConfig::max_epochs` due to early stopping).
+    pub epochs_trained: usize,
+    /// Best validation loss achieved during training.
+    pub best_val_loss: f32,
+    /// Mean positive class score after training.
+    #[allow(dead_code)]
+    pub pos_scores_mean: f32,
+    /// Minimum positive class score after training.
+    #[allow(dead_code)]
+    pub pos_scores_min: f32,
+    /// Maximum positive class score after training.
+    #[allow(dead_code)]
+    pub pos_scores_max: f32,
+    /// Mean negative class score after training.
+    #[allow(dead_code)]
+    pub neg_scores_mean: f32,
+    /// Minimum negative class score after training.
+    #[allow(dead_code)]
+    pub neg_scores_min: f32,
+    /// Maximum negative class score after training.
+    #[allow(dead_code)]
+    pub neg_scores_max: f32,
+}
+
 // ── Training ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -389,7 +419,7 @@ pub fn train_classifier(
     pos: &[Vec<f32>],
     neg: &[Vec<f32>],
     cfg: &TrainingConfig,
-) -> Result<ClassifierWeights> {
+) -> Result<ClassifierTrainingResult> {
     let pos_w = build_windows(pos);
     let neg_w = build_windows(neg);
     anyhow::ensure!(pos_w.len() + neg_w.len() >= 2, "Need ≥2 training windows");
@@ -455,8 +485,10 @@ pub fn train_classifier(
     let mut best = weights.clone();
 
     let mut opt = AdamStateGroup::new(&weights);
+    let mut epochs_trained = 0;
 
     for epoch in 0..cfg.max_epochs {
+        epochs_trained = epoch + 1;
         let mut tr_idx: Vec<usize> = (0..n_tr).collect();
         tr_idx.shuffle(&mut rng);
         let lr_scale =
@@ -574,21 +606,37 @@ pub fn train_classifier(
             })
             .collect()
     };
-    for (label, windows) in [("pos", &pos_w), ("neg", &neg_w)] {
-        let scores = score_normalized(windows);
-        if !scores.is_empty() {
-            let mean = scores.iter().copied().sum::<f32>() / scores.len() as f32;
-            let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            info!(
-                "Classifier final {label} scores: mean={mean:.4} min={min:.4} max={max:.4} (n={})",
-                scores.len(),
-            );
-        }
-    }
+    let pos_scores = score_normalized(&pos_w);
+    let neg_scores = score_normalized(&neg_w);
+    let (pos_scores_mean, pos_scores_min, pos_scores_max) = compute_score_stats(&pos_scores);
+    let (neg_scores_mean, neg_scores_min, neg_scores_max) = compute_score_stats(&neg_scores);
+    info!(
+        "Classifier final pos scores: mean={pos_scores_mean:.4} min={pos_scores_min:.4} max={pos_scores_max:.4} \
+         neg: mean={neg_scores_mean:.4} min={neg_scores_min:.4} max={neg_scores_max:.4}",
+    );
 
     weights.validate()?;
-    Ok(weights)
+    Ok(ClassifierTrainingResult {
+        weights,
+        epochs_trained,
+        best_val_loss: best_loss,
+        pos_scores_mean,
+        pos_scores_min,
+        pos_scores_max,
+        neg_scores_mean,
+        neg_scores_min,
+        neg_scores_max,
+    })
+}
+
+fn compute_score_stats(scores: &[f32]) -> (f32, f32, f32) {
+    if scores.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mean = scores.iter().copied().sum::<f32>() / scores.len() as f32;
+    let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    (mean, min, max)
 }
 
 fn gather<T: Clone>(data: &[T], idx: &[usize]) -> Vec<T> {
@@ -1020,7 +1068,8 @@ mod tests {
             max_epochs: 50,
             ..Default::default()
         };
-        let w = train_classifier(&pos, &neg, &cfg).unwrap();
+        let result = train_classifier(&pos, &neg, &cfg).unwrap();
+        let w = result.weights;
 
         let classifier = WakeWordClassifier::new(w);
         // Evaluate on the windows produced by build_windows — same path

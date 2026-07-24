@@ -416,7 +416,9 @@ impl ShellTool {
         // Allow agent to override the default timeout via `timeout_secs`.
         // Capped at MAX_SHELL_TIMEOUT_SECS to prevent absurdly long runs.
         let timeout_secs = super::get_opt_u64(&args, "timeout_secs")
-            .map_or(DEFAULT_SHELL_TIMEOUT_SECS, |s| s.min(MAX_SHELL_TIMEOUT_SECS));
+            .map_or(DEFAULT_SHELL_TIMEOUT_SECS, |s| {
+                s.min(MAX_SHELL_TIMEOUT_SECS)
+            });
         let timeout = Duration::from_secs(timeout_secs);
 
         let result = run_command_with_timeout(&mut cmd, timeout).await;
