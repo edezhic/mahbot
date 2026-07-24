@@ -34,7 +34,15 @@ const CONV2_OUT: usize = 64;
 const KERNEL_SIZE: usize = 3;
 const PADDING: usize = 1;
 const FC_OUT: usize = 1;
-const L2_LAMBDA: f32 = 0.001;
+/// L2 regularization strength (lambda).
+///
+/// Set to 0.0005 (mahbot-835) as a compromise between 829 baseline (0.001)
+/// and 832's 0.0001.  The expanded negative training dataset (20 confusable +
+/// 20 unrelated phrases × 3 seeds = ~2093 embeddings) requires less
+/// regularization than the original 5-phrase dataset (~200 embeddings) to
+/// avoid underfitting — at 0.001 the validation loss was 1.21 (worse than
+/// random), producing zero wake word detections.
+const L2_LAMBDA: f32 = 0.0005;
 const LEARNING_RATE: f32 = 0.001;
 const ADAM_BETA1: f32 = 0.9;
 const ADAM_BETA2: f32 = 0.999;
