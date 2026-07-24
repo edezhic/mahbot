@@ -36,16 +36,13 @@ const PADDING: usize = 1;
 const FC_OUT: usize = 1;
 /// L2 regularization strength (lambda).
 ///
-/// Set to 0.0001 (mahbot-835), matching the value that produced successful
-/// detection in mahbot-832.  The 829 baseline of 0.001 is too strong for the
-/// expanded negative dataset (20 confusable + 20 unrelated phrases × 3 seeds
-/// = ~2093 embeddings versus ~200 at 829), causing the Conv1D classifier to
-/// underfit with validation loss >1.0 and zero wake word detections.
-/// At 0.0005 (first attempt) the val loss dropped from 1.21 to 1.05 but the
-/// classifier still produced sub-0.80 per-frame scores, failing the rolling
-/// window gate.  At 0.0001 the model can better separate wake word frames
-/// from the 10× larger negative set while MATCH_THRESHOLD_FACTOR=0.80
-/// prevents false accepts.
+/// Set to 0.0001 (mahbot-835).  The 829 baseline of 0.001 caused the
+/// Conv1D classifier to underfit with the expanded negative dataset
+/// (2093 embeddings from 20 confusable + 20 unrelated × 3 seeds).
+/// Even at 0.0005 the classifier still produced sub-0.80 per-frame
+/// scores, failing the rolling window gate.  At 0.0001 the model can
+/// separate wake word frames from the 10× larger negative set while
+/// MATCH_THRESHOLD_FACTOR prevents false accepts.
 const L2_LAMBDA: f32 = 0.0001;
 const LEARNING_RATE: f32 = 0.001;
 const ADAM_BETA1: f32 = 0.9;
@@ -556,6 +553,28 @@ pub fn train_classifier(
             }
         }
     }
+
+    // Log average scores on ALL training positives and negatives.
+    let score_windows = |windows: &[Vec<f32>]| -> Vec<f32> {
+        windows
+            .iter()
+            .map(|w| {
+                let x_cf = to_channels_first(w, cin, lin);
+                forward_pass(&x_cf, &weights)
+            })
+            .collect()
+    };
+    for (label, windows) in [("pos", &pos_w), ("neg", &neg_w)] {
+        let scores = score_windows(windows);
+        let mean = scores.iter().copied().sum::<f32>() / scores.len() as f32;
+        let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        info!(
+            "Classifier final {label} scores: mean={mean:.4} min={min:.4} max={max:.4} (n={})",
+            scores.len(),
+        );
+    }
+
     weights.validate()?;
     Ok(weights)
 }

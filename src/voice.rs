@@ -344,15 +344,18 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829).  At 0.80 (threshold 2.40), the average per-frame
-/// soft score must exceed ~80% for detection to fire.  Combined with a clean
-/// verifier at 0.60, this reduces confusable false accepts toward ≤2 while
-/// maintaining ≥75% wake word detection.
-const MATCH_THRESHOLD_FACTOR: f32 = 0.80;
+/// (mahbot-773, mahbot-829, mahbot-835).  At 0.75 (threshold 2.25), the
+/// average per-frame soft score must exceed ~75% for detection to fire.
+/// The 829 baseline of 0.80 proved too strict for TTS-generated enrollment
+/// audio — the Conv1D classifier cannot produce consistent 0.80 scores with
+/// the expanded negative dataset (mahbot-835).  Combined with the verifier
+/// at 0.60, this maintains low false accepts while achieving ≥75% wake word
+/// detection.
+const MATCH_THRESHOLD_FACTOR: f32 = 0.75;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.80 = 2.40`).
+/// (= `3 × 0.75 = 2.25`).
 ///
 /// # Safety / precision
 /// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
