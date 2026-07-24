@@ -15,8 +15,8 @@ use crate::config::{CONFIG, ConfigData, ModelRouting, RoleConfig};
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable, stack,
-    text, text_editor, text_input, toggler, tooltip,
+    Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable, slider,
+    stack, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -2284,6 +2284,34 @@ impl SettingsState {
             .push(field_row("Status", status_text, None))
             .push(wake_word_row)
             .push(enroll_btn);
+
+        // Adaptive threshold k slider (mahbot-845)
+        let current_k: f32 = self
+            .config
+            .adaptive_k
+            .as_deref()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(2.5);
+        let k_slider = slider(1.0_f32..=4.0_f32, current_k, move |v| {
+            SettingsMessage::ConfigField {
+                key: "adaptive_k",
+                value: format!("{v:.1}"),
+            }
+        })
+        .step(0.1_f32)
+        .width(Length::Fixed(200.0));
+        column = column.push(iced::widget::Space::new().height(8));
+        column = column.push(field_row(
+            "Adaptive K",
+            iced::widget::row![
+                k_slider,
+                iced::widget::Space::new().width(8),
+                text(format!("{current_k:.1}")).size(13),
+            ]
+            .align_y(iced::Alignment::Center)
+            .into(),
+            Some("Detection sensitivity (1.0–4.0, default 2.5)"),
+        ));
 
         if let Some(ui) = enrollment_ui {
             column = column.push(ui);

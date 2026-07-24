@@ -119,6 +119,9 @@ const DEFAULT_VIDEO_GEN_MODEL: &str = "google/veo-3.1-lite";
 pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
+/// Default adaptive k multiplier for wake word detection.
+const DEFAULT_ADAPTIVE_K: &str = "2.5";
+
 // ── Named config structs ───────────────────────────────────────────
 
 /// A per-role model & reasoning-effort override.
@@ -300,6 +303,10 @@ pub struct ConfigData {
     /// Enable RMS-based automatic gain control for voice input (default: `"true"`).
     /// Normalises input volume before mel extraction.
     pub voice_agc: Option<String>,
+    /// Adaptive threshold k multiplier for wake word detection (default: `"2.5"`).
+    /// The adaptive threshold is computed as `mean + k × std` over a running
+    /// window of recent per-frame MLP scores.  Range: [1.0, 4.0].
+    pub adaptive_k: Option<String>,
     /// Per-role model overrides.
     pub per_role_configs: Vec<RoleConfig>,
     /// Per-model provider routing.
@@ -525,6 +532,7 @@ string_config_fields! {
     wake_word_templates [non_empty],
     voice_noise_suppression [non_empty],
     voice_agc [non_empty],
+    adaptive_k [or(DEFAULT_ADAPTIVE_K)],
 }
 
 impl ConfigData {

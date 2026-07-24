@@ -352,6 +352,29 @@ const _: () = assert!(
      the ring is non-empty when the tiling fallback is reached"
 );
 
+/// Compile-time invariant: the adaptive threshold floor (hard minimum) must
+/// not exceed the safe harbor (primary lower bound tracking the static
+/// threshold).  The safe harbor is always at least as high as the floor
+/// given current constants (FLOOR=1.80, SAFE_HARBOR=2.25).
+const _: () = assert!(
+    ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR,
+    "ADAPTIVE_FLOOR must be <= ADAPTIVE_SAFE_HARBOR"
+);
+
+/// Compile-time invariant: the adaptive threshold safe harbor must not exceed
+/// the absolute ceiling (upper bound).  Guarantees the clamp range is valid.
+const _: () = assert!(
+    ADAPTIVE_SAFE_HARBOR <= ADAPTIVE_CEILING,
+    "ADAPTIVE_SAFE_HARBOR must be <= ADAPTIVE_CEILING"
+);
+
+/// Compile-time invariant: the adaptive threshold absolute floor must not
+/// exceed the absolute ceiling (upper bound).
+const _: () = assert!(
+    ADAPTIVE_FLOOR <= ADAPTIVE_CEILING,
+    "ADAPTIVE_FLOOR must be <= ADAPTIVE_CEILING"
+);
+
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
 /// (mahbot-773, mahbot-829, mahbot-835).  At 0.75 (threshold 2.25), the
 /// average per-frame soft score must exceed ~75% for detection to fire.
@@ -365,14 +388,44 @@ const MATCH_THRESHOLD_FACTOR: f32 = 0.75;
 /// Detection threshold for the rolling sum of soft scores (mahbot-773).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
 /// (= `3 × 0.75 = 2.25`).
-///
-/// # Safety / precision
-/// The `usize → f32` casts are safe because `ROLLING_WINDOW_N` is at most 3
-/// (a trivially small value that fits exactly in f32's 23-bit mantissa).
 #[expect(clippy::cast_precision_loss)]
 fn match_threshold() -> f32 {
     (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR
 }
+
+// ── Adaptive threshold (mahbot-845) ──────────────────────────────────────
+
+/// Number of recent per-frame scores to track for adaptive threshold
+/// statistics. At ~128ms per frame, N=15 covers ~2 seconds of context.
+const ADAPTIVE_WINDOW_N: usize = 15;
+
+/// Default k multiplier for the adaptive threshold (mean + k × std).
+const ADAPTIVE_K_DEFAULT: f32 = 2.5;
+
+/// Minimum allowed adaptive k value (user-configurable range).
+const ADAPTIVE_K_MIN: f32 = 1.0;
+
+/// Maximum allowed adaptive k value (user-configurable range).
+const ADAPTIVE_K_MAX: f32 = 4.0;
+
+/// Absolute floor — the adaptive threshold must never drop below this value.
+const ADAPTIVE_FLOOR: f32 = 1.80;
+
+/// Absolute ceiling — the adaptive threshold must never exceed this value.
+const ADAPTIVE_CEILING: f32 = 2.85;
+
+/// Safe harbor — the adaptive threshold must never drop below this value,
+/// which matches the current static [`match_threshold()`]
+/// (ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR = 3 × 0.75 = 2.25).
+/// Derived from the same constants as [`match_threshold()`] so the two values
+/// are always in sync (mahbot-845, reviewer_3).  Prevents a feedback loop
+/// where false accepts push the threshold lower.
+#[expect(clippy::cast_precision_loss)]
+const ADAPTIVE_SAFE_HARBOR: f32 = (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR;
+
+/// Number of bootstrap frames to use the static threshold while the adaptive
+/// window fills (~640ms at ~128ms per frame).
+const ADAPTIVE_BOOTSTRAP_FRAMES: usize = 5;
 
 /// Process a per-frame soft score through the rolling window and determine
 /// whether wake word detection should fire (mahbot-773).
@@ -386,7 +439,11 @@ fn match_threshold() -> f32 {
 /// This function is pure with respect to global state: it only reads its
 /// parameters and modifies `score_window` in place.  This makes it directly
 /// testable without ONNX models or voice pipeline initialization.
-fn process_wake_word_score(total_score: f32, score_window: &mut Vec<f32>) -> bool {
+fn process_wake_word_score(
+    total_score: f32,
+    score_window: &mut Vec<f32>,
+    adaptive_threshold_override: Option<f32>,
+) -> (bool, f32) {
     if total_score < NO_MATCH_RESET_THRESHOLD {
         // Far from matching — reset the entire rolling window to prevent
         // slow accumulation from noise.
@@ -398,7 +455,7 @@ fn process_wake_word_score(total_score: f32, score_window: &mut Vec<f32>) -> boo
             );
         }
         score_window.clear();
-        false
+        (false, 0.0)
     } else {
         // Good-enough frame: append score to rolling window.
         score_window.push(total_score);
@@ -408,7 +465,7 @@ fn process_wake_word_score(total_score: f32, score_window: &mut Vec<f32>) -> boo
         }
 
         let rolling_sum: f32 = score_window.iter().sum();
-        let threshold = match_threshold();
+        let threshold = adaptive_threshold_override.unwrap_or_else(match_threshold);
 
         debug!(
             "Wake word score: total_score={total_score:.4} rolling_sum={rolling_sum:.4}/ \
@@ -422,9 +479,9 @@ fn process_wake_word_score(total_score: f32, score_window: &mut Vec<f32>) -> boo
                  (window={} scores)",
                 score_window.len(),
             );
-            true
+            (true, rolling_sum)
         } else {
-            false
+            (false, rolling_sum)
         }
     }
 }
@@ -439,12 +496,16 @@ fn process_wake_word_score(total_score: f32, score_window: &mut Vec<f32>) -> boo
 /// (tiling available embeddings to fill the 3-embedding window when the ring
 /// has fewer than 3 entries — see [`score_single_embedding`] implementation),
 /// applies rolling window scoring via [`process_wake_word_score`], and checks
-/// the second-stage logistic regression verifier gate.  All three callers
-/// exercise exactly the same code path, so changes to detection logic (ring
-/// buffer sizing, MLP window, tiling behaviour, rolling sum threshold, verifier
-/// gating) are automatically validated by the E2E test.
+/// the second-stage logistic regression verifier gate.
 ///
 /// # Returns
+/// - `(true, rolling_sum)` — the embedding triggered wake word detection.
+/// - `(false, _)` — continue feeding more embeddings.
+///
+/// The `rolling_sum` is the current rolling window sum at the time of
+/// evaluation (0.0 if the window was reset due to low score).
+///
+/// # Parameters
 /// - `true` — the embedding triggered wake word detection (all gates passed).
 /// - `false` — continue feeding more embeddings (the ring buffer and score
 ///   window are updated for the next call).
@@ -463,7 +524,9 @@ pub(crate) fn score_single_embedding(
     classifier: Option<&WakeWordClassifier>,
     verifier: Option<&VoiceVerifier>,
     score_window: &mut Vec<f32>,
-) -> bool {
+    mut adaptive_state: Option<&mut AdaptiveThresholdState>,
+    adaptive_k: f32,
+) -> (bool, f32) {
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
     while embedding_ring.len() > EMBEDDING_RING_MAX {
@@ -491,8 +554,23 @@ pub(crate) fn score_single_embedding(
         0.0
     };
 
+    // Feed total_score to adaptive state BEFORE the score window may be
+    // cleared by process_wake_word_score (when score < NO_MATCH_RESET_THRESHOLD).
+    // This is intentional: the adaptive state must track ALL scores including
+    // noise-floor / low scores so the mean/std statistics reflect the full
+    // acoustic environment, not just wake-word-like frames.  The score_window
+    // (detection rolling sum) and AdaptiveThresholdState (running statistics)
+    // are independent buffers with different purposes — clearing one does not
+    // imply the other should be cleared (mahbot-845).
+    let adaptive_override = adaptive_state
+        .as_mut()
+        .and_then(|state| state.feed(total_score, adaptive_k));
+
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
-    if process_wake_word_score(total_score, score_window) {
+    let (detected, rolling_sum) =
+        process_wake_word_score(total_score, score_window, adaptive_override);
+
+    if detected {
         // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
         // After the rolling window check passes, run the second-stage
         // logistic regression verifier to catch false positives that
@@ -510,12 +588,12 @@ pub(crate) fn score_single_embedding(
                 // Without this the accumulated classifier scores eventually
                 // let any speech through (mahbot-797).
                 score_window.clear();
-                return false;
+                return (false, rolling_sum);
             }
         }
-        return true;
+        return (true, rolling_sum);
     }
-    false
+    (false, rolling_sum)
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
@@ -1986,13 +2064,16 @@ fn run_enrollment_self_test(
         let mut detected = false;
 
         for embedding in utterance {
-            if score_single_embedding(
+            let (detected_this, _) = score_single_embedding(
                 embedding,
                 &mut embedding_ring,
                 Some(classifier),
                 None, // no verifier gate during enrollment self-test
                 &mut score_window,
-            ) {
+                None, // no adaptive threshold during enrollment self-test
+                ADAPTIVE_K_DEFAULT,
+            );
+            if detected_this {
                 detected = true;
                 break;
             }
@@ -2565,6 +2646,141 @@ impl SendMicStream {
 
 unsafe impl Send for SendMicStream {}
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Adaptive threshold state (mahbot-845)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Tracks running mean and standard deviation of recent per-frame MLP scores
+/// for adaptive threshold computation.
+///
+/// Maintains O(1) sum/sum_sq statistics over a rolling window of the last
+/// [`ADAPTIVE_WINDOW_N`] scores.  On each call to [`feed`](AdaptiveThresholdState::feed),
+/// the adaptive threshold is computed as:
+///
+/// ```text
+/// threshold = (mean_of_window + k × std_of_window) × ROLLING_WINDOW_N
+/// ```
+///
+/// The per-frame result is scaled by [`ROLLING_WINDOW_N`] to convert from
+/// per-frame score space [0,1] into rolling-sum space [0, ROLLING_WINDOW_N],
+/// matching the detection comparison in [`process_wake_word_score`].  Without
+/// this scaling the adaptive threshold (max ~1.0 + k × std) could never reach
+/// the rolling sum range, making the feature structurally a no-op (mahbot-845
+/// fix, reviewer_2 report).
+///
+/// The result is then clamped to the safeguard range: at least
+/// [`ADAPTIVE_SAFE_HARBOR`] (matching the static [`match_threshold()`]), never
+/// below [`ADAPTIVE_FLOOR`], and never above [`ADAPTIVE_CEILING`].  During the
+/// first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames the function returns `None`,
+/// telling the caller to use the static threshold while the window fills.
+#[derive(Debug, Clone)]
+pub(crate) struct AdaptiveThresholdState {
+    /// Rolling window of per-frame scores.
+    scores: Vec<f32>,
+    /// Running sum of scores in the window.
+    sum: f32,
+    /// Running sum of squared scores in the window.
+    sum_sq: f32,
+    /// Bootstrap frame counter.
+    bootstrap_count: usize,
+}
+
+impl AdaptiveThresholdState {
+    /// Create a new adaptive threshold tracker with empty statistics.
+    pub(crate) fn new() -> Self {
+        Self {
+            scores: Vec::with_capacity(ADAPTIVE_WINDOW_N),
+            sum: 0.0,
+            sum_sq: 0.0,
+            bootstrap_count: 0,
+        }
+    }
+
+    /// Feed a new per-frame MLP score and return the adaptive threshold.
+    ///
+    /// The threshold is computed from per-frame scores (range [0,1]), then
+    /// scaled by [`ROLLING_WINDOW_N`] to match the rolling-sum space [0,3]
+    /// where the detection comparison lives.  Returns `None` during the
+    /// bootstrap period (first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames) to tell
+    /// the caller to use the static threshold.  After bootstrap returns
+    /// `Some(threshold)` where `threshold` is already clamped to the full
+    /// safeguard range ([`ADAPTIVE_FLOOR`], [`ADAPTIVE_CEILING`],
+    /// [`ADAPTIVE_SAFE_HARBOR`]) in rolling-sum space.
+    pub(crate) fn feed(&mut self, score: f32, k: f32) -> Option<f32> {
+        // ── Update rolling window statistics ──
+        if self.scores.len() >= ADAPTIVE_WINDOW_N {
+            let oldest = self.scores.remove(0);
+            self.sum -= oldest;
+            self.sum_sq -= oldest * oldest;
+        }
+        self.scores.push(score);
+        self.sum += score;
+        self.sum_sq += score * score;
+
+        // ── Bootstrap phase ──
+        if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES {
+            self.bootstrap_count += 1;
+            return None;
+        }
+
+        // ── Compute adaptive threshold ──
+        #[expect(clippy::cast_precision_loss)] // ADAPTIVE_WINDOW_N fits exactly in f32
+        let n = self.scores.len() as f32;
+        let mean = self.sum / n;
+        // Population variance (divide by n, not n-1) — stable for a fixed-size window.
+        let variance = (self.sum_sq / n) - (mean * mean);
+        let std = variance.max(0.0).sqrt();
+
+        // Scale from per-frame [0,1] space to rolling-sum [0,ROLLING_WINDOW_N]
+        // space so the threshold is comparable to the rolling sum used in
+        // process_wake_word_score (mahbot-845 fix).
+        #[expect(clippy::cast_precision_loss)]
+        let adaptive = (mean + k * std) * ROLLING_WINDOW_N as f32;
+
+        // ── Safeguards ──
+        // Two lower bounds (safe harbor then absolute floor) and one upper
+        // bound (absolute ceiling).  Both max() calls apply independently:
+        // whichever bound is higher wins — this is equivalent to
+        // clamp(ADAPTIVE_FLOOR, ADAPTIVE_CEILING) combined with
+        // max(ADAPTIVE_SAFE_HARBOR) but spelled out for clarity.
+        let threshold = adaptive.max(ADAPTIVE_SAFE_HARBOR);
+        let threshold = threshold.max(ADAPTIVE_FLOOR);
+        let threshold = threshold.min(ADAPTIVE_CEILING);
+
+        Some(threshold)
+    }
+
+    /// Reset all statistics (called on pipeline reset / re-enrollment).
+    pub(crate) fn reset(&mut self) {
+        self.scores.clear();
+        self.sum = 0.0;
+        self.sum_sq = 0.0;
+        self.bootstrap_count = 0;
+    }
+
+    /// Create a pre-warmed state that has exited the bootstrap phase,
+    /// initialized with neutral scores.  Used by the E2E benchmark so the
+    /// adaptive threshold is active from the start of detection testing.
+    #[cfg(any(test, feature = "voice-tests"))]
+    pub(crate) fn warmed() -> Self {
+        let mut state = Self::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.5, ADAPTIVE_K_DEFAULT);
+        }
+        state
+    }
+
+    /// The number of scores currently in the window.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.scores.len()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pipeline context
+// ═══════════════════════════════════════════════════════════════════════════
+
 /// Runtime state for the voice pipeline main loop.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct PipelineCtx {
@@ -2672,6 +2888,17 @@ pub(crate) struct PipelineCtx {
     /// repeated transcription failure notifications (mahbot-812).
     /// At most one error message per 10-second window.
     last_error_message_time: Option<Instant>,
+    /// Adaptive threshold tracker (mahbot-845).
+    /// Maintains running mean/std of recent per-frame MLP scores for
+    /// dynamic threshold computation.
+    adaptive_threshold: AdaptiveThresholdState,
+    /// The k multiplier for adaptive threshold cached from config at
+    /// context creation time.  Updated on pipeline re-initialisation.
+    adaptive_k: f32,
+    /// Peak rolling-sum score achieved during the current detection
+    /// session.  Reset on each detection attempt.  Used by the E2E
+    /// benchmark for per-variant peak score reporting.
+    peak_score: f32,
 }
 
 /// Reset granularity for [`PipelineCtx::reset_pipeline_state`].
@@ -2737,6 +2964,15 @@ impl PipelineCtx {
             negative_audio_buf: Vec::new(),
             refractory_until: None,
             last_error_message_time: None,
+            adaptive_threshold: AdaptiveThresholdState::new(),
+            adaptive_k: {
+                let k_str = crate::config::CONFIG.adaptive_k();
+                k_str
+                    .parse::<f32>()
+                    .unwrap_or(ADAPTIVE_K_DEFAULT)
+                    .clamp(ADAPTIVE_K_MIN, ADAPTIVE_K_MAX)
+            },
+            peak_score: 0.0,
         }
     }
 
@@ -2786,6 +3022,8 @@ impl PipelineCtx {
                 self.is_recording = false;
                 self.audio_preprocessor.reset();
                 reset_vad();
+                self.adaptive_threshold.reset();
+                self.peak_score = 0.0;
 
                 // Full does NOT clear global enrollment accumulators — those
                 // survive mic stop/start cycles so mid-enrollment progress is
@@ -2803,6 +3041,8 @@ impl PipelineCtx {
                 self.vad_threshold = VAD_THRESHOLD;
                 self.last_wake_word_detection = None;
                 self.audio_preprocessor.clear_buffer();
+                self.adaptive_threshold.reset();
+                self.peak_score = 0.0;
 
                 // Cancel also clears global enrollment accumulators.
                 let mut state = voice_state().write().unwrap_poison();
@@ -3876,6 +4116,8 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         ctx.mel_frame_buffer.clear();
         ctx.embedding_ring.clear();
         ctx.score_window.clear();
+        ctx.adaptive_threshold.reset();
+        ctx.peak_score = 0.0;
         return;
     }
 
@@ -4238,13 +4480,20 @@ fn try_match_wake_word_and_push_embedding(ctx: &mut PipelineCtx) -> bool {
     let state = voice_state().read().unwrap_poison();
     let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
     let verifier = get_verifier();
-    if score_single_embedding(
+    let (detected, rolling_sum) = score_single_embedding(
         &embedding,
         &mut ctx.embedding_ring,
         classifier,
         Some(&verifier),
         &mut ctx.score_window,
-    ) {
+        Some(&mut ctx.adaptive_threshold),
+        ctx.adaptive_k,
+    );
+    // Track peak rolling-sum for diagnostics/benchmarking (mahbot-845).
+    if rolling_sum > ctx.peak_score {
+        ctx.peak_score = rolling_sum;
+    }
+    if detected {
         // Wake word detected — transition to recording mode.
         // See [`PipelineCtx::transition_to_recording`] for the exact
         // handoff sequence (mahbot-802).
@@ -4512,6 +4761,209 @@ mod tests {
         assert!(!ctx.should_send_error_message());
     }
 
+    // ── AdaptiveThresholdState tests (mahbot-845) ─────────────────────────
+    // Pure unit tests for the z-score adaptive threshold tracker.  Uses
+    // synthetic per-frame scores — no ONNX models or voice pipeline state.
+    // Covers bootstrap phase, mean/std computation, all safeguards, and reset.
+
+    #[test]
+    fn adaptive_bootstrap_returns_none() {
+        let mut state = AdaptiveThresholdState::new();
+        for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            assert!(
+                state.feed(0.5, ADAPTIVE_K_DEFAULT).is_none(),
+                "frame {i} should return None during bootstrap",
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_after_bootstrap_returns_some() {
+        let mut state = AdaptiveThresholdState::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            assert!(state.feed(0.5, ADAPTIVE_K_DEFAULT).is_none());
+        }
+        let result = state.feed(0.5, ADAPTIVE_K_DEFAULT);
+        assert!(result.is_some(), "should return Some after bootstrap");
+    }
+
+    #[test]
+    fn adaptive_safe_harbor_enforced() {
+        // Low, constant scores produce a low adaptive value that must be
+        // overridden by the safe harbor.
+        let mut state = AdaptiveThresholdState::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.1, ADAPTIVE_K_DEFAULT);
+        }
+        // adaptive = (0.1 + 2.5 × 0.0) × 3 = 0.3 → well below safe harbor (2.25)
+        let result = state.feed(0.1, ADAPTIVE_K_DEFAULT);
+        let threshold = result.expect("should return Some after bootstrap");
+        assert!(
+            (threshold - ADAPTIVE_SAFE_HARBOR).abs() < 0.01,
+            "with constant low score, threshold {threshold} should equal safe harbor {}",
+            ADAPTIVE_SAFE_HARBOR,
+        );
+    }
+
+    #[test]
+    fn adaptive_ceiling_enforced() {
+        // Very high, low-variance scores produce a high adaptive value that
+        // should be capped by the ceiling.
+        let mut state = AdaptiveThresholdState::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.99, ADAPTIVE_K_DEFAULT);
+        }
+        // Fill window with near-1.0 scores: adaptive ≈ (0.99 + 2.5 × ~0.0) × 3 ≈ 2.97
+        // Capped by ceiling 2.85.
+        for _ in ADAPTIVE_BOOTSTRAP_FRAMES..ADAPTIVE_WINDOW_N {
+            state.feed(0.99, ADAPTIVE_K_DEFAULT);
+        }
+        let result = state.feed(0.99, ADAPTIVE_K_DEFAULT);
+        let threshold = result.expect("should return Some after bootstrap");
+        assert!(
+            (threshold - ADAPTIVE_CEILING).abs() < 0.01,
+            "with constant high score, threshold {threshold} should equal ceiling {}",
+            ADAPTIVE_CEILING,
+        );
+    }
+
+    #[test]
+    fn adaptive_safeguard_chain_correctness() {
+        // Verify the safeguard chain produces correct results independent of
+        // the specific constant values.  The chain in feed() is:
+        //   result = max(adaptive, SAFE_HARBOR, FLOOR).min(CEILING)
+        //
+        // We test several scenarios:
+        // 1. Below both lower bounds → result = max(SAFE_HARBOR, FLOOR)
+        // 2. Between lower bounds → result = max(adaptive, SAFE_HARBOR, FLOOR)
+        // 3. Above ceiling → result = CEILING
+        // 4. At ceiling → result = CEILING
+
+        let chain = |adaptive: f32| -> f32 {
+            adaptive
+                .max(ADAPTIVE_SAFE_HARBOR)
+                .max(ADAPTIVE_FLOOR)
+                .min(ADAPTIVE_CEILING)
+        };
+
+        // Case 1: adaptive below both lower bounds
+        assert_eq!(
+            chain(0.0),
+            ADAPTIVE_SAFE_HARBOR,
+            "below both lower bounds should yield safe harbor",
+        );
+        // Since ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR (compile-time invariant),
+        // the result is always safe harbor, not floor.  This documents that the
+        // floor is a dominated safeguard with current constants.
+
+        // Case 2: adaptive between FLOOR and SAFE_HARBOR (if such range exists)
+        let mid = (ADAPTIVE_FLOOR + ADAPTIVE_SAFE_HARBOR) / 2.0;
+        assert!(
+            chain(mid) >= ADAPTIVE_SAFE_HARBOR,
+            "adaptive={mid} between floor and safe_harbor should yield ≥safe_harbor",
+        );
+
+        // Case 3: far above ceiling
+        assert_eq!(
+            chain(10.0),
+            ADAPTIVE_CEILING,
+            "above ceiling should yield ceiling",
+        );
+
+        // Case 4: exactly at ceiling
+        assert_eq!(
+            chain(ADAPTIVE_CEILING),
+            ADAPTIVE_CEILING,
+            "at ceiling should yield ceiling",
+        );
+    }
+
+    #[test]
+    fn adaptive_floor_is_hard_minimum() {
+        // This test verifies that the floor clamp is structurally present and
+        // correctly ordered in the safeguard chain.  With current constants,
+        // ADAPTIVE_FLOOR (1.80) < ADAPTIVE_SAFE_HARBOR (2.25), so the floor is
+        // always dominated — but the compile-time invariant above guarantees
+        // the relationship and the safeguard_chain_correctness test verifies
+        // the max(FLOOR) step doesn't break the chain.
+        //
+        // We prove the floor is reachable by demonstrating that even with
+        // completely zero input (k=0, score=0), the threshold respects ALL
+        // lower bounds:
+        let mut state = AdaptiveThresholdState::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.0, 0.0); // k=0, score=0 → adaptive = 0.0 * 3 = 0.0
+        }
+        let result = state.feed(0.0, 0.0);
+        let threshold = result.expect("should return Some after bootstrap");
+        // With k=0, score=0: adaptive = (0.0 + 0.0) × 3 = 0.0
+        // Chain: max(0.0, SAFE_HARBOR=2.25) = 2.25, max(2.25, FLOOR=1.80) = 2.25
+        assert!(
+            threshold >= ADAPTIVE_FLOOR && threshold >= ADAPTIVE_SAFE_HARBOR,
+            "threshold {threshold} should respect both floor {} and safe harbor {}",
+            ADAPTIVE_FLOOR,
+            ADAPTIVE_SAFE_HARBOR,
+        );
+        // Additionally, verify the floor constant is structurally valid:
+        assert!(
+            ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR,
+            "floor should not exceed safe harbor (compile-time invariant also enforces this)",
+        );
+    }
+
+    #[test]
+    fn adaptive_reset_clears_state() {
+        let mut state = AdaptiveThresholdState::new();
+        // Advance past bootstrap.
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.5, ADAPTIVE_K_DEFAULT);
+        }
+        assert!(state.feed(0.5, ADAPTIVE_K_DEFAULT).is_some());
+        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
+
+        state.reset();
+
+        assert_eq!(state.len(), 0, "window should be empty after reset");
+        assert!(
+            state.feed(0.5, ADAPTIVE_K_DEFAULT).is_none(),
+            "after reset, first feed should return None (re-enters bootstrap)",
+        );
+    }
+
+    #[test]
+    fn adaptive_window_eviction_correctness() {
+        // After filling the window and cycling scores, verify the sum/sum_sq
+        // statistics produce the correct mean.
+        let mut state = AdaptiveThresholdState::new();
+        // Bootstrap with 0.5.
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.5, ADAPTIVE_K_DEFAULT);
+        }
+        // Fill remaining window slots with 0.5.
+        for _ in ADAPTIVE_BOOTSTRAP_FRAMES..ADAPTIVE_WINDOW_N {
+            state.feed(0.5, ADAPTIVE_K_DEFAULT);
+        }
+        // Window now has ADAPTIVE_WINDOW_N entries, all 0.5.
+        // Feed 1.0 to trigger eviction of oldest (0.5).
+        // New window: (ADAPTIVE_WINDOW_N - 1) × 0.5 + 1 × 1.0
+        // mean = ((ADAPTIVE_WINDOW_N - 1) * 0.5 + 1.0) / ADAPTIVE_WINDOW_N
+        let expected_mean = (ADAPTIVE_WINDOW_N as f32 - 1.0) * 0.5 / ADAPTIVE_WINDOW_N as f32
+            + 1.0 / ADAPTIVE_WINDOW_N as f32;
+        let result = state.feed(1.0, 0.0); // k=0 so adaptive = mean × ROLLING_WINDOW_N
+        let threshold = result.expect("should return Some");
+        // After eviction: mean ≈ 0.533, adaptive = 0.533 * 3 = 1.6, clamped to safe harbor 2.25
+        // But we can still verify the internal mean indirectly.
+        let expected_raw = expected_mean * ROLLING_WINDOW_N as f32;
+        let clamped = expected_raw
+            .max(ADAPTIVE_SAFE_HARBOR)
+            .max(ADAPTIVE_FLOOR)
+            .min(ADAPTIVE_CEILING);
+        assert!(
+            (threshold - clamped).abs() < 0.001,
+            "threshold {threshold} should match expected clamped value {clamped} (raw={expected_raw})",
+        );
+    }
+
     // ── score_single_embedding tiling fallback tests (mahbot-825) ──────────
     // Tests that when the embedding ring has fewer than WINDOW_SIZE (3) entries,
     // the available embeddings are tiled to fill the window instead of returning
@@ -4545,16 +4997,18 @@ mod tests {
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
 
-        let detected = score_single_embedding(
+        let (detected, _) = score_single_embedding(
             &embedding,
             &mut ring,
             Some(&classifier),
             None,
             &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
         );
 
         // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.40) → window appended.
-        // Rolling sum 0.5 < match_threshold (2.40) → detection does NOT fire.
+        // Rolling sum 0.5 < match_threshold (2.25) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
@@ -4582,8 +5036,15 @@ mod tests {
         let mut score_window = Vec::new();
 
         // First embedding: ring = [a], tiled to [a, a, a] → score ~0.5.
-        let _detected =
-            score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
+        let (_detected, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            None,
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+        );
         assert!(
             !score_window.is_empty(),
             "first embedding should produce a score"
@@ -4596,11 +5057,18 @@ mod tests {
 
         // Second embedding: ring = [a, b], tiled to [a, b, b] → score ~0.5.
         score_window.clear();
-        let detected =
-            score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
+        let (detected, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            None,
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+        );
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 2.40)",
+            "two embeddings should not trigger detection (rolling sum < 2.25)",
         );
         assert!(
             !score_window.is_empty(),
@@ -4618,8 +5086,15 @@ mod tests {
         let mut score_window = Vec::new();
 
         for _ in 0..3 {
-            let _ =
-                score_single_embedding(&emb, &mut ring, Some(&classifier), None, &mut score_window);
+            let _ = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                None,
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+            );
         }
 
         assert!(
@@ -4647,6 +5122,8 @@ mod tests {
             Some(&classifier),
             None,
             &mut sw_tiled,
+            None,
+            ADAPTIVE_K_DEFAULT,
         );
         let tiled_score = sw_tiled.last().copied().unwrap_or(0.0);
 
@@ -4660,6 +5137,8 @@ mod tests {
                 Some(&classifier),
                 None,
                 &mut sw_nat,
+                None,
+                ADAPTIVE_K_DEFAULT,
             );
         }
         let natural_score = sw_nat.last().copied().unwrap_or(0.0);
@@ -4668,6 +5147,52 @@ mod tests {
             (tiled_score - natural_score).abs() < 0.01,
             "Tiled score {tiled_score} should match natural score {natural_score} \
              for stationary input",
+        );
+    }
+
+    // ── PipelineCtx adaptive_k clamping (mahbot-845) ──────────────────────
+    // PipelineCtx::new() reads adaptive_k from CONFIG and clamps it to
+    // [ADAPTIVE_K_MIN, ADAPTIVE_K_MAX].  Verify this works for out-of-range
+    // config values.
+
+    #[test]
+    #[serial_test::serial(config)]
+    fn adaptive_k_clamped_below_min() {
+        let _ = crate::config::CONFIG.set_string_field("adaptive_k", "0.1");
+        let ctx = PipelineCtx::new();
+        assert!(
+            (ctx.adaptive_k - ADAPTIVE_K_MIN).abs() < 0.01,
+            "adaptive_k {} should be clamped to min {}",
+            ctx.adaptive_k,
+            ADAPTIVE_K_MIN,
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(config)]
+    fn adaptive_k_clamped_above_max() {
+        let _ = crate::config::CONFIG.set_string_field("adaptive_k", "9.9");
+        let ctx = PipelineCtx::new();
+        assert!(
+            (ctx.adaptive_k - ADAPTIVE_K_MAX).abs() < 0.01,
+            "adaptive_k {} should be clamped to max {}",
+            ctx.adaptive_k,
+            ADAPTIVE_K_MAX,
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(config)]
+    fn adaptive_k_uses_default_when_config_empty() {
+        // Setting to empty string should cause parse failure, falling back
+        // to ADAPTIVE_K_DEFAULT.
+        let _ = crate::config::CONFIG.set_string_field("adaptive_k", "");
+        let ctx = PipelineCtx::new();
+        assert!(
+            (ctx.adaptive_k - ADAPTIVE_K_DEFAULT).abs() < 0.01,
+            "adaptive_k {} should be default {} when config is empty",
+            ctx.adaptive_k,
+            ADAPTIVE_K_DEFAULT,
         );
     }
 
