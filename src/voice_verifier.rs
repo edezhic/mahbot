@@ -21,7 +21,7 @@
 
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Default decision threshold for the verifier (standard logistic regression
 /// decision boundary).
@@ -37,19 +37,22 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.4;
 
 /// L2 regularization strength (lambda).
 ///
-/// Chosen for stability with the default learning rate (0.01):
-/// `lr * λ = 0.01`, giving a weight decay factor of 0.99 per gradient step.
-/// The steady-state weights satisfy `w_j = -g_j / λ` where `g_j` is the data
-/// gradient, so λ = 1.0 provides moderate regularization that prevents
-/// overfitting on the small (~10) enrollment samples without dominating the
-/// data signal.
-const L2_LAMBDA: f32 = 1.0;
+/// Reduced from 1.0 to 0.01 (mahbot-854) because the previous strong
+/// regularization combined with extreme class imbalance (17:1 negatives-to-
+/// positives) caused the model to learn constant near-zero outputs.  With
+/// class-weighted loss now compensating for imbalance, weaker regularization
+/// allows the model to develop discriminative weights.
+pub(crate) const L2_LAMBDA: f32 = 0.01;
 
 /// Learning rate for gradient descent.
-const LEARNING_RATE: f32 = 0.01;
+pub(crate) const LEARNING_RATE: f32 = 0.01;
 
 /// Maximum iterations for gradient descent.
-const MAX_ITER: usize = 2000;
+///
+/// Increased from 2,000 to 5,000 (mahbot-854) because class-weighted loss
+/// requires more iterations to converge — the positive gradient signal is
+/// amplified, making the loss landscape more complex.
+pub(crate) const MAX_ITER: usize = 5000;
 
 /// Embedding dimensionality (used by both verifier and voice pipeline).
 pub(crate) const EMBEDDING_DIM: usize = 96;
@@ -276,7 +279,22 @@ impl VoiceVerifier {
             })
             .collect();
 
-        // 3. Train logistic regression on scaled features
+        // 3. Compute class weight to compensate for imbalance: amplify
+        // positive-sample gradients so the model is penalised equally for
+        // misclassifying positives and negatives.
+        let class_weight = {
+            #[allow(clippy::cast_precision_loss)]
+            let n_pos_f = n_pos as f32;
+            #[allow(clippy::cast_precision_loss)]
+            let n_neg_f = n_neg as f32;
+            if n_pos_f > 0.0 {
+                n_neg_f / n_pos_f
+            } else {
+                1.0
+            }
+        };
+
+        // 4. Train logistic regression on scaled features
         let (weights, bias) = train_logistic_regression(
             &scaled_features,
             &labels,
@@ -284,16 +302,50 @@ impl VoiceVerifier {
             l2_lambda,
             learning_rate,
             max_iter,
+            class_weight,
         );
 
-        Self {
+        // 5. Build trained verifier
+        let verifier = Self {
             weights,
             bias,
             scaler_mean,
             scaler_std,
             threshold,
             trained: true,
+        };
+
+        // 6. Training diagnostics: compute scores on training examples so we
+        // can verify the model actually discriminates (mahbot-854).
+        {
+            let mut pos_scores = Vec::with_capacity(n_pos);
+            let mut neg_scores = Vec::with_capacity(n_neg);
+            for emb in positive_embeddings {
+                pos_scores.push(verifier.predict(emb));
+            }
+            for emb in negative_embeddings {
+                neg_scores.push(verifier.predict(emb));
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            let pos_mean = pos_scores.iter().sum::<f32>() / n_pos as f32;
+            #[allow(clippy::cast_precision_loss)]
+            let neg_mean = neg_scores.iter().sum::<f32>() / n_neg as f32;
+            let pos_min = pos_scores.iter().copied().fold(f32::INFINITY, f32::min);
+            let pos_max = pos_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let neg_min = neg_scores.iter().copied().fold(f32::INFINITY, f32::min);
+            let neg_max = neg_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+            info!(
+                "Verifier training diagnostics: {n_pos} pos + {n_neg} neg examples, \
+                 class_weight={class_weight:.2}, L2={l2_lambda}, LR={learning_rate}, \
+                 max_iter={max_iter} | \
+                 pos scores: mean={pos_mean:.4} [{pos_min:.4}, {pos_max:.4}] | \
+                 neg scores: mean={neg_mean:.4} [{neg_min:.4}, {neg_max:.4}]",
+            );
         }
+
+        verifier
     }
 
     /// Convenience: train a verifier using the given positive embeddings and
@@ -378,16 +430,22 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 /// Train a logistic regression model using batch gradient descent with L2
 /// regularisation.
 ///
-/// The cross-entropy loss with L2 penalty is:
+/// The cross-entropy loss with L2 penalty and class weighting is:
 /// ```text
-/// J(w) = -(1/N) Σ [y·log(σ) + (1-y)·log(1-σ)] + (λ/2)·||w||²
+/// J(w) = -(1/N) Σ [w_y · (y·log(σ) + (1-y)·log(1-σ))] + (λ/2)·||w||²
 /// ```
+///
+/// where `w_y = class_weight` for positive samples (y=1) and `1.0` for
+/// negative samples (y=0).  This compensates for class imbalance so the
+/// model is penalised equally for misclassifying positives and negatives.
 ///
 /// Gradient (averaged over the batch):
 /// ```text
-/// ∂J/∂wⱼ = (1/N) Σ (σ_i - y_i)·x_ij + λ·wⱼ
-/// ∂J/∂b  = (1/N) Σ (σ_i - y_i)
+/// ∂J/∂wⱼ = (1/N) Σ weight_i · (σ_i - y_i) · x_ij + λ·wⱼ
+/// ∂J/∂b  = (1/N) Σ weight_i · (σ_i - y_i)
 /// ```
+///
+/// where `weight_i = class_weight` if y_i = 1, else `1.0`.
 ///
 /// Returns `(weights, bias)` where `weights` has length `dim`.
 fn train_logistic_regression(
@@ -397,6 +455,7 @@ fn train_logistic_regression(
     l2_lambda: f32,
     learning_rate: f32,
     max_iter: usize,
+    class_weight: f32, // weight for positive samples (neg/pos ratio)
 ) -> (Vec<f32>, f32) {
     let n = features.len();
     if n == 0 || dim == 0 {
@@ -424,10 +483,16 @@ fn train_logistic_regression(
             let pred = sigmoid(z);
             let error = pred - labels[i]; // (σ - y) for cross-entropy gradient
 
+            // Class-weighted loss: amplify positive-sample gradients by
+            // class_weight so that the total gradient contribution from
+            // positives matches that from negatives despite class imbalance.
+            let sample_weight = if labels[i] > 0.5 { class_weight } else { 1.0 };
+            let weighted_error = error * sample_weight;
+
             for j in 0..dim {
-                dw[j] += error * features[i][j];
+                dw[j] += weighted_error * features[i][j];
             }
-            db += error;
+            db += weighted_error;
         }
 
         // Average over the batch and add L2 regularisation (only for weights,
@@ -759,9 +824,9 @@ mod tests {
             &positives,
             &negatives,
             DEFAULT_VERIFIER_THRESHOLD, // mahbot-853: lowered from 0.6 for streaming inference.
-            1.0,                        // L2 regularization (default)
-            0.01,                       // learning rate (default)
-            2000,                       // max iterations (default)
+            L2_LAMBDA,                  // L2 regularization (mahbot-854: 0.01)
+            LEARNING_RATE,              // learning rate (mahbot-854: 0.01)
+            MAX_ITER,                   // max iterations (mahbot-854: 5000)
         );
 
         assert!(verifier.is_trained(), "Verifier must be trained");

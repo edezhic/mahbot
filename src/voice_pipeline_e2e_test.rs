@@ -44,6 +44,7 @@ use super::*; // voice module items (process_enrollment_sample, etc.)
 use crate::tts;
 use crate::voice_verifier::VoiceVerifier;
 use crate::voice_verifier::generate_synthetic_negatives_from_positives;
+use crate::voice_verifier::{L2_LAMBDA, LEARNING_RATE, MAX_ITER};
 use crate::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
@@ -1582,9 +1583,9 @@ pub(crate) fn run_internal() {
         &all_positive_embeddings,
         &verifier_negatives,
         VoiceVerifier::default_threshold(),
-        1.0,
-        0.01,
-        2000,
+        L2_LAMBDA,     // mahbot-854: 0.01
+        LEARNING_RATE, // mahbot-854: 0.01
+        MAX_ITER,      // mahbot-854: 5000
     );
 
     if verifier.is_trained() {

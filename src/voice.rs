@@ -3847,9 +3847,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         crate::voice_verifier::DEFAULT_VERIFIER_THRESHOLD,
                         // Clean training (ambient audio negatives, no confusable phrases)
                         // ensures wake word variants pass while confusables are blocked.
-                        1.0,  // L2 regularization (lambda)
-                        0.01, // learning rate
-                        2000, // max iterations
+                        crate::voice_verifier::L2_LAMBDA, // mahbot-854: 0.01
+                        crate::voice_verifier::LEARNING_RATE, // mahbot-854: 0.01
+                        crate::voice_verifier::MAX_ITER,  // mahbot-854: 5000
                     );
                     info!(
                         "Verifier trained from {} positive + {n_neg} real \
