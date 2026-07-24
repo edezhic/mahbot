@@ -761,7 +761,9 @@ struct VoicePipelineState {
     enabled: bool,
     status: VoiceStatus,
     /// Trained Conv1D classifier weights (None before enrollment).
-    classifier_weights: Option<ClassifierWeights>,
+    /// In ensemble mode (mahbot-839) this contains all `NUM_ENSEMBLE_MEMBERS`
+    /// weight sets; in legacy mode it contains a single entry.
+    classifier_weights: Option<Vec<ClassifierWeights>>,
     /// Cached classifier for inference (avoids per-frame clone of weights).
     /// Recreated when [`classifier_weights`] changes.
     classifier: Option<WakeWordClassifier>,
@@ -840,7 +842,7 @@ pub fn set_status(status: VoiceStatus) {
 }
 
 #[must_use]
-pub fn get_classifier_weights() -> Option<ClassifierWeights> {
+pub fn get_classifier_weights() -> Option<Vec<ClassifierWeights>> {
     voice_state()
         .read()
         .unwrap_poison()
@@ -848,10 +850,11 @@ pub fn get_classifier_weights() -> Option<ClassifierWeights> {
         .clone()
 }
 
-pub fn set_classifier_weights(weights: ClassifierWeights) {
+pub fn set_classifier_weights(weights: Vec<ClassifierWeights>) {
     let mut state = voice_state().write().unwrap_poison();
+    debug_assert!(!weights.is_empty(), "Classifier weights must not be empty");
     state.classifier_weights = Some(weights.clone());
-    state.classifier = Some(WakeWordClassifier::new(weights));
+    state.classifier = Some(WakeWordClassifier::new_ensemble(weights));
 }
 
 #[must_use]
@@ -2246,13 +2249,72 @@ pub(crate) fn finalize_enrollment(
     // Step 1: Consistency check — gates on utterance quality before training
     validate_enrollment_consistency(enrollment_buffer)?;
 
-    // Step 2: Train the Conv1D classifier
-    let config = wake_word_classifier::TrainingConfig::default();
-    let result =
-        wake_word_classifier::train_classifier(positive_embeddings, negative_embeddings, &config)?;
-    // validate() inside train_classifier checks shapes + NaN/finite
+    // Step 2: Train the ensemble of Conv1D classifiers (mahbot-839).
+    // Train NUM_ENSEMBLE_MEMBERS independent models with different seeds
+    // for deterministic, diverse weight initializations and shuffles.
+    // The models are trained in parallel via std::thread::scope since they
+    // have no shared state and training is CPU-bound.
+    let base_config = wake_word_classifier::TrainingConfig::default();
+    let ensemble_results: Vec<Result<wake_word_classifier::ClassifierTrainingResult>> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..wake_word_classifier::NUM_ENSEMBLE_MEMBERS)
+                .map(|seed| {
+                    let config = wake_word_classifier::TrainingConfig {
+                        rng_seed: Some(seed as u64),
+                        ..base_config.clone()
+                    };
+                    s.spawn(move || {
+                        wake_word_classifier::train_classifier(
+                            positive_embeddings,
+                            negative_embeddings,
+                            &config,
+                        )
+                    })
+                })
+                .collect();
 
-    Ok(result)
+            // Join all threads — they run in parallel.
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+    let mut all_weights = Vec::with_capacity(wake_word_classifier::NUM_ENSEMBLE_MEMBERS);
+    // Track stats from seed-0 model for reporting (informational only)
+    let mut epochs_trained = 0;
+    let mut best_val_loss = f32::INFINITY;
+    let mut pos_scores_mean = 0.0;
+    let mut pos_scores_min = 0.0;
+    let mut pos_scores_max = 0.0;
+    let mut neg_scores_mean = 0.0;
+    let mut neg_scores_min = 0.0;
+    let mut neg_scores_max = 0.0;
+
+    for (i, result) in ensemble_results.into_iter().enumerate() {
+        let r = result?;
+        // Each result already validated its weights internally
+        all_weights.extend(r.weights);
+        if i == 0 {
+            epochs_trained = r.epochs_trained;
+            best_val_loss = r.best_val_loss;
+            pos_scores_mean = r.pos_scores_mean;
+            pos_scores_min = r.pos_scores_min;
+            pos_scores_max = r.pos_scores_max;
+            neg_scores_mean = r.neg_scores_mean;
+            neg_scores_min = r.neg_scores_min;
+            neg_scores_max = r.neg_scores_max;
+        }
+    }
+
+    Ok(wake_word_classifier::ClassifierTrainingResult {
+        weights: all_weights,
+        epochs_trained,
+        best_val_loss,
+        pos_scores_mean,
+        pos_scores_min,
+        pos_scores_max,
+        neg_scores_mean,
+        neg_scores_min,
+        neg_scores_max,
+    })
 }
 
 /// Validate enrollment utterance quality via centroid cosine similarity.
@@ -3004,25 +3066,27 @@ pub async fn run_voice_pipeline() {
     if let Some(json) = CONFIG.wake_word_templates() {
         // NOTE: The config key remains "wake_word_templates" for backward
         // compatibility.  Tries new format first, falls back to old format.
-        // Old format: just ClassifierWeights
-        // New format: { classifier: Option<ClassifierWeights>, verifier: VoiceVerifier }
+        // Old format: just ClassifierWeights (or single-object in PersistedModel)
+        // New format: { classifier: Vec<ClassifierWeights>, verifier: VoiceVerifier }
 
-        // Try new combined model format — uses module-level PersistedModel struct
-
+        // Try combined model format (ensemble or legacy single wrapped in vec)
         let loaded = if let Ok(model) = serde_json::from_str::<PersistedModel>(&json) {
-            if let Some(ref w) = model.classifier {
-                if let Err(e) = w.validate() {
-                    warn!("Stored classifier weights are invalid — re-enrollment required: {e}");
-                    false
-                } else {
-                    set_classifier_weights(w.clone());
-                    if let Some(ref v) = model.verifier {
-                        set_verifier(v.clone());
-                    }
-                    info!("Loaded wake word model (classifier + verifier) from config");
-                    true
+            let all_valid = model
+                .classifier
+                .as_ref()
+                .is_some_and(|members| members.iter().all(|w| w.validate().is_ok()));
+            if all_valid {
+                if let Some(ref members) = model.classifier {
+                    set_classifier_weights(members.clone());
                 }
+                if let Some(ref v) = model.verifier {
+                    set_verifier(v.clone());
+                }
+                let n = model.classifier.as_ref().map_or(0, Vec::len);
+                info!("Loaded wake word model from config ({n} ensemble members + verifier)");
+                true
             } else {
+                warn!("Stored classifier weights are invalid — re-enrollment required");
                 false
             }
         } else {
@@ -3035,7 +3099,7 @@ pub async fn run_voice_pipeline() {
                 if let Err(e) = weights.validate() {
                     warn!("Stored classifier weights are invalid — re-enrollment required: {e}");
                 } else {
-                    set_classifier_weights(weights);
+                    set_classifier_weights(vec![weights]);
                     info!("Loaded wake word classifier weights from config (legacy format)");
                 }
             } else {
@@ -3366,11 +3430,17 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 
                 let weights = match classifier_result {
                     Ok(result) => {
+                        // First model's weights for reporting (all are identical architecture)
+                        let first_params = result
+                            .weights
+                            .first()
+                            .map_or(0, ClassifierWeights::param_count);
                         info!(
-                            "Enrollment complete: wake word '{}' (classifier trained: {} params, \
-                             {} epochs, best val loss={:.4})",
+                            "Enrollment complete: wake word '{}' (ensemble of {} models, \
+                             {} params each, {} epochs, best val loss={:.4})",
                             WAKE_WORD_NAME,
-                            result.weights.param_count(),
+                            result.weights.len(),
+                            first_params,
                             result.epochs_trained,
                             result.best_val_loss,
                         );
@@ -3431,7 +3501,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 };
 
                 // ── Informational self-test (non-gating, diagnostic only) ──
-                let classifier = WakeWordClassifier::new(weights.clone());
+                let classifier = WakeWordClassifier::new_ensemble(weights.clone());
                 match run_enrollment_self_test(&enrollment_buffer, &classifier) {
                     Ok(()) => debug!("Detection self-test (informational): passed"),
                     Err(e) => debug!("Detection self-test (informational, non-gating): {e}"),
@@ -3464,10 +3534,54 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 
 /// Serialisable form of the wake word model (classifier + verifier).
 /// `verifier` is optional for backward compatibility with legacy persistence.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize)]
 struct PersistedModel {
-    classifier: Option<ClassifierWeights>,
+    /// Ensemble of classifier weight sets (NEW format, mahbot-839).
+    /// When loaded, if this is a single-element vec it's treated as a
+    /// single-model classifier for backward compatibility.
+    classifier: Option<Vec<ClassifierWeights>>,
     verifier: Option<VoiceVerifier>,
+}
+
+/// Custom deserialization for `PersistedModel` that supports both:
+/// - New format: `classifier` is an array of weight sets (ensemble).
+/// - Old format: `classifier` is a single weight set object.
+impl<'de> serde::Deserialize<'de> for PersistedModel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct PersistedModelHelper {
+            #[serde(default)]
+            classifier: Option<serde_json::Value>,
+            #[serde(default)]
+            verifier: Option<VoiceVerifier>,
+        }
+
+        let helper = PersistedModelHelper::deserialize(deserializer)?;
+
+        let classifier = match helper.classifier {
+            Some(val) => {
+                // Try as Vec<ClassifierWeights> (new ensemble format)
+                if let Ok(members) = serde_json::from_value::<Vec<ClassifierWeights>>(val.clone()) {
+                    Some(members)
+                }
+                // Try as single ClassifierWeights (old format)
+                else if let Ok(single) = serde_json::from_value::<ClassifierWeights>(val) {
+                    Some(vec![single])
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        Ok(PersistedModel {
+            classifier,
+            verifier: helper.verifier,
+        })
+    }
 }
 
 /// Persist current classifier weights and verifier to the config database.

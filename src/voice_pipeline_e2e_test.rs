@@ -922,7 +922,7 @@ fn test_detection_samples(
 ) {
     // Set classifier + verifier in global state for the streaming pipeline.
     // try_match_wake_word_and_push_embedding reads these from voice_state().
-    super::set_classifier_weights(classifier.weights_ref().clone());
+    super::set_classifier_weights(classifier.weights_ref().to_vec());
     super::set_verifier(verifier.clone());
 
     for (samples, label) in variants {
@@ -1327,10 +1327,15 @@ pub(crate) fn run_internal() {
     let neg_scores_min = training_result.neg_scores_min;
     let neg_scores_max = training_result.neg_scores_max;
 
-    let classifier = WakeWordClassifier::new(weights.clone());
+    let classifier = WakeWordClassifier::new_ensemble(weights.clone());
+    let first_params = weights.first().map_or(
+        0,
+        crate::wake_word_classifier::ClassifierWeights::param_count,
+    );
     info!(
-        "Classifier trained successfully: {} params, {} epochs, best val loss={best_val_loss:.4}",
-        weights.param_count(),
+        "Ensemble of {} models trained successfully: {} params each, {} epochs, best val loss={best_val_loss:.4}",
+        weights.len(),
+        first_params,
         epochs_trained,
     );
     info!(
@@ -1339,32 +1344,37 @@ pub(crate) fn run_internal() {
     );
 
     // ── Degenerate solution detection (mahbot-844) ──
-    // Check if the classifier weights are all near-zero, indicating a
-    // degenerate all-zero solution (as seen in 835 test #5).
+    // Check if ANY ensemble member has all near-zero weights, indicating a
+    // degenerate all-zero solution.  Ensemble averaging mitigates a single
+    // degenerate member, but flag it for diagnostics.
     let (degenerate, near_zero_frac) = {
-        let all_weights = weights.all_weight_slices();
-        let total_params: usize = all_weights.iter().map(|s| s.len()).sum();
-        let near_zero_count = all_weights
-            .iter()
-            .flat_map(|s| s.iter())
-            .filter(|v| v.abs() < 1e-6)
-            .count();
-        // Degenerate if >99% of weights are within ±1e-6 of zero
-        let near_zero_frac = near_zero_count as f64 / total_params as f64;
-        if near_zero_frac > 0.99 {
+        let mut worst_frac = 0.0_f64;
+        for member in &weights {
+            let all_w = member.all_weight_slices();
+            let total_params: usize = all_w.iter().map(|s| s.len()).sum();
+            let near_zero_count = all_w
+                .iter()
+                .flat_map(|s| s.iter())
+                .filter(|v| v.abs() < 1e-6)
+                .count();
+            let frac = near_zero_count as f64 / total_params as f64;
+            worst_frac = worst_frac.max(frac);
+        }
+        // Degenerate if >99% of weights in ANY member are within ±1e-6 of zero
+        if worst_frac > 0.99 {
             warn!(
-                "Classifier produced degenerate all-zero solution — training failed. \
-                 {:.1}% of weights near zero (threshold=1%). \
+                "Ensemble member produced degenerate all-zero solution — training had issues. \
+                 {:.1}% of weights near zero in worst member (threshold=1%). \
                  Skipping all detection phases.",
-                near_zero_frac * 100.0,
+                worst_frac * 100.0,
             );
-            (true, near_zero_frac)
+            (true, worst_frac)
         } else {
             info!(
-                "Classifier degenerate check: {:.1}% weights near zero — OK",
-                near_zero_frac * 100.0
+                "Classifier degenerate check: {:.1}% weights near zero in worst member — OK",
+                worst_frac * 100.0
             );
-            (false, near_zero_frac)
+            (false, worst_frac)
         }
     };
 
@@ -1772,7 +1782,7 @@ pub(crate) fn run_internal() {
             "neg_scores_max": neg_scores_max,
             "epochs_trained": epochs_trained,
             "best_val_loss": best_val_loss,
-            "total_params": weights.param_count(),
+            "total_params": weights.first().map_or(0, crate::wake_word_classifier::ClassifierWeights::param_count),
             "degenerate": degenerate,
         },
         "volume_sweep": serde_json::Value::Object(volume_sweep_map),

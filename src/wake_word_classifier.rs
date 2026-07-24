@@ -28,6 +28,11 @@ use crate::voice_verifier::EMBEDDING_DIM;
 // ── Constants ────────────────────────────────────────────────────────────
 
 pub const WINDOW_SIZE: usize = 3;
+
+/// Number of ensemble members to train for wake word detection (mahbot-839).
+/// Five independent models with different seeds are trained during enrollment
+/// and their post-sigmoid scores are averaged at inference time.
+pub const NUM_ENSEMBLE_MEMBERS: usize = 5;
 pub const INPUT_DIM: usize = WINDOW_SIZE * EMBEDDING_DIM; // 288
 const CONV1_OUT: usize = 64;
 const CONV2_OUT: usize = 64;
@@ -76,10 +81,18 @@ pub struct ClassifierWeights {
 
 impl Default for ClassifierWeights {
     fn default() -> Self {
+        Self::from_rng(&mut rand::rng())
+    }
+}
+
+impl ClassifierWeights {
+    /// Initialize classifier weights using a seeded RNG for deterministic training.
+    /// Used by [`train_classifier`] when a seed is configured, replacing the
+    /// non-deterministic `Default` path.
+    pub fn from_rng(rng: &mut (impl rand::Rng + ?Sized)) -> Self {
         let scale_c1 = (6.0 / (EMBEDDING_DIM + CONV1_OUT) as f32).sqrt();
         let scale_c2 = (6.0 / (CONV1_OUT + CONV2_OUT) as f32).sqrt();
         let scale_fc = (6.0 / (CONV2_OUT + FC_OUT) as f32).sqrt();
-        let mut rng = rand::rng();
         let mut uniform =
             |s: f32, n: usize| -> Vec<f32> { (0..n).map(|_| rng.random_range(-s..s)).collect() };
         Self {
@@ -100,9 +113,7 @@ impl Default for ClassifierWeights {
             bn_eps: 1e-5,
         }
     }
-}
 
-impl ClassifierWeights {
     /// Return references to all weight Vec fields for unified validation/counting.
     /// Adding a new Vec field to `ClassifierWeights` requires adding it here
     /// — a compile error if omitted from the array literal (Rust checks array
@@ -161,7 +172,10 @@ impl ClassifierWeights {
 // ── Classifier ──────────────────────────────────────────────────────────
 
 pub struct WakeWordClassifier {
-    weights: ClassifierWeights,
+    /// Ensemble member weight sets.  In single-model mode this contains one
+    /// entry; in ensemble mode (mahbot-839) it contains `NUM_ENSEMBLE_MEMBERS`
+    /// entries and `forward()` averages their post-sigmoid scores.
+    members: Vec<ClassifierWeights>,
 }
 
 /// Run the full Conv1D→BN→ReLU→Conv1D→BN→ReLU→AvgPool→FC→Sigmoid forward pass.
@@ -216,16 +230,37 @@ fn forward_pass(x: &[f32], w: &ClassifierWeights) -> f32 {
 }
 
 impl WakeWordClassifier {
-    /// Get a reference to the underlying classifier weights.
+    /// Get references to the underlying classifier weight sets.
     #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-    pub fn weights_ref(&self) -> &ClassifierWeights {
-        &self.weights
+    pub fn weights_ref(&self) -> &[ClassifierWeights] {
+        &self.members
     }
 
+    /// Create a single-member classifier (legacy / backward compat path).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(weights: ClassifierWeights) -> Self {
-        Self { weights }
+        Self {
+            members: vec![weights],
+        }
     }
 
+    /// Create a multi-member ensemble classifier.
+    ///
+    /// # Panics
+    /// Panics if `members` is empty — an ensemble must have at least one model.
+    pub fn new_ensemble(members: Vec<ClassifierWeights>) -> Self {
+        assert!(
+            !members.is_empty(),
+            "Ensemble must have at least one member"
+        );
+        Self { members }
+    }
+
+    /// Run the forward pass through all ensemble members and return the mean
+    /// post-sigmoid score.
+    ///
+    /// For a single-model classifier this is equivalent to the original
+    /// single-member forward pass.
     pub fn forward(&self, embeddings: &[Vec<f32>]) -> f32 {
         debug_assert_eq!(embeddings.len(), WINDOW_SIZE);
         // Flatten 3 embeddings into a 288-dim window, then L2-normalize
@@ -244,7 +279,15 @@ impl WakeWordClassifier {
         }
         // Convert from samples-first to channels-first layout for Conv1D.
         let cf = to_channels_first(&x, EMBEDDING_DIM, WINDOW_SIZE);
-        forward_pass(&cf, &self.weights)
+
+        // Average post-sigmoid scores across all ensemble members.
+        // Ensembling per-frame scores (not per-model rolling windows) means
+        // zero changes to `process_wake_word_score` or the verifier.
+        let mut total = 0.0;
+        for w in &self.members {
+            total += forward_pass(&cf, w);
+        }
+        total / self.members.len() as f32
     }
 }
 
@@ -317,8 +360,9 @@ fn sigmoid(x: f32) -> f32 {
 /// Result of training a wake word classifier, returned by [`train_classifier`].
 #[derive(Debug, Clone)]
 pub struct ClassifierTrainingResult {
-    /// The trained classifier weights.
-    pub weights: ClassifierWeights,
+    /// The trained classifier weights.  In ensemble mode (mahbot-839) this
+    /// contains all ensemble members' weight sets.
+    pub weights: Vec<ClassifierWeights>,
     /// Actual number of epochs trained (may be less than
     /// `TrainingConfig::max_epochs` due to early stopping).
     pub epochs_trained: usize,
@@ -478,7 +522,7 @@ pub fn train_classifier(
 
     let cin = EMBEDDING_DIM;
     let lin = WINDOW_SIZE;
-    let mut weights = ClassifierWeights::default();
+    let mut weights = ClassifierWeights::from_rng(&mut *rng);
     let bs = cfg.batch_size.min(n_tr).max(1);
     let mut best_loss = f32::INFINITY;
     let mut patience = 0;
@@ -617,7 +661,7 @@ pub fn train_classifier(
 
     weights.validate()?;
     Ok(ClassifierTrainingResult {
-        weights,
+        weights: vec![weights],
         epochs_trained,
         best_val_loss: best_loss,
         pos_scores_mean,
@@ -1069,9 +1113,7 @@ mod tests {
             ..Default::default()
         };
         let result = train_classifier(&pos, &neg, &cfg).unwrap();
-        let w = result.weights;
-
-        let classifier = WakeWordClassifier::new(w);
+        let classifier = WakeWordClassifier::new_ensemble(result.weights);
         // Evaluate on the windows produced by build_windows — same path
         // that train_classifier uses internally.
         for win in build_windows(&pos) {
