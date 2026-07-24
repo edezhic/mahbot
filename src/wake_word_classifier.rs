@@ -529,7 +529,7 @@ pub fn train_classifier(
                         + weights.fc_weight.iter().map(|x| x * x).sum::<f32>())
         };
 
-        debug!(
+        info!(
             "Epoch {}/{}: loss={:.6} val={:.6}",
             epoch + 1,
             cfg.max_epochs,
@@ -555,9 +555,19 @@ pub fn train_classifier(
     }
 
     // Log average scores on ALL training positives and negatives.
-    let score_windows = |windows: &[Vec<f32>]| -> Vec<f32> {
+    // We re-normalize pos_w/neg_w the same way all_x was normalized above.
+    let l2_normalize = |windows: &[Vec<f32>]| -> Vec<Vec<f32>> {
         windows
             .iter()
+            .map(|w| {
+                let n = w.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+                w.iter().map(|v| v / n).collect()
+            })
+            .collect()
+    };
+    let score_normalized = |windows: &[Vec<f32>]| -> Vec<f32> {
+        let norm = l2_normalize(windows);
+        norm.iter()
             .map(|w| {
                 let x_cf = to_channels_first(w, cin, lin);
                 forward_pass(&x_cf, &weights)
@@ -565,14 +575,16 @@ pub fn train_classifier(
             .collect()
     };
     for (label, windows) in [("pos", &pos_w), ("neg", &neg_w)] {
-        let scores = score_windows(windows);
-        let mean = scores.iter().copied().sum::<f32>() / scores.len() as f32;
-        let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
-        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        info!(
-            "Classifier final {label} scores: mean={mean:.4} min={min:.4} max={max:.4} (n={})",
-            scores.len(),
-        );
+        let scores = score_normalized(windows);
+        if !scores.is_empty() {
+            let mean = scores.iter().copied().sum::<f32>() / scores.len() as f32;
+            let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            info!(
+                "Classifier final {label} scores: mean={mean:.4} min={min:.4} max={max:.4} (n={})",
+                scores.len(),
+            );
+        }
     }
 
     weights.validate()?;
