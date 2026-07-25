@@ -48,7 +48,6 @@ use crate::voice_verifier::{L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER};
 use crate::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
-use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -78,42 +77,10 @@ const CONFUSABLE_HARD: &[&str] = super::CONFUSABLE_HARD;
 const CONFUSABLE_MEDIUM: &[&str] = super::CONFUSABLE_MEDIUM;
 const CONFUSABLE_EASY: &[&str] = super::CONFUSABLE_EASY;
 
-/// Completely unrelated phrases for negative detection testing (mahbot-834).
+/// Unrelated speech phrases for negative detection testing (mahbot-834).
 ///
-/// Expanded from 5 to 20 phrases covering:
-/// - Short commands (2-4 words) similar to typical wake word length
-/// - Medium phrases (5-8 words) with varied phonetic content
-/// - Long utterances (10+ words) to test sustained non-detection
-/// - Questions, statements, and filler speech
-/// - Mixed languages (French, Spanish, German) if TTS phoneme support
-///   varies per language — the detector should reject all non-wake-word
-///   speech regardless of language.
-const UNRELATED_PHRASES: &[&str] = &[
-    // ── Short commands (2-4 words) ──────────────────────────────────
-    "the weather today is sunny",
-    "what time is it",
-    "one two three four five",
-    "hello world",
-    "good morning everyone",
-    "turn on the lights",
-    "play some music",
-    "set a timer",
-    // ── Medium phrases (5-8 words) ───────────────────────────────────
-    "i need to buy groceries today",
-    "can you remind me of my appointment",
-    "please send a message to john",
-    "what is the capital of france",
-    "tell me a joke about programming",
-    "how do I get to the airport",
-    "the quick brown fox jumps over the lazy dog",
-    // ── Long utterances (10+ words) ──────────────────────────────────
-    "according to all known laws of aviation there is no way a bee should be able to fly",
-    "the principle of superposition states that a quantum system exists in all its possible states simultaneously",
-    // ── Non-English phrases (phonetically distinct from English wake word) ──
-    "bonjour comment allez vous aujourd hui",
-    "buenos días cómo estás",
-    "guten morgen wie geht es dir",
-];
+/// Uses the canonical list from the parent `voice` module (mahbot-872).
+const UNRELATED_PHRASES: &[&str] = super::UNRELATED_PHRASES;
 
 /// Silence audio length in samples (1 second at 16 kHz).
 const SILENCE_LEN: usize = 16_000;
@@ -320,36 +287,9 @@ const VOLUME_SWEEP_LEVELS: &[(&str, f32, bool)] = &[
 /// without disk I/O.
 ///
 /// Returns a hex string (always succeeds since the hashes are compile-time).
-fn compute_model_version_hash() -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(tts::DP_MODEL_SHA256.as_bytes());
-    hasher.update(tts::TEXT_ENC_MODEL_SHA256.as_bytes());
-    hasher.update(tts::VECTOR_EST_MODEL_SHA256.as_bytes());
-    hasher.update(tts::VOCODER_MODEL_SHA256.as_bytes());
-    hasher.update(tts::TTS_JSON_SHA256.as_bytes());
-    hasher.update(tts::UNICODE_INDEXER_SHA256.as_bytes());
-    hasher.update(tts::VOICE_STYLE_SHA256.as_bytes());
-    hex_string(&hasher.finalize())
-}
-
-/// Hex-encode a byte slice (no external dependency).
-fn hex_string(bytes: &[u8]) -> String {
-    const HEX_CHARS: &[u8] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX_CHARS[(b >> 4) as usize] as char);
-        s.push(HEX_CHARS[(b & 0xf) as usize] as char);
-    }
-    s
-}
-
-/// Build a cache key from synthesis parameters.
-fn cache_key(text: &str, style: &str, seed: u64, sample_rate: u32, model_hash: &str) -> String {
-    let input = format!("{text}\0{style}\0{seed}\0{sample_rate}\0{model_hash}");
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex_string(&hasher.finalize())
-}
+///
+/// Delegates to [`super::tts_model_version_hash`] which is the canonical
+/// implementation from `voice.rs`.
 
 /// Get the cache directory path.
 fn cache_dir() -> std::path::PathBuf {
@@ -359,64 +299,10 @@ fn cache_dir() -> std::path::PathBuf {
     root.join(TEST_CACHE_DIR)
 }
 
-/// Write PCM samples to the cache atomically.
-fn write_pcm_cache(path: &std::path::Path, samples: &[f32]) {
-    let tmp_path = path.with_extension("tmp");
-    let mut data = Vec::with_capacity(samples.len() * 4);
-    for &s in samples {
-        data.extend_from_slice(&s.to_le_bytes());
-    }
-    if let Err(e) = std::fs::write(&tmp_path, &data) {
-        warn!("Failed to write cache tmp file {}: {e}", tmp_path.display());
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        warn!(
-            "Failed to rename cache {} -> {}: {e}",
-            tmp_path.display(),
-            path.display()
-        );
-    }
-}
-
-/// Read PCM samples from the cache.  Returns `None` if cache miss or corrupt.
-/// When `expected_samples` is non-zero, verifies the file contains exactly that
-/// many f32 samples.  Otherwise falls back to alignment checking.
-fn read_pcm_cache(path: &std::path::Path, expected_samples: usize) -> Option<Vec<f32>> {
-    let data = std::fs::read(path).ok()?;
-    if expected_samples > 0 {
-        let expected_bytes = expected_samples * size_of::<f32>();
-        if data.len() != expected_bytes {
-            warn!(
-                "Cache file {} has wrong size: got {} bytes, expected {} — deleting",
-                path.display(),
-                data.len(),
-                expected_bytes,
-            );
-            let _ = std::fs::remove_file(path);
-            return None;
-        }
-    } else if data.len() % 4 != 0 {
-        // Alignment check for unknown-length caches
-        warn!(
-            "Cache file {} has non-aligned size {} — deleting",
-            path.display(),
-            data.len(),
-        );
-        let _ = std::fs::remove_file(path);
-        return None;
-    }
-    let samples = data
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    Some(samples)
-}
-
 /// Synthesize wake word variant audio with TTS caching support.
 ///
-/// If the audio is cached on disk and `cache_bust` is `false`, loads from
-/// cache instead of calling TTS.  Always writes to cache on synthesis.
+/// If cache_bust is true, deletes any cached audio first to force
+/// re-synthesis. Delegates to the production implementation.
 fn synthesize_wake_word_variant_cached(
     text: &str,
     style: &str,
@@ -426,25 +312,14 @@ fn synthesize_wake_word_variant_cached(
     cache_dir: &std::path::Path,
     cache_bust: bool,
 ) -> Option<Vec<f32>> {
-    let key = cache_key(text, style, seed, sample_rate, model_hash);
-    let cache_path = cache_dir.join(&key);
-
-    if !cache_bust && let Some(pcm) = read_pcm_cache(&cache_path, 0) {
-        return Some(pcm);
+    if cache_bust {
+        // Force re-synthesis by deleting any cached audio
+        let key = super::pcm_cache_key(text, style, seed, sample_rate, model_hash);
+        let cache_path = cache_dir.join(&key);
+        let _ = std::fs::remove_file(&cache_path);
     }
-
-    // Miss or bust — synthesise
-    let pcm = match tts::synthesize(text, style, seed, sample_rate) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("TTS synthesis failed for '{text}' with {style} (seed={seed}): {e}");
-            return None;
-        }
-    };
-
-    // Write atomically
-    write_pcm_cache(&cache_path, &pcm);
-    Some(pcm)
+    // Delegate to the production implementation
+    super::synthesize_with_pcm_cache(text, style, seed, sample_rate, model_hash, cache_dir)
 }
 
 // ── Audio generation helpers (with cache) ─────────────────────────────────
@@ -551,11 +426,28 @@ fn generate_augmented_variants(
     variants
 }
 
+/// Seed configuration for TTS phrase variant generation.
+///
+/// Encapsulates the three related seed parameters that control deterministic
+/// TTS synthesis of phrase variants with different seeds and style rotations.
+/// Bundled into a struct for call-site clarity (mahbot-872 reviewer feedback).
+#[derive(Clone, Copy)]
+struct SeedConfig {
+    /// Base seed for deterministic TTS synthesis of the phrase list.
+    base_seed: u64,
+    /// Number of seed variants — determines style rotation stride and seed
+    /// spacing.  Must match the `num_variants` passed to the batch caller.
+    num_variants: usize,
+    /// Which variant index this call generates (0..num_variants).  Used in
+    /// the style distribution and seed formulas.
+    seed_variant: usize,
+}
+
 /// Generate TTS audio for a list of phrases with caching.
 fn generate_phrase_variants_cached(
     phrases: &[&str],
     available_styles: &[String],
-    base_seed: u64,
+    seed: SeedConfig,
     prefix: &str,
     model_hash: &str,
     cache_dir: &std::path::Path,
@@ -565,18 +457,24 @@ fn generate_phrase_variants_cached(
     let num_styles = available_styles.len().max(1);
 
     for (i, &phrase) in phrases.iter().enumerate() {
-        let style_idx = i % num_styles;
+        // Use the same round-robin style distribution as production
+        // (mahbot-872 per-phrase seed formula): rotate styles across
+        // (phrase × seed_variant) combos.
+        let style_idx = (i * seed.num_variants + seed.seed_variant) % num_styles;
         let style = if available_styles.is_empty() {
             DEFAULT_TTS_STYLE
         } else {
             &available_styles[style_idx]
         };
-        let seed = base_seed + i as u64 + 500;
+        // Production seed formula (mahbot-872):
+        //   seed = base_seed + i * num_variants + seed_variant
+        let seed_val =
+            seed.base_seed + i as u64 * seed.num_variants as u64 + seed.seed_variant as u64;
 
         if let Some(pcm) = synthesize_wake_word_variant_cached(
             phrase,
             style,
-            seed,
+            seed_val,
             TARGET_SAMPLE_RATE,
             model_hash,
             cache_dir,
@@ -587,6 +485,34 @@ fn generate_phrase_variants_cached(
     }
 
     variants
+}
+
+/// Generate all seed variants for a phrase list in a single batch.
+fn generate_phrase_variants_batch(
+    phrases: &[&str],
+    available_styles: &[String],
+    seed: SeedConfig,
+    prefix: &str,
+    model_hash: &str,
+    cache_dir: &std::path::Path,
+    cache_bust: bool,
+) -> Vec<Vec<(Vec<f32>, String)>> {
+    (0..seed.num_variants)
+        .map(|i| {
+            generate_phrase_variants_cached(
+                phrases,
+                available_styles,
+                SeedConfig {
+                    seed_variant: i,
+                    ..seed
+                },
+                prefix,
+                model_hash,
+                cache_dir,
+                cache_bust,
+            )
+        })
+        .collect()
 }
 
 /// Generate white uniform noise in [-1.0, 1.0].
@@ -1508,7 +1434,7 @@ pub(crate) fn run_internal() {
     }
 
     // Compute model version hash for TTS caching (from compile-time constants)
-    let model_version_hash = compute_model_version_hash();
+    let model_version_hash = super::tts_model_version_hash();
     info!("TTS model version hash: {}", &model_version_hash[..16]);
 
     // Initialize TTS module
@@ -1577,72 +1503,98 @@ pub(crate) fn run_internal() {
 
     phase_times[P_VAD_ENROLLMENT] = phase_end_ms!();
 
+    // ── Phase 2b: Individual-variant streaming embeddings for verifier ─────
+    // The verifier's positive training data must match the detection distribution
+    // (single variants processed through AGC), not the VAD-segmented utterance
+    // distribution (concatenated multi-variant utterances).  Extract streaming
+    // embeddings from each individual enrollment variant through AGC +
+    // process_streaming_enrollment_sample, matching how Phase 8 processes each
+    // variant individually (mahbot-872 fix).  Uses a shared earshot VAD detector
+    // (matching the global VAD_DETECTOR in the inference pipeline) so the VAD
+    // state persists across variants and the embedding distribution matches
+    // detection (mahbot-872).
+    phase_start!("Phase 2b: Verifier positive streaming embeddings");
+    let agc_variants = {
+        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+        let agc_chunk_size = super::FRAME_LENGTH;
+        let enroll_all: Vec<(Vec<f32>, String)> = enrollment_variants
+            .iter()
+            .chain(augmented_variants.iter())
+            .cloned()
+            .collect();
+        enroll_all
+            .iter()
+            .map(|(samples, label)| {
+                let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
+                let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
+                for chunk in samples.chunks(agc_chunk_size) {
+                    let padded = if chunk.len() < agc_chunk_size {
+                        let mut p = chunk.to_vec();
+                        p.resize(agc_chunk_size, 0.0);
+                        p
+                    } else {
+                        chunk.to_vec()
+                    };
+                    processed.extend(pre.process(padded));
+                }
+                (processed, label.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    // Use a shared VAD detector across all variants, matching the inference
+    // pipeline's persistent VAD state (global VAD_DETECTOR).  This ensures the
+    // embedding distribution from training matches detection (mahbot-872).
+    let mut shared_vad = earshot::Detector::default();
+    let mut verifier_positive_streaming_embeddings: Vec<Vec<f32>> = Vec::new();
+    for (samples, _label) in &agc_variants {
+        match super::process_streaming_with_shared_vad(samples, &mut shared_vad) {
+            Ok(embs) => verifier_positive_streaming_embeddings.extend(embs),
+            Err(e) => warn!("Verifier positive embedding extraction failed for variant: {e}"),
+        }
+    }
+    info!(
+        "Verifier positive: {} individual-variant streaming embeddings (match detection distribution, shared VAD)",
+        verifier_positive_streaming_embeddings.len(),
+    );
+    phase_times[P_VAD_ENROLLMENT] = phase_end_ms!(); // reuse timer slot (timing is informational)
+
     // ── Phase 3: Generate negative training data ─────────────────────────
     phase_start!("Phase 3: Generating negative training data");
     info!("Generating negative training audio from unrelated + confusable phrases...");
-    let (
-        neg_unrelated_1,
-        neg_unrelated_2,
-        neg_unrelated_3,
+    let unrelated_batch = generate_phrase_variants_batch(
+        UNRELATED_PHRASES,
+        &available_styles,
+        SeedConfig {
+            base_seed: super::UNRELATED_SEED_BASE,
+            num_variants: super::UNRELATED_SEEDS_PER_PHRASE,
+            seed_variant: 0,
+        },
+        "neg_train",
+        &model_version_hash,
+        &cache_dir_path,
+        cache_bust,
+    );
+    let confusable_batch = generate_phrase_variants_batch(
+        CONFUSABLE_PHRASES,
+        &available_styles,
+        SeedConfig {
+            base_seed: super::CONFUSABLE_SEED_BASE,
+            num_variants: super::CONFUSABLE_SEEDS_PER_PHRASE,
+            seed_variant: 0,
+        },
+        "neg_conf_train",
+        &model_version_hash,
+        &cache_dir_path,
+        cache_bust,
+    );
+    let [neg_unrelated_1, neg_unrelated_2, neg_unrelated_3] = unrelated_batch.try_into().unwrap();
+    let [
         neg_confusable_1,
         neg_confusable_2,
         neg_confusable_3,
-    ) = (
-        generate_phrase_variants_cached(
-            UNRELATED_PHRASES,
-            &available_styles,
-            400,
-            "neg_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        ),
-        generate_phrase_variants_cached(
-            UNRELATED_PHRASES,
-            &available_styles,
-            410,
-            "neg_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        ),
-        generate_phrase_variants_cached(
-            UNRELATED_PHRASES,
-            &available_styles,
-            420,
-            "neg_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        ),
-        generate_phrase_variants_cached(
-            CONFUSABLE_PHRASES,
-            &available_styles,
-            500,
-            "neg_conf_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        ),
-        generate_phrase_variants_cached(
-            CONFUSABLE_PHRASES,
-            &available_styles,
-            510,
-            "neg_conf_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        ),
-        generate_phrase_variants_cached(
-            CONFUSABLE_PHRASES,
-            &available_styles,
-            520,
-            "neg_conf_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        ),
-    );
+        neg_confusable_4,
+        neg_confusable_5,
+    ] = confusable_batch.try_into().unwrap();
     let mut negative_embeddings: Vec<Vec<f32>> = Vec::new();
     // Extract both old-style (dense, more informative) and streaming
     // (distribution-matched) negatives for classifier training (mahbot-856).
@@ -1685,6 +1637,8 @@ pub(crate) fn run_internal() {
     let agc_confusable_1 = agc_process(&neg_confusable_1);
     let agc_confusable_2 = agc_process(&neg_confusable_2);
     let agc_confusable_3 = agc_process(&neg_confusable_3);
+    let agc_confusable_4 = agc_process(&neg_confusable_4);
+    let agc_confusable_5 = agc_process(&neg_confusable_5);
 
     for neg_set in [
         &agc_unrelated_1,
@@ -1693,6 +1647,8 @@ pub(crate) fn run_internal() {
         &agc_confusable_1,
         &agc_confusable_2,
         &agc_confusable_3,
+        &agc_confusable_4,
+        &agc_confusable_5,
     ] {
         let (embs, _, _) =
             process_variants_with(neg_set, |s| super::process_streaming_enrollment_sample(s));
@@ -1708,11 +1664,15 @@ pub(crate) fn run_internal() {
     negative_embeddings.extend(streaming_negatives);
     info!(
         "Extracted {} old-style + {} streaming negative embeddings from {} unrelated (3 seeds) + {} confusable phrases \
-         (across 3 seed variations)",
+         (across 5 seed variations, mahbot-872)",
         old_neg_count,
         stream_neg_count,
         neg_unrelated_1.len() + neg_unrelated_2.len() + neg_unrelated_3.len(),
-        neg_confusable_1.len() + neg_confusable_2.len() + neg_confusable_3.len(),
+        neg_confusable_1.len()
+            + neg_confusable_2.len()
+            + neg_confusable_3.len()
+            + neg_confusable_4.len()
+            + neg_confusable_5.len(),
     );
 
     // Supplement with distribution-matched synthetic negatives (mahbot-846).
@@ -1728,26 +1688,32 @@ pub(crate) fn run_internal() {
 
     // Build a SEPARATE negative set for the verifier that uses STREAMING
     // pipeline embeddings to match inference distribution (mahbot-855) and
-    // INCLUDES confusable phrase embeddings for confusable rejection training
-    // (mahbot-859).  Reuses the pre-computed AGC'd unrelated and confusable
-    // sets from above, avoiding redundant AGC processing.
+    // INCLUDES confusable + unrelated phrase embeddings for confusable rejection
+    // training (mahbot-859, mahbot-872).  Reuses the pre-computed AGC'd unrelated
+    // and confusable sets from above, avoiding redundant AGC processing.
     let mut verifier_negatives: Vec<Vec<f32>> = Vec::new();
+    // Unrelated speech phrases (3 seeds) — weight: UNRELATED_UPWEIGHT× (mahbot-872)
     for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
         let (embs, _, _) = process_variants_with(agc_unrelated, |s| {
             super::process_streaming_enrollment_sample(s)
         });
         verifier_negatives.extend(embs);
     }
-    let n_ambient_verifier = verifier_negatives.len();
-    // Include confusable phrase streaming embeddings (mahbot-859) so the
-    // verifier learns to reject phonetic near-misses like "hey map bot".
-    for agc_confusable in [&agc_confusable_1, &agc_confusable_2, &agc_confusable_3] {
+    let n_unrelated_verifier = verifier_negatives.len();
+    // Confusable phrase streaming embeddings (5 seeds, mahbot-872) — weight: CONFUSABLE_UPWEIGHT×
+    for agc_confusable in [
+        &agc_confusable_1,
+        &agc_confusable_2,
+        &agc_confusable_3,
+        &agc_confusable_4,
+        &agc_confusable_5,
+    ] {
         let (embs, _, _) = process_variants_with(agc_confusable, |s| {
             super::process_streaming_enrollment_sample(s)
         });
         verifier_negatives.extend(embs);
     }
-    let n_confusable_verifier = verifier_negatives.len() - n_ambient_verifier;
+    let n_confusable_verifier = verifier_negatives.len() - n_unrelated_verifier;
     verifier_negatives.extend(generate_synthetic_negatives_from_positives(
         SYNTHETIC_NEGATIVES_COUNT,
         &all_streaming_embeddings,
@@ -1755,19 +1721,24 @@ pub(crate) fn run_internal() {
     ));
     let n_synthetic_verifier = SYNTHETIC_NEGATIVES_COUNT;
 
-    // Build per-negative weights matching production (mahbot-870 Fix 3):
-    // ambient negatives get 1.0, confusable near-miss phrases get
-    // CONFUSABLE_UPWEIGHT (100×) so the verifier learns to reject them
-    // despite being a small fraction of the negative set.
+    // Build per-negative weights with three tiers matching production
+    // (mahbot-872): unrelated speech = UNRELATED_UPWEIGHT×, confusable =
+    // CONFUSABLE_UPWEIGHT× (reduced from 100× as mahbot-872 fallback),
+    // synthetic = 1.0× (ambient-equivalent since the bench has no actual
+    // ambient noise).
     let n_neg_total = verifier_negatives.len();
     let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg_total);
-    per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient_verifier));
+    per_neg_weights.extend(std::iter::repeat_n(
+        crate::voice_verifier::UNRELATED_UPWEIGHT,
+        n_unrelated_verifier,
+    ));
     per_neg_weights.extend(std::iter::repeat_n(
         crate::voice_verifier::CONFUSABLE_UPWEIGHT,
         n_confusable_verifier,
     ));
     per_neg_weights.extend(std::iter::repeat_n(1.0, n_synthetic_verifier));
     assert_eq!(per_neg_weights.len(), n_neg_total);
+
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
 
     // ── Phase 4: finalize_enrollment (consistency check + classifier training) ──
@@ -1864,7 +1835,7 @@ pub(crate) fn run_internal() {
     // ── Phase 5: Train the VoiceVerifier (mahbot-855, mahbot-861) ─────────
     phase_start!("Phase 5: Training VoiceVerifier");
     let verifier = VoiceVerifier::train(
-        &all_streaming_embeddings,
+        &verifier_positive_streaming_embeddings,
         &verifier_negatives,
         Some(&per_neg_weights), // per-negative weights matching production (mahbot-870 Fix 3)
         VoiceVerifier::default_threshold(),
@@ -1876,8 +1847,8 @@ pub(crate) fn run_internal() {
     if verifier.is_trained() {
         info!(
             "VoiceVerifier trained successfully with {} streaming positive + {} negative \
-             (streaming pipeline, unrelated + confusable + synthetic, mahbot-859)",
-            all_streaming_embeddings.len(),
+             (streaming pipeline, individual variants, unrelated + confusable + synthetic, mahbot-872)",
+            verifier_positive_streaming_embeddings.len(),
             verifier_negatives.len()
         );
     } else {
@@ -1969,7 +1940,11 @@ pub(crate) fn run_internal() {
         let confusable_variants = generate_phrase_variants_cached(
             CONFUSABLE_PHRASES,
             &available_styles,
-            300,
+            SeedConfig {
+                base_seed: 800,
+                num_variants: 1, // single seed per phrase (detection test, not training)
+                seed_variant: 0,
+            },
             "confusable",
             &model_version_hash,
             &cache_dir_path,
@@ -2013,7 +1988,11 @@ pub(crate) fn run_internal() {
         let unrelated_variants = generate_phrase_variants_cached(
             UNRELATED_PHRASES,
             &available_styles,
-            400,
+            SeedConfig {
+                base_seed: 900,
+                num_variants: 1, // single seed per phrase (detection test, not training)
+                seed_variant: 0,
+            },
             "unrelated",
             &model_version_hash,
             &cache_dir_path,

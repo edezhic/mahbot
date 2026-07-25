@@ -1074,7 +1074,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
         }
         hasher.update(&buf[..n]);
     }
-    let actual = hex_string(&hasher.finalize());
+    let actual = crate::util::hex_string(&hasher.finalize());
     if actual != expected {
         anyhow::bail!(
             "SHA256 mismatch for {}: expected {expected}, got {actual}",
@@ -1082,16 +1082,6 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn hex_string(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
 }
 
 // ── Text preprocessing ───────────────────────────────────────────────
@@ -1944,7 +1934,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(content);
-        let correct_hash = hex_string(&hasher.finalize());
+        let correct_hash = crate::util::hex_string(&hasher.finalize());
 
         // Matching hash passes
         assert!(verify_sha256(&tmp, &correct_hash).is_ok());

@@ -32,6 +32,7 @@
 use crate::ChatDirection;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
+use crate::util::hex_string;
 use crate::vector::cosine_similarity;
 use crate::voice_verifier::{EMBEDDING_DIM, VERIFIER_WINDOW_SIZE, VoiceVerifier};
 use crate::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
@@ -299,6 +300,27 @@ const CONTEXT_PADDING_MS: usize = 100;
 pub(crate) const CONTEXT_PADDING_SAMPLES: usize =
     (CONTEXT_PADDING_MS * SAMPLE_RATE as usize) / 1000;
 
+// ── Voice PCM disk cache (mahbot-872) ─────────────────────────────────
+
+/// Name of the directory under the storage root for PCM audio cache.
+const VOICE_CACHE_DIR: &str = "voice_cache";
+
+/// Number of TTS seeds per confusable phrase for prosodic diversity (mahbot-872).
+pub(crate) const CONFUSABLE_SEEDS_PER_PHRASE: usize = 5;
+
+/// Number of TTS seeds per unrelated phrase for prosodic diversity (mahbot-872).
+pub(crate) const UNRELATED_SEEDS_PER_PHRASE: usize = 3;
+
+/// Seed base offset for confusable phrase synthesis (mahbot-872).
+/// Each phrase i with seed j (0..CONFUSABLE_SEEDS_PER_PHRASE) uses:
+///   seed = CONFUSABLE_SEED_BASE + i * CONFUSABLE_SEEDS_PER_PHRASE + j
+pub(crate) const CONFUSABLE_SEED_BASE: u64 = 1000;
+
+/// Seed base offset for unrelated phrase synthesis (mahbot-872).
+/// Each phrase i with seed j (0..UNRELATED_SEEDS_PER_PHRASE) uses:
+///   seed = UNRELATED_SEED_BASE + i * UNRELATED_SEEDS_PER_PHRASE + j
+pub(crate) const UNRELATED_SEED_BASE: u64 = 2000;
+
 // ── Confusable phrase list for verifier negative training (mahbot-859) ──
 
 /// Canonical confusable near-miss phrases for VoiceVerifier training
@@ -336,6 +358,39 @@ pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
     "med bot",
     "my bot",
     "may bot",
+];
+
+/// Unrelated speech phrases for verifier negative training (mahbot-872).
+///
+/// These are phonetically and semantically unrelated to the wake word, and
+/// cover short commands, medium phrases, long utterances, and non-English
+/// speech.  The verifier must reject all non-wake-word speech regardless
+/// of language or sentence structure.
+pub(crate) const UNRELATED_PHRASES: &[&str] = &[
+    // ── Short commands (2-4 words) ──────────────────────────────────
+    "the weather today is sunny",
+    "what time is it",
+    "one two three four five",
+    "hello world",
+    "good morning everyone",
+    "turn on the lights",
+    "play some music",
+    "set a timer",
+    // ── Medium phrases (5-8 words) ───────────────────────────────────
+    "i need to buy groceries today",
+    "can you remind me of my appointment",
+    "please send a message to john",
+    "what is the capital of france",
+    "tell me a joke about programming",
+    "how do I get to the airport",
+    "the quick brown fox jumps over the lazy dog",
+    // ── Long utterances (10+ words) ──────────────────────────────────
+    "according to all known laws of aviation there is no way a bee should be able to fly",
+    "the principle of superposition states that a quantum system exists in all its possible states simultaneously",
+    // ── Non-English phrases (phonetically distinct from English wake word) ──
+    "bonjour comment allez vous aujourd hui",
+    "buenos días cómo estás",
+    "guten morgen wie geht es dir",
 ];
 
 /// Hard-tier confusable phrases — direct phonetic substitutions (wake-word-like).
@@ -414,6 +469,36 @@ pub(crate) fn confusable_negative_embeddings() -> &'static [Vec<f32>] {
     }
 }
 
+/// Cache for pre-computed unrelated speech streaming embeddings (mahbot-872).
+///
+/// Populated asynchronously during startup (see [`prewarm_unrelated_embeddings`])
+/// after voice ONNX models and TTS models are ready.  Uses the same PCM disk
+/// caching strategy as confusable embeddings so TTS model updates
+/// automatically invalidate cached audio.
+///
+/// The embeddings are used during verifier training to teach the logistic
+/// regression model to reject non-wake-word speech.
+///
+/// Once set, the cache is immutable — a new process is needed to regenerate.
+static UNRELATED_EMBEDDINGS_CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+
+/// Get the pre-computed unrelated speech streaming embeddings (mahbot-872).
+///
+/// Returns a cached slice of streaming embedding vectors pre-computed during
+/// startup via [`prewarm_unrelated_embeddings`].  The embeddings are generated
+/// from the canonical [`UNRELATED_PHRASES`] list using TTS synthesis + AGC +
+/// ONNX streaming pipeline.
+///
+/// If the pre-warm has not completed yet or models are not available, returns
+/// an empty slice — the verifier trains on ambient + confusable negatives only
+/// as a graceful fallback.
+pub(crate) fn unrelated_negative_embeddings() -> &'static [Vec<f32>] {
+    match UNRELATED_EMBEDDINGS_CACHE.get() {
+        Some(cache) => &cache[..],
+        None => &[],
+    }
+}
+
 /// Poll for TTS voice styles to become available (mahbot-859 Fix 3).
 ///
 /// TTS model download (~400 MB) may still be in progress when voice ONNX
@@ -473,15 +558,21 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
     }
 }
 
-/// Pre-warm the confusable phrase embedding cache (mahbot-859).
+/// Pre-warm the confusable phrase embedding cache (mahbot-859, mahbot-872).
 ///
 /// Runs asynchronously at startup after voice ONNX models and TTS are ready.
-/// For each confusable phrase:
+/// For each confusable phrase at 5 seeds each:
 ///
-/// 1. Synthesizes audio via TTS (in `spawn_blocking` — CPU-bound Kokoro-82M)
+/// 1. Checks the PCM disk cache — on hit, loads cached audio without
+///    re-synthesis; on miss, synthesises via TTS and writes to cache.
 /// 2. Applies AGC preprocessing via [`AudioPreprocessor`] in FRAME_LENGTH
 ///    chunks to match the production inference distribution
 /// 3. Extracts streaming embeddings via the ONNX pipeline
+///
+/// The PCM disk cache is keyed by (text + style + seed + sample rate + TTS
+/// model hash), so TTS model updates automatically invalidate stale cached
+/// audio.  Embedding model changes do NOT invalidate the PCM cache — fresh
+/// embeddings are extracted from cached PCM on the next startup.
 ///
 /// The resulting embeddings are stored in [`CONFUSABLE_EMBEDDINGS_CACHE`] and
 /// later used during verifier training.  If TTS models or voice ONNX models
@@ -496,33 +587,92 @@ pub(crate) async fn prewarm_confusable_embeddings() {
         return;
     }
 
-    // Need voice ONNX models.  TTS voice styles are checked below with
-    // a retry poll so the prewarm succeeds even if TTS is still downloading
-    // (mahbot-859 Fix 3).
+    let result = prewarm_phrase_embeddings(
+        "confusable",
+        CONFUSABLE_PHRASES,
+        CONFUSABLE_SEEDS_PER_PHRASE,
+        CONFUSABLE_SEED_BASE,
+        "ambient negatives only",
+    )
+    .await;
+
+    let count = result.len();
+
+    // OnceLock::set is a no-op if already set (race-safe).
+    let _ = CONFUSABLE_EMBEDDINGS_CACHE.set(result);
+
+    if count > 0 {
+        info!(
+            "Pre-warmed {count} confusable phrase streaming embedding(s)              from {} phrases × {CONFUSABLE_SEEDS_PER_PHRASE} seeds              for verifier negative training (mahbot-859, mahbot-872)",
+            CONFUSABLE_PHRASES.len(),
+        );
+    } else {
+        warn!(
+            "No confusable phrase embeddings could be generated —              verifier will train on ambient negatives only"
+        );
+    }
+}
+
+/// Shared pre-warm logic for phrase-based negative embeddings (mahbot-872).
+///
+/// Runs TTS synthesis (with PCM caching), AGC preprocessing, and ONNX streaming
+/// embedding extraction for each phrase × seed combination.  Used by both
+/// [`prewarm_confusable_embeddings`] and [`prewarm_unrelated_embeddings`] to
+/// avoid code duplication.
+///
+/// Returns extracted streaming embeddings, or an empty vec if pre-warming
+/// cannot proceed (models not available, no TTS styles, etc.).
+///
+/// # Parameters
+///
+/// * `phrase_type` — human-readable label for log messages ("confusable"/"unrelated").
+/// * `phrases` — the list of phrases to synthesise.
+/// * `seeds_per_phrase` — number of TTS seed variants per phrase.
+/// * `seed_base` — base offset for seed calculation (see seed formula below).
+/// * `fallback_info` — what the verifier falls back to if this prewarm fails (for logs).
+///
+/// # Seed formula
+///
+/// For phrase index `i` and seed variant `j` (0..`seeds_per_phrase`):
+///
+/// ```text
+/// seed = seed_base + i * seeds_per_phrase + j
+/// ```
+async fn prewarm_phrase_embeddings(
+    phrase_type: &'static str,
+    phrases: &'static [&'static str],
+    seeds_per_phrase: usize,
+    seed_base: u64,
+    fallback_info: &'static str,
+) -> Vec<Vec<f32>> {
+    // Need voice ONNX models.
     if ONNX_MODELS.get().is_none() {
         info!(
-            "Voice ONNX models not ready yet — confusable negative embeddings \
-             pre-warm skipped (verifier trains on ambient negatives only)"
+            "Voice ONNX models not ready yet — {phrase_type} negative embeddings              pre-warm skipped (verifier trains on {fallback_info})"
         );
-        return;
+        return Vec::new();
     }
 
     // Wait for TTS voice styles to become available by polling (mahbot-859 Fix 3).
-    // TTS model download (~400 MB) may still be in progress when voice models
-    // are ready (~2.4 MB).  Poll with a 30-second interval, racing against the
-    // global shutdown token, so the prewarm succeeds on first startup even on
-    // slow connections.  If TTS is not config-enabled, skip immediately since
-    // voice styles will never become available.
     let Some(available_styles) = wait_for_tts_styles().await else {
-        return;
+        return Vec::new();
     };
 
-    let phrases: &[&str] = CONFUSABLE_PHRASES;
+    // Resolve PCM cache directory; if it can't be resolved, skip caching
+    // (synthesis still works without it, just slower).
+    let cache_dir = voice_cache_dir();
+    if let Some(ref d) = cache_dir
+        && let Err(e) = std::fs::create_dir_all(d)
+    {
+        warn!("PCM cache directory creation failed: {e} — proceeding without cache");
+    }
+    let model_hash = tts_model_version_hash();
 
-    // Runs TTS synthesis, AGC, and ONNX embedding extraction in a blocking
-    // thread to avoid starving the async runtime (~2 minutes for 28 phrases
-    // of TTS + fast ONNX inference).
-    let result: Vec<Vec<f32>> = tokio::task::spawn_blocking(move || {
+    let num_styles = available_styles.len();
+
+    // Runs TTS synthesis (with PCM caching), AGC, and ONNX embedding
+    // extraction in a blocking thread to avoid starving the async runtime.
+    tokio::task::spawn_blocking(move || {
         use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
 
         let Some(models) = ONNX_MODELS.get() else {
@@ -533,36 +683,56 @@ pub(crate) async fn prewarm_confusable_embeddings() {
         let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
 
         for (i, &phrase) in phrases.iter().enumerate() {
-            // Rotate through available voice styles for acoustic diversity
-            // (mahbot-859 Fix 1: single-style prewarm → multi-style).
-            let style = &available_styles[i % available_styles.len()];
-            let seed = 42 + i as u64;
-            let pcm = match crate::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("TTS synthesis failed for confusable phrase '{phrase}': {e}");
+            for seed_idx in 0..seeds_per_phrase {
+                // Rotate through available voice styles for acoustic diversity
+                // (mahbot-859 Fix 1). Distribute seeds round-robin across styles.
+                let style_idx = (i * seeds_per_phrase + seed_idx) % num_styles;
+                let style = &available_styles[style_idx];
+                let seed = seed_base
+                    + i as u64 * seeds_per_phrase as u64
+                    + seed_idx as u64;
+
+                // Load PCM — from disk cache (preferred) or synthesise fresh.
+                let pcm = if let Some(ref cache_dir) = cache_dir {
+                    synthesize_with_pcm_cache(
+                        phrase,
+                        style,
+                        seed,
+                        SAMPLE_RATE,
+                        &model_hash,
+                        cache_dir,
+                    )
+                } else {
+                    match crate::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            warn!("TTS synthesis failed for {phrase_type} phrase '{phrase}': {e}");
+                            None
+                        }
+                    }
+                };
+
+                let Some(pcm) = pcm else {
                     continue;
+                };
+
+                // Apply AGC in FRAME_LENGTH chunks to match production inference
+                // distribution (mahbot-859 Fix 2).
+                let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
+                for chunk in pcm.chunks(FRAME_LENGTH) {
+                    let mut padded = chunk.to_vec();
+                    padded.resize(FRAME_LENGTH, 0.0);
+                    agc_audio.extend(pre.process(padded));
                 }
-            };
 
-            // Apply AGC in FRAME_LENGTH chunks to match production inference
-            // distribution (mahbot-859 Fix 2).  The production speech pipeline
-            // applies AudioPreprocessor::process to every incoming mic frame.
-            let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-            for chunk in pcm.chunks(FRAME_LENGTH) {
-                let mut padded = chunk.to_vec();
-                padded.resize(FRAME_LENGTH, 0.0);
-                agc_audio.extend(pre.process(padded));
-            }
-
-            // Extract streaming embeddings from AGC'd audio.
-            match extract_streaming_embeddings_from_audio(models, &agc_audio) {
-                Ok(embs) => all_embeddings.extend(embs),
-                Err(e) => {
-                    warn!(
-                        "Failed to extract streaming embedding for confusable \
-                         phrase '{phrase}': {e}"
-                    );
+                // Extract streaming embeddings from AGC'd audio.
+                match extract_streaming_embeddings_from_audio(models, &agc_audio) {
+                    Ok(embs) => all_embeddings.extend(embs),
+                    Err(e) => {
+                        warn!(
+                            "Failed to extract streaming embedding for {phrase_type}                              phrase '{phrase}' (seed={seed}): {e}"
+                        );
+                    }
                 }
             }
         }
@@ -570,28 +740,51 @@ pub(crate) async fn prewarm_confusable_embeddings() {
         all_embeddings
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_default()
+}
+
+/// Pre-warm unrelated speech embedding cache (mahbot-872).
+///
+/// Synthesises each [`UNRELATED_PHRASES`] entry with
+/// [`UNRELATED_SEEDS_PER_PHRASE`] TTS seeds, applies AGC, and extracts
+/// streaming embeddings via the ONNX pipeline.  Results are stored in
+/// [`UNRELATED_EMBEDDINGS_CACHE`] for lock-free reads during enrollment.
+///
+/// If the cache is already populated (from a previous call), this is a
+/// no-op.  Safe to call multiple times.
+pub(crate) async fn prewarm_unrelated_embeddings() {
+    // Fast path: already pre-warmed.
+    if UNRELATED_EMBEDDINGS_CACHE.get().is_some() {
+        return;
+    }
+
+    let result = prewarm_phrase_embeddings(
+        "unrelated",
+        UNRELATED_PHRASES,
+        UNRELATED_SEEDS_PER_PHRASE,
+        UNRELATED_SEED_BASE,
+        "ambient + confusable negatives only",
+    )
+    .await;
 
     let count = result.len();
 
-    // OnceLock::set is a no-op if already set (race-safe).
-    let _ = CONFUSABLE_EMBEDDINGS_CACHE.set(result);
+    let _ = UNRELATED_EMBEDDINGS_CACHE.set(result);
 
     if count > 0 {
         info!(
-            "Pre-warmed {count} confusable phrase streaming embedding(s) \
-             from {} phrases for verifier negative training (mahbot-859)",
-            CONFUSABLE_PHRASES.len(),
+            "Pre-warmed {count} unrelated phrase streaming embedding(s)              from {} phrases × {UNRELATED_SEEDS_PER_PHRASE} seeds              for verifier negative training (mahbot-872)",
+            UNRELATED_PHRASES.len(),
         );
     } else {
         warn!(
-            "No confusable phrase embeddings could be generated — \
-             verifier will train on ambient negatives only"
+            "No unrelated phrase embeddings could be generated — \
+             verifier will train on ambient + confusable negatives only"
         );
     }
 }
 
-// ── Model URLs and filenames ────────────────────────────────────────────
+// ── Model URLs and filenames ────────────────────────────
 
 const MEL_MODEL_FILENAME: &str = "melspectrogram.onnx";
 const MEL_MODEL_URL: &str =
@@ -2188,14 +2381,144 @@ async fn download_model(
     Ok(())
 }
 
-fn hex_string(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
+// ── Voice PCM disk cache helpers (mahbot-872) ─────────────────────────────
+
+/// Compute a deterministic cache key for TTS-synthesised PCM audio.
+///
+/// Includes all TTS model SHA256 constants so that any TTS model update
+/// automatically invalidates stale cached audio. The embedding model version
+/// is NOT included — cached PCM audio is model-independent; embeddings are
+/// freshly extracted from cached PCM on each startup using the current
+/// ONNX embedding model.
+pub(crate) fn pcm_cache_key(
+    text: &str,
+    style: &str,
+    seed: u64,
+    sample_rate: u32,
+    model_hash: &str,
+) -> String {
+    let input = format!("{text}\0{style}\0{seed}\0{sample_rate}\0{model_hash}");
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex_string(&hasher.finalize())
+}
+
+/// Hash of all TTS model SHA256 constants for cache invalidation.
+///
+/// Any change to any TTS model file produces a different hash, which
+/// changes the PCM cache key and triggers re-synthesis on first run.
+pub(crate) fn tts_model_version_hash() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(crate::tts::DP_MODEL_SHA256.as_bytes());
+    hasher.update(crate::tts::TEXT_ENC_MODEL_SHA256.as_bytes());
+    hasher.update(crate::tts::VECTOR_EST_MODEL_SHA256.as_bytes());
+    hasher.update(crate::tts::VOCODER_MODEL_SHA256.as_bytes());
+    hasher.update(crate::tts::TTS_JSON_SHA256.as_bytes());
+    hasher.update(crate::tts::UNICODE_INDEXER_SHA256.as_bytes());
+    hasher.update(crate::tts::VOICE_STYLE_SHA256.as_bytes());
+    hex_string(&hasher.finalize())
+}
+
+/// Path to the voice PCM cache directory (`~/.mahbot/voice_cache/`).
+pub(crate) fn voice_cache_dir() -> Option<PathBuf> {
+    let root = CONFIG.try_storage_root()?;
+    Some(root.join(VOICE_CACHE_DIR))
+}
+
+/// Write PCM f32 samples to the disk cache atomically.
+///
+/// Writes to a `.tmp` file first, then atomically renames to the final path,
+/// so partial writes are never visible to readers.
+pub(crate) fn write_pcm_cache(path: &Path, samples: &[f32]) {
+    let tmp_path = path.with_extension("tmp");
+    let mut data: Vec<u8> = Vec::with_capacity(samples.len() * 4);
+    for &s in samples {
+        data.extend_from_slice(&s.to_le_bytes());
+    }
+    if let Err(e) = std::fs::write(&tmp_path, &data) {
+        warn!(
+            "PCM cache: failed to write tmp file {}: {e}",
+            tmp_path.display()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        warn!(
+            "PCM cache: failed to rename {} -> {}: {e}",
+            tmp_path.display(),
+            path.display(),
+        );
+    }
+}
+
+/// Read PCM f32 samples from the disk cache.
+///
+/// Returns `None` if the cache file does not exist, has non-aligned size
+/// (not a multiple of 4 bytes), or fails to read.
+pub(crate) fn read_pcm_cache(path: &Path) -> Option<Vec<f32>> {
+    let data = std::fs::read(path).ok()?;
+    if data.is_empty() {
+        warn!("PCM cache: file {} is empty — deleting", path.display(),);
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    if data.len() % 4 != 0 {
+        warn!(
+            "PCM cache: file {} has non-aligned size {} — deleting",
+            path.display(),
+            data.len(),
+        );
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    let samples = data
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    Some(samples)
+}
+
+/// Synthesise a phrase via TTS, caching PCM audio to disk.
+///
+/// Checks the voice PCM disk cache first (keyed by text + style + seed +
+/// sample rate + TTS model hash).  On cache hit, returns cached PCM
+/// directly without calling TTS.  On cache miss, calls
+/// [`crate::tts::synthesize`], writes the result to the cache, and returns
+/// the PCM.
+///
+/// Returns `None` if TTS synthesis fails or the cache directory cannot
+/// be resolved.
+pub(crate) fn synthesize_with_pcm_cache(
+    text: &str,
+    style: &str,
+    seed: u64,
+    sample_rate: u32,
+    model_hash: &str,
+    cache_dir: &Path,
+) -> Option<Vec<f32>> {
+    let key = pcm_cache_key(text, style, seed, sample_rate, model_hash);
+    let cache_path = cache_dir.join(&key);
+
+    // Fast path: cache hit
+    if let Some(pcm) = read_pcm_cache(&cache_path) {
+        return Some(pcm);
+    }
+
+    // Cache miss — synthesise via TTS
+    let pcm = match crate::tts::synthesize(text, style, seed, sample_rate) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "TTS synthesis failed for '{text}' with {style} (seed={seed}): {e} \
+                 — skipping this variant"
+            );
+            return None;
+        }
+    };
+
+    // Write to disk cache atomically
+    write_pcm_cache(&cache_path, &pcm);
+    Some(pcm)
 }
 
 /// Verify a file's SHA256 hash matches the expected value.
@@ -2293,10 +2616,15 @@ async fn download_retry_loop() {
                     if ONNX_MODELS.set(models).is_ok() {
                         MODELS_STATE.store(ModelState::Ready, Ordering::Release);
                         info!("Voice models loaded successfully");
-                        // Pre-warm confusable negative embeddings in background
-                        // so enrollment never blocks on TTS synthesis
-                        // (mahbot-859 Fix 1).
-                        tokio::spawn(prewarm_confusable_embeddings());
+                        // Pre-warm confusable and unrelated negative embeddings in
+                        // background so enrollment never blocks on TTS synthesis
+                        // (mahbot-859 Fix 1, mahbot-872).  Ran sequentially within
+                        // a single task to avoid ONNX model thread-safety concerns
+                        // (mahbot-872 recommendation).
+                        tokio::spawn(async {
+                            prewarm_confusable_embeddings().await;
+                            prewarm_unrelated_embeddings().await;
+                        });
                         // Clear "Loading models" status — if enabled, auto-start
                         // transitions to Listening on the next pipeline tick.
                         set_status(if is_enabled() {
@@ -2590,6 +2918,51 @@ pub fn process_streaming_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f3
         .get()
         .ok_or_else(|| anyhow!("Voice models not loaded"))?;
     extract_streaming_embeddings_from_audio(models, samples)
+}
+
+/// Like [`process_streaming_enrollment_sample`] but accepts a shared VAD detector
+/// so the VAD state persists across calls, matching the inference pipeline's
+/// behavior (which uses the global [`VAD_DETECTOR`] via [`is_speech`]).
+///
+/// The caller must ensure the detector is locked appropriately for thread safety.
+/// Used by the E2E benchmark (behind `voice-tests` feature).
+#[expect(dead_code)]
+pub(crate) fn process_streaming_with_shared_vad(
+    samples: &[f32],
+    detector: &mut earshot::Detector,
+) -> Result<Vec<Vec<f32>>> {
+    let models = ONNX_MODELS
+        .get()
+        .ok_or_else(|| anyhow!("Voice models not loaded"))?;
+    if samples.is_empty() {
+        anyhow::bail!("No audio samples provided");
+    }
+
+    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+    let mut voice_batch: Vec<f32> = Vec::new();
+    let mut mel_frame_buffer: Vec<Vec<f32>> = Vec::new();
+
+    process_streaming_frames_inner(
+        samples,
+        &mut voice_batch,
+        &mut mel_frame_buffer,
+        |frame| is_speech_with_detector(frame, detector, VAD_THRESHOLD),
+        true, // trailing flush
+        |mel_buf| {
+            push_streaming_embedding(models, mel_buf, &mut embeddings);
+            false // offline extraction never stops early
+        },
+    );
+
+    if embeddings.is_empty() && !mel_frame_buffer.is_empty() {
+        push_streaming_embedding(models, &mel_frame_buffer, &mut embeddings);
+    }
+
+    if embeddings.is_empty() {
+        anyhow::bail!("No embeddings could be extracted from audio through streaming pipeline");
+    }
+
+    Ok(embeddings)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4568,12 +4941,22 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 // positives and negatives are processed through the streaming
                 // pipeline.
                 let pos_for_verifier = positive_streaming_embeddings; // moved — clone already taken for classifier combine
-                // Combine ambient negatives with pre-computed confusable phrase
-                // embeddings for verifier training (mahbot-859).
+                // Combine ambient negatives with pre-computed confusable and
+                // unrelated speech embeddings for verifier training (mahbot-859, mahbot-872).
                 let confusable_embs = confusable_negative_embeddings();
+                let unrelated_embs = unrelated_negative_embeddings();
                 let n_confusable_pre = confusable_embs.len();
+                let n_unrelated_pre = unrelated_embs.len();
                 let neg_for_verifier = {
                     let mut neg = streaming_negative_embeddings; // moved — clone already taken for classifier combine
+                    if !unrelated_embs.is_empty() {
+                        info!(
+                            "Adding {} pre-computed unrelated speech streaming \
+                             embeddings to verifier negative set (mahbot-872)",
+                            unrelated_embs.len(),
+                        );
+                        neg.extend_from_slice(unrelated_embs);
+                    }
                     if !confusable_embs.is_empty() {
                         info!(
                             "Adding {} pre-computed confusable phrase streaming \
@@ -4587,7 +4970,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 let verifier = tokio::task::spawn_blocking(move || {
                     use crate::voice_verifier::{
                         CONFUSABLE_UPWEIGHT, DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE,
-                        MLP_MAX_ITER, VoiceVerifier,
+                        MLP_MAX_ITER, UNRELATED_UPWEIGHT, VoiceVerifier,
                     };
 
                     if pos_for_verifier.is_empty() {
@@ -4596,19 +4979,40 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     } else if !neg_for_verifier.is_empty() {
                         let n_neg = neg_for_verifier.len();
                         let n_confusable = n_confusable_pre; // captured before spawn boundary
-                        let n_ambient = n_neg.saturating_sub(n_confusable);
+                        let n_unrelated = n_unrelated_pre;   // captured before spawn boundary
+                        let n_ambient = n_neg.saturating_sub(n_confusable + n_unrelated);
 
-                        // Build per-negative weights: ambient negatives get weight
-                        // 1.0, confusable near-miss phrases get CONFUSABLE_UPWEIGHT
-                        // (100×) so the verifier learns to reject them despite
-                        // being <5% of the negative set (mahbot-861).
+                        // Build per-negative weights with three tiers (mahbot-872):
+                        //   ambient (silence/environment noise)  → 1.0×
+                        //   unrelated speech                     → UNRELATED_UPWEIGHT×
+                        //   confusable near-miss phrases         → CONFUSABLE_UPWEIGHT× (reduced from 100× as mahbot-872 fallback)
                         let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
                         per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
+                        per_neg_weights.extend(std::iter::repeat_n(UNRELATED_UPWEIGHT, n_unrelated));
                         per_neg_weights.extend(std::iter::repeat_n(CONFUSABLE_UPWEIGHT, n_confusable));
                         info!(
                             "Building per-negative weights: {n_ambient} ambient (1.0) + \
-                             {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×)",
+                             {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
+                             {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
+                             {n_neg} total negatives (mahbot-872)",
                         );
+
+                        // Structural guard: verify weight ordering matches concatenation
+                        // order (ambient → unrelated → confusable).  Prevents silent
+                        // misalignment if either the concatenation or weight code is
+                        // refactored (mahbot-872 reviewer feedback).
+                        let check_tier = |offset: usize, count: usize, expected: f32, label: &str| {
+                            for (j, w) in per_neg_weights[offset..offset + count].iter().enumerate() {
+                                let i = offset + j;
+                                assert!(
+                                    (w - expected).abs() <= f32::EPSILON,
+                                    "Weight tier mismatch: {label} weight at position {i} should be {expected}, got {w}",
+                                );
+                            }
+                        };
+                        check_tier(0, n_ambient, 1.0, "ambient");
+                        check_tier(n_ambient, n_unrelated, UNRELATED_UPWEIGHT, "unrelated");
+                        check_tier(n_ambient + n_unrelated, n_confusable, CONFUSABLE_UPWEIGHT, "confusable");
 
                         let v = VoiceVerifier::train(
                             &pos_for_verifier,
@@ -4621,7 +5025,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         );
                         info!(
                             "Verifier trained from {} streaming positive + {n_neg} real \
-                             streaming negative embedding(s) (ambient + confusable + synthetic, mahbot-861)",
+                             streaming negative embedding(s) (ambient + unrelated + confusable + synthetic, mahbot-872)",
                             pos_for_verifier.len(),
                         );
                         v
@@ -6753,5 +7157,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── PCM cache key tests (mahbot-872) ────────────────────────────────────
+
+    #[test]
+    fn test_pcm_cache_key_determinism() {
+        let h = |text, style, seed| pcm_cache_key(text, style, seed, 16000, "test_hash");
+        let a = h("hey mahbot", "default", 42);
+        let b = h("hey mahbot", "default", 42);
+        assert_eq!(a, b, "same inputs must produce same cache key");
+    }
+
+    #[test]
+    fn test_pcm_cache_key_sensitivity_to_text() {
+        let h = |text| pcm_cache_key(text, "default", 42, 16000, "test_hash");
+        assert_ne!(
+            h("hey mahbot"),
+            h("hey madbot"),
+            "different phrases must produce different cache keys",
+        );
+    }
+
+    #[test]
+    fn test_pcm_cache_key_sensitivity_to_seed() {
+        let h = |seed| pcm_cache_key("hey mahbot", "default", seed, 16000, "test_hash");
+        assert_ne!(
+            h(42),
+            h(43),
+            "different seeds must produce different cache keys",
+        );
+    }
+
+    #[test]
+    fn test_pcm_cache_key_sensitivity_to_model_hash() {
+        let h = |mh| pcm_cache_key("hey mahbot", "default", 42, 16000, mh);
+        assert_ne!(
+            h("hash_a"),
+            h("hash_b"),
+            "different model hashes must produce different cache keys",
+        );
+    }
+
+    #[test]
+    fn test_tts_model_version_hash_is_non_empty() {
+        let hash = tts_model_version_hash();
+        assert!(!hash.is_empty(), "TTS model version hash must not be empty");
+        assert_eq!(hash.len(), 64, "SHA-256 hex string must be 64 chars");
     }
 }

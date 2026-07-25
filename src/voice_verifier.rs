@@ -96,9 +96,23 @@ pub(crate) const MLP_MAX_ITER: usize = 2000;
 ///
 /// Confusable phrases (e.g. "hey map bot", "day mahbot") are acoustically
 /// very similar to the wake word.  Without this upweighting, their gradient
-/// signal is drowned out by thousands of ambient negatives.  100× gives them
-/// ~50% of total negative gradient contribution despite being <5% of negatives.
-pub(crate) const CONFUSABLE_UPWEIGHT: f32 = 100.0;
+/// signal is drowned out by thousands of ambient negatives.  The weight was
+/// 100× in the original mahbot-872 implementation, but benchmark results
+/// showed positive detection collapse (~15%, need ≥85%) — the confusable
+/// gradient dominated (~95% of total), making the verifier overly conservative
+/// and rejecting the actual wake word.  Reduced to 50× as the documented
+/// fallback, bringing confusable gradient to ~77% of total and restoring
+/// positive class weight influence (mahbot-872).
+pub(crate) const CONFUSABLE_UPWEIGHT: f32 = 50.0;
+
+/// How much to upweight unrelated speech negative examples during MLP training.
+///
+/// Unrelated phrases (e.g. "what time is it", "good morning everyone") are
+/// phonetically very different from the wake word but still represent real
+/// non-wake-word speech that the verifier must reject.  10× gives them ~5×
+/// more gradient contribution than ambient silence while still prioritising
+/// confusable phrases as the primary negative signal.
+pub(crate) const UNRELATED_UPWEIGHT: f32 = 10.0;
 
 /// Embedding dimensionality (used by both verifier and voice pipeline).
 pub(crate) const EMBEDDING_DIM: usize = 96;

@@ -107,6 +107,21 @@ pub(crate) fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Format a byte slice as a lowercase hex string.
+///
+/// Each byte is written as two hex digits, yielding a string of length
+/// `bytes.len() * 2`.
+#[must_use]
+pub(crate) fn hex_string(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+}
+
 /// Expand a leading tilde (`~`) to the user's home directory.
 ///
 /// Checks `$HOME` first (Unix, Git Bash on Windows), then `$USERPROFILE`

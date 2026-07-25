@@ -486,16 +486,6 @@ fn decode_mp3(data: &[u8], path: &Path) -> Result<(Vec<f32>, i32)> {
 
 // ── File download helpers ─────────────────────────────────────────────
 
-/// Format a byte digest as a lowercase hex string.
-fn hex_string(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 /// Structure describing a file to download.
 struct ModelFile {
     filename: &'static str,
@@ -584,7 +574,7 @@ async fn download_file(client: &reqwest::Client, file: &ModelFile, dest: &Path) 
     file_handle.sync_all().await?;
     drop(file_handle);
 
-    let actual_sha256 = hex_string(&hasher.finalize());
+    let actual_sha256 = crate::util::hex_string(&hasher.finalize());
     if actual_sha256 != file.expected_sha256 {
         // Remove corrupted file.
         tokio::fs::remove_file(dest).await.ok();
@@ -749,7 +739,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
         }
         hasher.update(&buf[..n]);
     }
-    let actual = hex_string(&hasher.finalize());
+    let actual = crate::util::hex_string(&hasher.finalize());
     if actual != expected {
         anyhow::bail!("SHA256 mismatch: expected {expected}, got {actual}");
     }
@@ -857,13 +847,13 @@ mod tests {
 
     #[test]
     fn test_hex_string_empty() {
-        assert_eq!(hex_string(b""), "");
+        assert_eq!(crate::util::hex_string(b""), "");
     }
 
     #[test]
     fn test_hex_string_all_bytes() {
         let bytes: Vec<u8> = (0..=255u8).collect();
-        let hex = hex_string(&bytes);
+        let hex = crate::util::hex_string(&bytes);
         assert_eq!(hex.len(), 512);
         assert!(hex.starts_with("00010203"));
         assert!(hex.ends_with("fcfdfeff"));
