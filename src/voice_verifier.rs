@@ -62,8 +62,14 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.4;
 /// allows the model to develop discriminative weights.
 pub(crate) const L2_LAMBDA: f32 = 0.01;
 
-/// Learning rate for gradient descent.
-pub(crate) const LEARNING_RATE: f32 = 0.01;
+/// Learning rate for gradient descent (Adam).
+pub(crate) const LEARNING_RATE: f32 = 0.001;
+
+/// Adam optimizer hyperparameters (mahbot-878).
+/// Replaces plain SGD with Adam for more stable and faster convergence.
+const ADAM_BETA1: f32 = 0.9;
+const ADAM_BETA2: f32 = 0.999;
+const ADAM_EPS: f32 = 1e-8;
 
 /// Maximum iterations for gradient descent.
 ///
@@ -941,6 +947,7 @@ struct MlpWeights {
 #[allow(
     clippy::cast_precision_loss,
     clippy::many_single_char_names,
+    clippy::similar_names,
     clippy::too_many_lines
 )]
 fn train_mlp(
@@ -1010,6 +1017,26 @@ fn train_mlp(
     let mut dw2 = vec![0.0; h1_size * h2_size];
     let mut db2 = vec![0.0; h2_size];
     let mut dw3 = vec![0.0; h2_size];
+
+    // ── Adam optimizer state (mahbot-878) ──
+    // Replaces plain SGD with Adam for stable convergence.
+    // Each parameter group has its own momentum (m) and velocity (v).
+    let mut adam_t: usize = 0;
+    // w1: dim × h1_size
+    let mut adam_mmt_w1 = vec![0.0; w1.len()];
+    let mut adam_vel_w1 = vec![0.0; w1.len()];
+    let mut adam_mmt_b1 = vec![0.0; b1.len()];
+    let mut adam_vel_b1 = vec![0.0; b1.len()];
+    // w2: h1_size × h2_size
+    let mut adam_mmt_w2 = vec![0.0; w2.len()];
+    let mut adam_vel_w2 = vec![0.0; w2.len()];
+    let mut adam_mmt_b2 = vec![0.0; b2.len()];
+    let mut adam_vel_b2 = vec![0.0; b2.len()];
+    // w3: h2_size
+    let mut adam_mmt_w3 = vec![0.0; w3.len()];
+    let mut adam_vel_w3 = vec![0.0; w3.len()];
+    let mut adam_mmt_b3 = 0.0;
+    let mut adam_vel_b3 = 0.0;
 
     for _iteration in 0..max_iter {
         // Zero gradient buffers for this iteration.
@@ -1139,23 +1166,35 @@ fn train_mlp(
             dw3[j] += l2_lambda * w3[j];
         }
 
-        // ── Gradient descent update ──
-        for j in 0..w1.len() {
-            w1[j] -= learning_rate * dw1[j];
-        }
-        for j in 0..b1.len() {
-            b1[j] -= learning_rate * db1[j];
-        }
-        for j in 0..w2.len() {
-            w2[j] -= learning_rate * dw2[j];
-        }
-        for j in 0..b2.len() {
-            b2[j] -= learning_rate * db2[j];
-        }
-        for j in 0..w3.len() {
-            w3[j] -= learning_rate * dw3[j];
-        }
-        b3 -= learning_rate * db3;
+        // ── Adam parameter update (mahbot-878) ──
+        adam_t += 1;
+        let adam_lr = learning_rate;
+        let adam_b1 = ADAM_BETA1;
+        let adam_b2 = ADAM_BETA2;
+        // Bias-corrected learning rate: lr * sqrt(1 - b2^t) / (1 - b1^t)
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let lr_t = adam_lr * (1.0 - adam_b2.powi(adam_t as i32)).sqrt()
+            / (1.0 - adam_b1.powi(adam_t as i32));
+
+        // Helper closure for Adam update on a parameter slice.
+        let adam_update = |p: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32], lr_t: f32| {
+            for i in 0..p.len() {
+                m[i] = adam_b1 * m[i] + (1.0 - adam_b1) * g[i];
+                v[i] = adam_b2 * v[i] + (1.0 - adam_b2) * g[i] * g[i];
+                p[i] -= lr_t * m[i] / (v[i].sqrt() + ADAM_EPS);
+            }
+        };
+
+        adam_update(&mut w1, &dw1, &mut adam_mmt_w1, &mut adam_vel_w1, lr_t);
+        adam_update(&mut b1, &db1, &mut adam_mmt_b1, &mut adam_vel_b1, lr_t);
+        adam_update(&mut w2, &dw2, &mut adam_mmt_w2, &mut adam_vel_w2, lr_t);
+        adam_update(&mut b2, &db2, &mut adam_mmt_b2, &mut adam_vel_b2, lr_t);
+        adam_update(&mut w3, &dw3, &mut adam_mmt_w3, &mut adam_vel_w3, lr_t);
+        // b3 is a scalar — use single-element slices
+        let b3_grad = db3;
+        adam_mmt_b3 = adam_b1 * adam_mmt_b3 + (1.0 - adam_b1) * b3_grad;
+        adam_vel_b3 = adam_b2 * adam_vel_b3 + (1.0 - adam_b2) * b3_grad * b3_grad;
+        b3 -= lr_t * adam_mmt_b3 / (adam_vel_b3.sqrt() + ADAM_EPS);
     }
 
     MlpWeights {
@@ -1496,7 +1535,7 @@ mod tests {
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // mahbot-853: lowered from 0.6 for streaming inference.
             L2_LAMBDA,                  // L2 regularization (mahbot-854: 0.01)
-            LEARNING_RATE,              // learning rate (mahbot-854: 0.01)
+            LEARNING_RATE,              // learning rate (mahbot-878: 0.001, Adam)
             MAX_ITER,                   // max iterations (mahbot-854: 5000)
         );
 

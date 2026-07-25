@@ -547,25 +547,11 @@ fn generate_white_gaussian_noise() -> Vec<f32> {
 
 /// Generate pink noise (1/f spectrum) using the Voss-McCartney algorithm.
 /// Produces approximately -3 dB/octave rolloff.
+///
+/// Uses the canonical [`crate::util::generate_pink_noise`] with a reproducible
+/// seed (44) for deterministic benchmark output.
 fn generate_pink_noise() -> Vec<f32> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(44);
-    let num_oscillators = 8usize;
-    let mut samples = Vec::with_capacity(NOISE_LEN);
-    let mut values = [0.0f32; 8];
-    for i in 0..NOISE_LEN {
-        // Each step, each oscillator increments and may flip state
-        let mut sum = 0.0;
-        for (j, v) in values.iter_mut().enumerate() {
-            let period = 1 << j;
-            if i % period == 0 {
-                *v = rng.random::<f32>() * 2.0 - 1.0;
-            }
-            sum += *v;
-        }
-        // Normalize (gain ~ 1/sqrt(N_osc))
-        samples.push((sum / num_oscillators as f32).clamp(-1.0, 1.0));
-    }
-    samples
+    crate::util::generate_pink_noise(NOISE_LEN, rand::rngs::StdRng::seed_from_u64(44))
 }
 
 /// Generate brown noise (integrated white noise, 1/f² spectrum).
@@ -1090,15 +1076,16 @@ fn test_detection_samples(
 // ── Volume sweep (mahbot-844 Part 3, informational) ──────────────────────
 
 /// Apply a gain in dB to PCM audio and optionally hard-clip.
+///
+/// Uses the canonical [`crate::util::apply_gain`] internally, then
+/// optionally hard-clips to [-1.0, 1.0] for volume-sweep testing.
 fn apply_gain(samples: &[f32], gain_db: f32, hard_clip: bool) -> Vec<f32> {
-    let linear = 10.0_f32.powf(gain_db / 20.0);
-    samples
-        .iter()
-        .map(|&s| {
-            let s = s * linear;
-            if hard_clip { s.clamp(-1.0, 1.0) } else { s }
-        })
-        .collect()
+    let amplified = crate::util::apply_gain(samples, gain_db);
+    if hard_clip {
+        amplified.iter().map(|&s| s.clamp(-1.0, 1.0)).collect()
+    } else {
+        amplified
+    }
 }
 
 /// Run an informational volume sweep on positive detection variants.
@@ -1840,7 +1827,7 @@ pub(crate) fn run_internal() {
         Some(&per_neg_weights), // per-negative weights matching production (mahbot-870 Fix 3)
         VoiceVerifier::default_threshold(),
         L2_LAMBDA,     // mahbot-854: 0.01
-        LEARNING_RATE, // mahbot-854: 0.01
+        LEARNING_RATE, // mahbot-878: 0.001 (Adam)
         MLP_MAX_ITER,  // mahbot-861: 2000 (MLP converges faster)
     );
 

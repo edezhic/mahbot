@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use rand::{RngExt, SeedableRng};
 
 /// Extension trait to unwrap poisoned lock results, replacing
 /// `.unwrap_or_else(std::sync::PoisonError::into_inner)` with `.unwrap_poison()`.
@@ -880,6 +881,108 @@ mod unescape_c_style_tests {
             );
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Audio utility functions (canonical implementations, mahbot-878)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Generate pink noise (1/f spectrum) using the Voss-McCartney algorithm.
+///
+/// Uses a seeded RNG for reproducibility.  The high-pass delta variant
+/// naturally removes DC bias.  Output is normalized to unit RMS.
+///
+/// # Voss-McCartney variants
+///
+/// There are several common variants of Voss-McCartney pink noise:
+///
+/// * **High-pass delta** (this implementation): stores previous value per
+///   octave, emits the difference (new - prev).  Removes DC bias naturally.
+/// * **Direct-sum**: sums all octave values directly.  May accumulate DC bias.
+///
+/// The canonical implementation uses 16 octaves (~3 dB/octave rolloff down
+/// to 0.03 Hz at 16 kHz) and the high-pass delta variant for DC-free output.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f32> {
+    const NUM_OCTAVES: usize = 16;
+    let mut values = [0.0f32; NUM_OCTAVES];
+    let mut outputs = [0.0f32; NUM_OCTAVES];
+    let mut sample_count = 0u64;
+    let mut noise = Vec::with_capacity(len);
+
+    for _ in 0..len {
+        sample_count += 1;
+        let mut sum = 0.0;
+        for octave in 0..NUM_OCTAVES {
+            // Update this octave's generator at intervals of 2^octave samples.
+            if sample_count.is_multiple_of(1u64 << octave) {
+                values[octave] = rng.random::<f32>() * 2.0 - 1.0;
+            }
+            // High-pass delta: emit difference instead of direct value.
+            let new_val = values[octave];
+            let delta = new_val - outputs[octave];
+            outputs[octave] = new_val;
+            sum += delta;
+        }
+        noise.push(sum);
+    }
+
+    // Normalize to unit RMS
+    let rms = (noise.iter().map(|&s| s * s).sum::<f32>() / noise.len() as f32)
+        .sqrt()
+        .max(1e-10);
+    for s in &mut noise {
+        *s /= rms;
+    }
+
+    noise
+}
+
+/// Add pink noise to PCM audio at the given SNR (mahbot-878).
+///
+/// Uses seeded pink noise for reproducible augmentation.  The noise is
+/// scaled to match the desired signal-to-noise ratio in dB.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    // Compute signal RMS
+    let signal_rms = (pcm.iter().map(|&s| s * s).sum::<f32>() / pcm.len() as f32)
+        .sqrt()
+        .max(1e-10);
+
+    // Generate pink noise
+    let mut noise = generate_pink_noise(pcm.len(), &mut rng);
+
+    // Scale noise to desired SNR: noise_rms = signal_rms * 10^(-snr_db/20)
+    let noise_rms_target = signal_rms * 10.0_f32.powf(-snr_db / 20.0);
+    let noise_rms_current = (noise.iter().map(|&s| s * s).sum::<f32>() / noise.len() as f32)
+        .sqrt()
+        .max(1e-10);
+    let scale = noise_rms_target / noise_rms_current;
+    for s in &mut noise {
+        *s *= scale;
+    }
+
+    // Mix signal + noise, clamped to prevent numeric overflow from
+    // high-amplitude signal+noise sums (defense-in-depth, matching the
+    // prior tts_data_gen::add_noise behavior).  At typical SNR values
+    // (25dB for enrollment augmentation) clamping is a no-op for normal
+    // speech levels, but provides robustness for edge-case inputs.
+    pcm.iter()
+        .zip(noise.iter())
+        .map(|(&signal, &n)| (signal + n).clamp(-1.0, 1.0))
+        .collect()
+}
+
+/// Apply a fixed gain to PCM audio.
+///
+/// DETERMINISTIC — no RNG involved, unlike `randomize_volume`.
+/// The gain is `10^(gain_db / 20)`.  Negative values attenuate,
+/// positive values amplify.
+pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
+    let amp = 10.0_f32.powf(gain_db / 20.0);
+    pcm.iter().map(|&s| s * amp).collect()
 }
 
 #[cfg(test)]

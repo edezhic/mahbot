@@ -99,27 +99,14 @@ pub fn add_noise(samples: &[f32], snr_db: f32, noise_type: NoiseType) -> Vec<f32
     result
 }
 
-/// Generate pink noise using the Voss-McCartney algorithm.
+/// Generate pink noise using the canonical Voss-McCartney algorithm.
+///
+/// Delegates to [`crate::util::generate_pink_noise`] with a fresh global RNG,
+/// matching the original behavior of using [`rand::random`] indirectly through
+/// the global thread-local generator.
 #[allow(clippy::cast_precision_loss)]
 fn generate_pink_noise(len: usize) -> Vec<f32> {
-    // Use 16 octaves for good low-frequency response
-    let octaves = 16;
-    let mut values = vec![0.0f32; octaves];
-    let mut output = Vec::with_capacity(len);
-
-    for i in 0..len {
-        // Update a random octave whenever its period aligns
-        for (o, val) in values.iter_mut().enumerate() {
-            let period = 1 << o; // 2^o
-            if i % period == 0 {
-                *val = rand::random::<f32>() * 2.0 - 1.0;
-            }
-        }
-        // Sum all octaves and normalize by sqrt(octaves)
-        let sum: f32 = values.iter().sum();
-        output.push((sum / (octaves as f32).sqrt()).clamp(-1.0, 1.0));
-    }
-    output
+    crate::util::generate_pink_noise(len, rand::rng())
 }
 
 /// Compute the RMS (root mean square) of audio samples.
@@ -838,14 +825,18 @@ mod tests {
     fn test_generate_pink_noise() {
         let noise = generate_pink_noise(1000);
         assert_eq!(noise.len(), 1000);
-        for &s in &noise {
-            assert!((-1.0..=1.0).contains(&s));
-        }
-        // Pink noise should have non-zero RMS
+        // The canonical implementation normalizes to unit RMS (not
+        // per-sample clamping).  This is the correct behavior for
+        // audio processing — clamping is applied later in add_noise.
+        // Pink noise should have non-zero RMS near 1.0 (unit normalization).
         let rms = compute_rms(&noise);
         assert!(
             rms > 0.01,
             "Pink noise RMS should be non-trivial, got {rms}"
+        );
+        assert!(
+            (rms - 1.0).abs() < 0.1,
+            "Pink noise RMS should be near 1.0 (unit normalization), got {rms}"
         );
     }
 }

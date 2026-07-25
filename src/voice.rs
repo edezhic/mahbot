@@ -451,6 +451,18 @@ pub(crate) const CONFUSABLE_EASY: &[&str] = &[
 /// verifier trains on ambient negatives only.
 static CONFUSABLE_EMBEDDINGS_CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 
+/// Cache for pre-computed confusable phrase old-style (dense-stride) embeddings
+/// for Conv1D classifier negative training (mahbot-878).
+///
+/// Populated at prewarm time alongside [`CONFUSABLE_EMBEDDINGS_CACHE`] from the
+/// same spawn_blocking.  These dense embeddings provide a rich learning signal
+/// (many windows per utterance) for the Conv1D classifier, complementing the
+/// streaming embeddings used for verifier training.
+///
+/// If pre-warming fails or is not yet complete, returns an empty slice and the
+/// classifier trains on ambient negatives only.
+static CONFUSABLE_DENSE_CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+
 /// Get the pre-computed confusable phrase streaming embeddings (mahbot-859).
 ///
 /// Returns a cached slice of streaming embedding vectors pre-computed during
@@ -469,6 +481,23 @@ pub(crate) fn confusable_negative_embeddings() -> &'static [Vec<f32>] {
     }
 }
 
+/// Get the pre-computed confusable phrase OLD-STYLE (dense-stride) embeddings
+/// for Conv1D classifier negative training (mahbot-878).
+///
+/// Returns cached dense embeddings pre-computed during startup via
+/// [`prewarm_confusable_embeddings`].  These provide a rich learning signal
+/// for the Conv1D classifier (many windows per utterance).
+///
+/// If the pre-warm has not completed yet or models are not available, returns
+/// an empty slice — the classifier trains on ambient negatives only as a
+/// graceful fallback.
+pub(crate) fn confusable_dense_embeddings() -> &'static [Vec<f32>] {
+    match CONFUSABLE_DENSE_CACHE.get() {
+        Some(cache) => &cache[..],
+        None => &[],
+    }
+}
+
 /// Cache for pre-computed unrelated speech streaming embeddings (mahbot-872).
 ///
 /// Populated asynchronously during startup (see [`prewarm_unrelated_embeddings`])
@@ -482,6 +511,18 @@ pub(crate) fn confusable_negative_embeddings() -> &'static [Vec<f32>] {
 /// Once set, the cache is immutable — a new process is needed to regenerate.
 static UNRELATED_EMBEDDINGS_CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 
+/// Cache for pre-computed unrelated speech old-style (dense-stride) embeddings
+/// for Conv1D classifier negative training (mahbot-878).
+///
+/// Populated at prewarm time alongside [`UNRELATED_EMBEDDINGS_CACHE`] from the
+/// same spawn_blocking.  These dense embeddings provide a rich learning signal
+/// (many windows per utterance) for the Conv1D classifier, complementing the
+/// streaming embeddings used for verifier training.
+///
+/// If pre-warming fails or is not yet complete, returns an empty slice and the
+/// classifier trains on ambient + confusable negatives only.
+static UNRELATED_DENSE_CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+
 /// Get the pre-computed unrelated speech streaming embeddings (mahbot-872).
 ///
 /// Returns a cached slice of streaming embedding vectors pre-computed during
@@ -494,6 +535,23 @@ static UNRELATED_EMBEDDINGS_CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
 /// as a graceful fallback.
 pub(crate) fn unrelated_negative_embeddings() -> &'static [Vec<f32>] {
     match UNRELATED_EMBEDDINGS_CACHE.get() {
+        Some(cache) => &cache[..],
+        None => &[],
+    }
+}
+
+/// Get the pre-computed unrelated speech OLD-STYLE (dense-stride) embeddings
+/// for Conv1D classifier negative training (mahbot-878).
+///
+/// Returns cached dense embeddings pre-computed during startup via
+/// [`prewarm_unrelated_embeddings`].  These provide a rich learning signal
+/// for the Conv1D classifier (many windows per utterance).
+///
+/// If the pre-warm has not completed yet or models are not available, returns
+/// an empty slice — the classifier trains on ambient + confusable negatives
+/// only as a graceful fallback.
+pub(crate) fn unrelated_dense_embeddings() -> &'static [Vec<f32>] {
+    match UNRELATED_DENSE_CACHE.get() {
         Some(cache) => &cache[..],
         None => &[],
     }
@@ -587,7 +645,7 @@ pub(crate) async fn prewarm_confusable_embeddings() {
         return;
     }
 
-    let result = prewarm_phrase_embeddings(
+    let (streaming, dense) = prewarm_phrase_embeddings(
         "confusable",
         CONFUSABLE_PHRASES,
         CONFUSABLE_SEEDS_PER_PHRASE,
@@ -596,10 +654,11 @@ pub(crate) async fn prewarm_confusable_embeddings() {
     )
     .await;
 
-    let count = result.len();
+    let count = streaming.len();
 
     // OnceLock::set is a no-op if already set (race-safe).
-    let _ = CONFUSABLE_EMBEDDINGS_CACHE.set(result);
+    let _ = CONFUSABLE_EMBEDDINGS_CACHE.set(streaming);
+    let _ = CONFUSABLE_DENSE_CACHE.set(dense);
 
     if count > 0 {
         info!(
@@ -638,24 +697,25 @@ pub(crate) async fn prewarm_confusable_embeddings() {
 /// ```text
 /// seed = seed_base + i * seeds_per_phrase + j
 /// ```
+#[allow(clippy::too_many_lines)]
 async fn prewarm_phrase_embeddings(
     phrase_type: &'static str,
     phrases: &'static [&'static str],
     seeds_per_phrase: usize,
     seed_base: u64,
     fallback_info: &'static str,
-) -> Vec<Vec<f32>> {
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     // Need voice ONNX models.
     if ONNX_MODELS.get().is_none() {
         info!(
             "Voice ONNX models not ready yet — {phrase_type} negative embeddings              pre-warm skipped (verifier trains on {fallback_info})"
         );
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Wait for TTS voice styles to become available by polling (mahbot-859 Fix 3).
     let Some(available_styles) = wait_for_tts_styles().await else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     // Resolve PCM cache directory; if it can't be resolved, skip caching
@@ -676,11 +736,12 @@ async fn prewarm_phrase_embeddings(
         use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
 
         let Some(models) = ONNX_MODELS.get() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
 
         let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
-        let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+        let mut streaming_embeddings: Vec<Vec<f32>> = Vec::new();
+        let mut dense_embeddings: Vec<Vec<f32>> = Vec::new();
 
         for (i, &phrase) in phrases.iter().enumerate() {
             for seed_idx in 0..seeds_per_phrase {
@@ -688,9 +749,7 @@ async fn prewarm_phrase_embeddings(
                 // (mahbot-859 Fix 1). Distribute seeds round-robin across styles.
                 let style_idx = (i * seeds_per_phrase + seed_idx) % num_styles;
                 let style = &available_styles[style_idx];
-                let seed = seed_base
-                    + i as u64 * seeds_per_phrase as u64
-                    + seed_idx as u64;
+                let seed = seed_base + i as u64 * seeds_per_phrase as u64 + seed_idx as u64;
 
                 // Load PCM — from disk cache (preferred) or synthesise fresh.
                 let pcm = if let Some(ref cache_dir) = cache_dir {
@@ -725,19 +784,58 @@ async fn prewarm_phrase_embeddings(
                     agc_audio.extend(pre.process(padded));
                 }
 
-                // Extract streaming embeddings from AGC'd audio.
-                match extract_streaming_embeddings_from_audio(models, &agc_audio) {
-                    Ok(embs) => all_embeddings.extend(embs),
-                    Err(e) => {
-                        warn!(
-                            "Failed to extract streaming embedding for {phrase_type}                              phrase '{phrase}' (seed={seed}): {e}"
-                        );
+                // ── Symmetric PCM augmentation (mahbot-878) ──
+                // Apply the same 4 deterministic transforms to negative PCM
+                // that production enrollment applies to positives, ensuring
+                // the classifier learns phonetic distinction, not augmentation
+                // artifacts.  All 5 variants (original + 4 augmented) are
+                // extracted and accumulated.
+                //
+                // Speed-up is skipped for utterances with <500ms actual
+                // speech (pre-padding duration), matching the enrollment
+                // logic in handle_enrollment_sample.
+                let pre_pad_samples = agc_audio.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
+                let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(SAMPLE_RATE);
+                let speed_up_opt = if pre_pad_ms >= 500 {
+                    Some(speed_perturbation(&agc_audio, SAMPLE_RATE, 1.05))
+                } else {
+                    None
+                };
+                let noise_pcm = crate::util::add_noise(&agc_audio, 25.0, seed);
+
+                // Helper: extract both streaming and dense embeddings from
+                // a PCM variant and accumulate them.
+                let mut extract_and_accumulate = |variant_pcm: &[f32]| {
+                    if let Ok(embs) = extract_streaming_embeddings_from_audio(models, variant_pcm) {
+                        streaming_embeddings.extend(embs);
                     }
+                    if let Ok(embs) = process_enrollment_sample(variant_pcm) {
+                        dense_embeddings.extend(embs);
+                    }
+                };
+
+                // 1. Original (AGC'd, unmodified)
+                extract_and_accumulate(&agc_audio);
+
+                // 2. Speed-down (0.95×)
+                let speed_down_pcm = speed_perturbation(&agc_audio, SAMPLE_RATE, 0.95);
+                extract_and_accumulate(&speed_down_pcm);
+
+                // 3. Speed-up (1.05×, conditional)
+                if let Some(ref sp) = speed_up_opt {
+                    extract_and_accumulate(sp);
                 }
+
+                // 4. Volume-down (-3dB)
+                let volume_down_pcm = crate::util::apply_gain(&agc_audio, -3.0);
+                extract_and_accumulate(&volume_down_pcm);
+
+                // 5. Pink noise (SNR 25dB)
+                extract_and_accumulate(&noise_pcm);
             }
         }
 
-        all_embeddings
+        (streaming_embeddings, dense_embeddings)
     })
     .await
     .unwrap_or_default()
@@ -758,7 +856,7 @@ pub(crate) async fn prewarm_unrelated_embeddings() {
         return;
     }
 
-    let result = prewarm_phrase_embeddings(
+    let (streaming, dense) = prewarm_phrase_embeddings(
         "unrelated",
         UNRELATED_PHRASES,
         UNRELATED_SEEDS_PER_PHRASE,
@@ -767,9 +865,10 @@ pub(crate) async fn prewarm_unrelated_embeddings() {
     )
     .await;
 
-    let count = result.len();
+    let count = streaming.len();
 
-    let _ = UNRELATED_EMBEDDINGS_CACHE.set(result);
+    let _ = UNRELATED_EMBEDDINGS_CACHE.set(streaming);
+    let _ = UNRELATED_DENSE_CACHE.set(dense);
 
     if count > 0 {
         info!(
@@ -1206,14 +1305,24 @@ pub(crate) fn score_single_embedding(
                 );
             }
 
-            // Clear the score window so the next frame starts from zero.
-            // Without this the accumulated classifier scores eventually
-            // let any speech through (mahbot-797).
-            // The peak verifier score (across all frames) is already
-            // accumulated before this point, so the next time the rolling
-            // sum reaches threshold the same peak (or higher, if more
-            // embeddings have arrived) will be rechecked (mahbot-870).
-            score_window.clear();
+            // ⚠ DO NOT clear the rolling window on verifier block (mahbot-878).
+            // Previously the score window was cleared here, but this destroyed
+            // the classifier's rolling sum accumulation.  By the time the
+            // verifier had enough embeddings (≥3) for a temporally representative
+            // 3-frame window, the utterance had ended — causing 46.2% detection
+            // (Failure Mode B in mahbot-878).
+            //
+            // The rolling sum persists across frames.  If the sum again reaches
+            // threshold on a subsequent frame (with more temporal context), the
+            // verifier re-checks with a more representative window.  The
+            // NO_MATCH_RESET_THRESHOLD (0.20) in `process_wake_word_score`
+            // independently clears the window when any frame scores below 0.20,
+            // preventing noise accumulation on non-matching speech.
+            //
+            // The peak verifier score (across all frames) is accumulated
+            // before this point, so the next time the rolling sum reaches
+            // threshold the same peak (or higher, if more embeddings have
+            // arrived) will be rechecked (mahbot-870).
             return (false, rolling_sum);
         }
         return (true, rolling_sum);
@@ -1490,7 +1599,34 @@ struct VoicePipelineState {
     /// processed through the ONNX embedding model at verifier training time to
     /// produce real (non-synthetic) negative examples for the verifier (mahbot-797).
     negative_audio_chunks: Vec<Vec<f32>>,
+    /// Number of user utterances enrolled so far (mahbot-878).
+    ///
+    /// Unlike [`enrollment_buffer`] and [`streaming_enrollment_buffer`] which
+    /// may contain 5× entries due to PCM augmentation (original + 4 variants
+    /// per utterance), this counter tracks only the actual user utterances.
+    /// The UI counter and finalization trigger use this field, not the buffer
+    /// length.
+    ///
+    /// It is incremented once per `handle_enrollment_sample` call (before
+    /// augmentation), ensuring that even if augmentation is temporarily
+    /// disabled (e.g. for very short utterances where speed-up is skipped),
+    /// the enrollment still completes after the correct number of user
+    /// utterances.
+    enrolled_utterance_count: usize,
     cmd_tx: Option<mpsc::UnboundedSender<VoiceCommand>>,
+}
+
+impl VoicePipelineState {
+    /// Clear all enrollment accumulators (buffers + utterance counter).
+    ///
+    /// Called by [`PipelineCtx::reset_pipeline_state`] on [`ResetLevel::Cancel`]
+    /// and by tests to verify data model invariants.
+    fn reset_enrollment(&mut self) {
+        self.enrollment_buffer.clear();
+        self.streaming_enrollment_buffer.clear();
+        self.negative_audio_chunks.clear();
+        self.enrolled_utterance_count = 0;
+    }
 }
 
 #[derive(Debug)]
@@ -1529,6 +1665,7 @@ pub fn init_global() -> Result<()> {
             enrollment_buffer: Vec::new(),
             streaming_enrollment_buffer: Vec::new(),
             negative_audio_chunks: Vec::new(),
+            enrolled_utterance_count: 0,
             cmd_tx: None,
         }))
         .map_err(|_| anyhow!("VoicePipeline already initialized"))?;
@@ -4194,10 +4331,7 @@ impl PipelineCtx {
                 self.peak_verifier_score = 0.0;
 
                 // Cancel also clears global enrollment accumulators.
-                let mut state = voice_state().write().unwrap_poison();
-                state.enrollment_buffer.clear();
-                state.streaming_enrollment_buffer.clear();
-                state.negative_audio_chunks.clear();
+                voice_state().write().unwrap_poison().reset_enrollment();
             }
         }
     }
@@ -4358,30 +4492,44 @@ impl PipelineCtx {
         // Resume existing enrollment progress if available (e.g., the user
         // clicked Enroll while already enrolled or mid-enrollment — the
         // global enrollment_buffer from the interrupted session is intact).
-        // When starting fresh (existing_count == 0), use Cancel-level reset
-        // to clear stale buffers while preserving VAD/NS continuity (same
-        // mic stream, same acoustic environment) — mahbot-805.
-        let existing_count = voice_state().read().unwrap_poison().enrollment_buffer.len();
+        // When starting fresh (existing_utterances == 0), use Cancel-level
+        // reset to clear stale buffers while preserving VAD/NS continuity
+        // (same mic stream, same acoustic environment) — mahbot-805.
+        //
+        // Use enrolled_utterance_count (not enrollment_buffer.len()) because
+        // augmentation inflates the buffer to ~5× the utterance count,
+        // making the buffer-based check always >0 and the UI display
+        // nonsensical (mahbot-878 fix).
+        let existing_utterances = voice_state()
+            .read()
+            .unwrap_poison()
+            .enrolled_utterance_count;
 
-        if existing_count == 0 {
+        if existing_utterances == 0 {
             // Cancel-level reset: clears all audio buffers, enrollment
-            // accumulators, and global enrollment state, but preserves
-            // VAD/NS continuity (same mic stream, same acoustic environment).
+            // accumulators, global enrollment state, and resets the
+            // utterance counter, but preserves VAD/NS continuity (same
+            // mic stream, same acoustic environment).
             // vad_threshold will be set to ENROLLMENT_VAD_THRESHOLD below.
             self.reset_pipeline_state(ResetLevel::Cancel);
+        } else {
+            info!(
+                "Resuming enrollment from utterance \
+                 {existing_utterances}/{NUM_ENROLLMENT_SAMPLES}",
+            );
         }
 
         self.enrollment_mode = true;
         self.vad_threshold = ENROLLMENT_VAD_THRESHOLD;
         set_status(VoiceStatus::Enrolling {
-            sample: existing_count,
+            sample: existing_utterances,
             total: NUM_ENROLLMENT_SAMPLES,
             duration_ms: 0,
             quality: None,
         });
         info!(
-            "Voice pipeline: enrollment started (resuming from sample {}/{NUM_ENROLLMENT_SAMPLES})",
-            existing_count,
+            "Voice pipeline: enrollment started (resuming from utterance \
+             {existing_utterances}/{NUM_ENROLLMENT_SAMPLES})",
         );
     }
 
@@ -4583,7 +4731,12 @@ pub async fn run_voice_pipeline() {
                 if ctx.enrollment_mode {
                     let (sample, total) = {
                         let state = voice_state().read().unwrap_poison();
-                        (state.enrollment_buffer.len(), NUM_ENROLLMENT_SAMPLES)
+                        // Use enrolled_utterance_count (not enrollment_buffer.len())
+                        // because the buffer may have up to 5× entries due to PCM
+                        // augmentation (mahbot-878).  The intermediate status fields
+                        // are currently ignored by the GUI (static text), but using
+                        // the utterance count keeps the data model correct.
+                        (state.enrolled_utterance_count, NUM_ENROLLMENT_SAMPLES)
                     };
                     handle_enrollment_audio(&samples, &mut ctx, sample, total);
                 } else if ctx.is_recording {
@@ -4705,8 +4858,37 @@ fn check_enrollment_utterance_length(
     }
 }
 
-/// Handle enrollment sample: process audio into embeddings and accumulate.
+// ═══════════════════════════════════════════════════════════════════════════
+// PCM augmentation (mahbot-878)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Apply speed perturbation via resampling (anti-alias safe).
 ///
+/// Delegates to [`crate::util::resample_audio`] for proper anti-aliasing
+/// filtering and f64-precision interpolation (mahbot-878).  A `rate` of 1.0
+/// returns the original unchanged.  `rate < 1.0` slows down (adds samples),
+/// `rate > 1.0` speeds up (removes samples).  The ticket uses 0.95 (slow down)
+/// and 1.05 (speed up).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn speed_perturbation(pcm: &[f32], sample_rate: u32, rate: f32) -> Vec<f32> {
+    if pcm.is_empty() || (rate - 1.0).abs() < 1e-6 {
+        return pcm.to_vec();
+    }
+    // Speed perturbation via resampling: change the effective rate
+    // new_rate = sample_rate * rate, then resample back to sample_rate.
+    // This produces the same duration but with shifted pitch.
+    let effective_rate = (sample_rate as f32 * rate) as u32;
+    crate::util::resample_audio(pcm, effective_rate, sample_rate)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Implementation note: `apply_gain`, `generate_pink_noise`, and `add_noise`
+// are defined in `crate::util` (mahbot-878 canonical implementations).
+//
 /// Extracts BOTH old-style dense-stride and streaming-style embeddings for
 /// Conv1D classifier training (mahbot-856).  Old-style embeddings provide a
 /// strong learning signal (many dense windows), while streaming embeddings
@@ -4733,241 +4915,378 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // Compute utterance duration before moving `samples` into the closure.
     let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
-    // Clone samples for quality computation and streaming embedding extraction
-    // (the primary copy is moved into spawn_blocking for streaming extraction).
-    let samples_for_quality = samples.clone();
-    let samples_for_streaming = samples.clone();
+    // ── Generate 4 deterministic PCM augmented variants (mahbot-878) ──
+    // The original is kept as-is.  All variants are processed in a single
+    // spawn_blocking below, avoiding redundant ONNX model lookups and
+    // reducing thread spawn overhead.
+    //
+    // Pre-padding duration = actual speech duration excluding the 100ms
+    // of context padding at each end.  Used to decide whether speed-up
+    // augmentation is viable (very short utterances would become
+    // unintelligible).
+    let pre_pad_duration_samples = samples.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
+    let pre_pad_duration_ms = (pre_pad_duration_samples as u64 * 1000) / u64::from(SAMPLE_RATE);
+    let skip_speed_up = pre_pad_duration_ms < 500;
 
-    // Run ONNX inference on a blocking thread to avoid blocking the async pipeline.
-    // Extract streaming embeddings for both classifier and verifier training,
-    // and old-style embeddings for utterance length checking (mahbot-856).
-    let (embeddings_result, streaming_result) = tokio::task::spawn_blocking(move || {
-        let old = process_enrollment_sample(&samples);
-        let streaming = process_streaming_enrollment_sample(&samples_for_streaming);
-        (old, streaming)
+    // Seed for noise from current utterance count (read before incrementing).
+    let noise_seed = {
+        let state = voice_state().read().unwrap_poison();
+        state.enrolled_utterance_count as u64
+    };
+
+    // Generate variants — all deterministic, no RNG dependency except the
+    // seeded noise generator.
+    let original = samples.clone();
+    let speed_down = speed_perturbation(&samples, SAMPLE_RATE, 0.95);
+    let speed_up = if skip_speed_up {
+        None
+    } else {
+        Some(speed_perturbation(&samples, SAMPLE_RATE, 1.05))
+    };
+    let volume_down = crate::util::apply_gain(&samples, -3.0);
+    let noise = crate::util::add_noise(&samples, 25.0, noise_seed);
+
+    // Clone for quality computation (use the original for quality check).
+    let samples_for_quality = original.clone();
+
+    // Run ONNX inference for ALL 5 variants in a SINGLE spawn_blocking
+    // to avoid redundant blocking thread overhead (mahbot-878).
+    let results = tokio::task::spawn_blocking(move || {
+        // Process the original
+        let old_orig = process_enrollment_sample(&original);
+        let stream_orig = process_streaming_enrollment_sample(&original);
+
+        // Process speed-down variant
+        let old_spd_down = process_enrollment_sample(&speed_down);
+        let stream_spd_down = process_streaming_enrollment_sample(&speed_down);
+
+        // Process speed-up variant (if enabled)
+        let old_spd_up = speed_up.as_ref().map(|s| process_enrollment_sample(s));
+        let stream_spd_up = speed_up
+            .as_ref()
+            .map(|s| process_streaming_enrollment_sample(s));
+
+        // Process volume-down variant
+        let old_vol_down = process_enrollment_sample(&volume_down);
+        let stream_vol_down = process_streaming_enrollment_sample(&volume_down);
+
+        // Process noise variant
+        let old_noise = process_enrollment_sample(&noise);
+        let stream_noise = process_streaming_enrollment_sample(&noise);
+
+        (
+            (old_orig, stream_orig),
+            (old_spd_down, stream_spd_down),
+            (old_spd_up, stream_spd_up),
+            (old_vol_down, stream_vol_down),
+            (old_noise, stream_noise),
+        )
     })
     .await
     .unwrap_or_else(|e| {
+        let make_err = || Err::<Vec<Vec<f32>>, _>(anyhow!("Blocking task failed: {e}"));
         (
-            Err(anyhow!("Blocking task failed: {e}")),
-            Err(anyhow!("Blocking task failed: {e}")),
+            (make_err(), make_err()),
+            (make_err(), make_err()),
+            (None, None),
+            (make_err(), make_err()),
+            (make_err(), make_err()),
         )
     });
 
-    match embeddings_result {
-        Ok(embeddings) => {
-            // ── Minimum utterance length check (mahbot-772) ──
-            if let Err(msg) = check_enrollment_utterance_length(embeddings.len(), duration_ms) {
-                warn!("{msg}");
-                set_status(VoiceStatus::Error(msg));
+    // ── Old-style embeddings (original — used for min-length check) ──
+    let original_old = match results.0.0 {
+        Ok(ref e) => e.clone(),
+        Err(ref e) => {
+            warn!("Original enrollment embedding failed: {e}");
+            return;
+        }
+    };
+
+    // ── Minimum utterance length check (mahbot-772) ──
+    if let Err(msg) = check_enrollment_utterance_length(original_old.len(), duration_ms) {
+        warn!("{msg}");
+        set_status(VoiceStatus::Error(msg));
+        return;
+    }
+
+    // ── Push all 5 variants to buffers ──
+    // Collect results into two buffers: old-style (for classifier) and
+    // streaming (for verifier).  Each variant that produces valid embeddings
+    // is pushed as a separate entry.  Failed variants are silently skipped.
+    let mut old_results: Vec<Vec<Vec<f32>>> = Vec::with_capacity(5);
+    let mut streaming_results: Vec<Vec<Vec<f32>>> = Vec::with_capacity(5);
+
+    // Helper macro: push variant embeddings if extraction succeeded.
+    // Supports two forms:
+    //   push_variant!("label", old_result, stream_result);
+    //   push_variant!("label", old_option, stream_option, optional);
+    // The `optional` form unwraps `Option<Result<_,_>>` and skips silently
+    // if either value is `None` (used for speed-up, which may be skipped
+    // when utterance is too short).
+    macro_rules! push_variant {
+        ($label:expr, $old:expr, $stream:expr) => {
+            match ($old, $stream) {
+                (Ok(old_embs), Ok(stream_embs)) => {
+                    old_results.push(old_embs);
+                    streaming_results.push(stream_embs);
+                }
+                (Err(ref e), _) | (_, Err(ref e)) => {
+                    warn!(
+                        "{} variant embedding extraction failed: {e} — skipping variant",
+                        $label
+                    );
+                }
+            }
+        };
+        ($label:expr, $old:expr, $stream:expr, optional) => {
+            if let (Some(old_res), Some(stream_res)) = ($old, $stream) {
+                push_variant!($label, old_res, stream_res);
+            }
+        };
+    }
+
+    // Original
+    push_variant!("original", results.0.0, results.0.1);
+    // Speed-down
+    push_variant!("speed-down", results.1.0, results.1.1);
+    // Speed-up (optional — skipped when utterance <500ms unpadded duration)
+    push_variant!("speed-up", results.2.0, results.2.1, optional);
+    // Volume-down
+    push_variant!("volume-down", results.3.0, results.3.1);
+    // Noise
+    push_variant!("noise", results.4.0, results.4.1);
+
+    let (count, utterance_count, quality) = {
+        let mut state = voice_state().write().unwrap_poison();
+
+        // Compute quality on the original samples (quality check is only for
+        // the real utterance, not augmented variants).
+        let quality = Some(compute_utterance_quality(&samples_for_quality, noise_rms));
+
+        // Push all variant embeddings
+        state.enrollment_buffer.extend(old_results);
+        state.streaming_enrollment_buffer.extend(streaming_results);
+
+        // Increment utterance counter (one user utterance generates multiple
+        // buffer entries, but only counts as one user utterance).
+        state.enrolled_utterance_count += 1;
+        let utterance_count = state.enrolled_utterance_count;
+        let count = state.enrollment_buffer.len();
+        // state dropped here — no lock held across await
+        (count, utterance_count, quality)
+    };
+
+    info!(
+        "Enrolled utterance {utterance_count}/{NUM_ENROLLMENT_SAMPLES} \
+         ({count} buffer entries with augmentation)",
+    );
+
+    if utterance_count >= NUM_ENROLLMENT_SAMPLES {
+        // ── Collect positive embeddings (combined old-style + streaming) ──
+        // Uses BOTH old-style dense-stride and streaming-pipeline embeddings
+        // for classifier training.  The old-style embeddings provide a strong
+        // learning signal (many dense windows), while the streaming embeddings
+        // match the inference distribution.  Combined training gives the Conv1D
+        // classifier more positive examples to learn from, producing better
+        // score separation than streaming-only training (mahbot-856 fix).
+        //
+        // The verifier (trained separately below) uses streaming-only embeddings
+        // for distribution match with inference (mahbot-855).
+        let (enrollment_buffer, streaming_enrollment_buffer) = {
+            let state = voice_state().read().unwrap_poison();
+            (
+                state.enrollment_buffer.clone(),
+                state.streaming_enrollment_buffer.clone(),
+            )
+        };
+
+        let positive_embeddings: Vec<Vec<f32>> = enrollment_buffer
+            .iter()
+            .flat_map(|sample| sample.iter().cloned())
+            .collect();
+
+        let positive_streaming_embeddings: Vec<Vec<f32>> = streaming_enrollment_buffer
+            .iter()
+            .flat_map(|sample| sample.iter().cloned())
+            .collect();
+
+        // ── Clone negative audio chunks once for extraction ──
+        let (negative_audio_chunks, _n_chunks, used_real_negatives) = {
+            let state = voice_state().read().unwrap_poison();
+            let chunks = state.negative_audio_chunks.clone();
+            let n = chunks.len();
+            let should_use = n >= 2 && ONNX_MODELS.get().is_some();
+            (chunks, n, should_use)
+        };
+
+        // ── Extract negatives ──
+        // Extracts BOTH old-style (dense-stride) and streaming-style
+        // negatives for classifier training (mahbot-856).  Old-style
+        // provides a rich learning signal (many dense windows);
+        // streaming-style matches the inference distribution.
+        // Combined training gives the classifier symmetric positive and
+        // negative distributions.
+        // The verifier uses streaming-only negatives (mahbot-855).
+        let (old_negative_embeddings, streaming_negative_embeddings) = if used_real_negatives {
+            // Move negative_audio_chunks into blocking extraction.
+            // Clone at line 4010 is the only copy — the 2nd clone
+            // (previously at line 4022) is eliminated by moving.
+            tokio::task::spawn_blocking(move || {
+                let models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
+                let mut old_neg = Vec::new();
+                let mut streaming_neg = Vec::new();
+                for chunk in &negative_audio_chunks {
+                    // Extract old-style negatives for rich learning signal
+                    match process_enrollment_sample(chunk) {
+                        Ok(embs) => old_neg.extend(embs),
+                        Err(e) => warn!(
+                            "Failed to extract old-style negative embedding \
+                                     from ambient audio chunk ({} samples): {e}",
+                            chunk.len(),
+                        ),
+                    }
+                    // Extract streaming negatives for distribution match
+                    match extract_streaming_embeddings_from_audio(models, chunk) {
+                        Ok(embs) => streaming_neg.extend(embs),
+                        Err(e) => warn!(
+                            "Failed to extract streaming negative embedding \
+                                     from ambient audio chunk ({} samples): {e}",
+                            chunk.len(),
+                        ),
+                    }
+                }
+                (old_neg, streaming_neg)
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // Conditionally clear negative_audio_chunks
+        if used_real_negatives {
+            voice_state()
+                .write()
+                .unwrap_poison()
+                .negative_audio_chunks
+                .clear();
+        }
+        let classifier_result = {
+            // Combined training: both positives and negatives use
+            // old-style + streaming embeddings (mahbot-856).
+            // `positive_embeddings` is moved (not used after).
+            // `positive_streaming_embeddings` is cloned once (for
+            // combine below), then moved into `pos_for_verifier`.
+            // `old_negative_embeddings` is moved.
+            // `streaming_negative_embeddings` is cloned once (for
+            // combine below), then moved into `neg_for_verifier`.
+            let mut combined_pos = positive_embeddings;
+            combined_pos.extend(positive_streaming_embeddings.clone());
+            let mut combined_neg = old_negative_embeddings;
+            combined_neg.extend(streaming_negative_embeddings.clone());
+
+            // ── Add pre-computed speech negatives for classifier training (mahbot-878) ──
+            // The Conv1D classifier previously trained only on ambient noise negatives,
+            // which taught it to reject silence but not confusable or unrelated speech.
+            // Pre-extracted dense embeddings from confusable and unrelated phrases are
+            // added here (extracted during startup prewarm, same pipeline as the
+            // streaming embeddings used for verifier training).
+            //
+            // These provide a rich learning signal (many dense windows per utterance)
+            // that helps the classifier learn to reject phonetic near-misses and
+            // unrelated commands, not just silence (mahbot-878).
+            let confusable_dense = confusable_dense_embeddings();
+            let unrelated_dense = unrelated_dense_embeddings();
+            if !confusable_dense.is_empty() {
+                info!(
+                    "Adding {} confusable dense embeddings to classifier \
+                             negative set (mahbot-878)",
+                    confusable_dense.len(),
+                );
+                combined_neg.extend_from_slice(confusable_dense);
+            }
+            if !unrelated_dense.is_empty() {
+                info!(
+                    "Adding {} unrelated dense embeddings to classifier \
+                             negative set (mahbot-878)",
+                    unrelated_dense.len(),
+                );
+                combined_neg.extend_from_slice(unrelated_dense);
+            }
+            // Use streaming enrollment buffer for consistency check
+            // (matches inference distribution).
+            let buf = streaming_enrollment_buffer.clone();
+            tokio::task::spawn_blocking(move || {
+                finalize_enrollment(&combined_pos, &combined_neg, &buf)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow!("Classifier training task panicked: {e}")))
+        };
+
+        let (weights, val_losses) = match classifier_result {
+            Ok(result) => {
+                // First model's weights for reporting (all are identical architecture)
+                let first_params = result
+                    .weights
+                    .first()
+                    .map_or(0, ClassifierWeights::param_count);
+                info!(
+                    "Enrollment complete: wake word '{}' (ensemble of {} models, \
+                             {} params each, {} epochs, best val loss={:.4})",
+                    WAKE_WORD_NAME,
+                    result.weights.len(),
+                    first_params,
+                    result.epochs_trained,
+                    result.best_val_loss,
+                );
+                let vl = result.val_losses.clone();
+                (result.weights, vl)
+            }
+            Err(e) => {
+                warn!("Enrollment finalization failed: {e}");
+                set_status(VoiceStatus::Error("Enrollment failed".to_string()));
                 return;
             }
+        };
 
-            // ── Handle streaming embeddings ──
-            let streaming_embeddings = match streaming_result {
-                Ok(se) => se,
-                Err(e) => {
-                    warn!("Streaming embedding extraction failed for this utterance: {e}");
-                    // Do NOT fall back to old-style embeddings — they would
-                    // reproduce the training/inference distribution mismatch
-                    // that causes 46.2% detection (mahbot-855 root cause).
-                    // An empty entry keeps the buffer aligned and is skipped
-                    // during verifier training via flat_map.
-                    Vec::new()
-                }
-            };
-
-            let (count, quality) = {
-                let mut state = voice_state().write().unwrap_poison();
-
-                // Compute quality BEFORE pushing: compare against existing samples
-                // (without the current sample in the comparison set).
-                let quality = Some(compute_utterance_quality(&samples_for_quality, noise_rms));
-
-                state.enrollment_buffer.push(embeddings);
-                state.streaming_enrollment_buffer.push(streaming_embeddings);
-                let count = state.enrollment_buffer.len();
-                // state dropped here — no lock held across await
-                (count, quality)
-            };
-
-            if count >= NUM_ENROLLMENT_SAMPLES {
-                // ── Collect positive embeddings (combined old-style + streaming) ──
-                // Uses BOTH old-style dense-stride and streaming-pipeline embeddings
-                // for classifier training.  The old-style embeddings provide a strong
-                // learning signal (many dense windows), while the streaming embeddings
-                // match the inference distribution.  Combined training gives the Conv1D
-                // classifier more positive examples to learn from, producing better
-                // score separation than streaming-only training (mahbot-856 fix).
-                //
-                // The verifier (trained separately below) uses streaming-only embeddings
-                // for distribution match with inference (mahbot-855).
-                let (enrollment_buffer, streaming_enrollment_buffer) = {
-                    let state = voice_state().read().unwrap_poison();
-                    (
-                        state.enrollment_buffer.clone(),
-                        state.streaming_enrollment_buffer.clone(),
-                    )
-                };
-
-                let positive_embeddings: Vec<Vec<f32>> = enrollment_buffer
-                    .iter()
-                    .flat_map(|sample| sample.iter().cloned())
-                    .collect();
-
-                let positive_streaming_embeddings: Vec<Vec<f32>> = streaming_enrollment_buffer
-                    .iter()
-                    .flat_map(|sample| sample.iter().cloned())
-                    .collect();
-
-                // ── Clone negative audio chunks once for extraction ──
-                let (negative_audio_chunks, _n_chunks, used_real_negatives) = {
-                    let state = voice_state().read().unwrap_poison();
-                    let chunks = state.negative_audio_chunks.clone();
-                    let n = chunks.len();
-                    let should_use = n >= 2 && ONNX_MODELS.get().is_some();
-                    (chunks, n, should_use)
-                };
-
-                // ── Extract negatives ──
-                // Extracts BOTH old-style (dense-stride) and streaming-style
-                // negatives for classifier training (mahbot-856).  Old-style
-                // provides a rich learning signal (many dense windows);
-                // streaming-style matches the inference distribution.
-                // Combined training gives the classifier symmetric positive and
-                // negative distributions.
-                // The verifier uses streaming-only negatives (mahbot-855).
-                let (old_negative_embeddings, streaming_negative_embeddings) =
-                    if used_real_negatives {
-                        // Move negative_audio_chunks into blocking extraction.
-                        // Clone at line 4010 is the only copy — the 2nd clone
-                        // (previously at line 4022) is eliminated by moving.
-                        tokio::task::spawn_blocking(move || {
-                            let models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
-                            let mut old_neg = Vec::new();
-                            let mut streaming_neg = Vec::new();
-                            for chunk in &negative_audio_chunks {
-                                // Extract old-style negatives for rich learning signal
-                                match process_enrollment_sample(chunk) {
-                                    Ok(embs) => old_neg.extend(embs),
-                                    Err(e) => warn!(
-                                        "Failed to extract old-style negative embedding \
-                                     from ambient audio chunk ({} samples): {e}",
-                                        chunk.len(),
-                                    ),
-                                }
-                                // Extract streaming negatives for distribution match
-                                match extract_streaming_embeddings_from_audio(models, chunk) {
-                                    Ok(embs) => streaming_neg.extend(embs),
-                                    Err(e) => warn!(
-                                        "Failed to extract streaming negative embedding \
-                                     from ambient audio chunk ({} samples): {e}",
-                                        chunk.len(),
-                                    ),
-                                }
-                            }
-                            (old_neg, streaming_neg)
-                        })
-                        .await
-                        .unwrap_or_default()
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
-
-                // Conditionally clear negative_audio_chunks
-                if used_real_negatives {
-                    voice_state()
-                        .write()
-                        .unwrap_poison()
-                        .negative_audio_chunks
-                        .clear();
-                }
-                let classifier_result = {
-                    // Combined training: both positives and negatives use
-                    // old-style + streaming embeddings (mahbot-856).
-                    // `positive_embeddings` is moved (not used after).
-                    // `positive_streaming_embeddings` is cloned once (for
-                    // combine below), then moved into `pos_for_verifier`.
-                    // `old_negative_embeddings` is moved.
-                    // `streaming_negative_embeddings` is cloned once (for
-                    // combine below), then moved into `neg_for_verifier`.
-                    let mut combined_pos = positive_embeddings;
-                    combined_pos.extend(positive_streaming_embeddings.clone());
-                    let mut combined_neg = old_negative_embeddings;
-                    combined_neg.extend(streaming_negative_embeddings.clone());
-                    // Use streaming enrollment buffer for consistency check
-                    // (matches inference distribution).
-                    let buf = streaming_enrollment_buffer.clone();
-                    tokio::task::spawn_blocking(move || {
-                        finalize_enrollment(&combined_pos, &combined_neg, &buf)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow!("Classifier training task panicked: {e}")))
-                };
-
-                let (weights, val_losses) = match classifier_result {
-                    Ok(result) => {
-                        // First model's weights for reporting (all are identical architecture)
-                        let first_params = result
-                            .weights
-                            .first()
-                            .map_or(0, ClassifierWeights::param_count);
-                        info!(
-                            "Enrollment complete: wake word '{}' (ensemble of {} models, \
-                             {} params each, {} epochs, best val loss={:.4})",
-                            WAKE_WORD_NAME,
-                            result.weights.len(),
-                            first_params,
-                            result.epochs_trained,
-                            result.best_val_loss,
-                        );
-                        let vl = result.val_losses.clone();
-                        (result.weights, vl)
-                    }
-                    Err(e) => {
-                        warn!("Enrollment finalization failed: {e}");
-                        set_status(VoiceStatus::Error("Enrollment failed".to_string()));
-                        return;
-                    }
-                };
-
-                // ── Train verifier in spawn_blocking (CPU-bound MLP with ──────
-                // up to 2000 iterations — must not block the
-                // async runtime during enrollment finalization, mahbot-855).
-                //
-                // The verifier uses STREAMING-style embeddings (from
-                // streaming_enrollment_buffer) so the training distribution
-                // matches the inference distribution (mahbot-855).  Both
-                // positives and negatives are processed through the streaming
-                // pipeline.
-                let pos_for_verifier = positive_streaming_embeddings; // moved — clone already taken for classifier combine
-                // Combine ambient negatives with pre-computed confusable and
-                // unrelated speech embeddings for verifier training (mahbot-859, mahbot-872).
-                let confusable_embs = confusable_negative_embeddings();
-                let unrelated_embs = unrelated_negative_embeddings();
-                let n_confusable_pre = confusable_embs.len();
-                let n_unrelated_pre = unrelated_embs.len();
-                let neg_for_verifier = {
-                    let mut neg = streaming_negative_embeddings; // moved — clone already taken for classifier combine
-                    if !unrelated_embs.is_empty() {
-                        info!(
-                            "Adding {} pre-computed unrelated speech streaming \
+        // ── Train verifier in spawn_blocking (CPU-bound MLP with ──────
+        // up to 2000 iterations — must not block the
+        // async runtime during enrollment finalization, mahbot-855).
+        //
+        // The verifier uses STREAMING-style embeddings (from
+        // streaming_enrollment_buffer) so the training distribution
+        // matches the inference distribution (mahbot-855).  Both
+        // positives and negatives are processed through the streaming
+        // pipeline.
+        let pos_for_verifier = positive_streaming_embeddings; // moved — clone already taken for classifier combine
+        // Combine ambient negatives with pre-computed confusable and
+        // unrelated speech embeddings for verifier training (mahbot-859, mahbot-872).
+        let confusable_embs = confusable_negative_embeddings();
+        let unrelated_embs = unrelated_negative_embeddings();
+        let n_confusable_pre = confusable_embs.len();
+        let n_unrelated_pre = unrelated_embs.len();
+        let neg_for_verifier = {
+            let mut neg = streaming_negative_embeddings; // moved — clone already taken for classifier combine
+            if !unrelated_embs.is_empty() {
+                info!(
+                    "Adding {} pre-computed unrelated speech streaming \
                              embeddings to verifier negative set (mahbot-872)",
-                            unrelated_embs.len(),
-                        );
-                        neg.extend_from_slice(unrelated_embs);
-                    }
-                    if !confusable_embs.is_empty() {
-                        info!(
-                            "Adding {} pre-computed confusable phrase streaming \
+                    unrelated_embs.len(),
+                );
+                neg.extend_from_slice(unrelated_embs);
+            }
+            if !confusable_embs.is_empty() {
+                info!(
+                    "Adding {} pre-computed confusable phrase streaming \
                              embeddings to verifier negative set (mahbot-859)",
-                            confusable_embs.len(),
-                        );
-                        neg.extend_from_slice(confusable_embs);
-                    }
-                    neg
-                };
-                let verifier = tokio::task::spawn_blocking(move || {
+                    confusable_embs.len(),
+                );
+                neg.extend_from_slice(confusable_embs);
+            }
+            neg
+        };
+        let verifier = tokio::task::spawn_blocking(move || {
                     use crate::voice_verifier::{
                         CONFUSABLE_UPWEIGHT, DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE,
                         MLP_MAX_ITER, UNRELATED_UPWEIGHT, VoiceVerifier,
@@ -5020,7 +5339,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                             Some(&per_neg_weights),
                             DEFAULT_VERIFIER_THRESHOLD,
                             L2_LAMBDA,       // 0.01
-                            LEARNING_RATE,   // 0.01
+                            LEARNING_RATE,   // 0.001 (Adam, mahbot-878)
                             MLP_MAX_ITER,    // 2000 — MLP converges faster than linear (mahbot-861)
                         );
                         info!(
@@ -5049,36 +5368,44 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     crate::voice_verifier::VoiceVerifier::untrained()
                 });
 
-                // ── Informational self-test (non-gating, diagnostic only) ──
-                let classifier =
-                    WakeWordClassifier::new_ensemble_weighted(weights.clone(), val_losses.clone());
-                match run_enrollment_self_test(&streaming_enrollment_buffer, &classifier) {
-                    Ok(()) => debug!("Detection self-test (informational): passed"),
-                    Err(e) => debug!("Detection self-test (informational, non-gating): {e}"),
-                }
-
-                // ── Store classifier + verifier in global state ──
-                set_classifier_weighted(weights.clone(), val_losses);
-                set_verifier(verifier);
-
-                // ── Persist to config DB ──
-                persist_model_state().await;
-
-                // Clear enrollment mode
-                set_status(VoiceStatus::Enrolled);
-            } else {
-                set_status(VoiceStatus::Enrolling {
-                    sample: count,
-                    total: NUM_ENROLLMENT_SAMPLES,
-                    duration_ms,
-                    quality,
-                });
-            }
+        // ── Informational self-test (non-gating, diagnostic only) ──
+        let classifier =
+            WakeWordClassifier::new_ensemble_weighted(weights.clone(), val_losses.clone());
+        match run_enrollment_self_test(&streaming_enrollment_buffer, &classifier) {
+            Ok(()) => debug!("Detection self-test (informational): passed"),
+            Err(e) => debug!("Detection self-test (informational, non-gating): {e}"),
         }
-        Err(e) => {
-            warn!("Failed to process enrollment sample: {e}");
-            set_status(VoiceStatus::Error("Failed to process sample".to_string()));
+
+        // ── Store classifier + verifier in global state ──
+        set_classifier_weighted(weights.clone(), val_losses);
+        set_verifier(verifier);
+
+        // ── Persist to config DB ──
+        persist_model_state().await;
+
+        // ── Clear enrollment accumulators ──
+        // After successful finalization, the live enrollment buffers and
+        // utterance counter are no longer needed.  Without this clearing,
+        // a subsequent Enroll click would see stale buffer entries (50+
+        // for 10 utterances with augmentation) and either resume into
+        // nonsensical UI counts or re-train with stale + new data
+        // (mahbot-878 fix).
+        {
+            let mut state = voice_state().write().unwrap_poison();
+            state.enrollment_buffer.clear();
+            state.streaming_enrollment_buffer.clear();
+            state.enrolled_utterance_count = 0;
         }
+
+        // Clear enrollment mode
+        set_status(VoiceStatus::Enrolled);
+    } else {
+        set_status(VoiceStatus::Enrolling {
+            sample: utterance_count,
+            total: NUM_ENROLLMENT_SAMPLES,
+            duration_ms,
+            quality,
+        });
     }
 }
 
@@ -5850,6 +6177,8 @@ fn try_match_wake_word_and_push_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::{add_noise, apply_gain, generate_pink_noise};
+    use rand::SeedableRng;
     use std::time::{Duration, Instant};
 
     // ── VAD-gated utterance segmentation tests ────────────────────────────
@@ -7204,5 +7533,282 @@ mod tests {
         let hash = tts_model_version_hash();
         assert!(!hash.is_empty(), "TTS model version hash must not be empty");
         assert_eq!(hash.len(), 64, "SHA-256 hex string must be 64 chars");
+    }
+
+    // ── PCM augmentation tests (mahbot-878) ────────────────────────────────
+
+    #[test]
+    fn test_speed_perturbation_identity() {
+        // rate=1.0 should return approximately the original
+        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
+        let result = speed_perturbation(&pcm, 16000, 1.0);
+        assert_eq!(result.len(), pcm.len(), "identity should preserve length");
+        for (a, b) in pcm.iter().zip(result.iter()) {
+            assert!((a - b).abs() < 1e-5, "identity should preserve values");
+        }
+    }
+
+    #[test]
+    fn test_speed_perturbation_rates() {
+        // Slow down: rate=0.5 should produce more samples
+        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
+        let slowed = speed_perturbation(&pcm, 16000, 0.5);
+        assert!(
+            slowed.len() > pcm.len(),
+            "rate < 1 should increase sample count"
+        );
+        // Speed up: rate=2.0 should produce fewer samples
+        let sped_up = speed_perturbation(&pcm, 16000, 2.0);
+        assert!(
+            sped_up.len() < pcm.len(),
+            "rate > 1 should decrease sample count"
+        );
+    }
+
+    #[test]
+    fn test_speed_perturbation_determinism() {
+        // Same input + same rate → same output
+        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
+        let a = speed_perturbation(&pcm, 16000, 0.95);
+        let b = speed_perturbation(&pcm, 16000, 0.95);
+        assert_eq!(a, b, "deterministic speed perturbation");
+    }
+
+    #[test]
+    fn test_apply_gain_determinism() {
+        // apply_gain must be deterministic: same PCM + same gain_db → same output
+        let pcm: Vec<f32> = (0..50).map(|i| (i as f32 - 25.0) / 25.0).collect();
+        let a = apply_gain(&pcm, -3.0);
+        let b = apply_gain(&pcm, -3.0);
+        assert_eq!(a, b, "apply_gain must be deterministic");
+    }
+
+    #[test]
+    fn test_apply_gain_db_conversion() {
+        // 0 dB → unity gain (output == input)
+        let pcm: Vec<f32> = vec![0.5, -0.3, 0.1, -0.7, 0.9];
+        let unity = apply_gain(&pcm, 0.0);
+        for (a, b) in pcm.iter().zip(unity.iter()) {
+            assert!((a - b).abs() < 1e-6, "0 dB gain should be unity");
+        }
+        // -6 dB → amplitude halved (10^(-6/20) ≈ 0.5)
+        let attenuated = apply_gain(&pcm, -6.0);
+        let expected_amp = 10.0_f32.powf(-6.0 / 20.0);
+        for (orig, atten) in pcm.iter().zip(attenuated.iter()) {
+            assert!(
+                (atten - orig * expected_amp).abs() < 1e-6,
+                "-6 dB gain should multiply by {expected_amp}"
+            );
+        }
+        // +6 dB → amplitude doubled (10^(6/20) ≈ 2.0)
+        let amplified = apply_gain(&pcm, 6.0);
+        let expected_amp2 = 10.0_f32.powf(6.0 / 20.0);
+        for (orig, amp) in pcm.iter().zip(amplified.iter()) {
+            assert!(
+                (amp - orig * expected_amp2).abs() < 1e-6,
+                "+6 dB gain should multiply by {expected_amp2}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_noise_determinism() {
+        // Same PCM + same SNR + same seed → same output
+        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
+        let a = add_noise(&pcm, 25.0, 42);
+        let b = add_noise(&pcm, 25.0, 42);
+        assert_eq!(a.len(), b.len(), "add_noise output length should match");
+        assert_eq!(a, b, "add_noise with same seed must be deterministic");
+    }
+
+    #[test]
+    fn test_add_noise_seed_variation() {
+        // Different seed → different output
+        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
+        let a = add_noise(&pcm, 25.0, 42);
+        let b = add_noise(&pcm, 25.0, 99);
+        assert_ne!(a, b, "different seeds should produce different output");
+    }
+
+    #[test]
+    fn test_add_noise_snr_approximation() {
+        // At very high SNR (100 dB), the output should be very close to input
+        let pcm: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) / 500.0).collect();
+        let noisy = add_noise(&pcm, 100.0, 42);
+        // Compute actual SNR of output vs input
+        let signal_power: f32 = pcm.iter().map(|&s| s * s).sum();
+        let noise_power: f32 = pcm
+            .iter()
+            .zip(noisy.iter())
+            .map(|(&s, &n)| (n - s) * (n - s))
+            .sum();
+        let actual_snr_db = 10.0 * (signal_power / noise_power.max(1e-10)).log10();
+        assert!(
+            actual_snr_db > 80.0,
+            "at 100 dB target, actual SNR should be high (was {actual_snr_db:.1} dB)"
+        );
+    }
+
+    #[test]
+    fn test_generate_pink_noise_properties() {
+        // Pink noise should have positive and negative values
+        let noise = generate_pink_noise(1000, rand::rngs::StdRng::seed_from_u64(42));
+        assert_eq!(noise.len(), 1000);
+        let has_positive = noise.iter().any(|&s| s > 0.0);
+        let has_negative = noise.iter().any(|&s| s < 0.0);
+        assert!(has_positive, "pink noise should have positive values");
+        assert!(has_negative, "pink noise should have negative values");
+        // RMS should be near 1.0 (normalized)
+        let rms = (noise.iter().map(|&s| s * s).sum::<f32>() / 1000.0_f32).sqrt();
+        assert!(
+            (rms - 1.0).abs() < 0.1,
+            "pink noise RMS should be near 1.0 (was {rms})"
+        );
+    }
+
+    #[test]
+    fn test_augmentation_variants_are_different() {
+        // Verify that the 4 augmentation strategies produce different results
+        let pcm: Vec<f32> = (0..500).map(|i| (i as f32 - 250.0) / 250.0).collect();
+        let speed_down = speed_perturbation(&pcm, 16000, 0.95);
+        let speed_up = speed_perturbation(&pcm, 16000, 1.05);
+        let volume_down = apply_gain(&pcm, -3.0);
+        let noise = add_noise(&pcm, 25.0, 42);
+
+        // Each variant should differ from original AND each other
+        assert_ne!(speed_down, pcm, "speed-down should differ from original");
+        assert_ne!(speed_up, pcm, "speed-up should differ from original");
+        assert_ne!(volume_down, pcm, "volume-down should differ from original");
+        assert_ne!(noise, pcm, "noise should differ from original");
+
+        // Verify they also differ from each other (different transforms)
+        assert_ne!(
+            speed_down, speed_up,
+            "speed-down and speed-up should differ"
+        );
+        assert_ne!(
+            speed_down, volume_down,
+            "speed-down and volume-down should differ"
+        );
+        assert_ne!(speed_down, noise, "speed-down and noise should differ");
+    }
+
+    #[test]
+    fn test_enrolled_utterance_count_vs_buffer_size() {
+        // Verify that enrolled_utterance_count tracks user utterances while
+        // enrollment_buffer may hold up to 5× entries due to augmentation.
+        // This models the production flow in handle_enrollment_sample where
+        // each utterance produces 5 embedding entries (original + 4 variants).
+
+        // ── Helper: simulate adding one utterance with all 5 variants ──
+        fn simulate_utterance(
+            state: &mut VoicePipelineState,
+            // Each variant produces some number of per-window embeddings.
+            variant_embeddings: &[usize], // one entry per variant
+        ) {
+            for &n_windows in variant_embeddings {
+                state.enrollment_buffer.push(vec![vec![0.1; 96]; n_windows]);
+                state
+                    .streaming_enrollment_buffer
+                    .push(vec![vec![0.2; 96]; n_windows]);
+            }
+            state.enrolled_utterance_count += 1;
+        }
+
+        let mut state = VoicePipelineState {
+            enabled: false,
+            status: VoiceStatus::Disabled,
+            classifier_weights: None,
+            classifier_val_losses: vec![],
+            classifier: None,
+            verifier: crate::voice_verifier::VoiceVerifier::untrained(),
+            enrollment_buffer: Vec::new(),
+            streaming_enrollment_buffer: Vec::new(),
+            negative_audio_chunks: Vec::new(),
+            enrolled_utterance_count: 0,
+            cmd_tx: None,
+        };
+
+        // ── Simulate 2 utterances with all 5 variants succeeding ──
+        // Each utterance produces 5 entries (original + 4 augmented).
+        for _ in 0..2 {
+            simulate_utterance(&mut state, &[3, 3, 3, 3, 3]);
+        }
+
+        assert_eq!(
+            state.enrolled_utterance_count, 2,
+            "utterance count tracks utterances, not buffer entries"
+        );
+        assert_eq!(
+            state.enrollment_buffer.len(),
+            10,
+            "2 utterances × 5 variants = 10 buffer entries"
+        );
+        assert_eq!(
+            state.streaming_enrollment_buffer.len(),
+            10,
+            "streaming buffer also has 10 entries"
+        );
+
+        // ── Simulate 3 more utterances (total 5) with speed-up skipped ──
+        // Speed-up is skipped when pre-padding < 500ms, so only 4 variants.
+        for _ in 0..3 {
+            simulate_utterance(&mut state, &[3, 3, 3, 3]); // 4 variants, no speed-up
+        }
+
+        assert_eq!(state.enrolled_utterance_count, 5, "5 utterances total");
+        assert_eq!(
+            state.enrollment_buffer.len(),
+            10 + 3 * 4, // 10 from first 2 + 12 from next 3
+            "buffer entries: 2×5 + 3×4 = 22"
+        );
+
+        // ── Verify the invariant: buffer entries >= utterance count ──
+        assert!(
+            state.enrollment_buffer.len() >= state.enrolled_utterance_count,
+            "buffer should have at least as many entries as utterances when augmentation runs"
+        );
+
+        // ── Simulate Cancel reset (delegates to production code path) ──
+        // Calls VoicePipelineState::reset_enrollment() — the same method
+        // used by PipelineCtx::reset_pipeline_state(ResetLevel::Cancel).
+        state.reset_enrollment();
+
+        assert_eq!(
+            state.enrolled_utterance_count, 0,
+            "after Cancel: utterance count reset"
+        );
+        assert!(
+            state.enrollment_buffer.is_empty(),
+            "after Cancel: buffer cleared"
+        );
+        assert!(
+            state.streaming_enrollment_buffer.is_empty(),
+            "after Cancel: streaming buffer cleared"
+        );
+
+        // ── Verify finalization threshold uses utterance count, not buffer size ──
+        // The production check at handle_enrollment_sample's finalization gate:
+        //   if utterance_count >= NUM_ENROLLMENT_SAMPLES { ... finalize ... }
+        // If we add 10 utterances with only 1 entry each (no augmentation),
+        // utterance_count should trigger finalization at 10, even though
+        // buffer has only 10 entries.
+        for _ in 0..10 {
+            simulate_utterance(&mut state, &[5]); // 1 variant (no augmentation)
+        }
+        assert_eq!(
+            state.enrolled_utterance_count, 10,
+            "10 utterances → finalization trigger"
+        );
+        assert_eq!(
+            state.enrollment_buffer.len(),
+            10,
+            "buffer also has 10 entries (no augmentation)"
+        );
+        // The trigger check: utterance_count >= 10
+        assert!(
+            state.enrolled_utterance_count >= 10,
+            "utterance count 10 reaches NUM_ENROLLMENT_SAMPLES threshold"
+        );
     }
 }
