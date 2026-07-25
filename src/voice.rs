@@ -33,7 +33,7 @@ use crate::ChatDirection;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use crate::vector::cosine_similarity;
-use crate::voice_verifier::{EMBEDDING_DIM, VoiceVerifier};
+use crate::voice_verifier::{EMBEDDING_DIM, VERIFIER_WINDOW_SIZE, VoiceVerifier};
 use crate::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -856,7 +856,7 @@ pub(crate) fn score_single_embedding(
     score_window: &mut Vec<f32>,
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
-    peak_verifier_score: Option<&mut f32>,
+    mut peak_verifier_score: Option<&mut f32>,
 ) -> (bool, f32) {
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
@@ -931,50 +931,74 @@ pub(crate) fn score_single_embedding(
         );
     }
 
-    // ── Verifier max score (mahbot-859) ───────────────────────────────
-    // Always compute the max verifier prediction over the rolling window
-    // so it can be shared between the verifier gate (below) and the peak
-    // verifier score tracking.  Computing it once per frame avoids
-    // duplicating the O(WINDOW_SIZE × EMBEDDING_DIM) predict loop.
+    // ── Verifier max score (mahbot-859, mahbot-870) ──────────────────
+    // Always compute the max verifier prediction over stride-1 3-frame
+    // windows from the ring buffer.  The verifier now operates on 288-dim
+    // windows (3×96) matching the classifier's windowing convention.
+    // Each window is formed from 3 consecutive embeddings via the shared
+    // `fill_verifier_window()` helper (stack-allocated, no heap allocation
+    // on the inference hot path).  The max across all stride-1 windows in
+    // the windowing range (line 957-958) is computed below, then accumulated
+    // into `peak_verifier_score` (across all frames) for the gate decision
+    // (mahbot-870).  Using the accumulated peak gives the verifier time to
+    // build temporally representative 3-frame windows — the rolling sum
+    // can peak at frame ~3 while the verifier needs frame ~5+.
     //
-    // NOTE (mahbot-860): The verifier condition uses !embedding_ring.is_empty()
-    // instead of embedding_ring.len() >= ROLLING_WINDOW_N because the rolling
-    // sum can reach its threshold with only 2 high-scoring frames (each >0.675
-    // with the 1.35 threshold).  Under the old condition the verifier returned
-    // 0.0 (blocking detection) when fewer than 3 embeddings were available,
-    // causing the F1.json_enroll0 failure where peak_score=2.059 and
-    // verifier=0.779 both exceeded their thresholds yet detection was suppressed.
+    // NOTE (mahbot-860): The verifier condition uses embedding_ring.len() >= 3
+    // instead of ROLLING_WINDOW_N because the rolling sum can reach its
+    // threshold with only 2 high-scoring frames (each >0.675 with the 1.35
+    // threshold).  The verifier needs at least 3 embeddings to form a single
+    // 3-frame window; with fewer than 3 we skip the verifier gate.
     let max_verifier_score: f32 = if let Some(v) = verifier
         && v.is_trained()
-        && !embedding_ring.is_empty()
+        && embedding_ring.len() >= VERIFIER_WINDOW_SIZE
     {
-        let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
-        embedding_ring[start..]
-            .iter()
-            .map(|emb| v.predict(emb))
-            .fold(0.0f32, f32::max)
+        let start = embedding_ring
+            .len()
+            .saturating_sub(ROLLING_WINDOW_N + VERIFIER_WINDOW_SIZE - 1);
+        let end = embedding_ring.len();
+        let mut max_score = 0.0f32;
+        // Score all stride-1 windows in the range [start, end - VERIFIER_WINDOW_SIZE].
+        // Use a fixed-size stack array (no heap allocation) for real-time safety
+        // on the streaming inference path (mahbot-870).
+        let mut window = [0.0f32; crate::voice_verifier::VERIFIER_INPUT_DIM];
+        for i in start..=end.saturating_sub(VERIFIER_WINDOW_SIZE) {
+            crate::voice_verifier::fill_verifier_window(embedding_ring, i, &mut window);
+            let score = v.predict(&window);
+            max_score = max_score.max(score);
+        }
+        max_score
     } else {
         0.0
     };
 
-    // Track peak verifier score for diagnostics/benchmarking (mahbot-859).
-    // Runs on every frame regardless of detection status to capture the
-    // peak even for non-detected frames (useful for false-accept analysis).
-    if let Some(peak) = peak_verifier_score
-        && max_verifier_score > *peak
+    // ── Verifier peak tracking + gate (mahbot-870) ──────────────────
+    // Track the peak verifier score across all frames and use it for
+    // the gate decision.  Use `ref` to borrow the Option without moving
+    // it — the peak is needed below for the gate after tracking.
+    if let Some(ref mut peak) = peak_verifier_score
+        && max_verifier_score > **peak
     {
-        *peak = max_verifier_score;
+        **peak = max_verifier_score;
     }
 
     if detected {
-        // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
+        // ── Verifier gate (mahbot-777, mahbot-788, mahbot-870) ──────────
         // After the rolling window check passes, run the second-stage
-        // logistic regression verifier to catch false positives that
-        // survived the MLP classifier.  Uses the pre-computed
-        // `max_verifier_score` from above.
+        // MLP verifier to catch false positives that survived the MLP
+        // classifier.  Uses the PEAK verifier score across all frames
+        // (not just the current frame's window max), because the rolling
+        // sum can peak at frame ~3 (3 consecutive high classifier scores)
+        // while the verifier's 3-frame stride-1 windows need more
+        // embeddings (frame ~5+) before they are temporally representative
+        // (mahbot-870).  Using the accumulated peak delays the blocking
+        // decision until enough embeddings exist, without weakening the
+        // gate for sustained confusable phrases.
+        let effective_verifier_score =
+            peak_verifier_score.map_or(max_verifier_score, |p| max_verifier_score.max(*p));
         if let Some(v) = verifier
             && v.is_trained()
-            && max_verifier_score < v.threshold
+            && effective_verifier_score < v.threshold
         {
             // ── Voice debug logging (mahbot-853) ────────────────────
             // When the `voice-debug` feature is enabled and
@@ -985,7 +1009,7 @@ pub(crate) fn score_single_embedding(
             #[cfg(feature = "voice-debug")]
             if voice_debug_enabled() {
                 info!(
-                    "VOICE_DEBUG: verifier blocked — max_score={max_verifier_score:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
+                    "VOICE_DEBUG: verifier blocked — frame_max={max_verifier_score:.4} peak={effective_verifier_score:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
                     v.threshold,
                 );
             }
@@ -993,6 +1017,10 @@ pub(crate) fn score_single_embedding(
             // Clear the score window so the next frame starts from zero.
             // Without this the accumulated classifier scores eventually
             // let any speech through (mahbot-797).
+            // The peak verifier score (across all frames) is already
+            // accumulated before this point, so the next time the rolling
+            // sum reaches threshold the same peak (or higher, if more
+            // embeddings have arrived) will be rechecked (mahbot-870).
             score_window.clear();
             return (false, rolling_sum);
         }
@@ -3632,7 +3660,11 @@ pub(crate) struct PipelineCtx {
     peak_score: f32,
     /// Peak verifier score achieved during the current detection session
     /// (mahbot-859).  Updated to track the highest verifier prediction
-    /// across all embeddings in the window.  Reset alongside `peak_score`.
+    /// across all embeddings in the window.  Reset on Full, Soft (mahbot-870),
+    /// and Cancel.  Unlike `peak_score` (which is intentionally preserved on
+    /// Soft to maintain acoustic context), `peak_verifier_score` is reset on
+    /// Soft because stale verifier scores from a previous detection session
+    /// would otherwise block subsequent detections (mahbot-870).
     peak_verifier_score: f32,
 }
 
@@ -3773,6 +3805,13 @@ impl PipelineCtx {
                 // vad_threshold, last_wake_word_detection cooldown,
                 // auto_start_pending, is_recording, and global enrollment accumulators.
                 self.audio_preprocessor.clear_buffer();
+                // Reset peak verifier score (mahbot-870).  The accumulated peak
+                // from the previous detection session would otherwise carry stale
+                // verifier scores across Soft pipeline resets (which occur during
+                // transition_to_recording's handoff).  Without this reset, a high
+                // verifier peak from an earlier detection session could block
+                // subsequent detections even after the classifier un-triggers.
+                self.peak_verifier_score = 0.0;
             }
             ResetLevel::Cancel => {
                 self.vad_threshold = VAD_THRESHOLD;
@@ -6414,6 +6453,8 @@ mod tests {
         ctx.last_wake_word_detection = Some(Instant::now() - Duration::from_secs(5));
         ctx.auto_start_pending = true;
         ctx.is_recording = true;
+        ctx.peak_score = 0.75;
+        ctx.peak_verifier_score = 0.75;
         ctx
     }
 
@@ -6462,11 +6503,16 @@ mod tests {
 
         assert_buffers_cleared(&ctx);
 
-        // Full-specific: state flags reset.
+        // Full-specific: state flags and peak scores reset.
         assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
         assert!(ctx.last_wake_word_detection.is_none());
         assert!(!ctx.auto_start_pending);
         assert!(!ctx.is_recording);
+        assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Full");
+        assert_eq!(
+            ctx.peak_verifier_score, 0.0,
+            "peak_verifier_score must be reset on Full",
+        );
 
         // Global enrollment accumulators PRESERVED by Full — they survive
         // mic stop/start cycles so mid-enrollment progress is not lost on
@@ -6511,6 +6557,7 @@ mod tests {
         let saved_cooldown = ctx.last_wake_word_detection;
         let saved_auto_start = ctx.auto_start_pending;
         let saved_recording = ctx.is_recording;
+        let saved_peak_score = ctx.peak_score;
 
         ctx.reset_pipeline_state(ResetLevel::Soft);
 
@@ -6521,6 +6568,13 @@ mod tests {
         assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
+        // Soft resets peak_verifier_score (mahbot-870) but preserves peak_score
+        // (which is only reset on Full/Cancel alongside the wider acoustic state).
+        assert_eq!(
+            ctx.peak_verifier_score, 0.0,
+            "peak_verifier_score must be reset on Soft"
+        );
+        assert_eq!(ctx.peak_score, saved_peak_score);
 
         // Global enrollment accumulators preserved.
         let state = voice_state().read().unwrap_poison();
@@ -6555,6 +6609,12 @@ mod tests {
         // Cancel preserves handler-managed flags (unlike Full).
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
+        // Cancel resets both peak scores.
+        assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Cancel");
+        assert_eq!(
+            ctx.peak_verifier_score, 0.0,
+            "peak_verifier_score must be reset on Cancel",
+        );
 
         // Global enrollment accumulators cleared (unlike Soft).
         let state = voice_state().read().unwrap_poison();

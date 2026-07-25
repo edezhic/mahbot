@@ -1738,6 +1738,7 @@ pub(crate) fn run_internal() {
         });
         verifier_negatives.extend(embs);
     }
+    let n_ambient_verifier = verifier_negatives.len();
     // Include confusable phrase streaming embeddings (mahbot-859) so the
     // verifier learns to reject phonetic near-misses like "hey map bot".
     for agc_confusable in [&agc_confusable_1, &agc_confusable_2, &agc_confusable_3] {
@@ -1746,11 +1747,27 @@ pub(crate) fn run_internal() {
         });
         verifier_negatives.extend(embs);
     }
+    let n_confusable_verifier = verifier_negatives.len() - n_ambient_verifier;
     verifier_negatives.extend(generate_synthetic_negatives_from_positives(
         SYNTHETIC_NEGATIVES_COUNT,
         &all_streaming_embeddings,
         1.5,
     ));
+    let n_synthetic_verifier = SYNTHETIC_NEGATIVES_COUNT;
+
+    // Build per-negative weights matching production (mahbot-870 Fix 3):
+    // ambient negatives get 1.0, confusable near-miss phrases get
+    // CONFUSABLE_UPWEIGHT (100×) so the verifier learns to reject them
+    // despite being a small fraction of the negative set.
+    let n_neg_total = verifier_negatives.len();
+    let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg_total);
+    per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient_verifier));
+    per_neg_weights.extend(std::iter::repeat_n(
+        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+        n_confusable_verifier,
+    ));
+    per_neg_weights.extend(std::iter::repeat_n(1.0, n_synthetic_verifier));
+    assert_eq!(per_neg_weights.len(), n_neg_total);
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
 
     // ── Phase 4: finalize_enrollment (consistency check + classifier training) ──
@@ -1849,7 +1866,7 @@ pub(crate) fn run_internal() {
     let verifier = VoiceVerifier::train(
         &all_streaming_embeddings,
         &verifier_negatives,
-        None, // per-negative weights not needed in test (confusable already in set)
+        Some(&per_neg_weights), // per-negative weights matching production (mahbot-870 Fix 3)
         VoiceVerifier::default_threshold(),
         L2_LAMBDA,     // mahbot-854: 0.01
         LEARNING_RATE, // mahbot-854: 0.01
