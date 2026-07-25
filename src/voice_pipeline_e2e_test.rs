@@ -67,20 +67,16 @@ const NUM_AUGMENTATION_VARIANTS: usize = 8;
 /// Minimum detection rate for positive (wake word) variants required to pass.
 const MIN_DETECTION_RATE: f64 = 0.85;
 
-/// Maximum number of false accepts across ALL negative tests (confusable +
-/// unrelated + silence + noise).
-const MAX_FALSE_ACCEPTS: usize = 2;
-
-/// Per-category false accept limits (mahbot-844 Part 5).
-const MAX_CONFUSABLE_FA: usize = 1;
-const MAX_UNRELATED_FA: usize = 0;
-const MAX_SILENCE_FA: usize = 0;
-const MAX_NOISE_FA: usize = 1;
+/// Per-category false accept limits are now dynamic by tier — see
+/// [`tier_limits`] and [`BenchTier`] (mahbot-871).
 
 /// Confusable near-miss phrases for negative detection testing (mahbot-834).
 ///
 /// Uses the canonical list from the parent `voice` module (mahbot-859).
 const CONFUSABLE_PHRASES: &[&str] = super::CONFUSABLE_PHRASES;
+const CONFUSABLE_HARD: &[&str] = super::CONFUSABLE_HARD;
+const CONFUSABLE_MEDIUM: &[&str] = super::CONFUSABLE_MEDIUM;
+const CONFUSABLE_EASY: &[&str] = super::CONFUSABLE_EASY;
 
 /// Completely unrelated phrases for negative detection testing (mahbot-834).
 ///
@@ -175,7 +171,135 @@ const NOISE_OVERLAP_TYPES: &[(&str, NoiseGenerator)] = &[
     ("pink", generate_pink_noise),
     ("brown", generate_brown_noise),
 ];
-/// Hard-clipped applies +12dB gain then clamps at ±1.0 (simulating microphone
+
+// ── Tiered benchmark configuration (mahbot-871) ────────────────────────────
+
+/// Difficulty tiers for confusable phrase testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchTier {
+    Easy,
+    Medium,
+    Hard,
+}
+
+impl BenchTier {
+    /// Index into a 3-element array: Easy→0, Medium→1, Hard→2.
+    const fn index(self) -> usize {
+        match self {
+            BenchTier::Easy => 0,
+            BenchTier::Medium => 1,
+            BenchTier::Hard => 2,
+        }
+    }
+
+    /// Stable string label for JSON and human-readable output.
+    const fn as_str(self) -> &'static str {
+        match self {
+            BenchTier::Easy => "easy",
+            BenchTier::Medium => "medium",
+            BenchTier::Hard => "hard",
+        }
+    }
+}
+
+/// Per-category false-accept limits for a given tier.
+#[derive(Debug, Clone, Copy)]
+struct TierLimits {
+    confusable: usize,
+    unrelated: usize,
+    silence: usize,
+    noise: usize,
+    total: usize,
+}
+
+/// Resolve the benchmark tier from `MAHBOT_BENCH_TIER` env var.
+/// Defaults to `Hard` when unset or set to an unrecognized value.
+fn resolve_bench_tier() -> BenchTier {
+    match std::env::var("MAHBOT_BENCH_TIER") {
+        Ok(val) => match val.to_lowercase().as_str() {
+            "easy" => BenchTier::Easy,
+            "medium" => BenchTier::Medium,
+            "hard" => BenchTier::Hard,
+            other => {
+                warn!("Unknown MAHBOT_BENCH_TIER value '{other}'. Falling back to 'hard'.");
+                eprintln!("⚠ Unknown MAHBOT_BENCH_TIER value '{other}' — falling back to 'hard'.");
+                BenchTier::Hard
+            }
+        },
+        Err(_) => BenchTier::Hard,
+    }
+}
+
+/// Return the per-category false-accept limits for the given tier.
+const fn tier_limits(tier: BenchTier) -> TierLimits {
+    match tier {
+        BenchTier::Easy => TierLimits {
+            confusable: 0,
+            unrelated: 0,
+            silence: 0,
+            noise: 0,
+            total: 0,
+        },
+        BenchTier::Medium => TierLimits {
+            confusable: 1,
+            unrelated: 0,
+            silence: 0,
+            noise: 1,
+            total: 1, // combined confusable+noise cap (tighter than sum of individual limits)
+        },
+        BenchTier::Hard => TierLimits {
+            confusable: 1,
+            unrelated: 0,
+            silence: 0,
+            noise: 1,
+            total: 2,
+        },
+    }
+}
+
+/// Extract the phrase text from a generate_phrase_variants_cached label.
+///
+/// Label format: `"{prefix}_{phrase}_s{i}"` e.g. `"confusable_hey madbot_s0"`.
+///
+/// The seed suffix `_s{i}` (underscore + 's' + digits) is always the
+/// rightmost `_s` in the label, so `rfind` finds it correctly even if the
+/// phrase text itself contains the substring `_s`. We additionally verify
+/// that the `_s` is followed by at least one ASCII digit as a sanity check
+/// against label-format drift.
+fn phrase_from_label<'a>(label: &'a str, prefix: &str) -> &'a str {
+    let after_prefix = label
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_prefix('_'))
+        .unwrap_or(label);
+    // The seed suffix `_s{i}` is always the rightmost `_s` in the label.
+    if let Some(idx) = after_prefix.rfind("_s") {
+        let after_s = &after_prefix[idx + 2..];
+        if after_s.starts_with(|c: char| c.is_ascii_digit()) {
+            return &after_prefix[..idx];
+        }
+    }
+    // No valid seed suffix found; return the full string after the prefix.
+    after_prefix
+}
+
+/// Determine the difficulty tier for a confusable phrase.
+fn tier_for_phrase(phrase: &str) -> BenchTier {
+    if CONFUSABLE_HARD.contains(&phrase) {
+        BenchTier::Hard
+    } else if CONFUSABLE_MEDIUM.contains(&phrase) {
+        BenchTier::Medium
+    } else if CONFUSABLE_EASY.contains(&phrase) {
+        BenchTier::Easy
+    } else {
+        unreachable!(
+            "Confusable phrase '{phrase}' not found in any tier array. \
+             The phrase must exist in exactly one of CONFUSABLE_HARD/MEDIUM/EASY, \
+             and those arrays must together cover all entries in CONFUSABLE_PHRASES."
+        )
+    }
+}
+
+// ── TTS audio cache (mahbot-844 Part 1) ─────────────────────────────────────
 /// clipping after boost) — so the gain parameter is 12.0 with clip=true.
 const VOLUME_SWEEP_LEVELS: &[(&str, f32, bool)] = &[
     ("minus_12dB", -12.0, false),
@@ -1093,6 +1217,10 @@ fn run_volume_sweep(
 ///
 /// Slices already-synthesized speech (confusable/unrelated) before wake word
 /// audio and tests whether the wake word is still detected.
+///
+/// `confusable_variants` **must** contain only hard-tier confusable variants
+/// (see mahbot-871 — the mid-utterance test always uses the hardest confusable
+/// distractor regardless of the selected benchmark tier).
 fn run_mid_utterance_test(
     all_wake_variants: &[(Vec<f32>, String)],
     confusable_variants: &[(Vec<f32>, String)],
@@ -1350,6 +1478,15 @@ pub(crate) fn run_internal() {
     let mut phase_times = [0u64; NUM_PHASES];
 
     info!("═══ Voice Pipeline E2E Benchmark ═══");
+
+    // Resolve benchmark tier and limits (mahbot-871).
+    let selected_tier = resolve_bench_tier();
+    let limits = tier_limits(selected_tier);
+    let selected_tier_str = selected_tier.as_str();
+    info!(
+        "Benchmark tier: {selected_tier_str} (confusable FA ≤{}, total FA ≤{})",
+        limits.confusable, limits.total
+    );
 
     // ── 0. Initialize global state ─────────────────────────────────────
     // Set CONFIG storage root so model paths resolve.
@@ -1763,6 +1900,9 @@ pub(crate) fn run_internal() {
     let mut volume_sweep_results: Vec<(&str, f64)> = Vec::new();
     let mut mid_utterance_results: Vec<(&str, bool)> = Vec::new();
     let mut noise_overlap_results: Vec<(String, f64)> = Vec::new();
+    // Per-tier confusable fa tracking (mahbot-871). Populated after Phase 9.
+    let mut conf_fa_by_tier: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let conf_fa_hard_variants: Vec<(Vec<f32>, String)>;
 
     // Latency stats — declared here (for scope) but populated inside the
     // detection block (or remain at defaults when degenerate).
@@ -1829,6 +1969,25 @@ pub(crate) fn run_internal() {
             &mut conf_metrics,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
+        );
+        // Split false accepts by tier for per-tier tracking (mahbot-871).
+        for label in &conf_metrics.false_accepts {
+            let phrase = phrase_from_label(label, "confusable");
+            let tier_idx = tier_for_phrase(phrase).index();
+            conf_fa_by_tier[tier_idx].push(label.clone());
+        }
+        // Build hard-tier confusable variants slice for mid-utterance test.
+        conf_fa_hard_variants = confusable_variants
+            .iter()
+            .filter(|(_, label)| {
+                let phrase = phrase_from_label(label, "confusable");
+                CONFUSABLE_HARD.contains(&phrase)
+            })
+            .cloned()
+            .collect();
+        info!(
+            "Hard-tier confusable variants: {} (for mid-utterance test)",
+            conf_fa_hard_variants.len()
         );
         phase_times[P_CONFUSABLE_NEGATIVES] = phase_end_ms!();
 
@@ -1988,9 +2147,10 @@ pub(crate) fn run_internal() {
 
         // ── Part 4: Mid-utterance detection (informational) ──────────────
         info!("─── Mid-utterance detection (informational) ───");
+        // Always use hard-tier confusable variants as distractor (mahbot-871).
         mid_utterance_results = run_mid_utterance_test(
             &all_wake_variants,
-            &confusable_variants,
+            &conf_fa_hard_variants,
             &unrelated_variants,
         );
     } else {
@@ -2007,7 +2167,8 @@ pub(crate) fn run_internal() {
     // ── Phase 15 timing ─────────────────────────────────
     phase_start!("Phase 15: Teardown");
 
-    let total_false_accepts = conf_metrics.false_accepts.len()
+    let selected_conf_fa = &conf_fa_by_tier[selected_tier.index()];
+    let total_false_accepts = selected_conf_fa.len()
         + unrelated_metrics.false_accepts.len()
         + silence_metric.false_accepts.len()
         + noise_false_accepts.len();
@@ -2027,37 +2188,50 @@ pub(crate) fn run_internal() {
         MIN_DETECTION_RATE * 100.0,
     );
     info!(
-        "Confusable false accepts: {} / {} (limit ≤{MAX_CONFUSABLE_FA})",
-        conf_metrics.false_accepts.len(),
+        "Confusable false accepts: {} / {} (tier={selected_tier_str}, selected limit ≤{})",
+        selected_conf_fa.len(),
         conf_metrics.total,
+        limits.confusable,
     );
     if !conf_metrics.false_accepts.is_empty() {
-        info!("  False triggers: {:?}", conf_metrics.false_accepts);
+        info!(
+            "  All confusable false triggers: {:?}",
+            conf_metrics.false_accepts
+        );
+        if !selected_conf_fa.is_empty() {
+            info!("  Selected-tier triggers: {:?}", selected_conf_fa);
+        }
     }
     info!(
-        "Unrelated false accepts: {} / {} (limit ≤{MAX_UNRELATED_FA})",
+        "Unrelated false accepts: {} / {} (limit ≤{})",
         unrelated_metrics.false_accepts.len(),
         unrelated_metrics.total,
+        limits.unrelated,
     );
     if !unrelated_metrics.false_accepts.is_empty() {
         info!("  False triggers: {:?}", unrelated_metrics.false_accepts);
     }
     info!(
-        "Silence false accepts: {} / 1 (limit ≤{MAX_SILENCE_FA})",
+        "Silence false accepts: {} / 1 (limit ≤{})",
         silence_metric.false_accepts.len(),
+        limits.silence,
     );
     info!(
-        "Noise false accepts: {} / {} ({} profiles, limit ≤{MAX_NOISE_FA})",
+        "Noise false accepts: {} / {} ({} profiles, limit ≤{})",
         noise_false_accepts.len(),
         NOISE_PROFILES.len(),
         NOISE_PROFILES.len(),
+        limits.noise,
     );
     if !noise_false_accepts.is_empty() {
         info!("  False triggers: {:?}", noise_false_accepts);
     }
 
     info!("──────────────────────────────────────────────");
-    info!("Total false accepts: {total_false_accepts} — limit ≤{MAX_FALSE_ACCEPTS}");
+    info!(
+        "Total false accepts: {total_false_accepts} — tier limit ≤{}",
+        limits.total
+    );
     info!("Enrollment consistency: validated by finalize_enrollment (Phase 4)");
     info!("══════════════════════════════════════════════");
 
@@ -2088,14 +2262,14 @@ pub(crate) fn run_internal() {
         // Detection rate assertion
         let dr_ok = pos_metrics.detection_rate() >= MIN_DETECTION_RATE;
 
-        // Per-category false accept assertions (mahbot-844 Part 5)
-        let conf_fa_ok = conf_metrics.false_accepts.len() <= MAX_CONFUSABLE_FA;
-        let unrel_fa_ok = unrelated_metrics.false_accepts.len() == MAX_UNRELATED_FA;
-        let silence_fa_ok = silence_metric.false_accepts.len() == MAX_SILENCE_FA;
-        let noise_fa_ok = noise_false_accepts.len() <= MAX_NOISE_FA;
+        // Per-category false accept assertions (tiered, mahbot-871)
+        let conf_fa_ok = selected_conf_fa.len() <= limits.confusable;
+        let unrel_fa_ok = unrelated_metrics.false_accepts.len() <= limits.unrelated;
+        let silence_fa_ok = silence_metric.false_accepts.len() <= limits.silence;
+        let noise_fa_ok = noise_false_accepts.len() <= limits.noise;
 
-        // Aggregate assertion
-        let total_fa_ok = total_false_accepts <= MAX_FALSE_ACCEPTS;
+        // Aggregate assertion (tier-specific, mahbot-871)
+        let total_fa_ok = total_false_accepts <= limits.total;
 
         dr_ok
             && conf_fa_ok
@@ -2124,14 +2298,23 @@ pub(crate) fn run_internal() {
     }
 
     // Build per-variant negative diagnostics with verifier scores (mahbot-859).
+    // Confusable variants get tier-qualified categories (mahbot-871):
+    // selected-tier → "confusable", non-selected → "confusable_{tier}".
     let mut negative_pv: Vec<serde_json::Value> = Vec::new();
     for pv in &conf_metrics.per_variant {
+        let phrase = phrase_from_label(&pv.variant, "confusable");
+        let variant_tier = tier_for_phrase(phrase);
+        let category = if variant_tier == selected_tier {
+            "confusable".to_string()
+        } else {
+            format!("confusable_{}", variant_tier.as_str())
+        };
         negative_pv.push(serde_json::json!({
             "variant": pv.variant,
             "detected": pv.detected,
             "peak_score": pv.peak_score,
             "verifier_score": pv.verifier_score,
-            "category": "confusable",
+            "category": category,
         }));
     }
     for pv in &unrelated_metrics.per_variant {
@@ -2167,6 +2350,14 @@ pub(crate) fn run_internal() {
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
         "passed": passed,
+        "tier": selected_tier_str,
+        "effective_limits": {
+            "confusable": limits.confusable,
+            "unrelated": limits.unrelated,
+            "silence": limits.silence,
+            "noise": limits.noise,
+            "total": limits.total,
+        },
         "phases": {
             "phase_1_enrollment_audio_ms": phase_times[P_ENROLLMENT_AUDIO],
             "phase_2_vad_enrollment_ms": phase_times[P_VAD_ENROLLMENT],
@@ -2189,7 +2380,7 @@ pub(crate) fn run_internal() {
             "detected": pos_metrics.detected,
             "total_positive": pos_metrics.total,
             "false_accepts": {
-                "confusable": conf_metrics.false_accepts.len(),
+                "confusable": selected_conf_fa.len(),
                 "unrelated": unrelated_metrics.false_accepts.len(),
                 "silence": silence_metric.false_accepts.len(),
                 "noise": noise_false_accepts.len(),
@@ -2235,13 +2426,6 @@ pub(crate) fn run_internal() {
         "config": {
             "num_enrollment_variants": NUM_ENROLLMENT_VARIANTS,
             "min_detection_rate": MIN_DETECTION_RATE,
-            "max_total_false_accepts": MAX_FALSE_ACCEPTS as u64,
-            "per_category_limits": {
-                "confusable": MAX_CONFUSABLE_FA,
-                "unrelated": MAX_UNRELATED_FA,
-                "silence": MAX_SILENCE_FA,
-                "noise": MAX_NOISE_FA,
-            }
         }
     });
 
@@ -2253,6 +2437,78 @@ pub(crate) fn run_internal() {
     );
     println!("--- BENCHMARK_JSON_END ---");
 
+    // ── Human-readable report (stderr, mahbot-871) ────────────────────────
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let dr = pos_metrics.detection_rate();
+    let dr_ok = dr >= MIN_DETECTION_RATE;
+    let dr_pass = if dr_ok { '✓' } else { '✗' };
+    let overall_pass = if passed { '✓' } else { '✗' };
+
+    // Per-tier counts for report
+    let fa_easy = conf_fa_by_tier[0].len();
+    let fa_medium = conf_fa_by_tier[1].len();
+    let fa_hard = conf_fa_by_tier[2].len();
+
+    eprintln!(
+        "\n\
+         ═══════════════════════════════════════════════════════════\n\
+                 Voice Pipeline E2E Benchmark Report\n\
+         ═══════════════════════════════════════════════════════════\n\
+         Date/Time:      {timestamp}\n\
+         Tier:           {selected_tier_str}\n\
+         Detection rate: {dr:.1}% ({detected}/{total})  {dr_pass} (target ≥{MIN_DETECTION_RATE:.0}%)\n\
+         False accepts:\n\
+           Confusable:\n\
+             Easy:    {fa_easy}",
+        detected = pos_metrics.detected,
+        total = pos_metrics.total,
+    );
+    if !conf_fa_by_tier[0].is_empty() {
+        eprintln!("               Triggers: {:?}", conf_fa_by_tier[0]);
+    }
+    eprintln!("             Medium:  {fa_medium}",);
+    if !conf_fa_by_tier[1].is_empty() {
+        eprintln!("               Triggers: {:?}", conf_fa_by_tier[1]);
+    }
+    eprintln!("             Hard:    {fa_hard}",);
+    if !conf_fa_by_tier[2].is_empty() {
+        eprintln!("               Triggers: {:?}", conf_fa_by_tier[2]);
+    }
+    let unrelated_count = unrelated_metrics.false_accepts.len();
+    let unrelated_ok = unrelated_count <= limits.unrelated;
+    let silence_count = silence_metric.false_accepts.len();
+    let silence_ok = silence_count <= limits.silence;
+    let noise_count = noise_false_accepts.len();
+    let noise_ok = noise_count <= limits.noise;
+    let total_ok = total_false_accepts <= limits.total;
+    eprintln!(
+        "           Unrelated:  {unrelated_count}  {unrel_pass_char} (limit ≤{})",
+        limits.unrelated,
+        unrel_pass_char = if unrelated_ok { '✓' } else { '✗' },
+    );
+    eprintln!(
+        "           Silence:    {silence_count}  {sil_pass_char} (limit ≤{})",
+        limits.silence,
+        sil_pass_char = if silence_ok { '✓' } else { '✗' },
+    );
+    eprintln!(
+        "           Noise:      {noise_count}  {noise_pass_char} (limit ≤{})",
+        limits.noise,
+        noise_pass_char = if noise_ok { '✓' } else { '✗' },
+    );
+    eprintln!(
+        "           ───────────────────────────────────────\n\
+         \x20          Total:      {total_false_accepts}  {total_pass_char} (limit ≤{})",
+        limits.total,
+        total_pass_char = if total_ok { '✓' } else { '✗' },
+    );
+    eprintln!(
+        "         ═══════════════════════════════════════════════════════════\n\
+                   RESULT: {overall_pass} {}\n\
+         ═══════════════════════════════════════════════════════════",
+        if passed { "PASS" } else { "FAIL" },
+    );
+
     // ── Assertions (gated) ──
     assert!(
         pos_metrics.detection_rate() >= MIN_DETECTION_RATE,
@@ -2263,32 +2519,37 @@ pub(crate) fn run_internal() {
         MIN_DETECTION_RATE * 100.0,
     );
 
-    // Aggregate false accept limit
+    // Aggregate false accept limit (tier-specific, mahbot-871)
     assert!(
-        total_false_accepts <= MAX_FALSE_ACCEPTS,
-        "Too many false accepts: {total_false_accepts} — need ≤{MAX_FALSE_ACCEPTS}",
+        total_false_accepts <= limits.total,
+        "Too many false accepts: {total_false_accepts} — tier={selected_tier_str} limit ≤{total}",
+        total = limits.total,
     );
 
-    // Per-category false accept limits (mahbot-844 Part 5)
+    // Per-category false accept limits (tier-specific, mahbot-871)
     assert!(
-        conf_metrics.false_accepts.len() <= MAX_CONFUSABLE_FA,
-        "Too many confusable false accepts: {} — need ≤{MAX_CONFUSABLE_FA}",
-        conf_metrics.false_accepts.len(),
+        selected_conf_fa.len() <= limits.confusable,
+        "Too many confusable false accepts in tier '{selected_tier_str}': {} — need ≤{}",
+        selected_conf_fa.len(),
+        limits.confusable,
     );
     assert!(
-        unrelated_metrics.false_accepts.len() == MAX_UNRELATED_FA,
-        "Too many unrelated false accepts: {} — need =={MAX_UNRELATED_FA}",
+        unrelated_metrics.false_accepts.len() <= limits.unrelated,
+        "Too many unrelated false accepts: {} — need ≤{}",
         unrelated_metrics.false_accepts.len(),
+        limits.unrelated,
     );
     assert!(
-        silence_metric.false_accepts.len() == MAX_SILENCE_FA,
-        "Too many silence false accepts: {} — need =={MAX_SILENCE_FA}",
+        silence_metric.false_accepts.len() <= limits.silence,
+        "Too many silence false accepts: {} — need ≤{}",
         silence_metric.false_accepts.len(),
+        limits.silence,
     );
     assert!(
-        noise_false_accepts.len() <= MAX_NOISE_FA,
-        "Too many noise false accepts: {} — need ≤{MAX_NOISE_FA}",
+        noise_false_accepts.len() <= limits.noise,
+        "Too many noise false accepts: {} — need ≤{}",
         noise_false_accepts.len(),
+        limits.noise,
     );
 
     assert!(

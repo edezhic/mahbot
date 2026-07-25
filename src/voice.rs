@@ -338,11 +338,53 @@ pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
     "may bot",
 ];
 
+/// Hard-tier confusable phrases — direct phonetic substitutions (wake-word-like).
+/// These are the most acoustically similar to the wake word.
+/// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
+#[cfg(feature = "voice-tests")]
+pub(crate) const CONFUSABLE_HARD: &[&str] = &[
+    "hey madbot",
+    "hey map bot",
+    "day mahbot",
+    "hey nab it",
+    "hey man",
+    "hey mabot",
+    "hey mahbott",
+    "hey mat",
+    "hey max",
+    "pay mabot",
+];
+
+/// Medium-tier confusable phrases — rhythmic/melodic confusables and embedded
+/// wake-word sounds. Moderately difficult to distinguish from the wake word.
+/// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
+#[cfg(feature = "voice-tests")]
+pub(crate) const CONFUSABLE_MEDIUM: &[&str] = &[
+    "hay map pot",
+    "huh mahbot",
+    "eh mad bot",
+    "hey maybott",
+    "they mad bot",
+    "haymaker",
+    "hey maybe not",
+    "play mah jong",
+    "hey matter of fact",
+    "a day with mahbot",
+];
+
+/// Easy-tier confusable phrases — short phonetic near-misses.
+/// These are single-phoneme substitutions that are relatively easy to reject.
+/// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
+#[cfg(feature = "voice-tests")]
+pub(crate) const CONFUSABLE_EASY: &[&str] = &[
+    "madbot", "mat bot", "bad bot", "mad lot", "mad pot", "med bot", "my bot", "may bot",
+];
+
 /// Cache for pre-computed confusable phrase streaming embeddings (mahbot-859).
 ///
 /// Populated asynchronously during startup (see [`prewarm_confusable_embeddings`])
 /// after voice ONNX models and TTS models are ready, so enrollment never blocks
-/// on TTS synthesis (~2 minutes for 29 phrases).  Uses AGC pre-processing to
+/// on TTS synthesis (~2 minutes for 28 phrases).  Uses AGC pre-processing to
 /// match the production inference distribution (mahbot-859 Fix 2).
 ///
 /// The embeddings are used during verifier training to teach the logistic
@@ -478,7 +520,7 @@ pub(crate) async fn prewarm_confusable_embeddings() {
     let phrases: &[&str] = CONFUSABLE_PHRASES;
 
     // Runs TTS synthesis, AGC, and ONNX embedding extraction in a blocking
-    // thread to avoid starving the async runtime (~2 minutes for 29 phrases
+    // thread to avoid starving the async runtime (~2 minutes for 28 phrases
     // of TTS + fast ONNX inference).
     let result: Vec<Vec<f32>> = tokio::task::spawn_blocking(move || {
         use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
@@ -6605,5 +6647,52 @@ mod tests {
             "expected success with 8/10 passing: {:?}",
             result,
         );
+    }
+
+    /// Validate that every entry in `CONFUSABLE_PHRASES` appears in exactly one
+    /// tier array (`CONFUSABLE_HARD`, `CONFUSABLE_MEDIUM`, `CONFUSABLE_EASY`),
+    /// and that there are no overlaps between tier arrays (mahbot-871).
+    ///
+    /// This test is only run when `voice-tests` is enabled, because the tier
+    /// constants are gated behind that feature flag.
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn tier_arrays_completely_cover_confusable_phrases() {
+        // Collect tiers into a list for iteration.
+        let tiers: &[(&[&str], &str)] = &[
+            (CONFUSABLE_HARD, "CONFUSABLE_HARD"),
+            (CONFUSABLE_MEDIUM, "CONFUSABLE_MEDIUM"),
+            (CONFUSABLE_EASY, "CONFUSABLE_EASY"),
+        ];
+
+        // Every phrase in CONFUSABLE_PHRASES must appear in exactly one tier.
+        for phrase in CONFUSABLE_PHRASES {
+            let matches: Vec<&str> = tiers
+                .iter()
+                .filter(|(arr, _)| arr.contains(phrase))
+                .map(|(_, name)| *name)
+                .collect();
+
+            assert_eq!(
+                matches.len(),
+                1,
+                "Confusable phrase '{phrase}' appears in {} tier arrays (need exactly 1): {:?}",
+                matches.len(),
+                matches,
+            );
+        }
+
+        // No phrase should appear in more than one tier (redundant with above
+        // but explicit for clarity and to catch cross-tier duplicates).
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (arr, name) in tiers {
+            for phrase in *arr {
+                assert!(
+                    seen.insert(phrase),
+                    "Confusable phrase '{phrase}' appears in multiple tier arrays \
+                     (already seen in a previous tier, now also in {name})",
+                );
+            }
+        }
     }
 }
