@@ -4478,8 +4478,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     }
                 };
 
-                // ── Train verifier in spawn_blocking (CPU-bound logistic ──────
-                // regression with up to 5000 iterations — must not block the
+                // ── Train verifier in spawn_blocking (CPU-bound MLP with ──────
+                // up to 2000 iterations — must not block the
                 // async runtime during enrollment finalization, mahbot-855).
                 //
                 // The verifier uses STREAMING-style embeddings (from
@@ -4490,9 +4490,10 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 let pos_for_verifier = positive_streaming_embeddings; // moved — clone already taken for classifier combine
                 // Combine ambient negatives with pre-computed confusable phrase
                 // embeddings for verifier training (mahbot-859).
+                let confusable_embs = confusable_negative_embeddings();
+                let n_confusable_pre = confusable_embs.len();
                 let neg_for_verifier = {
                     let mut neg = streaming_negative_embeddings; // moved — clone already taken for classifier combine
-                    let confusable_embs = confusable_negative_embeddings();
                     if !confusable_embs.is_empty() {
                         info!(
                             "Adding {} pre-computed confusable phrase streaming \
@@ -4505,8 +4506,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 };
                 let verifier = tokio::task::spawn_blocking(move || {
                     use crate::voice_verifier::{
-                        DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE, MAX_ITER,
-                        VoiceVerifier,
+                        CONFUSABLE_UPWEIGHT, DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE,
+                        MLP_MAX_ITER, VoiceVerifier,
                     };
 
                     if pos_for_verifier.is_empty() {
@@ -4514,17 +4515,33 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         VoiceVerifier::untrained()
                     } else if !neg_for_verifier.is_empty() {
                         let n_neg = neg_for_verifier.len();
+                        let n_confusable = n_confusable_pre; // captured before spawn boundary
+                        let n_ambient = n_neg.saturating_sub(n_confusable);
+
+                        // Build per-negative weights: ambient negatives get weight
+                        // 1.0, confusable near-miss phrases get CONFUSABLE_UPWEIGHT
+                        // (100×) so the verifier learns to reject them despite
+                        // being <5% of the negative set (mahbot-861).
+                        let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
+                        per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
+                        per_neg_weights.extend(std::iter::repeat_n(CONFUSABLE_UPWEIGHT, n_confusable));
+                        info!(
+                            "Building per-negative weights: {n_ambient} ambient (1.0) + \
+                             {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×)",
+                        );
+
                         let v = VoiceVerifier::train(
                             &pos_for_verifier,
                             &neg_for_verifier,
+                            Some(&per_neg_weights),
                             DEFAULT_VERIFIER_THRESHOLD,
-                            L2_LAMBDA,     // 0.01
-                            LEARNING_RATE, // 0.01
-                            MAX_ITER,      // 5000
+                            L2_LAMBDA,       // 0.01
+                            LEARNING_RATE,   // 0.01
+                            MLP_MAX_ITER,    // 2000 — MLP converges faster than linear (mahbot-861)
                         );
                         info!(
                             "Verifier trained from {} streaming positive + {n_neg} real \
-                             streaming negative embedding(s) (ambient + confusable + synthetic, mahbot-859)",
+                             streaming negative embedding(s) (ambient + confusable + synthetic, mahbot-861)",
                             pos_for_verifier.len(),
                         );
                         v
