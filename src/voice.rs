@@ -994,8 +994,7 @@ pub(crate) fn score_single_embedding(
         // (mahbot-870).  Using the accumulated peak delays the blocking
         // decision until enough embeddings exist, without weakening the
         // gate for sustained confusable phrases.
-        let effective_verifier_score =
-            peak_verifier_score.map_or(max_verifier_score, |p| max_verifier_score.max(*p));
+        let effective_verifier_score = peak_verifier_score.map_or(max_verifier_score, |p| *p);
         if let Some(v) = verifier
             && v.is_trained()
             && effective_verifier_score < v.threshold

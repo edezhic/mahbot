@@ -131,7 +131,9 @@ const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 /// `threshold`, the wake word detection is suppressed.
 ///
 /// Backward compatibility: old serialized models with `weights`+`bias` (linear)
-/// are still supported at inference time.
+/// that match the 288-dim input dimension are still supported at inference time.
+/// Legacy 96-dim models are correctly rejected by `is_trained()` since they cannot
+/// process 288-dim windows (mahbot-870).
 ///
 /// When `trained` is `false`, the verifier is a no-op (all frames pass with
 /// score 1.0).
@@ -347,6 +349,10 @@ impl VoiceVerifier {
         // fitted on L2-normalized windows.  Inference must match the
         // same ordering so the MLP receives inputs from the same
         // distribution as training.
+        //
+        // Both intermediate buffers use stack-allocated arrays (288 f32s =
+        // 1152 bytes each) instead of heap Vecs, since predict() is called
+        // on every streaming inference frame (mahbot-874).
 
         // Step 1: L2-normalize the input window (unit-sphere projection).
         let norm_l2: f32 = embedding
@@ -355,28 +361,40 @@ impl VoiceVerifier {
             .sum::<f32>()
             .sqrt()
             .max(1e-10);
-        let x_l2: Vec<f32> = embedding.iter().map(|v| v / norm_l2).collect();
+        let mut x_l2 = [0.0f32; VERIFIER_INPUT_DIM];
+        #[allow(clippy::cast_precision_loss)]
+        for (i, &v) in embedding.iter().enumerate() {
+            x_l2[i] = v / norm_l2;
+        }
 
         // Step 2: Apply StandardScaler (per-dim mean/std centering) on
         // the L2-normalized values — same order as training pipeline.
-        let x: Vec<f32> = if !self.scaler_mean.is_empty() && !self.scaler_std.is_empty() {
-            x_l2.iter()
-                .zip(self.scaler_mean.iter())
-                .zip(self.scaler_std.iter())
-                .map(
-                    |((&val, &mean), &std)| {
-                        if std > 0.0 { (val - mean) / std } else { val }
-                    },
-                )
-                .collect()
-        } else {
-            x_l2 // no scaler — use L2-normalized input directly
-        };
+        let x: [f32; VERIFIER_INPUT_DIM] =
+            if !self.scaler_mean.is_empty() && !self.scaler_std.is_empty() {
+                let mut scaled = [0.0f32; VERIFIER_INPUT_DIM];
+                for i in 0..VERIFIER_INPUT_DIM {
+                    let std = self.scaler_std[i];
+                    scaled[i] = if std > 0.0 {
+                        (x_l2[i] - self.scaler_mean[i]) / std
+                    } else {
+                        x_l2[i]
+                    };
+                }
+                scaled
+            } else {
+                x_l2 // no scaler — use L2-normalized input directly
+            };
 
         // Use MLP if available (new format, mahbot-861), fall back to legacy
-        // linear model for backward compatibility.  MLP dimension validation
-        // prevents index-out-of-bounds in mlp_forward() if a corrupted
-        // serialized model has wrong-weight tensors.
+        // linear model for backward compatibility with 288-dim linear models.
+        // MLP dimension validation prevents index-out-of-bounds in
+        // mlp_forward() if a corrupted serialized model has wrong-weight tensors.
+        //
+        // Note: Legacy 96-dim linear models are not supported through this
+        // fallback — is_trained() correctly rejects them because their weights
+        // dimension (96) does not match VERIFIER_INPUT_DIM (288).  Only
+        // 288-dim linear models (which no production training produces) are
+        // reachable here (mahbot-874).
         //
         // MLP path: input is L2-norm → scaler (matching training pipeline).
         // Linear path: legacy models predate both L2-norm and scaler, so use
@@ -1407,8 +1425,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verifier_accepts_positive() {
-        // Train on known positive and negative synthetic embeddings.
+    fn test_verifier_accepts_positive_rejects_negative() {
+        // Train on known positive and negative synthetic embeddings, then verify
+        // both acceptance of held-out positives and rejection of held-out negatives
+        // (consolidated from two separate tests with identical setup, mahbot-874).
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
@@ -1426,38 +1446,19 @@ mod tests {
         assert!(verifier.is_trained(), "Verifier must be trained");
 
         // Verify a held-out positive is accepted.
-        let held_out = make_positive_embedding(&mut rng);
-        let score = verifier.predict(&held_out);
+        let held_out_pos = make_positive_embedding(&mut rng);
+        let score_pos = verifier.predict(&held_out_pos);
         assert!(
-            score >= 0.5,
-            "Verifier should accept positive embedding (score >= 0.5), got score={score:.4}",
+            score_pos >= 0.5,
+            "Verifier should accept positive embedding (score >= 0.5), got score={score_pos:.4}",
         );
-    }
-
-    #[test]
-    fn test_verifier_rejects_negative() {
-        let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
-        let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
-
-        let verifier = VoiceVerifier::train(
-            &positives,
-            &negatives,
-            None, // no per-negative weights
-            DEFAULT_VERIFIER_THRESHOLD,
-            0.001,
-            0.1,
-            500,
-        );
-
-        assert!(verifier.is_trained());
 
         // Verify a held-out negative is rejected.
-        let held_out = make_negative_embedding(&mut rng);
-        let score = verifier.predict(&held_out);
+        let held_out_neg = make_negative_embedding(&mut rng);
+        let score_neg = verifier.predict(&held_out_neg);
         assert!(
-            score < 0.5,
-            "Verifier should reject negative embedding (score < 0.5), got score={score:.4}",
+            score_neg < 0.5,
+            "Verifier should reject negative embedding (score < 0.5), got score={score_neg:.4}",
         );
     }
 
