@@ -299,6 +299,256 @@ const CONTEXT_PADDING_MS: usize = 100;
 pub(crate) const CONTEXT_PADDING_SAMPLES: usize =
     (CONTEXT_PADDING_MS * SAMPLE_RATE as usize) / 1000;
 
+// ── Confusable phrase list for verifier negative training (mahbot-859) ──
+
+/// Canonical confusable near-miss phrases for VoiceVerifier training
+/// (mahbot-859).
+pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
+    // ── Direct phonetic substitutions (wake-word-like) ──────────────
+    "hey madbot",
+    "hey map bot",
+    "day mahbot",
+    "hey nab it",
+    "hey man",
+    "hey mabot",
+    "hey mahbott",
+    "hey mat",
+    "hey max",
+    "pay mabot",
+    // ── Rhythmic/melodic confusables ─────────────────────────────────
+    "hay map pot",
+    "huh mahbot",
+    "eh mad bot",
+    "hey maybott",
+    "they mad bot",
+    "haymaker",
+    // ── Embedded wake-word sounds ────────────────────────────────────
+    "hey maybe not",
+    "play mah jong",
+    "hey matter of fact",
+    "a day with mahbot",
+    // ── Short phonetic near-misses ──────────────────────────────────
+    "madbot",
+    "mat bot",
+    "bad bot",
+    "mad lot",
+    "mad pot",
+    "med bot",
+    "my bot",
+    "may bot",
+];
+
+/// Cache for pre-computed confusable phrase streaming embeddings (mahbot-859).
+///
+/// Populated asynchronously during startup (see [`prewarm_confusable_embeddings`])
+/// after voice ONNX models and TTS models are ready, so enrollment never blocks
+/// on TTS synthesis (~2 minutes for 29 phrases).  Uses AGC pre-processing to
+/// match the production inference distribution (mahbot-859 Fix 2).
+///
+/// The embeddings are used during verifier training to teach the logistic
+/// regression model to reject confusable near-miss phrases.
+///
+/// Once set, the cache is immutable — a new process is needed to regenerate
+/// (e.g. after ONNX model changes).  If pre-warming fails or is not yet
+/// complete, [`confusable_negative_embeddings`] returns an empty slice and the
+/// verifier trains on ambient negatives only.
+static CONFUSABLE_EMBEDDINGS_CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+
+/// Get the pre-computed confusable phrase streaming embeddings (mahbot-859).
+///
+/// Returns a cached slice of streaming embedding vectors pre-computed during
+/// startup via [`prewarm_confusable_embeddings`].  The embeddings are generated
+/// from the canonical [`CONFUSABLE_PHRASES`] list using TTS synthesis + AGC +
+/// ONNX streaming pipeline, running asynchronously at startup to avoid blocking
+/// enrollment.
+///
+/// If the pre-warm has not completed yet or models are not available, returns
+/// an empty slice — the verifier trains on ambient negatives only as a graceful
+/// fallback.
+pub(crate) fn confusable_negative_embeddings() -> &'static [Vec<f32>] {
+    match CONFUSABLE_EMBEDDINGS_CACHE.get() {
+        Some(cache) => &cache[..],
+        None => &[],
+    }
+}
+
+/// Poll for TTS voice styles to become available (mahbot-859 Fix 3).
+///
+/// TTS model download (~400 MB) may still be in progress when voice ONNX
+/// models (~2.4 MB) finish loading.  We poll with a 30-second interval,
+/// racing against the global shutdown token, so the prewarm succeeds on
+/// first startup even on slow connections.
+///
+/// Returns `Some(styles)` when styles are available, or `None` if:
+/// - TTS is not config-enabled (styles will never become available)
+/// - TTS download permanently failed
+/// - Shutdown was requested
+async fn wait_for_tts_styles() -> Option<Vec<String>> {
+    if !crate::tts::is_config_enabled() {
+        info!(
+            "TTS is disabled in config — confusable negative embeddings \
+             pre-warm skipped (verifier trains on ambient negatives only)"
+        );
+        return None;
+    }
+
+    let mut styles = crate::tts::list_voice_styles();
+    if !styles.is_empty() {
+        return Some(styles);
+    }
+
+    info!(
+        "TTS voice styles not yet available — polling every 30s \
+         (confusable embeddings pre-warm deferred)"
+    );
+
+    let shutdown = crate::shutdown::shutdown_token();
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(30)) => {
+                styles = crate::tts::list_voice_styles();
+                if !styles.is_empty() {
+                    info!("TTS voice styles now available — proceeding with pre-warm");
+                    return Some(styles);
+                }
+                if crate::tts::download_failed() {
+                    info!(
+                        "TTS model download permanently failed — confusable negative \
+                         embeddings pre-warm skipped (verifier trains on \
+                         ambient negatives only)"
+                    );
+                    return None;
+                }
+            }
+            () = shutdown.cancelled() => {
+                info!(
+                    "Shutdown requested — confusable negative embeddings \
+                     pre-warm aborted"
+                );
+                return None;
+            }
+        }
+    }
+}
+
+/// Pre-warm the confusable phrase embedding cache (mahbot-859).
+///
+/// Runs asynchronously at startup after voice ONNX models and TTS are ready.
+/// For each confusable phrase:
+///
+/// 1. Synthesizes audio via TTS (in `spawn_blocking` — CPU-bound Kokoro-82M)
+/// 2. Applies AGC preprocessing via [`AudioPreprocessor`] in FRAME_LENGTH
+///    chunks to match the production inference distribution
+/// 3. Extracts streaming embeddings via the ONNX pipeline
+///
+/// The resulting embeddings are stored in [`CONFUSABLE_EMBEDDINGS_CACHE`] and
+/// later used during verifier training.  If TTS models or voice ONNX models
+/// are not available, the function returns without populating the cache and
+/// the verifier trains on ambient negatives only.
+///
+/// This function is safe to call multiple times — [`OnceLock::set`] is a no-op
+/// if the cache is already populated.
+pub(crate) async fn prewarm_confusable_embeddings() {
+    // Fast path: already pre-warmed.  OnceLock::get is lock-free after init.
+    if CONFUSABLE_EMBEDDINGS_CACHE.get().is_some() {
+        return;
+    }
+
+    // Need voice ONNX models.  TTS voice styles are checked below with
+    // a retry poll so the prewarm succeeds even if TTS is still downloading
+    // (mahbot-859 Fix 3).
+    if ONNX_MODELS.get().is_none() {
+        info!(
+            "Voice ONNX models not ready yet — confusable negative embeddings \
+             pre-warm skipped (verifier trains on ambient negatives only)"
+        );
+        return;
+    }
+
+    // Wait for TTS voice styles to become available by polling (mahbot-859 Fix 3).
+    // TTS model download (~400 MB) may still be in progress when voice models
+    // are ready (~2.4 MB).  Poll with a 30-second interval, racing against the
+    // global shutdown token, so the prewarm succeeds on first startup even on
+    // slow connections.  If TTS is not config-enabled, skip immediately since
+    // voice styles will never become available.
+    let Some(available_styles) = wait_for_tts_styles().await else {
+        return;
+    };
+
+    let phrases: &[&str] = CONFUSABLE_PHRASES;
+
+    // Runs TTS synthesis, AGC, and ONNX embedding extraction in a blocking
+    // thread to avoid starving the async runtime (~2 minutes for 29 phrases
+    // of TTS + fast ONNX inference).
+    let result: Vec<Vec<f32>> = tokio::task::spawn_blocking(move || {
+        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+
+        let Some(models) = ONNX_MODELS.get() else {
+            return Vec::new();
+        };
+
+        let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
+        let mut all_embeddings: Vec<Vec<f32>> = Vec::new();
+
+        for (i, &phrase) in phrases.iter().enumerate() {
+            // Rotate through available voice styles for acoustic diversity
+            // (mahbot-859 Fix 1: single-style prewarm → multi-style).
+            let style = &available_styles[i % available_styles.len()];
+            let seed = 42 + i as u64;
+            let pcm = match crate::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("TTS synthesis failed for confusable phrase '{phrase}': {e}");
+                    continue;
+                }
+            };
+
+            // Apply AGC in FRAME_LENGTH chunks to match production inference
+            // distribution (mahbot-859 Fix 2).  The production speech pipeline
+            // applies AudioPreprocessor::process to every incoming mic frame.
+            let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
+            for chunk in pcm.chunks(FRAME_LENGTH) {
+                let mut padded = chunk.to_vec();
+                padded.resize(FRAME_LENGTH, 0.0);
+                agc_audio.extend(pre.process(padded));
+            }
+
+            // Extract streaming embeddings from AGC'd audio.
+            match extract_streaming_embeddings_from_audio(models, &agc_audio) {
+                Ok(embs) => all_embeddings.extend(embs),
+                Err(e) => {
+                    warn!(
+                        "Failed to extract streaming embedding for confusable \
+                         phrase '{phrase}': {e}"
+                    );
+                }
+            }
+        }
+
+        all_embeddings
+    })
+    .await
+    .unwrap_or_default();
+
+    let count = result.len();
+
+    // OnceLock::set is a no-op if already set (race-safe).
+    let _ = CONFUSABLE_EMBEDDINGS_CACHE.set(result);
+
+    if count > 0 {
+        info!(
+            "Pre-warmed {count} confusable phrase streaming embedding(s) \
+             from {} phrases for verifier negative training (mahbot-859)",
+            CONFUSABLE_PHRASES.len(),
+        );
+    } else {
+        warn!(
+            "No confusable phrase embeddings could be generated — \
+             verifier will train on ambient negatives only"
+        );
+    }
+}
+
 // ── Model URLs and filenames ────────────────────────────────────────────
 
 const MEL_MODEL_FILENAME: &str = "melspectrogram.onnx";
@@ -537,6 +787,12 @@ fn voice_debug_enabled() -> bool {
 /// - `verifier` — trained logistic regression verifier (`None` skips the
 ///   second-stage gate, matching enrollment self-test behaviour).
 /// - `score_window` — persistent rolling window of recent confidence scores.
+/// - `peak_verifier_score` — optional accumulator for the running max verifier
+///   prediction across frames (mahbot-859).  Pass `Some(&mut field)` to track
+///   the peak; pass `None` to skip.  The verifier max is computed once per
+///   frame and shared between the gate and this accumulator, avoiding redundant
+///   `predict` calls.
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn score_single_embedding(
     embedding: &[f32],
     embedding_ring: &mut Vec<Vec<f32>>,
@@ -545,6 +801,7 @@ pub(crate) fn score_single_embedding(
     score_window: &mut Vec<f32>,
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
+    peak_verifier_score: Option<&mut f32>,
 ) -> (bool, f32) {
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
@@ -619,40 +876,62 @@ pub(crate) fn score_single_embedding(
         );
     }
 
+    // ── Verifier max score (mahbot-859) ───────────────────────────────
+    // Always compute the max verifier prediction over the rolling window
+    // so it can be shared between the verifier gate (below) and the peak
+    // verifier score tracking.  Computing it once per frame avoids
+    // duplicating the O(WINDOW_SIZE × EMBEDDING_DIM) predict loop.
+    let max_verifier_score: f32 = if let Some(v) = verifier
+        && v.is_trained()
+        && embedding_ring.len() >= ROLLING_WINDOW_N
+    {
+        let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
+        embedding_ring[start..]
+            .iter()
+            .map(|emb| v.predict(emb))
+            .fold(0.0f32, f32::max)
+    } else {
+        0.0
+    };
+
+    // Track peak verifier score for diagnostics/benchmarking (mahbot-859).
+    // Runs on every frame regardless of detection status to capture the
+    // peak even for non-detected frames (useful for false-accept analysis).
+    if let Some(peak) = peak_verifier_score
+        && max_verifier_score > *peak
+    {
+        *peak = max_verifier_score;
+    }
+
     if detected {
         // ── Verifier gate (mahbot-777, mahbot-788) ────────────────────
         // After the rolling window check passes, run the second-stage
         // logistic regression verifier to catch false positives that
-        // survived the MLP classifier.
+        // survived the MLP classifier.  Uses the pre-computed
+        // `max_verifier_score` from above.
         if let Some(v) = verifier
             && v.is_trained()
+            && max_verifier_score < v.threshold
         {
-            let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
-            let max_score = embedding_ring[start..]
-                .iter()
-                .map(|emb| v.predict(emb))
-                .fold(0.0f32, f32::max);
-            if max_score < v.threshold {
-                // ── Voice debug logging (mahbot-853) ────────────────────
-                // When the `voice-debug` feature is enabled and
-                // `MAHBOT_VOICE_DEBUG=1` is set, log the verifier's score
-                // and threshold when it blocks a detection.  This provides
-                // observability into verifier behaviour without requiring
-                // recompilation when the feature is already enabled.
-                #[cfg(feature = "voice-debug")]
-                if voice_debug_enabled() {
-                    info!(
-                        "VOICE_DEBUG: verifier blocked — max_score={max_score:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
-                        v.threshold,
-                    );
-                }
-
-                // Clear the score window so the next frame starts from zero.
-                // Without this the accumulated classifier scores eventually
-                // let any speech through (mahbot-797).
-                score_window.clear();
-                return (false, rolling_sum);
+            // ── Voice debug logging (mahbot-853) ────────────────────
+            // When the `voice-debug` feature is enabled and
+            // `MAHBOT_VOICE_DEBUG=1` is set, log the verifier's score
+            // and threshold when it blocks a detection.  This provides
+            // observability into verifier behaviour without requiring
+            // recompilation when the feature is already enabled.
+            #[cfg(feature = "voice-debug")]
+            if voice_debug_enabled() {
+                info!(
+                    "VOICE_DEBUG: verifier blocked — max_score={max_verifier_score:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
+                    v.threshold,
+                );
             }
+
+            // Clear the score window so the next frame starts from zero.
+            // Without this the accumulated classifier scores eventually
+            // let any speech through (mahbot-797).
+            score_window.clear();
+            return (false, rolling_sum);
         }
         return (true, rolling_sum);
     }
@@ -1924,6 +2203,10 @@ async fn download_retry_loop() {
                     if ONNX_MODELS.set(models).is_ok() {
                         MODELS_STATE.store(ModelState::Ready, Ordering::Release);
                         info!("Voice models loaded successfully");
+                        // Pre-warm confusable negative embeddings in background
+                        // so enrollment never blocks on TTS synthesis
+                        // (mahbot-859 Fix 1).
+                        tokio::spawn(prewarm_confusable_embeddings());
                         // Clear "Loading models" status — if enabled, auto-start
                         // transitions to Listening on the next pipeline tick.
                         set_status(if is_enabled() {
@@ -1934,7 +2217,9 @@ async fn download_retry_loop() {
                         return;
                     }
                     // Another instance already set the models — adopt Ready
-                    // state and exit (avoids wasted retry loops).
+                    // state and exit (avoids wasted retry loops).  Pre-warm
+                    // was triggered by the first instance; calling it again
+                    // is a no-op (cache check).
                     MODELS_STATE.store(ModelState::Ready, Ordering::Release);
                     info!("Voice models already loaded by another task");
                     set_status(if is_enabled() {
@@ -2405,6 +2690,7 @@ fn run_enrollment_self_test(
                 &mut score_window,
                 None, // no adaptive threshold during enrollment self-test
                 ADAPTIVE_K_DEFAULT,
+                None, // no peak verifier tracking during self-test
             );
             if detected_this {
                 detected = true;
@@ -3281,6 +3567,10 @@ pub(crate) struct PipelineCtx {
     /// session.  Reset on each detection attempt.  Used by the E2E
     /// benchmark for per-variant peak score reporting.
     peak_score: f32,
+    /// Peak verifier score achieved during the current detection session
+    /// (mahbot-859).  Updated to track the highest verifier prediction
+    /// across all embeddings in the window.  Reset alongside `peak_score`.
+    peak_verifier_score: f32,
 }
 
 /// Reset granularity for [`PipelineCtx::reset_pipeline_state`].
@@ -3355,6 +3645,7 @@ impl PipelineCtx {
                     .clamp(ADAPTIVE_K_MIN, ADAPTIVE_K_MAX)
             },
             peak_score: 0.0,
+            peak_verifier_score: 0.0,
         }
     }
 
@@ -3406,6 +3697,7 @@ impl PipelineCtx {
                 reset_vad();
                 self.adaptive_threshold.reset();
                 self.peak_score = 0.0;
+                self.peak_verifier_score = 0.0;
 
                 // Full does NOT clear global enrollment accumulators — those
                 // survive mic stop/start cycles so mid-enrollment progress is
@@ -3425,6 +3717,7 @@ impl PipelineCtx {
                 self.audio_preprocessor.clear_buffer();
                 self.adaptive_threshold.reset();
                 self.peak_score = 0.0;
+                self.peak_verifier_score = 0.0;
 
                 // Cancel also clears global enrollment accumulators.
                 let mut state = voice_state().write().unwrap_poison();
@@ -4174,7 +4467,21 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 // positives and negatives are processed through the streaming
                 // pipeline.
                 let pos_for_verifier = positive_streaming_embeddings; // moved — clone already taken for classifier combine
-                let neg_for_verifier = streaming_negative_embeddings; // moved — clone already taken for classifier combine
+                // Combine ambient negatives with pre-computed confusable phrase
+                // embeddings for verifier training (mahbot-859).
+                let neg_for_verifier = {
+                    let mut neg = streaming_negative_embeddings; // moved — clone already taken for classifier combine
+                    let confusable_embs = confusable_negative_embeddings();
+                    if !confusable_embs.is_empty() {
+                        info!(
+                            "Adding {} pre-computed confusable phrase streaming \
+                             embeddings to verifier negative set (mahbot-859)",
+                            confusable_embs.len(),
+                        );
+                        neg.extend_from_slice(confusable_embs);
+                    }
+                    neg
+                };
                 let verifier = tokio::task::spawn_blocking(move || {
                     use crate::voice_verifier::{
                         DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE, MAX_ITER,
@@ -4196,7 +4503,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         );
                         info!(
                             "Verifier trained from {} streaming positive + {n_neg} real \
-                             streaming negative embedding(s) (streaming pipeline, mahbot-855)",
+                             streaming negative embedding(s) (ambient + confusable + synthetic, mahbot-859)",
                             pos_for_verifier.len(),
                         );
                         v
@@ -4207,8 +4514,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         );
                         info!(
                             "Verifier trained from {} streaming positive \
-                             embedding(s) + synthetic negatives (no real \
-                             negatives available, mahbot-855)",
+                             embedding(s) + synthetic negatives (no real or confusable \
+                             negatives available, mahbot-859)",
                             pos_for_verifier.len(),
                         );
                         v
@@ -4616,6 +4923,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         ctx.score_window.clear();
         ctx.adaptive_threshold.reset();
         ctx.peak_score = 0.0;
+        ctx.peak_verifier_score = 0.0;
         return;
     }
 
@@ -4984,7 +5292,9 @@ fn try_match_wake_word_and_push_embedding(
     // MLP classifier forward pass, rolling window scoring, and verifier
     // gate — the same logic exercised by `run_enrollment_self_test` and
     // the E2E integration test.  Any change to detection heuristics is
-    // automatically validated by the integration test.
+    // automatically validated by the integration test.  The function also
+    // tracks the peak verifier score in `ctx.peak_verifier_score` (mahbot-859),
+    // avoiding a redundant predict loop at the call site.
     let state = voice_state().read().unwrap_poison();
     let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
     let verifier = get_verifier();
@@ -4996,6 +5306,7 @@ fn try_match_wake_word_and_push_embedding(
         &mut ctx.score_window,
         Some(&mut ctx.adaptive_threshold),
         ctx.adaptive_k,
+        Some(&mut ctx.peak_verifier_score),
     );
     // Track peak rolling-sum for diagnostics/benchmarking (mahbot-845).
     if rolling_sum > ctx.peak_score {
@@ -5677,6 +5988,7 @@ mod tests {
             &mut score_window,
             None,
             ADAPTIVE_K_DEFAULT,
+            None,
         );
 
         // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.20) → window appended.
@@ -5716,6 +6028,7 @@ mod tests {
             &mut score_window,
             None,
             ADAPTIVE_K_DEFAULT,
+            None,
         );
         assert!(
             !score_window.is_empty(),
@@ -5737,6 +6050,7 @@ mod tests {
             &mut score_window,
             None,
             ADAPTIVE_K_DEFAULT,
+            None,
         );
         assert!(
             !detected,
@@ -5766,6 +6080,7 @@ mod tests {
                 &mut score_window,
                 None,
                 ADAPTIVE_K_DEFAULT,
+                None,
             );
         }
 
@@ -5796,6 +6111,7 @@ mod tests {
             &mut sw_tiled,
             None,
             ADAPTIVE_K_DEFAULT,
+            None,
         );
         let tiled_score = sw_tiled.last().copied().unwrap_or(0.0);
 
@@ -5811,6 +6127,7 @@ mod tests {
                 &mut sw_nat,
                 None,
                 ADAPTIVE_K_DEFAULT,
+                None,
             );
         }
         let natural_score = sw_nat.last().copied().unwrap_or(0.0);
@@ -5848,6 +6165,7 @@ mod tests {
                 &mut score_window,
                 Some(&mut adaptive),
                 ADAPTIVE_K_DEFAULT,
+                None,
             );
             // None of these should detect (single embedding rolling sum ~0.5 < 1.65).
             assert!(!detected, "frame {i} should not detect wake word");
@@ -5889,6 +6207,7 @@ mod tests {
                 &mut score_window,
                 Some(&mut adaptive),
                 ADAPTIVE_K_DEFAULT,
+                None,
             );
         }
 
@@ -5906,6 +6225,7 @@ mod tests {
             &mut score_window,
             Some(&mut adaptive),
             ADAPTIVE_K_DEFAULT,
+            None,
         );
 
         // The adaptive state should NOT have been updated (peek doesn't push).

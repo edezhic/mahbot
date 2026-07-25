@@ -37,21 +37,9 @@ pub enum NoiseType {
 
 /// Confusable phrases — phonetic near-misses of the default wake word.
 /// These are used to generate negative training examples.
-const CONFUSABLE_PHRASES: &[&str] = &[
-    "hey madbot",
-    "hey map bot",
-    "hey man",
-    "hey mabot",
-    "madbot",
-    "mat bot",
-    "bad bot",
-    "mad lot",
-    "mad pot",
-    "med bot",
-    "my bot",
-    "may bot",
-    "unrelated speech",
-];
+///
+/// Uses the canonical list from [`crate::voice::CONFUSABLE_PHRASES`] (mahbot-859).
+const CONFUSABLE_PHRASES: &[&str] = crate::voice::CONFUSABLE_PHRASES;
 
 /// Training data directory name under storage root.
 const TRAINING_DIR: &str = "training";

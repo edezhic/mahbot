@@ -79,40 +79,8 @@ const MAX_NOISE_FA: usize = 1;
 
 /// Confusable near-miss phrases for negative detection testing (mahbot-834).
 ///
-/// Expanded from 5 to 20 phrases covering:
-/// - Direct phonetic substitutions that sound similar to "hey mahbot"
-///   (madbot, map bot, mabot, mahbott, maybot, nab it, etc.)
-/// - Similar two-word rhythmic patterns
-///   (day mahbot, hey man, hey max, hey mat, pay mabot, hay map pot)
-/// - Longer phrases containing wake word sound patterns embedded within
-///   (hey maybe not, play mah jong, they mad bot, hey matter of fact)
-/// - False starts with similar syllable structure
-///   (huh mahbot, eh mad bot, haymaker)
-const CONFUSABLE_PHRASES: &[&str] = &[
-    // ── Direct phonetic substitutions (wake-word-like) ──────────────
-    "hey madbot",
-    "hey map bot",
-    "day mahbot",
-    "hey nab it",
-    "hey man",
-    "hey mabot",
-    "hey mahbott",
-    "hey mat",
-    "hey max",
-    "pay mabot",
-    // ── Rhythmic/melodic confusables ─────────────────────────────────
-    "hay map pot",
-    "huh mahbot",
-    "eh mad bot",
-    "hey maybott",
-    "they mad bot",
-    "haymaker",
-    // ── Embedded wake-word sounds ────────────────────────────────────
-    "hey maybe not",
-    "play mah jong",
-    "hey matter of fact",
-    "a day with mahbot",
-];
+/// Uses the canonical list from the parent `voice` module (mahbot-859).
+const CONFUSABLE_PHRASES: &[&str] = super::CONFUSABLE_PHRASES;
 
 /// Completely unrelated phrases for negative detection testing (mahbot-834).
 ///
@@ -947,6 +915,9 @@ struct PerVariantResult {
     detected: bool,
     /// Peak ensemble rolling-sum score achieved during processing.
     peak_score: f32,
+    /// Peak verifier prediction score achieved during processing
+    /// (0.0 if verifier is untrained or no embeddings passed the threshold).
+    verifier_score: f32,
 }
 
 /// Track per-variant detection results for reporting.
@@ -1056,11 +1027,12 @@ fn test_detection_samples(
             }
             on_detection(metrics, label);
         }
-        // Record per-variant result (mahbot-845).
+        // Record per-variant result (mahbot-845) with verifier score (mahbot-859).
         metrics.per_variant.push(PerVariantResult {
             variant: label.clone(),
             detected: result.detected,
             peak_score: peak,
+            verifier_score: ctx.peak_verifier_score,
         });
     }
 }
@@ -1293,6 +1265,7 @@ fn run_noise_overlap_test(
                     variant: label.clone(),
                     detected: result.detected,
                     peak_score: peak,
+                    verifier_score: ctx.peak_verifier_score,
                 });
             }
 
@@ -1616,13 +1589,22 @@ pub(crate) fn run_internal() {
         1.5,
     ));
 
-    // Build a SEPARATE negative set for the verifier that EXCLUDES confusable
-    // and uses STREAMING pipeline embeddings to match inference distribution
-    // (mahbot-855).  Reuses the pre-computed AGC'd unrelated sets from above
-    // (mahbot-856), avoiding redundant AGC processing.
+    // Build a SEPARATE negative set for the verifier that uses STREAMING
+    // pipeline embeddings to match inference distribution (mahbot-855) and
+    // INCLUDES confusable phrase embeddings for confusable rejection training
+    // (mahbot-859).  Reuses the pre-computed AGC'd unrelated and confusable
+    // sets from above, avoiding redundant AGC processing.
     let mut verifier_negatives: Vec<Vec<f32>> = Vec::new();
     for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
         let (embs, _, _) = process_variants_with(agc_unrelated, |s| {
+            super::process_streaming_enrollment_sample(s)
+        });
+        verifier_negatives.extend(embs);
+    }
+    // Include confusable phrase streaming embeddings (mahbot-859) so the
+    // verifier learns to reject phonetic near-misses like "hey map bot".
+    for agc_confusable in [&agc_confusable_1, &agc_confusable_2, &agc_confusable_3] {
+        let (embs, _, _) = process_variants_with(agc_confusable, |s| {
             super::process_streaming_enrollment_sample(s)
         });
         verifier_negatives.extend(embs);
@@ -1739,7 +1721,7 @@ pub(crate) fn run_internal() {
     if verifier.is_trained() {
         info!(
             "VoiceVerifier trained successfully with {} streaming positive + {} negative \
-             (streaming pipeline, unrelated + synthetic, no confusable phrases, mahbot-855)",
+             (streaming pipeline, unrelated + confusable + synthetic, mahbot-859)",
             all_streaming_embeddings.len(),
             verifier_negatives.len()
         );
@@ -1785,6 +1767,9 @@ pub(crate) fn run_internal() {
     // detection block (or remain at defaults when degenerate).
     let (mut lat_mean, mut lat_median, mut lat_p95) = (0.0_f64, 0.0_f64, 0.0_f64);
     let mut latency_samples = 0usize;
+
+    // Per-variant metrics for noise profiles (collected across all profiles).
+    let mut noise_metrics: Vec<DetectionMetrics> = Vec::new();
 
     if !degenerate {
         // Create a pre-warmed adaptive threshold state shared across all
@@ -1901,8 +1886,9 @@ pub(crate) fn run_internal() {
                 info!("    → no false accepts ✓");
             } else {
                 info!("    → false accepts: {}", metric.false_accepts.len());
-                noise_false_accepts.extend(metric.false_accepts);
+                noise_false_accepts.extend(metric.false_accepts.clone());
             }
+            noise_metrics.push(metric);
         }
         phase_times[P_NOISE_PROFILES] = phase_end_ms!();
 
@@ -2136,6 +2122,47 @@ pub(crate) fn run_internal() {
         );
     }
 
+    // Build per-variant negative diagnostics with verifier scores (mahbot-859).
+    let mut negative_pv: Vec<serde_json::Value> = Vec::new();
+    for pv in &conf_metrics.per_variant {
+        negative_pv.push(serde_json::json!({
+            "variant": pv.variant,
+            "detected": pv.detected,
+            "peak_score": pv.peak_score,
+            "verifier_score": pv.verifier_score,
+            "category": "confusable",
+        }));
+    }
+    for pv in &unrelated_metrics.per_variant {
+        negative_pv.push(serde_json::json!({
+            "variant": pv.variant,
+            "detected": pv.detected,
+            "peak_score": pv.peak_score,
+            "verifier_score": pv.verifier_score,
+            "category": "unrelated",
+        }));
+    }
+    for pv in &silence_metric.per_variant {
+        negative_pv.push(serde_json::json!({
+            "variant": pv.variant,
+            "detected": pv.detected,
+            "peak_score": pv.peak_score,
+            "verifier_score": pv.verifier_score,
+            "category": "silence",
+        }));
+    }
+    for metric in &noise_metrics {
+        for pv in &metric.per_variant {
+            negative_pv.push(serde_json::json!({
+                "variant": pv.variant,
+                "detected": pv.detected,
+                "peak_score": pv.peak_score,
+                "verifier_score": pv.verifier_score,
+                "category": "noise",
+            }));
+        }
+    }
+
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
         "passed": passed,
@@ -2174,9 +2201,11 @@ pub(crate) fn run_internal() {
                     "variant": pv.variant,
                     "detected": pv.detected,
                     "peak_score": pv.peak_score,
+                    "verifier_score": pv.verifier_score,
                 })
             }).collect()
         ),
+        "per_variant_negatives": serde_json::Value::Array(negative_pv),
         "noise_overlap": serde_json::Value::Object(
             noise_overlap_results.iter().map(|(key, rate)| {
                 (key.clone(), serde_json::json!(rate))
