@@ -579,8 +579,9 @@ const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 /// Conv1D classifier producing per-frame scores of 0.00–0.98 (mean ~0.16),
 /// the old threshold of 0.40 cleared 81.7% of frames — the new threshold
 /// allows accumulation from borderline frames, increasing peak scores.
-/// False accepts remain zero because the detection threshold (1.65) is
-/// still far above the negative distribution mean (0.02).
+/// False accepts remain low because the detection threshold (1.35, lowered
+/// from 1.65 in mahbot-860) is still far above the negative distribution
+/// mean (0.033).
 const NO_MATCH_RESET_THRESHOLD: f32 = 0.20;
 
 /// Number of recent per-frame scores to keep in the rolling sum window
@@ -612,7 +613,7 @@ const _: () = assert!(
 /// Compile-time invariant: the adaptive threshold floor (hard minimum) must
 /// not exceed the safe harbor (primary lower bound tracking the static
 /// threshold).  The safe harbor is always at least as high as the floor
-/// given current constants (FLOOR=1.65, SAFE_HARBOR=1.65).
+/// given current constants (FLOOR=1.35, SAFE_HARBOR=1.35).
 const _: () = assert!(
     ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR,
     "ADAPTIVE_FLOOR must be <= ADAPTIVE_SAFE_HARBOR"
@@ -633,18 +634,20 @@ const _: () = assert!(
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-773, mahbot-829, mahbot-835, mahbot-852).  At 0.55 (threshold 1.65),
-/// the average per-frame soft score must exceed ~55% for detection to fire.
-/// Lowered from 0.75 in mahbot-852 to increase detection rate while maintaining
-/// zero false accepts — the negative distribution mean is 0.02 vs threshold 1.65,
-/// providing a large safety margin.  Combined with the verifier at 0.40
-/// (mahbot-853), this maintains low false accepts while achieving ≥85%
-/// wake word detection.
-const MATCH_THRESHOLD_FACTOR: f32 = 0.55;
+/// (mahbot-773, mahbot-829, mahbot-835, mahbot-852, mahbot-860).  At 0.45
+/// (threshold 1.35), the average per-frame soft score must exceed ~45% for
+/// detection to fire.  Lowered from 0.55 in mahbot-860 to capture borderline
+/// wake word variants that scored between 1.36 and 1.596 (below the old 1.65
+/// threshold) in the mahbot-859 benchmark.  The negative distribution mean
+/// (0.033) is still far below 1.35, maintaining a large safety margin against
+/// noise.  Combined with the verifier at 0.40 (mahbot-853), this maintains
+/// low false accepts while achieving ≥85% wake word detection.
+const MATCH_THRESHOLD_FACTOR: f32 = 0.45;
 
-/// Detection threshold for the rolling sum of soft scores (mahbot-773).
+/// Detection threshold for the rolling sum of soft scores (mahbot-773, mahbot-860).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.55 = 1.65`).
+/// (= `3 × 0.45 = 1.35`).  Lowered from 1.65 to 1.35 in mahbot-860 to capture
+/// borderline wake word variants.
 #[expect(clippy::cast_precision_loss)]
 fn match_threshold() -> f32 {
     (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR
@@ -666,14 +669,24 @@ const ADAPTIVE_K_MIN: f32 = 1.0;
 const ADAPTIVE_K_MAX: f32 = 4.0;
 
 /// Absolute floor — the adaptive threshold must never drop below this value.
-const ADAPTIVE_FLOOR: f32 = 1.65;
+/// Lowered from 1.65 to 1.35 alongside ADAPTIVE_SAFE_HARBOR in mahbot-860 to
+/// capture borderline wake word variants with classifier scores between 1.36
+/// and 1.596 (mahbot-859 benchmark data).
+///
+/// Computed from the same expression as ADAPTIVE_SAFE_HARBOR so the two
+/// values produce the exact same f32 bit pattern, satisfying the compile-time
+/// invariant ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR without floating-point
+/// rounding differences (mahbot-860).
+#[expect(clippy::cast_precision_loss)]
+const ADAPTIVE_FLOOR: f32 = (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR;
 
 /// Absolute ceiling — the adaptive threshold must never exceed this value.
 const ADAPTIVE_CEILING: f32 = 2.85;
 
 /// Safe harbor — the adaptive threshold must never drop below this value,
 /// which matches the current static [`match_threshold()`]
-/// (ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR = 3 × 0.55 = 1.65).
+/// (ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR = 3 × 0.45 = 1.35).
+/// Lowered from 1.65 to 1.35 in mahbot-860.
 /// Derived from the same constants as [`match_threshold()`] so the two values
 /// are always in sync (mahbot-845, reviewer_3).  Prevents a feedback loop
 /// where false accepts push the threshold lower.
@@ -685,7 +698,7 @@ const ADAPTIVE_SAFE_HARBOR: f32 = (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FA
 const ADAPTIVE_BOOTSTRAP_FRAMES: usize = 5;
 
 /// Process a per-frame soft score through the rolling window and determine
-/// whether wake word detection should fire (mahbot-773).
+/// whether wake word detection should fire (mahbot-773, mahbot-860).
 ///
 /// Returns `true` when the rolling sum of recent scores meets or exceeds
 /// `match_threshold()`.  When the incoming score is below
@@ -881,9 +894,17 @@ pub(crate) fn score_single_embedding(
     // so it can be shared between the verifier gate (below) and the peak
     // verifier score tracking.  Computing it once per frame avoids
     // duplicating the O(WINDOW_SIZE × EMBEDDING_DIM) predict loop.
+    //
+    // NOTE (mahbot-860): The verifier condition uses !embedding_ring.is_empty()
+    // instead of embedding_ring.len() >= ROLLING_WINDOW_N because the rolling
+    // sum can reach its threshold with only 2 high-scoring frames (each >0.675
+    // with the 1.35 threshold).  Under the old condition the verifier returned
+    // 0.0 (blocking detection) when fewer than 3 embeddings were available,
+    // causing the F1.json_enroll0 failure where peak_score=2.059 and
+    // verifier=0.779 both exceeded their thresholds yet detection was suppressed.
     let max_verifier_score: f32 = if let Some(v) = verifier
         && v.is_trained()
-        && embedding_ring.len() >= ROLLING_WINDOW_N
+        && !embedding_ring.is_empty()
     {
         let start = embedding_ring.len().saturating_sub(ROLLING_WINDOW_N);
         embedding_ring[start..]
@@ -5614,7 +5635,7 @@ mod tests {
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.1, ADAPTIVE_K_DEFAULT);
         }
-        // adaptive = (0.1 + 2.5 × 0.0) × 3 = 0.3 → well below safe harbor (1.65)
+        // adaptive = (0.1 + 2.5 × 0.0) × 3 = 0.3 → well below safe harbor (1.35)
         let result = state.feed(0.1, ADAPTIVE_K_DEFAULT);
         let threshold = result.expect("should return Some after bootstrap");
         assert!(
@@ -5701,9 +5722,9 @@ mod tests {
     fn adaptive_floor_is_hard_minimum() {
         // This test verifies that the floor clamp is structurally present and
         // correctly ordered in the safeguard chain.  With current constants,
-        // ADAPTIVE_FLOOR (1.65) == ADAPTIVE_SAFE_HARBOR (1.65), so both bounds
+        // ADAPTIVE_FLOOR (1.35) == ADAPTIVE_SAFE_HARBOR (1.35), so both bounds
         // produce the same result.  This documents that with current constants
-        // the floor and safe harbor are equal (mahbot-852).
+        // the floor and safe harbor are equal (mahbot-860).
         //
         // We prove the floor is reachable by demonstrating that even with
         // completely zero input (k=0, score=0), the threshold respects ALL
@@ -5715,7 +5736,7 @@ mod tests {
         let result = state.feed(0.0, 0.0);
         let threshold = result.expect("should return Some after bootstrap");
         // With k=0, score=0: adaptive = (0.0 + 0.0) × 3 = 0.0
-        // Chain: max(0.0, SAFE_HARBOR=1.65) = 1.65, max(1.65, FLOOR=1.65) = 1.65
+        // Chain: max(0.0, SAFE_HARBOR=1.35) = 1.35, max(1.35, FLOOR=1.35) = 1.35
         assert!(
             threshold >= ADAPTIVE_FLOOR && threshold >= ADAPTIVE_SAFE_HARBOR,
             "threshold {threshold} should respect both floor {} and safe harbor {}",
@@ -5769,7 +5790,7 @@ mod tests {
             + 1.0 / ADAPTIVE_WINDOW_N as f32;
         let result = state.feed(1.0, 0.0); // k=0 so adaptive = mean × ROLLING_WINDOW_N
         let threshold = result.expect("should return Some");
-        // After eviction: mean ≈ 0.533, adaptive = 0.533 * 3 = 1.6, clamped to safe harbor 1.65
+        // After eviction: mean ≈ 0.533, adaptive = 0.533 * 3 = 1.6, well above safe harbor 1.35
         // But we can still verify the internal mean indirectly.
         let expected_raw = expected_mean * ROLLING_WINDOW_N as f32;
         let clamped = expected_raw
@@ -5820,8 +5841,11 @@ mod tests {
     fn adaptive_peek_after_bootstrap_returns_some() {
         // After bootstrap completes, peek() should return a threshold.
         let mut state = AdaptiveThresholdState::new();
+        // Use low scores (0.1) so the computed adaptive value (~0.3) stays
+        // below the safe harbor (1.35), verifying that peek() produces a
+        // clamped threshold rather than a raw adaptive value (mahbot-860).
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT);
+            state.feed(0.1, ADAPTIVE_K_DEFAULT);
         }
         let peek_result = state.peek(ADAPTIVE_K_DEFAULT);
         assert!(
@@ -5832,7 +5856,7 @@ mod tests {
         let threshold = peek_result.unwrap();
         assert!(
             (threshold - ADAPTIVE_SAFE_HARBOR).abs() < 0.01,
-            "peek threshold {threshold} should equal safe harbor {} with constant input",
+            "peek threshold {threshold} should equal safe harbor {} with constant low input",
             ADAPTIVE_SAFE_HARBOR,
         );
     }
@@ -5953,22 +5977,25 @@ mod tests {
     // a hard-coded 0.0.  These exercise the pure detection logic without ONNX
     // models — just the Conv1D classifier with known weights.
 
-    /// Build a WakeWordClassifier with all-zero weights so it always outputs
-    /// sigmoid(0.0) = 0.5, regardless of input.  This lets us verify that the
-    /// tiling fallback actually runs the classifier forward pass (producing a
-    /// non-zero, known score) rather than short-circuiting to 0.0.
-    fn classifier_always_half() -> WakeWordClassifier {
+    /// Build a test classifier whose forward pass always returns `target_score`
+    /// (by setting fc_bias = ln(target_score / (1 - target_score)) so that
+    /// sigmoid(bias) = target_score).  All other weights are zeroed.
+    fn classifier_always_score(target_score: f32) -> WakeWordClassifier {
+        let target = target_score.clamp(1e-6, 1.0 - 1e-6); // avoid log(0)
         let mut w = ClassifierWeights::default();
-        // Zero all trainable weights and biases so the forward pass produces
-        // sigmoid(0.0) = 0.5 for any input.  Batch norm parameters from
-        // default() are already identity (gamma=1, beta=0, mean=0, var=1).
         w.conv1_weight.fill(0.0);
         w.conv1_bias.fill(0.0);
         w.conv2_weight.fill(0.0);
         w.conv2_bias.fill(0.0);
         w.fc_weight.fill(0.0);
-        w.fc_bias.fill(0.0);
+        w.fc_bias[0] = (target / (1.0 - target)).ln();
         WakeWordClassifier::new(w)
+    }
+
+    /// Build a test classifier that always returns ~0.5 for any input
+    /// (sigmoid(0.0) = 0.5).
+    fn classifier_always_half() -> WakeWordClassifier {
+        classifier_always_score(0.5)
     }
 
     #[test]
@@ -5992,7 +6019,7 @@ mod tests {
         );
 
         // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.20) → window appended.
-        // Rolling sum 0.5 < match_threshold (1.65) → detection does NOT fire.
+        // Rolling sum 0.5 < match_threshold (1.35) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
@@ -6054,7 +6081,7 @@ mod tests {
         );
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 1.65)",
+            "two embeddings should not trigger detection (rolling sum < 1.35)",
         );
         assert!(
             !score_window.is_empty(),
@@ -6149,7 +6176,12 @@ mod tests {
     fn score_single_with_adaptive_state_completes_bootstrap() {
         // With an adaptive state, score_single_embedding should complete
         // the bootstrap phase after ADAPTIVE_BOOTSTRAP_FRAMES embeddings.
-        let classifier = classifier_always_half();
+        // Uses a classifier that produces ~0.3 per frame so the rolling sum
+        // stays below the detection threshold (0.3 × 3 = 0.9 < 1.35).
+        // Updated from classifier_always_half() (~0.5 per frame) after the
+        // mahbot-860 threshold lowering (1.65 → 1.35) made 3 × 0.5 = 1.5 ≥ 1.35
+        // trigger detection during the test.
+        let classifier = classifier_always_score(0.3);
         let embedding = vec![0.5; EMBEDDING_DIM];
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
@@ -6167,7 +6199,7 @@ mod tests {
                 ADAPTIVE_K_DEFAULT,
                 None,
             );
-            // None of these should detect (single embedding rolling sum ~0.5 < 1.65).
+            // None of these should detect (rolling sum ~0.9 < 1.35).
             assert!(!detected, "frame {i} should not detect wake word");
         }
 
